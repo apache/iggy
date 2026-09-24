@@ -303,6 +303,7 @@ mod leader_aware;
 mod links;
 pub mod prelude;
 pub mod quic;
+mod request_budget;
 pub mod session;
 mod session_owner;
 pub mod stream_builder;

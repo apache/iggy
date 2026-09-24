@@ -41,6 +41,8 @@ pub struct TcpClientConfig {
     pub reconnection: TcpClientReconnectionConfig,
     /// Interval of heartbeats sent by the client
     pub heartbeat_interval: NonZeroIggyDuration,
+    /// TCP login request budget. Other requests do not use this setting yet.
+    pub request_timeout: NonZeroIggyDuration,
     /// Disable Nagle algorithm for the TCP socket.
     pub nodelay: bool,
 }
@@ -54,6 +56,7 @@ impl Default for TcpClientConfig {
             tls_ca_file: None,
             tls_validate_certificate: true,
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
+            request_timeout: NonZeroIggyDuration::from_str("30s").unwrap(),
             auto_login: AutoLogin::Disabled,
             reconnection: TcpClientReconnectionConfig::default(),
             nodelay: false,
@@ -73,6 +76,7 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
             tls_validate_certificate: true,
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
+            request_timeout: connection_string.options().request_timeout(),
             nodelay: connection_string.options().nodelay(),
         }
     }

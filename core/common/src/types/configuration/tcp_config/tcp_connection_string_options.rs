@@ -28,6 +28,7 @@ pub struct TcpConnectionStringOptions {
     tls_ca_file: Option<String>,
     reconnection: TcpClientReconnectionConfig,
     heartbeat_interval: NonZeroIggyDuration,
+    request_timeout: NonZeroIggyDuration,
     nodelay: bool,
 }
 
@@ -51,6 +52,10 @@ impl TcpConnectionStringOptions {
     pub fn nodelay(&self) -> bool {
         self.nodelay
     }
+
+    pub fn request_timeout(&self) -> NonZeroIggyDuration {
+        self.request_timeout
+    }
 }
 
 impl ConnectionStringOptions for TcpConnectionStringOptions {
@@ -71,6 +76,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
         let mut reconnection_interval = "1s".to_owned();
         let mut reestablish_after = "5s".to_owned();
         let mut heartbeat_interval = "5s".to_owned();
+        let mut request_timeout = "30s".to_owned();
         let mut nodelay = false;
 
         for option in options {
@@ -100,6 +106,9 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                 "heartbeat_interval" => {
                     heartbeat_interval = option_parts[1].to_string();
                 }
+                "request_timeout" => {
+                    request_timeout = option_parts[1].to_string();
+                }
                 "nodelay" => {
                     nodelay = option_parts[1] == "true";
                 }
@@ -127,8 +136,10 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
 
         let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
+        let request_timeout = NonZeroIggyDuration::from_str(request_timeout.as_str())
+            .map_err(|_| IggyError::InvalidConnectionString)?;
 
-        let connection_string_options = TcpConnectionStringOptions::new(
+        let mut connection_string_options = TcpConnectionStringOptions::new(
             tls_enabled,
             tls_domain,
             tls_ca_file,
@@ -136,6 +147,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
             heartbeat_interval,
             nodelay,
         );
+        connection_string_options.request_timeout = request_timeout;
 
         Ok(connection_string_options)
     }
@@ -156,6 +168,7 @@ impl TcpConnectionStringOptions {
             tls_ca_file,
             reconnection,
             heartbeat_interval,
+            request_timeout: NonZeroIggyDuration::from_str("30s").unwrap(),
             nodelay,
         }
     }
@@ -169,6 +182,7 @@ impl Default for TcpConnectionStringOptions {
             tls_ca_file: None,
             reconnection: Default::default(),
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
+            request_timeout: NonZeroIggyDuration::from_str("30s").unwrap(),
             nodelay: false,
         }
     }
