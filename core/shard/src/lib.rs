@@ -10127,6 +10127,14 @@ where
         // Self-clearing: any path that advances `commit_min` past the stuck op
         // leaves `stuck_op != commit_min + 1`, so nothing has to retract it.
         let next_op = commit_min.saturating_add(1);
+        // TODO(#4294): exclude the op the pipeline holds. `commit_journal`
+        // deliberately stops at the pipeline head (`on_ack` commits it), so a
+        // primary whose inherited head sits at `commit_min + 1` looks
+        // walk-stalled here, the walk moves nothing, and
+        // `drop_unwalkable_metadata_entry` truncates a prepare the pipeline
+        // still needs; the next commit driver then panics with "committed
+        // prepare ... must be in journal". Suggested fix: add
+        // `&& !consensus.pipeline_head_header().is_some_and(|h| h.op == next_op)`.
         #[allow(clippy::cast_possible_truncation)]
         let next_op_resident = normal
             && !transferring
