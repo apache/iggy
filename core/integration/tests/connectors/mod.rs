@@ -21,6 +21,7 @@ mod delta;
 mod doris;
 mod elasticsearch;
 mod fixtures;
+mod fluss;
 mod http;
 mod http_config_provider;
 mod iceberg;
