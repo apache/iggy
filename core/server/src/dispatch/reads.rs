@@ -27,7 +27,7 @@
 
 use crate::cluster_meta::ClusterRoster;
 use crate::dispatch::authz::{
-    authorize_default_read, authorize_partition_read, authorize_uid,
+    authorize_default_read, authorize_partition_read, authorize_uid, build_inline_permissioner,
     inline_grant_lacks_stream_scope,
 };
 use crate::dispatch::failure::{
@@ -72,9 +72,7 @@ use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{
-    ClusterNodeRole, IggyError, Permissions, SnapshotCompression, SystemSnapshotType,
-};
+use iggy_common::{ClusterNodeRole, IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::framing::MAX_MESSAGE_SIZE;
@@ -383,13 +381,14 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    let session_perms = user_id
+    let alt_permissioner = user_id
         .filter(|&uid| external_auth.enabled && uid == external_auth.user_id)
-        .and_then(|_| {
+        .and_then(|uid| {
             let now_secs = iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
-            sessions
+            let perms = sessions
                 .borrow_mut()
-                .session_permissions_for_connection(transport_client_id, now_secs)
+                .session_permissions_for_connection(transport_client_id, now_secs)?;
+            Some(build_inline_permissioner(uid, &perms))
         });
     match code {
         PING_CODE => {
@@ -422,7 +421,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 return;
             }
-            if inline_grant_lacks_stream_scope(session_perms.as_deref()) {
+            if inline_grant_lacks_stream_scope(alt_permissioner.as_ref(), user_id.unwrap_or(0)) {
                 send_non_replicated_deny(
                     shard,
                     &request,
@@ -448,8 +447,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     shard,
                     user_id,
                     Permissioner::get_clients,
-                    session_perms.as_deref(),
-                    |p| p.global.manage_servers || p.global.read_servers,
+                    alt_permissioner.as_ref(),
                 )
             })
             .await
@@ -483,8 +481,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     shard,
                     user_id,
                     Permissioner::get_client,
-                    session_perms.as_deref(),
-                    |p| p.global.manage_servers || p.global.read_servers,
+                    alt_permissioner.as_ref(),
                 )
             })
             .await
@@ -544,7 +541,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 transport_client_id,
                 &request,
                 user_id,
-                session_perms.as_deref(),
+                alt_permissioner.as_ref(),
             )
             .await;
         }
@@ -602,7 +599,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                         user_id,
                         consumer_client_id,
                         attachment,
-                        session_perms.as_deref(),
+                        alt_permissioner.as_ref(),
                     )
                     .await;
                 }
@@ -618,7 +615,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 transport_client_id,
                 &request,
                 user_id,
-                session_perms.as_deref(),
+                alt_permissioner.as_ref(),
             )
             .await;
         }
@@ -633,7 +630,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     .await;
                 return;
             }
-            if inline_grant_lacks_stream_scope(session_perms.as_deref()) {
+            if inline_grant_lacks_stream_scope(alt_permissioner.as_ref(), user_id.unwrap_or(0)) {
                 send_non_replicated_deny(
                     shard,
                     &request,
@@ -664,7 +661,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 watermark,
                 &roster,
                 client_ip,
-                session_perms.as_deref(),
+                alt_permissioner.as_ref(),
             )
             .await;
         }
@@ -823,7 +820,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
-    session_perms: Option<&Permissions>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -837,7 +834,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     // read-your-writes hold sits INSIDE the same call, behind that denial: an
     // unauthorized read must fail now, not after the whole poll budget.
     if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-        authorize_default_read(shard, code, request_body(request), user_id, session_perms)
+        authorize_default_read(
+            shard,
+            code,
+            request_body(request),
+            user_id,
+            alt_permissioner,
+        )
     })
     .await
     {
@@ -925,7 +928,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
-    session_perms: Option<&Permissions>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -933,13 +936,8 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if let Err(error) = authorize_uid(
-        shard,
-        user_id,
-        Permissioner::get_snapshot,
-        session_perms,
-        |p| p.global.manage_servers || p.global.read_servers,
-    ) {
+    if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot, alt_permissioner)
+    {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }

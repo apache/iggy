@@ -757,14 +757,15 @@ async fn handle_client_request<B, MJ, S, SB>(
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
             // `None` rather than trust that.
-            let session_perms = user_id
+            let alt_permissioner = user_id
                 .filter(|&uid| external_auth.enabled && uid == external_auth.user_id)
-                .and_then(|_| {
+                .and_then(|uid| {
                     let now_secs =
                         iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
-                    sessions
+                    let perms = sessions
                         .borrow_mut()
-                        .session_permissions_for_connection(transport_client_id, now_secs)
+                        .session_permissions_for_connection(transport_client_id, now_secs)?;
+                    Some(authz::build_inline_permissioner(uid, &perms))
                 });
             dispatch_partition_request(
                 shard,
@@ -774,7 +775,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 transport_client_id,
                 user_id,
                 consumer_session,
-                session_perms.as_deref(),
+                alt_permissioner.as_ref(),
             )
             .await;
         }
@@ -810,14 +811,16 @@ async fn handle_client_request<B, MJ, S, SB>(
             {
                 let now_secs =
                     iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
-                let session_perms = sessions
+                let alt_cg_permissioner = sessions
                     .borrow_mut()
-                    .session_permissions_for_connection(transport_client_id, now_secs);
+                    .session_permissions_for_connection(transport_client_id, now_secs)
+                    .map(|perms| authz::build_inline_permissioner(user_id.unwrap_or(0), &perms));
                 if let Some(deny_code) = authz::authorize_consumer_group_op(
                     shard,
                     request.header().operation,
                     request_body(&request),
-                    session_perms.as_deref(),
+                    user_id.unwrap_or(0),
+                    alt_cg_permissioner.as_ref(),
                 ) {
                     send_deny_reply(shard, transport_client_id, request.header(), deny_code).await;
                     return;

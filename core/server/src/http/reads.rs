@@ -30,9 +30,11 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codes::GET_STATS_CODE;
 use iggy_common::wire_conversions::identifier_to_wire;
-use iggy_common::{Identifier, IggyError, Permissions};
+use iggy_common::{Identifier, IggyError};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+
+use crate::dispatch::authz::build_inline_permissioner;
 use send_wrapper::SendWrapper;
 use std::rc::Rc;
 
@@ -58,15 +60,13 @@ pub(in crate::http) fn authorize_read(
     identity: &Identity,
     consistency: Consistency,
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
-    inline_grant_check: impl Fn(&Permissions) -> bool,
 ) -> Result<(), ReadError> {
     if state.external_auth.enabled && identity.user_id == state.external_auth.user_id {
         let perms = state
             .session_grant_permissions(&identity.session_key)
             .ok_or(ReadError::Rejected(IggyError::Unauthorized))?;
-        if !inline_grant_check(&perms) {
-            return Err(ReadError::Rejected(IggyError::Unauthorized));
-        }
+        let inline_perm = build_inline_permissioner(identity.user_id, &perms);
+        rule(&inline_perm, identity.user_id).map_err(ReadError::Rejected)?;
     } else {
         state
             .shard
@@ -103,9 +103,8 @@ pub(in crate::http) async fn read_local(
     code: u32,
     body: &[u8],
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
-    inline_grant_check: impl Fn(&Permissions) -> bool,
 ) -> Result<Bytes, ReadError> {
-    gate_local_read(state, identity, consistency, code, rule, inline_grant_check).await?;
+    gate_local_read(state, identity, consistency, code, &rule).await?;
     let clients_count = if code == GET_STATS_CODE {
         u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
             .unwrap_or(u32::MAX)
@@ -159,14 +158,13 @@ pub(in crate::http) async fn gate_local_read(
     consistency: Consistency,
     code: u32,
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
-    inline_grant_check: impl Fn(&Permissions) -> bool,
 ) -> Result<(), ReadError> {
     await_recovery_barrier(&state.shard).await?;
-    authorize_read(state, identity, consistency, &rule, &inline_grant_check)?;
+    authorize_read(state, identity, consistency, &rule)?;
     if read_needs_metadata_frontier(code)
         && await_metadata_read_frontier(state, identity).await? == FrontierWait::CaughtUp
     {
-        authorize_read(state, identity, consistency, &rule, &inline_grant_check)?;
+        authorize_read(state, identity, consistency, &rule)?;
     }
     Ok(())
 }
@@ -397,7 +395,6 @@ pub(in crate::http) fn authorize_data_plane(
     stream_id: &Identifier,
     topic_id: &Identifier,
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
-    inline_grant_check: impl FnOnce(&Permissions, usize, usize) -> bool,
 ) -> Result<(), IggyError> {
     let (Ok(wire_stream), Ok(wire_topic)) =
         (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
@@ -421,11 +418,8 @@ pub(in crate::http) fn authorize_data_plane(
         let perms = state
             .session_grant_permissions(&sk)
             .ok_or(IggyError::Unauthorized)?;
-        return if inline_grant_check(&perms, stream_id, topic_id) {
-            Ok(())
-        } else {
-            Err(IggyError::Unauthorized)
-        };
+        let inline_perm = build_inline_permissioner(user_id, &perms);
+        return rule(&inline_perm, user_id, stream_id, topic_id);
     }
     state
         .shard
