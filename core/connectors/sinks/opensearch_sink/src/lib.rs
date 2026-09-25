@@ -481,7 +481,7 @@ impl OpenSearchSink {
                 messages_metadata,
                 message.offset,
                 message.id,
-            )?,
+            ),
         };
 
         if self.config.include_metadata {
@@ -1266,7 +1266,7 @@ fn generated_document_id(
     messages_metadata: &MessagesMetadata,
     offset: u64,
     message_id: u128,
-) -> Result<String, Error> {
+) -> String {
     let components = json!([
         topic_metadata.stream.as_str(),
         topic_metadata.topic.as_str(),
@@ -1274,12 +1274,13 @@ fn generated_document_id(
         offset,
         message_id.to_string()
     ]);
-    let bytes = serde_json::to_vec(&components).map_err(|error| {
-        Error::Serialization(format!(
-            "Failed to serialize generated document ID: {error}"
-        ))
-    })?;
-    Ok(format!("{GENERATED_ID_PREFIX}{}", calculate_256(&bytes)))
+    // Every component is a `&str`, an integer, or a `String` - none of which
+    // `serde_json` can fail to serialize (the only failure modes are a
+    // non-finite float or a custom `Serialize` impl that errors, neither of
+    // which appears here).
+    let bytes =
+        serde_json::to_vec(&components).expect("generated document ID components always serialize");
+    format!("{GENERATED_ID_PREFIX}{}", calculate_256(&bytes))
 }
 
 fn is_transient_error(error: &Error) -> bool {
@@ -1523,7 +1524,6 @@ mod tests {
             message.offset,
             message.id,
         )
-        .expect("generated ID components should serialize")
     }
 
     #[test]
@@ -2062,16 +2062,15 @@ mod tests {
             topic: "created.topic".to_string(),
         };
 
-        let first_id = generated_document_id(&first, &messages_metadata(), 11, 42).unwrap();
-        let second_id = generated_document_id(&second, &messages_metadata(), 11, 42).unwrap();
+        let first_id = generated_document_id(&first, &messages_metadata(), 11, 42);
+        let second_id = generated_document_id(&second, &messages_metadata(), 11, 42);
 
         assert_ne!(first_id, second_id);
     }
 
     #[test]
     fn given_max_u128_message_id_should_generate_id() {
-        let id = generated_document_id(&topic_metadata(), &messages_metadata(), 11, u128::MAX)
-            .expect("u128::MAX should serialize");
+        let id = generated_document_id(&topic_metadata(), &messages_metadata(), 11, u128::MAX);
 
         assert!(id.starts_with(GENERATED_ID_PREFIX));
     }
@@ -2087,8 +2086,7 @@ mod tests {
             topic: "t".repeat(255),
         };
 
-        let id = generated_document_id(&topic_metadata, &messages_metadata(), u64::MAX, u128::MAX)
-            .expect("max-length names should serialize");
+        let id = generated_document_id(&topic_metadata, &messages_metadata(), u64::MAX, u128::MAX);
 
         assert!(id.len() <= MAX_DOCUMENT_ID_BYTES);
         assert!(id.starts_with(GENERATED_ID_PREFIX));
