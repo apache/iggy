@@ -442,7 +442,13 @@ impl OpenSearchSink {
         };
 
         if self.config.include_metadata {
-            inject_metadata(&mut document, topic_metadata, messages_metadata, &message);
+            inject_metadata(
+                self.id,
+                &mut document,
+                topic_metadata,
+                messages_metadata,
+                &message,
+            );
         }
 
         Ok(PreparedDocument {
@@ -1098,6 +1104,7 @@ fn document_from_raw(bytes: Vec<u8>) -> Map<String, Value> {
 /// Writes the reserved `iggy_*` provenance fields, overwriting any same-named
 /// payload fields so provenance always reflects the true message coordinates.
 fn inject_metadata(
+    id: u32,
     document: &mut Map<String, Value>,
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
@@ -1126,13 +1133,13 @@ fn inject_metadata(
     ];
 
     for (field, value) in fields {
-        upsert_metadata_field(document, field, value);
+        upsert_metadata_field(id, document, field, value);
     }
 
     if let Some(headers) = &message.headers
         && !headers.is_empty()
     {
-        upsert_metadata_field(document, "iggy_headers", headers_to_json(headers));
+        upsert_metadata_field(id, document, "iggy_headers", headers_to_json(headers));
     }
 }
 
@@ -1158,9 +1165,11 @@ fn headers_to_json(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Value {
     Value::Object(map)
 }
 
-fn upsert_metadata_field(document: &mut Map<String, Value>, field: &str, value: Value) {
+fn upsert_metadata_field(id: u32, document: &mut Map<String, Value>, field: &str, value: Value) {
     if document.insert(field.to_string(), value).is_some() {
-        debug!("Overwriting payload field '{field}' with OpenSearch connector provenance");
+        debug!(
+            "OpenSearch sink connector ID: {id}: overwriting payload field '{field}' with provenance"
+        );
     }
 }
 
