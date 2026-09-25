@@ -23,22 +23,20 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+use std::sync::Arc;
+
+use iggy_gateway_kafka::auth::SaslAuthenticator;
 use iggy_gateway_kafka::server::bind_listener;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 /// Bind an ephemeral port, start `KafkaGateway`, return address + shutdown sender.
 pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
     spawn_test_server_with_config(GatewayConfig {
-        bind_addr: String::new(),
-        advertised_host: None,
-        advertised_port: None,
-        max_frame_size: 8 * 1024 * 1024,
-        max_connections: 1024,
         idle_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
-        instance_id: 0,
+        ..GatewayConfig::default()
     })
     .await
 }
@@ -61,6 +59,25 @@ pub async fn spawn_test_server_with_config(
     config.bind_addr = addr.to_string();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let server = KafkaGateway::new(config);
+    tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_rx).await;
+    });
+
+    (addr, shutdown_tx)
+}
+
+/// Same as [`spawn_test_server_with_config`], with a verifier attached for the SASL suites.
+#[allow(clippy::unused_async)]
+pub async fn spawn_test_server_with_authenticator(
+    mut config: GatewayConfig,
+    authenticator: Arc<dyn SaslAuthenticator>,
+) -> (SocketAddr, broadcast::Sender<()>) {
+    let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    config.bind_addr = addr.to_string();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = KafkaGateway::new(config).with_authenticator(authenticator);
     tokio::spawn(async move {
         let _ = server.run(listener, shutdown_rx).await;
     });

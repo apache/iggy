@@ -97,7 +97,7 @@ async fn init_producer_id(
 }
 
 fn stub_state(instance_id: u16) -> GatewayState {
-    GatewayState::new(default_broker(), None, MAX_FRAME_SIZE, instance_id)
+    GatewayState::new(default_broker(), None, MAX_FRAME_SIZE, false, instance_id)
 }
 
 /// Produce v3 body with one topic and one partition, so a per-partition error code has somewhere
@@ -376,6 +376,7 @@ async fn given_a_server_configured_with_an_instance_id_when_init_producer_id_sho
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),
         instance_id,
+        ..GatewayConfig::default()
     })
     .await;
 
