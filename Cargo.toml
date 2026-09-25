@@ -50,6 +50,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sinks/surrealdb_sink",
     "core/connectors/sources/elasticsearch_source",
+    "core/connectors/sources/fluss_source",
     "core/connectors/sources/http_source",
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
@@ -180,6 +181,7 @@ file-operation = "0.8.32"
 flatbuffers = "25.12.19"
 flate2 = "1.1.10"
 flume = "0.12.0"
+fluss-rs = "1.0.0"
 fs2 = "0.4.3"
 futures = "0.3.34"
 futures-core = { version = "0.3.34", default-features = false }
