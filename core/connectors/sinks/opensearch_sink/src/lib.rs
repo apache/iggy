@@ -736,9 +736,9 @@ impl OpenSearchSink {
     /// retry (`retries == 1`) uses attempt `0` so it sleeps `retry_delay`
     /// itself rather than `retry_delay * 2`. Jitter can push the raw backoff
     /// up to 20% above `max_retry_delay`, so the jittered result is clamped
-    /// back down to it. `retry_after` overrides the computed backoff when the
-    /// server named an exact wait via a `Retry-After` header - honoring it
-    /// takes priority over our own estimate.
+    /// back down to it. `retry_after` overrides the computed backoff but is
+    /// still clamped to `max_retry_delay` - a hostile or misconfigured
+    /// server naming an hours-long wait can't force an unbounded sleep.
     async fn sleep_before_retry(
         &self,
         operation: &str,
@@ -747,13 +747,15 @@ impl OpenSearchSink {
         failure: &str,
         retry_after: Option<Duration>,
     ) {
-        let delay = retry_after.unwrap_or_else(|| {
-            retry_backoff(
-                self.config.retry_delay,
-                retries,
-                self.config.max_retry_delay,
-            )
-        });
+        let delay = retry_after
+            .map(|wait| wait.min(self.config.max_retry_delay))
+            .unwrap_or_else(|| {
+                retry_backoff(
+                    self.config.retry_delay,
+                    retries,
+                    self.config.max_retry_delay,
+                )
+            });
         warn!(
             "OpenSearch sink connector ID: {}: {} failed (retry {}/{}): {}. Retrying in {:?}...",
             self.id, operation, retries, max_retries, failure, delay
@@ -2727,7 +2729,14 @@ mod tests {
     #[tokio::test]
     async fn given_retry_after_header_on_429_should_override_computed_backoff() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 1).await;
+        // max_retry_delay raised above the 1s header value used below, so this
+        // test isolates "header overrides the computed backoff" from capping
+        // (covered separately by the test below).
+        let mut config = fast_retry_config(1);
+        config.url = server.uri();
+        config.max_retries = Some(1);
+        config.max_retry_delay = Some("5s".to_string());
+        let sink = sink_with_config(config);
         let client = mock_client(&sink);
         let documents = [prepared("a")];
         let body = build_bulk_body(&sink.config.index, &[&documents[0]]).expect("build body");
@@ -2759,11 +2768,54 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(outcome.indexed, 1);
-        // fast_retry_config caps the computed backoff at 2ms; honoring a 1s
+        // fast_retry_config's computed backoff caps at 1ms; honoring a 1s
         // Retry-After instead means the real wait is orders of magnitude longer.
         assert!(
             elapsed >= Duration::from_millis(900),
             "expected the Retry-After header to be honored, waited only {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_retry_after_header_exceeding_max_retry_delay_should_be_capped() {
+        let server = MockServer::start().await;
+        let sink = mock_bulk_sink(&server, 1).await;
+        let client = mock_client(&sink);
+        let documents = [prepared("a")];
+        let body = build_bulk_body(&sink.config.index, &[&documents[0]]).expect("build body");
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(body.clone()))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "3600"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": false,
+                "items": [{ "index": { "_id": "a", "status": 201, "result": "created" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let start = std::time::Instant::now();
+        let outcome = sink
+            .index_chunk(&client, &documents)
+            .await
+            .expect("resending after the capped wait should succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.indexed, 1);
+        // fast_retry_config caps max_retry_delay at 2ms; without the cap this
+        // would wait the full hour the header named.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected the Retry-After header to be capped by max_retry_delay, waited {elapsed:?}"
         );
     }
 
