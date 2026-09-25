@@ -266,6 +266,11 @@ struct ClientEntry {
     /// recommits replace in place, and a rebind drops the previous
     /// register reply before pushing the new one.
     ring: VecDeque<CachedReply>,
+    /// Inline-grant permissions for external auth sessions. Set at register
+    /// time when the external auth service returned an inline grant; `None`
+    /// for regular users. Replicated through the Register op body so every
+    /// node can authorize without node-local grant state.
+    session_permissions: Option<Arc<iggy_common::Permissions>>,
     /// Owning client id and the commit op of the latest cached reply,
     /// denormalized out of `ring.back()`'s header. Purely to keep
     /// [`ClientTable::evict_oldest`] off the header-cast path: it runs inside
@@ -321,6 +326,8 @@ pub struct ClientEntrySnapshot {
     /// reply payload up to roughly double on disk.
     #[serde(with = "reply_bytes")]
     pub reply: Vec<u8>,
+    #[serde(default)]
+    pub session_permissions: Option<iggy_common::Permissions>,
 }
 
 /// Serializable [`ClientTable`]: the occupied slots, each with its index.
@@ -773,6 +780,10 @@ impl ClientTable {
                         watermark: entry.watermark,
                         watermark_checksum: entry.watermark_checksum,
                         reply: entry.latest().as_bytes().to_vec(),
+                        session_permissions: entry
+                            .session_permissions
+                            .as_ref()
+                            .map(|arc| (**arc).clone()),
                     },
                 ))
             })
@@ -871,6 +882,7 @@ impl ClientTable {
                 epoch: entry.epoch,
                 attachment: None,
                 user_id: entry.user_id,
+                session_permissions: entry.session_permissions.map(Arc::new),
                 watermark: entry.watermark,
                 watermark_checksum: entry.watermark_checksum,
                 committed_window: 0,
@@ -1019,7 +1031,13 @@ impl ClientTable {
     ///
     /// # Panics
     /// If `client_id == 0` or `client_id != reply.header().client`.
-    pub fn commit_register(&mut self, client_id: u128, user_id: u32, reply: Message<ReplyHeader>) {
+    pub fn commit_register(
+        &mut self,
+        client_id: u128,
+        user_id: u32,
+        reply: Message<ReplyHeader>,
+        session_permissions: Option<iggy_common::Permissions>,
+    ) {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         assert_eq!(
             client_id,
@@ -1044,6 +1062,7 @@ impl ClientTable {
             entry.epoch = epoch;
             entry.attachment = None;
             entry.user_id = user_id;
+            entry.session_permissions = session_permissions.map(Arc::new);
             // Drop the previous register reply (if still retained) before
             // pushing the new one: only the newest rebind's reply is
             // replayable, and two request-0 entries would break the ring's
@@ -1088,6 +1107,7 @@ impl ClientTable {
                 epoch,
                 attachment: None,
                 user_id,
+                session_permissions: session_permissions.map(Arc::new),
                 client_id,
                 latest_commit,
                 watermark: fence
@@ -1728,6 +1748,19 @@ impl ClientTable {
         self.slots[slot_idx].as_ref().map(|entry| entry.user_id)
     }
 
+    /// Inline-grant permissions for `client_id`, if the session was registered
+    /// with an external auth inline grant.
+    #[must_use]
+    pub fn get_session_permissions(
+        &self,
+        client_id: u128,
+    ) -> Option<Arc<iggy_common::Permissions>> {
+        let &slot_idx = self.index.get(&client_id)?;
+        self.slots[slot_idx]
+            .as_ref()
+            .and_then(|entry| entry.session_permissions.clone())
+    }
+
     /// Active committed entries.
     #[must_use]
     pub fn count(&self) -> usize {
@@ -2011,6 +2044,7 @@ impl ClientTable {
                 epoch,
                 attachment: None,
                 user_id,
+                session_permissions: None,
                 watermark,
                 watermark_checksum,
                 committed_window: 0,
@@ -2109,6 +2143,7 @@ impl ClientEntry {
             epoch: 0,
             attachment: None,
             user_id,
+            session_permissions: None,
             watermark,
             watermark_checksum: 0,
             committed_window: committed_window | 1,
@@ -2204,6 +2239,7 @@ mod tests {
             CLIENT,
             TEST_USER_ID,
             make_register_reply(CLIENT, FIRST_SESSION),
+            None,
         );
         assert!(
             table
@@ -2223,6 +2259,7 @@ mod tests {
             CLIENT,
             TEST_USER_ID,
             make_register_reply(CLIENT, NEXT_SESSION),
+            None,
         );
         assert!(!attached.is_valid());
 
@@ -2243,12 +2280,13 @@ mod tests {
         const CLIENT: u128 = 41;
         const OTHER_CLIENT: u128 = 42;
         let mut table = ClientTable::new(1);
-        table.commit_register(CLIENT, TEST_USER_ID, make_register_reply(CLIENT, 1));
+        table.commit_register(CLIENT, TEST_USER_ID, make_register_reply(CLIENT, 1), None);
         let attached = table.attach_session(CLIENT, 1, TEST_USER_ID).unwrap();
         table.commit_register(
             OTHER_CLIENT,
             TEST_USER_ID,
             make_register_reply(OTHER_CLIENT, 2),
+            None,
         );
         assert!(!attached.is_valid());
 
@@ -2274,14 +2312,24 @@ mod tests {
         const CHURN: [u128; 2] = [0xB0B1, 0xB0B2];
 
         let mut table = ClientTable::new(2);
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 1),
+            None,
+        );
         // Request 1 commits for A, so its watermark is 1.
         table.commit_reply(CLIENT_A, TEST_USER_ID, make_reply_for(CLIENT_A, 1, 2));
 
         // Two fresh registers fill the table and evict A (oldest commit).
         for (offset, churn) in CHURN.iter().enumerate() {
             let commit = 3 + offset as u64;
-            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+            table.commit_register(
+                *churn,
+                TEST_USER_ID,
+                make_register_reply(*churn, commit),
+                None,
+            );
         }
         assert!(
             table.get_epoch(CLIENT_A).is_none(),
@@ -2289,7 +2337,12 @@ mod tests {
         );
 
         // A resumes: fresh register under the same id, then retries request 1.
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 10));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 10),
+            None,
+        );
         let resumed_epoch = table.get_epoch(CLIENT_A).expect("resume registered");
 
         match table.check_request(CLIENT_A, resumed_epoch, 1, 0) {
@@ -2324,18 +2377,33 @@ mod tests {
         const OTHER_USER: u32 = TEST_USER_ID + 1;
 
         let mut table = ClientTable::new(2);
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 1),
+            None,
+        );
         table.commit_reply(CLIENT_A, TEST_USER_ID, make_reply_for(CLIENT_A, 1, 2));
         for (offset, churn) in [0xB0B1u128, 0xB0B2].iter().enumerate() {
             let commit = 3 + offset as u64;
-            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+            table.commit_register(
+                *churn,
+                TEST_USER_ID,
+                make_register_reply(*churn, commit),
+                None,
+            );
         }
         assert!(
             table.get_epoch(CLIENT_A).is_none(),
             "the churn must have evicted A, leaving its fence"
         );
 
-        table.commit_register(CLIENT_A, OTHER_USER, make_register_reply(CLIENT_A, 10));
+        table.commit_register(
+            CLIENT_A,
+            OTHER_USER,
+            make_register_reply(CLIENT_A, 10),
+            None,
+        );
         let squatter_epoch = table.get_epoch(CLIENT_A).expect("registered");
         assert!(
             matches!(
@@ -2403,16 +2471,31 @@ mod tests {
         const CLIENT_A: u128 = 0xA11CE;
 
         let mut table = ClientTable::new(2);
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 1),
+            None,
+        );
         table.commit_reply(CLIENT_A, TEST_USER_ID, make_reply_for(CLIENT_A, 1, 2));
         for (offset, churn) in [0xB0B1u128, 0xB0B2].iter().enumerate() {
             let commit = 3 + offset as u64;
-            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+            table.commit_register(
+                *churn,
+                TEST_USER_ID,
+                make_register_reply(*churn, commit),
+                None,
+            );
         }
         assert!(table.get_epoch(CLIENT_A).is_none(), "A must be evicted");
 
         table.remove_client(CLIENT_A, TEST_USER_ID, SessionEnd::Explicit);
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 10));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 10),
+            None,
+        );
         let epoch = table.get_epoch(CLIENT_A).expect("registered again");
         assert!(
             matches!(
@@ -2427,13 +2510,18 @@ mod tests {
     /// `watermark`; returns the table.
     fn table_with_evicted(client: u128, user: u32, watermark: u64) -> ClientTable {
         let mut table = ClientTable::new(2);
-        table.commit_register(client, user, make_register_reply(client, 1));
+        table.commit_register(client, user, make_register_reply(client, 1), None);
         for request in 1..=watermark {
             table.commit_reply(client, user, make_reply_for(client, request, 1 + request));
         }
         for (offset, churn) in [0xB0B1u128, 0xB0B2].iter().enumerate() {
             let commit = 100 + offset as u64;
-            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+            table.commit_register(
+                *churn,
+                TEST_USER_ID,
+                make_register_reply(*churn, commit),
+                None,
+            );
         }
         assert!(
             table.get_epoch(client).is_none(),
@@ -2453,7 +2541,12 @@ mod tests {
         let existed = table.remove_client(CLIENT_A, 0, SessionEnd::DisconnectCleanup);
         assert!(!existed, "the slot was already reclaimed by the eviction");
 
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 200));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 200),
+            None,
+        );
         let epoch = table.get_epoch(CLIENT_A).expect("resumed");
         assert!(
             matches!(
@@ -2471,13 +2564,23 @@ mod tests {
     fn disconnect_cleanup_of_a_live_entry_leaves_a_fence() {
         const CLIENT_A: u128 = 0xA11CE;
         let mut table = ClientTable::new(4);
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 1),
+            None,
+        );
         table.commit_reply(CLIENT_A, TEST_USER_ID, make_reply_for(CLIENT_A, 5, 2));
 
         assert!(table.remove_client(CLIENT_A, 0, SessionEnd::DisconnectCleanup));
         assert!(table.get_epoch(CLIENT_A).is_none(), "slot reclaimed");
 
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 3));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 3),
+            None,
+        );
         let epoch = table.get_epoch(CLIENT_A).expect("resumed");
         assert!(
             matches!(
@@ -2549,7 +2652,12 @@ mod tests {
     fn user_id_for_session_resolves_live_entries_and_fences() {
         const CLIENT_A: u128 = 0xA11CE;
         let mut table = ClientTable::new(4);
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 9));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 9),
+            None,
+        );
         let live_epoch = table.get_epoch(CLIENT_A).expect("registered");
         assert_eq!(
             table.user_id_for_session(CLIENT_A, live_epoch),
@@ -2577,7 +2685,12 @@ mod tests {
         let late = table.commit_reply(CLIENT_A, TEST_USER_ID, make_reply_for(CLIENT_A, 2, 150));
         assert!(matches!(late, CommitReply::AdvancedFence));
 
-        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 200));
+        table.commit_register(
+            CLIENT_A,
+            TEST_USER_ID,
+            make_register_reply(CLIENT_A, 200),
+            None,
+        );
         let epoch = table.get_epoch(CLIENT_A).expect("resumed");
         match table.check_request(CLIENT_A, epoch, 2, 0) {
             RequestStatus::Duplicate(cached) => {
@@ -2624,7 +2737,12 @@ mod tests {
         for extra in 0..retention {
             let client = 0xC000 + extra as u128;
             let commit = 300 + extra as u64 * 2;
-            table.commit_register(client, TEST_USER_ID, make_register_reply(client, commit));
+            table.commit_register(
+                client,
+                TEST_USER_ID,
+                make_register_reply(client, commit),
+                None,
+            );
             table.commit_reply(client, TEST_USER_ID, make_reply_for(client, 1, commit + 1));
             table.remove_client(client, TEST_USER_ID, SessionEnd::DisconnectCleanup);
             let a_survives = table
@@ -2726,7 +2844,12 @@ mod tests {
         // keep -- a register-only session is skipped on purpose.
         for client in 1..=20u128 {
             let commit = (client * 2) as u64;
-            table.commit_register(client, TEST_USER_ID, make_register_reply(client, commit));
+            table.commit_register(
+                client,
+                TEST_USER_ID,
+                make_register_reply(client, commit),
+                None,
+            );
             table.commit_reply(client, TEST_USER_ID, make_reply_for(client, 1, commit + 1));
         }
         assert_eq!(
@@ -2814,8 +2937,8 @@ mod tests {
     #[test]
     fn to_from_snapshot_round_trips_epochs_and_watermarks() {
         let mut table = ClientTable::new(8);
-        table.commit_register(1, 11, make_register_reply(1, 10));
-        table.commit_register(2, 22, make_register_reply(2, 20));
+        table.commit_register(1, 11, make_register_reply(1, 10), None);
+        table.commit_register(2, 22, make_register_reply(2, 20), None);
         // Client 1 committed request 5; its reply is the entry's latest.
         table.commit_reply(1, TEST_USER_ID, make_reply_with_checksum(1, 5, 30, 0xbeef));
 
@@ -2860,7 +2983,7 @@ mod tests {
     #[test]
     fn snapshot_drops_stale_ring_replies_but_keeps_at_most_once() {
         let mut table = ClientTable::new(4);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 5, 20));
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 6, 21));
 
@@ -2880,15 +3003,15 @@ mod tests {
     #[test]
     fn snapshot_preserves_slot_order_for_eviction() {
         let mut table = ClientTable::new(2);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
-        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
 
         let mut restored = ClientTable::from_snapshot(table.to_snapshot(), 0).unwrap();
         assert_eq!(restored.client_ids().collect::<Vec<_>>(), vec![1, 2]);
 
         // Full table: the oldest latest_commit (client 1, op 10) is evicted, and
         // latest_commit came back from the persisted reply header.
-        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30));
+        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30), None);
         assert_eq!(restored.get_epoch(1), None);
         assert_eq!(restored.get_epoch(2), Some(20));
         assert_eq!(restored.get_epoch(3), Some(30));
@@ -2900,13 +3023,13 @@ mod tests {
     #[test]
     fn from_snapshot_shrinks_to_the_configured_capacity() {
         let mut table = ClientTable::new(8);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
 
         let mut restored = ClientTable::from_snapshot(table.to_snapshot(), 2).unwrap();
 
         // Capacity 2: the recovered session plus one, and the third register evicts.
-        restored.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
-        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30));
+        restored.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
+        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30), None);
         assert_eq!(restored.count(), 2);
         assert_eq!(
             restored.get_epoch(1),
@@ -2920,7 +3043,7 @@ mod tests {
     #[test]
     fn from_snapshot_keeps_a_slot_above_the_configured_capacity() {
         let mut table = ClientTable::new(8);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
         let mut snapshot = table.to_snapshot();
         snapshot.slots[0].0 = 5;
 
@@ -2935,8 +3058,8 @@ mod tests {
     #[test]
     fn from_snapshot_rejects_two_entries_in_one_slot() {
         let mut table = ClientTable::new(2);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
-        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
         let mut snapshot = table.to_snapshot();
         snapshot.slots[1].0 = snapshot.slots[0].0;
 
@@ -2951,7 +3074,7 @@ mod tests {
         // The capacity is allocated from this index, so an out-of-range one must be
         // refused before the allocation rather than sized from.
         let mut table = ClientTable::new(2);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
         let mut snapshot = table.to_snapshot();
         snapshot.slots[0].0 = u32::MAX;
 
@@ -2966,14 +3089,14 @@ mod tests {
     #[test]
     fn from_snapshot_grows_to_the_configured_capacity() {
         let mut table = ClientTable::new(1);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
 
         let mut restored = ClientTable::from_snapshot(table.to_snapshot(), 3).unwrap();
 
         // Two free slots were padded on, so the next registers land without
         // evicting the recovered session.
-        restored.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
-        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30));
+        restored.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
+        restored.commit_register(3, TEST_USER_ID, make_register_reply(3, 30), None);
         assert_eq!(restored.count(), 3);
         assert_eq!(restored.get_epoch(1), Some(10));
     }
@@ -2981,8 +3104,8 @@ mod tests {
     #[test]
     fn from_snapshot_rejects_duplicate_client_ids() {
         let mut table = ClientTable::new(2);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
-        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
         let mut snapshot = table.to_snapshot();
         snapshot.slots[1].1 = snapshot.slots[0].1.clone();
 
@@ -2999,7 +3122,7 @@ mod tests {
     #[test]
     fn from_snapshot_rejects_invalid_reply_bytes() {
         let mut table = ClientTable::new(2);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
         let mut snapshot = table.to_snapshot();
         snapshot.slots[0].1.reply = vec![0xff; 8];
 
@@ -3013,7 +3136,7 @@ mod tests {
     /// (table, epoch=1).
     fn table_with_client() -> (ClientTable, u64) {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
         let epoch = table.get_epoch(1).expect("just registered");
         (table, epoch)
     }
@@ -3023,7 +3146,7 @@ mod tests {
     #[test]
     fn register_epoch_is_the_register_commit_op() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 42));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 42), None);
         assert_eq!(table.get_epoch(1), Some(42));
         assert_eq!(table.get_watermark(1), Some(0));
         assert_eq!(table.get_user_id(1), Some(TEST_USER_ID));
@@ -3037,7 +3160,7 @@ mod tests {
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 5, 15));
         assert_eq!(table.get_watermark(1), Some(5));
 
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20), None);
         assert_eq!(
             table.get_epoch(1),
             Some(20),
@@ -3062,8 +3185,8 @@ mod tests {
     #[test]
     fn reregister_refreshes_user_id() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, 11, make_register_reply(1, 10));
-        table.commit_register(1, 22, make_register_reply(1, 20));
+        table.commit_register(1, 11, make_register_reply(1, 10), None);
+        table.commit_register(1, 22, make_register_reply(1, 20), None);
         assert_eq!(table.get_user_id(1), Some(22));
     }
 
@@ -3071,8 +3194,8 @@ mod tests {
     #[test]
     fn register_stores_user_id() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, 11, make_register_reply(1, 10));
-        table.commit_register(2, 22, make_register_reply(2, 20));
+        table.commit_register(1, 11, make_register_reply(1, 10), None);
+        table.commit_register(2, 22, make_register_reply(2, 20), None);
         assert_eq!(table.get_user_id(1), Some(11));
         assert_eq!(table.get_user_id(2), Some(22));
         assert_eq!(
@@ -3098,7 +3221,7 @@ mod tests {
     #[test]
     fn check_request_stale_epoch_is_fenced() {
         let (mut table, first_epoch) = table_with_client();
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20), None);
         assert_eq!(table.get_epoch(1), Some(20));
         match table.check_request(1, first_epoch, 1, 0) {
             RequestStatus::Fenced { current, received } => {
@@ -3398,15 +3521,15 @@ mod tests {
     #[test]
     fn in_place_replace_keeps_eviction_ranking_current() {
         let mut table = ClientTable::new(2);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
-        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
         // Client 1 commits request 1, then the same request re-commits at a
         // higher op (the WAL-replay shape) via the in-place arm.
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 1, 30));
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 1, 40));
 
         // Client 2 is now the oldest (20 < 40) and must be the victim.
-        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 50));
+        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 50), None);
         assert!(
             table.get_reply(1).is_some(),
             "client 1's refreshed commit must protect it from eviction"
@@ -3420,9 +3543,9 @@ mod tests {
     #[test]
     fn eviction_removes_oldest_commit() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
-        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20), None);
+        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30), None);
         assert!(table.get_reply(100).is_none());
         assert!(table.get_reply(200).is_some());
         assert!(table.get_reply(300).is_some());
@@ -3432,9 +3555,9 @@ mod tests {
     #[test]
     fn eviction_is_deterministic_by_slot_index() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 10));
-        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 10), None);
+        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30), None);
         assert!(table.get_reply(100).is_none());
         assert!(table.get_reply(200).is_some());
         assert!(table.get_reply(300).is_some());
@@ -3443,8 +3566,8 @@ mod tests {
     #[test]
     fn slot_reuse_after_eviction() {
         let mut table = ClientTable::new(1);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20), None);
         assert!(table.get_reply(100).is_none());
         assert!(table.get_reply(200).is_some());
         assert_eq!(table.count(), 1);
@@ -3455,10 +3578,10 @@ mod tests {
     #[test]
     fn eviction_ignores_local_state_and_picks_oldest_commit() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20), None);
         // A prepare in flight for 100 (primary-only state) must not spare it.
-        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30));
+        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30), None);
         assert!(
             table.get_reply(100).is_none(),
             "oldest commit is evicted even with a local prepare outstanding"
@@ -3772,9 +3895,9 @@ mod tests {
     fn set_capacity_resizes_empty_table() {
         let mut table = ClientTable::new(10);
         table.set_capacity(2);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
-        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20), None);
+        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30), None);
         assert_eq!(table.count(), 2, "resized cap of 2 evicts the oldest");
         assert!(table.get_reply(100).is_none());
     }
@@ -3793,8 +3916,8 @@ mod tests {
     #[test]
     fn commit_reply_after_eviction_reports_no_entry() {
         let mut table = ClientTable::new(1);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20), None);
         let outcome = table.commit_reply(100, TEST_USER_ID, make_reply_for(100, 1, 21));
         assert_eq!(outcome, CommitReply::NoEntry);
         assert_eq!(table.count(), 1);
@@ -3839,10 +3962,10 @@ mod tests {
     #[test]
     fn different_clients_independent_epochs() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
-        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), None);
         // Rebind client 2 only.
-        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 30));
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 30), None);
         assert_eq!(table.get_epoch(1), Some(10));
         assert_eq!(table.get_epoch(2), Some(30));
         assert!(matches!(
@@ -3867,12 +3990,12 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_preserves_dedup_state() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, 11, make_register_reply(1, 10));
+        table.commit_register(1, 11, make_register_reply(1, 10), None);
         table.commit_reply(1, TEST_USER_ID, make_reply_with_checksum(1, 1, 11, 0xAA));
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 2, 12));
         // Rebind at op 20: fence moves to 20, watermark preserved.
-        table.commit_register(1, 22, make_register_reply(1, 20));
-        table.commit_register(2, 33, make_register_reply(2, 30));
+        table.commit_register(1, 22, make_register_reply(1, 20), None);
+        table.commit_register(2, 33, make_register_reply(2, 30), None);
 
         let encoded = table.encode();
         let decoded = ClientTable::decode(&encoded, 10).expect("roundtrip decodes");
@@ -3944,13 +4067,13 @@ mod tests {
     #[test]
     fn decode_rebuilds_eviction_ranking() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10));
-        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20));
+        table.commit_register(100, TEST_USER_ID, make_register_reply(100, 10), None);
+        table.commit_register(200, TEST_USER_ID, make_register_reply(200, 20), None);
         table.commit_reply(100, TEST_USER_ID, make_reply_for(100, 1, 30));
 
         let mut decoded = ClientTable::decode(&table.encode(), 2).expect("roundtrip decodes");
         // 200 (latest commit 20) is older than 100 (latest commit 30).
-        decoded.commit_register(300, TEST_USER_ID, make_register_reply(300, 40));
+        decoded.commit_register(300, TEST_USER_ID, make_register_reply(300, 40), None);
         assert!(decoded.get_reply(100).is_some());
         assert!(decoded.get_reply(200).is_none(), "200 was the oldest");
         assert!(decoded.get_reply(300).is_some());
@@ -3959,7 +4082,7 @@ mod tests {
     #[test]
     fn decode_rejects_corruption() {
         let mut table = ClientTable::new(4);
-        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10));
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), None);
         let encoded = table.encode();
 
         // Flipped content byte -> checksum mismatch.
@@ -4000,8 +4123,8 @@ mod tests {
     #[test]
     fn decode_rejects_a_duplicate_client_id() {
         let mut table = ClientTable::new(2);
-        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10));
-        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20));
+        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10), None);
+        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20), None);
         let encoded = table.encode();
 
         // Rewrite the second entry's client_id to match the first. Entries are
@@ -4030,8 +4153,8 @@ mod tests {
     #[test]
     fn decode_grows_capacity_to_the_received_count() {
         let mut table = ClientTable::new(2);
-        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10));
-        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20));
+        table.commit_register(7, TEST_USER_ID, make_register_reply(7, 10), None);
+        table.commit_register(9, TEST_USER_ID, make_register_reply(9, 20), None);
         let encoded = table.encode();
 
         let grown = ClientTable::decode(&encoded, 1).expect("decode grows past the local floor");
@@ -4048,7 +4171,7 @@ mod tests {
     #[test]
     fn decode_rejects_a_count_past_the_slot_ceiling() {
         let mut table = ClientTable::new(1);
-        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10));
+        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10), None);
         let encoded = table.encode();
 
         let content = &encoded[..encoded.len() - size_of::<u64>()];
@@ -4075,7 +4198,7 @@ mod tests {
     #[test]
     fn decode_rejects_a_ring_longer_than_capacity() {
         let mut table = ClientTable::new(1);
-        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10));
+        table.commit_register(3, TEST_USER_ID, make_register_reply(3, 10), None);
         let encoded = table.encode();
 
         let content = &encoded[..encoded.len() - size_of::<u64>()];

@@ -225,6 +225,7 @@ pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
         user_id: u32,
+        session_permissions: Option<iggy_common::Permissions>,
         /// The committed bind, or the submit error verbatim. The error must
         /// survive the hop: the ownership refusal is TERMINAL, and flattening it
         /// into "no reply" makes the login look transient, which costs the
@@ -243,6 +244,7 @@ pub enum MetadataSubmit {
     ForwardedRegister {
         vsr_client_id: u128,
         user_id: u32,
+        session_permissions: Option<iggy_common::Permissions>,
         /// Correlation the origin minted; echoed verbatim in the result.
         nonce: u128,
         /// Replica the result frame goes back to.
@@ -3299,6 +3301,7 @@ where
         (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
             vsr_client_id: header.client,
             user_id: header.user_id,
+            session_permissions: None,
             nonce: header.nonce,
             origin_replica: header.replica,
         });

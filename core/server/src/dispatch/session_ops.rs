@@ -201,6 +201,7 @@ where
 }
 
 #[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_arguments)]
 async fn complete_login_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -209,6 +210,7 @@ async fn complete_login_register<B, MJ, S, SB>(
     request_header: &RoutedRequestHeader,
     user_id: u32,
     client_version: &ClientVersionInfo,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Result<(), LoginRegisterError>
 where
     B: ShellBus,
@@ -255,15 +257,16 @@ where
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
-        // The wire reply carries only the fence epoch; the SDK numbers its
-        // own requests, so the bind watermark is not surfaced (see the
-        // BoundSession doc for who does consume it).
-        Ok(bound) => bound.epoch,
-        Err(error) => {
-            return Err(LoginRegisterError::Transient(error));
-        }
-    };
+    let session =
+        match submit_register_on_owner(shard, vsr_client_id, user_id, session_permissions).await {
+            // The wire reply carries only the fence epoch; the SDK numbers its
+            // own requests, so the bind watermark is not surfaced (see the
+            // BoundSession doc for who does consume it).
+            Ok(bound) => bound.epoch,
+            Err(error) => {
+                return Err(LoginRegisterError::Transient(error));
+            }
+        };
 
     // Post-commit: Connected -> Authenticated -> Bound in a single borrow with
     // no await in between, so the intermediate Authenticated state is never
@@ -506,6 +509,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     user_id: u32,
     nonce: u128,
     origin_replica: u8,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -526,7 +530,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     let bound = shard
         .plane
         .metadata()
-        .submit_register_in_process(vsr_client_id, user_id)
+        .submit_register_in_process(vsr_client_id, user_id, session_permissions)
         .await;
     // `view` predates the await above, which parks with no deadline, so the
     // sealed value can be stale by send time. The origin routes the result by
@@ -597,6 +601,7 @@ pub(in crate::dispatch) async fn submit_register_local_or_forward<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -621,7 +626,7 @@ where
         return shard
             .plane
             .metadata()
-            .submit_register_in_process(vsr_client_id, user_id)
+            .submit_register_in_process(vsr_client_id, user_id, session_permissions)
             .await;
     }
 
@@ -955,6 +960,7 @@ pub async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -964,12 +970,19 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return submit_register_local_or_forward(shard, vsr_client_id, user_id).await;
+        return submit_register_local_or_forward(
+            shard,
+            vsr_client_id,
+            user_id,
+            session_permissions,
+        )
+        .await;
     }
     let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
+        session_permissions: session_permissions.cloned(),
         reply,
     });
     // The owner's outcome, verbatim in both directions. `Canceled` is only for a
@@ -1242,6 +1255,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &wire_request.version_info,
+                    None,
                 )
                 .await
                 {
@@ -1278,6 +1292,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &wire_request.version_info,
+                    None,
                 )
                 .await
                 {
@@ -1419,6 +1434,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &version_info,
+                    None,
                 )
                 .await
                 {
@@ -1461,13 +1477,11 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     expires_at,
                     "external auth inline grant accepted"
                 );
-                // Set permissions BEFORE binding the session so that any
-                // request arriving immediately after bind already sees the
-                // grants. On bind failure we roll back.
+                let perms_arc = std::sync::Arc::new(permissions);
                 sessions.borrow_mut().set_session_permissions(
                     transport_client_id,
                     crate::external_auth::SessionPermissions {
-                        permissions: std::sync::Arc::new(permissions),
+                        permissions: std::sync::Arc::clone(&perms_arc),
                         expires_at,
                     },
                 );
@@ -1479,6 +1493,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     reserved_uid,
                     &version_info,
+                    Some(&perms_arc),
                 )
                 .await
                 {
@@ -1727,6 +1742,7 @@ mod tests {
                 client,
                 ACTING_USER,
                 register_reply(client, SESSION),
+                None,
             );
         }
         // A's transport connection, authenticated + bound — the state a
@@ -1820,7 +1836,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, USER).await
+                submit_register_local_or_forward(&shard, CLIENT, USER, None).await
             })
         };
         await_forward(&bus).await;
@@ -1938,7 +1954,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, 0xCAFE, 7).await
+                submit_register_local_or_forward(&shard, 0xCAFE, 7, None).await
             })
         };
         await_forward(&bus).await;
@@ -1967,7 +1983,7 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
 
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, None).await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         assert!(
             outcome.unwrap_err().is_transient(),
@@ -2066,7 +2082,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, 7).await
+                submit_register_local_or_forward(&shard, CLIENT, 7, None).await
             })
         };
         await_forward(&bus).await;
@@ -2113,7 +2129,7 @@ mod tests {
         // matters is that nothing left over the interconnect.
         let _ = compio::time::timeout(
             Duration::from_millis(50),
-            submit_register_local_or_forward(&shard, 0xCAFE, 7),
+            submit_register_local_or_forward(&shard, 0xCAFE, 7, None),
         )
         .await;
         assert!(
@@ -2129,7 +2145,7 @@ mod tests {
         let bus = SpyBus::default();
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, incarnation));
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, None).await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         bus.sole_replica_send::<ForwardRegisterHeader>().1.nonce
     }

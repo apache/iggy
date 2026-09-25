@@ -778,6 +778,7 @@ mod tests {
                         watermark: 3,
                         watermark_checksum: 0,
                         reply: vec![1, 2, 3],
+                        session_permissions: None,
                     },
                 )],
             }),
