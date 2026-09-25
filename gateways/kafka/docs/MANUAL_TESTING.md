@@ -64,6 +64,70 @@ All tests must pass. If the fixture-backed suites (`api_handler_tests`, `server_
 
 ## 3. Manual test cases
 
+### Category S — SASL/PLAIN
+
+Run against a real Iggy server, because the automated suite drives a stub verifier and cannot
+catch a client-compatibility problem. One already slipped through that way: advertising
+`SaslHandshake` from v1 rather than v0 passed every automated test and made librdkafka report
+"SASL Handshake not supported by broker" before it sent anything.
+
+No host installs needed, both clients run from containers with `--network host`:
+
+```bash
+# Terminal 1 - Iggy, with known development credentials
+IGGY_PATH=/tmp/iggy-sasl-data ./target/debug/iggy-server --fresh --with-default-root-credentials
+
+# Terminal 2 - gateway with SASL on
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+  IGGY_KAFKA_BIND_ADDR=127.0.0.1:9095 RUST_LOG=debug cargo run -p iggy-gateway-kafka
+```
+
+`KC` below is shorthand for:
+
+```bash
+docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 \
+  -X security.protocol=SASL_PLAINTEXT -X sasl.mechanisms=PLAIN
+```
+
+| ID | Test | Command | Pass criteria | Last run |
+| ---- | ------ | --------- | --------------- | ---------- |
+| S1 | Valid credentials | `KC -X sasl.username=iggy -X sasl.password=iggy -L` | Metadata returned, no auth error | Pass |
+| S2 | Wrong password | same with `sasl.password=WRONG` | Client reports "Authentication failed", connection drops | Pass |
+| S3 | Unknown mechanism | `-X sasl.mechanisms=SCRAM-SHA-256` | Client reports the mechanism is unsupported **and names PLAIN** | Pass |
+| S4 | No credentials | `docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 -L` | No metadata served; client suggests SASL may be required | Pass |
+| S5 | Java client | see below | Authenticates, and lists `SaslHandshake(17): 0 to 1 [usable: 1]` and `SaslAuthenticate(36): 0 to 2 [usable: 2]` | Pass |
+| S6 | Feature off | restart without `IGGY_KAFKA_SASL_ENABLED`, rerun S1 | Client reports no broker SASL support; plaintext `-L` still served | Pass |
+
+S5 is the case that matters most, because the Java client negotiates `SaslAuthenticate` **v2**, the
+compact framing no other case here exercises, and it sends `ApiVersions` both before and after
+authenticating:
+
+```bash
+cat > /tmp/client.properties <<'EOF'
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="iggy" password="iggy";
+EOF
+docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
+  apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
+```
+
+#### Login cost
+
+Every authenticated connection costs one Iggy login. Measured against a debug build of both
+binaries on one host, so treat these as an upper bound rather than a benchmark:
+
+| Concurrent logins | Median | p95 | Rate |
+| ------------------- | -------- | ----- | ------ |
+| 1 | 10.6 ms | 12.3 ms | 92/s |
+| 8 | 20.6 ms | 29.2 ms | 371/s |
+| 32 | 75.2 ms | 107.9 ms | 412/s |
+
+Latency grows with concurrency while throughput flattens, which is what a server-side Argon2 on
+shard threads with no blocking pool predicts. No failures at any level. Re-measure before quoting
+these anywhere: a release build will be substantially faster.
+
 ### Category A — Smoke tests (must pass before check-in)
 
 The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:9092` (a real Kafka
@@ -181,8 +245,8 @@ Requires `kcat` installed. Gateway does **not** implement SASL or full broker se
 | ---- | ------ | --------- | --------------------- |
 | G1 | Broker metadata | `kcat -b 127.0.0.1:9093 -L` | ApiVersions + Metadata handshake; broker appears in metadata |
 | G2 | Produce (likely fails later) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | Produce is still a stub: retriable `NOT_LEADER_OR_FOLLOWER` (6), so kcat retries — document actual error |
-| G3 | Consumer group rebalance | `kcat -b 127.0.0.1:9093 -G g1 test` in two terminals | Both join the group and sync, but each receives an empty assignment: the Metadata stub reports the topic unknown (error 3), so the assignor has no partitions to hand out. Record the exact librdkafka log lines |
-| G4 | Ungraceful consumer exit | `kill -9` one of G3's kcats | Within `session.timeout.ms` the survivor logs a rebalance; its assignment stays empty, as in G3 |
+| G3 | Consumer group rebalance | `kcat -b 127.0.0.1:9093 -G g1 test` in two terminals | Both complete JoinGroup and SyncGroup and are assigned 0 partitions, because the Metadata stub reports `test` as unknown and the assignor has nothing to hand out. Record the exact librdkafka log lines |
+| G4 | Ungraceful consumer exit | `kill -9` one of G3's kcats | Within `session.timeout.ms` the survivor logs a rebalance, rejoins and is again assigned 0 partitions |
 | G5 | Java console consumer | `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g2 --topic test` | Exercises JoinGroup v9, SyncGroup v5, Heartbeat v4, FindCoordinator v4. `group.protocol` defaults to `classic` in 4.x; `--consumer-property group.protocol=consumer` sends ConsumerGroupHeartbeat (68) instead and the connection closes |
 | G6 | Graceful kcat exit | G3's two kcats, then Ctrl-C one (kcat closes its consumer, which sends LeaveGroup v0/v1) | The survivor rebalances within one heartbeat interval, not `session.timeout.ms`. Join, leave and sync are real, but the assignment is empty: the Metadata stub reports the topic unknown, so the assignor has no partitions to hand out |
 | G7 | Graceful Java exit | G5 in two terminals, then Ctrl-C one | Same as G6 |

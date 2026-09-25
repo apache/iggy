@@ -77,6 +77,7 @@ fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
         BrokerAdvertise::default(),
         None,
         8 * 1024 * 1024,
+        false,
         GroupCoordinator::new(config, CancellationToken::new()),
     ))
 }
@@ -1277,10 +1278,11 @@ async fn given_several_keys_when_finding_the_coordinator_at_v4_should_return_one
     assert_eq!(decoder.remaining(), 0);
 }
 
-/// Transactions are out of scope permanently, so the answer is the one error librdkafka and the
-/// Java client both treat as fatal, rather than one a transactional producer would spin on forever.
+/// Transactions are out of scope permanently, so the answer is the code both the Java client and
+/// librdkafka treat as fatal, rather than one a transactional producer would spin on forever.
 #[tokio::test(start_paused = true)]
-async fn given_a_transaction_key_type_when_finding_the_coordinator_should_return_a_fatal_error() {
+async fn given_a_transaction_key_type_when_finding_the_coordinator_should_return_transactional_id_authorization_failed()
+ {
     let state = test_state(immediate_config());
 
     let mut decoder = find_coordinator(&state, 1, &["txn"], 1).await;

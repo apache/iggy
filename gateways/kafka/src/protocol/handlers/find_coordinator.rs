@@ -45,6 +45,7 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 
 /// `key_type` 0. Types 1 (transaction) and 2 (share) have no coordinator here.
 const COORDINATOR_TYPE_GROUP: i8 = 0;
+
 const COORDINATOR_TYPE_TRANSACTION: i8 = 1;
 
 /// The node id this gateway advertises for itself, in Metadata and here alike.
@@ -102,9 +103,7 @@ pub fn encode_response(
         COORDINATOR_TYPE_GROUP => {
             return encode_inner(version, &keys, ERROR_NONE, None, Some(broker));
         }
-        // Not a retriable code: transactions are out of scope for good, and anything librdkafka
-        // does not treat as fatal here (INVALID_REQUEST included) leaves a transactional producer
-        // re-querying the coordinator forever.
+        // Transactions are out of scope for good, so the producer must fail rather than retry.
         COORDINATOR_TYPE_TRANSACTION => ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
         _ => ERROR_INVALID_REQUEST,
     };

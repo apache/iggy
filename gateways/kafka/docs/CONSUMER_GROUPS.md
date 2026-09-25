@@ -152,6 +152,7 @@ The consequences:
 | `max_members_per_group` | 1000 | Kafka's `group.max.size`; beyond it, `GROUP_MAX_SIZE_REACHED` (81) |
 | `max_total_members` | 10000 | Across every group, checked before a member id is minted; `COORDINATOR_NOT_AVAILABLE` (15) |
 | `max_member_blob_bytes` | 64 KiB | One JoinGroup's total protocol metadata, and one SyncGroup assignment blob; beyond it, `INVALID_REQUEST` (42) |
+| `max_group_roster_bytes` | 4 MiB | Member ids, instance ids and largest protocol metadata summed across one group, which bounds the leader's JoinGroup response; beyond it, `GROUP_MAX_SIZE_REACHED` (81) |
 
 The frame-level bounds guard (`src/protocol/bounds_guard.rs`) bounds one request. These bound what
 is *retained*: a member's subscription and assignment outlive the connection that sent them, up to
@@ -163,13 +164,17 @@ at commit time.
 
 ## What a real consumer still cannot do
 
-`OffsetFetch` (9) is sent by every consumer immediately after `SyncGroup`, and it is not in scope
-([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so a
-consumer that gets through a rebalance will then loop: coordinator connection closes, client marks
-the coordinator unknown, re-runs FindCoordinator, retries OffsetFetch, closes again. Membership
-survives that loop, because group state is not per-connection and heartbeats resume on the new
-connection - but the consumer never fetches. Fetch is a stub in any case, so nothing can be
-consumed until [#3535](https://github.com/apache/iggy/issues/3535)/#3542 land.
+A consumer completes JoinGroup and SyncGroup and then holds no partitions. Metadata is a stub that
+answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's assignor sees no
+partitions and hands every member an empty assignment. The consumer stays a member and keeps
+heartbeating, but has nothing to fetch.
+
+Once Metadata reports partitions, the next wall is `OffsetFetch` (9), which a consumer sends after
+`SyncGroup` for a non-empty assignment and which is not in scope
+([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so
+that consumer would loop: coordinator connection closes, client marks the coordinator unknown,
+re-runs FindCoordinator, retries OffsetFetch, closes again. Fetch is a stub in any case, so nothing
+can be consumed until [#3535](https://github.com/apache/iggy/issues/3535)/#3542 land.
 
 A dynamic consumer releases its partitions on close through `LeaveGroup`. A static one does not
 send it (see [Static membership](#static-membership-is-accepted-not-honoured)), so a static

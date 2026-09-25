@@ -71,10 +71,11 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         tracing::debug!(%reason, "JoinGroup rejoin reason");
     }
 
-    let result = state
-        .groups
-        .join(&JoinRequest::from((api_version, &request)))
-        .await;
+    let join_request = JoinRequest::from((api_version, &request));
+    // The join can park for a whole rebalance timeout, and the decoded request is a view into
+    // the frame it arrived in.
+    drop(request);
+    let result = state.groups.join(&join_request).await;
     respond_or_close(encode_response(api_version, &result), "JoinGroup")
 }
 

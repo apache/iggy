@@ -22,20 +22,21 @@ use iggy_gateway_kafka::protocol::api::BrokerAdvertise;
 
 /// Scoped API keys exercised by the regression suite.
 ///
-/// Declaration order mirrors `SUPPORTED_RANGES` in `src/protocol/api.rs`: the `ApiVersions` tests
-/// compare the advertised list row by row against this one.
+/// Ascending by key, the order `ApiVersions` advertises in regardless of how `SUPPORTED_RANGES` in
+/// `src/protocol/api.rs` is declared: the `ApiVersions` tests compare the advertised list row by
+/// row against this one.
 pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (0, "Produce", 3, 9),
     (1, "Fetch", 4, 12),
     (2, "ListOffsets", 1, 6),
     (3, "Metadata", 0, 9),
-    (18, "ApiVersions", 0, 3),
-    (19, "CreateTopics", 2, 5),
     (10, "FindCoordinator", 0, 4),
     (11, "JoinGroup", 0, 9),
     (12, "Heartbeat", 0, 4),
     (13, "LeaveGroup", 0, 5),
     (14, "SyncGroup", 0, 5),
+    (18, "ApiVersions", 0, 3),
+    (19, "CreateTopics", 2, 5),
 ];
 
 pub fn default_broker() -> BrokerAdvertise {
