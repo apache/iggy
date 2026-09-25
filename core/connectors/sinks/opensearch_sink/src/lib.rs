@@ -1496,7 +1496,7 @@ mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
     use std::sync::atomic::AtomicU32;
-    use wiremock::matchers::{body_bytes, method, path};
+    use wiremock::matchers::{body_bytes, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn topic_metadata() -> TopicMetadata {
@@ -1579,6 +1579,36 @@ mod tests {
 
             assert_eq!(resolved.refresh, Some(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn given_refresh_configured_should_send_it_as_a_query_parameter() {
+        let server = MockServer::start().await;
+        let mut config = fast_retry_config(1);
+        config.url = server.uri();
+        config.max_retries = Some(1);
+        config.refresh = Some(RefreshPolicy::WaitFor);
+        let sink = sink_with_config(config);
+        let client = mock_client(&sink);
+        let documents = [prepared("a")];
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(query_param("refresh", "wait_for"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": false,
+                "items": [{ "index": { "_id": "a", "status": 201, "result": "created" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = sink
+            .index_chunk(&client, &documents)
+            .await
+            .expect("bulk request carrying the configured refresh query param should succeed");
+
+        assert_eq!(outcome.indexed, 1);
     }
 
     #[test]
