@@ -493,7 +493,6 @@ impl OpenSearchSink {
     ) -> Result<usize, PartialIndexError> {
         let total = documents.len();
         let mut indexed = 0usize;
-        let mut attempted = 0usize;
         // The runtime commits the offset regardless of this error, so returning
         // early would drop the remaining chunks for good. The first failure is
         // kept, not the last, matching `BulkOutcome::merge`: it's the one an
@@ -502,7 +501,6 @@ impl OpenSearchSink {
         let mut first_error: Option<Error> = None;
 
         for chunk in documents.chunks(self.config.batch_size) {
-            attempted += chunk.len();
             match self.index_chunk(client, chunk).await {
                 Ok(outcome) => {
                     indexed += outcome.indexed;
@@ -514,7 +512,7 @@ impl OpenSearchSink {
             }
             debug!(
                 "OpenSearch sink with ID: {} indexed {}/{} documents",
-                self.id, attempted, total
+                self.id, indexed, total
             );
         }
 
