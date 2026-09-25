@@ -325,7 +325,8 @@ impl OpenSearchSink {
         // A 403 only means cluster:monitor/health is missing, not that the cluster is down.
         if status == StatusCode::FORBIDDEN {
             warn!(
-                "OpenSearch health check returned 403: the configured user lacks the cluster-scoped cluster:monitor/health privilege. Treating the cluster as reachable; grant that privilege to restore the check."
+                "OpenSearch sink connector ID: {}: health check returned 403: the configured user lacks the cluster-scoped cluster:monitor/health privilege. Treating the cluster as reachable; grant that privilege to restore the check.",
+                self.id
             );
             return Ok(());
         }
@@ -339,7 +340,10 @@ impl OpenSearchSink {
             .retry_on_open("index existence check", || self.index_exists(client))
             .await?
         {
-            info!("OpenSearch index '{}' already exists", self.config.index);
+            info!(
+                "OpenSearch sink connector ID: {}: index '{}' already exists",
+                self.id, self.config.index
+            );
             return Ok(());
         }
 
@@ -378,7 +382,10 @@ impl OpenSearchSink {
     }
 
     async fn create_index(&self, client: &OpenSearch) -> Result<(), Error> {
-        info!("Creating OpenSearch index '{}'", self.config.index);
+        info!(
+            "OpenSearch sink connector ID: {}: creating index '{}'",
+            self.id, self.config.index
+        );
 
         let indices = client.indices();
         let request = indices.create(IndicesCreateParts::Index(&self.config.index));
@@ -391,7 +398,10 @@ impl OpenSearchSink {
 
         let status = response.status_code();
         if status.is_success() {
-            info!("Created OpenSearch index '{}'", self.config.index);
+            info!(
+                "OpenSearch sink connector ID: {}: created index '{}'",
+                self.id, self.config.index
+            );
             return Ok(());
         }
 
@@ -399,8 +409,8 @@ impl OpenSearchSink {
         // Another runtime instance winning the create race is not an error.
         if is_index_already_exists_error(&body) {
             info!(
-                "OpenSearch index '{}' was created concurrently",
-                self.config.index
+                "OpenSearch sink connector ID: {}: index '{}' was created concurrently",
+                self.id, self.config.index
             );
             return Ok(());
         }
@@ -814,13 +824,13 @@ impl Sink for OpenSearchSink {
                     .fetch_add(indexed as u64, Ordering::Relaxed);
                 if self.config.verbose_logging {
                     info!(
-                        "Indexed {} of {} messages into OpenSearch index '{}'",
-                        indexed, messages_count, self.config.index
+                        "OpenSearch sink connector ID: {}: indexed {} of {} messages into index '{}'",
+                        self.id, indexed, messages_count, self.config.index
                     );
                 } else {
                     debug!(
-                        "Indexed {} of {} messages into OpenSearch index '{}'",
-                        indexed, messages_count, self.config.index
+                        "OpenSearch sink connector ID: {}: indexed {} of {} messages into index '{}'",
+                        self.id, indexed, messages_count, self.config.index
                     );
                 }
                 Ok(())
