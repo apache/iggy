@@ -1060,48 +1060,14 @@ struct BulkResponseBody {
     items: Vec<BulkItem>,
 }
 
-/// One `_bulk` response item, e.g. `{"index": {"status": 201}}`. Deserialized
-/// by hand (rather than `HashMap<String, BulkItemResult>`) so the action key
-/// (`"index"`, though this sink only ever sends that one - not hardcoded, to
-/// avoid assuming its name) is discarded via `IgnoredAny` instead of being
-/// allocated into an owned `String` for every item, every chunk.
-#[derive(Debug)]
-struct BulkItem(Option<BulkItemResult>);
-
-impl<'de> Deserialize<'de> for BulkItem {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct BulkItemVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for BulkItemVisitor {
-            type Value = BulkItem;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a bulk response item object")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let first = match map.next_key::<serde::de::IgnoredAny>()? {
-                    Some(_) => Some(map.next_value()?),
-                    None => None,
-                };
-                // Drain any further entries so the deserializer doesn't see a
-                // truncated map; a well-formed item never has more than one.
-                while map
-                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                    .is_some()
-                {}
-                Ok(BulkItem(first))
-            }
-        }
-
-        deserializer.deserialize_map(BulkItemVisitor)
-    }
+/// One `_bulk` response item, e.g. `{"index": {"status": 201}}`. `index` is
+/// hardcoded rather than kept dynamic: this sink only ever sends `index`
+/// actions (`build_bulk_body`), and OpenSearch always echoes back the same
+/// action verb it was sent, so the response key is guaranteed. Unknown keys
+/// (never expected, but not fatal) are ignored regardless of position.
+#[derive(Debug, Default, Deserialize)]
+struct BulkItem {
+    index: Option<BulkItemResult>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1159,7 +1125,7 @@ fn parse_bulk_response(
     // `errors: false` is only trustworthy if every item has a 2xx result.
     if !response.errors.unwrap_or(true) {
         for (position, item) in items.iter().enumerate() {
-            let result = item.0.as_ref();
+            let result = item.index.as_ref();
             let has_error = result.is_some_and(|result| result.error.is_some());
             let status_ok = result
                 .and_then(|result| result.status)
@@ -1176,7 +1142,7 @@ fn parse_bulk_response(
 
     let mut attempt = BulkAttempt::default();
     for (position, item) in items.iter().enumerate() {
-        let Some(result) = item.0.as_ref() else {
+        let Some(result) = item.index.as_ref() else {
             return Err(BulkResponseError::MalformedItem { position });
         };
 
