@@ -101,16 +101,7 @@ class StringTag {
  */
 class IggyException : public std::runtime_error {
   public:
-    /**
-     * @brief Creates an Iggy exception from a null-terminated message.
-     * @param message Error description.
-     */
     explicit IggyException(const char *message) : std::runtime_error(message) {}
-
-    /**
-     * @brief Creates an Iggy exception from an owning string.
-     * @param message Error description.
-     */
     explicit IggyException(const std::string &message) : std::runtime_error(message) {}
 };
 
@@ -168,7 +159,6 @@ class LoginInfo final {
  */
 class Identifier final {
   public:
-    /** @brief Maximum encoded length of a name-based identifier. */
     static constexpr std::size_t kMaxIdentifierLength = 255;
 
     /** @brief Selects the representation stored by an Identifier. */
@@ -2645,12 +2635,6 @@ enum class Durability : std::uint8_t {
     Persisted,   ///< Wait for quorum commit backed by stable storage.
 };
 
-/**
- * @brief Returns the protocol option name for a durability policy.
- * @param durability Durability policy to encode.
- * @return `replicated` or `persisted`.
- * @throws std::invalid_argument if @p durability is not a declared enumerator.
- */
 constexpr std::string_view to_string(const Durability durability) {
     switch (durability) {
         case Durability::Replicated:
@@ -2671,7 +2655,6 @@ constexpr std::string_view to_string(const Durability durability) {
  */
 class TopicCreateOptions final {
   public:
-    /** @brief Creates options with every setting left to the server default. */
     TopicCreateOptions() = default;
 
     /**
@@ -2941,7 +2924,6 @@ class TopicCreateOptions final {
  */
 class TopicUpdateOptions final {
   public:
-    /** @brief Creates an update that leaves every topic setting unchanged. */
     TopicUpdateOptions() = default;
 
     /**
@@ -3064,7 +3046,6 @@ class TopicUpdateOptions final {
  */
 class StreamUpdateOptions final {
   public:
-    /** @brief Creates an update with no requested stream settings. */
     StreamUpdateOptions() = default;
 
     /**
