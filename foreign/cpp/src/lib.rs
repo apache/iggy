@@ -382,6 +382,7 @@ mod ffi {
         created_at: u64,
         status: UserStatus,
         username: String,
+        options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -391,6 +392,7 @@ mod ffi {
         username: String,
         has_permissions: bool,
         permissions: Permissions,
+        options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -656,6 +658,7 @@ mod ffi {
             username: String,
             has_status: bool,
             status: UserStatus,
+            options: Vec<HeaderEntry>,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,
