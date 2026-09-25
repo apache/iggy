@@ -25,7 +25,7 @@ use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_API_VERSIONS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, advertised_min_version,
-    is_supported_version, supported_api_ranges,
+    is_supported_version, sasl_advertised_ranges, supported_api_ranges,
 };
 use crate::protocol::bounds_guard::validate_api_versions_shape;
 use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
@@ -40,19 +40,25 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     clippy::unused_async,
     reason = "the shared handler signature, kept until a handler awaits the bridge"
 )]
-pub async fn handle(_state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     if !is_supported_version(API_KEY_API_VERSIONS, api_version) {
         // KIP-511: reply with v0 when the requested version is not understood.
-        return respond_or_close(encode_response(0, ERROR_UNSUPPORTED_VERSION), "ApiVersions");
+        return respond_or_close(
+            encode_response(0, ERROR_UNSUPPORTED_VERSION, state.sasl_enabled),
+            "ApiVersions",
+        );
     }
     match decode_guarded::<ApiVersionsRequest>(api_version, body, validate_api_versions_shape) {
-        Ok(_) => respond_or_close(encode_response(api_version, ERROR_NONE), "ApiVersions"),
+        Ok(_) => respond_or_close(
+            encode_response(api_version, ERROR_NONE, state.sasl_enabled),
+            "ApiVersions",
+        ),
         Err(error) => {
             // debug!, not warn!: attacker-controlled, not operator-actionable (see the same
             // note on the Produce decode-failure arm).
             tracing::debug!(%error, "failed to decode ApiVersions request");
             respond_or_close(
-                encode_response(api_version, ERROR_INVALID_REQUEST),
+                encode_response(api_version, ERROR_INVALID_REQUEST, state.sasl_enabled),
                 "ApiVersions",
             )
         }
@@ -65,9 +71,21 @@ pub async fn handle(_state: &GatewayState, api_version: i16, body: Bytes) -> Han
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `api_version`.
-pub fn encode_response(api_version: i16, error_code: i16) -> Result<Bytes> {
-    let api_keys = supported_api_ranges()
-        .iter()
+pub fn encode_response(api_version: i16, error_code: i16, sasl_enabled: bool) -> Result<Bytes> {
+    // The SASL keys are advertised only while the feature is on, and are deliberately kept out of
+    // `SUPPORTED_RANGES` so dispatch never serves them. With SASL off the state machine still
+    // answers them with `ILLEGAL_SASL_STATE` and keeps the connection open.
+    let sasl = if sasl_enabled {
+        sasl_advertised_ranges()
+    } else {
+        &[][..]
+    };
+    // Ascending by api_key, as every real broker emits it. Chaining the SASL rows onto the end
+    // would put key 17 after key 19, which no broker does and some clients do not expect.
+    let mut rows: Vec<&ApiVersionRange> = supported_api_ranges().iter().chain(sasl).collect();
+    rows.sort_unstable_by_key(|r| r.api_key);
+    let api_keys = rows
+        .into_iter()
         .map(|r| {
             ApiVersion::default()
                 .with_api_key(r.api_key)
