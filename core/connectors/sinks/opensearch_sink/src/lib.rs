@@ -224,6 +224,7 @@ impl ResolvedOpenSearchSinkConfig {
                 .unwrap_or(DEFAULT_CREATE_INDEX_IF_NOT_EXISTS),
             index_mapping: config.index_mapping,
             include_metadata: config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA),
+            // Clamped to 1: `[T]::chunks(0)` panics, and `documents.chunks(batch_size)` would hit it on `batch_size = 0`.
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1),
             timeout: parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT),
             refresh: config.refresh.map(Into::into),
