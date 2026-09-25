@@ -702,8 +702,8 @@ impl OpenSearchSink {
             )
         });
         warn!(
-            "OpenSearch {} failed (retry {}/{}): {}. Retrying in {:?}...",
-            operation, retries, max_retries, failure, delay
+            "OpenSearch sink connector ID: {}: {} failed (retry {}/{}): {}. Retrying in {:?}...",
+            self.id, operation, retries, max_retries, failure, delay
         );
         sleep(delay).await;
     }
