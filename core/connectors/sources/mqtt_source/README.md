@@ -1,304 +1,118 @@
-# MQTT source connector
+# Apache Iggy MQTT Source Connector (`iggy_connector_mqtt_source`)
 
-This dynamically loaded source plugin subscribes to an MQTT broker through
-`rumqttc` and forwards each received MQTT publish payload to the Iggy connector
-runtime through the existing `iggy_connector_sdk::source_connector!` ABI.
+The **MQTT Source Connector** is a dynamically loaded shared library plugin (`.so` / `.dylib` / `.dll`) for Apache Iggy. Built using the `iggy_connector_sdk::source_connector!` C-FFI ABI and the [`rumqttc`](https://crates.io/crates/rumqttc) asynchronous client, it ingests telemetry and event streams from external MQTT brokers (such as **EMQX** or Mosquitto) directly into persistent **Apache Iggy** streams, topics, and partitions.
 
-For the connector boundary, supported use cases, delivery guarantees, and
-explicit non-goals, see [SCOPE.md](SCOPE.md).
+---
 
-The connector is an external plugin. It does not modify the Iggy server or
-define a private C ABI. The SDK macro exposes the lifecycle symbols consumed by
-the connectors runtime.
-
-## Current implementation boundary
-
-- The plugin supports MQTT 3.1.1 through `rumqttc`'s default API and MQTT 5
-  through `rumqttc::v5`. The `mqtt311` configuration name means MQTT 3.1.1;
-  literal MQTT 3.1 is not supported by the current `rumqttc` release.
-- The plugin accepts QoS 0, 1, and 2. Acknowledgement behavior is derived
-  entirely from QoS: QoS 0 has no MQTT acknowledgement, QoS 1 is acknowledged
-  with PUBACK after Iggy Ack, and QoS 2 starts its acknowledgement handshake
-  with PUBREC after Iggy Ack.
-- The driver always enables `rumqttc` manual acknowledgements for QoS 1/2 so
-  the broker acknowledgement cannot be sent before Iggy accepts the message.
-- For QoS 2, `AsyncClient::try_ack` sends `PUBREC` after Iggy Ack. `rumqttc`
-  records the incoming packet identifier, then its event loop automatically
-  answers the broker's `PUBREL` with `PUBCOMP`. The connector does not need to
-  implement a second QoS 2 acknowledgement API.
-- `session_expiry_interval` applies to MQTT 5. MQTT 3.1.1 uses its persistent
-  session behavior through `clean_start = false`.
-- `open` parses the broker URL, creates the `AsyncClient` and `EventLoop`,
-  subscribes to every configured topic, and performs an initial broker poll.
-- `poll` drives the protocol-specific event loop, accumulates up to
-  `batch_size` publishes for at most `batch_timeout` after the first publish,
-  normalizes them into the internal message shape, and returns one raw Iggy
-  `ProducedMessages` batch.
-- The source holds one bounded pending batch. Its acknowledgement token vector
-  contains one token for each QoS 1/2 message in the batch and no token for QoS
-  0 messages.
-- The runtime's `Ack` result commits connector state and asks the driver to
-  send the protocol-appropriate MQTT acknowledgement.
-- A `Nack` drops the pending slot without acknowledging the publish. QoS 1/2
-  may then be redelivered by the broker/session; QoS 0 cannot be redelivered.
-- The persisted state currently records acknowledged-message count for
-  lifecycle validation. It is not a broker cursor, so restart/reconnect
-  delivery remains at-least-once and duplicates are possible.
-- The plugin does not add a custom ABI. The SDK macro generates the runtime
-  symbols: `iggy_source_open`, `iggy_source_handle_v2`,
-  `iggy_source_batch_result`, `iggy_source_close`, and `iggy_source_version`.
-
-The payload is emitted as `Schema::Raw` because MQTT payloads are opaque bytes.
-The source also maps MQTT delivery metadata into Iggy message headers. Headers
-survive the runtime's source forwarding path and can be consumed by transforms
-or a future MQTT sink.
-
-## MQTT header contract
-
-Every produced message contains these headers:
-
-| Header | Type | Meaning |
-| --- | --- | --- |
-| `mqtt.protocol` | string | `mqtt311` or `mqtt5` |
-| `mqtt.topic` | string | Topic on which the broker delivered the message |
-| `mqtt.qos` | unsigned integer | Delivered MQTT QoS: `0`, `1`, or `2` |
-| `mqtt.dup` | boolean | MQTT duplicate-delivery flag |
-| `mqtt.retain` | boolean | MQTT retained-message flag |
-| `mqtt.packet_id` | unsigned integer, optional | Packet identifier for QoS 1/2; absent for QoS 0 |
-
-MQTT 5 publish properties are added when present:
-
-| Header | Type | Meaning |
-| --- | --- | --- |
-| `mqtt.payload_format_indicator` | boolean | MQTT payload format indicator |
-| `mqtt.message_expiry_interval` | unsigned integer | Message expiry interval |
-| `mqtt.topic_alias` | unsigned integer | MQTT topic alias |
-| `mqtt.response_topic` | string | MQTT response topic |
-| `mqtt.correlation_data` | raw bytes | MQTT correlation data |
-| `mqtt.content_type` | string | MQTT content type |
-| `mqtt.user_property.<index>.key` | string | MQTT user-property key |
-| `mqtt.user_property.<index>.value` | string | MQTT user-property value |
-| `mqtt.subscription_identifier.<index>` | unsigned integer | Matching subscription identifier |
-
-The index for repeated properties starts at zero and preserves the order
-provided by the broker. Header values are subject to Iggy's header size limits;
-an oversized mapped property causes message normalization to fail rather than
-silently truncating metadata.
-
-`mqtt.packet_id` and `mqtt.dup` describe the incoming broker delivery. They
-must not be reused as identifiers for a future outgoing MQTT publish. An MQTT
-sink must let its own client session generate outgoing packet identifiers and
-duplicate flags.
-
-The driver abstraction is private to the plugin. It keeps the MQTT 3.1.1 and
-MQTT 5 client types, event loops, and acknowledgement tokens out of the Iggy
-source trait and FFI layer.
-
-## Source batching decisions
-
-The source-side batch is separate from the Iggy producer batch. Plugin batching
-reduces FFI calls, serialization overhead, and acknowledgement bookkeeping
-before the runtime receives the messages.
-
-The agreed behavior is:
+## Architecture Overview
 
 ```text
-first MQTT publish arrives
-    │
-    ├── collect until batch_size is reached
-    └── or flush when batch_timeout expires
-         │
-         ▼
-ProducedMessages with one bounded pending batch
+  [ IoT Edge Devices ]
+           │
+           │ MQTT 3.1.1 / MQTT 5 (Sensor Telemetry & Events)
+           ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           EMQX BROKER                                    │
+│  • Client Authentication, Authorizations, & Session Queues              │
+│  • Topic Subscriptions, Wildcards (+, #), & QoS Management              │
+└────────────────────────────────────┬─────────────────────────────────────┘
+                                     │
+                                     │ MQTT / TLS Connection
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                   IGGY CONNECTORS RUNTIME PROCESS                        │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  MQTT Source Plugin (libiggy_connector_mqtt_source.so)             │  │
+│  │  • Embedded `rumqttc` Client (`AsyncClient` + `EventLoop`)         │  │
+│  │  • Normalizes MQTT Packets ──► Iggy Payload & Metadata Headers     │  │
+│  │  • Holds QoS 1/2 PUBACK until Iggy Confirms Persistence            │  │
+│  └─────────────────────────────────┬──────────────────────────────────┘  │
+│                                    │                                     │
+│                                    │ C-ABI FFI Boundary                  │
+│                                    │ (iggy_source_open, poll, ack, etc)  │
+│                                    ▼                                     │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  Iggy Connector Runtime Core                                       │  │
+│  │  • Schema Decoders / Encoders (`Schema::Raw`)                      │  │
+│  │  • Optional Field Transformations (Add/Delete/Rename)              │  │
+│  │  • State Checkpoint Storage (File / HTTP endpoint)                 │  │
+│  └─────────────────────────────────┬──────────────────────────────────┘  │
+└────────────────────────────────────┼─────────────────────────────────────┘
+                                     │
+                                     │ Native Binary Client Protocol
+                                     ▼ (TCP / QUIC)
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            IGGY SERVER                                   │
+│  • Thread-Per-Core Shared-Nothing Storage Engine (`io_uring`)            │
+│  • Appends Messages to Stream ──► Topic ──► Partition Disk Logs          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-- A partial batch is flushed when `batch_timeout` expires.
-- `batch_timeout` starts when the first message in the batch arrives and does
-  not reset for later messages.
-- QoS 0 contributes a message but no acknowledgement token.
-- QoS 1 contributes one token and is acknowledged with PUBACK after Iggy Ack.
-- QoS 2 contributes one token and begins its PUBREC/PUBREL/PUBCOMP sequence
-  after Iggy Ack through `rumqttc`.
-- A batch Nack acknowledges none of its MQTT messages.
-- MQTT acknowledgement failures are retried within the current batch. The
-  driver makes at most six attempts for each token, pumping the rumqttc event
-  loop between attempts and waiting up to 10 ms between attempts. Exhausted
-  retries preserve the unacknowledged tokens and stop the source so they can
-  be redelivered rather than discarded.
-- The driver buffers incoming messages only within bounded batch capacity while
-  making progress on a full rumqttc request channel.
+---
 
-The QoS 1 and QoS 2 paths provide at-least-once delivery. QoS 0 remains
-at-most-once. Acknowledging a batch does not guarantee that no duplicate will
-appear after a process or broker restart.
+## Features
 
-## Integration-test execution decision
+* **Multi-Protocol Support**: Supports **MQTT 3.1.1** (`mqtt311`) and **MQTT 5** (`mqtt5`) protocols.
+* **Quality of Service (QoS)**: Ingests QoS 0, QoS 1, and QoS 2 messages.
+* **Deferred Acknowledgment (Manual ACKs)**: Configures `rumqttc` with manual acknowledgments enabled. For QoS 1/2 messages, broker acknowledgments (`PUBACK` / `PUBREC`) are held pending and only sent after `iggy-server` confirms persistence.
+* **Per-Subscription QoS Overrides**: Configure a global fallback QoS alongside per-subscription overrides for specific topic filters.
+* **TLS & Mutual TLS (mTLS)**: Supports secure broker URLs (`mqtts://` / `ssl://`) with system trust roots or custom CA bundles (`ca_file`), client certificates (`client_cert_file`), and client keys (`client_key_file`) via Rustls.
+* **Source-Side Micro-Batching**: Micro-batches incoming messages up to `batch_size` or until `batch_timeout` fires, minimizing FFI serialization and network overhead.
+* **Rich Header Mapping**: Preserves MQTT metadata (topic, protocol, QoS, retain, dup, packet ID) and MQTT 5 properties (content type, response topic, correlation data, user properties) as Iggy message headers.
+* **Route Isolation**: Run multiple connector instances in parallel to route distinct MQTT topic filters into separate Iggy streams and topics.
+* **Process Isolation**: Operates inside the `iggy-connectors` process memory space via C-ABI FFI, keeping the core `iggy-server` decoupled and untouched.
 
-MQTT integration tests use the `emqx/emqx:latest` image. The current latest
-image can take longer to initialize than older EMQX images, especially when
-several containers start simultaneously. The MQTT integration suite should
-therefore be executed serially:
+---
 
-```bash
-cargo test -p integration --test mod connectors::mqtt::mqtt_source -- \
-  --test-threads=1
-```
+## Configuration Architecture
 
-This avoids treating host-side container startup contention as a connector
-failure. A future fixture improvement may reuse one authenticated EMQX
-container for the complete MQTT suite.
+Configuration operates in **two distinct layers**:
 
-## Remaining batching improvements
+1. **Runtime Layer**: Configured in the connector TOML file (e.g., `mqtt_source.toml`). Defines the connector identity, shared library path, and destination Iggy stream/topic mapping.
+2. **Plugin Layer (`[plugin_config]`)**: Defines MQTT-specific connection parameters, credentials, subscriptions, QoS levels, and TLS configurations. The runtime passes this table to the plugin serialized as JSON across the FFI boundary.
 
-The following items are intentionally tracked separately from the initial
-batching implementation:
+---
 
-1. Add packet-level QoS 2 ordering assertions for every token in a full batch.
-2. Measure throughput and memory usage at different `batch_size` and
-   `request_capacity` values.
-3. Consider reusing one EMQX fixture instead of serially creating a container
-   per test.
+## Configuration Options (`[plugin_config]`)
 
-These improvements do not require changes to the Iggy server, connectors
-runtime, SDK trait, or FFI symbols.
+| Field | Type | Required | Default | Description |
+| :--- | :--- | :---: | :--- | :--- |
+| `broker_url` | String | **Yes** | — | Broker URL scheme (`mqtt://`, `mqtts://`, or `ssl://`) and host/port. |
+| `subscriptions` | Array[String] | **Yes** | — | Non-empty list of unique MQTT topic filters (wildcards `+` and `#` supported). |
+| `protocol` | String | No | `"mqtt5"` | MQTT protocol version: `"mqtt5"` or `"mqtt311"`. |
+| `qos` | Integer | No | `1` | Default global subscription QoS (`0`, `1`, or `2`). |
+| `subscription_qos` | Table | No | `{}` | Map of topic-filter strings to explicit QoS overrides (`0`, `1`, or `2`). |
+| `client_id` | String | No | `iggy-mqtt-source-{id}` | MQTT client identifier. |
+| `username` | String | No | None | Broker authentication username (must be supplied together with `password`). |
+| `password` | String | No | None | Broker authentication password (wrapped as a secret, never logged). |
+| `clean_start` | Boolean | No | `false` | MQTT clean start flag (or clean session for MQTT 3.1.1). |
+| `session_expiry_interval` | Integer | No | None | MQTT 5 session expiry interval in seconds. |
+| `keep_alive` | Duration | No | `"30s"` | Ping interval string (minimum `1s` for MQTT 3.1.1, minimum `5s` for MQTT 5). |
+| `poll_timeout` | Duration | No | `"1s"` | Maximum duration spent waiting on network events per driver poll tick. |
+| `request_capacity` | Integer | No | `32` | Bounded capacity for `rumqttc` internal request channel (must be `> 0`). |
+| `batch_size` | Integer | No | `100` | Maximum messages accumulated into a single source batch. |
+| `batch_timeout` | Duration | No | `"10ms"` | Maximum wait duration after the first message arrives before flushing a batch. |
+| `verbose_logging` | Boolean | No | `false` | Enables additional debug logging inside the plugin driver. |
+| `tls.ca_file` | String | No | None | File path to custom CA root certificates in PEM format. |
+| `tls.client_cert_file` | String | No | None | File path to mTLS client certificate in PEM format (must pair with `client_key_file`). |
+| `tls.client_key_file` | String | No | None | File path to mTLS client private key in PEM format (must pair with `client_cert_file`). |
+| `tls.server_name` | String | No | None | TLS Server Name Indication (SNI) string (must match `broker_url` host). |
 
-## Configuration
+---
 
-The runtime configuration has two layers:
+## Configuration Examples
 
-1. The connector file configures the plugin path and the destination Iggy
-   stream/topic.
-2. The `[plugin_config]` table configures the MQTT broker connection. The
-   runtime serializes this table and passes it to the plugin as JSON.
-
-The repository contains two useful examples:
-
-- [`config.toml`](config.toml) is a standalone source connector configuration.
-  It is safe to copy into a local connector configuration directory after
-  replacing the broker settings.
-- [`../../runtime/example_config/connectors/mqtt_source.toml`](../../runtime/example_config/connectors/mqtt_source.toml)
-  is the runtime example used with the example connector configuration.
-
-The MQTT plugin fields are:
-
-| Field | Required | Description |
-| --- | --- | --- |
-| `broker_url` | yes | `mqtt://` or another URL supported by `rumqttc` |
-| `subscriptions` | yes | Non-empty list of MQTT topic filters |
-| `protocol` | no | `mqtt311` or `mqtt5`; defaults to `mqtt5` |
-| `qos` | no | Subscription QoS `0`, `1`, or `2`; defaults to `1` |
-| `subscription_qos` | no | Exact topic-filter overrides for `qos`; every key must be listed in `subscriptions` and every value must be `0`, `1`, or `2` |
-| `tls` | no | TLS settings for `mqtts://` or `ssl://` brokers |
-| `client_id` | no | MQTT client identifier; the runtime ID is used when absent |
-| `username` / `password` | no | Must be supplied together |
-| `clean_start` | no | MQTT clean-session/clean-start setting |
-| `session_expiry_interval` | no | MQTT 5 session expiry interval |
-| `keep_alive` | no | Duration; defaults to `30s` |
-| `poll_timeout` | no | Duration; defaults to `1s` |
-| `request_capacity` | no | Positive rumqttc request-channel capacity; defaults to `32` |
-| `batch_size` | no | Maximum MQTT messages returned by one source poll; defaults to `100` |
-| `batch_timeout` | no | Maximum accumulation time after the first message; defaults to `10ms` |
-| `verbose_logging` | no | Enables additional plugin logging |
-
-TLS is enabled by an `mqtts://` or `ssl://` broker URL. Without a `[tls]`
-table, `rumqttc` uses the system trust roots. A custom CA, client certificate,
-and client key can be supplied through files:
-
-```toml
-broker_url = "mqtts://emqx.example.com:8883"
-
-[plugin_config.tls]
-ca_file = "/etc/iggy/certs/emqx-ca.pem"
-client_cert_file = "/etc/iggy/certs/client-cert.pem"
-client_key_file = "/etc/iggy/certs/client-key.pem"
-server_name = "emqx.example.com"
-```
-
-`ca_file` is optional. `client_cert_file` and `client_key_file` must be
-provided together. The connector reads and validates configured files during
-`open`; it never logs certificate contents or private-key paths. Certificate
-verification remains enabled and there is no insecure bypass option.
-
-The current `rumqttc` transport derives TLS server-name verification from the
-broker URL host. Therefore, when `server_name` is supplied, it must match that
-host. This keeps the setting explicit without pretending that the current
-client API supports a separate network endpoint and SNI name.
-
-The plugin-side batch is bounded by `batch_size`. The runtime still applies its
-own Iggy producer `batch_length` and `linger_time` settings after the FFI
-boundary. `request_capacity` remains the bounded rumqttc request-channel
-capacity; when it temporarily fills while acknowledgements are queued, the
-driver advances the event loop and buffers incoming messages up to the bounded
-batch capacity instead of dropping them.
-
-### Per-subscription QoS
-
-`qos` is the default subscription QoS. The optional `subscription_qos` table
-overrides it for individual filters using exact string matches:
-
-```toml
-subscriptions = [
-  "devices/+/telemetry",
-  "devices/+/status",
-]
-qos = 1
-
-[plugin_config.subscription_qos]
-"devices/+/telemetry" = 2
-"devices/+/status" = 0
-```
-
-The connector rejects duplicate filters, overrides for filters that are not in
-`subscriptions`, and values outside `0`, `1`, and `2`. The same resolution is
-used for MQTT 3.1.1 and MQTT 5 subscription setup. The QoS of an incoming
-publish and its acknowledgement token still come from the broker delivery,
-not from this configuration table.
-
-## Route-specific destinations
-
-The current source FFI contract does not carry a destination stream or topic,
-and the runtime creates one Iggy producer for each source configuration. The
-first production routing model therefore uses one MQTT source instance per
-route. Each instance owns a non-overlapping MQTT subscription and one static
-Iggy destination:
-
-```text
-mqtt_site_a.toml
-  devices/site-a/# → site_a / telemetry
-
-mqtt_site_b.toml
-  devices/site-b/# → site_b / telemetry
-```
-
-The example files are [`mqtt_site_a.toml`](../../runtime/example_config/connectors/mqtt_site_a.toml)
-and [`mqtt_site_b.toml`](../../runtime/example_config/connectors/mqtt_site_b.toml).
-Use unique connector keys and MQTT client IDs for every route. Keep the topic
-filters non-overlapping unless duplicate delivery to multiple Iggy destinations
-is intentional.
-
-This approach requires no SDK, FFI, runtime, or plugin code change. The tradeoff
-is one MQTT connection, source lifecycle, state file, and set of metrics per
-route. A future single-instance dynamic-routing design would require the FFI
-message to carry a destination and the runtime to manage producers keyed by
-that destination.
-
-## Runtime integration
-
-The MQTT plugin is only one part of a source configuration. The runtime source
-configuration selects the plugin, Iggy destination, output schema, batching,
-optional transforms, logging, and benchmark mode. MQTT payloads must use the
-`raw` stream schema because the connector preserves them as opaque bytes.
+### 1. Basic Production Telemetry (QoS 1 with Credentials)
 
 ```toml
 type = "source"
-key = "mqtt"
+key = "mqtt_telemetry"
 enabled = true
 version = 1
-name = "MQTT source"
+name = "MQTT Telemetry Source"
 path = "target/release/libiggy_connector_mqtt_source"
 plugin_config_format = "json"
-verbose = false
-benchmark = false
 
 [[streams]]
 stream = "iot"
@@ -312,95 +126,232 @@ broker_url = "mqtt://127.0.0.1:1883"
 subscriptions = ["devices/+/telemetry"]
 protocol = "mqtt5"
 qos = 1
+client_id = "iggy-telemetry-source"
+username = "iggy_app"
+password = "local-secret-password"
+clean_start = false
+session_expiry_interval = 3600
+keep_alive = "30s"
+batch_size = 100
+batch_timeout = "10ms"
 ```
 
-Transforms configured on the source are applied by the connectors runtime
-after the MQTT plugin produces the message and before it is encoded and sent
-to Iggy. A transform may modify, pass through, or intentionally filter the
-payload and headers.
-
-The runtime-level `verbose` and `benchmark` options are separate from the
-plugin-level `verbose_logging` option. The former controls runtime processing
-logs and benchmark timing; the latter controls additional MQTT plugin logs.
-
-The connector does not assign a stable `ProducedMessage.id` or source event
-timestamp. MQTT packet identifiers are protocol-session identifiers and must
-not be used as durable deduplication keys. Consumers that need idempotency
-should derive an application-level identifier from the payload or MQTT
-metadata.
-
-Credentials use secret-aware types inside the plugin and must not be committed
-to this repository. Use a local secret file, an environment override, or a
-secret-management system for deployed credentials.
-
-## Configuration paths and environment overrides
-
-With the local configuration provider, the runtime reads one main runtime
-configuration file and then loads connector `.toml` files from its configured
-connector directory:
+### 2. Per-Subscription QoS Overrides
 
 ```toml
-# core/connectors/runtime/config.toml
-[connectors]
-config_type = "local"
-config_dir = "core/connectors/runtime/example_config/connectors"
+[plugin_config]
+broker_url = "mqtt://127.0.0.1:1883"
+subscriptions = [
+  "devices/+/telemetry",
+  "devices/+/alerts",
+  "devices/+/diagnostics"
+]
+qos = 1 # Fallback for devices/+/alerts
+
+[plugin_config.subscription_qos]
+"devices/+/telemetry" = 2   # High-importance telemetry via QoS 2
+"devices/+/diagnostics" = 0 # Disposable diagnostic metrics via QoS 0
 ```
 
-The main runtime file can be selected with:
+### 3. Secure TLS & Mutual TLS (mTLS) Setup
 
-```bash
-IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/config.toml \
-  cargo run --bin iggy-connectors
+```toml
+[plugin_config]
+broker_url = "mqtts://emqx.example.com:8883"
+subscriptions = ["factory/+/metrics"]
+protocol = "mqtt5"
+qos = 1
+
+[plugin_config.tls]
+ca_file = "/etc/iggy/certs/ca.pem"
+client_cert_file = "/etc/iggy/certs/client-cert.pem"
+client_key_file = "/etc/iggy/certs/client-key.pem"
+server_name = "emqx.example.com"
 ```
 
-The connector directory can be overridden with
-`IGGY_CONNECTORS_CONNECTORS_CONFIG_DIR`. This is useful for testing one MQTT
-configuration without loading the repository's other connector files:
+### 4. Multi-Instance Route Isolation
 
-```bash
-mqtt_config_dir="$(mktemp -d)"
-cp core/connectors/runtime/example_config/connectors/mqtt_source.toml \
-  "$mqtt_config_dir/mqtt_source.toml"
+To route distinct MQTT topic filters to different Iggy streams or topics, run
+one source connector instance per route. The runtime loads every connector TOML
+from its configured `config_dir`. For the standard example layout, create these
+files locally:
 
-IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/config.toml \
-IGGY_CONNECTORS_CONNECTORS_CONFIG_DIR="$mqtt_config_dir" \
-  cargo run --bin iggy-connectors
+`core/connectors/runtime/example_config/connectors/mqtt_site_a.toml`:
+
+```toml
+type = "source"
+key = "mqtt_site_a"
+enabled = true
+version = 1
+name = "MQTT source - site A"
+path = "target/release/libiggy_connector_mqtt_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "site_a"
+topic = "telemetry"
+schema = "raw"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+broker_url = "mqtt://127.0.0.1:1883"
+subscriptions = ["devices/site-a/#"]
+protocol = "mqtt5"
+qos = 1
+client_id = "iggy-mqtt-source-site-a"
+clean_start = false
+session_expiry_interval = 3600
+keep_alive = "30s"
+poll_timeout = "1s"
+request_capacity = 32
+batch_size = 100
+batch_timeout = "10ms"
+verbose_logging = false
 ```
 
-For a local-provider connector with key `mqtt`, plugin fields can be overridden
-without editing the connector file. The prefix is:
+`core/connectors/runtime/example_config/connectors/mqtt_site_b.toml`:
 
-```text
-IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_<FIELD>
+```toml
+type = "source"
+key = "mqtt_site_b"
+enabled = true
+version = 1
+name = "MQTT source - site B"
+path = "target/release/libiggy_connector_mqtt_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "site_b"
+topic = "telemetry"
+schema = "raw"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+broker_url = "mqtt://127.0.0.1:1883"
+subscriptions = ["devices/site-b/#"]
+protocol = "mqtt5"
+qos = 1
+client_id = "iggy-mqtt-source-site-b"
+clean_start = false
+session_expiry_interval = 3600
+keep_alive = "30s"
+poll_timeout = "1s"
+request_capacity = 32
+batch_size = 100
+batch_timeout = "10ms"
+verbose_logging = false
 ```
 
-Examples:
+Use unique connector keys and MQTT client IDs for every route. Keep topic
+filters non-overlapping unless duplicate delivery to multiple Iggy destinations
+is intentional. Build the plugin first, copy these files into the active
+connector `config_dir`, and restart `iggy-connectors`.
+
+---
+
+## Environment Variable Overrides
+
+Any property inside `[plugin_config]` can be overridden at runtime using environment variables without modifying configuration files:
 
 ```bash
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_BROKER_URL="mqtt://127.0.0.1:1883"
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_USERNAME="emqx-user"
-export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_PASSWORD="replace-me"
+export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_PASSWORD="secret-password"
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_QOS=1
-export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_PROTOCOL="mqtt5"
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_SUBSCRIPTIONS='["devices/+/telemetry"]'
 ```
 
-Scalar values are parsed according to their JSON/TOML type. Lists such as
-`subscriptions` must be supplied as a JSON array. The runtime applies these
-overrides after reading the connector file, so an environment value wins over
-the matching file value. The runtime loads a `.env` file from the current
-directory by default, or a specific dotenv file using
-`IGGY_CONNECTORS_ENV_PATH`.
+---
 
-Build the plugin with:
+## Message Header Reference
 
-```bash
-cargo build -p iggy_connector_mqtt_source --release
+The connector attaches MQTT metadata directly to `ProducedMessage.headers`:
+
+| Header Key | Type | Description |
+| :--- | :--- | :--- |
+| `mqtt.protocol` | String | `"mqtt311"` or `"mqtt5"`. |
+| `mqtt.topic` | String | Topic filter on which the broker delivered the message. |
+| `mqtt.qos` | Integer | Delivered MQTT QoS (`0`, `1`, or `2`). |
+| `mqtt.dup` | Boolean | Duplicate delivery flag from broker. |
+| `mqtt.retain` | Boolean | Retained message flag. |
+| `mqtt.packet_id` | Integer | MQTT Packet ID for QoS 1/2 (absent for QoS 0). |
+| `mqtt.content_type` | String | *(MQTT 5)* Content type descriptor. |
+| `mqtt.response_topic` | String | *(MQTT 5)* Response topic for request/reply flows. |
+| `mqtt.correlation_data` | Bytes | *(MQTT 5)* Correlation binary data. |
+| `mqtt.message_expiry_interval` | Integer | *(MQTT 5)* Message expiry interval in seconds. |
+| `mqtt.user_property.<N>.key` | String | *(MQTT 5)* User property key at index `N`. |
+| `mqtt.user_property.<N>.value` | String | *(MQTT 5)* User property value at index `N`. |
+
+---
+
+## Redelivery & Acknowledgment Mechanism
+
+The connector guarantees **At-Least-Once Delivery** for QoS 1 and QoS 2 messages using manual protocol acknowledgments.
+
+```text
+  MQTT Broker             MQTT Source Plugin            Connector Runtime           Iggy Server
+       │                         │                              │                        │
+       │ 1. MQTT PUBLISH (QoS 1) │                              │                        │
+       ├────────────────────────►│                              │                        │
+       │                         │ [Message held pending]       │                        │
+       │                         │ [NO PUBACK SENT YET]         │                        │
+       │                         │                              │                        │
+       │                         │ 2. Source::poll() batch      │                        │
+       │                         ├─────────────────────────────►│                        │
+       │                         │                              │ 3. Send over TCP/QUIC  │
+       │                         │                              ├───────────────────────►│
+       │                         │                              │                        │
+       │                         │                              │ 4. Persists to log     │
+       │                         │                              │◄───────────────────────┤
+       │                         │                              │    Returns Iggy ACK    │
+       │                         │                              │                        │
+       │                         │ 5. SourceBatchResult::Ack    │                        │
+       │                         │◄─────────────────────────────┤                        │
+       │                         │                              │                        │
+       │ 6. MQTT PUBACK          │                              │                        │
+       │◄────────────────────────┤                              │                        │
+       │                         │ [Pending message cleared]    │                        │
 ```
 
-The resulting shared library is placed under `target/release/` and can be
-referenced by the connectors runtime using its normal plugin path setting.
+### Transaction Steps
 
-Before starting the runtime, make sure the configured `path` points to the
-library built for the selected profile. For a release build this is normally
-`target/release/libiggy_connector_mqtt_source.so` on Linux.
+1. **Inbound Staging**: When `rumqttc` receives a QoS 1 or QoS 2 `PUBLISH` packet, the driver stages the message into an internal pending buffer along with its deferred `AckToken`. **No `PUBACK` or `PUBREC` is sent to the broker yet**.
+2. **Polling & FFI Handoff**: The runtime calls `Source::poll()`. The plugin packages staged messages into a batch, records `AckTokens` inside `pending_batch`, serializes candidate `ConnectorState`, and returns `ProducedMessages` with `Schema::Raw`.
+3. **Iggy Persistence & State Save**: The runtime sends the batch to `iggy-server` over TCP/QUIC and saves candidate state checkpoints to disk or HTTP storage.
+4. **Ack Callback**: Upon successful Iggy write, the runtime calls `Source::on_batch_result(Ack)`.
+5. **Broker Acknowledgment**: The plugin retrieves in-flight `AckTokens` and executes `client.try_ack(&publish)`. `rumqttc` transmits the `PUBACK` (for QoS 1) or initiates `PUBREC` (for QoS 2) to EMQX.
+6. **Nack Rollback**: If Iggy delivery fails or times out, the runtime returns `SourceBatchResult::Nack`. The plugin drops the candidate state **without acknowledging the MQTT tokens**. The broker's QoS 1/2 retry loop will subsequently redeliver the unacknowledged messages.
+
+---
+
+## Failure Modes & Observed Redelivery Behaviors
+
+| Failure Scenario | Current Observation | Explanation & Root Cause |
+| :--- | :--- | :--- |
+| **Broker terminates / restarts** | Message may disappear | EMQX may lose its in-flight MQTT session state upon restart. Even with persistent storage enabled, a standard Docker data volume does not guarantee the preservation of every unacknowledged packet across container recreations. |
+| **Iggy terminates / restarts only** | No immediate redelivery | The MQTT source plugin and runtime remain connected to the broker. The plugin holds `PUBACK`/`PUBREC` pending while waiting for Iggy to recover. Because the active TCP/MQTT session never drops, the broker does not trigger an immediate redelivery while the session timer remains active. |
+| **Iggy and Connector restart** | Message redelivered | Restarting the connector drops the underlying TCP socket and initiates a new MQTT connection. Upon reconnecting (with `clean_start = false`), EMQX detects the unacknowledged QoS 1/2 message in the session queue and redelivers it. |
+| **Connector terminates / restarts** | Message redelivered | EMQX remains online and retains the unacknowledged packet in its active MQTT session. Once the connector restarts and re-establishes its session, EMQX immediately redelivers the unacknowledged packet. |
+
+---
+
+## Critical End-User & Operational Notes
+
+1. **At-Least-Once Delivery & Duplicate Tolerance**:
+   * The persisted `ConnectorState` records an `acknowledged_messages: u64` count for runtime tracking—**it is not a durable MQTT broker cursor**.
+   * If a crash or network drop occurs after Iggy persists a batch but before `PUBACK` reaches the MQTT broker, the broker will redeliver those messages upon reconnecting. **Downstream Iggy consumers must be designed to handle duplicate messages idempotently**.
+
+2. **Single Destination per Connector Instance**:
+   * A single source connector instance writes to **one** static Iggy stream and topic.
+   * Dynamic per-message destination routing based on MQTT topics is not supported within a single instance; use separate connector files for distinct target streams/topics.
+
+3. **Packet ID Scope**:
+   * MQTT `packet_id` values (e.g., `42`) are ephemeral session tokens generated by the client/broker for connection handshakes. They are reused across connections and **must never be used as durable deduplication keys or offset identifiers** in Iggy.
+
+4. **Single In-Flight Batch Constraint**:
+   * The Iggy Connector SDK enforces that only **one batch may be in flight** at a time. Calling `poll()` while a previous batch is awaiting `Ack`/`Nack` returns `Err(Error::InvalidState)`.
+
+5. **TLS Server Name (SNI) Coupling**:
+   * The underlying `rumqttc` client derives TLS Server Name Indication (SNI) hostname verification directly from `broker_url`. If `tls.server_name` is configured, it **must match the host component** specified in `broker_url`.

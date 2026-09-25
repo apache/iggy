@@ -317,7 +317,16 @@ pub(crate) fn qos_for_subscription(
 impl Source for MqttSource {
     async fn open(&mut self) -> Result<(), Error> {
         let (qos, keep_alive, poll_timeout, request_capacity, batch_size, batch_timeout) =
-            self.validate_config()?;
+            match self.validate_config() {
+                Ok(values) => values,
+                Err(error) => {
+                    error!(
+                        "Failed to validate MQTT source connector with ID {}: {error}",
+                        self.id
+                    );
+                    return Err(error);
+                }
+            };
         let driver = match MqttDriver::connect(
             self.id,
             &self.config,
