@@ -73,7 +73,7 @@ pub async fn init_by_consumer(args: &Args, client: &dyn Client) {
 }
 
 pub async fn init_by_producer(args: &Args, client: &dyn Client) -> Result<(), IggyError> {
-    let stream_id = args.stream_id.clone().try_into()?;
+    let stream_id = Identifier::named(&args.stream_id)?;
     let topic_name = args.topic_id.clone();
     let stream = client.get_stream(&stream_id).await?;
     if stream.is_some() {
