@@ -5400,7 +5400,7 @@ mod view_change_data_loss_tests {
                     match submit_shard
                         .plane
                         .metadata()
-                        .submit_register_in_process(straggler_client, 0)
+                        .submit_register_in_process(straggler_client, 0, None)
                         .await
                     {
                         Ok(_) => {

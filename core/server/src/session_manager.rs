@@ -655,6 +655,7 @@ mod tests {
                 client,
                 USER,
                 build_empty_reply(&header, client, epoch, epoch),
+                None,
             );
             sessions.ensure_connection(client, addr(5000), ClientTransportKind::Tcp);
             sessions.login(client, USER).unwrap();

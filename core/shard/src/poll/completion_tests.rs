@@ -114,7 +114,12 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             op: 1,
             ..Default::default()
         };
-        table.commit_register(CLIENT, USER, build_reply_message_with(&header, 0, |_| {}));
+        table.commit_register(
+            CLIENT,
+            USER,
+            build_reply_message_with(&header, 0, |_| {}),
+            None,
+        );
         let (_stop, stop) = channel(1);
         let pump = owner.run_message_pump(stop, Arc::new(AtomicBool::new(false)));
         futures::pin_mut!(pump);
@@ -380,6 +385,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
             PARENT,
             USER,
             build_reply_message_with(&registration, 0, |_| {}),
+            None,
         );
         let streams = owner.plane.metadata().mux_stm.streams();
         if matches!(change, Change::PendingRevocation) {
@@ -437,6 +443,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                     PARENT,
                     USER,
                     build_reply_message_with(&registration, 0, |_| {}),
+                    None,
                 );
             }
             Change::Leave => streams.remove_consumer_group_member(PARENT, IggyTimestamp::default()),

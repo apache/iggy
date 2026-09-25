@@ -612,8 +612,12 @@ where
         // table, so recovery from one still starts empty. It converges once the
         // node takes its next checkpoint.
         if header.operation == Operation::Register {
+            let perms = journal
+                .entry_at(header)
+                .await?
+                .and_then(|entry| super::metadata::decode_register_body_permissions(entry.body()));
             let reply = build_reply_message(header, &bytes::Bytes::new());
-            client_table.commit_register(header.client, header.user_id, reply);
+            client_table.commit_register(header.client, header.user_id, reply, perms);
             last_applied_op = Some(header.op);
             continue;
         }
@@ -1348,6 +1352,7 @@ mod tests {
             CLIENT,
             USER,
             build_reply_message(register.header(), &bytes::Bytes::new()),
+            None,
         );
         let app = make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1);
         at_checkpoint.commit_reply(

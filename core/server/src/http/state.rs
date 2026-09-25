@@ -421,12 +421,13 @@ impl HttpInner {
         // A canceled submit used to strand consensus state mid-await; now the
         // detached task always drives it to completion and a disconnect only
         // drops the receiver half (same discipline as `submit_committed`).
+        let grant_perms = crate::http::extractor::SessionKey::from_table_key(&key)
+            .and_then(|sk| self.session_grant_permissions(&sk));
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
-            let result = submit_register_on_owner(&shard, client_id, user_id).await;
-            // A failed send means the handler died mid-await; the Register
-            // itself has already committed, which is what matters.
+            let result =
+                submit_register_on_owner(&shard, client_id, user_id, grant_perms.as_deref()).await;
             let _ = result_slot.send(result);
         })
         .detach();

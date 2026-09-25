@@ -641,12 +641,12 @@ pub fn apply_committed_prepare<M>(
 {
     let header = *prepare.header();
     if header.operation == Operation::Register {
-        // Register: commit_register creates the session, no state-machine op.
         if table_mutations_allowed {
+            let perms = decode_register_body_permissions(prepare.body());
             let reply = build_reply_message(&header, &bytes::Bytes::new());
             client_table
                 .borrow_mut()
-                .commit_register(header.client, header.user_id, reply);
+                .commit_register(header.client, header.user_id, reply, perms);
         }
         return;
     }
@@ -2024,6 +2024,7 @@ where
         &self,
         client_id: u128,
         user_id: u32,
+        session_permissions: Option<&iggy_common::Permissions>,
     ) -> Result<BoundSession, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let consensus = self
@@ -2078,7 +2079,8 @@ where
             return Err(MetadataSubmitError::InProgress);
         }
 
-        let request = build_register_request_message(consensus, client_id, user_id);
+        let request =
+            build_register_request_message(consensus, client_id, user_id, session_permissions);
         // Wire path runs `RoutedRequestHeader::validate` at network boundary;
         // in-process skips it. debug_assert pins drift.
         debug_assert!(
@@ -2878,13 +2880,14 @@ where
             // the single-threaded shard and keeps the head revalidation
             // sound.
             let reply = if prepare_header.operation == Operation::Register {
-                // Register: commit_register creates session, no SM.
+                let perms = decode_register_body_permissions(prepare.body());
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
                 if self.client_table_mutation_allowed(prepare_header.op) {
                     self.client_table.borrow_mut().commit_register(
                         prepare_header.client,
                         prepare_header.user_id,
                         reply.clone(),
+                        perms,
                     );
                 }
                 reply
@@ -3807,17 +3810,37 @@ where
 ///
 /// Buffer is `size_of::<RoutedRequestHeader>()`; `prepare_request` transmutes into
 /// `PrepareHeader` (also 256 bytes), no realloc.
+/// Decode inline-grant permissions from a Register prepare body. Empty body
+/// (the pre-ext-auth format) returns `None`.
+pub(crate) fn decode_register_body_permissions(body: &[u8]) -> Option<iggy_common::Permissions> {
+    if body.is_empty() {
+        return None;
+    }
+    match rmp_serde::from_slice::<iggy_common::Permissions>(body) {
+        Ok(perms) => Some(perms),
+        Err(error) => {
+            tracing::warn!(%error, "failed to decode permissions from Register body");
+            None
+        }
+    }
+}
+
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Message<RoutedRequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
+    let body_bytes = session_permissions
+        .and_then(|p| rmp_serde::to_vec(p).ok())
+        .unwrap_or_default();
     let header_size = size_of::<RoutedRequestHeader>();
-    let mut msg = Message::<RoutedRequestHeader>::new(header_size);
+    let total_size = header_size + body_bytes.len();
+    let mut msg = Message::<RoutedRequestHeader>::new(total_size);
     let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
         &mut msg.as_mut_slice()[..header_size],
     )
@@ -3825,22 +3848,18 @@ where
     *header = RoutedRequestHeader {
         command: Command::Request,
         operation: Operation::Register,
-        size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
+        size: u32::try_from(total_size).expect("Register message size fits u32"),
         cluster: consensus.cluster(),
         view: consensus.view(),
         release: 0,
         client: client_id,
         session: 0,
         request: 0,
-        // Replicated on the prepare so every replica resolves session -> user.
         user_id,
-        // Route through the metadata consensus group. The chain-forwarded
-        // prepare is re-routed on each peer by namespace; a `0` here would
-        // hash to a non-zero shard with no metadata consensus and be
-        // silently dropped (see `shard::router::route_typed`).
         group: server_common::sharding::METADATA_GROUP,
         ..RoutedRequestHeader::default()
     };
+    msg.as_mut_slice()[header_size..].copy_from_slice(&body_bytes);
     msg
 }
 
@@ -4258,6 +4277,7 @@ mod tests {
                         watermark: 3,
                         watermark_checksum: 0xabc,
                         reply: vec![1, 2, 3],
+                        session_permissions: None,
                     },
                 ),
                 (
@@ -4269,6 +4289,7 @@ mod tests {
                         watermark: 0,
                         watermark_checksum: 0,
                         reply: vec![4, 5],
+                        session_permissions: None,
                     },
                 ),
             ],
@@ -4309,6 +4330,7 @@ mod tests {
                     watermark: 0,
                     watermark_checksum: 0,
                     reply: vec![0xFF; REPLY_LEN],
+                    session_permissions: None,
                 },
             )],
         });
@@ -4494,12 +4516,15 @@ mod tests {
                 TestMux::default(),
                 None,
             );
-        md.client_table
-            .borrow_mut()
-            .commit_register(CLIENT, OWNER, register_reply(CLIENT, 1));
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            OWNER,
+            register_reply(CLIENT, 1),
+            None,
+        );
 
         assert_eq!(
-            md.submit_register_in_process(CLIENT, IMPOSTOR).await,
+            md.submit_register_in_process(CLIENT, IMPOSTOR, None).await,
             Err(MetadataSubmitError::ClientIdOwnedByAnotherUser),
             "a different user must not be resumed onto this entry"
         );
@@ -4517,7 +4542,7 @@ mod tests {
         // consensus (a bind is a fencing event), which this NoopBus harness
         // never commits -- so passing the gate is observable as Pending,
         // while a refusal resolves immediately.
-        let mut rebind = std::pin::pin!(md.submit_register_in_process(CLIENT, OWNER));
+        let mut rebind = std::pin::pin!(md.submit_register_in_process(CLIENT, OWNER, None));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
             rebind.as_mut().poll(&mut cx).is_pending(),
@@ -4533,7 +4558,7 @@ mod tests {
         const SESSION: u64 = 10;
         const ACTING_USER: u32 = 7;
         let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
-        table.commit_register(CLIENT, ACTING_USER, register_reply(CLIENT, SESSION));
+        table.commit_register(CLIENT, ACTING_USER, register_reply(CLIENT, SESSION), None);
         let client_table = RefCell::new(table);
 
         match resolve_acting_user_id(Operation::CreateStream, CLIENT, &client_table) {
@@ -4642,6 +4667,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         let prepare = plane
@@ -4673,6 +4699,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         // `create_topic_request` builds the body with no options at all.
@@ -4775,7 +4802,7 @@ mod tests {
             );
         md.client_table
             .borrow_mut()
-            .commit_register(CLIENT, USER, register_reply(CLIENT, 1));
+            .commit_register(CLIENT, USER, register_reply(CLIENT, 1), None);
 
         // Cache a committed SUCCESS for request 1 under the PAT operation,
         // exactly as the commit path would (empty apply body + result section).
@@ -4961,6 +4988,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         // Three prepares through the real primary path: pipeline entry, WAL
@@ -5107,6 +5135,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         // Minted while the sequencer is still at 0, so it carries op 1: exactly
@@ -5185,6 +5214,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         for request in 1..=OPS {
@@ -5282,6 +5312,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         // Give the WAL a head far below the floor about to be installed, which is
@@ -5379,6 +5410,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         for op in 1..=OPS {
@@ -5474,6 +5506,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         // Fill to one op under the boundary through the real primary path,
@@ -5621,6 +5654,7 @@ mod tests {
                 client,
                 ACTING_USER,
                 register_reply(client, SESSION),
+                None,
             );
         }
 
@@ -5745,6 +5779,7 @@ mod tests {
             CLIENT_B,
             ACTING_USER,
             register_reply(CLIENT_B, SESSION),
+            None,
         );
 
         // B's op journaled + self-acked; park its commit mid-window.
@@ -5768,7 +5803,7 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed, not bounced.
-        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER, None));
         assert!(
             register.as_mut().poll(&mut cx).is_pending(),
             "mid-window register must park in the request queue, not error"
@@ -5883,6 +5918,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         // Journal ops 1..=3 directly (no acks, so `commit_min` stays 0 and the
@@ -5980,6 +6016,7 @@ mod tests {
             CLIENT_B,
             ACTING_USER,
             register_reply(CLIENT_B, SESSION),
+            None,
         );
 
         // B's op journaled + self-acked; park its commit driver mid-window
@@ -6004,7 +6041,7 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed into the request queue.
-        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER, None));
         assert!(register.as_mut().poll(&mut cx).is_pending());
         assert_eq!(consensus.request_queue_len(), 1);
 
@@ -6095,6 +6132,7 @@ mod tests {
             CLIENT,
             ACTING_USER,
             register_reply(CLIENT, SESSION),
+            None,
         );
 
         let projected = md
