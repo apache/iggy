@@ -147,6 +147,7 @@ impl std::fmt::Debug for ResolvedOpenSearchSinkConfig {
             .field("index", &self.index)
             .field("username", &self.username)
             .field("password", &self.password)
+            .field("document_id_field", &self.document_id_field)
             .field(
                 "create_index_if_not_exists",
                 &self.create_index_if_not_exists,
@@ -3148,6 +3149,17 @@ mod tests {
         let rendered = format!("{sink:?}");
 
         assert!(!rendered.contains("hunter2"), "{rendered}");
+    }
+
+    #[test]
+    fn given_document_id_field_configured_should_appear_in_debug_output() {
+        let mut config = base_config();
+        config.document_id_field = Some("order_id".to_string());
+
+        let rendered = format!("{:?}", sink_with_config(config));
+
+        assert!(rendered.contains("document_id_field"), "{rendered}");
+        assert!(rendered.contains("order_id"), "{rendered}");
     }
 
     // Regression test: Debug can run before open() ever validates the URL.
