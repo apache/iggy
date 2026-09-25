@@ -30,23 +30,30 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
-use crate::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
+use crate::auth::{AuthError, AuthenticatedPrincipal, FailedLoginThrottle, SaslAuthenticator};
+use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
     DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM,
-    ERROR_UNSUPPORTED_VERSION, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS,
     decode_acl_filter, decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome,
     encode_error_for_key, handle_request_bounded, respond_describe_acls_error,
     sasl_authenticate_outcome, sasl_handshake_outcome,
 };
 use crate::protocol::header::{request_header_version, response_header_version};
-use crate::protocol::sasl::{SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain};
+use crate::protocol::sasl::{
+    PlainCredentials, SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState,
+    parse_plain,
+};
 use std::io;
 
 const READ_CHUNK: usize = 65536;
+const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
 
 /// Builds the log filter, forcing the Iggy SDK quiet unless the operator asked otherwise.
 ///
@@ -60,17 +67,33 @@ const READ_CHUNK: usize = 65536;
 /// and using it verbatim silently drops this the moment anyone sets it, including on the run
 /// commands this repository's own documentation gives. An explicit `iggy=` directive still wins,
 /// so raising it deliberately for debugging remains possible.
+///
+/// `EnvFilter` matches targets by prefix, so `iggy=warn` also catches this crate. The gateway gets
+/// its own directive at the operator's default level, since the longer target wins, and without it
+/// every authentication decision this gateway logs would be filtered out.
 fn sdk_quieted_filter(rust_log: Option<&str>) -> String {
     let base = rust_log.unwrap_or("info");
     let base = if base.trim().is_empty() { "info" } else { base };
-    let names_sdk = base
-        .split(',')
-        .any(|directive| directive.trim().starts_with("iggy="));
-    if names_sdk {
-        base.to_string()
-    } else {
-        format!("{base},iggy=warn")
+    let directives: Vec<&str> = base.split(',').map(str::trim).collect();
+    if directives
+        .iter()
+        .any(|directive| directive.starts_with("iggy="))
+    {
+        return base.to_string();
     }
+    let names_gateway = directives
+        .iter()
+        .any(|directive| directive.split(['=', '[']).next() == Some(GATEWAY_LOG_TARGET));
+    if names_gateway {
+        return format!("{base},iggy=warn");
+    }
+    let default_level = directives
+        .iter()
+        .rev()
+        .copied()
+        .find(|directive| directive.parse::<LevelFilter>().is_ok())
+        .unwrap_or("info");
+    format!("{base},iggy=warn,{GATEWAY_LOG_TARGET}={default_level}")
 }
 
 #[derive(Debug, Clone)]
@@ -113,13 +136,21 @@ pub struct GatewayConfig {
     /// A connection that has proven nothing still holds a `max_connections` permit, so it gets a
     /// budget measured in seconds instead.
     pub pre_auth_timeout: Duration,
-    /// Credential verifications allowed to run at once, across every connection.
+    /// Credential verifications the gateway runs at once, across every connection.
     ///
     /// Each one costs an Argon2id verify on an Iggy shard thread that has no blocking pool, so
-    /// unauthenticated traffic can otherwise saturate the server's request loop with nothing but
+    /// unauthenticated traffic can otherwise pile that work onto the server with nothing but
     /// shape-valid tokens. `max_connections` alone is not a bound on that: it caps sockets, not
     /// the work each one can ask Iggy to do. Verifications beyond this queue rather than fail,
     /// since a rejected login is indistinguishable from a wrong password to the client.
+    ///
+    /// This bounds the gateway's side only. A verification that times out frees its slot, but the
+    /// login it started keeps hashing inside Iggy, so a slow server can briefly carry more than
+    /// this many.
+    ///
+    /// Four by default, which stays under the shard count of any node with 16 or fewer physical
+    /// cores. A default above that is no bound at all on the deployments most likely to run one
+    /// gateway in front of one node; a larger node raises it deliberately.
     pub max_concurrent_authentications: usize,
 }
 
@@ -137,7 +168,7 @@ impl Default for GatewayConfig {
             shutdown_drain_timeout: Duration::from_secs(25),
             sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
-            max_concurrent_authentications: 16,
+            max_concurrent_authentications: 4,
         }
     }
 }
@@ -225,12 +256,24 @@ pub fn bind_listener(addr: &str) -> Result<TcpListener> {
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
+    bridge: Option<Arc<IggyBridge>>,
 }
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
 struct SharedAuth {
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
     slots: Semaphore,
+    failed_logins: FailedLoginThrottle,
+}
+
+impl SharedAuth {
+    fn new(authenticator: Option<Arc<dyn SaslAuthenticator>>, max_concurrent: usize) -> Self {
+        Self {
+            authenticator,
+            slots: Semaphore::new(max_concurrent),
+            failed_logins: FailedLoginThrottle::default(),
+        }
+    }
 }
 
 impl KafkaGateway {
@@ -239,7 +282,17 @@ impl KafkaGateway {
         Self {
             config: Arc::new(config),
             authenticator: None,
+            bridge: None,
         }
+    }
+
+    /// Serve requests against `bridge` instead of the stub answers.
+    ///
+    /// `None` is the default and keeps every handler on its stub.
+    #[must_use]
+    pub fn with_bridge(mut self, bridge: Option<Arc<IggyBridge>>) -> Self {
+        self.bridge = bridge;
+        self
     }
 
     /// Supplies the verifier that SASL credentials are checked against.
@@ -280,25 +333,28 @@ impl KafkaGateway {
         if self.config.sasl_enabled && self.authenticator.is_none() {
             return Err(KafkaProtocolError::InvalidConfig(
                 "SASL is enabled but no authenticator is configured; every client would be \
-                 rejected. Set IGGY_KAFKA_IGGY_ADDR and the Iggy credentials, or unset \
-                 IGGY_KAFKA_SASL_ENABLED"
+                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
+                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
                     .into(),
             ));
         }
         let local_addr = listener.local_addr()?;
-        let broker = Arc::new(BrokerAdvertise::from_server_config(
-            &self.config,
-            local_addr,
-        )?);
+        let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
         info!(
             "kafka listener bound on {} (advertised as {}:{})",
             local_addr, broker.host, broker.port
         );
+        let state = Arc::new(GatewayState::new(
+            broker,
+            self.bridge.clone(),
+            self.config.max_frame_size,
+            self.config.sasl_enabled,
+        ));
 
-        let shared_auth = Arc::new(SharedAuth {
-            authenticator: self.authenticator.clone(),
-            slots: Semaphore::new(self.config.max_concurrent_authentications),
-        });
+        let shared_auth = Arc::new(SharedAuth::new(
+            self.authenticator.clone(),
+            self.config.max_concurrent_authentications,
+        ));
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
         // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits
@@ -342,13 +398,13 @@ impl KafkaGateway {
                                 warn!(%peer, "TCP_KEEPALIVE failed: {e}");
                             }
                             let cfg = Arc::clone(&self.config);
-                            let broker = Arc::clone(&broker);
+                            let state = Arc::clone(&state);
                             let auth = Arc::clone(&shared_auth);
                             let conn_cancel = cancel.child_token();
                             tracker.spawn(async move {
                                 let _permit = permit;
                                 if let Err(err) =
-                                    handle_connection(stream, cfg, peer, broker, auth, conn_cancel)
+                                    handle_connection(stream, cfg, peer, state, auth, conn_cancel)
                                         .await
                                 {
                                     // debug!, not warn!: every `KafkaProtocolError` that can
@@ -420,10 +476,12 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 /// for no gain in clarity.
 struct ConnectionContext<'a> {
     config: &'a GatewayConfig,
-    broker: &'a BrokerAdvertise,
+    state: &'a GatewayState,
     authenticator: Option<&'a dyn SaslAuthenticator>,
     auth_slots: &'a Semaphore,
+    failed_logins: &'a FailedLoginThrottle,
     peer: &'a SocketAddr,
+    cancel: &'a CancellationToken,
 }
 
 /// Decides what one decoded frame earns, advancing `sasl_state` when it authenticates.
@@ -463,32 +521,29 @@ async fn route_frame(
         {
             describe_acls(principal.as_ref(), req.request_api_version, body, peer)
         }
-        SaslAction::Dispatch => handle_request_bounded(
-            req.request_api_key,
-            req.request_api_version,
-            body,
-            ctx.broker,
-            ctx.config.max_frame_size,
-            ctx.config.sasl_enabled,
-        ),
-        SaslAction::DispatchFirstApiVersions => {
-            let outcome = handle_request_bounded(
+        SaslAction::Dispatch => {
+            handle_request_bounded(
+                ctx.state,
                 req.request_api_key,
                 req.request_api_version,
                 body,
-                ctx.broker,
-                ctx.config.max_frame_size,
-                ctx.config.sasl_enabled,
-            );
-            // Spend the allowance only on an answer the client can use. A refusal it is entitled
-            // to retry at a lower version, which is what the KIP-511 downgrade path does, must not
-            // consume the single attempt and strand a conformant client on the retry.
-            if answered_successfully(&outcome) {
-                *sasl_state = SaslState::AwaitHandshake {
-                    api_versions_seen: true,
-                };
-            }
-            outcome
+            )
+            .await
+        }
+        SaslAction::DispatchPreAuthApiVersions => {
+            // Counted whatever the answer says. A refusal the client is entitled to retry at a
+            // lower version, which is what the KIP-511 downgrade path does, is covered by the
+            // allowance rather than exempt from it: spending it only on a usable answer lets a
+            // peer repeat a rejected version forever, resetting the pre-authentication read budget
+            // on every frame and holding a `max_connections` permit with it.
+            sasl_state.count_api_versions_answer();
+            handle_request_bounded(
+                ctx.state,
+                req.request_api_key,
+                req.request_api_version,
+                body,
+            )
+            .await
         }
         SaslAction::AcceptHandshake(mechanism) => {
             debug!(%peer, %mechanism, "SASL mechanism negotiated");
@@ -519,15 +574,7 @@ async fn route_frame(
             HandleOutcome::Close
         }
         SaslAction::Authenticate => {
-            let (outcome, verified) = authenticate_token(
-                ctx.authenticator,
-                ctx.auth_slots,
-                ctx.config.pre_auth_timeout,
-                req.request_api_version,
-                body,
-                peer,
-            )
-            .await;
+            let (outcome, verified) = authenticate_token(ctx, req.request_api_version, body).await;
             // Only a plain `Respond` is success: every refusal path answers with
             // `RespondThenClose`, so the state advances on exactly the accepting branch.
             if matches!(outcome, HandleOutcome::Respond(_)) {
@@ -556,7 +603,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<GatewayConfig>,
     peer: SocketAddr,
-    broker: Arc<BrokerAdvertise>,
+    state: Arc<GatewayState>,
     shared_auth: Arc<SharedAuth>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -572,10 +619,12 @@ async fn handle_connection(
     let mut principal: Option<AuthenticatedPrincipal> = None;
     let ctx = ConnectionContext {
         config: &config,
-        broker: &broker,
+        state: &state,
         authenticator: shared_auth.authenticator.as_deref(),
         auth_slots: &shared_auth.slots,
+        failed_logins: &shared_auth.failed_logins,
         peer: &peer,
+        cancel: &cancel,
     };
 
     loop {
@@ -620,7 +669,17 @@ async fn handle_connection(
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
         let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
-        if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
+        if dispatch_outcome(
+            &mut stream,
+            &peer,
+            &config,
+            &req,
+            resp_hdr_ver,
+            outcome,
+            &cancel,
+        )
+        .await?
+        {
             return Ok(());
         }
     }
@@ -632,13 +691,11 @@ async fn handle_connection(
 /// user, a wrong password and an unreachable Iggy are indistinguishable to the client on purpose;
 /// the gateway's own log carries the difference.
 async fn authenticate_token(
-    authenticator: Option<&dyn SaslAuthenticator>,
-    auth_slots: &Semaphore,
-    budget: Duration,
+    ctx: &ConnectionContext<'_>,
     api_version: i16,
     body: Bytes,
-    peer: &SocketAddr,
 ) -> (HandleOutcome, Option<AuthenticatedPrincipal>) {
+    let peer = ctx.peer;
     let failed = || {
         (
             sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true),
@@ -646,7 +703,7 @@ async fn authenticate_token(
         )
     };
 
-    let Some(authenticator) = authenticator else {
+    let Some(authenticator) = ctx.authenticator else {
         // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
         // alternative is admitting an unauthenticated connection.
         error!(%peer, "SASL is enabled but no authenticator is configured");
@@ -661,32 +718,35 @@ async fn authenticate_token(
         return failed();
     };
 
-    // The wait for a slot and the verification itself share one deadline, and it is the same
-    // pre-authentication budget every other unauthenticated read gets. Without it the queue is the
-    // bound: an unauthenticated connection would sit in `acquire()` for as long as the backlog
-    // takes to drain, holding a `max_connections` permit the whole time, which is precisely the
-    // invariant `pre_auth_timeout` is documented to enforce.
-    let verified = tokio::time::timeout(budget, async {
-        // Acquire fails only once the semaphore is closed, which this gateway never does.
-        let Ok(slot) = auth_slots.acquire().await else {
-            error!(%peer, "authentication slots unavailable");
-            return None;
-        };
-        Some(authenticator.authenticate(&credentials, slot).await)
-    })
-    .await;
+    // Checked before a slot is taken, so a throttled peer costs neither a slot nor a hash. Closed
+    // rather than answered 58 for the same reason an overload is: the client would treat 58 as
+    // fatal, and a correct password retried after the delay must still get through.
+    if ctx.failed_logins.is_blocked(peer.ip()) {
+        debug!(%peer, "SASL authentication refused: peer is throttled after a rejected login");
+        return (HandleOutcome::Close, None);
+    }
 
-    let Ok(Some(result)) = verified else {
-        // Overloaded or shutting down. Close rather than answer 58: a Kafka client treats that
-        // code as fatal and surfaces it to the application, and nothing here says the credentials
-        // were wrong. A close reads as a transport failure, which is retriable.
-        warn!(%peer, "authentication did not complete within the pre-authentication budget");
+    // The connection loop only watches the shutdown token between frames, so a verification in
+    // flight has to watch it here or a drain waits out the whole budget.
+    let verified = tokio::select! {
+        () = ctx.cancel.cancelled() => {
+            debug!(%peer, "SASL authentication abandoned by shutdown");
+            return (HandleOutcome::Close, None);
+        }
+        verified = verify_within_budget(ctx, authenticator, &credentials) => verified,
+    };
+
+    let Some(result) = verified else {
+        // Overloaded or timed out. Close rather than answer 58: a Kafka client treats that code as
+        // fatal and surfaces it to the application, and nothing here says the credentials were
+        // wrong. A close reads as a transport failure, which is retriable.
         return (HandleOutcome::Close, None);
     };
 
     match result {
         Ok(authenticated) => {
             debug!(%peer, "SASL authentication succeeded");
+            ctx.failed_logins.record_success(peer.ip());
             (
                 sasl_authenticate_outcome(api_version, ERROR_NONE, false),
                 Some(authenticated),
@@ -695,6 +755,7 @@ async fn authenticate_token(
         // A rejection is the client's problem and is terminal, so it earns a parseable 58.
         Err(AuthError::Rejected) => {
             debug!(%peer, "SASL authentication rejected");
+            ctx.failed_logins.record_rejection(peer.ip());
             failed()
         }
         // An outage is not. Kafka clients treat 58 as fatal and surface it to the application, so
@@ -759,20 +820,46 @@ fn describe_acls(
     }
 }
 
-/// Whether an `ApiVersions` outcome carries `error_code` 0, meaning the client got a usable
-/// answer rather than one it is expected to retry at a lower version.
-fn answered_successfully(outcome: &HandleOutcome) -> bool {
-    let (HandleOutcome::Respond(body) | HandleOutcome::RespondThenClose(body)) = outcome else {
-        return false;
+/// Waits for an authentication slot, then verifies, each within the pre-authentication budget.
+///
+/// Two budgets rather than one shared deadline. The wait needs its own bound so a queued
+/// connection cannot hold a `max_connections` permit for as long as the backlog takes to drain,
+/// which is the invariant `pre_auth_timeout` is documented to enforce. The verification's budget
+/// starts once the slot is held, because cutting a verification short does not stop the login it
+/// started inside Iggy: a verification that inherited whatever the queue left of a shared deadline
+/// would be abandoned mid-hash and hand its slot to the next one while Iggy is still working.
+async fn verify_within_budget(
+    ctx: &ConnectionContext<'_>,
+    authenticator: &dyn SaslAuthenticator,
+    credentials: &PlainCredentials,
+) -> Option<std::result::Result<AuthenticatedPrincipal, AuthError>> {
+    let peer = ctx.peer;
+    let budget = ctx.config.pre_auth_timeout;
+    let Ok(acquired) = timeout(budget, ctx.auth_slots.acquire()).await else {
+        warn!(%peer, "no authentication slot came free within the pre-authentication budget");
+        return None;
     };
-    // `ApiVersions` puts its error code in the first two bytes of the body at every version.
-    body.len() >= 2 && i16::from_be_bytes([body[0], body[1]]) == ERROR_NONE
+    // Acquire fails only once the semaphore is closed, which this gateway never does.
+    let Ok(slot) = acquired else {
+        error!(%peer, "authentication slots unavailable");
+        return None;
+    };
+    let Ok(result) = timeout(budget, authenticator.authenticate(credentials, slot)).await else {
+        warn!(%peer, "authentication did not complete within the pre-authentication budget");
+        return None;
+    };
+    Some(result)
 }
 
 /// Answers a request that is well-formed but not legal in this connection's SASL state.
 ///
 /// `keep_open` marks the one case a real broker does not treat as fatal: a SASL request arriving
 /// on a connection that already authenticated.
+///
+/// The version is checked ahead of the encoders rather than left to fail inside one. A SASL key
+/// asked for above the version this gateway accepts has no response schema to answer in, so
+/// `keep_open` cannot hold there: a body shaped for another version would be misparsed, the same
+/// reason [`SaslAction::RejectHandshakeVersion`] closes rather than clamping.
 fn illegal_state_outcome(
     api_key: i16,
     api_version: i16,
@@ -780,18 +867,22 @@ fn illegal_state_outcome(
     sasl_enabled: bool,
 ) -> HandleOutcome {
     match api_key {
-        API_KEY_SASL_HANDSHAKE => {
+        API_KEY_SASL_HANDSHAKE if (0..=SASL_HANDSHAKE_VERSION).contains(&api_version) => {
             sasl_handshake_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
-        API_KEY_SASL_AUTHENTICATE => {
+        API_KEY_SASL_AUTHENTICATE if (0..=SASL_AUTHENTICATE_MAX_VERSION).contains(&api_version) => {
             sasl_authenticate_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
         // `encode_error_for_key` consults the firewall table, and this key is deliberately absent
         // from it, so routing through there would answer an unauthenticated client with a bodyless
         // close while the unreachable guard above is the one that speaks. Answer it directly.
-        API_KEY_DESCRIBE_ACLS if sasl_enabled => {
+        API_KEY_DESCRIBE_ACLS
+            if sasl_enabled && SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.contains(&api_version) =>
+        {
             respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
+        API_KEY_SASL_HANDSHAKE | API_KEY_SASL_AUTHENTICATE => HandleOutcome::Close,
+        API_KEY_DESCRIBE_ACLS if sasl_enabled => HandleOutcome::Close,
         _ => encode_error_for_key(api_key, api_version, ERROR_ILLEGAL_SASL_STATE, sasl_enabled),
     }
 }
@@ -836,6 +927,7 @@ async fn dispatch_outcome(
     req: &RequestHeader,
     resp_hdr_ver: i16,
     outcome: HandleOutcome,
+    cancel: &CancellationToken,
 ) -> Result<bool> {
     match outcome {
         HandleOutcome::NoResponse => {
@@ -885,8 +977,32 @@ async fn dispatch_outcome(
                 api_version = req.request_api_version,
                 "closing connection after responding"
             );
+            close_gracefully(stream, config.write_timeout, cancel).await;
             Ok(true)
         }
+    }
+}
+
+/// Sends FIN, then discards input until the peer closes, `budget` runs out or shutdown begins.
+///
+/// Dropping a socket with unread bytes in its receive queue makes Linux send RST instead of FIN,
+/// and an RST lets the peer discard the response this close follows before its client reads it.
+/// A real broker closes an authentication failure gracefully for the same reason.
+async fn close_gracefully(stream: &mut TcpStream, budget: Duration, cancel: &CancellationToken) {
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let mut discard = [0u8; 4096];
+    let drain_input = async {
+        while let Ok(read) = stream.read(&mut discard).await {
+            if read == 0 {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = cancel.cancelled() => {}
+        _ = timeout(budget, drain_input) => {}
     }
 }
 
@@ -1005,15 +1121,22 @@ pub async fn read_frame(
 /// Returns the [`WorkerGuard`]; it must be held for the lifetime of `main` (dropping it stops the
 /// worker thread and any buffered-but-unflushed log lines are lost) - see `main.rs`.
 pub fn init_tracing() -> WorkerGuard {
-    let filter = tracing_subscriber::EnvFilter::new(sdk_quieted_filter(
-        std::env::var("RUST_LOG").ok().as_deref(),
-    ));
+    // `EnvFilter::new` drops a directive it cannot parse, and `iggy=warn` always parses, so one
+    // typo in `RUST_LOG` would otherwise leave every other target with no output at all.
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let (filter, rejected) = match EnvFilter::try_new(sdk_quieted_filter(rust_log.as_deref())) {
+        Ok(filter) => (filter, None),
+        Err(error) => (EnvFilter::new(sdk_quieted_filter(None)), Some(error)),
+    };
     let (non_blocking_stdout, guard) = tracing_appender::non_blocking(io::stdout());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(non_blocking_stdout)
         .try_init()
         .map_err(|e| error!("failed to initialize tracing: {e}"));
+    if let Some(error) = rejected {
+        warn!(%error, "RUST_LOG is invalid; logging at the default level instead");
+    }
     guard
 }
 
@@ -1023,16 +1146,53 @@ mod tests {
 
     #[test]
     fn given_no_rust_log_should_quiet_the_sdk() {
-        assert_eq!(sdk_quieted_filter(None), "info,iggy=warn");
-        assert_eq!(sdk_quieted_filter(Some("")), "info,iggy=warn");
+        assert_eq!(
+            sdk_quieted_filter(None),
+            "info,iggy=warn,iggy_gateway_kafka=info"
+        );
+        assert_eq!(
+            sdk_quieted_filter(Some("")),
+            "info,iggy=warn,iggy_gateway_kafka=info"
+        );
     }
 
     #[test]
     fn given_a_rust_log_should_still_quiet_the_sdk() {
         // The whole point: reading RUST_LOG verbatim dropped the credential-disclosure control on
         // every run command this repository's own docs give.
-        assert_eq!(sdk_quieted_filter(Some("info")), "info,iggy=warn");
-        assert_eq!(sdk_quieted_filter(Some("debug")), "debug,iggy=warn");
+        assert_eq!(
+            sdk_quieted_filter(Some("info")),
+            "info,iggy=warn,iggy_gateway_kafka=info"
+        );
+        assert_eq!(
+            sdk_quieted_filter(Some("debug")),
+            "debug,iggy=warn,iggy_gateway_kafka=debug"
+        );
+    }
+
+    #[test]
+    fn given_the_quieted_filter_should_keep_gateway_logs_and_drop_sdk_info() {
+        // `iggy=warn` matches `iggy_gateway_kafka` by prefix, so the built string alone cannot
+        // show that the gateway's own lines survive. Only the filter's verdict can.
+        let filter = EnvFilter::try_new(sdk_quieted_filter(Some("info"))).expect("valid filter");
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(
+                target: "iggy_gateway_kafka::server",
+                tracing::Level::INFO
+            ));
+            assert!(!tracing::enabled!(
+                target: "iggy::clients::client",
+                tracing::Level::INFO
+            ));
+            assert!(tracing::enabled!(
+                target: "iggy::clients::client",
+                tracing::Level::WARN
+            ));
+        });
     }
 
     #[test]
@@ -1042,6 +1202,16 @@ mod tests {
         assert_eq!(
             sdk_quieted_filter(Some("iggy_gateway_kafka=debug")),
             "iggy_gateway_kafka=debug,iggy=warn"
+        );
+    }
+
+    #[test]
+    fn given_a_bare_gateway_target_should_not_override_it() {
+        // A bare target enables every level for it. Appending `iggy_gateway_kafka=info` would
+        // cap what the operator explicitly asked for.
+        assert_eq!(
+            sdk_quieted_filter(Some("iggy_gateway_kafka")),
+            "iggy_gateway_kafka,iggy=warn"
         );
     }
 
@@ -1378,13 +1548,13 @@ mod tests {
 
     /// `#[serial]`, unkeyed (shares `bridge::config`'s default group - both this module and
     /// `bridge::config` compile into the same lib unit-test binary. `main.rs`'s own `#[serial]`
-    /// test does NOT share this group: `main.rs` is the separate `iggy-gateway-kafka` bin's own
-    /// test harness, a different process, and `serial_test`'s mutex is process-local - see that
-    /// test's own doc comment for the mirror-image note): `init_tracing` reads `RUST_LOG` via
-    /// `EnvFilter::try_from_default_env`, and edition 2024's `env::set_var`/`remove_var` are
-    /// unsound against *any* concurrent env read in another thread, not just a write to the same
-    /// key - a set/remove elsewhere in this binary racing this read is exactly the hazard,
-    /// regardless of which var either side touches.
+    /// tests do NOT share this group: `main.rs` is the separate `iggy-gateway-kafka` bin's own
+    /// test harness, a different process, and `serial_test`'s mutex is process-local - see the
+    /// first of those tests' doc comment for the mirror-image note): `init_tracing` reads `RUST_LOG` with
+    /// `std::env::var`, and edition 2024's `env::set_var`/`remove_var` are unsound against *any*
+    /// concurrent env read in another thread, not just a write to the same key - a set/remove
+    /// elsewhere in this binary racing this read is exactly the hazard, regardless of which var
+    /// either side touches.
     #[test]
     #[serial]
     fn init_tracing_is_idempotent() {

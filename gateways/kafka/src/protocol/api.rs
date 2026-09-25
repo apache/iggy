@@ -15,31 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::{Buf, Bytes};
-use kafka_protocol::messages::api_versions_response::ApiVersion;
-use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
-use kafka_protocol::messages::{
-    ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateTopicsRequest, DescribeAclsRequest,
-    FetchRequest, ListOffsetsRequest, MetadataRequest, MetadataResponse, ProduceRequest,
-    SaslAuthenticateRequest, SaslHandshakeRequest, TopicName,
-};
-use kafka_protocol::protocol::{Decodable, StrBytes};
+use std::sync::Arc;
 
-use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::acl::{self, AclBinding, AclFilter, PrincipalPermissions};
+use bytes::Bytes;
+
+use kafka_protocol::messages::{
+    DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
+};
+
+use crate::bridge::IggyBridge;
+use crate::error::Result;
+use crate::protocol::acl::{
+    self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
+    encode_describe_acls_response,
+};
 use crate::protocol::bounds_guard::{
-    validate_api_versions_shape, validate_create_topics_shape, validate_describe_acls_shape,
-    validate_fetch_shape, validate_list_offsets_shape, validate_metadata_shape,
-    validate_produce_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
+    validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
-use crate::protocol::responses::{
-    encode_create_topics_error_response, encode_create_topics_response,
-    encode_describe_acls_error_response, encode_describe_acls_response,
-    encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
-    encode_list_offsets_response, encode_message, encode_produce_error_response,
-    encode_produce_response, encode_sasl_authenticate_response, encode_sasl_handshake_response,
+use crate::protocol::handlers::{
+    api_versions, create_topics, decode_guarded, dispatch, fetch, list_offsets, metadata, produce,
+    respond_or_close,
 };
-use crate::protocol::sasl::SaslMechanism;
+use crate::protocol::sasl::{
+    SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
+};
 
 pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
@@ -103,11 +102,16 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
-/// The credentials themselves were rejected.
+/// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
 ///
-/// The accompanying message stays generic. Iggy's own login path runs a dummy hash for an unknown
-/// user specifically to avoid a user-enumeration oracle, and distinguishing "no such user" from
-/// "wrong password" here would reintroduce one.
+/// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
+/// other than the two KIP-79 sentinels, since Iggy has no per-message timestamp index at all.
+/// Non-retriable, so a Java client resolves immediately instead of retrying
+/// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
+pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+/// A credential was refused. Deliberately undifferentiated: Iggy answers a bad password and an
+/// unknown user the same way, and distinguishing them here would reintroduce a user-enumeration
+/// oracle.
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 
 /// Result of handling one Kafka request body.
@@ -129,7 +133,8 @@ pub enum HandleOutcome {
 }
 
 impl HandleOutcome {
-    /// Return the response body, or panic with `msg` if the outcome is not [`Self::Respond`].
+    /// Return the response body of a [`Self::Respond`] or [`Self::RespondThenClose`], or panic
+    /// with `msg`.
     ///
     /// # Panics
     ///
@@ -151,15 +156,6 @@ impl HandleOutcome {
     #[must_use]
     pub const fn is_close(&self) -> bool {
         matches!(self, Self::Close)
-    }
-
-    /// Whether applying this outcome ends the connection, whether or not it writes first.
-    ///
-    /// Distinct from [`Self::is_close`], which asks only whether the connection ends *without* a
-    /// response. Callers deciding whether to keep reading want this one.
-    #[must_use]
-    pub const fn closes_connection(&self) -> bool {
-        matches!(self, Self::Close | Self::RespondThenClose(_))
     }
 }
 
@@ -186,36 +182,12 @@ pub struct ApiVersionRange {
 }
 
 static SUPPORTED_RANGES: &[ApiVersionRange] = &[
-    ApiVersionRange {
-        api_key: API_KEY_PRODUCE,
-        min_version: 3,
-        max_version: 9,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_FETCH,
-        min_version: 4,
-        max_version: 12,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_LIST_OFFSETS,
-        min_version: 1,
-        max_version: 6,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_METADATA,
-        min_version: 0,
-        max_version: 9,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_API_VERSIONS,
-        min_version: 0,
-        max_version: 3,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_CREATE_TOPICS,
-        min_version: 2,
-        max_version: 5,
-    },
+    produce::RANGE,
+    fetch::RANGE,
+    list_offsets::RANGE,
+    metadata::RANGE,
+    api_versions::RANGE,
+    create_topics::RANGE,
 ];
 
 #[must_use]
@@ -223,12 +195,116 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
     SUPPORTED_RANGES
 }
 
+/// Everything a handler needs that outlives one request.
+///
+/// `bridge` is `None` until `IGGY_KAFKA_BRIDGE_ENABLED` turns it on. A handler that finds `None`
+/// answers with its stub, so APIs can be wired one at a time.
+///
+/// One `IggyBridge` is one `IggyClient` and its TCP transport is lockstep, so Kafka connections
+/// serialize behind whichever Iggy request is in flight. The `Arc` does not change that. See the
+/// README's "Concurrency ceiling".
+pub struct GatewayState {
+    pub broker: BrokerAdvertise,
+    pub bridge: Option<Arc<IggyBridge>>,
+    pub max_frame_size: usize,
+    /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed. Kept on the
+    /// shared state so `ApiVersions` can answer without a widened handler signature.
+    pub sasl_enabled: bool,
+}
+
+impl GatewayState {
+    #[must_use]
+    pub const fn new(
+        broker: BrokerAdvertise,
+        bridge: Option<Arc<IggyBridge>>,
+        max_frame_size: usize,
+        sasl_enabled: bool,
+    ) -> Self {
+        Self {
+            broker,
+            bridge,
+            max_frame_size,
+            sasl_enabled,
+        }
+    }
+
+    /// State with no bridge, so every handler takes its stub path.
+    #[must_use]
+    pub const fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+        Self::new(broker, None, max_frame_size, false)
+    }
+}
+
+/// Default `max_frame_size` used by [`handle_request`] - the direct call sites across this
+/// crate's test suite that don't care about the response-size guard specifically. Production
+/// traffic goes through [`handle_request_bounded`] instead (see `server.rs`'s call site), with
+/// the connection's actual configured `max_frame_size`.
+const DEFAULT_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+/// Handles one decoded request frame and returns how the connection should proceed.
+pub async fn handle_request(
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+    broker: &BrokerAdvertise,
+) -> HandleOutcome {
+    let state = GatewayState::stub(broker.clone(), DEFAULT_MAX_FRAME_SIZE);
+    handle_request_bounded(&state, api_key, api_version, body).await
+}
+
+/// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
+/// a response larger than `max_frame_size` before decoding it.
+///
+/// See [`crate::protocol::bounds_guard`]'s `MAX_REQUEST_ELEMENTS`/`RESPONSE_BYTES_PER_ELEMENT`
+/// docs for the CPU/memory amplification this closes (a request within the old element budget
+/// alone could still produce a multi-megabyte response from a single synchronous, non-yielding
+/// call).
+pub async fn handle_request_bounded(
+    state: &GatewayState,
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
+    dispatch(state, api_key, api_version, body).await
+}
+
+#[must_use]
+pub fn is_supported_version(api_key: i16, api_version: i16) -> bool {
+    SUPPORTED_RANGES
+        .iter()
+        .find(|r| r.api_key == api_key)
+        .is_some_and(|r| api_version >= r.min_version && api_version <= r.max_version)
+}
+
+/// Highest version this gateway accepts for `api_key`, from the single firewall table.
+#[must_use]
+pub fn supported_max_version(api_key: i16) -> Option<i16> {
+    SUPPORTED_RANGES
+        .iter()
+        .find(|r| r.api_key == api_key)
+        .map(|r| r.max_version)
+}
+
+/// Min version advertised in `ApiVersions` (may differ from the firewall min).
+///
+/// Produce must advertise min=0 per KAFKA-18659 / `PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION`
+/// even though this gateway only accepts Produce v3+.
+#[must_use]
+pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
+    if api_key == API_KEY_PRODUCE {
+        0
+    } else {
+        firewall_min
+    }
+}
+
 /// Advertised only when SASL is switched on, and deliberately absent from [`SUPPORTED_RANGES`].
 ///
 /// These two keys never reach [`handle_request_bounded`]: the connection loop routes them through
-/// the SASL state machine before dispatch. Keeping them out of the firewall table means a gateway
-/// with SASL off treats them as any other unknown key and closes, which is what stops enabling the
-/// feature later from silently widening what an unauthenticated client can send today.
+/// the SASL state machine before dispatch, whether SASL is on or off. With it off every connection
+/// starts authenticated, so both keys are answered `ILLEGAL_SASL_STATE` and the connection stays
+/// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
+/// table means dispatch never serves them on its own.
 ///
 /// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
 /// that the frame reader cannot parse, so advertising it would invite exactly the shape this
@@ -401,6 +477,12 @@ fn finish_sasl(encoded: Result<Bytes>, close: bool, api_name: &str) -> HandleOut
     }
 }
 
+/// The SASL keys, advertised only while the feature is on.
+#[must_use]
+pub fn sasl_advertised_ranges() -> &'static [ApiVersionRange] {
+    SASL_ADVERTISED_RANGES
+}
+
 /// Builds a well-formed error response for `api_key`, shaped for `api_version`.
 ///
 /// Used when a request is refused for a reason that belongs to the connection rather than the
@@ -428,13 +510,15 @@ pub fn encode_error_for_key(
         return HandleOutcome::Close;
     }
     let encoded = match api_key {
-        API_KEY_FETCH => encode_fetch_error_response(api_version, error_code),
-        API_KEY_LIST_OFFSETS => encode_list_offsets_error_response(api_version, error_code),
-        API_KEY_CREATE_TOPICS => encode_create_topics_error_response(api_version, error_code),
+        API_KEY_FETCH => fetch::encode_error_response(api_version, error_code),
+        API_KEY_LIST_OFFSETS => list_offsets::encode_error_response(api_version, error_code),
+        API_KEY_CREATE_TOPICS => create_topics::encode_error_response(api_version, error_code),
         // Carries the live SASL setting, not a hardcoded `false`: answering an illegal-state
         // ApiVersions with a SASL-less key set contradicts the advertisement sent one frame
         // earlier on the same connection.
-        API_KEY_API_VERSIONS => encode_api_versions_response(api_version, error_code, sasl_enabled),
+        API_KEY_API_VERSIONS => {
+            api_versions::encode_response(api_version, error_code, sasl_enabled)
+        }
         _ => return HandleOutcome::Close,
     };
     match encoded {
@@ -443,518 +527,5 @@ pub fn encode_error_for_key(
             tracing::debug!(%error, api_key, "no encodable error response; closing connection");
             HandleOutcome::Close
         }
-    }
-}
-
-/// Default `max_frame_size` used by [`handle_request`] - the ~150 direct call sites across this
-/// crate's test suite that don't care about the response-size guard specifically. Production
-/// traffic goes through [`handle_request_bounded`] instead (see `server.rs`'s call site), with
-/// the connection's actual configured `max_frame_size`.
-const DEFAULT_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
-
-/// Handles one decoded request frame and returns how the connection should proceed.
-pub fn handle_request(
-    api_key: i16,
-    api_version: i16,
-    body: Bytes,
-    broker: &BrokerAdvertise,
-) -> HandleOutcome {
-    handle_request_bounded(
-        api_key,
-        api_version,
-        body,
-        broker,
-        DEFAULT_MAX_FRAME_SIZE,
-        false,
-    )
-}
-
-/// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
-/// a response larger than `max_frame_size` before decoding it.
-///
-/// See [`crate::protocol::bounds_guard`]'s `MAX_REQUEST_ELEMENTS`/`RESPONSE_BYTES_PER_ELEMENT`
-/// docs for the CPU/memory amplification this closes (a request within the old element budget
-/// alone could still produce a multi-megabyte response from a single synchronous, non-yielding
-/// call).
-pub fn handle_request_bounded(
-    api_key: i16,
-    api_version: i16,
-    body: Bytes,
-    broker: &BrokerAdvertise,
-    max_frame_size: usize,
-    sasl_enabled: bool,
-) -> HandleOutcome {
-    if api_key == API_KEY_PRODUCE {
-        return handle_produce_request(api_version, body, max_frame_size);
-    }
-    handle_other_request(
-        api_key,
-        api_version,
-        body,
-        broker,
-        max_frame_size,
-        sasl_enabled,
-    )
-}
-
-/// Decode `T` from the whole request body and reject unconsumed trailing bytes.
-///
-/// `kafka_protocol`'s `Decodable` stops once it has read the fields its schema defines; it does
-/// not know (or care) whether the caller handed it an exact-length body, so the trailing-bytes
-/// check has to live here.
-fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
-    let value =
-        T::decode(&mut body, version).map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
-    if body.has_remaining() {
-        return Err(KafkaProtocolError::Malformed(
-            "unexpected trailing bytes in request body".to_string(),
-        ));
-    }
-    Ok(value)
-}
-
-/// Runs `validate` (see [`crate::protocol::bounds_guard`]) before [`decode_exhaustive`].
-///
-/// `kafka_protocol` validates wire-declared array/string lengths as non-negative but never
-/// against the bytes actually remaining in the frame, so a tiny frame declaring a huge count
-/// drives an allocation attempt that aborts the whole process (`handle_alloc_error`, not a
-/// panic - uncatchable, and it kills every connection, not just the offending one). `validate`
-/// rejects that class of frame first, on a walk that never allocates a collection.
-fn decode_guarded<T: Decodable>(
-    version: i16,
-    body: Bytes,
-    validate: impl FnOnce(i16, &Bytes) -> Result<()>,
-) -> Result<T> {
-    validate(version, &body)?;
-    decode_exhaustive(version, body)
-}
-
-/// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding
-/// fails rather than propagating - there is no parseable response to send in that case.
-fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
-    match result {
-        Ok(body) => HandleOutcome::Respond(body),
-        Err(error) => {
-            tracing::warn!(%error, "failed to encode {api_name} response; closing connection");
-            HandleOutcome::Close
-        }
-    }
-}
-
-/// Produce is the only request the wire protocol allows to go unanswered
-/// (`acks=0`), so it gets its own path that may return [`HandleOutcome::NoResponse`].
-///
-/// The firewall check runs AFTER decoding the request, not before: `ApiVersions` advertises
-/// Produce min=0 (see [`advertised_min_version`]) while the firewall's real floor is 3, so a
-/// spec-compliant client can legitimately send Produce v0-2 with `acks=0`. Rejecting those
-/// versions before reading `acks` would send an error response the client never expects,
-/// desyncing the next correlation id it reads.
-fn handle_produce_request(api_version: i16, body: Bytes, max_frame_size: usize) -> HandleOutcome {
-    // Above the encoder max there is no response parseable at the client's version, so close
-    // rather than decode (same policy the other APIs apply). Fail-closed on a missing row
-    // (i16::MIN, not i16::MAX): `handle_request` dispatches Produce on a hard-coded `api_key ==`
-    // check, not from this table, so if a future edit ever drops the Produce row to disable the
-    // API, a fail-open default here would leave Produce v0-2 acks=0 silently accepted on an API
-    // the operator believes is off - unwrap_or(i16::MAX) is not the sound default the sibling
-    // lookup at `unsupported_version_response` uses (`map_or(0, ...)`, i.e. fail-closed).
-    if api_version > supported_max_version(API_KEY_PRODUCE).unwrap_or(i16::MIN) {
-        return HandleOutcome::Close;
-    }
-    // `kafka_protocol`'s ProduceRequest/ProduceResponse schemas only go back to v3, so v0-2
-    // (still advertised as the min in ApiVersions per KAFKA-18659) can be neither decoded nor
-    // encoded by the crate - there is no parseable response at these versions regardless of
-    // body content. `acks` is always the first i16 on the wire there (`transactional_id` was
-    // added in v3), so it's peeked by hand: acks=0 must keep the connection open per the wire
-    // protocol's fire-and-forget rule even though no response can ever be encoded for it.
-    if api_version < 3 {
-        let acks = match body.get(0..2) {
-            Some(&[hi, lo]) => Some(i16::from_be_bytes([hi, lo])),
-            _ => None,
-        };
-        return match acks {
-            Some(0) | None => HandleOutcome::NoResponse,
-            Some(_) => unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
-                encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
-            }),
-        };
-    }
-    match decode_guarded::<ProduceRequest>(api_version, body, |v, b| {
-        validate_produce_shape(v, b, max_frame_size)
-    }) {
-        // acks=0 is fire-and-forget: the client isn't reading a response, so
-        // sending one desyncs the next correlation id it expects.
-        Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
-        // `api_version` is always in `[3, supported_max]` here: the `< 3` case returned above,
-        // and the `> max` case returned at the top of this function - so it is always within
-        // `SUPPORTED_RANGES`' Produce row and an `is_supported_version` re-check can never fail.
-        Ok(req) => respond_or_close(encode_produce_response(api_version, &req), "Produce"),
-        Err(error) => {
-            // `kafka_protocol` decodes the whole request in one shot; a failure anywhere gives
-            // no partial-field access, so `acks` is unknowable here (unlike the pre-migration
-            // field-by-field decoder, which could still know `acks` on a later-field failure).
-            // Responding risks desyncing an acks=0 fire-and-forget client's correlation stream,
-            // so every Produce decode failure now stays silent - a behavior change from the
-            // hand-rolled decoder, which answered with INVALID_REQUEST when `acks` was known and
-            // nonzero.
-            // debug!, not warn!: the body is attacker-controlled, not operator-actionable, and
-            // a client looping malformed bodies on one connection (never disconnected - this
-            // arm returns NoResponse) has no rate limit here.
-            tracing::debug!(%error, "failed to decode Produce request (no response)");
-            HandleOutcome::NoResponse
-        }
-    }
-}
-
-fn handle_other_request(
-    api_key: i16,
-    api_version: i16,
-    body: Bytes,
-    broker: &BrokerAdvertise,
-    max_frame_size: usize,
-    sasl_enabled: bool,
-) -> HandleOutcome {
-    match api_key {
-        API_KEY_API_VERSIONS => handle_api_versions(api_version, body, sasl_enabled),
-        API_KEY_METADATA => handle_metadata(api_version, body, broker, max_frame_size),
-        API_KEY_FETCH => handle_versioned_request(
-            API_KEY_FETCH,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<FetchRequest>(v, b, |v, b| {
-                    validate_fetch_shape(v, b, max_frame_size)
-                })
-            },
-            encode_fetch_response,
-            encode_fetch_error_response,
-            "Fetch",
-        ),
-        API_KEY_LIST_OFFSETS => handle_versioned_request(
-            API_KEY_LIST_OFFSETS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<ListOffsetsRequest>(v, b, |v, b| {
-                    validate_list_offsets_shape(v, b, max_frame_size)
-                })
-            },
-            encode_list_offsets_response,
-            encode_list_offsets_error_response,
-            "ListOffsets",
-        ),
-        API_KEY_CREATE_TOPICS => handle_versioned_request(
-            API_KEY_CREATE_TOPICS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<CreateTopicsRequest>(v, b, |v, b| {
-                    validate_create_topics_shape(v, b, max_frame_size)
-                })
-            },
-            encode_create_topics_response,
-            encode_create_topics_error_response,
-            "CreateTopics",
-        ),
-        // Unknown API key: no api-specific response schema exists, so any body we send is
-        // misparsed by the client against the schema it expected. Close is unambiguous.
-        _ => HandleOutcome::Close,
-    }
-}
-
-fn handle_api_versions(api_version: i16, body: Bytes, sasl_enabled: bool) -> HandleOutcome {
-    if !is_supported_version(API_KEY_API_VERSIONS, api_version) {
-        // KIP-511: reply with v0 when the requested version is not understood.
-        return respond_or_close(
-            encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION, sasl_enabled),
-            "ApiVersions",
-        );
-    }
-    match decode_guarded::<ApiVersionsRequest>(api_version, body, validate_api_versions_shape) {
-        Ok(_) => respond_or_close(
-            encode_api_versions_response(api_version, ERROR_NONE, sasl_enabled),
-            "ApiVersions",
-        ),
-        Err(error) => {
-            // debug!, not warn!: attacker-controlled, not operator-actionable (see the same
-            // note on the Produce decode-failure arm above).
-            tracing::debug!(%error, "failed to decode ApiVersions request");
-            respond_or_close(
-                encode_api_versions_response(api_version, ERROR_INVALID_REQUEST, sasl_enabled),
-                "ApiVersions",
-            )
-        }
-    }
-}
-
-fn handle_metadata(
-    api_version: i16,
-    body: Bytes,
-    broker: &BrokerAdvertise,
-    max_frame_size: usize,
-) -> HandleOutcome {
-    if !is_supported_version(API_KEY_METADATA, api_version) {
-        // Clamping the response to the supported max leaves a body the client parses at its own
-        // (unsupported) version, so UNSUPPORTED_VERSION never survives. Clients that skip
-        // ApiVersions get a naked close instead.
-        tracing::warn!(
-            api_version,
-            max_supported = supported_max_version(API_KEY_METADATA),
-            "Metadata version unsupported; closing connection"
-        );
-        return HandleOutcome::Close;
-    }
-    match decode_metadata_topics(api_version, body, max_frame_size) {
-        Ok(topics) => respond_or_close(
-            encode_metadata_response(api_version, &topics, broker, ERROR_NONE),
-            "Metadata",
-        ),
-        Err(error) => {
-            // Metadata has no top-level error field; a malformed body cannot carry
-            // INVALID_REQUEST in a version-correct way for every client. Close.
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(
-                %error,
-                api_version,
-                "Failed to decode Metadata request; closing connection"
-            );
-            HandleOutcome::Close
-        }
-    }
-}
-
-fn handle_versioned_request<T>(
-    api_key: i16,
-    api_version: i16,
-    body: Bytes,
-    decode: impl FnOnce(i16, Bytes) -> Result<T>,
-    encode_ok: impl FnOnce(i16, &T) -> Result<Bytes>,
-    encode_err: impl Fn(i16, i16) -> Result<Bytes>,
-    api_name: &str,
-) -> HandleOutcome {
-    if is_supported_version(api_key, api_version) {
-        match decode(api_version, body) {
-            Ok(req) => respond_or_close(encode_ok(api_version, &req), api_name),
-            Err(error) => {
-                // debug!, not warn!: attacker-controlled, not operator-actionable.
-                tracing::debug!(%error, "Failed to decode {api_name} request");
-                respond_or_close(encode_err(api_version, ERROR_INVALID_REQUEST), api_name)
-            }
-        }
-    } else {
-        unsupported_version_response(api_key, api_version, |version| {
-            encode_err(version, ERROR_UNSUPPORTED_VERSION)
-        })
-    }
-}
-
-/// Unsupported-version policy for APIs whose encoders only implement up to
-/// [`ApiVersionRange::max_version`].
-///
-/// - `api_version > max`: Close. `SUPPORTED_RANGES` is the governance boundary, not just an
-///   encoding-capability limit - `kafka_protocol` can often encode versions above our firewall
-///   max just fine, but responding there would silently widen what this gateway accepts.
-/// - `api_version < min`: Respond with an error shaped for that version when `kafka_protocol`
-///   can encode it, otherwise `encode` fails and [`respond_or_close`] closes instead. In
-///   practice every `SUPPORTED_RANGES` min was chosen at or above the oldest version
-///   `kafka_protocol` implements for that message, so this always closes today (e.g.
-///   `ListOffsets` v0's legacy `old_style_offsets` shape predates the crate's schema) - kept
-///   generic rather than hard-coded so a future `kafka_protocol` upgrade that widens a schema's
-///   floor is picked up automatically instead of silently staying on `Close`.
-fn unsupported_version_response(
-    api_key: i16,
-    api_version: i16,
-    encode: impl FnOnce(i16) -> Result<Bytes>,
-) -> HandleOutcome {
-    let max_version = SUPPORTED_RANGES
-        .iter()
-        .find(|r| r.api_key == api_key)
-        .map_or(0, |r| r.max_version);
-    if api_version > max_version {
-        tracing::warn!(
-            api_key,
-            api_version,
-            max_version,
-            "request version above encoder max; closing connection"
-        );
-        return HandleOutcome::Close;
-    }
-    respond_or_close(encode(api_version), "unsupported-version")
-}
-
-#[must_use]
-pub fn is_supported_version(api_key: i16, api_version: i16) -> bool {
-    SUPPORTED_RANGES
-        .iter()
-        .find(|r| r.api_key == api_key)
-        .is_some_and(|r| api_version >= r.min_version && api_version <= r.max_version)
-}
-
-/// Highest version this gateway accepts for `api_key`, from the single firewall table.
-#[must_use]
-pub fn supported_max_version(api_key: i16) -> Option<i16> {
-    SUPPORTED_RANGES
-        .iter()
-        .find(|r| r.api_key == api_key)
-        .map(|r| r.max_version)
-}
-
-/// Min version advertised in `ApiVersions` (may differ from the firewall min).
-///
-/// Produce must advertise min=0 per KAFKA-18659 / `PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION`
-/// even though this gateway only accepts Produce v3+.
-#[must_use]
-pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
-    if api_key == API_KEY_PRODUCE {
-        0
-    } else {
-        firewall_min
-    }
-}
-
-fn encode_api_versions_response(
-    api_version: i16,
-    error_code: i16,
-    sasl_enabled: bool,
-) -> Result<Bytes> {
-    let sasl_ranges = if sasl_enabled {
-        SASL_ADVERTISED_RANGES
-    } else {
-        &[]
-    };
-    // Ascending by api_key, as every real broker emits it. Chaining the SASL rows onto the end
-    // would otherwise produce 0,1,2,3,18,19,17,36. Java and librdkafka both re-key on receipt so
-    // they cope, but anything binary-searching the array would not.
-    let mut rows: Vec<&ApiVersionRange> = SUPPORTED_RANGES.iter().chain(sasl_ranges).collect();
-    rows.sort_unstable_by_key(|r| r.api_key);
-    let api_keys = rows
-        .into_iter()
-        .map(|r| {
-            ApiVersion::default()
-                .with_api_key(r.api_key)
-                .with_min_version(advertised_min_version(r.api_key, r.min_version))
-                .with_max_version(r.max_version)
-        })
-        .collect();
-    let resp = ApiVersionsResponse::default()
-        .with_error_code(error_code)
-        .with_api_keys(api_keys);
-    encode_message(&resp, api_version, 128)
-}
-
-fn encode_metadata_response(
-    response_version: i16,
-    topics: &[StrBytes],
-    broker: &BrokerAdvertise,
-    topic_error_override: i16,
-) -> Result<Bytes> {
-    // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
-    // or a forced override (unused today; kept for symmetry with other encoders).
-    let topic_error = if topic_error_override == ERROR_NONE {
-        ERROR_UNKNOWN_TOPIC_OR_PARTITION
-    } else {
-        topic_error_override
-    };
-
-    let response_topics = topics
-        .iter()
-        .map(|name| {
-            MetadataResponseTopic::default()
-                .with_error_code(topic_error)
-                .with_name(Some(TopicName(name.clone())))
-        })
-        .collect();
-
-    let broker_entry = MetadataResponseBroker::default()
-        .with_node_id(BrokerId(1))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
-
-    let resp = MetadataResponse::default()
-        .with_brokers(vec![broker_entry])
-        .with_controller_id(BrokerId(1))
-        .with_topics(response_topics);
-
-    encode_message(&resp, response_version, 256)
-}
-
-/// Decodes a Metadata request body so the response can echo topic names.
-///
-/// A null topics array (`-1` legacy / `varint=0` compact) means "all topics" and decodes to an
-/// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
-/// name to echo, so it errors rather than silently dropping the topic from the response.
-fn decode_metadata_topics(
-    api_version: i16,
-    body: Bytes,
-    max_frame_size: usize,
-) -> Result<Vec<StrBytes>> {
-    let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
-        validate_metadata_shape(v, b, max_frame_size)
-    })?;
-    req.topics
-        .unwrap_or_default()
-        .into_iter()
-        .map(|topic| {
-            topic
-                .name
-                .map(|name| name.0)
-                .ok_or(KafkaProtocolError::NullTopicName)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
-
-    #[test]
-    fn decode_metadata_topics_legacy_null_topic_name_fails() {
-        let body = Bytes::from_static(&[
-            0x00, 0x00, 0x00, 0x01, // one topic
-            0xff, 0xff, // null topic name
-        ]);
-        let err = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::NullTopicName));
-    }
-
-    #[test]
-    fn decode_metadata_topics_legacy_null_array_means_all_topics() {
-        // -1 is the spec-defined "all topics" sentinel for the legacy i32 array count, not a
-        // malformed request - must decode to an empty list.
-        let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
-        let topics = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert!(topics.is_empty());
-    }
-
-    #[test]
-    fn decode_metadata_topics_empty_body_is_malformed() {
-        assert!(decode_metadata_topics(0, Bytes::new(), TEST_MAX_FRAME_SIZE).is_err());
-    }
-
-    #[test]
-    fn decode_metadata_topics_flexible_truncated_after_topics_fails() {
-        // topics = null (all topics) but missing allow_auto / auth flags / tagged fields.
-        let body = Bytes::from_static(&[0x00]);
-        assert!(decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
-    }
-
-    #[test]
-    fn decode_api_versions_v3_requires_software_fields() {
-        assert!(decode_exhaustive::<ApiVersionsRequest>(3, Bytes::new()).is_err());
-    }
-
-    #[test]
-    fn decode_api_versions_v3_accepts_valid_body() {
-        // Hand-encoded rather than round-tripped through `ApiVersionsRequest::encode`: encoding
-        // is gated behind the crate's "client" feature, which this broker-only binary doesn't
-        // enable.
-        let body = Bytes::from_static(&[
-            0x0a, b'i', b'g', b'g', b'y', b'-', b't', b'e', b's',
-            b't', // compact string (len 9)
-            0x06, b'0', b'.', b'1', b'.', b'0', // compact string (len 5)
-            0x00, // empty tagged fields
-        ]);
-        decode_exhaustive::<ApiVersionsRequest>(3, body).unwrap();
     }
 }

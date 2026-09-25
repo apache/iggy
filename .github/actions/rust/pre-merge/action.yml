@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, test-1, test-2, test-3, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -213,8 +213,11 @@ runs:
       run: cargo fmt --all -- --check
       shell: bash
 
+    # clippy-macos-aarch64 runs the same lint on macos-14. Code behind
+    # cfg(target_os) splits is dead to the Linux leg, so its warnings would
+    # otherwise reach master unseen.
     - name: Cargo clippy
-      if: inputs.task == 'clippy'
+      if: inputs.task == 'clippy' || inputs.task == 'clippy-macos-aarch64'
       run: cargo clippy --all-targets --all-features -- -D warnings
       shell: bash
 
@@ -248,7 +251,7 @@ runs:
       if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
         ./scripts/ci/apt-install.sh musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
-        rm -f $HOME/.local/share/keyrings/*
+        rm -f "$HOME"/.local/share/keyrings/*
       shell: bash
 
     - name: Install cargo-llvm-cov

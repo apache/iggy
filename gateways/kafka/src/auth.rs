@@ -21,8 +21,10 @@
 //! password are an Iggy username and password, so authenticating is forwarding them to an Iggy
 //! login and seeing whether it succeeds. `docs/AUTHENTICATION.md` has the reasoning.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use iggy::prelude::{
@@ -32,6 +34,8 @@ use iggy::prelude::{
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
 
+use crate::bridge::config::DEFAULT_IGGY_ADDR;
+use crate::env::parse_bool;
 use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
 
@@ -55,9 +59,11 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Retries the dial makes before giving up, not the SDK's unlimited default.
 ///
-/// A Kafka client retries the whole authentication itself, so an unbounded inner loop would only
-/// hide the failure underneath one the client cannot see.
-const VERIFY_RECONNECTION_RETRIES: u32 = 1;
+/// The SDK counts passes after the first, so zero still makes one full pass over the endpoints.
+/// Any retry adds a second pass plus a `reconnection.interval` sleep while an authentication slot
+/// is held, and a Kafka client retries the whole authentication itself anyway, so an inner loop
+/// would only hide the failure underneath one the client cannot see.
+const VERIFY_RECONNECTION_RETRIES: u32 = 0;
 
 /// Budget for tearing the verification client down again.
 ///
@@ -66,6 +72,113 @@ const VERIFY_RECONNECTION_RETRIES: u32 = 1;
 /// pre-authentication budget. Nothing is lost by cutting it short: dropping the client closes the
 /// socket regardless.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Delay imposed on a peer after its first rejected login, doubled on every further rejection.
+const THROTTLE_BASE_DELAY: Duration = Duration::from_millis(500);
+
+/// Ceiling on the doubling, and how long a peer stays remembered once its delay has run out.
+const THROTTLE_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Peers remembered at once.
+///
+/// Bounds the table against a sweep of source addresses. Once it is full of peers still inside
+/// their delay, new peers go untracked, which is no worse than having no throttle at all.
+const THROTTLE_MAX_PEERS: usize = 4096;
+
+/// Refuses verifications from a peer whose last login was rejected, for an escalating delay.
+///
+/// Every guess costs a full Argon2id hash on an Iggy shard thread, and reconnecting is free, so
+/// without this a single peer can keep every authentication slot busy with wrong passwords.
+/// Keyed on the IP rather than the socket address because the port changes on every reconnect,
+/// and on the /64 for IPv6 because a single host is routinely handed a whole /64 to draw from.
+/// Peers sharing a NAT share a delay, which is why it starts short.
+#[derive(Debug, Default)]
+pub struct FailedLoginThrottle {
+    peers: Mutex<HashMap<IpAddr, Strikes>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Strikes {
+    rejections: u32,
+    blocked_until: Instant,
+}
+
+impl Strikes {
+    fn is_forgotten(&self, now: Instant) -> bool {
+        now >= self.blocked_until + THROTTLE_MAX_DELAY
+    }
+}
+
+impl FailedLoginThrottle {
+    /// Whether `peer` is still inside the delay its last rejection earned.
+    #[must_use]
+    pub fn is_blocked(&self, peer: IpAddr) -> bool {
+        self.is_blocked_at(peer, Instant::now())
+    }
+
+    /// Records a rejected login from `peer` and extends its delay.
+    pub fn record_rejection(&self, peer: IpAddr) {
+        self.record_rejection_at(peer, Instant::now());
+    }
+
+    /// Forgets `peer` once it has proven a credential.
+    pub fn record_success(&self, peer: IpAddr) {
+        self.peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&throttle_key(peer));
+    }
+
+    fn is_blocked_at(&self, peer: IpAddr, now: Instant) -> bool {
+        let peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        peers
+            .get(&throttle_key(peer))
+            .is_some_and(|strikes| now < strikes.blocked_until)
+    }
+
+    fn record_rejection_at(&self, peer: IpAddr, now: Instant) {
+        let peer = throttle_key(peer);
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        if !peers.contains_key(&peer) && peers.len() >= THROTTLE_MAX_PEERS {
+            peers.retain(|_, strikes| !strikes.is_forgotten(now));
+            if peers.len() >= THROTTLE_MAX_PEERS {
+                return;
+            }
+        }
+        let rejections = peers
+            .get(&peer)
+            .filter(|strikes| !strikes.is_forgotten(now))
+            .map_or(1, |strikes| strikes.rejections.saturating_add(1));
+        let doublings = (rejections - 1).min(16);
+        let delay = THROTTLE_BASE_DELAY
+            .saturating_mul(1 << doublings)
+            .min(THROTTLE_MAX_DELAY);
+        peers.insert(
+            peer,
+            Strikes {
+                rejections,
+                blocked_until: now + delay,
+            },
+        );
+    }
+}
+
+/// The address a peer is throttled under: IPv4 as is, IPv6 truncated to its /64.
+///
+/// An IPv4-mapped IPv6 address is unwrapped first, so a dual-stack listener throttles the same
+/// client under the same key whichever socket family it arrived on.
+fn throttle_key(peer: IpAddr) -> IpAddr {
+    match peer {
+        IpAddr::V4(_) => peer,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || {
+                let prefix = v6.to_bits() & !u128::from(u64::MAX);
+                IpAddr::V6(Ipv6Addr::from_bits(prefix))
+            },
+            IpAddr::V4,
+        ),
+    }
+}
 
 /// Why a SASL exchange did not produce a verified identity.
 ///
@@ -159,12 +272,6 @@ pub struct IggyAuthenticator {
     tls: IggyTls,
 }
 
-/// Iggy address used when `IGGY_KAFKA_IGGY_ADDR` is unset.
-///
-/// Matches `bridge::config`'s own default. The two read the same variable for the same purpose, so
-/// they must not disagree about what it falls back to.
-const DEFAULT_IGGY_ADDR: &str = "127.0.0.1:8090";
-
 impl IggyAuthenticator {
     /// The complete set of `IGGY_KAFKA_*` vars this type reads, for `main`'s unknown-var guard.
     ///
@@ -215,14 +322,11 @@ impl IggyAuthenticator {
     pub fn from_env() -> Result<Self, String> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
-        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED").as_deref() {
-            Ok("true") => true,
-            Ok("false") | Err(_) => false,
-            Ok(other) => {
-                return Err(format!(
-                    "invalid IGGY_KAFKA_IGGY_TLS_ENABLED `{other}`: expected `true` or `false`"
-                ));
-            }
+        // Unset reads as off; only a value that is set and unrecognised is an error, which is
+        // what `parse_bool` decides for every switch in this gateway.
+        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED") {
+            Ok(raw) => parse_bool("IGGY_KAFKA_IGGY_TLS_ENABLED", &raw)?,
+            Err(_) => false,
         };
         let domain = std::env::var("IGGY_KAFKA_IGGY_TLS_DOMAIN").unwrap_or_default();
         let ca_file = std::env::var("IGGY_KAFKA_IGGY_TLS_CA_FILE").ok();
@@ -442,9 +546,22 @@ fn classify(error: &IggyError) -> AuthError {
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;
+    use serial_test::serial;
     use tokio::sync::Semaphore;
 
     use super::*;
+
+    /// Leaves every variable [`IggyAuthenticator::from_env`] reads unset, so one case's value
+    /// cannot decide another's result.
+    fn clear_authenticator_env() {
+        for key in IggyAuthenticator::KNOWN_ENV_VARS {
+            // SAFETY: every test that calls this is `#[serial]`, which is what makes an env
+            // mutation sound under edition 2024 - see the note on the tests below.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
 
     fn credentials() -> PlainCredentials {
         PlainCredentials {
@@ -530,6 +647,142 @@ mod tests {
             classify(&IggyError::TransientNotCommitted),
             AuthError::Unavailable
         ));
+    }
+
+    /// `#[serial]`, unkeyed: this crate's lib test binary shares one default group, and
+    /// `bridge::config`'s and `server`'s env-touching tests are in it too. Edition 2024's
+    /// `env::set_var`/`remove_var` are unsound against *any* concurrent env read on another
+    /// thread, whichever key either side happens to touch.
+    #[test]
+    #[serial]
+    fn given_an_empty_environment_when_read_should_reach_the_shared_default_in_the_clear() {
+        clear_authenticator_env();
+        let authenticator = IggyAuthenticator::from_env().expect("an empty environment is valid");
+        assert!(!authenticator.is_tls_enabled());
+        assert_eq!(
+            authenticator.to_string(),
+            format!("{DEFAULT_IGGY_ADDR} in the clear"),
+            "the address falls back to the same constant the bridge defaults to"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_a_mistyped_tls_switch_when_read_should_refuse_to_start() {
+        clear_authenticator_env();
+        // SAFETY: `#[serial]` excludes every other env-touching test in this binary.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "TRUE");
+        }
+        let result = IggyAuthenticator::from_env();
+        clear_authenticator_env();
+        assert!(
+            result.is_err(),
+            "defaulting a mistyped security switch to off is how a deployment sends passwords in \
+             the clear while believing it does not"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_tls_material_without_the_switch_when_read_should_refuse_to_start() {
+        clear_authenticator_env();
+        // SAFETY: `#[serial]` excludes every other env-touching test in this binary.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_CA_FILE", "/etc/iggy/ca.pem");
+        }
+        let result = IggyAuthenticator::from_env();
+        clear_authenticator_env();
+        assert!(
+            result.is_err(),
+            "configured TLS material with the switch unset is the same mistake reached through \
+             the unset path instead of a typo"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_a_complete_tls_configuration_when_read_should_carry_it_through() {
+        clear_authenticator_env();
+        // SAFETY: `#[serial]` excludes every other env-touching test in this binary.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_ADDR", "iggy.internal:8090");
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "true");
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_DOMAIN", "iggy.internal");
+        }
+        let result = IggyAuthenticator::from_env();
+        clear_authenticator_env();
+
+        let authenticator = result.expect("a complete TLS configuration is valid");
+        assert!(authenticator.is_tls_enabled());
+        assert_eq!(authenticator.to_string(), "iggy.internal:8090 over TLS");
+    }
+
+    #[test]
+    fn given_a_rejected_peer_when_throttled_should_block_until_the_delay_runs_out() {
+        let throttle = FailedLoginThrottle::default();
+        let peer: IpAddr = [192, 0, 2, 1].into();
+        let other: IpAddr = [192, 0, 2, 2].into();
+        let start = Instant::now();
+
+        throttle.record_rejection_at(peer, start);
+        assert!(throttle.is_blocked_at(peer, start));
+        assert!(
+            !throttle.is_blocked_at(other, start),
+            "the delay is per peer"
+        );
+        assert!(!throttle.is_blocked_at(peer, start + THROTTLE_BASE_DELAY));
+
+        // A second rejection before the peer is forgotten doubles the delay.
+        let second = start + THROTTLE_BASE_DELAY;
+        throttle.record_rejection_at(peer, second);
+        assert!(throttle.is_blocked_at(peer, second + THROTTLE_BASE_DELAY));
+        assert!(!throttle.is_blocked_at(peer, second + THROTTLE_BASE_DELAY * 2));
+    }
+
+    #[test]
+    fn given_a_throttled_peer_when_it_authenticates_should_be_forgotten() {
+        let throttle = FailedLoginThrottle::default();
+        let peer: IpAddr = [192, 0, 2, 1].into();
+        let start = Instant::now();
+        throttle.record_rejection_at(peer, start);
+        throttle.record_rejection_at(peer, start);
+        throttle.record_success(peer);
+        assert!(!throttle.is_blocked_at(peer, start));
+
+        // The escalation restarts from the base delay rather than where it left off.
+        throttle.record_rejection_at(peer, start);
+        assert!(!throttle.is_blocked_at(peer, start + THROTTLE_BASE_DELAY));
+    }
+
+    #[test]
+    fn given_an_ipv6_peer_should_share_a_delay_across_its_slash_64() {
+        let throttle = FailedLoginThrottle::default();
+        let start = Instant::now();
+        let first: IpAddr = "2001:db8:1:2::1".parse().expect("valid address");
+        let same_prefix: IpAddr = "2001:db8:1:2:ffff::9".parse().expect("valid address");
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().expect("valid address");
+
+        throttle.record_rejection_at(first, start);
+        assert!(throttle.is_blocked_at(same_prefix, start));
+        assert!(!throttle.is_blocked_at(other_prefix, start));
+
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().expect("valid address");
+        let plain: IpAddr = [192, 0, 2, 7].into();
+        throttle.record_rejection_at(mapped, start);
+        assert!(throttle.is_blocked_at(plain, start));
+    }
+
+    #[test]
+    fn given_repeated_rejections_should_cap_the_delay() {
+        let throttle = FailedLoginThrottle::default();
+        let peer: IpAddr = [192, 0, 2, 1].into();
+        let start = Instant::now();
+        for _ in 0..64 {
+            throttle.record_rejection_at(peer, start);
+        }
+        assert!(throttle.is_blocked_at(peer, start + THROTTLE_MAX_DELAY / 2));
+        assert!(!throttle.is_blocked_at(peer, start + THROTTLE_MAX_DELAY));
     }
 
     #[tokio::test]

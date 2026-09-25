@@ -38,7 +38,7 @@ use tracing::warn;
 
 use crate::dispatch::login_error::LoginRegisterError;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::responses::reply_body;
+use crate::reply_frame::reply_body;
 
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
@@ -243,10 +243,11 @@ mod tests {
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::responses::messages::SendMessagesConfirmationResponse;
 
-    use crate::responses::{
-        NonReplicatedResponse, build_deny_reply, build_empty_reply, build_reply_from_bytes,
-        build_reply_with_body, transient_code,
+    use crate::reply_frame::{
+        build_deny_reply, build_empty_reply, build_reply_from_bytes, build_reply_with_body,
+        transient_code,
     };
+    use crate::responses::NonReplicatedResponse;
 
     use crate::http::wire::build_request_message;
 

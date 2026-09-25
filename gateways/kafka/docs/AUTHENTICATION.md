@@ -1,8 +1,9 @@
 # Kafka authentication and Iggy identity
 
-Status: proposed. Answers [#3549](https://github.com/apache/iggy/issues/3549) and needs a TLS listener
-first (see [Transport security](#transport-security)). The mechanism choice below is forced by how Iggy
-stores credentials, not preferred.
+Status: implemented. Answers [#3549](https://github.com/apache/iggy/issues/3549). The gateway listener
+still has no TLS, so PLAIN stays confined to a trusted network until that lands (see
+[Transport security](#transport-security)). The mechanism choice below is forced by how Iggy stores
+credentials, not preferred.
 
 ## Decision
 
@@ -20,8 +21,10 @@ the only place a credential is defined or verified.
 verified on every connection, against Iggy, and that verification is deliberately not cached. See
 [Verification is per connection](#verification-is-per-connection-and-cannot-be-cached).
 
-**Authorization stays in Iggy.** The gateway does not implement its own ACL model. It authenticates a Kafka
-client into an Iggy identity and lets the server's existing permission checks decide what that identity can do.
+**Authorization is meant to stay in Iggy.** The gateway will not implement its own ACL model. The intent is
+to carry the authenticated Iggy identity onto the data plane and let the server's existing permission checks
+decide what it can do. That is later work: today the verified client is shut down as soon as the credential
+clears, and nothing carries the principal past authentication.
 
 ## Why SCRAM is out
 
@@ -124,8 +127,8 @@ never retrievable, so a restarted gateway cannot recover what it minted and must
 again, handling `PersonalAccessTokenAlreadyExists` (51). Names have to be instance-scoped or two gateways
 fight over one token. A user holds at most `max_tokens_per_user` tokens, 100 by default
 (`core/server/config.toml:305`), and tokens leaked by instances that never cleaned up count against that.
-Token expiry has to outlive the cache TTL with margin. The gateway would also be holding bearer credentials
-carrying the full rights of their users with no scope narrowing, in memory, for every principal it has seen.
+The gateway would also be holding bearer credentials carrying the full rights of their users with no scope
+narrowing, in memory, for every principal it has seen.
 
 Measure the login rate before taking any of that on.
 
@@ -144,7 +147,7 @@ Per connection, with SASL enabled. Only ApiVersions and SaslHandshake are legal 
 | | SaslAuthenticate (36), credentials rejected | answer 58 with a generic message, then close |
 | | anything else | answer 34, then close |
 | `Authenticated` | any supported API, including ApiVersions again | serve |
-| `AwaitHandshake` | a second ApiVersions | answer 34, then close (one is allowed, as on a real broker) |
+| `AwaitHandshake` | ApiVersions past the allowance | answer 34, then close (two are allowed: the one a real broker allows, plus the KIP-511 downgrade retry) |
 | `AwaitToken` | SaslAuthenticate above the advertised ceiling | close, no schema exists at that version |
 | any | Metadata or Produce while unauthenticated | close with no body (no error field, and acks=0 forbids one) |
 | | SaslHandshake or SaslAuthenticate | answer 34, keep the connection |
@@ -158,32 +161,39 @@ Notes that decide the implementation.
   out of scope. That matters beyond convenience, see the re-authentication note below.
 - **ApiVersions is answered twice.** The Java client sends it once before the handshake and again after
   authenticating, so it must stay legal in both states.
+- **The pre-authentication allowance counts answers, not successes.** A refusal a client may retry at a
+  lower version is one it may also repeat, and every frame resets the pre-authentication deadline, so
+  spending the allowance only on a usable answer leaves the connection unbounded.
 - **Produce with `acks=0` stays silent.** Answering an unauthenticated fire-and-forget produce desyncs the
   client's correlation stream, so that case closes without writing. The existing rationale in
   `protocol/api.rs` applies unchanged.
-- **Pre-authentication deadline.** An unauthenticated connection currently holds a `max_connections` permit
-  for up to the idle timeout, ten minutes by default. Authentication needs its own, much shorter deadline.
+- **Pre-authentication deadline.** An unauthenticated connection holds a `max_connections` permit, so it
+  gets `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` between frames rather than the ten-minute idle timeout.
 
 ## Error mapping
 
 At authentication time a rejected credential becomes `SASL_AUTHENTICATION_FAILED` (58) with a generic
-message. An Iggy that cannot be reached, or an overloaded gateway, closes the connection without a body
-instead: Kafka clients treat 58 as fatal and raise it to the application, so borrowing it for a transient
+message. An Iggy that cannot be reached, an overloaded gateway, or a peer still inside the delay a previous
+rejection earned, closes the connection without a body instead: Kafka clients treat 58 as fatal and raise it to the application, so borrowing it for a transient
 condition turns a blip into a permanent failure for credentials that were always correct. A close reads as
 a transport failure, which is retriable, and still says nothing about whether the account exists. Iggy's login path already runs a dummy hash for unknown users to avoid a user-enumeration oracle,
 so the gateway must not reintroduce one by distinguishing unknown user from wrong password in the message
 or by returning early.
 
+### Planned: authorization errors
+
+Not implemented. Today `bridge/error.rs` picks the Kafka code from the Iggy error, and neither 30 nor 31
+is produced anywhere.
+
 After authentication, Iggy reports exactly one permission-denied code, `IggyError::Unauthorized` (41,
 `core/common/src/error/iggy_error.rs:97`), alongside `Unauthenticated` (40). Kafka distinguishes
 `TOPIC_AUTHORIZATION_FAILED` (29), `GROUP_AUTHORIZATION_FAILED` (30) and `CLUSTER_AUTHORIZATION_FAILED`
-(31). The gateway therefore picks the Kafka code from the operation it was performing, not from the Iggy
-error, because the Iggy error cannot tell them apart.
+(31). Once handlers act as the authenticated principal, the gateway will have to pick the Kafka code from
+the operation it was performing, not from the Iggy error, because the Iggy error cannot tell them apart.
 
 Iggy's data-plane permission checks read the local shard's view, so a permission revocation is visible on
-the control plane immediately and on the data plane only after that shard applies it. Combined with the
-principal cache TTL above, revocation is eventually consistent by two mechanisms rather than one. Say so
-in the README rather than leaving an operator to discover it.
+the control plane immediately and on the data plane only after that shard applies it. Say so in the README
+rather than leaving an operator to discover it.
 
 ## Transport security
 
@@ -195,9 +205,10 @@ follow-up. The Iggy side already supports it on both ends (client at
 `core/configs/src/server_config/tcp.rs:31`), shipped disabled.
 
 The two hops are configured independently. `IGGY_KAFKA_IGGY_TLS_ENABLED` and its companions encrypt
-the gateway's link to Iggy and are what make the gateway usable at all against a TLS-only Iggy
-server, where every verification would otherwise fail as unreachable. The Kafka-side listener is the
-half that is still missing.
+only the connection the credential check makes to Iggy, and are what make SASL usable at all against a
+TLS-only Iggy server, where every verification would otherwise fail as unreachable. The bridge's own
+client has no TLS at any setting, so the bridge hop stays unencrypted and carries
+`IGGY_KAFKA_IGGY_PASSWORD` in the clear. The Kafka-side listener is the other half still missing.
 
 Two limits worth recording. There is no mTLS anywhere in the tree, every rustls config uses
 `with_no_client_auth()`, so certificate-based Kafka client authentication cannot map to an Iggy identity
@@ -221,8 +232,9 @@ has to resolve it first.
 - SCRAM-SHA-256 and SCRAM-SHA-512, blocked on credential storage that does not exist.
 - SASL/OAUTHBEARER and GSSAPI.
 - mTLS and certificate-based identity.
-- Mapping Kafka ACL administration APIs onto Iggy permissions. Authorization is enforced, but the
-  `DescribeAcls` and `CreateAcls` API keys stay unimplemented.
+- Authorization. No handler asks Iggy about permissions yet, since the verified identity is not carried
+  onto the data plane; SASL is an admission gate only. The `DescribeAcls` and `CreateAcls` API keys also
+  stay unimplemented.
 - KIP-368 re-authentication.
 
 ## Open questions
@@ -234,9 +246,7 @@ has to resolve it first.
    Auto-provisioning also cannot work here: the gateway only ever sees a password it cannot validate
    against anything until a user already exists, so provisioning would accept any credential as a new
    account. Default: an operator creates the accounts, and the gateway only consumes them.
-2. **What is the principal cache TTL?** It bounds how long a revoked Iggy user keeps working through the
-   gateway. Default: 5 minutes.
-3. **What happens when SASL is enabled on a gateway that already serves unauthenticated clients?** Enabling
+2. **What happens when SASL is enabled on a gateway that already serves unauthenticated clients?** Enabling
    it breaks every existing client at once, since the version advertisement changes. Default: SASL is
    off unless configured, and the two SASL keys are not advertised when it is off.
 

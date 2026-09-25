@@ -27,14 +27,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::SemaphorePermit;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
-use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
+use iggy_gateway_kafka::protocol::sasl::{MAX_PRE_AUTH_API_VERSIONS, PlainCredentials};
 
 #[path = "common/codec.rs"]
 mod codec;
@@ -355,6 +355,44 @@ async fn given_wrong_credentials_when_authenticating_should_fail_then_close() {
 }
 
 #[tokio::test]
+async fn given_pipelined_bytes_behind_a_rejected_token_should_close_with_a_fin_not_a_reset() {
+    // Unread input at close makes Linux send RST instead of FIN, and an RST lets the client's
+    // stack discard the 58 before the client reads it. Loopback delivers the 58 ahead of the RST
+    // either way, so what this pins is the close itself: a clean EOF, not a reset.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut stream).await;
+
+    let rejected = build_request_frame(
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        Some("sasl-test"),
+        &authenticate_body(&plain_token("alice", "wrong-password")),
+    );
+    let pipelined = build_request_frame(API_KEY_METADATA, 0, 3, Some("sasl-test"), &[0, 0, 0, 0]);
+    let mut both = BytesMut::from(&rejected[..]);
+    both.extend_from_slice(&pipelined);
+    stream.write_all(&both).await.expect("write requests");
+    // Let the server answer and close before the client reads anything.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    let (echoed, body) =
+        parse_response_payload(API_KEY_SASL_AUTHENTICATE, AUTHENTICATE_VERSION, payload);
+    assert_eq!(echoed, 2);
+    assert_eq!(error_code(&body), ERROR_SASL_AUTHENTICATION_FAILED);
+    let mut rest = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut rest))
+        .await
+        .expect("the server must close the connection");
+    assert!(
+        matches!(read, Ok(0)),
+        "the close must be a FIN the client reads as EOF, not a reset: {read:?}"
+    );
+}
+
+#[tokio::test]
 async fn given_a_malformed_plain_token_when_authenticating_should_fail_like_a_bad_password() {
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -493,6 +531,37 @@ async fn given_a_second_handshake_after_authenticating_should_be_refused_without
     // Still usable: a real broker does not drop an authenticated connection over this.
     let metadata = send(&mut stream, API_KEY_METADATA, 0, 4, &[0, 0, 0, 0]).await;
     assert!(!metadata.is_empty(), "connection must survive the refusal");
+}
+
+#[tokio::test]
+async fn given_a_handshake_above_the_version_ceiling_after_authenticating_should_close() {
+    // The keep-open promise stops where the schemas do. SaslHandshake has no v2, so there is no
+    // body this client could parse and one shaped for v1 would be misparsed; the version is
+    // checked before the encoder rather than left to fail inside it.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut stream).await;
+
+    let token = plain_token("alice", "s3cret");
+    let authenticated = send(
+        &mut stream,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&token),
+    )
+    .await;
+    assert_eq!(error_code(&authenticated), ERROR_NONE);
+
+    let frame = build_request_frame(
+        API_KEY_SASL_HANDSHAKE,
+        HANDSHAKE_VERSION + 1,
+        3,
+        Some("sasl-test"),
+        &handshake_body("PLAIN"),
+    );
+    stream.write_all(&frame).await.expect("write request");
+    assert_closed(&mut stream).await;
 }
 
 #[tokio::test]
@@ -777,20 +846,27 @@ async fn given_iggy_is_unreachable_when_authenticating_should_not_send_a_termina
 }
 
 #[tokio::test]
-async fn given_a_second_pre_auth_api_versions_should_be_refused_and_close() {
+async fn given_pre_auth_api_versions_past_the_allowance_should_be_refused_and_close() {
     // Without this the pre-auth read budget resets on every frame, so a client that never
     // authenticates holds a connection permit indefinitely by sending ApiVersions on a timer.
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    let first = send(&mut stream, API_KEY_API_VERSIONS, 1, 1, &[]).await;
-    assert!(!first.is_empty(), "the first ApiVersions is answered");
+    for correlation_id in 1..=i32::from(MAX_PRE_AUTH_API_VERSIONS) {
+        let answered = send(&mut stream, API_KEY_API_VERSIONS, 1, correlation_id, &[]).await;
+        assert_eq!(
+            error_code(&answered),
+            ERROR_NONE,
+            "ApiVersions {correlation_id} is inside the allowance"
+        );
+    }
 
-    let second = send(&mut stream, API_KEY_API_VERSIONS, 1, 2, &[]).await;
+    let refused = send(&mut stream, API_KEY_API_VERSIONS, 1, 99, &[]).await;
     assert_eq!(
-        error_code(&second),
+        error_code(&refused),
         ERROR_ILLEGAL_SASL_STATE,
-        "a real broker allows exactly one ApiVersions before the handshake"
+        "a real broker allows one ApiVersions before the handshake, and the allowance adds only \
+         the KIP-511 downgrade retry"
     );
     assert_closed(&mut stream).await;
 }
@@ -962,7 +1038,7 @@ impl SaslAuthenticator for StallingAuthenticator {
 
 #[tokio::test]
 async fn given_all_authentication_slots_are_busy_when_waiting_too_long_should_close_not_reject() {
-    // The permit wait shares the pre-authentication budget. Without that bound a connection sits
+    // The permit wait is bounded by the pre-authentication budget. Without that a connection sits
     // in the queue holding a `max_connections` permit for as long as the backlog takes to drain,
     // which is the invariant `pre_auth_timeout` is documented to enforce. It must close rather
     // than answer 58, which a Kafka client treats as fatal even though nothing was rejected.
@@ -1079,6 +1155,91 @@ async fn given_a_single_authentication_slot_should_verify_one_credential_at_a_ti
 }
 
 #[tokio::test]
+async fn given_a_verification_in_flight_when_shutting_down_should_close_without_waiting_it_out() {
+    // The connection loop only watches the shutdown token between frames. A verification that
+    // did not watch it too would hold the drain for the whole pre-authentication budget.
+    let config = GatewayConfig {
+        pre_auth_timeout: Duration::from_secs(30),
+        shutdown_drain_timeout: Duration::from_secs(30),
+        ..sasl_config()
+    };
+    let authenticator = Arc::new(StallingAuthenticator {
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let (addr, shutdown) = spawn_test_server_with_authenticator(config, authenticator).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut stream).await;
+    let token = plain_token("alice", "s3cret");
+    let frame = build_request_frame(
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        Some("sasl-test"),
+        &authenticate_body(&token),
+    );
+    stream.write_all(&frame).await.expect("write request");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    shutdown.send(()).expect("signal shutdown");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "shutdown must end a verification in flight"
+    );
+}
+
+#[tokio::test]
+async fn given_a_rejected_login_when_the_peer_retries_at_once_should_close_until_the_delay_passes()
+{
+    let addr = spawn_sasl_gateway().await;
+
+    let mut rejected = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut rejected).await;
+    let body = send(
+        &mut rejected,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&plain_token("alice", "wrong-password")),
+    )
+    .await;
+    assert_eq!(error_code(&body), ERROR_SASL_AUTHENTICATION_FAILED);
+    assert_closed(&mut rejected).await;
+
+    // Even the right password is not checked while the peer is throttled, and it gets a close
+    // rather than 58, which a Kafka client would treat as fatal.
+    let mut throttled = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut throttled).await;
+    let frame = build_request_frame(
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        Some("sasl-test"),
+        &authenticate_body(&plain_token("alice", "s3cret")),
+    );
+    throttled.write_all(&frame).await.expect("write request");
+    assert_closed(&mut throttled).await;
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut retried = TcpStream::connect(addr).await.expect("connect");
+    handshake_ok(&mut retried).await;
+    let body = send(
+        &mut retried,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&plain_token("alice", "s3cret")),
+    )
+    .await;
+    assert_eq!(
+        error_code(&body),
+        ERROR_NONE,
+        "the delay must run out on its own"
+    );
+}
+
+#[tokio::test]
 async fn given_a_pre_auth_request_above_the_firewall_should_close_rather_than_answer_it() {
     // `kafka_protocol`'s encoders reach further than this gateway's firewall, so encoding at the
     // requested version would hand an unauthenticated client a well-formed body for a version the
@@ -1093,9 +1254,9 @@ async fn given_a_pre_auth_request_above_the_firewall_should_close_rather_than_an
 }
 
 #[tokio::test]
-async fn given_a_refused_first_api_versions_should_not_spend_the_single_allowance() {
+async fn given_a_refused_api_versions_when_retried_lower_should_still_be_answered() {
     // A client refused at one version is entitled to retry lower, which is what the KIP-511
-    // downgrade does. Spending the allowance on the refusal strands it on the retry.
+    // downgrade does. An allowance that did not cover the retry would strand it.
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -1521,4 +1682,28 @@ async fn given_a_malformed_acl_filter_should_answer_an_error_and_stay_open() {
     )
     .await;
     assert_eq!(acl_error_code(&good), ERROR_NONE);
+}
+
+#[tokio::test]
+async fn given_a_repeated_refused_api_versions_should_run_the_allowance_out() {
+    // The half a success-only allowance misses: a version this gateway refuses is one the peer
+    // can repeat, and every frame resets the pre-authentication read budget, so refusals that
+    // cost nothing hold a `max_connections` permit for as long as the client keeps typing.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    for correlation_id in 1..=i32::from(MAX_PRE_AUTH_API_VERSIONS) {
+        let refused = send(&mut stream, API_KEY_API_VERSIONS, 99, correlation_id, &[]).await;
+        assert_ne!(
+            error_code(&refused),
+            ERROR_NONE,
+            "v99 is out of range at every attempt"
+        );
+    }
+
+    // Past the allowance there is nothing left to answer with: ILLEGAL_SASL_STATE has no shape at
+    // a version outside the firewall, so this closes without a body.
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 99, 99, Some("sasl-test"), &[]);
+    stream.write_all(&frame).await.expect("write request");
+    assert_closed(&mut stream).await;
 }

@@ -54,7 +54,7 @@ value.static = "hello"
 
 `retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
 
-Two items changed in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
+Two symbols were removed and one field changed meaning, each in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
 
 | Removed | Replacement |
 | --- | --- |
@@ -62,6 +62,8 @@ Two items changed in a way that breaks out-of-tree plugins, so those plugins mus
 | `jitter` (was public) | `retry_backoff`, which applies the jitter itself. |
 
 Both types carry `(u32, Duration, Duration)` and the two delay roles cross over, so a field-by-field rename compiles and swaps the base delay for the cap. Map the fields by name.
+
+`MessagesMetadata.schema` and `RawMessages.schema` now name the variant the `Payload` holds rather than the wire format the stream's decoder reads. `Schema::Proto` means a `Payload::Proto` string on the sink path where it meant protobuf wire bytes before, so a plugin built against 0.4.0 rebuilds the run as the wrong variant with no error anywhere.
 
 ## Protocol Buffers Support
 
@@ -156,11 +158,15 @@ Create the stream and topic, then start the runtime from the repository root:
 IGGY_CONNECTORS_CONFIG_PATH=connectors.toml ./target/release/iggy-connectors
 ```
 
-The source sends 100 records, then continues polling without new messages. Stdout logs message offsets and the serialized JSON envelope bytes, containing `type_url` and base64 `value`. The sink's `raw` schema also determines how the plugin receives those transformed bytes.
+The source sends 100 records, then continues polling without new messages. Stdout logs message offsets and the serialized JSON envelope bytes, containing `type_url` and base64 `value`. The batch handed to the plugin is tagged with the payload's own schema rather than the stream's configured `raw`: `proto_convert` leaves a `Payload::Json`, so the plugin receives a `json` batch.
 
 The format-conversion transforms define no per-key defaults. Every non-optional key shown above must be present, or the configuration fails to deserialize (`schema_path`, `message_type`, `field_mappings`, and `descriptor_set` are optional).
 
 The two `[[streams]]` shapes differ: a source produces to a single `topic` and can tune batching via `batch_length` and `linger_time`, while a sink consumes from a list of `topics` and can additionally set `batch_length`, `poll_interval`, and `consumer_group`.
+
+Transforms are keyed by type, so one connector configures at most one `proto_convert`.
+
+The order of a transform chain is not defined. The runtime builds the chain from a map keyed by transform type, so two transforms on one connector can run in either order from one process to the next. Do not configure a chain whose result depends on which transform runs first.
 
 ### Key Configuration Options
 
@@ -175,7 +181,7 @@ These are SDK configuration fields, not Random or Stdout `plugin_config` keys. T
 #### Transform Options
 
 - **`proto_convert`**: Transform for converting between protobuf and other formats
-- **`source_format`** / **`target_format`**: Formats to convert between - any schema value (`json`, `raw`, `text`, `proto`, `flat_buffer`, `avro`)
+- **`source_format`** / **`target_format`**: Formats to convert between - any schema value (`json`, `raw`, `text`, `proto`, `flat_buffer`, `avro`). Only `flatbuffer_convert` checks `source_format` against the payload it was handed and rejects a mismatch. `proto_convert` and `avro_convert` dispatch on the format pair with no up-front guard, which is why the `schema = "raw"` plus `source_format = "proto"` example above works
 - **`preserve_unknown_fields`**: Accepted by `proto_convert`, but currently has no effect
 - **`include_paths`**: Additional directories searched for imported `.proto` files
 - **`field_mappings`**: Renames fields in a JSON input object before conversion (e.g., `"old_field" = "new_field"`)
@@ -352,6 +358,7 @@ fn main() -> Result<(), Error> {
 - **Manual Loading**: `load_schema()` reloads the configured source. Missing or unreadable files, invalid protobuf syntax, compilation failures, and malformed descriptor bytes return errors and preserve an already-loaded schema. `update_config(config, true)` also restores the previous configuration on error; `false` changes the configuration while retaining the cached schema.
 - **Fallbacks**: Absent schema sources or an unmatched `message_type` can return `Ok(())` without an active message descriptor. Successful reloads into fallback mode clear the previous descriptor. Check the actual encoded/decoded result when validating a schema setup.
 - **Encoding Errors**: Errors encoding a loaded message descriptor are returned to the caller. The encoder does not retry that message as Any. The decoder attempts Any after a schema decoding error.
-- **Transform Configuration**: Create a new converter to change its configuration. `load_schema()` can reload its existing source. Without a descriptor, JSON-to-protobuf conversion produces JSON text in `Payload::Proto`, not a schema-encoded binary message.
+- **Transform Configuration**: Create a new converter to change its configuration. `load_schema()` can reload its existing source. Without a descriptor, JSON-to-protobuf conversion produces JSON text in `Payload::Proto`, not a schema-encoded binary message. With a descriptor it encodes a top-level JSON object to `Payload::Raw` and falls back to `Payload::Proto` for anything else, so one configured instance can return either variant depending on the message.
+- **Two Schema Inverses**: `Schema::Proto` means protobuf wire bytes when a source plugin sets `ProducedMessages::schema`, and a `Payload::Proto` string when the runtime tags a sink batch from `Payload::schema()`. `Schema::try_into_payload` reads the first and `Payload::try_from_schema` the second. Sink plugins use `Payload::try_from_schema`, which round-trips every variant; the source path keeps the Any-decoding arm.
 - **Format Options**: Encoder `preserve_unknown_fields`, `compact_encoding`, `validate_message`, and `deterministic_encoding` are accepted but have no effect. Decoder `preserve_unknown_fields` retains unknown varints as numbers and length-delimited data as base64; fixed-width unknown fields become placeholders. It does not retain the original wire encoding. See the [Transforms page](https://iggy.apache.org/docs/connectors/transforms) for conversion-specific limits.
 - Protocol Buffers provide efficient binary serialization compared to JSON

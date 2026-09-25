@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SASL mechanism parsing and the per-connection authentication state machine.
+//! SASL mechanism parsing, the per-connection authentication state machine, and the response
+//! encoders for its two API keys.
 //!
 //! Pure and synchronous: nothing here performs I/O or talks to Iggy. Verifying the credentials
 //! this module extracts is the caller's job, which keeps the state machine unit-testable and
@@ -24,6 +25,13 @@
 //! See `docs/AUTHENTICATION.md` for the decisions this implements.
 
 use std::fmt::{Display, Formatter};
+
+use bytes::Bytes;
+use kafka_protocol::messages::{SaslAuthenticateResponse, SaslHandshakeResponse};
+use kafka_protocol::protocol::StrBytes;
+
+use crate::error::Result as EncodeResult;
+use crate::protocol::handlers::encode_message;
 use std::str::FromStr;
 
 use secrecy::SecretString;
@@ -134,10 +142,11 @@ pub fn parse_plain(auth_bytes: &[u8]) -> Result<PlainCredentials, SaslError> {
 /// dispatch path has no second "is SASL on" question to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaslState {
-    /// No mechanism negotiated yet. `api_versions_seen` marks that this connection has already
-    /// spent its one pre-authentication `ApiVersions`.
+    /// No mechanism negotiated yet. `api_versions_answered` counts the pre-authentication
+    /// `ApiVersions` frames this connection has already been answered, capped by
+    /// [`MAX_PRE_AUTH_API_VERSIONS`].
     AwaitHandshake {
-        api_versions_seen: bool,
+        api_versions_answered: u8,
     },
     AwaitToken(SaslMechanism),
     Authenticated,
@@ -148,7 +157,22 @@ impl SaslState {
     #[must_use]
     pub const fn new() -> Self {
         Self::AwaitHandshake {
-            api_versions_seen: false,
+            api_versions_answered: 0,
+        }
+    }
+
+    /// Records one answered pre-authentication `ApiVersions`.
+    ///
+    /// Every answer counts, whatever error code it carries. Counting only usable answers lets a
+    /// peer repeat a version this gateway refuses for as long as it likes, and each frame resets
+    /// the pre-authentication read budget, so the connection holds a `max_connections` permit with
+    /// it.
+    pub const fn count_api_versions_answer(&mut self) {
+        if let Self::AwaitHandshake {
+            api_versions_answered,
+        } = self
+        {
+            *api_versions_answered = api_versions_answered.saturating_add(1);
         }
     }
 }
@@ -184,10 +208,17 @@ pub enum SaslAction {
     /// Wrong request, but not fatal: a SASL request on an already-authenticated connection gets
     /// `ILLEGAL_SASL_STATE` and keeps the connection, matching a real broker.
     IllegalStateKeepOpen,
-    /// The one pre-authentication `ApiVersions` this connection was allowed. Answer it and record
-    /// that it is spent.
-    DispatchFirstApiVersions,
+    /// A pre-authentication `ApiVersions` within this connection's allowance. Answer it, then
+    /// count it with [`SaslState::count_api_versions_answer`].
+    DispatchPreAuthApiVersions,
 }
+
+/// Pre-authentication `ApiVersions` frames one connection may be answered.
+///
+/// Two, not the single frame a conformant exchange needs. A client that opens above this gateway's
+/// ceiling is answered `UNSUPPORTED_VERSION` in a v0 body and retries lower (KIP-511), so the
+/// downgrade costs a second frame before the handshake.
+pub const MAX_PRE_AUTH_API_VERSIONS: u8 = 2;
 
 /// Highest `SaslHandshake` version accepted. See [`SaslAction::RejectHandshakeVersion`].
 pub const SASL_HANDSHAKE_VERSION: i16 = 1;
@@ -217,17 +248,20 @@ impl SaslState {
                 SaslAction::IllegalStateKeepOpen
             }
             (Self::Authenticated, _) => SaslAction::Dispatch,
-            // Exactly one ApiVersions before the handshake, which is what a real broker allows
+            // A real broker allows exactly one ApiVersions before the handshake
             // (`SaslServerAuthenticator` moves out of `HANDSHAKE_OR_VERSIONS_REQUEST` after
-            // answering one). Allowing an unlimited number lets a connection that never
-            // authenticates hold a `max_connections` permit forever, because each frame resets the
-            // pre-authentication read budget.
+            // answering one); the allowance here covers the KIP-511 downgrade retry on top of it.
+            // Allowing an unlimited number lets a connection that never authenticates hold a
+            // `max_connections` permit forever, because each frame resets the pre-authentication
+            // read budget.
             (
                 Self::AwaitHandshake {
-                    api_versions_seen: false,
+                    api_versions_answered,
                 },
                 API_KEY_API_VERSIONS,
-            ) => SaslAction::DispatchFirstApiVersions,
+            ) if api_versions_answered < MAX_PRE_AUTH_API_VERSIONS => {
+                SaslAction::DispatchPreAuthApiVersions
+            }
             (Self::AwaitHandshake { .. }, API_KEY_SASL_HANDSHAKE) => {
                 if api_version == SASL_HANDSHAKE_VERSION {
                     mechanism
@@ -249,6 +283,59 @@ impl SaslState {
             _ => SaslAction::IllegalState,
         }
     }
+}
+
+// ── Response encoders ──────────────────────────────────────────────────────────
+
+/// `SaslHandshake` response: the outcome plus the mechanisms this gateway enables.
+///
+/// The mechanism list is sent on every outcome, not just success. A client that asked for an
+/// unsupported mechanism prints the list to tell its operator what to configure instead, so
+/// omitting it on the error path turns a fixable misconfiguration into an opaque failure.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_sasl_handshake_response(
+    version: i16,
+    error_code: i16,
+    mechanisms: &[&str],
+) -> EncodeResult<Bytes> {
+    let resp = SaslHandshakeResponse::default()
+        .with_error_code(error_code)
+        .with_mechanisms(
+            mechanisms
+                .iter()
+                .map(|name| StrBytes::from_string((*name).to_string()))
+                .collect(),
+        );
+    encode_message(&resp, version, 64)
+}
+
+/// `SaslAuthenticate` response.
+///
+/// `session_lifetime_ms` is always 0, meaning the session never needs re-authenticating (KIP-368).
+/// That is not only a simplification: Iggy's sole correct re-authentication is logout followed by
+/// login, which drops and re-mints the session, and re-login on a still-bound connection takes a
+/// replay branch that reports the new user while leaving the server bound to the old one. Until
+/// that is resolved, promising a finite lifetime would promise something unsafe to deliver.
+///
+/// `auth_bytes` is empty on success, which is what PLAIN's server completion looks like.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_sasl_authenticate_response(
+    version: i16,
+    error_code: i16,
+    error_message: Option<&str>,
+) -> EncodeResult<Bytes> {
+    let resp = SaslAuthenticateResponse::default()
+        .with_error_code(error_code)
+        .with_error_message(error_message.map(|msg| StrBytes::from_string(msg.to_string())))
+        .with_auth_bytes(Bytes::new())
+        .with_session_lifetime_ms(0);
+    encode_message(&resp, version, 64)
 }
 
 #[cfg(test)]
@@ -341,19 +428,25 @@ mod tests {
         let state = SaslState::new();
         assert_eq!(
             state.classify(API_KEY_API_VERSIONS, 3, None),
-            SaslAction::DispatchFirstApiVersions
+            SaslAction::DispatchPreAuthApiVersions
         );
     }
 
     #[test]
-    fn given_a_second_pre_auth_api_versions_should_be_refused() {
-        // A real broker allows exactly one. Without this, a client that never authenticates keeps
-        // resetting the pre-auth read budget and holds a connection permit indefinitely.
-        let spent = SaslState::AwaitHandshake {
-            api_versions_seen: true,
-        };
+    fn given_a_spent_api_versions_allowance_should_refuse_the_next_one() {
+        // A real broker allows one and the KIP-511 downgrade retry needs a second. Past that, a
+        // client that never authenticates keeps resetting the pre-auth read budget and holds a
+        // connection permit indefinitely.
+        let mut state = SaslState::new();
+        for _ in 0..MAX_PRE_AUTH_API_VERSIONS {
+            assert_eq!(
+                state.classify(API_KEY_API_VERSIONS, 3, None),
+                SaslAction::DispatchPreAuthApiVersions
+            );
+            state.count_api_versions_answer();
+        }
         assert_eq!(
-            spent.classify(API_KEY_API_VERSIONS, 3, None),
+            state.classify(API_KEY_API_VERSIONS, 3, None),
             SaslAction::IllegalState
         );
     }

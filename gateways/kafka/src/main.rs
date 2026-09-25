@@ -25,7 +25,8 @@ use tokio::sync::{Semaphore, broadcast};
 use tracing::{info, warn};
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
-use iggy_gateway_kafka::bridge::IggyBridgeConfig;
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig};
+use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::server::{bind_listener, init_tracing};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -37,11 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _tracing_guard = init_tracing();
 
     let config = load_config()?;
+    let sasl_enabled = config.sasl_enabled;
+    let bridge = connect_bridge(sasl_enabled).await?;
 
     let listener = bind_listener(&config.bind_addr)
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
-    let sasl_enabled = config.sasl_enabled;
-    let mut server = KafkaGateway::new(config);
+    let mut server = KafkaGateway::new(config).with_bridge(bridge);
     if sasl_enabled {
         let authenticator = IggyAuthenticator::from_env()?;
         // Unconditional, because the Kafka listener has no TLS at any setting. This is the hop the
@@ -53,8 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if !authenticator.is_tls_enabled() {
             warn!(
-                "the link from this gateway to Iggy is also unencrypted; set \
-                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to close the second hop"
+                "the credential check's link to Iggy is also unencrypted; set \
+                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it. The bridge's own connection has \
+                 no TLS at any setting"
             );
         }
         info!("SASL/PLAIN enabled; credentials verified against {authenticator}");
@@ -78,10 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The `IGGY_KAFKA_*` vars `load_config` itself reads. `IGGY_KAFKA_` is a
-/// `DELEGATED_ENV_VAR_PREFIXES` entry in `core/configs` (see that file's comment), which trades
-/// away the central provider's typo-detection for this whole namespace - a misspelled key here
-/// would otherwise silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars`
-/// is this crate's own replacement for that lost check.
+/// `SERVER_ALLOWED_ENV_PREFIXES` entry in `core/configs`, which trades away the server's
+/// unknown-variable check for this whole namespace - a misspelled key here would otherwise
+/// silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars` is this crate's
+/// own replacement for that lost check.
 ///
 /// Deliberately excludes `IggyBridgeConfig::KNOWN_ENV_VARS`: `reject_unknown_kafka_env_vars`
 /// checks both lists rather than one merged copy, so a bridge var rename can't silently desync
@@ -96,6 +99,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_READ_TIMEOUT_SECS",
     "IGGY_KAFKA_WRITE_TIMEOUT_SECS",
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
+    "IGGY_KAFKA_BRIDGE_ENABLED",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -103,12 +107,11 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
 
 /// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] or
 /// [`IggyBridgeConfig::KNOWN_ENV_VARS`] - a typo (e.g. `IGGY_KAFKA_BIN_ADDR`) would otherwise be
-/// silently ignored: `core/configs`' central provider skips the whole `IGGY_KAFKA_` prefix, and
+/// silently ignored: the server's check in `core/configs` skips the whole `IGGY_KAFKA_` prefix, and
 /// this crate's own `env_var()` only ever looks up exact known names, so nothing reads the
-/// misspelled var and nothing warns either. Checking both lists (not `IggyBridgeConfig`'s
-/// wiring into `main`) is deliberate: a user who exports a bridge var ahead of
-/// `#3535`/`#3536` landing must not see a spurious "unknown env var" rejection for a name this
-/// crate already recognizes.
+/// misspelled var and nothing warns either. Checking both lists is deliberate: a user who
+/// exports a bridge var while `IGGY_KAFKA_BRIDGE_ENABLED` is off must not see a spurious
+/// "unknown env var" rejection for a name this crate already recognizes.
 fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     for (key, _) in std::env::vars() {
         if key.starts_with("IGGY_KAFKA_")
@@ -125,38 +128,54 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
     Ok(())
 }
 
-/// Warns if any bridge-specific env var is set while nothing reads it.
+/// Connects the Iggy bridge when `IGGY_KAFKA_BRIDGE_ENABLED` is true, otherwise returns `None`
+/// and every handler keeps answering with its stub.
 ///
-/// `IGGY_KAFKA_IGGY_ADDR` stops being unread once SASL is on, since that is the server credentials
-/// are verified against, so only that variable drops out of the warning. Every other bridge
-/// variable is still unread, and a set-but-ignored credential is worth saying so about.
-///
-/// `reject_unknown_kafka_env_vars`'s own accepted-but-unread carve-out for these vars exists so a
-/// user exporting them ahead of that wiring landing isn't told the name is unrecognized - but that
-/// silence is exactly what the guard's own doc comment warns an unread var would otherwise cause.
-/// This closes that gap: still accepted, no longer silent.
-fn warn_on_unused_bridge_env_vars(sasl_enabled: bool) {
-    let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
-        .iter()
-        .copied()
-        // With SASL on, the address is the one bridge variable that is genuinely read, so it drops
-        // out of the warning. Suppressing the whole list instead made this quieter than it was
-        // before SASL existed, hiding a set credential that still goes nowhere.
-        .filter(|var| !(sasl_enabled && *var == "IGGY_KAFKA_IGGY_ADDR"))
-        .filter(|var| std::env::var(var).is_ok())
-        .collect();
-    if !set.is_empty() {
-        warn!(
-            "{} set but not yet used: the Kafka <-> Iggy bridge isn't wired into the running \
-             gateway until #3535/#3536 land",
-            set.join(", ")
-        );
+/// Off by default, so wiring one API at a time does not change what an operator sees. A failed
+/// connect is fatal: an operator who turned the bridge on must learn it is unreachable at
+/// startup, not from `NOT_LEADER_OR_FOLLOWER` on every produce.
+async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, String> {
+    if !bridge_enabled()? {
+        let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
+            .iter()
+            .copied()
+            // With SASL on, the address is the one bridge variable that is genuinely read, since
+            // it names the server credentials are verified against. Warning that nothing reads it
+            // would be false, and suppressing the whole list instead would hide a set credential
+            // that really does go nowhere.
+            .filter(|var| !(sasl_enabled && *var == "IGGY_KAFKA_IGGY_ADDR"))
+            .filter(|var| std::env::var(var).is_ok())
+            .collect();
+        if !set.is_empty() {
+            warn!(
+                "{} set but IGGY_KAFKA_BRIDGE_ENABLED is not true: the gateway is answering with \
+                 stub responses and reads none of them",
+                set.join(", ")
+            );
+        }
+        return Ok(None);
     }
+    let config = IggyBridgeConfig::from_env().map_err(|e| format!("invalid bridge config: {e}"))?;
+    let bridge = IggyBridge::connect(config)
+        .await
+        .map_err(|e| format!("failed to connect the Iggy bridge: {e}"))?;
+    info!("Iggy bridge connected");
+    Ok(Some(Arc::new(bridge)))
+}
+
+/// `IGGY_KAFKA_BRIDGE_ENABLED`, rejecting anything that is neither `true` nor `false`.
+///
+/// A typo otherwise reads as "off", which leaves stub responses and nothing in the log.
+fn bridge_enabled() -> Result<bool, String> {
+    env_var("IGGY_KAFKA_BRIDGE_ENABLED").map_or(Ok(false), |raw| {
+        raw.parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_BRIDGE_ENABLED `{raw}`: {e}"))
+    })
 }
 
 /// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
-/// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
+/// connection, a semaphore cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
     let mut config = GatewayConfig::default();
@@ -205,8 +224,18 @@ fn load_config() -> Result<GatewayConfig, String> {
     if let Some(raw) = env_var("IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS") {
         // Rejecting zero matters more here than elsewhere: a zero-permit semaphore never yields,
         // so every authentication would wait out its budget and no client could ever log in.
-        config.max_concurrent_authentications =
+        let max_concurrent_authentications: usize =
             parse_positive("IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS", &raw)?;
+        // Both caps build a `Semaphore`, so both need the same ceiling: above `MAX_PERMITS`,
+        // `Semaphore::new` panics and the gateway dies on a startup value instead of rejecting it.
+        if max_concurrent_authentications > Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS {max_concurrent_authentications} \
+                 exceeds maximum {}",
+                Semaphore::MAX_PERMITS
+            ));
+        }
+        config.max_concurrent_authentications = max_concurrent_authentications;
     }
     // Drain of 0 is valid: abandon in-flight connections immediately on shutdown.
     if let Some(raw) = env_var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
@@ -215,28 +244,38 @@ fn load_config() -> Result<GatewayConfig, String> {
             .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
+    reject_iggy_tls_without_sasl(config.sasl_enabled)?;
 
-    warn_on_unused_bridge_env_vars(config.sasl_enabled);
     Ok(config)
+}
+
+/// Refuses `IGGY_KAFKA_IGGY_TLS_*` while SASL is off.
+///
+/// Only the credential verifier reads them, and it is built only with SASL on. Accepting them
+/// otherwise lets an operator believe the link to Iggy is encrypted when nothing reads the switch,
+/// the same mistake `IggyAuthenticator::from_env` refuses to start for.
+fn reject_iggy_tls_without_sasl(sasl_enabled: bool) -> Result<(), String> {
+    if sasl_enabled {
+        return Ok(());
+    }
+    let set: Vec<&str> = IggyAuthenticator::KNOWN_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| var.starts_with("IGGY_KAFKA_IGGY_TLS_"))
+        .filter(|var| std::env::var(var).is_ok())
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} set but IGGY_KAFKA_SASL_ENABLED is not true; only the SASL credential check reads them, \
+         so nothing would be encrypted",
+        set.join(", ")
+    ))
 }
 
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok()
-}
-
-/// Parses a boolean switch, accepting only the two spellings an operator can check by eye.
-///
-/// Not `str::parse::<bool>` alone, because the failure mode matters here: a typo in the value of
-/// the one variable that turns authentication on must stop the process, never quietly leave it
-/// serving unauthenticated traffic.
-fn parse_bool(key: &str, raw: &str) -> Result<bool, String> {
-    match raw {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!(
-            "invalid {key} `{other}`: expected `true` or `false`"
-        )),
-    }
 }
 
 /// Parse a strictly-positive value, rejecting `0` (which for connection caps and timeouts would
@@ -284,14 +323,15 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
-    use super::{parse_bool, parse_positive, reject_unknown_kafka_env_vars};
+    use super::{parse_positive, reject_iggy_tls_without_sasl, reject_unknown_kafka_env_vars};
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
-    /// default group). This is the only `#[serial]` test compiled into *this* binary
-    /// (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `bridge::config`'s and
-    /// `server`'s env-touching tests compile into the separate lib test binary, and
-    /// `serial_test`'s mutex is process-local, so it does not (and does not need to) coordinate
-    /// with either of those; `server.rs`'s own `#[serial]` test makes the mirror-image note.
+    /// default group). The `#[serial]` tests in this module are the only ones compiled into *this*
+    /// binary (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `auth`'s,
+    /// `bridge::config`'s and `server`'s env-touching tests compile into the separate lib test
+    /// binary, and `serial_test`'s mutex is process-local, so it does not (and does not need to)
+    /// coordinate with any of those; `server.rs`'s own `#[serial]` test makes the mirror-image
+    /// note.
     ///
     /// # Safety
     /// Edition 2024's `env::set_var`/`remove_var` are unsound against *any* concurrent env read
@@ -342,20 +382,23 @@ mod tests {
         );
     }
 
-    /// The one variable that turns authentication on must fail loudly on a typo, never default to
-    /// off. Every spelling a person might reach for is rejected except the two documented ones.
+    /// `#[serial]` for the same reason as the test above: it mutates process-wide env state.
     #[test]
-    fn parse_bool_accepts_only_the_two_documented_spellings() {
-        assert_eq!(parse_bool("KEY", "true"), Ok(true));
-        assert_eq!(parse_bool("KEY", "false"), Ok(false));
-        for typo in [
-            "1", "0", "TRUE", "False", "yes", "no", "on", "off", "", " true",
-        ] {
-            assert!(
-                parse_bool("KEY", typo).is_err(),
-                "{typo:?} must not be silently treated as a boolean"
-            );
+    #[serial]
+    fn given_iggy_tls_without_sasl_should_refuse_to_start() {
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "true");
         }
+        let without_sasl = reject_iggy_tls_without_sasl(false);
+        let with_sasl = reject_iggy_tls_without_sasl(true);
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_ENABLED");
+        }
+        assert!(
+            without_sasl.is_err(),
+            "nothing reads the TLS switch with SASL off, so accepting it hides that"
+        );
+        assert!(with_sasl.is_ok());
     }
 
     #[test]
