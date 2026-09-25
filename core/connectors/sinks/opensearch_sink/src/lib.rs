@@ -471,7 +471,8 @@ impl OpenSearchSink {
             }
         };
 
-        if id.is_empty() {
+        // Checked via `.trim()`, but `id` itself stays untrimmed - whitespace can be meaningful.
+        if id.trim().is_empty() {
             return Err(Error::InvalidRecordValue(format!(
                 "OpenSearch document_id_field '{field}' is empty"
             )));
@@ -1837,6 +1838,23 @@ mod tests {
                 message(Payload::Json(simd_json::json!({ "order_id": oversized }))),
             )
             .expect_err("oversized document ID should be rejected");
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
+    }
+
+    #[test]
+    fn given_whitespace_only_document_id_field_should_return_invalid_record() {
+        let mut config = base_config();
+        config.document_id_field = Some("order_id".to_string());
+        let sink = sink_with_config(config);
+
+        let error = sink
+            .prepare_document(
+                &topic_metadata(),
+                &messages_metadata(),
+                message(Payload::Json(simd_json::json!({ "order_id": "   " }))),
+            )
+            .expect_err("whitespace-only document ID should be rejected");
 
         assert!(matches!(error, Error::InvalidRecordValue(_)));
     }
