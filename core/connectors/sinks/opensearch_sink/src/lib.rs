@@ -38,7 +38,7 @@ use opensearch::{
     params::Refresh,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
@@ -982,15 +982,44 @@ impl BulkAttempt {
     }
 }
 
+// Exact size of `{"index":{"_index":"","_id":""}}` plus the trailing `\n` -
+// the minimum this line will always take, regardless of document content.
+const ACTION_LINE_SKELETON_BYTES: usize = r#"{"index":{"_index":"","_id":""}}"#.len() + 1;
+
+#[derive(Serialize)]
+struct BulkActionLine<'a> {
+    index: BulkActionTarget<'a>,
+}
+
+#[derive(Serialize)]
+struct BulkActionTarget<'a> {
+    #[serde(rename = "_index")]
+    index: &'a str,
+    #[serde(rename = "_id")]
+    id: &'a str,
+}
+
 /// Serializes the `_bulk` NDJSON payload (alternating `index` action line and
 /// document line per document) into one `Bytes` buffer. Takes references so a
 /// retry can serialize just the rejected subset without cloning documents.
 fn build_bulk_body(index: &str, documents: &[&PreparedDocument]) -> Result<Bytes, Error> {
-    let mut buffer = BytesMut::new();
+    // Reserves only the action line's exact size (known up front) plus the
+    // index/id lengths, not a guess at document body size - the unpredictable
+    // part still grows the buffer normally, same as before this reservation.
+    let capacity: usize = documents
+        .iter()
+        .map(|document| ACTION_LINE_SKELETON_BYTES + index.len() + document.id.len())
+        .sum();
+    let mut buffer = BytesMut::with_capacity(capacity);
     for document in documents {
         serde_json::to_writer(
             (&mut buffer).writer(),
-            &json!({ "index": { "_index": index, "_id": document.id } }),
+            &BulkActionLine {
+                index: BulkActionTarget {
+                    index,
+                    id: &document.id,
+                },
+            },
         )
         .map_err(|error| {
             Error::Serialization(format!(
@@ -2361,6 +2390,24 @@ mod tests {
             id: id.to_string(),
             document: json!({ "id": id }),
         }
+    }
+
+    #[test]
+    fn given_document_id_with_json_special_characters_should_be_escaped_not_corrupted() {
+        let index = "iggy_probe";
+        let document = PreparedDocument {
+            id: "a\"b\\c\nd".to_string(),
+            document: json!({ "value": 1 }),
+        };
+
+        let body = build_bulk_body(index, &[&document]).expect("build body");
+        let mut lines = std::str::from_utf8(&body).expect("valid utf8").lines();
+
+        let action_line: Value = serde_json::from_str(lines.next().expect("action line"))
+            .expect("action line should stay valid JSON despite special characters in the ID");
+
+        assert_eq!(action_line["index"]["_index"], index);
+        assert_eq!(action_line["index"]["_id"], document.id);
     }
 
     #[test]
