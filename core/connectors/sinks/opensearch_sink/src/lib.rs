@@ -705,7 +705,7 @@ impl OpenSearchSink {
 impl Sink for OpenSearchSink {
     async fn open(&mut self) -> Result<(), Error> {
         self.validate_config()?;
-        let normalized_url = normalize_url(&self.config.url)?;
+        let normalized_url = normalize_url(self.id, &self.config.url)?;
         info!(
             "Opening OpenSearch sink connector with ID: {} for URL: {}, index: {}",
             self.id,
@@ -1245,7 +1245,7 @@ fn is_blank_secret(value: &SecretString) -> bool {
     value.expose_secret().trim().is_empty()
 }
 
-fn normalize_url(raw: &str) -> Result<String, Error> {
+fn normalize_url(id: u32, raw: &str) -> Result<String, Error> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(Error::Connection(
@@ -1284,7 +1284,9 @@ fn normalize_url(raw: &str) -> Result<String, Error> {
         ));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        warn!("Ignoring the query string and fragment on the OpenSearch URL");
+        warn!(
+            "OpenSearch sink connector ID: {id}: ignoring the query string and fragment on the configured URL"
+        );
     }
     url.set_query(None);
     url.set_fragment(None);
@@ -1292,7 +1294,7 @@ fn normalize_url(raw: &str) -> Result<String, Error> {
     // Kept, not stripped: the transport joins request paths onto it, so a proxy subpath works.
     if url.path() != "/" {
         warn!(
-            "Using '{}' as the OpenSearch base path, so requests are sent to paths like '{}/_bulk'",
+            "OpenSearch sink connector ID: {id}: using '{}' as the base path, so requests are sent to paths like '{}/_bulk'",
             url.path(),
             url.path().trim_end_matches('/')
         );
@@ -2374,7 +2376,7 @@ mod tests {
     }
 
     fn mock_client(sink: &OpenSearchSink) -> OpenSearch {
-        let normalized = normalize_url(&sink.config.url).expect("normalize");
+        let normalized = normalize_url(sink.id, &sink.config.url).expect("normalize");
         sink.create_client(&normalized).expect("build client")
     }
 
@@ -2968,7 +2970,7 @@ mod tests {
     #[test]
     fn given_url_without_scheme_should_default_to_http() {
         assert_eq!(
-            normalize_url("localhost:9200").expect("normalize"),
+            normalize_url(1, "localhost:9200").expect("normalize"),
             "http://localhost:9200"
         );
     }
@@ -2976,7 +2978,7 @@ mod tests {
     #[test]
     fn given_uppercase_scheme_should_be_recognized_not_double_prefixed() {
         assert_eq!(
-            normalize_url("HTTPS://localhost:9200").expect("normalize"),
+            normalize_url(1, "HTTPS://localhost:9200").expect("normalize"),
             "https://localhost:9200"
         );
     }
@@ -2984,7 +2986,7 @@ mod tests {
     #[test]
     fn given_unsupported_scheme_should_fail_normalization() {
         let error =
-            normalize_url("ftp://localhost:9200").expect_err("ftp is not a supported scheme");
+            normalize_url(1, "ftp://localhost:9200").expect_err("ftp is not a supported scheme");
 
         assert!(matches!(error, Error::Connection(_)));
         assert!(format!("{error}").contains("ftp"));
@@ -2993,7 +2995,8 @@ mod tests {
     #[test]
     fn given_url_with_query_and_fragment_should_strip_them_and_keep_the_base_path() {
         assert_eq!(
-            normalize_url("https://localhost:9200/opensearch?foo=bar#section").expect("normalize"),
+            normalize_url(1, "https://localhost:9200/opensearch?foo=bar#section")
+                .expect("normalize"),
             "https://localhost:9200/opensearch"
         );
     }
@@ -3003,7 +3006,7 @@ mod tests {
     #[test]
     fn given_url_with_base_path_should_preserve_it() {
         assert_eq!(
-            normalize_url("https://proxy.example.com/opensearch/").expect("normalize"),
+            normalize_url(1, "https://proxy.example.com/opensearch/").expect("normalize"),
             "https://proxy.example.com/opensearch"
         );
     }
@@ -3011,19 +3014,19 @@ mod tests {
     #[test]
     fn given_root_url_should_normalize_to_bare_origin() {
         assert_eq!(
-            normalize_url("https://localhost:9200/").expect("normalize"),
+            normalize_url(1, "https://localhost:9200/").expect("normalize"),
             "https://localhost:9200"
         );
     }
 
     #[test]
     fn given_blank_url_should_fail_normalization() {
-        assert!(matches!(normalize_url("   "), Err(Error::Connection(_))));
+        assert!(matches!(normalize_url(1, "   "), Err(Error::Connection(_))));
     }
 
     #[test]
     fn given_malformed_url_should_fail_normalization() {
-        let error = normalize_url("http://[::1")
+        let error = normalize_url(1, "http://[::1")
             .expect_err("an unterminated IPv6 literal should not parse");
 
         assert!(matches!(error, Error::Connection(_)));
@@ -3031,7 +3034,7 @@ mod tests {
 
     #[test]
     fn given_credentials_embedded_in_url_should_fail_normalization() {
-        let error = normalize_url("https://admin:hunter2@opensearch.example.com:9200")
+        let error = normalize_url(1, "https://admin:hunter2@opensearch.example.com:9200")
             .expect_err("embedded credentials should be rejected");
 
         assert!(matches!(error, Error::InvalidConfigValue(_)));
@@ -3039,7 +3042,7 @@ mod tests {
 
     #[test]
     fn given_username_only_embedded_in_url_should_fail_normalization() {
-        let error = normalize_url("https://admin@opensearch.example.com:9200")
+        let error = normalize_url(1, "https://admin@opensearch.example.com:9200")
             .expect_err("embedded username without a password should still be rejected");
 
         assert!(matches!(error, Error::InvalidConfigValue(_)));
