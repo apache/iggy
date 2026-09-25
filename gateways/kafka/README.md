@@ -2,13 +2,12 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
-> **Stub warning:** most APIs still don't persist or read real data. Produce and Fetch return
-> retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. CreateTopics does **not** create topics; valid requests return
-> `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. ListOffsets is wired
-> to the Iggy bridge: with `IGGY_KAFKA_BRIDGE_ENABLED=true` it answers `EARLIEST`/`LATEST` from
-> real partition state; with the bridge off (the default) it stays a stub and answers
-> `NOT_LEADER_OR_FOLLOWER` (6). See [docs/SCOPE.md](docs/SCOPE.md).
+> **Stub warning:** most APIs still don't persist or read real data. With
+> `IGGY_KAFKA_BRIDGE_ENABLED=true`, ListOffsets answers `EARLIEST`/`LATEST` from real partition
+> state and Fetch reads records from Iggy. With the bridge off (the default) both are stubs.
+> Produce always answers retriable `NOT_LEADER_OR_FOLLOWER` (6), so clients keep their data.
+> CreateTopics creates nothing and answers `NOT_CONTROLLER` (41). Metadata reports every topic as
+> unknown, so a real client cannot reach ListOffsets or Fetch yet. See [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
@@ -85,12 +84,53 @@ guards the hop from the gateway to Iggy rather than the hop from the producer to
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
-streams/topics, provisions them on demand, and looks up high watermarks (one or many partitions of
-a topic per call) for `ListOffsets`.
-**Not wired into the live Produce/Fetch dispatch path yet** - that lands with
-[#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
-Exercised today by `bridge`'s own unit tests and `tests/bridge_iggy_integration_tests.rs` (spawns a
-real `iggy-server`).
+streams/topics, provisions them on demand, looks up high watermarks (one or many partitions of
+a topic per call) for `ListOffsets`, and probes and polls partitions for Fetch.
+Produce does not call it yet ([#3535](https://github.com/apache/iggy/issues/3535)).
+Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs`,
+`tests/list_offsets_real_bridge_tests.rs` and `tests/fetch_real_bridge_tests.rs`. The last three
+start a real `iggy-server`.
+
+### Fetch ([#3536](https://github.com/apache/iggy/issues/3536))
+
+Per request: one probe per topic, shared with other Fetches, then polls of each partition with
+records, in request order. One uncompressed batch per partition.
+
+| Field | Gateway |
+| ----- | ------- |
+| Partition, offset | As sent. Both systems count from 0. |
+| Offset below the oldest kept one | Reads from the oldest kept one. If none is kept, an empty batch up to `high_watermark`. The consumer moves past the gap. |
+| `high_watermark` | One past the last committed offset. |
+| `last_stable_offset` | Same as `high_watermark`. No transactions. |
+| `log_start_offset` | Always `-1`. |
+| Sessions | None opened. `session_id` is always `0`, so every request is a full one. |
+| `max_wait_ms` | Honored, max 18 s. |
+| `min_bytes` | Ends a wait once new bytes, estimated from Iggy's average message size, reach it. Records found on the first read go out at once. |
+| `max_bytes` | Honored, max `IGGY_KAFKA_MAX_FRAME_SIZE`. |
+| `partition_max_bytes` | Honored. |
+| First partition with records | At least one record, even past every byte limit (KIP-74). |
+| Records per partition | At most 1000 per request, polled 16 and then up to 64 at a time. |
+| `isolation_level`, replica id, epochs, rack, forgotten topics | Ignored. |
+
+| Code | When | Java consumer |
+| ---- | ---- | ------------- |
+| 1 | Offset below 0, or past `high_watermark` | Resets its offset (`auto.offset.reset`). |
+| 3 | Topic or partition not in Iggy, or a name Kafka refuses | Refreshes metadata, retries. |
+| 6 | Iggy unreachable, too slow, or not signed in | Refreshes metadata, retries. |
+| 29 | The bridge's Iggy user lacks permission. Fetch reads as that user, not as the client. | Fails. |
+| -1 | Anything else, such as a stored message the gateway cannot map. Sent after `max_wait_ms`. | Retries the same offset. |
+| 70 | Top level. The request continues a session. | Sends a full request. |
+
+The Java consumer throws on any other partition code, so Fetch sends none.
+
+Limits:
+
+- 20 s per request, wait included, so a waiting Fetch fits the 25 s shutdown drain. Partitions
+  not read by then answer `0` with no records.
+- 4 requests read and encode at once. A waiting request, or a response on a slow socket, holds no
+  slot. So response memory grows with connections: `max_bytes` each, or one larger record.
+- A message the gateway cannot map stops the consumer at its offset. Records before it are served.
+  The log shows it once at `warn`.
 
 ### Connection config
 
@@ -107,10 +147,10 @@ Iggy SDK client's own default of unlimited retries, one dial per second, forever
 attempt - retries included - is capped at `REQUEST_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
 fails in bounded time whether the address refuses the connection or silently drops it, instead of
 blocking the calling task indefinitely. Every other bridge call (`ensure_stream_and_topic`,
-`high_watermark(s)`, `close`) carries the same `REQUEST_TIMEOUT` for the same reason: the SDK
-reconnects internally, mid-call, on a transport error, through the same undead-lined dial path - a
-bridge call made well after the initial connect can still hit this if Iggy becomes unreachable
-later.
+`high_watermark(s)`, `probe`, `poll`, `close`) carries the same `REQUEST_TIMEOUT` for the same
+reason: the SDK reconnects internally, mid-call, on a transport error, through the same
+undead-lined dial path - a bridge call made well after the initial connect can still hit this if
+Iggy becomes unreachable later.
 
 This timeout only bounds the *caller's* wait, not the SDK's own work: the SDK writes and reads on
 a detached background task specifically so that dropping the awaiting future - what this timeout
@@ -118,8 +158,8 @@ does on expiry - cannot abort it mid-flight. A timed-out call can leave that tas
 shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
 every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
 Concurrency ceiling below) and no semaphore bounding concurrent bridge calls - no longer a
-hypothetical now that ListOffsets (`#3537`) calls it from a real handler; more pressing once
-CreateTopics (`#3538`), Metadata (`#3534`), Produce (`#3535`) and Fetch (`#3536`) add their own
+hypothetical now that ListOffsets (`#3537`) and Fetch (`#3536`) call it from real handlers; more
+pressing once CreateTopics (`#3538`), Metadata (`#3534`) and Produce (`#3535`) add their own
 concurrent callers. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't a
 followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
 
@@ -184,6 +224,9 @@ whichever single Iggy request is in flight; the Kafka side's own connection limi
 is a known gap to address before `#3535`/`#3536` put this on a hot path, not a design decision to
 rely on.
 
+Fetches share topic probes: at most about 10 `get_topic` calls per second per topic, for all
+consumers together, on that same client.
+
 ### Error mapping
 
 `BridgeError::to_kafka_error_code()` maps Iggy failures to Kafka wire error codes:
@@ -211,6 +254,8 @@ rely on.
 - Too many partitions requested (`TooManyPartitions`) → `INVALID_PARTITIONS` (37), reachable
   through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
+
+Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
 
 ### Server limits the gateway inherits
 

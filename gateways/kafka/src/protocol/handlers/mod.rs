@@ -33,6 +33,7 @@ pub mod produce;
 
 use bytes::{Buf, Bytes, BytesMut};
 use kafka_protocol::protocol::{Decodable, Encodable};
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
@@ -40,6 +41,21 @@ use crate::protocol::api::{
     API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
     GatewayState, HandleOutcome, is_supported_version, supported_max_version,
 };
+
+/// Work that copies this many bytes or more runs off the async worker.
+const OFF_WORKER_BYTES: usize = 64 * 1024;
+
+/// Runs `work`, which copies about `bytes`. For [`OFF_WORKER_BYTES`] or more, other tasks move to
+/// another worker first, so they keep running. A current-thread runtime runs it in place.
+pub(crate) fn off_worker<T>(bytes: usize, work: impl FnOnce() -> T) -> T {
+    let multi_thread = Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread);
+    if bytes >= OFF_WORKER_BYTES && multi_thread {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
 
 /// Routes one decoded request body to the module that owns its API key.
 ///
@@ -131,20 +147,33 @@ pub(crate) fn handle_versioned_request<T>(
     encode_err: impl Fn(i16, i16) -> Result<Bytes>,
     api_name: &str,
 ) -> HandleOutcome {
-    if is_supported_version(api_key, api_version) {
-        match decode(api_version, body) {
-            Ok(req) => respond_or_close(encode_ok(api_version, &req), api_name),
-            Err(error) => {
-                // debug!, not warn!: attacker-controlled, not operator-actionable.
-                tracing::debug!(%error, "Failed to decode {api_name} request");
-                respond_or_close(encode_err(api_version, ERROR_INVALID_REQUEST), api_name)
-            }
-        }
-    } else {
-        unsupported_version_response(api_key, api_version, |version| {
-            encode_err(version, ERROR_UNSUPPORTED_VERSION)
-        })
+    match decode_request(api_key, api_version, body, decode, encode_err, api_name) {
+        Ok(req) => respond_or_close(encode_ok(api_version, &req), api_name),
+        Err(outcome) => outcome,
     }
+}
+
+/// The decoded request, or the answer to send when the version or the body is bad.
+pub(crate) fn decode_request<T>(
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+    decode: impl FnOnce(i16, Bytes) -> Result<T>,
+    encode_err: impl Fn(i16, i16) -> Result<Bytes>,
+    api_name: &str,
+) -> core::result::Result<T, HandleOutcome> {
+    if !is_supported_version(api_key, api_version) {
+        return Err(unsupported_version_response(
+            api_key,
+            api_version,
+            |version| encode_err(version, ERROR_UNSUPPORTED_VERSION),
+        ));
+    }
+    decode(api_version, body).map_err(|error| {
+        // debug!, not warn!: attacker-controlled, not operator-actionable.
+        tracing::debug!(%error, "Failed to decode {api_name} request");
+        respond_or_close(encode_err(api_version, ERROR_INVALID_REQUEST), api_name)
+    })
 }
 
 /// Unsupported-version policy for APIs whose encoders only implement up to
@@ -176,4 +205,24 @@ pub(crate) fn unsupported_version_response(
         return HandleOutcome::Close;
     }
     respond_or_close(encode(api_version), "unsupported-version")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_no_runtime_when_work_is_large_should_run_it_in_place() {
+        assert_eq!(off_worker(OFF_WORKER_BYTES, || 7), 7);
+    }
+
+    #[tokio::test]
+    async fn given_a_current_thread_runtime_when_work_is_large_should_run_it_in_place() {
+        assert_eq!(off_worker(OFF_WORKER_BYTES, || 7), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_a_multi_thread_runtime_when_work_is_large_should_run_it() {
+        assert_eq!(off_worker(OFF_WORKER_BYTES, || 7), 7);
+    }
 }

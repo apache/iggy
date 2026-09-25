@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use kafka_protocol::error::ResponseError;
+use tokio::sync::Semaphore;
 
 use crate::bridge::IggyBridge;
 use crate::protocol::handlers::{
     api_versions, create_topics, dispatch, fetch, list_offsets, metadata, produce,
 };
+use crate::protocol::probe_board::ProbeBoard;
 
 pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
@@ -37,6 +41,8 @@ pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 /// uses it for an `IggyError` with no closer Kafka analogue.
 pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 pub const ERROR_NONE: i16 = 0;
+/// Fetch: the offset is negative or past the high watermark. The client resets its position.
+pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = ResponseError::OffsetOutOfRange.code();
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 /// Retriable; Produce stub uses this until the Iggy bridge persists records.
 pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
@@ -82,6 +88,9 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// Non-retriable, so a Java client resolves immediately instead of retrying
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+/// Fetch: the request continues a session. This gateway opens none, so the client starts over
+/// with a full request.
+pub const ERROR_FETCH_SESSION_ID_NOT_FOUND: i16 = ResponseError::FetchSessionIdNotFound.code();
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -168,11 +177,22 @@ pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
     pub max_frame_size: usize,
+    /// Fetch reads that poll and encode at once. Caps the memory they hold, not the responses
+    /// waiting on a slow socket.
+    pub(crate) fetch_slots: Arc<Semaphore>,
+    /// Per Kafka topic and partition, the offset where a message that does not map stops Fetch.
+    /// Logs each stop once.
+    pub(crate) stuck_offsets: Mutex<HashMap<(String, u32), u64>>,
+    /// Topic probes that every Fetch shares.
+    pub(crate) probe_board: ProbeBoard,
 }
+
+/// Fetch reads that run at once. Iggy serves the polls one at a time anyway.
+const FETCH_SLOTS: usize = 4;
 
 impl GatewayState {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         broker: BrokerAdvertise,
         bridge: Option<Arc<IggyBridge>>,
         max_frame_size: usize,
@@ -181,12 +201,15 @@ impl GatewayState {
             broker,
             bridge,
             max_frame_size,
+            fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
+            stuck_offsets: Mutex::new(HashMap::new()),
+            probe_board: ProbeBoard::default(),
         }
     }
 
     /// State with no bridge, so every handler takes its stub path.
     #[must_use]
-    pub const fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+    pub fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
         Self::new(broker, None, max_frame_size)
     }
 }

@@ -18,8 +18,8 @@
 //! Iggy SDK integration layer.
 //!
 //! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
-//! high-watermark lookups, and translates Iggy errors to Kafka wire error codes. Not yet wired
-//! into the live Produce/Fetch dispatch path - that lands with `#3535`/`#3536`.
+//! high-watermark lookups, and translates Iggy errors to Kafka wire error codes. `ListOffsets`
+//! and Fetch call it. Produce does not yet (`#3535`).
 
 pub mod config;
 pub mod error;
@@ -28,5 +28,5 @@ pub mod topic_map;
 
 pub use config::IggyBridgeConfig;
 pub use error::BridgeError;
-pub use iggy_bridge::IggyBridge;
+pub use iggy_bridge::{IggyBridge, PartitionProbe, TopicProbe};
 pub use topic_map::{TopicMapping, TopicOverride};

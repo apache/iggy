@@ -31,15 +31,12 @@ use tokio::time::Instant;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, GatewayState,
+    HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
-use crate::protocol::handlers::{
-    decode_guarded, encode_message, handle_versioned_request, is_supported_version,
-    respond_or_close, unsupported_version_response,
-};
+use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_OFFSETS,
@@ -92,46 +89,32 @@ type HighWatermarksResult =
     core::result::Result<Vec<(u32, core::result::Result<i64, BridgeError>)>, BridgeError>;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
-    let Some(bridge) = &state.bridge else {
-        return handle_versioned_request(
-            API_KEY_LIST_OFFSETS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<ListOffsetsRequest>(v, b, |v, b| {
-                    validate_list_offsets_shape(v, b, state.max_frame_size)
-                })
-            },
-            encode_response,
-            encode_error_response,
-            "ListOffsets",
-        );
-    };
-
-    if !is_supported_version(API_KEY_LIST_OFFSETS, api_version) {
-        return unsupported_version_response(API_KEY_LIST_OFFSETS, api_version, |version| {
-            encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
-        });
-    }
-
-    let req = match decode_guarded::<ListOffsetsRequest>(api_version, body, |v, b| {
-        validate_list_offsets_shape(v, b, state.max_frame_size)
-    }) {
+    let decoded = decode_request(
+        API_KEY_LIST_OFFSETS,
+        api_version,
+        body,
+        |v, b| decode(state, v, b),
+        encode_error_response,
+        "ListOffsets",
+    );
+    let req = match decoded {
         Ok(req) => req,
-        Err(error) => {
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(%error, "Failed to decode ListOffsets request");
-            return respond_or_close(
-                encode_error_response(api_version, ERROR_INVALID_REQUEST),
-                "ListOffsets",
-            );
-        }
+        Err(outcome) => return outcome,
+    };
+    let Some(bridge) = &state.bridge else {
+        return respond_or_close(encode_response(api_version, &req), "ListOffsets");
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let topics = resolve_all_topics(bridge, &req.topics, deadline).await;
     let resp = ListOffsetsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets")
+}
+
+fn decode(state: &GatewayState, version: i16, body: Bytes) -> Result<ListOffsetsRequest> {
+    decode_guarded::<ListOffsetsRequest>(version, body, |v, b| {
+        validate_list_offsets_shape(v, b, state.max_frame_size)
+    })
 }
 
 /// One topic's bridge-lookup outcome, decided once per distinct name in [`resolve_all_topics`]
@@ -144,7 +127,8 @@ enum TopicLookup {
     Watermarks(HighWatermarksResult),
     /// Beyond [`MAX_BRIDGE_BACKED_TOPICS`], or the deadline elapsed before this topic's turn - no
     /// call was made. Answered [`ERROR_REQUEST_TIMED_OUT`] (retriable) rather than
-    /// [`ERROR_INVALID_REQUEST`] so a client's own per-topic retry narrows the batch on its own.
+    /// [`ERROR_INVALID_REQUEST`](crate::protocol::api::ERROR_INVALID_REQUEST) so a client's own
+    /// per-topic retry narrows the batch on its own.
     NotAttempted,
 }
 
@@ -340,9 +324,9 @@ fn resolve_one_partition(
         // Real only for a partition retention has never trimmed: Iggy tracks no rolling
         // low-watermark distinct from partition creation, so a `0` here for an older,
         // already-trimmed partition names a log-start offset that no longer exists - a real
-        // consumer with `auto.offset.reset=earliest` would seek into a hole. Harmless *today*
-        // only because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this
-        // returns. Not fixable client-side; needs the bridge to expose a real start offset.
+        // consumer with `auto.offset.reset=earliest` would seek into a hole. Fetch there reads
+        // from the oldest kept message, so the consumer skips the gap. Not fixable client-side;
+        // needs the bridge to expose a real start offset.
         EARLIEST_TIMESTAMP => offset_response(requested.partition_index, 0),
         // Non-retriable, unlike ERROR_UNKNOWN_SERVER_ERROR: a Java client resolves this
         // immediately instead of retrying the request until its own default.api.timeout.ms.

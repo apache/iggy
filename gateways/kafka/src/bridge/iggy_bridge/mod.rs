@@ -29,6 +29,8 @@ mod offsets;
 mod produce;
 mod topics;
 
+pub use fetch::{PartitionProbe, TopicProbe};
+
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///
 /// Not the SDK's own default (`TcpClientReconnectionConfig::default()` is `max_retries: None` -
@@ -103,9 +105,7 @@ async fn with_request_timeout<T>(
 
 /// Owns one connected `IggyClient` and resolves Kafka topics against it.
 ///
-/// Produce/Fetch handler wiring is a separate, later change (`#3535`/`#3536`) - this type is the
-/// shared plumbing those handlers will call into, exercised standalone here via its own tests and
-/// an integration test against a real `iggy-server`.
+/// `ListOffsets` and Fetch call it. Produce handler wiring is a separate, later change (`#3535`).
 ///
 /// One `IggyClient`, shared across every Kafka connection this gateway serves - and the SDK's TCP
 /// transport is lockstep, one request in flight at a time (`tcp_client.rs`: "the connection is

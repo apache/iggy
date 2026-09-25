@@ -88,7 +88,9 @@ The handler in [#3536](https://github.com/apache/iggy/issues/3536) owns the poli
 the mapping refuses. Two shapes are on the table. Skipping serves the records around it and
 leaves a gap, which Kafka consumers already tolerate on a compacted topic. Its cost is that a
 message goes missing with no signal. Quarantining records the offset and surfaces a metric. Its
-cost is somewhere to keep the record. Neither is decided here.
+cost is somewhere to keep the record. Neither is decided here. Until one is, Fetch serves the
+records before such a message and answers `-1` at it, so the consumer stops at that offset.
+The `-1` goes out after `max_wait_ms`, so the consumer does not spin.
 
 ### Timestamps
 

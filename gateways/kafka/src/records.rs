@@ -91,7 +91,7 @@ const MAX_VARINT_BYTES: usize = 5;
 const MAX_VARLONG_BYTES: usize = 10;
 /// Base offset, batch length, leader epoch, magic, CRC, attributes, last offset delta, first and
 /// max timestamp, producer id, producer epoch, base sequence and record count.
-const BATCH_HEADER_BYTES: usize = 61;
+pub const BATCH_HEADER_BYTES: usize = 61;
 /// Widest v2 record framing: five varints at five bytes each, an attributes byte, and the header
 /// count varint, before the key, the value and the header bytes.
 const RECORD_FRAMING_BYTES: usize = 31;
@@ -198,8 +198,8 @@ pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
 /// enforces the namespace, so that is a claim the message makes and not one the server keeps: an
 /// Iggy writer can set `kafka.v` to a version this build does not implement, and every read of
 /// that message then fails. Fetch cannot serve a record it cannot decode and a Kafka consumer
-/// cannot step over one, so the handler in #3536 owns the skip-or-quarantine policy for a message
-/// that fails here. `BRIDGE_MAPPING.md` records that as the open end of the provenance design.
+/// cannot step over one, so Fetch answers -1 at that offset and the consumer stops there.
+/// `BRIDGE_MAPPING.md` records that as the open end of the provenance design.
 ///
 /// # Errors
 ///
@@ -776,28 +776,57 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
     Ok(buf.freeze())
 }
 
+/// A v2 batch with no records that spans `base_offset` to `last_offset`.
+///
+/// A consumer moves past `last_offset`, as it does past a batch that compaction emptied.
+#[must_use]
+pub fn empty_batch(base_offset: i64, last_offset: i64) -> Bytes {
+    let last_offset_delta =
+        i32::try_from(last_offset.saturating_sub(base_offset)).unwrap_or(i32::MAX);
+    // From the attributes on, which is what the CRC covers.
+    let mut body = BytesMut::with_capacity(BATCH_HEADER_BYTES);
+    body.put_i16(0); // attributes: no compression, CreateTime
+    body.put_i32(last_offset_delta);
+    body.put_i64(NO_TIMESTAMP); // first timestamp
+    body.put_i64(NO_TIMESTAMP); // max timestamp
+    body.put_i64(NO_PRODUCER_ID);
+    body.put_i16(NO_PRODUCER_EPOCH);
+    body.put_i32(NO_SEQUENCE);
+    body.put_i32(0); // record count
+
+    let mut batch = BytesMut::with_capacity(BATCH_HEADER_BYTES);
+    batch.put_i64(base_offset);
+    // From the leader epoch on: 4 epoch bytes, 1 magic byte, 4 CRC bytes, then the body.
+    batch.put_i32(i32::try_from(body.len() + 9).unwrap_or(i32::MAX));
+    batch.put_i32(NO_PARTITION_LEADER_EPOCH);
+    batch.put_i8(BATCH_VERSION);
+    batch.put_u32(crc32c::crc32c(&body));
+    batch.extend_from_slice(&body);
+    batch.freeze()
+}
+
+/// An upper bound on the bytes `record` adds to a batch [`encode_batch`] writes.
+///
+/// Fetch sums these against its byte budget before it encodes.
+#[must_use]
+pub fn record_size_bound(record: &Record) -> usize {
+    let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
+    RECORD_FRAMING_BYTES
+        + field(record.key.as_ref())
+        + field(record.value.as_ref())
+        + record
+            .headers
+            .iter()
+            .map(|(name, value)| HEADER_FRAMING_BYTES + name.as_str().len() + field(value.as_ref()))
+            .sum::<usize>()
+}
+
 /// An upper bound on the encoded batch, so the Fetch path reserves once instead of doubling.
 ///
 /// `kafka_protocol` never reserves: it writes every field with `put_slice` into whatever buffer
 /// it is handed. Every length needed here is already in hand.
 fn batch_size(records: &[Record]) -> usize {
-    let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
-    BATCH_HEADER_BYTES
-        + records
-            .iter()
-            .map(|record| {
-                RECORD_FRAMING_BYTES
-                    + field(record.key.as_ref())
-                    + field(record.value.as_ref())
-                    + record
-                        .headers
-                        .iter()
-                        .map(|(name, value)| {
-                            HEADER_FRAMING_BYTES + name.as_str().len() + field(value.as_ref())
-                        })
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
+    BATCH_HEADER_BYTES + records.iter().map(record_size_bound).sum::<usize>()
 }
 
 /// Decompresses one batch, refusing the write that would pass the request budget.
@@ -1403,6 +1432,19 @@ mod tests {
         let crc = crc32c::crc32c(&bytes[21..]);
         bytes[17..21].copy_from_slice(&crc.to_be_bytes());
         Bytes::from(bytes)
+    }
+
+    #[test]
+    fn given_a_gap_when_an_empty_batch_spans_it_should_decode_with_no_records() {
+        let batch = empty_batch(10, 41);
+        assert_eq!(batch.len(), BATCH_HEADER_BYTES);
+        let info = RecordBatchDecoder::decode_batch_info(&mut batch.clone()).unwrap();
+        assert_eq!(info.len(), 1, "one batch, with a valid CRC");
+        assert_eq!(info[0].min_offset, 10);
+        assert_eq!(info[0].record_count, 0);
+        // After the base offset, length, leader epoch, magic, CRC and attributes.
+        let last_offset_delta = i32::from_be_bytes(batch[23..27].try_into().unwrap());
+        assert_eq!(last_offset_delta, 31, "a consumer moves on to offset 42");
     }
 
     #[test]
