@@ -22,7 +22,7 @@ use iggy_common::{HeaderKey, HeaderValue, IggyTimestamp, calculate_256};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
     convert::owned_value_to_serde_json,
-    retry::{is_transient_status, parse_duration, retry_backoff},
+    retry::{is_transient_status, parse_duration, parse_retry_after, retry_backoff},
     sink_connector,
 };
 use opensearch::{
@@ -31,6 +31,7 @@ use opensearch::{
     cluster::ClusterHealthParts,
     http::{
         StatusCode,
+        headers::RETRY_AFTER,
         transport::{SingleNodeConnectionPool, TransportBuilder},
     },
     indices::{IndicesCreateParts, IndicesExistsParts},
@@ -284,8 +285,14 @@ impl OpenSearchSink {
             }
 
             retries += 1;
-            self.sleep_before_retry(operation, retries, self.config.max_open_retries, &failure)
-                .await;
+            self.sleep_before_retry(
+                operation,
+                retries,
+                self.config.max_open_retries,
+                &failure,
+                None,
+            )
+            .await;
         }
     }
 
@@ -542,10 +549,21 @@ impl OpenSearchSink {
                 None => request,
             };
 
+            let mut retry_after = None;
             let failure = match tokio::time::timeout(self.config.timeout, request.send()).await {
                 Ok(Ok(response)) => {
                     let status = response.status_code();
                     if !status.is_success() {
+                        // Read before the body is consumed below: `text()`/`json()`
+                        // take `response` by value, so the header is gone once
+                        // either is called.
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            retry_after = response
+                                .headers()
+                                .get(RETRY_AFTER)
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(parse_retry_after);
+                        }
                         let response_body = response.text().await.unwrap_or_default();
                         let error = map_status_error("bulk request", status, &response_body);
                         if !is_transient_status(status) {
@@ -643,8 +661,14 @@ impl OpenSearchSink {
             }
 
             retries += 1;
-            self.sleep_before_retry("bulk request", retries, self.config.max_retries, &failure)
-                .await;
+            self.sleep_before_retry(
+                "bulk request",
+                retries,
+                self.config.max_retries,
+                &failure,
+                retry_after,
+            )
+            .await;
         }
     }
 
@@ -652,19 +676,24 @@ impl OpenSearchSink {
     /// retry (`retries == 1`) uses attempt `0` so it sleeps `retry_delay`
     /// itself rather than `retry_delay * 2`. Jitter can push the raw backoff
     /// up to 20% above `max_retry_delay`, so the jittered result is clamped
-    /// back down to it.
+    /// back down to it. `retry_after` overrides the computed backoff when the
+    /// server named an exact wait via a `Retry-After` header - honoring it
+    /// takes priority over our own estimate.
     async fn sleep_before_retry(
         &self,
         operation: &str,
         retries: u32,
         max_retries: u32,
         failure: &str,
+        retry_after: Option<Duration>,
     ) {
-        let delay = retry_backoff(
-            self.config.retry_delay,
-            retries,
-            self.config.max_retry_delay,
-        );
+        let delay = retry_after.unwrap_or_else(|| {
+            retry_backoff(
+                self.config.retry_delay,
+                retries,
+                self.config.max_retry_delay,
+            )
+        });
         warn!(
             "OpenSearch {} failed (retry {}/{}): {}. Retrying in {:?}...",
             operation, retries, max_retries, failure, delay
@@ -2473,6 +2502,49 @@ mod tests {
 
         assert_eq!(outcome.indexed, 2);
         assert_eq!(outcome.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn given_retry_after_header_on_429_should_override_computed_backoff() {
+        let server = MockServer::start().await;
+        let sink = mock_bulk_sink(&server, 1).await;
+        let client = mock_client(&sink);
+        let documents = [prepared("a")];
+        let body = build_bulk_body(&sink.config.index, &[&documents[0]]).expect("build body");
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(body.clone()))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": false,
+                "items": [{ "index": { "_id": "a", "status": 201, "result": "created" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let start = std::time::Instant::now();
+        let outcome = sink
+            .index_chunk(&client, &documents)
+            .await
+            .expect("resending after the named wait should succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.indexed, 1);
+        // fast_retry_config caps the computed backoff at 2ms; honoring a 1s
+        // Retry-After instead means the real wait is orders of magnitude longer.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected the Retry-After header to be honored, waited only {elapsed:?}"
+        );
     }
 
     #[tokio::test]
