@@ -730,11 +730,131 @@ pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
     Ok(())
 }
 
+/// Cap on a whole `SaslAuthenticate` body.
+///
+/// The body is one length-prefixed blob, so capping it is the same as capping `auth_bytes`.
+/// PLAIN credentials are a couple of hundred bytes at the outside (Iggy caps a username at 50 and
+/// a password at 100), and this is the one frame an *unauthenticated* connection can send
+/// repeatedly. Generous enough to leave room for a future multi-round mechanism.
+///
+/// This is not a memory bound on the connection. `read_frame` buffers the whole frame, up to
+/// `max_frame_size`, before a header is even decoded, so an unauthenticated peer can still make
+/// the gateway hold that much. What this cap bounds is everything downstream of the guard: what
+/// reaches `parse_plain`, and what a future mechanism would carry into a credential exchange.
+const MAX_SASL_AUTH_BYTES: usize = 4096;
+
+/// `SaslHandshake` carries one non-nullable string, the mechanism name.
+///
+/// `_version` is unused: the message is never flexible, so v0 and v1 share this shape, and the
+/// state machine refuses v0 before a body is ever validated.
+///
+/// # Errors
+///
+/// Returns an error when the declared string length does not fit the remaining frame.
+pub fn validate_sasl_handshake_shape(_version: i16, body: &Bytes) -> Result<()> {
+    // No response-size guard: the response echoes a fixed mechanism list, never anything decoded
+    // from this body, so nothing here can amplify.
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    c.legacy_string(false)?;
+    Ok(())
+}
+
+/// `SaslAuthenticate` carries one non-nullable bytes field, the mechanism token.
+///
+/// # Errors
+///
+/// Returns [`KafkaProtocolError::FrameTooLarge`] when the body exceeds this module's
+/// `MAX_SASL_AUTH_BYTES` cap, or an error when the declared length does not fit the remaining
+/// frame.
+pub fn validate_sasl_authenticate_shape(version: i16, body: &Bytes) -> Result<()> {
+    if body.len() > MAX_SASL_AUTH_BYTES {
+        return Err(KafkaProtocolError::FrameTooLarge {
+            max_bytes: MAX_SASL_AUTH_BYTES,
+            actual_bytes: body.len(),
+        });
+    }
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    if version >= 2 {
+        c.compact_bytes(false)?;
+        c.tagged_fields()?;
+    } else {
+        c.legacy_bytes(false)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+
     use super::*;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn sasl_handshake_well_formed_mechanism_accepted() {
+        let body = Bytes::from_static(&[0x00, 0x05, b'P', b'L', b'A', b'I', b'N']);
+        assert!(validate_sasl_handshake_shape(1, &body).is_ok());
+    }
+
+    #[test]
+    fn sasl_handshake_declared_length_past_the_frame_rejected() {
+        // Claims a 16-byte mechanism name in a 2-byte body.
+        let body = Bytes::from_static(&[0x00, 0x10, b'P', b'L']);
+        assert!(validate_sasl_handshake_shape(1, &body).is_err());
+    }
+
+    #[test]
+    fn sasl_handshake_null_mechanism_rejected() {
+        // -1 is the null marker, and the field is not nullable.
+        let body = Bytes::from_static(&[0xFF, 0xFF]);
+        assert!(validate_sasl_handshake_shape(1, &body).is_err());
+    }
+
+    #[test]
+    fn sasl_authenticate_well_formed_token_accepted() {
+        let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x03, 0x00, b'a', 0x00]);
+        assert!(validate_sasl_authenticate_shape(1, &body).is_ok());
+    }
+
+    #[test]
+    fn sasl_authenticate_v2_compact_token_accepted() {
+        // Compact bytes: varint(len + 1), then the token, then the tagged-fields byte.
+        let body = Bytes::from_static(&[0x04, 0x00, b'a', 0x00, 0x00]);
+        assert!(validate_sasl_authenticate_shape(2, &body).is_ok());
+    }
+
+    #[test]
+    fn sasl_authenticate_declared_length_past_the_frame_rejected() {
+        let body = Bytes::from_static(&[0x00, 0x00, 0x10, 0x00, 0x01]);
+        assert!(validate_sasl_authenticate_shape(1, &body).is_err());
+    }
+
+    /// The cap exists because this is the one frame an unauthenticated connection can send
+    /// repeatedly. It must be refused on the body length alone, before any field is walked.
+    #[test]
+    fn sasl_authenticate_oversized_body_rejected_before_walking_it() {
+        let mut oversized = BytesMut::with_capacity(MAX_SASL_AUTH_BYTES + 8);
+        oversized.extend_from_slice(&u32::try_from(MAX_SASL_AUTH_BYTES).unwrap().to_be_bytes());
+        oversized.resize(MAX_SASL_AUTH_BYTES + 8, b'A');
+        let body = oversized.freeze();
+        assert!(matches!(
+            validate_sasl_authenticate_shape(1, &body),
+            Err(KafkaProtocolError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn sasl_authenticate_at_the_cap_is_still_walked_not_rejected_on_size() {
+        // Exactly at the cap must not trip the size guard, or the boundary is off by one.
+        let mut at_cap = BytesMut::with_capacity(MAX_SASL_AUTH_BYTES);
+        let token_len = MAX_SASL_AUTH_BYTES - 4;
+        at_cap.extend_from_slice(&u32::try_from(token_len).unwrap().to_be_bytes());
+        at_cap.resize(MAX_SASL_AUTH_BYTES, b'A');
+        let body = at_cap.freeze();
+        assert_eq!(body.len(), MAX_SASL_AUTH_BYTES);
+        assert!(validate_sasl_authenticate_shape(1, &body).is_ok());
+    }
 
     /// The two payloads reproduced in review, verbatim: both must be rejected before reaching
     /// `kafka_protocol`, not merely rejected eventually.
