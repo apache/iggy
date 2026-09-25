@@ -85,7 +85,7 @@ All API keys not listed above close the connection (see Governance model above) 
 | 9 | OffsetFetch | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542); sent right after SyncGroup, so a joined consumer loops on it today ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)) |
 | 13 | LeaveGroup | Graceful shutdown — [#3543](https://github.com/apache/iggy/issues/3543); without it a departing member is evicted by session expiry instead |
 | 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
-| 17 | SaslHandshake | Auth — later issue |
+| 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol; a 4.0 client may need `group.protocol=classic` |
 | 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
 
@@ -184,7 +184,17 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
-- [ ] SASL (17, 36) if required by deployment
+Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
+[`AUTHENTICATION.md`](AUTHENTICATION.md).
+
+- [x] SASL/PLAIN (17, 36), opt-in via `IGGY_KAFKA_SASL_ENABLED`, credentials verified against Iggy.
+      Kept out of `SUPPORTED_RANGES` on purpose: the connection loop routes both keys through the
+      SASL state machine before dispatch, so a gateway with the feature off advertises neither key
+      and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
+      connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
+      silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
+      credential storage, not deferred
+- [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys
 

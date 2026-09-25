@@ -348,7 +348,7 @@ async fn create_topics_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn unsupported_api_keys_close_connection() {
-    for key in [8, 9, 13, 15, 17, 20, 42, 999] {
+    for key in [8, 9, 13, 15, 20, 42, 999] {
         let outcome = handle_request(key, 0, Bytes::new(), &default_broker()).await;
         assert!(
             outcome.is_close(),

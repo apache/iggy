@@ -19,3 +19,4 @@ pub mod api;
 pub mod bounds_guard;
 pub mod handlers;
 pub mod header;
+pub mod sasl;

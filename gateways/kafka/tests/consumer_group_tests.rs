@@ -75,6 +75,7 @@ fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
         BrokerAdvertise::default(),
         None,
         8 * 1024 * 1024,
+        false,
         GroupCoordinator::new(config, CancellationToken::new()),
     ))
 }

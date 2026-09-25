@@ -37,7 +37,6 @@ pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
     (13, "LeaveGroup"),
     (15, "DescribeGroups"),
     (16, "ListGroups"),
-    (17, "SaslHandshake"),
     (20, "DeleteTopics"),
 ];
 
