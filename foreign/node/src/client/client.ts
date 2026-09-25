@@ -16,7 +16,12 @@
 // under the License.
 
 import { createPool, type Pool } from 'generic-pool';
-import type { RawClient, ClientConfig, ClientConfigOrString } from "./client.type.js"
+import type {
+  ClientConfig,
+  ClientConfigOrString,
+  ClientEventMap,
+  RawClient
+} from "./client.type.js"
 import { getRawClient } from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
@@ -59,7 +64,7 @@ const createPooledClientProvider = (config: ClientConfig) => {
     });
     return pooled;
   }
-  return { clientProvider, pool };
+  return { clientProvider, pool, client };
 };
 
 
@@ -72,6 +77,8 @@ export class Client extends CommandAPI {
   _config: ClientConfig
   /** Connection pool instance */
   _pool: Pool<RawClient>
+  /** Event source owned by the pool */
+  private readonly eventHandler: RawClient
 
   /**
    * Creates a new pooled client.
@@ -80,11 +87,42 @@ export class Client extends CommandAPI {
   */
   constructor(config: ClientConfigOrString) {
     const normalizedConfig = normalizeClientConfig(config);
-    const { clientProvider, pool } =
+    const { clientProvider, pool, client } =
       createPooledClientProvider(normalizedConfig);
     super(clientProvider);
     this._config = normalizedConfig;
     this._pool = pool;
+    this.eventHandler = client;
+  }
+
+  /**
+   * Registers a listener for a client connection event.
+   *
+   * @param event - Client event name
+   * @param listener - Event listener
+   * @returns This client
+   */
+  on<Event extends keyof ClientEventMap>(
+    event: Event,
+    listener: (...args: ClientEventMap[Event]) => void
+  ): this {
+    this.eventHandler.on(event, listener);
+    return this;
+  }
+
+  /**
+   * Registers a listener that runs once for a client connection event.
+   *
+   * @param event - Client event name
+   * @param listener - Event listener
+   * @returns This client
+   */
+  once<Event extends keyof ClientEventMap>(
+    event: Event,
+    listener: (...args: ClientEventMap[Event]) => void
+  ): this {
+    this.eventHandler.once(event, listener);
+    return this;
   }
 
   /**
