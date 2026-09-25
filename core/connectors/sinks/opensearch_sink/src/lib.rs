@@ -1016,12 +1016,12 @@ fn parse_bulk_response(
         .unwrap_or(true)
     {
         for (position, item) in items.iter().enumerate() {
-            let status = item
-                .as_object()
-                .and_then(|item| item.values().next())
+            let result = item.as_object().and_then(|item| item.values().next());
+            let status = result
                 .and_then(|result| result.get("status"))
                 .and_then(Value::as_u64);
-            if !status.is_some_and(|status| (200..300).contains(&status)) {
+            let has_error = result.is_some_and(|result| result.get("error").is_some());
+            if has_error || !status.is_some_and(|status| (200..300).contains(&status)) {
                 return Err(BulkResponseError::MalformedItem { position });
             }
         }
@@ -2195,6 +2195,21 @@ mod tests {
         let response = json!({
             "errors": false,
             "items": [{}]
+        });
+
+        assert!(matches!(
+            parse_bulk_response(&response, 1),
+            Err(BulkResponseError::MalformedItem { position: 0 })
+        ));
+    }
+
+    #[test]
+    fn given_clean_flag_bulk_response_with_item_error_should_be_rejected_as_unparsable() {
+        let response = json!({
+            "errors": false,
+            "items": [
+                { "index": { "_id": "a", "status": 201, "error": { "reason": "conflict" } } }
+            ]
         });
 
         assert!(matches!(
