@@ -913,6 +913,79 @@ async fn given_backup_member_when_host_crashes_should_expire_membership(harness:
     drop(connection);
 }
 
+#[iggy_harness(cluster_nodes = 3, server(
+    heartbeat.enabled = false,
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
+    sharding.cpu_allocation = "0..1",
+))]
+async fn given_primary_member_when_host_crashes_should_expire_membership(
+    harness: &mut TestHarness,
+) {
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    create_liveness_group(&observer).await;
+    let primary = primary_index(harness, &observer).await;
+    drop(observer);
+    let stream = Identifier::named(LIVENESS_STREAM).unwrap();
+    let topic = Identifier::named(LIVENESS_TOPIC).unwrap();
+    let group = Identifier::named(LIVENESS_GROUP).unwrap();
+    let member = harness.root_client_for_node(primary).await.unwrap();
+    member
+        .join_consumer_group(&stream, &topic, &group)
+        .await
+        .unwrap();
+    let joined = liveness_group(&member).await;
+    assert_eq!(joined.members_count, 1);
+    let dead_member = joined.members[0].id;
+
+    // The crashed host can no longer submit its member's disconnect Logout.
+    harness.kill_node(primary).unwrap();
+    drop(member);
+    let survivor = (primary + 1) % harness.cluster_size();
+    let deadline = Instant::now() + RESUME_BUDGET;
+    let replacement = loop {
+        if let Ok(client) = harness.root_client_for_node(survivor).await
+            && client
+                .join_consumer_group(&stream, &topic, &group)
+                .await
+                .is_ok()
+        {
+            break client;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no survivor accepted the replacement member"
+        );
+        sleep(RETRY_PAUSE).await;
+    };
+
+    let deadline = Instant::now() + RESUME_BUDGET;
+    let expired = loop {
+        let state = liveness_group(&replacement).await;
+        if state.members_count == 1
+            && state.members[0].id != dead_member
+            && state.members[0].partitions_count == 1
+        {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dead primary's member kept its partition: {:?}",
+            state.members
+        );
+        sleep(RETRY_PAUSE).await;
+    };
+
+    harness.restart_node(primary).unwrap();
+    sleep(LIVENESS_OBSERVATION).await;
+    let after = liveness_group(&replacement).await;
+    assert_eq!(
+        after.members_count, 1,
+        "restarting the crashed host restored its member"
+    );
+    assert_eq!(after.members[0].id, expired.members[0].id);
+}
+
 async fn liveness_group(observer: &IggyClient) -> ConsumerGroupDetails {
     observer
         .get_consumer_group(
@@ -933,17 +1006,7 @@ async fn bind_group_member_on_backup(
     let stream = Identifier::named(LIVENESS_STREAM).unwrap();
     let topic = Identifier::named(LIVENESS_TOPIC).unwrap();
     let group = Identifier::named(LIVENESS_GROUP).unwrap();
-    let roster = observer.get_cluster_metadata().await.unwrap();
-    let leader_port = roster
-        .nodes
-        .iter()
-        .find(|node| node.role == ClusterNodeRole::Leader)
-        .unwrap()
-        .endpoints
-        .tcp;
-    let primary = (0..harness.cluster_size())
-        .find(|&index| harness.node(index).tcp_addr().unwrap().port() == leader_port)
-        .unwrap();
+    let primary = primary_index(harness, observer).await;
     let backup = (0..harness.cluster_size())
         .find(|&index| index != primary && index != 0)
         .unwrap();
@@ -972,6 +1035,22 @@ async fn bind_group_member_on_backup(
         .unwrap();
     assert_eq!(members.members_count, 1);
     (backup_connection, primary, backup)
+}
+
+async fn primary_index(harness: &TestHarness, observer: &IggyClient) -> usize {
+    let leader_port = observer
+        .get_cluster_metadata()
+        .await
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|node| node.role == ClusterNodeRole::Leader)
+        .unwrap()
+        .endpoints
+        .tcp;
+    (0..harness.cluster_size())
+        .find(|&index| harness.node(index).tcp_addr().unwrap().port() == leader_port)
+        .unwrap()
 }
 
 async fn create_liveness_group(observer: &IggyClient) {
