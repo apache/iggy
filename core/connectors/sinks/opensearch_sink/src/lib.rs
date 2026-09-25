@@ -1597,12 +1597,20 @@ mod tests {
 
     #[test]
     fn given_refresh_policy_should_resolve_to_the_matching_opensearch_variant() {
-        let mut config = base_config();
-        config.refresh = Some(RefreshPolicy::True);
+        let cases = [
+            (RefreshPolicy::True, Refresh::True),
+            (RefreshPolicy::False, Refresh::False),
+            (RefreshPolicy::WaitFor, Refresh::WaitFor),
+        ];
 
-        let resolved = ResolvedOpenSearchSinkConfig::resolve(1, config);
+        for (policy, expected) in cases {
+            let mut config = base_config();
+            config.refresh = Some(policy);
 
-        assert_eq!(resolved.refresh, Some(Refresh::True));
+            let resolved = ResolvedOpenSearchSinkConfig::resolve(1, config);
+
+            assert_eq!(resolved.refresh, Some(expected));
+        }
     }
 
     #[test]
