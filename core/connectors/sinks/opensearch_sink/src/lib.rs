@@ -41,7 +41,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     net::IpAddr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -641,7 +641,7 @@ impl OpenSearchSink {
                     } else {
                         // A bulk call answers 200 even when individual documents
                         // fail, so the per-item results decide the outcome.
-                        match response.json::<Value>().await {
+                        match response.json::<BulkResponseBody>().await {
                             Ok(payload) => match parse_bulk_response(&payload, pending.len()) {
                                 Ok(attempt) => {
                                     let retry_set = documents_at(&pending, &attempt.retryable);
@@ -1051,11 +1051,31 @@ fn documents_at<'a>(
         .collect()
 }
 
+/// Only the fields this sink reads are typed, so `serde_json` skips the rest without allocating.
+#[derive(Debug, Deserialize)]
+struct BulkResponseBody {
+    #[serde(default)]
+    errors: Option<bool>,
+    // HashMap, not a hardcoded "index" field: the action key's name isn't assumed.
+    items: Vec<HashMap<String, BulkItemResult>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BulkItemResult {
+    status: Option<u16>,
+    error: Option<BulkItemErrorDetail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkItemErrorDetail {
+    reason: Option<String>,
+}
+
 /// Why a `_bulk` response's `items` array could not be trusted to reflect
-/// what OpenSearch actually did with every pending document.
+/// what OpenSearch actually did with every pending document. A missing
+/// `items` field fails earlier, at `BulkResponseBody` deserialization.
 #[derive(Debug)]
 enum BulkResponseError {
-    MissingItems,
     ItemCountMismatch { expected: usize, actual: usize },
     MalformedItem { position: usize },
 }
@@ -1063,7 +1083,6 @@ enum BulkResponseError {
 impl std::fmt::Display for BulkResponseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingItems => write!(f, "response has no `items` array"),
             Self::ItemCountMismatch { expected, actual } => write!(
                 f,
                 "response `items` array has {actual} entries, expected {expected}"
@@ -1075,19 +1094,16 @@ impl std::fmt::Display for BulkResponseError {
     }
 }
 
-/// Requires exactly one item per pending document. A missing, short, or
-/// malformed `items` array leaves the true per-item outcome unknown, so the
-/// whole response is rejected rather than silently under-accounted: a chunk
-/// that OpenSearch answered with fewer or unparsable items must not be
-/// treated as cleanly handled just because nothing came back marked failed.
+/// Requires exactly one item per pending document. A short or malformed
+/// `items` array leaves the true per-item outcome unknown, so the whole
+/// response is rejected rather than silently under-accounted: a chunk that
+/// OpenSearch answered with fewer or unparsable items must not be treated as
+/// cleanly handled just because nothing came back marked failed.
 fn parse_bulk_response(
-    response: &Value,
+    response: &BulkResponseBody,
     expected: usize,
 ) -> Result<BulkAttempt, BulkResponseError> {
-    let items = response
-        .get("items")
-        .and_then(Value::as_array)
-        .ok_or(BulkResponseError::MissingItems)?;
+    let items = &response.items;
 
     if items.len() != expected {
         return Err(BulkResponseError::ItemCountMismatch {
@@ -1097,18 +1113,14 @@ fn parse_bulk_response(
     }
 
     // `errors: false` is only trustworthy if every item has a 2xx result.
-    if !response
-        .get("errors")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
+    if !response.errors.unwrap_or(true) {
         for (position, item) in items.iter().enumerate() {
-            let result = item.as_object().and_then(|item| item.values().next());
-            let status = result
-                .and_then(|result| result.get("status"))
-                .and_then(Value::as_u64);
-            let has_error = result.is_some_and(|result| result.get("error").is_some());
-            if has_error || !status.is_some_and(|status| (200..300).contains(&status)) {
+            let result = item.values().next();
+            let has_error = result.is_some_and(|result| result.error.is_some());
+            let status_ok = result
+                .and_then(|result| result.status)
+                .is_some_and(|status| (200..300).contains(&status));
+            if has_error || !status_ok {
                 return Err(BulkResponseError::MalformedItem { position });
             }
         }
@@ -1120,21 +1132,20 @@ fn parse_bulk_response(
 
     let mut attempt = BulkAttempt::default();
     for (position, item) in items.iter().enumerate() {
-        let result = item
-            .as_object()
-            .and_then(|item| item.values().next())
-            .ok_or(BulkResponseError::MalformedItem { position })?;
+        let Some(result) = item.values().next() else {
+            return Err(BulkResponseError::MalformedItem { position });
+        };
 
-        let status = result.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
-        if result.get("error").is_none() && (200..300).contains(&status) {
+        let status = result.status.unwrap_or(0);
+        if result.error.is_none() && (200..300).contains(&status) {
             attempt.indexed += 1;
             continue;
         }
 
         let reason = result
-            .get("error")
-            .and_then(|error| error.get("reason"))
-            .and_then(Value::as_str)
+            .error
+            .as_ref()
+            .and_then(|error| error.reason.as_deref())
             .unwrap_or("unknown error");
         let failure = format!("status {status}: {reason}");
 
@@ -2095,6 +2106,13 @@ mod tests {
     // The bulk-response fixtures below are verbatim captures from OpenSearch
     // 3.8.0; the shapes are measured, not assumed.
 
+    // Adapts existing `json!` fixtures to the typed `BulkResponseBody`.
+    fn parsed(response: &Value, expected: usize) -> Result<BulkAttempt, BulkResponseError> {
+        let body: BulkResponseBody =
+            serde_json::from_value(response.clone()).expect("test fixture should deserialize");
+        parse_bulk_response(&body, expected)
+    }
+
     #[test]
     fn given_clean_bulk_response_should_count_every_document_as_indexed() {
         let response = json!({
@@ -2106,7 +2124,7 @@ mod tests {
             ]
         });
 
-        let attempt = parse_bulk_response(&response, 2).expect("well-formed response");
+        let attempt = parsed(&response, 2).expect("well-formed response");
 
         assert_eq!(
             attempt,
@@ -2136,9 +2154,7 @@ mod tests {
         });
 
         assert_eq!(
-            parse_bulk_response(&response, 2)
-                .expect("well-formed response")
-                .indexed,
+            parsed(&response, 2).expect("well-formed response").indexed,
             2
         );
     }
@@ -2161,7 +2177,7 @@ mod tests {
             ]
         });
 
-        let attempt = parse_bulk_response(&response, 2).expect("well-formed response");
+        let attempt = parsed(&response, 2).expect("well-formed response");
 
         assert_eq!(attempt.indexed, 1);
         assert_eq!(attempt.permanent_failed, 1);
@@ -2184,7 +2200,7 @@ mod tests {
             ]
         });
 
-        let error = parse_bulk_response(&response, 1)
+        let error = parsed(&response, 1)
             .expect("well-formed response")
             .into_outcome()
             .into_error("iggy_probe")
@@ -2202,7 +2218,7 @@ mod tests {
             ]
         });
 
-        let error = parse_bulk_response(&response, 1)
+        let error = parsed(&response, 1)
             .expect("well-formed response")
             .into_outcome()
             .into_error("iggy_probe")
@@ -2221,7 +2237,7 @@ mod tests {
             ]
         });
 
-        let outcome = parse_bulk_response(&response, 2)
+        let outcome = parsed(&response, 2)
             .expect("well-formed response")
             .into_outcome();
 
@@ -2279,10 +2295,8 @@ mod tests {
 
     #[test]
     fn given_bulk_response_without_items_should_be_rejected_as_unparsable() {
-        assert!(matches!(
-            parse_bulk_response(&json!({}), 1),
-            Err(BulkResponseError::MissingItems)
-        ));
+        // Fails at deserialization now, one layer earlier than parse_bulk_response.
+        assert!(serde_json::from_value::<BulkResponseBody>(json!({})).is_err());
     }
 
     #[test]
@@ -2295,7 +2309,7 @@ mod tests {
         });
 
         assert!(matches!(
-            parse_bulk_response(&response, 2),
+            parsed(&response, 2),
             Err(BulkResponseError::ItemCountMismatch {
                 expected: 2,
                 actual: 1
@@ -2314,7 +2328,7 @@ mod tests {
         });
 
         assert!(matches!(
-            parse_bulk_response(&response, 2),
+            parsed(&response, 2),
             Err(BulkResponseError::MalformedItem { position: 1 })
         ));
     }
@@ -2327,7 +2341,7 @@ mod tests {
         });
 
         assert!(matches!(
-            parse_bulk_response(&response, 1),
+            parsed(&response, 1),
             Err(BulkResponseError::MalformedItem { position: 0 })
         ));
     }
@@ -2342,7 +2356,7 @@ mod tests {
         });
 
         assert!(matches!(
-            parse_bulk_response(&response, 1),
+            parsed(&response, 1),
             Err(BulkResponseError::MalformedItem { position: 0 })
         ));
     }
@@ -2359,7 +2373,7 @@ mod tests {
             ]
         });
 
-        let attempt = parse_bulk_response(&response, 4).expect("well-formed response");
+        let attempt = parsed(&response, 4).expect("well-formed response");
 
         assert_eq!(attempt.indexed, 1);
         assert_eq!(attempt.permanent_failed, 1);
@@ -2376,7 +2390,7 @@ mod tests {
         });
 
         assert!(
-            parse_bulk_response(&response, 1)
+            parsed(&response, 1)
                 .expect("well-formed response")
                 .retryable
                 .is_empty()
