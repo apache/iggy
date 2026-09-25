@@ -36,6 +36,25 @@ use std::ops::Range;
 use configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use iggy_common::{IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+
+/// Algorithms accepted for trusted-issuer (JWKS-verified) tokens. Only
+/// asymmetric families are allowed; symmetric HS* is rejected so an attacker
+/// cannot set `alg: HS256` in the header and sign with a known public key
+/// (the classic algorithm-confusion attack). The JWKS resolver only stores
+/// RSA and EC keys, so the `jsonwebtoken` crate would also reject an HMAC
+/// signature against those key types, but an explicit allowlist makes the
+/// guarantee independent of library internals.
+const TRUSTED_ISSUER_ALGORITHMS: &[Algorithm] = &[
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::EdDSA,
+];
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use server_common::crypto;
 use tracing::{debug, error, info, warn};
@@ -307,11 +326,8 @@ impl JwtManager {
             }
         };
 
-        // The algorithm is taken from the token header (e.g. RS256), not the
-        // self-issued HS256; issuer and audience are pinned to the config, and
-        // the timing checks mirror the self-issued path (enforce `nbf`, honor
-        // the configured clock skew).
-        let mut validation = Validation::new(insecure.header.alg);
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.algorithms = TRUSTED_ISSUER_ALGORITHMS.to_vec();
         validation.set_issuer(std::slice::from_ref(&config.issuer));
         validation.set_audience(std::slice::from_ref(&config.audience));
         validation.validate_nbf = true;
