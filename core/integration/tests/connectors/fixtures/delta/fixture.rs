@@ -21,7 +21,7 @@ use deltalake::kernel::{DataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
 use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -178,6 +178,68 @@ impl TestFixture for DeltaFixture {
         Self::create_table(&table_uri).await?;
         info!(
             "Delta fixture created with table path: {}",
+            table_path.display()
+        );
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            table_path,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let table_uri = format!("file://{}", self.table_path.display());
+
+        let mut envs = HashMap::new();
+        envs.insert(ENV_SINK_TABLE_URI.to_string(), table_uri);
+        envs.insert(
+            ENV_SINK_PATH.to_string(),
+            "../../target/debug/libiggy_connector_delta_sink".to_string(),
+        );
+        envs
+    }
+}
+
+pub struct DeltaCorruptedLogFixture {
+    _temp_dir: TempDir,
+    table_path: PathBuf,
+}
+
+impl DeltaCorruptedLogFixture {
+    // Overwrites the version-0 commit file with garbage bytes but keeps its
+    // name intact: `is_delta_table_location` only lists filenames under
+    // `_delta_log`, so the table still "exists"; `DeltaTable::load` is what
+    // then fails parsing this file during log replay.
+    async fn corrupt_commit_log(table_path: &Path) -> Result<(), TestBinaryError> {
+        let commit_path = table_path
+            .join("_delta_log")
+            .join("00000000000000000000.json");
+        tokio::fs::write(&commit_path, b"not a valid delta log commit entry")
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "DeltaCorruptedLogFixture".to_string(),
+                message: format!(
+                    "Failed to corrupt commit log at {}: {error}",
+                    commit_path.display()
+                ),
+            })
+    }
+}
+
+#[async_trait]
+impl TestFixture for DeltaCorruptedLogFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let temp_dir = TempDir::new().map_err(|error| TestBinaryError::FixtureSetup {
+            fixture_type: "DeltaCorruptedLogFixture".to_string(),
+            message: format!("Failed to create temp directory: {error}"),
+        })?;
+
+        let table_path = temp_dir.path().join("delta_table");
+        let table_uri = format!("file://{}", table_path.display());
+        DeltaFixture::create_table(&table_uri).await?;
+        Self::corrupt_commit_log(&table_path).await?;
+        info!(
+            "Delta corrupted-log fixture created with table path: {}",
             table_path.display()
         );
 
@@ -385,6 +447,90 @@ impl TestFixture for DeltaS3Fixture {
             self.minio_endpoint.clone(),
         );
         envs.insert(ENV_SINK_AWS_S3_ALLOW_HTTP.to_string(), "true".to_string());
+        envs
+    }
+}
+
+pub struct DeltaS3NoTableFixture {
+    inner: DeltaS3Fixture,
+}
+
+#[async_trait]
+impl TestFixture for DeltaS3NoTableFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let id = Uuid::new_v4();
+        let network = format!("iggy-delta-s3-{id}");
+        let minio_name = fixtures::unique_container_name("minio-delta-no-table");
+
+        let (minio, minio_endpoint) = DeltaS3Fixture::start_minio(&network, &minio_name).await?;
+        DeltaS3Fixture::create_bucket(&minio_endpoint).await?;
+
+        info!("Delta S3 'no table' fixture ready with MinIO at {minio_endpoint}");
+
+        Ok(Self {
+            inner: DeltaS3Fixture {
+                minio,
+                minio_endpoint,
+            },
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
+    }
+}
+
+pub struct DeltaS3NoBucketFixture {
+    inner: DeltaS3Fixture,
+}
+
+#[async_trait]
+impl TestFixture for DeltaS3NoBucketFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let id = Uuid::new_v4();
+        let network = format!("iggy-delta-s3-{id}");
+        let minio_name = fixtures::unique_container_name("minio-delta-no-bucket");
+
+        let (minio, minio_endpoint) = DeltaS3Fixture::start_minio(&network, &minio_name).await?;
+
+        info!("Delta S3 'no bucket' fixture ready with MinIO at {minio_endpoint}");
+
+        Ok(Self {
+            inner: DeltaS3Fixture {
+                minio,
+                minio_endpoint,
+            },
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
+    }
+}
+
+pub struct DeltaS3WrongCredentialsFixture {
+    inner: DeltaS3Fixture,
+}
+
+#[async_trait]
+impl TestFixture for DeltaS3WrongCredentialsFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        info!("Delta S3 'wrong credentials' fixture reusing a regular DeltaS3Fixture setup");
+        Ok(Self {
+            inner: DeltaS3Fixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SINK_AWS_S3_ACCESS_KEY.to_string(),
+            "wrong-access-key".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_AWS_S3_SECRET_KEY.to_string(),
+            "wrong-secret-key".to_string(),
+        );
         envs
     }
 }

@@ -37,33 +37,64 @@ impl Sink for DeltaSink {
         );
 
         let table_url = url::Url::parse(&self.config.table_uri).map_err(|e| {
-            error!("Failed to parse table URI '{}': {e}", self.config.table_uri);
-            Error::InitError(format!("Invalid table URI: {e}"))
+            error!(
+                "Connector configuration: failed to parse table_uri = '{}': {e}.",
+                self.config.table_uri
+            );
+            Error::InvalidConfigValue(format!("table_uri: {e}"))
         })?;
+        let table_uri = &self.config.table_uri;
 
         info!("Parsed table URI: {}", table_url);
 
-        let storage_options = build_storage_options(&self.config).map_err(|e| {
-            error!("Invalid storage configuration: {e}");
-            Error::InitError(format!("Invalid storage configuration: {e}"))
+        let storage_options = build_storage_options(&self.config).inspect_err(|e| {
+            error!("Connector configuration: invalid storage configuration. Error message: {e}");
         })?;
 
-        let table =
-            match deltalake::open_table_with_storage_options(table_url, storage_options).await {
-                Ok(table) => table,
-                Err(e) => {
-                    error!("Failed to load Delta table: {e}");
-                    return Err(Error::InitError(format!("Failed to load Delta table: {e}")));
+        let builder = deltalake::DeltaTableBuilder::from_url(table_url)
+            .map_err(|e| {
+                error!("deltalake-rs interface: failed to configure with table_uri = '{table_uri}'. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}");
+                Error::InvalidConfigValue(format!("table_uri = '{table_uri}' caused an error in deltalake-rs interface. Check deltalake::DeltaTableBuilder::from_url docs and code to correct your table_uri. Error message: {e}"))
+            })?
+            .with_storage_options(storage_options);
+        let mut table = builder.build().map_err(|e| {
+            error!("deltalake-rs interface: failed to configure with provided storage configuration. Error message: {e}");
+            Error::InitError(format!("deltalake-rs interface: failed to configure with provided storage configuration. Error message: {e}"))
+        })?;
+        let table_exists = table
+            .verify_deltatable_existence()
+            .await
+            .map_err(
+                |e| {
+                    error!("deltalake-rs interface: failed to list table_uri '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}");
+                    Error::InitError(format!("deltalake-rs interface: failed to list table_uri '{table_uri}' directory to verify delta table existence. Make sure the destination exists and the access to the destination is set up correctly - read the Iggy delta connector docs for more information. Error message: {e}"))
                 }
-            };
+            )?;
+        if !table_exists {
+            error!(
+                "No delta table found in '{table_uri}'. Make sure to create the delta table in the destination manually or verify the validity of such table."
+            );
+            return Err(Error::InitError(format!(
+                "No delta table found in '{table_uri}'. Make sure to create the delta table in the destination manually or verify the validity of such table."
+            )));
+        }
+
+        table
+            .load()
+            .await
+            .map_err(|e| {
+                error!("deltalake-rs interface: failed to load the table's latest snapshot. See deltalake::DeltaTable::load for more information. Error message: {e}");
+                Error::InitError(format!("deltalake-rs interface: failed to load the table's latest snapshot. See deltalake::DeltaTable::load for more information. Error message: {e}"))
+            })?;
 
         let kernel_schema = table
             .snapshot()
             .map_err(|e| {
-                error!("Failed to get table snapshot: {e}");
-                Error::InitError(format!("Failed to get table snapshot: {e}"))
+                error!("deltalake-rs interface: failed to get the table's latest snapshot. See deltalake::DeltaTable::snapshot for more information. Error message: {e}");
+                Error::InitError(format!("deltalake-rs interface: failed to get the table's latest snapshot. See deltalake::DeltaTable::snapshot for more information. Error message: {e}"))
             })?
             .schema();
+
         // TODO: coercion tree is never refreshed if the schema changes concurrently,
         // leading to opaque errors downstream.
         let coercion_tree = create_coercion_tree(&kernel_schema);
@@ -107,9 +138,9 @@ impl Sink for DeltaSink {
             return Ok(());
         }
 
-        // TODO: all partition consume() calls serialize on this single lock, holding it
-        // through flush_and_commit() I/O. fix: per-partition writers keyed by partition_id.
-        // Ref: https://github.com/apache/iggy/pull/2889/#discussion_r2936719763
+        // This lock is held across the write and flush_and_commit I/O below,
+        // serializing consume() for topics sharing this sink. Kept intentionally:
+        // see #3839 for why per-partition writers were researched and dropped.
         let mut state_guard = self.state.lock().await;
         let state = state_guard.as_mut().ok_or_else(|| {
             error!("Delta sink state not initialized — was open() called?");
