@@ -72,6 +72,29 @@ const INDEX_ALREADY_EXISTS_ERROR: &str = "resource_already_exists_exception";
 /// one item: a single oversized ID would cost every document in its chunk.
 const MAX_DOCUMENT_ID_BYTES: usize = 512;
 
+// Connector-owned rather than exposing `opensearch::params::Refresh` directly:
+// keeps this config's wire format under this connector's own control instead
+// of an internal detail of the opensearch crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum RefreshPolicy {
+    #[serde(rename = "true")]
+    True,
+    #[serde(rename = "false")]
+    False,
+    #[serde(rename = "wait_for")]
+    WaitFor,
+}
+
+impl From<RefreshPolicy> for Refresh {
+    fn from(policy: RefreshPolicy) -> Self {
+        match policy {
+            RefreshPolicy::True => Refresh::True,
+            RefreshPolicy::False => Refresh::False,
+            RefreshPolicy::WaitFor => Refresh::WaitFor,
+        }
+    }
+}
+
 // No `Serialize`: nothing serializes this type, and the only in-tree helper for
 // a `SecretString` field writes the credential in plaintext.
 #[derive(Debug, Default, Deserialize)]
@@ -86,7 +109,7 @@ pub struct OpenSearchSinkConfig {
     pub include_metadata: Option<bool>,
     pub batch_size: Option<usize>,
     pub timeout: Option<String>,
-    pub refresh: Option<Refresh>,
+    pub refresh: Option<RefreshPolicy>,
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
     pub max_retry_delay: Option<String>,
@@ -196,7 +219,7 @@ impl ResolvedOpenSearchSinkConfig {
             include_metadata: config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA),
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1),
             timeout: parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT),
-            refresh: config.refresh,
+            refresh: config.refresh.map(Into::into),
             max_retries: config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             retry_delay,
             max_retry_delay,
@@ -3102,12 +3125,18 @@ mod tests {
     }
 
     #[test]
-    fn given_refresh_values_should_match_opensearch_wire_format() {
-        assert_eq!(serde_json::to_string(&Refresh::True).unwrap(), "\"true\"");
-        assert_eq!(serde_json::to_string(&Refresh::False).unwrap(), "\"false\"");
+    fn given_refresh_wire_values_should_deserialize_to_the_matching_variant() {
         assert_eq!(
-            serde_json::to_string(&Refresh::WaitFor).unwrap(),
-            "\"wait_for\""
+            serde_json::from_str::<RefreshPolicy>("\"true\"").unwrap(),
+            RefreshPolicy::True
+        );
+        assert_eq!(
+            serde_json::from_str::<RefreshPolicy>("\"false\"").unwrap(),
+            RefreshPolicy::False
+        );
+        assert_eq!(
+            serde_json::from_str::<RefreshPolicy>("\"wait_for\"").unwrap(),
+            RefreshPolicy::WaitFor
         );
     }
 
@@ -3218,6 +3247,6 @@ mod tests {
                 .map(|password| password.expose_secret().to_string()),
             Some("hunter2".to_string())
         );
-        assert_eq!(config.refresh, Some(Refresh::WaitFor));
+        assert_eq!(config.refresh, Some(RefreshPolicy::WaitFor));
     }
 }
