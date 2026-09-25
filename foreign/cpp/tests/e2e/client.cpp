@@ -738,6 +738,24 @@ TEST_F(E2E_Client, UpdateUserAllowsUsernameAndStatusToBeUpdatedIndependently) {
     });
 }
 
+TEST_F(E2E_Client, UpdateUserWithoutChangesIsNoOp) {
+    RecordProperty("description", "Accepts an empty user update without changing the user.");
+    auto client                = GetLoggedInHighLevelClient();
+    const std::string username = GetRandomName(50);
+    ASSERT_NO_THROW({
+        const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
+
+        ASSERT_NO_THROW(client.UpdateUser(iggy::Identifier::Numeric(created.Id()), std::nullopt, std::nullopt,
+                                          iggy::UserUpdateOptions{}));
+
+        const auto fetched = client.GetUser(iggy::Identifier::Numeric(created.Id()));
+        EXPECT_EQ(fetched.Id(), created.Id());
+        EXPECT_EQ(fetched.CreatedAt(), created.CreatedAt());
+        EXPECT_EQ(fetched.Username(), created.Username());
+        EXPECT_EQ(fetched.Status(), created.Status());
+    });
+}
+
 TEST_F(E2E_Client, UpdateUserAcceptsUsernameLengthBounds) {
     RecordProperty("description", "Accepts exact three-byte and fifty-byte username boundaries.");
     auto client                         = GetLoggedInHighLevelClient();

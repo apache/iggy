@@ -136,8 +136,8 @@ void IggyBlockingClient::DeleteUser(const Identifier &user) {
 }
 
 void IggyBlockingClient::UpdateUser(const Identifier &user,
-                                    const std::optional<std::string> username,
-                                    const std::optional<UserStatus> status,
+                                    std::optional<std::string> username,
+                                    std::optional<UserStatus> status,
                                     const UserUpdateOptions &options) {
     RethrowAsIggyException([this, &user, &username, status, &options] {
         auto ffi_options = ToFfiRawOptions(options.RawEntries());
