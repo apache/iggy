@@ -44,7 +44,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     net::IpAddr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 use tokio::time::sleep;
@@ -124,6 +124,9 @@ pub struct OpenSearchSink {
     invocations_count: AtomicU64,
     documents_indexed: AtomicU64,
     errors_count: AtomicU64,
+    // Warns at most once per connector instance instead of once per record,
+    // so a persistently misconfigured document_id_field can't flood logs.
+    missing_document_id_field_warned: AtomicBool,
 }
 
 // `OpenSearch` derives `Debug` down through its `Transport`, and
@@ -139,6 +142,10 @@ impl std::fmt::Debug for OpenSearchSink {
             .field("invocations_count", &self.invocations_count)
             .field("documents_indexed", &self.documents_indexed)
             .field("errors_count", &self.errors_count)
+            .field(
+                "missing_document_id_field_warned",
+                &self.missing_document_id_field_warned,
+            )
             .finish()
     }
 }
@@ -238,6 +245,7 @@ impl OpenSearchSink {
             invocations_count: AtomicU64::new(0),
             documents_indexed: AtomicU64::new(0),
             errors_count: AtomicU64::new(0),
+            missing_document_id_field_warned: AtomicBool::new(false),
         }
     }
 
@@ -499,6 +507,15 @@ impl OpenSearchSink {
             return Ok(None);
         };
         let Some(value) = document.get(field) else {
+            if !self
+                .missing_document_id_field_warned
+                .swap(true, Ordering::Relaxed)
+            {
+                warn!(
+                    "OpenSearch sink connector ID: {}: document_id_field '{field}' missing from a message; falling back to a generated ID. Further occurrences will not be logged individually.",
+                    self.id
+                );
+            }
             return Ok(None);
         };
 
@@ -1867,6 +1884,45 @@ mod tests {
             .expect("prepare document");
 
         assert_eq!(prepared.id, expected_id);
+    }
+
+    #[test]
+    fn given_repeated_missing_document_id_field_should_warn_only_once() {
+        let mut config = base_config();
+        config.document_id_field = Some("order_id".to_string());
+        let sink = sink_with_config(config);
+
+        assert!(
+            !sink
+                .missing_document_id_field_warned
+                .load(Ordering::Relaxed)
+        );
+
+        sink.prepare_document(
+            &topic_metadata(),
+            &messages_metadata(),
+            message(Payload::Json(simd_json::json!({ "name": "Alice" }))),
+        )
+        .expect("prepare document");
+
+        assert!(
+            sink.missing_document_id_field_warned
+                .load(Ordering::Relaxed)
+        );
+
+        // A second occurrence must not panic or otherwise misbehave now that
+        // the flag is already set - it just stays silent.
+        sink.prepare_document(
+            &topic_metadata(),
+            &messages_metadata(),
+            message(Payload::Json(simd_json::json!({ "name": "Bob" }))),
+        )
+        .expect("prepare document");
+
+        assert!(
+            sink.missing_document_id_field_warned
+                .load(Ordering::Relaxed)
+        );
     }
 
     #[test]
