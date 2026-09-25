@@ -25,6 +25,7 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
+pub mod lease;
 pub mod liveness;
 
 use crate::namespace::{resolve_offset_group_id, resolve_partition_namespace};

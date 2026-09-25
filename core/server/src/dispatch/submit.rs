@@ -24,7 +24,7 @@
 //! their replica forwards) delegate to `session_ops`, which owns that
 //! machinery.
 
-use crate::consumer_group::liveness::ConsumerGroupLiveness;
+use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::dispatch::session_ops::{
     answer_forwarded_logout, answer_forwarded_register, submit_logout_local_or_forward,
     submit_register_local_or_forward,

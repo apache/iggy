@@ -19,7 +19,7 @@
 
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
 use crate::boot::wire_shell_handlers;
-use crate::consumer_group::liveness::ConsumerGroupLiveness;
+use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::partition_helpers::load_partition_or_fence;
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;

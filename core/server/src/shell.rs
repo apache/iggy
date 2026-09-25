@@ -23,7 +23,7 @@
 //! Everything here is type- and config-level; construction (wiring the
 //! handlers against a live bus) stays in [`crate::boot`].
 
-use crate::consumer_group::liveness::ConsumerGroupLiveness;
+use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::session_manager::SessionManager;
 use configs::server::ServerConfig;
 use consensus::{ConsensusTimers, VsrConsensus};

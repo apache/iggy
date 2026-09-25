@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Volatile, primary-owned leases for persisted consumer-group memberships.
-//! A new primary and each newly observed session get a full timeout. Only
-//! server-observed connections renew leases, never recovered client-table rows.
+//! Shard 0's periodic pass: backups report bound sessions to the metadata
+//! primary, which renews leases and commits a Logout for each expired member.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -28,7 +27,7 @@ use bytes::BytesMut;
 use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::{
     Command, ConsensusHeader, ConsumerSession, ConsumerSessionHeartbeatHeader, HEADER_SIZE,
-    MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, PrepareHeader, WireDecode, WireEncode,
+    MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, PrepareHeader, WireEncode,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -38,8 +37,9 @@ use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use server_common::sharding::CONSUMER_SESSION_REPORT_TIMEOUT;
 use shard::Receiver;
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace};
 
+use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 
 const MAX_LOGOUTS_PER_PASS: usize = 256;
@@ -50,134 +50,6 @@ enum Pass {
     Stopped,
     HitCap,
     Drained,
-}
-
-#[derive(Debug)]
-struct Lease {
-    session: Option<u64>,
-    last_seen: Instant,
-}
-
-/// Bounded by the current consumer-group members, independent of heartbeat volume.
-#[derive(Default)]
-pub struct ConsumerGroupLiveness {
-    view: Option<u32>,
-    leases: BTreeMap<u128, Lease>,
-    last_incomplete: Option<Instant>,
-    last_incomplete_warning: Option<Instant>,
-    report_offset: usize,
-    report_incomplete: bool,
-}
-
-impl ConsumerGroupLiveness {
-    fn observe_view(&mut self, view: Option<u32>) {
-        if self.view != view {
-            self.leases.clear();
-            self.last_incomplete = None;
-            self.last_incomplete_warning = None;
-            self.view = view;
-        }
-    }
-
-    fn reconcile(&mut self, view: u32, members: &BTreeMap<u128, Option<u64>>, now: Instant) {
-        self.observe_view(Some(view));
-        self.leases
-            .retain(|client_id, _| members.contains_key(client_id));
-        for (&client_id, &session) in members {
-            let lease = self.leases.entry(client_id).or_insert(Lease {
-                session,
-                last_seen: now,
-            });
-            if lease.session != session {
-                *lease = Lease {
-                    session,
-                    last_seen: now,
-                };
-            }
-        }
-    }
-
-    fn renew(&mut self, session: ConsumerSession, now: Instant) {
-        if let Some(lease) = self.leases.get_mut(&session.client_id)
-            && lease.session == Some(session.session)
-        {
-            lease.last_seen = now;
-        }
-    }
-
-    fn defer_expiry(&mut self, now: Instant, timeout: Duration, replica: u8) {
-        // Recovered memberships do not identify their hosting replica. Until
-        // every reporting node can enumerate its clients, absence is uncertain.
-        if self
-            .last_incomplete_warning
-            .is_none_or(|last| now.saturating_duration_since(last) >= timeout)
-        {
-            warn!(
-                replica,
-                ?timeout,
-                "incomplete consumer session report; deferring session expiry"
-            );
-            self.last_incomplete_warning = Some(now);
-        }
-        self.last_incomplete = Some(now);
-    }
-
-    pub(crate) fn receive(
-        &mut self,
-        cluster: u128,
-        primary_view: Option<u32>,
-        message: &Message<ConsumerSessionHeartbeatHeader>,
-        now: Instant,
-        timeout: Duration,
-    ) {
-        self.observe_view(primary_view);
-        let header = message.header();
-        if primary_view != Some(header.view) || header.cluster != cluster {
-            return;
-        }
-        // Validate the whole batch before refreshing anything.
-        let sessions = message
-            .body()
-            .as_chunks::<{ ConsumerSession::ENCODED_SIZE }>()
-            .0;
-        if let Err(error) = sessions
-            .iter()
-            .try_for_each(|bytes| ConsumerSession::decode(bytes).map(|_| ()))
-        {
-            debug!(
-                ?error,
-                replica = header.replica,
-                "invalid consumer session heartbeat body"
-            );
-            return;
-        }
-        if header.incomplete != 0 {
-            self.defer_expiry(now, timeout, header.replica);
-        }
-        for bytes in sessions {
-            if let Ok((session, _)) = ConsumerSession::decode(bytes) {
-                self.renew(session, now);
-            }
-        }
-    }
-
-    fn expired(
-        &self,
-        view: u32,
-        client_id: u128,
-        session: Option<u64>,
-        now: Instant,
-        timeout: Duration,
-    ) -> bool {
-        self.view == Some(view)
-            && self.last_incomplete.is_none_or(|last_incomplete| {
-                now.saturating_duration_since(last_incomplete) >= timeout
-            })
-            && self.leases.get(&client_id).is_some_and(|lease| {
-                lease.session == session
-                    && now.saturating_duration_since(lease.last_seen) >= timeout
-            })
-    }
 }
 
 pub async fn run(
@@ -479,7 +351,7 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
-    use iggy_binary_protocol::{Operation, WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{Operation, WireDecode, WireIdentifier, WireName, WireOptions};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::lifecycle::Shutdown;
     use metadata::stm::StateMachine;
