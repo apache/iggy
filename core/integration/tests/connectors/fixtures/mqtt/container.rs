@@ -63,6 +63,8 @@ pub(super) struct MqttBrokerContainer {
 
 impl MqttBrokerContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
+        // EMQX is configured through its environment so the fixture exercises
+        // the same password-based authentication used by the source connector.
         let container = GenericImage::new(EMQX_IMAGE, EMQX_TAG)
             .with_wait_for(WaitFor::Nothing)
             .with_exposed_port(EMQX_MQTT_PORT.tcp())
@@ -100,6 +102,8 @@ impl MqttBrokerContainer {
         let broker_url = format!("mqtt://127.0.0.1:{host_port}");
         let dashboard_url = format!("http://127.0.0.1:{dashboard_port}");
 
+        // The image does not expose a reliable container readiness signal, so
+        // wait for the dashboard, create the MQTT user, then probe MQTT itself.
         let token = wait_for_dashboard_token(&dashboard_url).await?;
         create_mqtt_user(&dashboard_url, &token).await?;
         wait_for_mqtt(&broker_url, MQTT_USERNAME, MQTT_PASSWORD).await?;
@@ -111,6 +115,8 @@ impl MqttBrokerContainer {
     }
 
     pub(super) async fn restart(&self) -> Result<(), TestBinaryError> {
+        // Pause/resume keeps the mapped endpoint and broker state intact while
+        // still forcing clients through their reconnect paths.
         self.container
             .pause()
             .await

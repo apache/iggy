@@ -43,6 +43,8 @@ use url::Url;
 const ACK_RETRY_ATTEMPTS: usize = 5;
 const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+// Metadata is kept separate from the payload so protocol details can be
+// preserved in Iggy headers without changing the application bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MqttMessageMetadata {
     pub(crate) qos: Qos,
@@ -51,6 +53,7 @@ pub(crate) struct MqttMessageMetadata {
     pub(crate) retain: bool,
 }
 
+/// MQTT payload plus normalized topic metadata ready for Iggy headers.
 #[derive(Debug)]
 pub(crate) struct MqttMessage {
     pub(crate) payload: Vec<u8>,
@@ -59,12 +62,14 @@ pub(crate) struct MqttMessage {
     pub(crate) metadata: MqttMessageMetadata,
 }
 
+/// A normalized MQTT message and its optional deferred acknowledgement token.
 #[derive(Debug)]
 pub(crate) struct ReceivedMessage {
     pub(crate) message: MqttMessage,
     pub(crate) ack_token: Option<AckToken>,
 }
 
+/// The original publish packet needed by rumqttc to acknowledge QoS 1 or QoS 2.
 #[derive(Debug)]
 pub(crate) struct AckToken(AckTokenKind);
 
@@ -85,7 +90,10 @@ enum MqttConnection {
     },
 }
 
+/// Protocol-specific MQTT client and event loop behind one common driver API.
 pub(crate) struct MqttDriver {
+    // Messages received while flushing acknowledgements are retained here rather
+    // than dropped. The source batch size bounds this queue.
     connection: MqttConnection,
     buffered_messages: VecDeque<ReceivedMessage>,
 }
@@ -111,6 +119,8 @@ impl MqttDriver {
                     .set_clean_session(config.clean_start)
                     .set_keep_alive(keep_alive)
                     .set_request_channel_capacity(request_capacity)
+                    // Manual acknowledgements let Iggy persistence happen before
+                    // PUBACK/PUBREC is sent to the broker.
                     .set_manual_acks(true);
                 set_mqtt311_credentials(&mut options, config);
                 if let Some(transport) = tls_transport(config)? {
@@ -119,6 +129,8 @@ impl MqttDriver {
 
                 let (client, mut event_loop) = Mqtt311Client::new(options, request_capacity);
                 for topic in &config.subscriptions {
+                    // Each filter may select its own QoS override; the global
+                    // value is used only when no exact override is configured.
                     let subscription_qos = qos_for_subscription(config, topic, qos)?;
                     client
                         .subscribe(topic, subscription_qos.into())
@@ -146,6 +158,8 @@ impl MqttDriver {
                     .set_clean_start(config.clean_start)
                     .set_keep_alive(keep_alive)
                     .set_request_channel_capacity(request_capacity)
+                    // MQTT 5 uses the same deferred-acknowledgement lifecycle;
+                    // rumqttc maps the token to PUBREC/PUBREL/PUBCOMP internally.
                     .set_manual_acks(true)
                     .set_session_expiry_interval(config.session_expiry_interval);
                 set_mqtt5_credentials(&mut options, config);
@@ -155,6 +169,8 @@ impl MqttDriver {
 
                 let (client, mut event_loop) = Mqtt5Client::new(options, request_capacity);
                 for topic in &config.subscriptions {
+                    // Keep subscription QoS resolution identical across protocol
+                    // versions so the configuration has one predictable meaning.
                     let subscription_qos = qos_for_subscription(config, topic, qos)?;
                     client
                         .subscribe(topic, subscription_qos.into())
@@ -180,10 +196,14 @@ impl MqttDriver {
         &mut self,
         poll_timeout: Duration,
     ) -> Result<Option<ReceivedMessage>, iggy_connector_sdk::Error> {
+        // Consume buffered messages first. They arrived while another message's
+        // acknowledgement was being flushed and are already valid source data.
         if let Some(message) = self.buffered_messages.pop_front() {
             return Ok(Some(message));
         }
 
+        // Bound each driver poll so the source can flush partial batches and
+        // respond to runtime shutdown instead of waiting indefinitely.
         let deadline = tokio::time::Instant::now() + poll_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -197,6 +217,8 @@ impl MqttDriver {
                             Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
                                 Some(normalize_mqtt311(publish)?)
                             }
+                            // Connection and subscription events advance the
+                            // event loop but are not source messages.
                             Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => None,
                         },
                         Ok(Err(error)) => {
@@ -232,6 +254,8 @@ impl MqttDriver {
         poll_timeout: Duration,
         max_buffered_messages: usize,
     ) -> Result<(), iggy_connector_sdk::Error> {
+        // Process tokens in order. On failure, remove only tokens already
+        // acknowledged so the remaining suffix can be retried.
         let mut acknowledged = 0;
         let retry_delay = ACK_RETRY_DELAY.min(poll_timeout);
         while acknowledged < ack_tokens.len() {
@@ -248,6 +272,8 @@ impl MqttDriver {
                         if attempt == ACK_RETRY_ATTEMPTS {
                             break;
                         }
+                        // rumqttc may need event-loop progress before try_ack can
+                        // enqueue the acknowledgement.
                         if let Err(error) = self
                             .poll_for_ack_progress(poll_timeout, max_buffered_messages)
                             .await
@@ -273,6 +299,8 @@ impl MqttDriver {
     }
 
     fn try_acknowledge(&self, ack_token: &AckToken) -> Result<(), iggy_connector_sdk::Error> {
+        // A token must be acknowledged by the same protocol client that created
+        // it. Mixing MQTT 3.1.1 and MQTT 5 tokens is an invalid internal state.
         match (&self.connection, &ack_token.0) {
             (MqttConnection::Mqtt311 { client, .. }, AckTokenKind::Mqtt311(publish)) => client
                 .try_ack(publish)
@@ -289,6 +317,8 @@ impl MqttDriver {
         poll_timeout: Duration,
         max_buffered_messages: usize,
     ) -> Result<(), iggy_connector_sdk::Error> {
+        // A publish can arrive while the event loop is being driven for an ACK.
+        // Preserve it for the next source poll, subject to the batch bound.
         let received = match &mut self.connection {
             MqttConnection::Mqtt311 { event_loop, .. } => {
                 let event = timeout(poll_timeout, event_loop.poll())
@@ -338,6 +368,8 @@ impl MqttDriver {
 }
 
 fn retain_unacknowledged_tokens(ack_tokens: &mut Vec<AckToken>, acknowledged: usize) {
+    // The prefix has already been accepted by the broker. Keep the suffix so a
+    // retry does not repeat successful acknowledgements or discard failures.
     ack_tokens.drain(..acknowledged);
 }
 
@@ -348,6 +380,8 @@ fn install_rustls_provider() {
 fn tls_transport(
     config: &MqttSourceConfig,
 ) -> Result<Option<Transport>, iggy_connector_sdk::Error> {
+    // No TLS table means plaintext MQTT. When present, build a complete rustls
+    // transport from either the supplied CA or the system trust store.
     let Some(tls) = &config.tls else {
         return Ok(None);
     };
@@ -378,6 +412,8 @@ fn read_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Err
 }
 
 fn read_certificate_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
+    // Validate PEM contents during initialization so bad certificates produce an
+    // actionable configuration error before the broker connection starts.
     let contents = read_file(path, field)?;
     let mut reader = BufReader::new(Cursor::new(&contents));
     let certificates = certs(&mut reader)
@@ -410,6 +446,7 @@ fn read_private_key_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connec
 }
 
 fn system_root_cert_store() -> Result<RootCertStore, iggy_connector_sdk::Error> {
+    // This path is used only when TLS is enabled without a custom CA bundle.
     let mut root_cert_store = RootCertStore::empty();
     let native_certificates = load_native_certs();
     for certificate in native_certificates.certs {
@@ -431,6 +468,8 @@ fn build_tls_config(
     ca: Option<Vec<u8>>,
     client_auth: Option<(Vec<u8>, Vec<u8>)>,
 ) -> Result<ClientConfig, iggy_connector_sdk::Error> {
+    // Client authentication is optional, but certificate and key parsing stays
+    // here so mismatches fail before rumqttc starts its reconnect loop.
     let root_cert_store = match ca {
         Some(ca) => {
             let mut reader = BufReader::new(Cursor::new(ca));
@@ -498,6 +537,8 @@ fn broker_url_with_client_id(
     config: &MqttSourceConfig,
     id: u32,
 ) -> Result<String, iggy_connector_sdk::Error> {
+    // rumqttc reads the client ID from the URL query when parsing options. Add a
+    // generated value only when the operator did not configure one explicitly.
     let mut url = Url::parse(&config.broker_url).map_err(|error| {
         iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
     })?;
@@ -567,6 +608,8 @@ async fn poll_mqtt5(
 fn normalize_mqtt311(
     publish: Mqtt311Publish,
 ) -> Result<ReceivedMessage, iggy_connector_sdk::Error> {
+    // Normalize both MQTT protocol versions into one source representation. Only
+    // the acknowledgement token type remains protocol-specific.
     let qos = publish.qos.into();
     let metadata = MqttMessageMetadata {
         qos,
@@ -588,6 +631,8 @@ fn normalize_mqtt311(
 pub(crate) fn normalize_mqtt5(
     publish: Mqtt5Publish,
 ) -> Result<ReceivedMessage, iggy_connector_sdk::Error> {
+    // MQTT 5 adds publish properties; common metadata headers are built first
+    // and the optional properties are appended afterward.
     let qos = publish.qos.into();
     let metadata = MqttMessageMetadata {
         qos,
@@ -615,6 +660,8 @@ fn metadata_headers(
     topic: &str,
     metadata: MqttMessageMetadata,
 ) -> Result<BTreeMap<HeaderKey, HeaderValue>, iggy_connector_sdk::Error> {
+    // Stable lowercase header names let consumers inspect MQTT metadata without
+    // decoding the original MQTT packet again.
     let mut headers = BTreeMap::new();
     insert_string_header(&mut headers, "mqtt.protocol", protocol)?;
     insert_string_header(&mut headers, "mqtt.topic", topic)?;
@@ -631,6 +678,8 @@ fn insert_mqtt5_properties(
     headers: &mut BTreeMap<HeaderKey, HeaderValue>,
     properties: &rumqttc::v5::mqttbytes::v5::PublishProperties,
 ) -> Result<(), iggy_connector_sdk::Error> {
+    // MQTT 5 properties are copied into headers because the payload remains the
+    // original application bytes. Repeated user properties use distinct keys.
     if let Some(value) = properties.payload_format_indicator {
         headers.insert(header_key("mqtt.payload_format_indicator")?, value.into());
     }

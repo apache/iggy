@@ -46,6 +46,7 @@ const DEFAULT_REQUEST_CAPACITY: usize = 32;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_BATCH_TIMEOUT: &str = "10ms";
 
+/// MQTT wire protocol selected for the broker connection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MqttProtocol {
@@ -56,6 +57,10 @@ pub enum MqttProtocol {
     Mqtt5,
 }
 
+/// Subscription delivery level requested from the broker.
+///
+/// QoS 0 has no acknowledgement token. QoS 1 and QoS 2 produce a token that
+/// remains pending until the corresponding Iggy batch is acknowledged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Qos {
     Zero,
@@ -80,35 +85,56 @@ impl TryFrom<u8> for Qos {
 
 #[derive(Debug, Deserialize)]
 pub struct MqttSourceConfig {
+    /// MQTT broker URL, using `mqtt://`, `mqtts://`, or `ssl://`.
     pub broker_url: String,
+    /// Topic filters subscribed to by this connector instance.
     pub subscriptions: Vec<String>,
+    /// Exact topic-filter QoS overrides applied on top of `qos`.
     #[serde(default)]
     pub subscription_qos: BTreeMap<String, u8>,
+    /// MQTT protocol version used for the connection.
     #[serde(default)]
     pub protocol: MqttProtocol,
+    /// Default subscription QoS when no per-filter override exists.
     #[serde(default = "default_qos")]
     pub qos: u8,
+    /// Optional CA and client-authentication material for TLS connections.
     #[serde(default)]
     pub tls: Option<MqttTlsConfig>,
+    /// Explicit broker client ID. A connector-specific ID is generated when absent.
     pub client_id: Option<String>,
+    /// Broker username, which must be paired with `password`.
     pub username: Option<String>,
+    /// Broker password, kept secret in memory and never included in debug output.
     pub password: Option<SecretString>,
+    /// Whether the broker should discard the previous session on connect.
     #[serde(default)]
     pub clean_start: bool,
+    /// MQTT 5 session expiry interval in seconds.
     pub session_expiry_interval: Option<u32>,
+    /// MQTT keep-alive interval.
     pub keep_alive: Option<String>,
+    /// Maximum time to wait for a message during batch collection.
     pub poll_timeout: Option<String>,
+    /// Capacity of rumqttc's request channel.
     pub request_capacity: Option<usize>,
+    /// Maximum number of messages in one Iggy source batch.
     pub batch_size: Option<usize>,
+    /// Maximum time to wait after the first message before flushing a batch.
     pub batch_timeout: Option<String>,
+    /// Enables per-message MQTT logging for troubleshooting.
     pub verbose_logging: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MqttTlsConfig {
+    /// Optional custom CA bundle. System roots are used when this is absent.
     pub ca_file: Option<String>,
+    /// Client certificate for mutual TLS, paired with `client_key_file`.
     pub client_cert_file: Option<String>,
+    /// Client private key for mutual TLS, paired with `client_cert_file`.
     pub client_key_file: Option<String>,
+    /// TLS server name, which must match the broker URL host.
     pub server_name: Option<String>,
 }
 
@@ -118,8 +144,13 @@ pub struct MqttSource {
     poll_timeout: Duration,
     batch_size: usize,
     batch_timeout: Duration,
+    // The driver is moved out briefly during event-loop I/O to avoid holding a
+    // mutex guard across await points.
     driver: Mutex<Option<MqttDriver>>,
+    // Committed only after the runtime confirms the corresponding Iggy batch.
     state: Mutex<State>,
+    // At most one batch is staged because the SDK reports one batch result at a
+    // time. It pairs candidate state with QoS acknowledgement tokens.
     pending_batch: Mutex<Option<PendingBatch>>,
 }
 
@@ -136,17 +167,24 @@ impl fmt::Debug for MqttSource {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct State {
+    // This is an operational counter rather than a broker offset. MQTT
+    // redelivery is controlled by the broker session and acknowledgement state.
     acknowledged_messages: u64,
 }
 
 #[derive(Debug)]
 struct PendingBatch {
+    // Tokens are kept separately from ProducedMessage because the runtime
+    // acknowledges Iggy before the driver acknowledges MQTT.
     ack_tokens: Vec<AckToken>,
+    // State is staged until the same batch has been persisted and acknowledged.
     candidate_state: State,
 }
 
 impl MqttSource {
     pub fn new(id: u32, config: MqttSourceConfig, state: Option<ConnectorState>) -> Self {
+        // Invalid or incompatible state starts from a safe empty counter. The
+        // broker can still redeliver unacknowledged QoS messages after reconnect.
         let restored_state = state.and_then(|state| {
             state.deserialize::<State>(CONNECTOR_NAME, id).inspect(|state| {
                 info!(
@@ -173,6 +211,8 @@ impl MqttSource {
     }
 
     fn validate_config(&self) -> Result<(Qos, Duration, Duration, usize, usize, Duration), Error> {
+        // Validate static values before opening the network connection so an
+        // operator sees configuration errors during initialization.
         if self.config.broker_url.trim().is_empty() {
             return Err(Error::InvalidConfigValue(
                 "broker_url must not be empty".to_string(),
@@ -197,6 +237,8 @@ impl MqttSource {
                 )));
             }
         }
+        // An override is keyed by the exact configured filter. An unknown key
+        // would otherwise be accepted but never used.
         for subscription in self.config.subscription_qos.keys() {
             if !self
                 .config
@@ -214,6 +256,8 @@ impl MqttSource {
                 "username and password must be configured together".to_string(),
             ));
         }
+        // Certificate and hostname checks happen before rumqttc is constructed,
+        // so malformed TLS configuration cannot become a reconnect loop.
         validate_tls_config(&self.config)?;
 
         let qos = Qos::try_from(self.config.qos)?;
@@ -230,6 +274,11 @@ impl MqttSource {
             DEFAULT_POLL_TIMEOUT,
             "poll_timeout",
         )?;
+        if poll_timeout.is_zero() {
+            return Err(Error::InvalidConfigValue(
+                "poll_timeout must be greater than zero".to_string(),
+            ));
+        }
         let request_capacity = self
             .config
             .request_capacity
@@ -239,7 +288,15 @@ impl MqttSource {
                 "request_capacity must be greater than zero".to_string(),
             ));
         }
+        if request_capacity < self.config.subscriptions.len() {
+            return Err(Error::InvalidConfigValue(format!(
+                "request_capacity must be at least the number of subscriptions ({})",
+                self.config.subscriptions.len()
+            )));
+        }
 
+        // These bounds protect both the plugin-owned batch and the MQTT request
+        // channel from configurations that would otherwise never make progress.
         let batch_size = self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
         if batch_size == 0 {
             return Err(Error::InvalidConfigValue(
@@ -281,6 +338,8 @@ impl MqttSource {
         &self,
         driver: &mut MqttDriver,
     ) -> Result<Vec<driver::ReceivedMessage>, Error> {
+        // Start the batch timeout only after the first message arrives. A quiet
+        // connector therefore remains cheap while partial batches still flush.
         let Some(first) = driver.next_message(self.poll_timeout).await? else {
             return Ok(Vec::new());
         };
@@ -307,6 +366,7 @@ pub(crate) fn qos_for_subscription(
     subscription: &str,
     default_qos: Qos,
 ) -> Result<Qos, Error> {
+    // The global QoS is the fallback; an exact filter override wins when present.
     match config.subscription_qos.get(subscription).copied() {
         Some(value) => Qos::try_from(value),
         None => Ok(default_qos),
@@ -316,6 +376,8 @@ pub(crate) fn qos_for_subscription(
 #[async_trait]
 impl Source for MqttSource {
     async fn open(&mut self) -> Result<(), Error> {
+        // Opening validates configuration and creates the broker session. Polling
+        // assumes this driver is ready.
         let (qos, keep_alive, poll_timeout, request_capacity, batch_size, batch_timeout) =
             match self.validate_config() {
                 Ok(values) => values,
@@ -364,6 +426,8 @@ impl Source for MqttSource {
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         sleep(Duration::from_millis(10)).await;
+        // The SDK permits one source batch in flight. A second poll would lose
+        // the association between messages, candidate state, and ACK tokens.
         if self.pending_batch.lock().await.is_some() {
             return Err(Error::InvalidState);
         }
@@ -374,6 +438,8 @@ impl Source for MqttSource {
             .await
             .take()
             .ok_or_else(|| Error::InitError("MQTT driver is not initialized".to_string()))?;
+        // Move the driver out while polling so network I/O does not occur while
+        // holding the source mutex. Restore it before returning.
         let received = self.collect_batch(&mut driver).await;
         *self.driver.lock().await = Some(driver);
         let received = received?;
@@ -382,6 +448,8 @@ impl Source for MqttSource {
         }
 
         let state = self.current_state().await;
+        // This is only a candidate. The runtime persists the returned batch and
+        // reports Ack or Nack through on_batch_result afterward.
         let candidate_state = State {
             acknowledged_messages: state
                 .acknowledged_messages
@@ -428,6 +496,8 @@ impl Source for MqttSource {
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        // A Nack means the runtime could not confirm the Iggy write or state save.
+        // Keep committed state unchanged so QoS 1/2 messages can be redelivered.
         let Some(mut pending_batch) = self.pending_batch.lock().await.take() else {
             return Ok(());
         };
@@ -440,6 +510,8 @@ impl Source for MqttSource {
         }
 
         if pending_batch.ack_tokens.is_empty() {
+            // QoS 0 has no broker token. Iggy persistence is the only completion
+            // event needed before committing the candidate state.
             *self.state.lock().await = pending_batch.candidate_state;
             return Ok(());
         }
@@ -451,6 +523,8 @@ impl Source for MqttSource {
             ));
         };
         let acknowledgement = driver
+            // MQTT acknowledgements are sent only after Iggy acknowledges the
+            // batch, preserving at-least-once delivery.
             .acknowledge_batch(
                 &mut pending_batch.ack_tokens,
                 self.poll_timeout,
@@ -459,6 +533,8 @@ impl Source for MqttSource {
             .await;
         *self.driver.lock().await = Some(driver);
         if let Err(error) = acknowledgement {
+            // The driver retains tokens that were not acknowledged, allowing a
+            // later retry without losing partial progress.
             *self.pending_batch.lock().await = Some(pending_batch);
             return Err(error);
         }
@@ -494,6 +570,8 @@ fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Dur
 }
 
 fn validate_tls_config(config: &MqttSourceConfig) -> Result<(), Error> {
+    // `tls` is meaningful only for a secure broker URL. The transport itself is
+    // built later by the driver after these consistency checks pass.
     let Some(tls) = &config.tls else {
         return Ok(());
     };
@@ -923,6 +1001,28 @@ mod tests {
     fn given_invalid_poll_timeout_duration_should_reject_configuration() {
         let mut config = test_config();
         config.poll_timeout = Some("not a duration".to_string());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_zero_poll_timeout_should_reject_configuration() {
+        let mut config = test_config();
+        config.poll_timeout = Some("0s".to_string());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_request_capacity_smaller_than_subscription_count_should_reject_configuration() {
+        let mut config = test_config();
+        config.subscriptions = vec![
+            "devices/+/telemetry".to_string(),
+            "devices/+/status".to_string(),
+        ];
+        config.request_capacity = Some(1);
         let source = MqttSource::new(7, config, None);
 
         assert!(source.validate_config().is_err());

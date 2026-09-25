@@ -31,6 +31,8 @@ use container::{
 };
 
 struct MqttFixture {
+    // The publisher and source deliberately share protocol and QoS settings so
+    // a test never validates a different broker delivery mode by accident.
     broker: MqttBrokerContainer,
     protocol: publisher::Protocol,
     qos: u8,
@@ -66,6 +68,8 @@ impl MqttFixture {
         batch_size: &'static str,
         batch_timeout: &'static str,
     ) -> Result<Self, TestBinaryError> {
+        // Batch settings are injected as strings because the runtime receives
+        // them through its environment configuration provider.
         Ok(Self {
             broker: MqttBrokerContainer::start().await?,
             protocol,
@@ -147,6 +151,9 @@ impl MqttFixture {
     }
 
     fn runtime_envs(&self) -> HashMap<String, String> {
+        // Keep fixture overrides aligned with production TOML field names. Each
+        // test changes only the protocol, QoS, credentials, or batch behavior it
+        // is intended to exercise.
         let protocol = match self.protocol {
             publisher::Protocol::Mqtt311 => "mqtt311",
             publisher::Protocol::Mqtt5 => "mqtt5",
@@ -232,6 +239,8 @@ impl Mqtt5PendingBatchFixture {
 #[async_trait]
 impl TestFixture for Mqtt5PendingBatchFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
+        // A large batch and long timeout leave one QoS 1 publish pending long
+        // enough for restart tests to exercise broker redelivery.
         Ok(Self(
             MqttFixture::start_with_batch(
                 publisher::Protocol::Mqtt5,

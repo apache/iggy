@@ -29,6 +29,8 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 pub(super) async fn can_connect(broker_url: &str, username: &str, password: &str) -> bool {
+    // MQTT 5 is sufficient for readiness. The source protocol matrix is tested
+    // by publish(), while this probe only checks broker availability and auth.
     connect_mqtt5(broker_url, username, password).await.is_ok()
 }
 
@@ -47,6 +49,8 @@ pub(super) async fn publish(
     username: &str,
     password: &str,
 ) -> Result<(), String> {
+    // A successful return means the publisher observed broker-level completion.
+    // It does not mean that Iggy has persisted the message yet.
     match protocol {
         Protocol::Mqtt311 => {
             publish_mqtt311(broker_url, topic, qos, payload, username, password).await
@@ -198,6 +202,9 @@ async fn wait_for_mqtt311_publish(
     event_loop: &mut rumqttc::EventLoop,
     qos: u8,
 ) -> Result<(), String> {
+    // From the publisher's perspective, completion is an outgoing publish for
+    // QoS 0, PUBACK for QoS 1, and PUBCOMP for QoS 2. Iggy persistence is checked
+    // separately by the integration test.
     timeout(Duration::from_secs(10), async {
         loop {
             match event_loop
@@ -251,6 +258,8 @@ async fn wait_for_mqtt311_mixed_publishes(
     event_loop: &mut rumqttc::EventLoop,
     messages: &[(u8, Vec<u8>)],
 ) -> Result<(), String> {
+    // A mixed batch has different broker handshakes, so completion is counted
+    // separately for each QoS instead of using one aggregate event count.
     let expected_qos0 = messages.iter().filter(|(qos, _)| *qos == 0).count();
     let expected_qos1 = messages.iter().filter(|(qos, _)| *qos == 1).count();
     let expected_qos2 = messages.iter().filter(|(qos, _)| *qos == 2).count();
@@ -295,6 +304,8 @@ async fn wait_for_mqtt5_publish(
     event_loop: &mut rumqttc::v5::EventLoop,
     qos: u8,
 ) -> Result<(), String> {
+    // Broker completion must not be confused with the later source-to-Iggy
+    // persistence assertion.
     timeout(Duration::from_secs(10), async {
         loop {
             match event_loop
@@ -348,6 +359,8 @@ async fn wait_for_mqtt5_mixed_publishes(
     event_loop: &mut rumqttc::v5::EventLoop,
     messages: &[(u8, Vec<u8>)],
 ) -> Result<(), String> {
+    // QoS 0, 1, and 2 use different completion packets, so keep separate
+    // counters while draining the shared MQTT 5 event loop.
     let expected_qos0 = messages.iter().filter(|(qos, _)| *qos == 0).count();
     let expected_qos1 = messages.iter().filter(|(qos, _)| *qos == 1).count();
     let expected_qos2 = messages.iter().filter(|(qos, _)| *qos == 2).count();

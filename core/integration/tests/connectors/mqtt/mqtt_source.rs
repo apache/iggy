@@ -32,6 +32,10 @@ use tokio::time::{sleep, timeout};
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
+// The fixture injects the broker URL, credentials, protocol, QoS, and plugin
+// path through runtime environment overrides. Each test therefore exercises the
+// same production connector configuration path used outside the harness.
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
     seed = seeds::connector_stream
@@ -40,6 +44,8 @@ async fn mqtt5_invalid_credentials_should_fail_source_initialization(
     harness: &TestHarness,
     fixture: Mqtt5InvalidCredentialsFixture,
 ) {
+    // The publisher uses valid credentials so this test isolates the source
+    // connector's authentication failure from broker-side publish failures.
     let source = wait_for_source_status(harness, "error").await;
     assert_eq!(
         source
@@ -66,6 +72,8 @@ async fn mqtt311_invalid_credentials_should_fail_source_initialization(
     harness: &TestHarness,
     fixture: Mqtt311InvalidCredentialsFixture,
 ) {
+    // MQTT 3.1.1 and MQTT 5 must reject invalid source credentials in the same
+    // initialization phase, even though the broker accepts the test publisher.
     let source = wait_for_source_status(harness, "error").await;
     assert_eq!(
         source
@@ -92,6 +100,8 @@ async fn mqtt311_qos0_messages_are_persisted_to_iggy(
     harness: &TestHarness,
     fixture: Mqtt311Qos0Fixture,
 ) {
+    // QoS 0 has no deferred broker acknowledgement. Persistence is verified
+    // separately from the publisher's successful network send.
     assert_message_is_persisted(
         harness,
         fixture.publish(b"mqtt311-qos0-integration"),
@@ -108,6 +118,8 @@ async fn mqtt311_qos1_messages_are_persisted_to_iggy(
     harness: &TestHarness,
     fixture: Mqtt311Qos1Fixture,
 ) {
+    // This test checks both persistence and the metadata needed to prove that
+    // the source received a QoS 1 publish with a packet identifier.
     let message = assert_message_is_persisted(
         harness,
         fixture.publish(b"mqtt311-qos1-integration"),
@@ -154,6 +166,8 @@ async fn mqtt311_qos2_messages_are_persisted_to_iggy(
     harness: &TestHarness,
     fixture: Mqtt311Qos2Fixture,
 ) {
+    // QoS 2 persistence is necessary but does not by itself prove the complete
+    // handshake. The publisher fixture also waits for PUBCOMP before returning.
     assert_message_is_persisted(
         harness,
         fixture.publish(b"mqtt311-qos2-integration"),
@@ -202,6 +216,8 @@ async fn mqtt5_messages_are_persisted_as_a_source_batch(
     harness: &TestHarness,
     fixture: Mqtt5Qos1Fixture,
 ) {
+    // Publishing many messages without waiting between sends exercises the
+    // source-side batch path rather than only single-message polling.
     wait_for_source_running(harness).await;
     let payloads = (0..10)
         .map(|index| format!("mqtt5-batch-{index}").into_bytes())
@@ -242,6 +258,8 @@ async fn mqtt5_partial_source_batch_flushes_after_timeout(
     harness: &TestHarness,
     fixture: Mqtt5Qos1Fixture,
 ) {
+    // The source must flush a partial batch when batch_timeout expires, even
+    // though fewer than batch_size messages arrive.
     let payload = b"mqtt5-partial-batch-timeout";
     assert_message_is_persisted(harness, fixture.publish(payload), payload).await;
 }
@@ -254,6 +272,8 @@ async fn mqtt5_connector_restart_redelivers_pending_qos1_batch(
     harness: &TestHarness,
     fixture: Mqtt5PendingBatchFixture,
 ) {
+    // The connector restart happens before the pending QoS 1 batch is confirmed.
+    // The broker therefore retains the publish and redelivers it after reconnect.
     wait_for_source_running(harness).await;
     let payload = b"mqtt5-connector-restart-redelivery";
     fixture
@@ -273,6 +293,8 @@ async fn mqtt5_iggy_failure_redelivers_unacknowledged_qos1_message(
     harness: &mut TestHarness,
     fixture: Mqtt5Qos1Fixture,
 ) {
+    // Iggy is stopped after the source is ready. EMQX can accept the publish, but
+    // the source cannot persist it or send the deferred MQTT acknowledgement.
     wait_for_source_running(harness).await;
     harness
         .server_mut()
@@ -293,6 +315,8 @@ async fn mqtt5_iggy_failure_redelivers_unacknowledged_qos1_message(
         .root_client()
         .await
         .expect("Iggy should accept connections after restart");
+    // The runtime does not automatically recreate a failed source in this test;
+    // restarting it creates the MQTT session that receives the redelivery.
     restart_source(harness).await;
 
     assert_message_is_persisted(harness, async { Ok(()) }, payload).await;
@@ -306,6 +330,9 @@ async fn mqtt5_emqx_outage_recovers_batch_accumulation(
     harness: &TestHarness,
     fixture: Mqtt5PendingBatchFixture,
 ) {
+    // Pause/resume interrupts the broker connection while preserving its mapped
+    // port and authentication database. This tests reconnect behavior without
+    // introducing a new container or changing the broker endpoint.
     wait_for_source_running(harness).await;
     let first_payload = b"mqtt5-emqx-restart-first".to_vec();
     let second_payload = b"mqtt5-emqx-restart-second".to_vec();
@@ -334,6 +361,8 @@ async fn mqtt5_mixed_qos_messages_are_persisted_as_a_source_batch(
     harness: &TestHarness,
     fixture: Mqtt5Qos2Fixture,
 ) {
+    // A single Iggy batch may contain QoS 0, QoS 1, and QoS 2 messages. The source
+    // must persist all payloads while retaining the correct token per QoS level.
     wait_for_source_running(harness).await;
     let messages = vec![
         (0, b"mqtt5-mixed-qos0".to_vec()),
@@ -353,6 +382,9 @@ async fn mqtt5_mixed_qos_messages_are_persisted_as_a_source_batch(
 }
 
 async fn assert_payloads_are_persisted(harness: &TestHarness, expected: HashSet<Vec<u8>>) {
+    // MQTT completion only proves that the broker accepted the publishes. Poll
+    // Iggy until every expected payload is persisted; ordering is not part of the
+    // source contract, so compare sets instead of positions.
     let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -502,6 +534,9 @@ async fn assert_message_is_persisted<F>(
 where
     F: Future<Output = Result<(), String>>,
 {
+    // The publisher future waits for the broker-level QoS completion. The Iggy
+    // poll below is still required because MQTT acknowledgement and Iggy
+    // persistence are separate lifecycle events.
     wait_for_source_running(harness).await;
     publish.await.expect("MQTT publish should complete");
 
@@ -541,6 +576,8 @@ where
 }
 
 async fn assert_message_is_not_persisted(harness: &TestHarness, payload: &[u8]) {
+    // Use a bounded observation window so an authentication failure cannot pass
+    // merely because the test stopped polling too early.
     let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -582,6 +619,8 @@ async fn wait_for_source_running(harness: &TestHarness) {
 }
 
 async fn restart_source(harness: &TestHarness) {
+    // Restart only the MQTT source through the runtime control plane. Keeping
+    // Iggy and EMQX alive isolates connector lifecycle and redelivery behavior.
     let runtime = harness
         .connectors_runtime()
         .expect("connectors runtime should be configured");
@@ -599,6 +638,8 @@ async fn restart_source(harness: &TestHarness) {
 }
 
 async fn wait_for_source_status(harness: &TestHarness, expected_status: &str) -> Value {
+    // Runtime startup is asynchronous. Poll the control API instead of sleeping
+    // for a fixed duration so the test remains reliable on slower CI hosts.
     let runtime = harness
         .connectors_runtime()
         .expect("connectors runtime should be configured");
