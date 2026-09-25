@@ -1141,6 +1141,11 @@ handshake_grace = "10 s"
 # The url must start with http:// or https://. Plain HTTP logs a warning at
 # startup since credentials may be sent in cleartext. The response body is
 # capped at 1 MiB.
+#
+# Note: the auth service is not part of iggy cluster and operators must manage it separately.
+# It must be reachable from every iggy node, and should be trusted to handle credentials securely.
+# No SSRF exists here, the callout service should be the one handling further services (LDAP, OAuth, etc.)
+#  and returning a simple decision to iggy.
 [external_auth]
 enabled = false
 url = ""
