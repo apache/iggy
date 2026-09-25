@@ -951,6 +951,28 @@ TEST_F(E2E_Client, UpdateUserRejectsRenameToRootUsername) {
     });
 }
 
+TEST_F(E2E_Client, UpdateUserWithUnsupportedOptionsRejectsAndPreservesUser) {
+    RecordProperty("description", "Rejects unsupported user options without changing the user.");
+    auto client                   = GetLoggedInHighLevelClient();
+    const std::string username    = GetRandomName(50);
+    const std::string replacement = GetRandomName(50);
+    ASSERT_NO_THROW({
+        const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active);
+        iggy::UserUpdateOptions options;
+        options.SetRawEntries({{"not_a_real_option", "true"}});
+
+        ASSERT_THROW(
+            client.UpdateUser(iggy::Identifier::String(username), replacement, iggy::UserStatus::Inactive, options),
+            iggy::IggyException);
+
+        const auto fetched = client.GetUser(iggy::Identifier::String(username));
+        EXPECT_EQ(fetched.Id(), created.Id());
+        EXPECT_EQ(fetched.Username(), username);
+        EXPECT_EQ(fetched.Status(), iggy::UserStatus::Active);
+        ASSERT_THROW(client.GetUser(iggy::Identifier::String(replacement)), iggy::IggyException);
+    });
+}
+
 TEST_F(LowLevelE2E_Client, ReadUsersPermissionDoesNotAllowUpdateUser) {
     RecordProperty("description", "Rejects updates from a user with read_users but not manage_users.");
     iggy::ffi::Client *root_client    = GetLoggedInClient();
