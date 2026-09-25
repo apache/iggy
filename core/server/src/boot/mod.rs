@@ -546,9 +546,7 @@ async fn shard_main(
                 config.metadata.clients_table_max,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
-                    if config.external_auth.enabled {
-                        mux_stm.set_external_auth_user_id(config.external_auth.user_id);
-                    }
+                    mux_stm.set_external_auth_user_id(config.external_auth.user_id);
                 },
                 |mux_stm, client, stamp| {
                     mux_stm
@@ -649,11 +647,11 @@ async fn shard_main(
     // external auth user_id. The Owner path sets it in seed_baseline when
     // replaying from the WAL; a snapshot restore sets it from the snapshot's
     // own field (MetadataSnapshot v6+). This post-recovery call covers the
-    // Waiter path and is idempotent for the same value.
-    if config.external_auth.enabled {
-        mux_stm.set_external_auth_user_id(config.external_auth.user_id);
-        // The reserved user_id must not collide with a real user, or the
-        // authz gate would block that user from all metadata operations.
+    // Waiter path and is idempotent for the same value. Set unconditionally
+    // so the STM authz gate is deterministic across all cluster nodes
+    // regardless of per-node config.
+    mux_stm.set_external_auth_user_id(config.external_auth.user_id);
+    {
         let uid = config.external_auth.user_id;
         let collides = mux_stm
             .users()
