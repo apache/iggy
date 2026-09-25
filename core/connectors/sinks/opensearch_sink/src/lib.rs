@@ -165,14 +165,16 @@ impl std::fmt::Debug for ResolvedOpenSearchSinkConfig {
     }
 }
 
-impl From<OpenSearchSinkConfig> for ResolvedOpenSearchSinkConfig {
-    fn from(config: OpenSearchSinkConfig) -> Self {
+impl ResolvedOpenSearchSinkConfig {
+    // Not a `From` impl: the swap warning below needs the connector ID,
+    // which only the caller (`OpenSearchSink::new`) has in scope.
+    fn resolve(id: u32, config: OpenSearchSinkConfig) -> Self {
         let mut retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let mut max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
         if retry_delay > max_retry_delay {
             warn!(
-                "OpenSearch sink retry_delay ({:?}) exceeds max_retry_delay ({:?}). Swapping values.",
+                "OpenSearch sink connector ID: {id}: retry_delay ({:?}) exceeds max_retry_delay ({:?}). Swapping values.",
                 retry_delay, max_retry_delay
             );
             std::mem::swap(&mut retry_delay, &mut max_retry_delay);
@@ -207,7 +209,7 @@ impl OpenSearchSink {
     pub fn new(id: u32, config: OpenSearchSinkConfig) -> Self {
         Self {
             id,
-            config: config.into(),
+            config: ResolvedOpenSearchSinkConfig::resolve(id, config),
             client: None,
             invocations_count: AtomicU64::new(0),
             documents_indexed: AtomicU64::new(0),
