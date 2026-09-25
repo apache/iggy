@@ -628,7 +628,7 @@ class StreamPermissions final {
 
   private:
     [[nodiscard]] ffi::StreamPermissions ToFfi() const;
-    static StreamPermissions FromFfi(ffi::StreamPermissions permissions);
+    static StreamPermissions FromFfi(const ffi::StreamPermissions &permissions);
 
     friend class Permissions;
 
@@ -688,7 +688,7 @@ class Permissions final {
 
   private:
     [[nodiscard]] ffi::Permissions ToFfi() const;
-    static Permissions FromFfi(ffi::Permissions permissions);
+    static Permissions FromFfi(const ffi::Permissions &permissions);
 
     friend class IggyBlockingClient;
     friend class UserInfoDetails;
@@ -1151,6 +1151,10 @@ class UserInfo final {
      */
     [[nodiscard]] const std::string &Username() const noexcept { return username_; }
 
+    /**
+     * @brief Returns explicit user creation options.
+     * @return Options owned by this value.
+     */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
   private:
@@ -1216,6 +1220,10 @@ class UserInfoDetails final {
      */
     [[nodiscard]] const std::optional<::iggy::Permissions> &Permissions() const noexcept { return permissions_; }
 
+    /**
+     * @brief Returns explicit user creation options.
+     * @return Options owned by this value.
+     */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
   private:
@@ -3523,7 +3531,7 @@ class IggyBlockingClient final {
     void UpdateUser(const Identifier &user,
                     std::optional<std::string> username,
                     std::optional<UserStatus> status,
-                    const UserUpdateOptions &options);
+                    const UserUpdateOptions &options = {});
 
     /**
      * @brief Creates a top-level stream in the cluster metadata.

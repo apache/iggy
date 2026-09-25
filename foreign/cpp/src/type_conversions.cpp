@@ -98,7 +98,7 @@ ffi::StreamPermissions StreamPermissions::ToFfi() const {
     return permissions;
 }
 
-StreamPermissions StreamPermissions::FromFfi(ffi::StreamPermissions permissions) {
+StreamPermissions StreamPermissions::FromFfi(const ffi::StreamPermissions &permissions) {
     StreamPermissions result;
     result.manage_stream_ = permissions.manage_stream;
     result.read_stream_   = permissions.read_stream;
@@ -106,8 +106,8 @@ StreamPermissions StreamPermissions::FromFfi(ffi::StreamPermissions permissions)
     result.read_topics_   = permissions.read_topics;
     result.poll_messages_ = permissions.poll_messages;
     result.send_messages_ = permissions.send_messages;
-    for (auto &entry : permissions.topics) {
-        result.topics_.emplace(entry.topic_id, TopicPermissions::FromFfi(entry.permissions));
+    for (const auto &entry : permissions.topics) {
+        result.topics_.insert_or_assign(entry.topic_id, TopicPermissions::FromFfi(entry.permissions));
     }
     return result;
 }
@@ -125,11 +125,11 @@ ffi::Permissions Permissions::ToFfi() const {
     return permissions;
 }
 
-Permissions Permissions::FromFfi(ffi::Permissions permissions) {
+Permissions Permissions::FromFfi(const ffi::Permissions &permissions) {
     Permissions result;
     result.global_ = GlobalPermissions::FromFfi(permissions.global);
-    for (auto &entry : permissions.streams) {
-        result.streams_.emplace(entry.stream_id, StreamPermissions::FromFfi(std::move(entry.permissions)));
+    for (const auto &entry : permissions.streams) {
+        result.streams_.insert_or_assign(entry.stream_id, StreamPermissions::FromFfi(entry.permissions));
     }
     return result;
 }
@@ -143,7 +143,7 @@ UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
 UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
     std::optional<::iggy::Permissions> permissions;
     if (user.has_permissions) {
-        permissions = ::iggy::Permissions::FromFfi(std::move(user.permissions));
+        permissions = ::iggy::Permissions::FromFfi(user.permissions);
     }
     return UserInfoDetails(user.id, user.created_at, static_cast<UserStatus>(user.status),
                            std::string(user.username.c_str(), user.username.size()), std::move(permissions),
