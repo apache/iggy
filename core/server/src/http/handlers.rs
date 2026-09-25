@@ -120,9 +120,6 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
-use crate::dispatch::authz::{
-    can_list_topics, can_poll_messages, can_read_stream, can_read_topic, can_send_messages,
-};
 use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::external_auth::{
@@ -330,7 +327,6 @@ pub(in crate::http) async fn describe_options(
         DESCRIBE_OPTIONS_CODE,
         &body,
         |_, _| Ok(()),
-        |_| true,
     ))
     .await?;
     let response = DescribeOptionsResponse::decode_from(&bytes)
@@ -355,7 +351,6 @@ pub(in crate::http) async fn get_streams(
         GET_STREAMS_CODE,
         &body,
         Permissioner::get_streams,
-        |p| p.global.manage_streams || p.global.read_streams,
     ))
     .await?;
     let response = GetStreamsResponse::decode_from(&bytes)
@@ -395,10 +390,6 @@ pub(in crate::http) async fn get_stream(
             resolve_gate_stream(&state, &request.stream_id)
                 .map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
         },
-        |p| {
-            resolve_gate_stream(&state, &request.stream_id)
-                .is_none_or(|sid| can_read_stream(p, sid))
-        },
     ))
     .await?;
     let response = GetStreamResponse::decode_from(&bytes)
@@ -432,10 +423,6 @@ pub(in crate::http) async fn get_topics(
         |permissioner, uid| {
             resolve_gate_stream(&state, &request.stream_id)
                 .map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
-        },
-        |p| {
-            resolve_gate_stream(&state, &request.stream_id)
-                .is_none_or(|sid| can_list_topics(p, sid))
         },
     ))
     .await?;
@@ -476,10 +463,6 @@ pub(in crate::http) async fn get_topic(
                     permissioner.get_topic(uid, stream_id, topic_id)
                 })
         },
-        |p| {
-            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
-                .is_none_or(|(sid, tid)| can_read_topic(p, sid, tid))
-        },
     ))
     .await?;
     let response = GetTopicResponse::decode_from(&bytes)
@@ -504,7 +487,6 @@ pub(in crate::http) async fn get_users(
         GET_USERS_CODE,
         &body,
         Permissioner::get_users,
-        |p| p.global.manage_users || p.global.read_users,
     ))
     .await?;
     let response = GetUsersResponse::decode_from(&bytes)
@@ -551,11 +533,6 @@ pub(in crate::http) async fn get_user(
                 permissioner.get_user(uid)
             }
         },
-        |p| {
-            let is_self_check =
-                resolve_gate_user(&state, &request.user_id) == Some(identity.user_id as usize);
-            is_self_check || p.global.manage_users || p.global.read_users
-        },
     ))
     .await?;
     let response = UserDetailsResponse::decode_from(&bytes)
@@ -594,10 +571,6 @@ pub(in crate::http) async fn get_cgs(
                 .map_or(Ok(()), |(stream_id, topic_id)| {
                     permissioner.get_consumer_groups(uid, stream_id, topic_id)
                 })
-        },
-        |p| {
-            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
-                .is_none_or(|(sid, tid)| can_read_topic(p, sid, tid))
         },
     ))
     .await?;
@@ -639,10 +612,6 @@ pub(in crate::http) async fn get_cg(
                     permissioner.get_consumer_group(uid, stream_id, topic_id)
                 })
         },
-        |p| {
-            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
-                .is_none_or(|(sid, tid)| can_read_topic(p, sid, tid))
-        },
     ))
     .await?;
     let response = ConsumerGroupDetailsResponse::decode_from(&bytes)
@@ -667,7 +636,6 @@ pub(in crate::http) async fn get_stats(
         GET_STATS_CODE,
         &body,
         Permissioner::get_stats,
-        |p| p.global.manage_servers || p.global.read_servers,
     ))
     .await?;
     let response = StatsResponse::decode_from(&bytes)
@@ -768,7 +736,6 @@ pub(in crate::http) async fn get_snapshot(
         query.consistency,
         GET_SNAPSHOT_FILE_CODE,
         Permissioner::get_snapshot,
-        |p| p.global.manage_servers || p.global.read_servers,
     ))
     .await?;
     let archive = snapshot::collect(
@@ -830,7 +797,6 @@ pub(in crate::http) async fn get_clients(
         query.consistency,
         GET_CLIENTS_CODE,
         Permissioner::get_clients,
-        |p| p.global.manage_servers || p.global.read_servers,
     ))
     .await?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
@@ -863,7 +829,6 @@ pub(in crate::http) async fn get_client(
         query.consistency,
         GET_CLIENT_CODE,
         Permissioner::get_client,
-        |p| p.global.manage_servers || p.global.read_servers,
     ))
     .await?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
@@ -1338,20 +1303,22 @@ pub(in crate::http) async fn poll_messages(
 ) -> Result<Json<PolledMessages>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let is_ext_auth =
+        state.external_auth.enabled && identity.user_id == state.external_auth.user_id;
     SendWrapper::new(gate_local_read(
         &state,
         &identity,
         consistency.consistency,
         POLL_MESSAGES_CODE,
         |permissioner, uid| {
-            resolve_gate_topic_ids(&state, &stream_id, &topic_id)
-                .map_or(Ok(()), |(stream_id, topic_id)| {
-                    permissioner.poll_messages(uid, stream_id, topic_id)
-                })
-        },
-        |p| match resolve_gate_topic_ids(&state, &stream_id, &topic_id) {
-            Some((sid, tid)) => can_poll_messages(p, sid, tid),
-            None => false,
+            resolve_gate_topic_ids(&state, &stream_id, &topic_id).map_or(
+                if is_ext_auth {
+                    Err(IggyError::Unauthorized)
+                } else {
+                    Ok(())
+                },
+                |(stream_id, topic_id)| permissioner.poll_messages(uid, stream_id, topic_id),
+            )
         },
     ))
     .await?;
@@ -1424,20 +1391,22 @@ pub(in crate::http) async fn get_consumer_offset(
 ) -> Result<Json<ConsumerOffsetInfo>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let is_ext_auth =
+        state.external_auth.enabled && identity.user_id == state.external_auth.user_id;
     SendWrapper::new(gate_local_read(
         &state,
         &identity,
         consistency.consistency,
         GET_CONSUMER_OFFSET_CODE,
         |permissioner, uid| {
-            resolve_gate_topic_ids(&state, &stream_id, &topic_id)
-                .map_or(Ok(()), |(stream_id, topic_id)| {
-                    permissioner.get_consumer_offset(uid, stream_id, topic_id)
-                })
-        },
-        |p| match resolve_gate_topic_ids(&state, &stream_id, &topic_id) {
-            Some((sid, tid)) => can_poll_messages(p, sid, tid),
-            None => false,
+            resolve_gate_topic_ids(&state, &stream_id, &topic_id).map_or(
+                if is_ext_auth {
+                    Err(IggyError::Unauthorized)
+                } else {
+                    Ok(())
+                },
+                |(stream_id, topic_id)| permissioner.get_consumer_offset(uid, stream_id, topic_id),
+            )
         },
     ))
     .await?;
@@ -1506,7 +1475,6 @@ pub(in crate::http) async fn send_messages(
         &stream_id,
         &topic_id,
         Permissioner::append_messages,
-        can_send_messages,
     )
     .map_err(PartitionWriteError::Rejected)?;
     // Rejects an oversized partitioning key and an empty or oversized batch.
@@ -1580,7 +1548,6 @@ pub(in crate::http) async fn store_consumer_offset(
         &stream_id,
         &topic_id,
         Permissioner::store_consumer_offset,
-        can_poll_messages,
     )
     .map_err(PartitionWriteError::Rejected)?;
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
@@ -1633,7 +1600,6 @@ pub(in crate::http) async fn delete_consumer_offset(
         &stream_id,
         &topic_id,
         Permissioner::delete_consumer_offset,
-        can_poll_messages,
     )
     .map_err(PartitionWriteError::Rejected)?;
     // `Consumer::new` fixes the kind to `Consumer`, exactly as the legacy
@@ -1885,7 +1851,6 @@ pub(in crate::http) async fn get_pats(
         GET_PERSONAL_ACCESS_TOKENS_CODE,
         &body,
         |_, _| Ok(()),
-        |_| true,
     ))
     .await?;
     let response = GetPersonalAccessTokensResponse::decode_from(&bytes)
