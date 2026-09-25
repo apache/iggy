@@ -16,6 +16,7 @@
 // under the License.
 
 mod mongodb_sink;
+mod mongodb_source;
 
 const TEST_MESSAGE_COUNT: usize = 3;
 const POLL_ATTEMPTS: usize = 400;
