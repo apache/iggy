@@ -1050,6 +1050,16 @@ impl Simulator {
                     self.seed,
                     self.executor.schedule_hash(),
                 );
+                let pending_completions = shard.poll_completion_inbox_len();
+                assert_eq!(
+                    pending_completions,
+                    0,
+                    "lost wakeup: replica {replica_id} shard {} completion lane holds \
+                     {pending_completions} result(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
                 let pending_redispatch = shard.redispatched_frame_count();
                 assert_eq!(
                     pending_redispatch,
@@ -1375,45 +1385,46 @@ impl Simulator {
         self.run_pumps();
     }
 
-    /// Poll messages directly from a replica's partition.
+    /// Poll messages through a replica's partition owner.
+    ///
+    /// The returned future owns its request and shard handle, so it can run on
+    /// the simulator executor while the caller advances the simulation or
+    /// releases paused work. The owner accepts the read and replies before
+    /// awaiting replication of an automatic commit.
     ///
     /// # Errors
-    /// `IggyError::ResourceNotFound` if the namespace is not on this replica.
+    /// Returns routing and owner rejections, `IggyError::ResourceNotFound` if
+    /// the owner reports a missing partition, or `IggyError::ShardCommunicationError`
+    /// if a submitted request times out or loses its reply.
+    ///
+    /// # Panics
+    /// If `replica_idx` is out of bounds or the owner replies for a different read type.
+    #[allow(clippy::future_not_send)]
     pub fn poll_messages(
         &self,
         replica_idx: usize,
         namespace: IggyNamespace,
         consumer: PollingConsumer,
         args: &PollingArgs,
-    ) -> Result<PollFragments<4096>, IggyError> {
-        let shard = self.replicas[replica_idx].partition_shard(namespace);
-        // Build the owned poll plan synchronously, then execute off the borrow.
-        //
-        // The one `block_on` allowed to stay, and only because `plan.execute()`
-        // cannot suspend here: the sim's partitions are in-memory (no
-        // `partition_dir`), so the plan serves the resident journal tier with no disk
-        // IO and no `bus.sleep`. A suspending await would fail two ways. On the
-        // virtual clock it would hang this thread forever, the clock advancing only
-        // through `advance_time`, which does not run during `block_on`. On the retry
-        // path it would panic on the compio timer outside a compio runtime. Safe only
-        // because it runs between `run_pumps` calls, with the executor quiescent and
-        // no pump holding the partition commit lock in a suspended frame.
-        let Some(plan) = shard
-            .plane
-            .partitions()
-            .build_poll_snapshot(&namespace, consumer, args)
-        else {
-            return Err(IggyError::ResourceNotFound(format!(
-                "partition not found for namespace {namespace:?} on replica {replica_idx}"
-            )));
-        };
-        // Partitions are driven directly, so a poll's auto-commit is never
-        // replicated (the serving shard's job in the real server). Offset discarded.
-        let (fragments, _commit_offset, auto_commit) = futures::executor::block_on(plan.execute())?;
-        if let Some(applied) = auto_commit {
-            applied.admit(|_| Ok::<(), IggyError>(()))?;
+    ) -> impl Future<Output = Result<PollFragments<4096>, IggyError>> + use<> {
+        let owner = Rc::clone(self.replicas[replica_idx].partition_shard(namespace));
+        let args = args.clone();
+        async move {
+            match owner
+                .partition_read(namespace, shard::PartitionRead::Poll { consumer, args })
+                .await
+            {
+                Some(shard::PartitionReadReply::Poll { fragments, .. }) => Ok(fragments),
+                Some(shard::PartitionReadReply::Rejected(error)) => Err(error),
+                Some(shard::PartitionReadReply::NotFound) => {
+                    Err(IggyError::ResourceNotFound(format!(
+                        "partition not found for namespace {namespace:?} on replica {replica_idx}"
+                    )))
+                }
+                None => Err(IggyError::ShardCommunicationError),
+                Some(reply) => panic!("unexpected reply to a poll request: {reply:?}"),
+            }
         }
-        Ok(fragments)
     }
 
     /// Partition offsets from a replica.
@@ -1677,6 +1688,7 @@ mod tests {
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
     use consensus::Status;
+    use futures::FutureExt;
     use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
     use iggy_common::ConsumerKind;
     use server_common::sharding::IggyNamespace;
@@ -1699,6 +1711,142 @@ mod tests {
             }
         }
         panic!("request {request_id} did not receive a reply");
+    }
+
+    /// The simulator helper must yield while its owner runs, then return the
+    /// accepted resident read even if the automatic commit's replica send stalls.
+    /// Releasing that send must let the same commit reach the other replicas.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_simulator_poll_when_replica_send_stalls_should_reply_and_resume_replication() {
+        // 1. Publish one message and let the cluster finish the initial work.
+        // The pause installed later must affect the poll's automatic commit.
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let client_id = 1u128;
+        let replica_count = 3u8;
+        let primary_replica = 0u8;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut simulator = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed: 0xC011_EC71,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        simulator.init_partition(namespace);
+        let client = SimClient::new(client_id);
+        simulator.register_client_with_primary(&client);
+        let append_reply = submit_and_wait_for_reply(
+            &mut simulator,
+            client_id,
+            primary_replica,
+            client.send_messages(
+                namespace,
+                &[Bytes::from_static(b"reply-before-replication")],
+            ),
+        );
+        assert_eq!(append_reply.header().status, 0);
+        simulator.run_pumps();
+
+        // 2. Confirm that the poll uses resident data. This scenario checks
+        // reply timing after inline acceptance, without a detached disk read.
+        let owner =
+            Rc::clone(simulator.replicas[usize::from(primary_replica)].partition_shard(namespace));
+        let consumer_id = 7;
+        let partition_id = 0;
+        let consumer = PollingConsumer::Consumer(consumer_id, partition_id);
+        let auto_commit = true;
+        let poll_args = PollingArgs::new(iggy_common::PollingStrategy::next(), 1, auto_commit);
+        let resident_plan = owner
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, &poll_args)
+            .expect("poll snapshot");
+        assert!(
+            !resident_plan.needs_off_pump_io(),
+            "fixture must exercise inline resident completion"
+        );
+        drop(resident_plan);
+
+        // 3. Run the poll task with the next replica send paused.
+        // The separate caller task lets the owner send a reply while
+        // its replication continuation is still waiting for release.
+        let resume_replication = owner.bus.delay_next_replica_send();
+        let (poll_result_sender, poll_result_receiver) = shard::channel(1);
+        let poll = simulator.poll_messages(
+            usize::from(primary_replica),
+            namespace,
+            consumer,
+            &poll_args,
+        );
+        simulator.executor.spawn(async move {
+            let _ = poll_result_sender.try_send(poll.await);
+        });
+        simulator.run_pumps();
+
+        // 4. The nonempty reply must already be available before releasing
+        // replication. Waiting for it asynchronously here would hide a stall.
+        let fragments = poll_result_receiver
+            .recv()
+            .now_or_never()
+            .expect("admitted poll replies while replication remains suspended")
+            .expect("reply channel is open")
+            .expect("owning shard accepted the poll");
+        assert!(!fragments.is_empty());
+
+        // 5. Before release, neither backup has received the automatic commit.
+        // Inspect backups because the stalled owner still borrows its partition.
+        for backup in &simulator.replicas[1..] {
+            let (consumer_offset, _) = backup
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .consumer_offset_read(&namespace, consumer)
+                .expect("partition exists on the backup");
+            assert_eq!(consumer_offset, None);
+        }
+        assert!(
+            resume_replication.send(()).is_ok(),
+            "replication must still be waiting after the poll reply"
+        );
+
+        // 6. Drive network delivery as well as the executor. A reply alone
+        // must not let the helper silently discard its replication continuation.
+        let replicated = (0..100).any(|_| {
+            simulator.step();
+            simulator.replicas.iter().all(|replica| {
+                replica
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .with_partition(&namespace, |partition| {
+                        partition.durable_consumer_offset_count(iggy_common::ConsumerKind::Consumer)
+                            == 1
+                    })
+                    == Some(true)
+            })
+        });
+        assert!(
+            replicated,
+            "automatic commit reaches every replica after release"
+        );
+        let (consumer_offset, _partition_commit_offset) = owner
+            .plane
+            .partitions()
+            .consumer_offset_read(&namespace, consumer)
+            .expect("partition exists");
+        assert_eq!(
+            consumer_offset,
+            Some(0),
+            "admission records the served cursor"
+        );
     }
 
     #[test]
@@ -2457,11 +2605,19 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 2_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            2_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "workload produced no replies");
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
             "system did not drain within the tick budget"
         );
         // Cross-replica agreement + entity oracle (single client => strict).
@@ -2513,7 +2669,15 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            3_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "workload produced no replies");
         assert!(
             !sim.crashed.is_empty(),
@@ -2521,7 +2685,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
             "surviving quorum did not drain within the tick budget"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -2574,7 +2738,15 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            3_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "lossy workload produced no replies");
         assert!(
             wl.resends() > 0,
@@ -2583,7 +2755,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -2740,7 +2912,7 @@ mod tests {
         }
 
         // Poll through the dispatch shell (`on_client_request`, drain,
-        // `handle_poll_messages`, `partition_read`, `on_partition_read`), running as a
+        // `handle_poll_messages`, `partition_read`, the owning shard), running as a
         // task the executor interleaves with the pump.
         let poll = client.poll_messages(ns, 10);
         sim.submit_request(client_id, 0, poll.into_generic());
@@ -2757,7 +2929,7 @@ mod tests {
 
     /// A `SimClient` poll returns the produced messages through the real dispatch
     /// read path (`on_client_request`, `handle_poll_messages`, `partition_read`,
-    /// `on_partition_read`), running as a task the executor interleaves with the pump,
+    /// the owning shard), running as a task the executor interleaves with the pump,
     /// and the whole login/produce/poll round-trip replays byte-for-byte on one seed.
     #[test]
     fn shell_poll_returns_produced_messages_deterministically() {
@@ -3036,8 +3208,8 @@ mod tests {
     /// Injected through the synthetic `hold_borrow_across_await` rather than the real
     /// read, because the production read has no borrow-holding suspension to seed: the
     /// journal read is a synchronous memory copy, and `with_partition` returns an owned
-    /// `PollPlan` before the only awaits (disk read, offset persist) run off the borrow
-    /// in `spawn_poll_io`.
+    /// `PollPlan` before disk reads run off the borrow. Completion returns to the owner
+    /// before consumer progress changes.
     ///
     /// TODO: once storage faults are modelled, the disk-tier read
     /// (`PollPlan::execute`, `read_disk`) becomes a real seedable await in the read
@@ -3674,7 +3846,15 @@ mod tests {
         let mut wl = Workload::new(options);
         let clients = [client];
         // run() asserts the per-tick invariants every tick under injected crashes.
-        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            3_000,
+            u64::MAX,
+            &mut invariants,
+        );
 
         let crashed = sim.crashed.len();
         assert!(
@@ -3902,6 +4082,7 @@ mod tests {
             let mut workload = Workload::new(options);
             let mut injector = FaultInjector::new(seed, replica_count);
             let clients = [client];
+            let mut invariants = crate::workload::invariants::Invariants::new();
             let replies = run_with_faults(
                 &mut sim,
                 &mut workload,
@@ -3909,6 +4090,7 @@ mod tests {
                 3_000,
                 u64::MAX,
                 &mut injector,
+                &mut invariants,
             );
             (
                 replies,
@@ -4416,7 +4598,15 @@ mod tests {
         let mut wl = Workload::new(options);
 
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 4_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            4_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "shell workload produced no replies");
 
         let stats = wl.auditor.stats();
@@ -4432,7 +4622,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -4514,7 +4704,16 @@ mod tests {
 
         let clients = [client];
         let mut injector = FaultInjector::new(seed, replica_count);
-        run_with_faults(&mut sim, &mut wl, &clients, 1_500, u64::MAX, &mut injector);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        run_with_faults(
+            &mut sim,
+            &mut wl,
+            &clients,
+            1_500,
+            u64::MAX,
+            &mut injector,
+            &mut invariants,
+        );
 
         assert!(
             wl.auditor.stats().transient_rejections > 0,
@@ -4523,7 +4722,7 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
@@ -4594,6 +4793,7 @@ mod tests {
 
         let clients = [client];
         let mut injector = FaultInjector::new(seed, replica_count);
+        let mut invariants = crate::workload::invariants::Invariants::new();
         let _ = workload::run_with_faults(
             &mut sim,
             &mut workload,
@@ -4601,6 +4801,7 @@ mod tests {
             4_000,
             u64::MAX,
             &mut injector,
+            &mut invariants,
         );
 
         assert!(
@@ -4608,7 +4809,7 @@ mod tests {
             "no replica crashed, so no view change ran and this proves nothing"
         );
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000),
+            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &workload),
         );
@@ -4658,22 +4859,18 @@ mod tests {
 
         let clients = [client];
         let mut injector = FaultInjector::new(seed, replica_count);
+        // The checker is read afterwards, so it is declared here rather than left to
+        // the driver: `chain` below is the accumulated canonical commit chain.
         let mut invariants = Invariants::new();
-        // Driven here rather than through `workload::run` so the accumulated
-        // chain is readable afterwards; `run` builds its own `Invariants`.
-        for _ in 0..4_000u32 {
-            wl.tick();
-            injector.step(&mut sim, &wl);
-            workload::resubmit_due(&mut sim, &mut wl);
-            if let Some((target, msg)) = wl.build_request(&clients[0]) {
-                sim.submit_request(clients[0].client_id(), target, msg.into_generic());
-            }
-            for reply in sim.step() {
-                let cmds = wl.on_reply(&reply);
-                workload::apply_sim_commands(&mut sim, &cmds);
-            }
-            invariants.check(&sim, &wl);
-        }
+        workload::run_with_faults(
+            &mut sim,
+            &mut wl,
+            &clients,
+            4_000,
+            u64::MAX,
+            &mut injector,
+            &mut invariants,
+        );
 
         assert!(
             injector.restarts() > 0,
@@ -4691,12 +4888,12 @@ mod tests {
         );
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
         assert!(
-            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000),
+            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000, &mut invariants),
             "metadata views never converged after the drain"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -5074,11 +5271,19 @@ mod tests {
         options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
         let mut wl = Workload::new(options);
         let clients = [client];
-        let replies = workload::run(&mut sim, &mut wl, &clients, 2_000, u64::MAX);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        let replies = workload::run(
+            &mut sim,
+            &mut wl,
+            &clients,
+            2_000,
+            u64::MAX,
+            &mut invariants,
+        );
         assert!(replies > 0, "workload produced no replies");
 
         assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000, &mut invariants),
             "system did not drain within the tick budget"
         );
         oracle::assert_converged(&sim, &mut wl);
@@ -7834,6 +8039,91 @@ mod review_4092_dst_tests {
         assert!(
             options.durability.is_persisted() || options.consumer_offset_durability.is_persisted(),
             "no simulator API can seed a persisted topic, so the durability guarantee this PR adds is unreachable from the deterministic simulator and `init_partition` asserts it out anyway"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_answer_divergence_tests {
+    //! End-to-end seeds for the probe-answer `StartView`. The mechanism itself is
+    //! pinned by `consensus::impls::probe_answer_tests`; these replay the runs that
+    //! found it.
+
+    use super::*;
+
+    /// Seed 144 of the uniform swarm lane: replica 0 prepared op 7 in view 0
+    /// without acks, view 1 truncated it and prepared a different op 7, and
+    /// replica 0 then adopted view 1 through a probe answer that carried no
+    /// canonical headers, so it kept its own op 7 and committed that instead.
+    ///
+    /// Network faults only, no crash needed, which is why it lands at op 7 and
+    /// replays fast. The mechanism is pinned separately by
+    /// `consensus::impls::probe_answer_tests`; this is the end-to-end seed.
+    #[test]
+    fn given_a_probe_adopted_view_when_the_head_diverges_should_not_commit_the_stale_entry() {
+        use crate::workload::{
+            self, FaultInjector, Workload,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let seed = 144;
+        // Swarm, not a fixed profile: the asymmetric partitions and clogs this
+        // seed draws are what let a primary prepare an op it cannot get acked.
+        let mut network_opts = packet::PacketSimulatorOptions::swarm(seed);
+        network_opts.node_count = replica_count;
+        network_opts.client_count = 1;
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.weights = ActionWeights::uniform();
+        options.crash_per_tick_ratio = 0.01;
+        options.restart_per_tick_ratio = 0.05;
+        let mut wl = Workload::new(options);
+
+        let mut injector = FaultInjector::new(seed, replica_count);
+        let mut invariants = crate::workload::invariants::Invariants::new();
+        // `run_with_faults` runs the per-tick invariants and the live state
+        // checker, which is where the divergence fired.
+        workload::run_with_faults(
+            &mut sim,
+            &mut wl,
+            &[client],
+            6_000,
+            u64::MAX,
+            &mut injector,
+            &mut invariants,
+        );
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000, &mut invariants),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &wl),
+        );
+        assert!(
+            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000, &mut invariants),
+            "metadata views never converged after the drain"
+        );
+        let report = oracle::assert_converged(&sim, &mut wl);
+        assert!(
+            report.ops_compared > 0,
+            "no committed metadata op was witnessed on two replicas, so this seed \
+             would pass on a diverged cluster"
         );
     }
 }

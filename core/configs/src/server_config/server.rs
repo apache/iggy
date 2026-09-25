@@ -61,7 +61,13 @@ pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_SHARD_RUNTIME_CAPACITY",
     "IGGY_SHARD_EVENT_INTERVAL",
     "IGGY_CI_BUILD",
+    "IGGY_HOME",
+    "IGGY_USERNAME",
+    "IGGY_PASSWORD",
 ];
+
+pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -261,6 +267,7 @@ impl ServerConfig {
                 .chain(SERVER_PROCESS_ENV_VARS.iter().copied())
                 .collect(),
         )
+        .with_allowed_env_prefixes(SERVER_ALLOWED_ENV_PREFIXES)
     }
 
     /// All recognised env var names for [`ServerConfig`].
@@ -281,7 +288,10 @@ pub struct ServerConfigEnvProvider {
 impl Default for ServerConfigEnvProvider {
     fn default() -> Self {
         Self {
-            provider: TypedEnvProvider::from_config(ServerConfig::ENV_PREFIX),
+            // `ServerConfig::config_provider` checks every `IGGY_` name before
+            // this provider runs.
+            provider: TypedEnvProvider::from_config(ServerConfig::ENV_PREFIX)
+                .without_unknown_env_var_check(),
         }
     }
 }
@@ -472,7 +482,7 @@ mod tests {
 
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
-        assert_eq!(cfg.message_bus.peer_queue_capacity, 256);
+        assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
     }
 
     #[test]
@@ -505,6 +515,34 @@ mod tests {
         assert!(
             names.iter().any(|n| n.starts_with("IGGY_MESSAGE_BUS_")),
             "expected at least one IGGY_MESSAGE_BUS_* env var, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_provider_accepts_server_process_env_vars() {
+        for name in SERVER_PROCESS_ENV_VARS {
+            // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+            // against any concurrent environment access. `serial_test::serial` on
+            // this test is what prevents that.
+            unsafe { env::set_var(name, "1") };
+        }
+
+        let data = ServerConfigEnvProvider::default().data();
+
+        for name in SERVER_PROCESS_ENV_VARS {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+
+        // The provider holds no scan of its own, so the typed provider's
+        // debug_assert! stays quiet. A panic above is one failure this test
+        // guards, and one of these names reaching the map is the other.
+        let data = data.expect("the server env provider must accept every process variable");
+        let profile = data.get(&Profile::default()).expect("no default profile");
+        assert!(
+            profile.is_empty(),
+            "none of these variables is a config value, so none of them may reach the map: {profile:?}"
         );
     }
 }

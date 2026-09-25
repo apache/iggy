@@ -44,6 +44,11 @@
 //! CI campaign wants: `none`/`light`/`heavy` are three points in parameter space,
 //! so a thousand seeds against `heavy` is the same network a thousand times. The
 //! drawn values print on the `network:` line and `--seed` replays them exactly.
+//!
+//! Exit codes: `0` passed, `2` the configuration is unusable, `3` the run proved
+//! nothing because a vacuity floor went unmet, and `101` an invariant or an oracle
+//! failed. Only `101` is a bug. A campaign that cannot tell `3` from `101` reports
+//! its own thin seeds as failures, which is what splitting them apart is for.
 
 use clap::{Parser, ValueEnum};
 use iggy_common::IggyByteSize;
@@ -53,9 +58,26 @@ use simulator::Simulator;
 use simulator::client::SimClient;
 use simulator::packet::{COMMAND_LABELS, PacketSimulatorOptions, PartitionMode, PartitionSymmetry};
 use simulator::workload::actions::Action;
+use simulator::workload::invariants::Invariants;
 use simulator::workload::options::{ActionWeights, WorkloadOptions};
 use simulator::workload::{FaultInjector, Workload, oracle, run_with_faults};
 use strum::IntoEnumIterator;
+
+/// Exit code for a run that proved nothing.
+///
+/// Apart from the `101` a panic exits with, because a run under a vacuity floor is
+/// not a failure: every oracle held and none of them had anything to compare.
+const EXIT_VACUOUS: i32 = 3;
+
+/// Report that the run proved nothing, then exit with [`EXIT_VACUOUS`].
+///
+/// On stdout beside the coverage numbers rather than on stderr, because this is an
+/// outcome of the run and not a diagnostic of one. No panic, so the reproduce line
+/// the panic hook prints stays reserved for failures worth reproducing.
+fn vacuous(reason: std::fmt::Arguments<'_>) -> ! {
+    println!("vacuous: {reason}");
+    std::process::exit(EXIT_VACUOUS)
+}
 
 #[derive(Parser)]
 #[command(about = "Deterministic workload fuzzer for the Iggy simulator")]
@@ -119,14 +141,14 @@ struct Args {
     /// than Iggy is.
     #[arg(long)]
     restore_partition_frontier: bool,
-    /// Fail the run if the entity oracle did not hold at quiesce.
+    /// End the run as vacuous if the entity oracle did not hold at quiesce.
     ///
     /// An eviction disarms it (the forgotten request's fate is unknown) and it
     /// re-arms only once the shadow is proven equal to committed state again. Without
     /// this flag a run whose oracle stayed disarmed still exits 0.
     #[arg(long)]
     require_entity_oracle: bool,
-    /// Committed workload operations this run must produce, or it fails.
+    /// Committed workload operations this run must produce, or it ends as vacuous.
     ///
     /// A run that commits nothing proved nothing: every oracle downstream compares an
     /// empty shadow against empty committed state and agrees. `0` opts out.
@@ -135,7 +157,7 @@ struct Args {
     /// Committed ops, on EITHER plane, that must have been witnessed by more than
     /// one live replica, i.e. that exercised cross-replica agreement. Ignored below
     /// two live replicas, where the property is untestable rather than untested.
-    /// `0` opts out.
+    /// `0` opts out. An unmet floor exits [`EXIT_VACUOUS`], like every floor here.
     #[arg(long, default_value_t = 1)]
     min_ops_compared: usize,
     /// As `--min-ops-compared`, but METADATA ops only.
@@ -147,7 +169,8 @@ struct Args {
     /// with `0`.
     #[arg(long, default_value_t = 1)]
     min_metadata_ops_compared: usize,
-    /// Fail the run if crash or restart injection was requested but never happened.
+    /// End the run as vacuous if crash or restart injection was requested but never
+    /// happened.
     /// Off by default, since a short run at low probability may legitimately draw
     /// none; on for a campaign where such a seed is silently wasted.
     #[arg(long)]
@@ -518,13 +541,16 @@ fn validate_network_options(options: &PacketSimulatorOptions) -> Result<(), Stri
 /// compare the replicas against each other and against the oracle.
 ///
 /// Split out of `main` only for length. Every assert here is a hard failure by
-/// design; see the individual comments for why each one is not a warning.
+/// design, and the individual comments say why each one is not a warning. The
+/// vacuity floors are the exception: they end the run at [`EXIT_VACUOUS`], since a
+/// run that compared nothing has disproved nothing either.
 fn run_quiesce_phase(
     args: &Args,
     sim: &mut Simulator,
     workload: &mut Workload,
     seed: u64,
     replicas: u8,
+    invariants: &mut Invariants,
 ) {
     // Liveness phase, opt-in: a drain against a handicapped cluster has no
     // verdict, but healing unconditionally resolves the wedges worth reporting.
@@ -546,7 +572,7 @@ fn run_quiesce_phase(
     // unactionable; with the client resending, a request unanswered inside the
     // budget is either a wedge or a liveness bug.
     assert!(
-        oracle::drive_to_quiesce(sim, workload, 50_000),
+        oracle::drive_to_quiesce(sim, workload, 50_000, invariants),
         "{}",
         oracle::quiesce_failure_report(sim, workload),
     );
@@ -554,7 +580,7 @@ fn run_quiesce_phase(
     // the leader as whichever live replica claims to be primary, so asserting
     // mid-view-change finds none or finds a deposed one, both false failures.
     assert!(
-        oracle::settle_to_stable_view(sim, workload, 50_000),
+        oracle::settle_to_stable_view(sim, workload, 50_000, invariants),
         "metadata views never converged after the drain\n{}",
         oracle::quiesce_failure_report(sim, workload),
     );
@@ -580,36 +606,37 @@ fn run_quiesce_phase(
         convergence.replicas_compared,
         convergence.namespaces_checked,
     );
-    assert!(
-        !args.require_entity_oracle || workload.strict_outcome_oracle(),
-        "--require-entity-oracle: the entity oracle was {entity_oracle}, so this run \
-         proved nothing about entity state (seed={seed:#x})"
-    );
+    if args.require_entity_oracle && !workload.strict_outcome_oracle() {
+        vacuous(format_args!(
+            "--require-entity-oracle: the entity oracle was {entity_oracle}, so this run \
+             proved nothing about entity state (seed={seed:#x})"
+        ));
+    }
     let live = usize::from(replicas) - sim.crashed.len();
     // Either plane satisfies it: a partition-plane run commits almost no metadata,
     // so the metadata count alone called every such run vacuous.
     let compared = convergence.ops_compared + convergence.partition_ops_compared;
-    assert!(
-        args.min_ops_compared == 0 || live < 2 || compared >= args.min_ops_compared,
-        "--min-ops-compared {}: {live} replicas live but only {compared} op(s) witnessed \
-         by more than one ({} metadata, {} partition), so cross-replica agreement went \
-         untested (seed={seed:#x})",
-        args.min_ops_compared,
-        convergence.ops_compared,
-        convergence.partition_ops_compared,
-    );
+    if args.min_ops_compared > 0 && live >= 2 && compared < args.min_ops_compared {
+        vacuous(format_args!(
+            "--min-ops-compared {}: {live} replicas live but only {compared} op(s) witnessed \
+             by more than one ({} metadata, {} partition), so cross-replica agreement went \
+             untested (seed={seed:#x})",
+            args.min_ops_compared, convergence.ops_compared, convergence.partition_ops_compared,
+        ));
+    }
     // The metadata half on its own: summing the planes above lets a partition-only
     // run clear that floor while the metadata oracle compares nothing.
-    assert!(
-        args.min_metadata_ops_compared == 0
-            || live < 2
-            || convergence.ops_compared >= args.min_metadata_ops_compared,
-        "--min-metadata-ops-compared {}: {live} replicas live but only {} committed metadata \
-         op(s) witnessed by more than one, so the metadata oracle compared an empty chain \
-         (seed={seed:#x})",
-        args.min_metadata_ops_compared,
-        convergence.ops_compared,
-    );
+    if args.min_metadata_ops_compared > 0
+        && live >= 2
+        && convergence.ops_compared < args.min_metadata_ops_compared
+    {
+        vacuous(format_args!(
+            "--min-metadata-ops-compared {}: {live} replicas live but only {} committed metadata \
+             op(s) witnessed by more than one, so the metadata oracle compared an empty chain \
+             (seed={seed:#x})",
+            args.min_metadata_ops_compared, convergence.ops_compared,
+        ));
+    }
     // Again after the drain: the drain both answers outstanding requests and
     // issues its own resends, so the pre-drain numbers are not the final ones.
     print_coverage(workload);
@@ -679,6 +706,9 @@ fn main() {
     let mut workload = Workload::new(options);
 
     let mut injector = FaultInjector::new(seed, replicas);
+    // One checker for the whole run: the drain in `run_quiesce_phase` continues with
+    // it, so a mark set during the active phase still holds the drain to account.
+    let mut invariants = Invariants::new();
     let replies = run_with_faults(
         &mut sim,
         &mut workload,
@@ -686,6 +716,7 @@ fn main() {
         ticks,
         u64::MAX,
         &mut injector,
+        &mut invariants,
     );
     println!(
         "ran {ticks} ticks; {replies} replies; crashes={} restarts={} still down: {}",
@@ -700,7 +731,14 @@ fn main() {
     print_coverage(&workload);
 
     if quiesce {
-        run_quiesce_phase(&args, &mut sim, &mut workload, seed, replicas);
+        run_quiesce_phase(
+            &args,
+            &mut sim,
+            &mut workload,
+            seed,
+            replicas,
+            &mut invariants,
+        );
     }
 
     // After the quiesce block, so the drain's own commits count. Rejections are added
@@ -709,23 +747,26 @@ fn main() {
     // full of them exercised the plane.
     let stats = workload.auditor.stats();
     let commits: u64 = stats.commits_per_action.iter().sum::<u64>() + stats.committed_rejections;
-    assert!(
-        commits >= args.min_commits,
-        "--min-commits {}: the run committed {commits} operation(s) on the {plane:?} \
-         plane, so every oracle above compared empty against empty (seed={seed:#x})",
-        args.min_commits,
-    );
+    if commits < args.min_commits {
+        vacuous(format_args!(
+            "--min-commits {}: the run committed {commits} operation(s) on the {plane:?} \
+             plane, so every oracle above compared empty against empty (seed={seed:#x})",
+            args.min_commits,
+        ));
+    }
     if args.require_faults {
-        assert!(
-            crash_prob <= 0.0 || injector.crashes() > 0,
-            "--require-faults: --crash-prob {crash_prob} crashed nothing \
-             (seed={seed:#x})"
-        );
-        assert!(
-            args.restart_prob <= 0.0 || injector.restarts() > 0,
-            "--require-faults: --restart-prob {} restarted nothing (seed={seed:#x})",
-            args.restart_prob,
-        );
+        if crash_prob > 0.0 && injector.crashes() == 0 {
+            vacuous(format_args!(
+                "--require-faults: --crash-prob {crash_prob} crashed nothing \
+                 (seed={seed:#x})"
+            ));
+        }
+        if args.restart_prob > 0.0 && injector.restarts() == 0 {
+            vacuous(format_args!(
+                "--require-faults: --restart-prob {} restarted nothing (seed={seed:#x})",
+                args.restart_prob,
+            ));
+        }
     }
 
     print_command_coverage(&sim);

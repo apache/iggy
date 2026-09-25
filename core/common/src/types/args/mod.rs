@@ -160,14 +160,14 @@ pub struct ArgsOptional {
 
     /// The optional send window for QUIC
     ///
-    /// [default: 100000]
+    /// [default: 1000000]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quic_send_window: Option<u64>,
 
     /// The optional receive window for QUIC
     ///
-    /// [default: 100000]
+    /// [default: 1000000]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quic_receive_window: Option<u64>,
@@ -188,7 +188,7 @@ pub struct ArgsOptional {
 
     /// The optional maximum idle timeout for QUIC
     ///
-    /// [default: 10000]
+    /// [default: 100000]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quic_max_idle_timeout: Option<u64>,

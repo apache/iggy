@@ -61,8 +61,10 @@ pub use doris::{
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
-    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
-    HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
+    GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkIndividualFixture,
+    HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture, HttpSinkNdjsonFixture,
+    HttpSinkNoMetadataFixture, HttpSinkRawFixture, HttpSourceFixture, MANAGEMENT_TOKEN,
+    PARTNER_BEARER_TOKEN, PARTNER_ENDPOINT_ID, PARTNER_INSTANCE,
 };
 pub use iceberg::{
     DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
@@ -80,10 +82,13 @@ pub use mongodb::{
 };
 pub use opensearch::{OpenSearchFailureFixture, OpenSearchOps, OpenSearchSinkFixture};
 pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceDeleteFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceOps,
+    POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
+    PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture, PostgresSourceByteaFixture,
+    PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture, PostgresSourceDeleteFixture,
+    PostgresSourceDeleteSlowPollFixture, PostgresSourceJsonFixture, PostgresSourceJsonbFixture,
+    PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
+    PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
+    PostgresSourceOps, PostgresSourceTextKeyFixture,
 };
 pub use quickwit::{
     QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,
@@ -100,7 +105,7 @@ pub use redshift::{
 };
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use surrealdb::{
-    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
-    SurrealDbSinkRawFixture,
+    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkDatabaseFixture, SurrealDbSinkFixture,
+    SurrealDbSinkJsonFixture, SurrealDbSinkNamespaceFixture, SurrealDbSinkRawFixture,
 };
 pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

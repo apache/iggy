@@ -25,7 +25,7 @@ use common::{
     set_replica_ctx,
 };
 use iggy_binary_protocol::Command;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
 use std::cell::Cell;
@@ -61,7 +61,14 @@ async fn writer_batches_pipelined_sends_in_order() {
     set_replica_ctx(&bus0, CLUSTER, 0, 2, None);
     let on_reply: MessageHandler = Rc::new(|_, _| {});
     let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_reply);
-    start_connector(&bus0, 0, vec![(1, addr1)], dial_0, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(
+        &bus0,
+        0,
+        vec![(1, addr1)],
+        dial_0,
+        bus0.config().reconnect_period,
+    )
+    .await;
 
     // Wait for connect.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

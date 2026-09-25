@@ -20,6 +20,22 @@ suite goes through `tests/common/fixtures.rs::load_fixture_body_or_skip`, which 
 regeneration hint when a fixture is missing, and panics instead when `KAFKA_FIXTURES_REQUIRED=1`
 is set (CI sets this) so a broken generation step can't leave a suite green with zero assertions.
 
+### `iggy-server` binary (required for `bridge_iggy_integration_tests`)
+
+No fixtures needed, but `iggy-server` has to be built *first* - this suite spawns it directly and
+does not build it for you:
+
+```bash
+cargo build --package server --bin iggy-server
+cargo test -p iggy-gateway-kafka
+```
+
+Same prerequisite `core/integration`'s own server-spawning tests already carry (this suite's
+`iggy_server_binary()` walks up from its own `env::current_exe()` to find the already-built binary
+in the same target directory; neither harness invokes `cargo build` itself). Skipping this step
+fails with a clear "binary not found" message naming the build command to run, not a hang or a
+silent skip.
+
 ---
 
 ## Test files
@@ -47,6 +63,8 @@ file under `tests/` anymore.
 | [`server_integration_tests.rs`](../tests/server_integration_tests.rs) | `read_frame` unit-level I/O | No |
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
 | [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
+| [`sasl_tests.rs`](../tests/sasl_tests.rs) | SASL/PLAIN over a socket — full handshake, every refusal path, and the disabled default. Drives a stub verifier implementing `SaslAuthenticator`, so no Iggy server is needed | No |
+| [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
 
 `tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `scope.rs`, `server.rs`,
 `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`

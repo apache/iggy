@@ -153,17 +153,6 @@ pub fn parse_duration(value: Option<&str>, default_value: &str) -> Duration {
         })
 }
 
-/// Apply ±20 % random jitter to `base` to spread retry storms.
-pub(crate) fn jitter(base: Duration) -> Duration {
-    let millis = base.as_millis() as u64;
-    let jitter_range = millis / 5; // 20% of base
-    if jitter_range == 0 {
-        return base;
-    }
-    let delta = rand::rng().random_range(0..=jitter_range * 2);
-    Duration::from_millis(millis.saturating_sub(jitter_range).saturating_add(delta))
-}
-
 /// True exponential backoff: `base × 2^attempt`, capped at `max_delay`.
 ///
 /// `attempt` is 0-based. Retry loops count from 1, so passing their counter
@@ -171,11 +160,11 @@ pub(crate) fn jitter(base: Duration) -> Duration {
 /// takes a 1-based retry number and applies jitter and the cap.
 pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
     let factor = 2u64.saturating_pow(attempt);
-    let millis = base
-        .as_millis()
+    let nanos = base
+        .as_nanos()
         .saturating_mul(factor as u128)
-        .min(max_delay.as_millis());
-    Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+        .min(max_delay.as_nanos());
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 /// Parse a `Retry-After` header value (integer seconds).
@@ -217,19 +206,30 @@ impl RetryPolicy {
 /// retry waits `base_delay`, the second `2 × base_delay`, and so on, which is
 /// the convention the `retry_delay` config fields document.
 ///
-/// The cap is re-applied after jittering, because ±20 % jitter on an
-/// already-capped delay can otherwise land above `max_delay`, which the config
-/// fields document as a strict upper bound.
+/// The delay is drawn uniformly from a ±20 % window around that value, cut off
+/// at `max_delay`, which the config fields document as a strict upper bound.
+/// The window narrows as the backoff approaches the cap and sits entirely
+/// below it once the backoff saturates.
 ///
-/// Prefer [`retry_async`], which calls this for you. Reach for it directly
-/// only in a loop that cannot be expressed as a retried `Result`.
+/// Prefer [`retry_async`], which calls this for you. Reach for it directly in
+/// a loop that computes its own delay, such as [`HttpRetryMiddleware`], which
+/// retries on an `Ok` response rather than an `Err`.
 pub fn retry_backoff(base_delay: Duration, retry: u32, max_delay: Duration) -> Duration {
-    jitter(exponential_backoff(
-        base_delay,
-        retry.saturating_sub(1),
-        max_delay,
-    ))
-    .min(max_delay)
+    let target = exponential_backoff(base_delay, retry.saturating_sub(1), max_delay);
+    let target_nanos = u64::try_from(target.as_nanos()).unwrap_or(u64::MAX);
+    let spread = target_nanos / 5; // 20% of the target
+
+    // Draw uniformly inside the window, cut off at `max_delay`. A draw that
+    // clamps instead lands on the bound itself, and at the cap that is half of
+    // every draw, which puts the most-backed-off instances back in step.
+    let low = target_nanos.saturating_sub(spread);
+    let high = target_nanos
+        .saturating_add(spread)
+        .min(u64::try_from(max_delay.as_nanos()).unwrap_or(u64::MAX));
+    if high <= low {
+        return Duration::from_nanos(low);
+    }
+    Duration::from_nanos(rand::rng().random_range(low..=high))
 }
 
 /// Why [`retry_async`] stopped.
@@ -576,6 +576,7 @@ pub async fn check_connectivity_with_retry(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::collections::HashSet;
     use std::time::Instant;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -854,6 +855,44 @@ mod tests {
                 "retry {retry} backed off {delay:?}, expected roughly {nominal:?}"
             );
         }
+    }
+
+    #[test]
+    fn given_a_sub_millisecond_delay_should_still_spread() {
+        // Whole-millisecond math rounds the window to zero below 5 ms and
+        // returns the target unchanged, so every instance waits the same.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_micros(500),
+            max_delay: Duration::from_millis(10),
+        };
+        let spread: HashSet<Duration> = (0..64).map(|_| policy.backoff(1)).collect();
+
+        assert!(
+            spread.len() > 1,
+            "the backoff collapsed sub-millisecond delays onto {spread:?}"
+        );
+        assert!(policy.backoff(1) > Duration::ZERO);
+    }
+
+    #[test]
+    fn given_a_saturated_backoff_should_not_pile_onto_the_cap() {
+        // Base far above the cap, so every draw starts saturated.
+        let policy = RetryPolicy {
+            max_attempts: 16,
+            base_delay: Duration::from_secs(30),
+            max_delay: Duration::from_secs(1),
+        };
+
+        let draws = 512;
+        let at_cap = (0..draws)
+            .filter(|_| policy.backoff(8) == policy.max_delay)
+            .count();
+
+        assert!(
+            at_cap * 10 < draws,
+            "{at_cap}/{draws} saturated draws landed exactly on max_delay"
+        );
     }
 
     #[test]

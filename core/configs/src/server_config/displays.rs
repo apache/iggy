@@ -63,11 +63,12 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ wal_bytes_max: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
+            "{{ wal_bytes_max: {}, wal_group_commit_delay_micros: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
              offset_reservation_lease: {}, \
              evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
              transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
             self.wal_bytes_max,
+            self.wal_group_commit_delay_micros,
             self.validate_checksum,
             self.prepare_queue_depth,
             self.dedup_clients_max,
@@ -95,12 +96,14 @@ impl Display for MessageBusConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ max_batch: {}, max_message_size: {}, peer_queue_capacity: {}, \
-             reconnect_period: {}, close_peer_timeout: {}, close_grace: {}, \
-             handshake_grace: {} }}",
+            "{{ max_batch: {}, max_message_size: {}, replica_read_buffer_size: {}, \
+             peer_queue_capacity: {}, client_queue_capacity: {}, reconnect_period: {}, \
+             close_peer_timeout: {}, close_grace: {}, handshake_grace: {} }}",
             self.max_batch,
             self.max_message_size,
+            self.replica_read_buffer_size,
             self.peer_queue_capacity,
+            self.client_queue_capacity,
             self.reconnect_period,
             self.close_peer_timeout,
             self.close_grace,

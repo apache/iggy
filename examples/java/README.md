@@ -2,25 +2,25 @@
 
 This directory contains comprehensive sample applications that showcase various usage patterns of the Iggy java client SDK, from basic operations to advanced multi-tenant scenarios.
 
-Java 17 and Gradle 9.2.1 are recommended for running the examples.
+Java 17 or newer is required. The included Gradle wrapper downloads the pinned Gradle version. The project uses `includeBuild` to compile the SDK from `foreign/java` in the same checkout.
 
 ## Running Examples
 
-The Java SDK speaks the VSR (Viewstamped Replication) wire protocol, so the examples run against the VSR server.
+These examples target server **0.9.0** and speak the VSR (Viewstamped Replication) wire protocol. Build the server and SDK from the same checkout for unreleased changes. Run the Gradle tasks below from `examples/java`, with each producer before its consumer.
 
 Iggy requires valid credentials to authenticate client requests. The examples assume that the server is using the default root credentials, set through environment variables before starting the server:
 
-macOS/Linux:
+Linux, from the repository root:
 
 ```bash
 export IGGY_ROOT_USERNAME=iggy
 export IGGY_ROOT_PASSWORD=iggy
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
 ```
 
-Windows(Powershell):
+PowerShell environment variables:
 
-```bash
+```powershell
 $env:IGGY_ROOT_USERNAME = "iggy"
 $env:IGGY_ROOT_PASSWORD = "iggy"
 ```
@@ -28,12 +28,9 @@ $env:IGGY_ROOT_PASSWORD = "iggy"
 > **Note** <br>
 > This setup is intended only for development and testing, not production use.
 
-By default, all server data is stored in the `local_data` directory (this can be changed via `system.path` in `config.toml`).
+By default, all server data is stored in the `local_data` directory (this can be changed via `IGGY_PATH`).
 
-Root credentials are applied **only on the very first startup**, when no data directory exists yet.
-Once the server has created and populated the data directory, the existing stored credentials will always be used, and setting the environment variables will no longer override them.
-
-If the server has already been started once and your example returns `Error: InvalidCredentials`, then this means the stored credentials differ from the defaults. Delete the existing data directory, then start the server again with the environment variables set.
+`--fresh` wipes this replica's local data directory. Environment credentials take precedence over `--with-default-root-credentials`. Bootstrap settings do not replace recovered credentials, and a fresh cluster replica can recover them from peers. On an existing server, use the credentials that were configured for it.
 
 You can also customize the server using environment variables:
 
@@ -62,7 +59,7 @@ Shows metadata management using custom headers:
 ./gradlew runMessageHeadersConsumer
 ```
 
-Demonstrates using header keys and values for message metadata instead of payload-based typing, with header-based message routing.
+Uses a `message_type` header to choose the application handler for each order event.
 
 ### Message Envelopes
 
@@ -96,19 +93,19 @@ Testing and benchmarking support:
 ./gradlew runSinkDataProducer
 ```
 
-Produces high-throughput data (1000+ messages per batch) with realistic user records.
+Produces 100 batches of 1000 to 1099 messages with generated user records.
 
 ## Stream Builder Examples
 
 ### Stream Builder
 
-Building streams with advanced configuration:
+Producing and consuming messages in one class:
 
 ```bash
 ./gradlew runStreamBasic
 ```
 
-Shows how to use the stream builder API to create and configure streams with custom settings.
+Uses the blocking client to create a stream and topic, send three messages, and poll them. It deletes its `test_stream` stream after the run.
 
 ## Async Client Examples
 
@@ -124,7 +121,6 @@ Shows:
 
 - CompletableFuture chaining patterns
 - Submitting multiple sends without blocking
-- Performance comparison with blocking client
 
 ### Async Consumer
 
@@ -163,16 +159,16 @@ Demonstrates secure TLS-encrypted TCP connections:
 ./gradlew runTcpTlsConsumer
 ```
 
-These examples require a TLS-enabled Iggy server. Start the server with:
+These examples require a TLS-enabled Iggy server. From the repository root, start a disposable server with the development certificates:
 
 ```bash
 IGGY_TCP_TLS_ENABLED=true \
 IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
 ```
 
-Uses `IggyTcpClientBuilder` with TLS options (`enableTls`, `tlsDomain`, `tlsCaCertPath`) to establish TLS-encrypted TCP connections with CA certificate verification.
+Uses `IggyTcpClientBuilder.enableTls()` and `tlsCertificate("../../core/certs/iggy_ca_cert.pem")` with CA verification. Run the clients from `examples/java` so that path resolves. The same data and credential prerequisites apply; these certificates are for development only.
 
 ## Blocking vs. Async - When to Use Each
 

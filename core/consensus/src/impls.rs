@@ -36,6 +36,7 @@ use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -268,9 +269,20 @@ impl PipelineEntry {
     }
 }
 
+/// Identity and capacity held by a pending automatic commit.
+#[derive(Debug)]
+pub struct AutoCommitRequestContext {
+    /// History accepted with the poll, which must still match at promotion.
+    pub history: PollHistoryId,
+    /// Keeps this request's consumer key occupied through promotion and staging.
+    pub reservation: AutoCommitReservation,
+}
+
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
+    /// Automatic commit context owned by this entry until promotion or removal.
+    auto_commit: Option<AutoCommitRequestContext>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
     /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
@@ -294,6 +306,30 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    /// Build an automatic commit entry that owns its capacity guard.
+    /// The context must match the consumer key encoded in `message`.
+    #[must_use]
+    pub fn with_auto_commit(
+        message: Message<RoutedRequestHeader>,
+        context: AutoCommitRequestContext,
+    ) -> Self {
+        let mut entry = Self::new(message);
+        entry.auto_commit = Some(context);
+        entry
+    }
+
+    /// Transfer the context without dropping its reservation.
+    /// Promotion must retain the returned context through replication staging.
+    pub const fn take_auto_commit(&mut self) -> Option<AutoCommitRequestContext> {
+        self.auto_commit.take()
+    }
+
+    /// Inspect the context without acquiring another reservation.
+    #[must_use]
+    pub const fn auto_commit(&self) -> Option<&AutoCommitRequestContext> {
+        self.auto_commit.as_ref()
+    }
+
     /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
@@ -322,6 +358,7 @@ impl RequestEntry {
         reply_sender: Option<Sender<Message<ReplyHeader>>>,
     ) -> Self {
         Self {
+            auto_commit: None,
             message,
             received_at: 0,
             reply_sender,
@@ -728,6 +765,13 @@ impl LocalPipeline {
         for entry in &mut self.prepare_queue {
             entry.reply_sender.take();
         }
+    }
+
+    /// Remove pending requests while preserving the order of those retained.
+    /// Removed entries drop their reply senders and automatic commit reservations.
+    /// Prepare entries are unaffected.
+    pub fn retain_requests(&mut self, mut keep: impl FnMut(&RequestEntry) -> bool) {
+        self.request_queue.retain(|request| keep(request));
     }
 
     /// Drop `request_queue` only; preserve `prepare_queue`. View-change reset.
@@ -1154,9 +1198,9 @@ where
 
     timeouts: RefCell<TimeoutManager>,
 
-    /// Monotonic timestamp from the most recent accepted commit heartbeat.
-    /// Old/replayed commit messages with a lower timestamp are ignored.
-    heartbeat_timestamp: Cell<u64>,
+    /// View and counter of the last emitted or accepted heartbeat. A new
+    /// primary's counter can be lower, so freshness is scoped to its view.
+    heartbeat_watermark: Cell<(u32, u64)>,
 
     /// Time source for [`Self::next_monotonic_timestamp`]; see
     /// [`ConsensusClock`].
@@ -1445,7 +1489,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
-            heartbeat_timestamp: Cell::new(0),
+            heartbeat_watermark: Cell::new((0, 0)),
             clock,
         }
     }
@@ -1657,8 +1701,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.commit_min.set(commit_min);
     }
 
-    /// Maximum number of faulty replicas that can be tolerated.
-    /// For a cluster of 2f+1 replicas, this returns f.
+    /// `StartViewChange` votes needed from other replicas before sending `DoViewChange`.
+    /// This is f for 2f+1 replicas, not the failure bound for every quorum configuration.
     #[must_use]
     pub const fn max_faulty(&self) -> usize {
         (self.replica_count as usize - 1) / 2
@@ -2793,8 +2837,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // After view change the new primary may have commit_min < commit_max
         // until commit_journal catches up. Send commit_min (what we've
         // actually applied) so backups don't advance past us.
-        let ts = self.heartbeat_timestamp.get() + 1;
-        self.heartbeat_timestamp.set(ts);
+        let ts = self.heartbeat_watermark.get().1 + 1;
+        self.heartbeat_watermark.set((self.view.get(), ts));
 
         vec![VsrAction::SendCommit {
             view: self.view.get(),
@@ -2903,13 +2947,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
-    /// Handle a received `DoViewChange` message (only relevant for primary candidate).
-    ///
-    /// "When the new primary receives f + 1 DOVIEWCHANGE messages from different
-    /// replicas (including itself), it sets its view-number to that in the messages
-    /// and selects as the new log the one contained in the message with the largest v'..."
-    ///
-    /// The `commit` this replica advertises in a `DoViewChange`.
+    /// The `commit` this replica advertises in a `DoViewChange`, and in any
+    /// `StartView` it announces.
     ///
     /// `commit_max`, not `commit_min`: the new primary floors its pipeline rebuild
     /// at `max(commit)` across the quorum, and only `commit_max` bounds that range
@@ -2920,7 +2959,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// the prepares and `DoViewChangeHeader::validate` rejects `commit > op`.
     /// Lossless for the rebuild floor: quorum intersection guarantees some sender
     /// whose head covers the true commit point carries it.
-    fn dvc_commit(&self) -> u64 {
+    #[must_use]
+    pub fn dvc_commit(&self) -> u64 {
         let op = self.sequencer.current_sequence();
         self.commit_max.get().min(op)
     }
@@ -3191,12 +3231,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![VsrAction::SendStartView {
             view: self.view.get(),
             op: self.sequencer.current_sequence(),
-            commit: self.commit_max.get(),
+            commit: self.dvc_commit(),
             incarnation: header.incarnation,
             target: Some(header.replica),
-            // A probe answer reports this primary's settled frontier, not a
-            // freshly merged log, so there is no canonical suffix to publish.
-            suffix: Vec::new(),
+            // A prober can hold a different entry at an op at or below this
+            // commit point, left from a view whose entry the change truncated.
+            // Without the canonical headers it cannot know, so it adopts the
+            // commit point and applies its own stale entry.
+            suffix: self.local_dvc_suffix().headers().to_vec(),
             group: self.group,
         }]
     }
@@ -3451,8 +3493,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// so it doesn't start a spurious view change. Returns `true` if
     /// `commit_max` advanced, signalling the caller to run `commit_journal`.
     ///
-    /// Only accepts heartbeats with a strictly newer monotonic timestamp
-    /// to prevent old/replayed messages from suppressing view changes.
+    /// Only refreshes liveness for a newer heartbeat within its view, so
+    /// old/replayed messages cannot suppress view changes.
     ///
     /// # Panics
     /// If `header.group` does not match this replica's namespace.
@@ -3506,10 +3548,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return CommitOutcome::Accepted;
         }
 
-        // Only accept heartbeats with a strictly newer timestamp to prevent
-        // old/replayed commit messages from resetting the timeout.
-        if self.heartbeat_timestamp.get() < header.timestamp_monotonic {
-            self.heartbeat_timestamp.set(header.timestamp_monotonic);
+        let heartbeat = (header.view, header.timestamp_monotonic);
+        if self.heartbeat_watermark.get() < heartbeat {
+            self.heartbeat_watermark.set(heartbeat);
             self.timeouts
                 .borrow_mut()
                 .reset(TimeoutKind::NormalHeartbeat);
@@ -4042,8 +4083,8 @@ where
         // cost on the produce path, and it would describe the WRONG bytes:
         // `stamp_prepare_for_persistence` rewrites the command header INSIDE this
         // sealed region before the entry is journaled. Leaving those prepares at `0`
-        // is the designed "nothing to verify" sentinel, so a future durable partition
-        // journal skips verification instead of failing every entry as corrupt.
+        // is the designed "nothing to verify" sentinel: partition prepares
+        // leave message-body integrity to the batch checksums.
         //
         // TODO(consensus): a partition prepare's `checksum` covers its header alone,
         // so two at one op with matching header fields are indistinguishable however
@@ -4053,8 +4094,8 @@ where
         // the zero. Two closures, both larger than they look:
         //
         // 1. The batch checksum, recomputed after `stamp_prepare_for_persistence`.
-        //    But stamping runs per replica after replication and folds `base_offset`
-        //    in, so identity would change at stamp time and the journaled entry would
+        //    But stamping runs after this projection and folds `base_offset` in,
+        //    so identity would change at stamp time and the journaled entry would
         //    no longer match the pipeline entry `handle_prepare_ok` compares.
         // 2. The stamp-invariant cover: everything past the 256-byte command header,
         //    which stamping never touches. Identical on every replica, safe to seal
@@ -4225,6 +4266,10 @@ mod fresh_group_start_tests {
 mod request_queue_tests {
     use super::*;
     use iggy_binary_protocol::{Command, Operation};
+    use iggy_common::ConsumerKind;
+    use server_common::poll::AutoCommitReservationToken;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
@@ -4242,6 +4287,58 @@ mod request_queue_tests {
             ..RoutedRequestHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn queued_contexts_keep_each_reservation_until_their_own_removal() {
+        let consumer_id = 7;
+        let client_id = 1;
+        let reclaim_epoch = Rc::new(Cell::new(0));
+        let active_keys = Rc::new(Cell::new(0));
+        let token = Rc::new(AutoCommitReservationToken::new(
+            ConsumerKind::Consumer,
+            consumer_id,
+            reclaim_epoch,
+            Rc::clone(&active_keys),
+        ));
+        let history = PollHistoryId::default();
+        let mut pipeline = LocalPipeline::new();
+
+        // Each queued request holds its own guard for the same consumer key.
+        // The queue stores these messages without interpreting their payloads.
+        for request_number in 1..=2 {
+            let context = AutoCommitRequestContext {
+                history,
+                reservation: token.acquire(),
+            };
+            pipeline
+                .push_request(RequestEntry::with_auto_commit(
+                    make_request(client_id, request_number),
+                    context,
+                ))
+                .expect("both requests fit in the queue");
+        }
+
+        // Removing the first entry transfers its context to the caller, as
+        // promotion would. Releasing it must preserve the second reservation.
+        let mut first_request = pipeline.pop_request().expect("first queued request");
+        let first_context = first_request
+            .take_auto_commit()
+            .expect("context follows first request");
+        assert_eq!(first_request.message.header().request, 1);
+        assert_eq!(first_context.history, history);
+        drop(first_context);
+        assert_eq!(token.active_count(), 1);
+        assert_eq!(
+            active_keys.get(),
+            1,
+            "the queued request still holds the key"
+        );
+
+        // Clearing the queue drops the remaining context and frees the key.
+        pipeline.clear_request_queue();
+        assert_eq!(token.active_count(), 0);
+        assert_eq!(active_keys.get(), 0);
     }
 
     #[test]
@@ -4493,6 +4590,7 @@ mod pipeline_entry_tests {
 #[cfg(test)]
 pub mod test_bus {
     use super::{Command, METADATA_GROUP, Message, StartViewHeader};
+    use iggy_binary_protocol::{CommitHeader, ConsensusHeader};
     use message_bus::{BusMessage, MessageBus};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
@@ -4527,6 +4625,26 @@ pub mod test_bus {
         header.group = METADATA_GROUP;
         header.size = size as u32;
         msg
+    }
+
+    /// A `Commit` heartbeat from `replica` in `view` stamped with `counter`.
+    ///
+    /// # Panics
+    /// Never: the header size fits in `u32`.
+    #[must_use]
+    pub fn make_commit(view: u32, replica: u8, counter: u64) -> Message<CommitHeader> {
+        Message::<CommitHeader>::new(std::mem::size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = 1;
+                header.replica = replica;
+                header.view = view;
+                header.group = METADATA_GROUP;
+                header.timestamp_monotonic = counter;
+                header.size = u32::try_from(std::mem::size_of::<CommitHeader>()).unwrap();
+                header.seal();
+            },
+        )
     }
 
     /// A [`MessageBus`] that accepts everything and remembers nothing.
@@ -5151,6 +5269,93 @@ mod vsr_consensus_tests {
                 .iter()
                 .any(|action| matches!(action, VsrAction::SendCommit { .. })),
             "a healthy primary must heartbeat"
+        );
+    }
+
+    #[test]
+    fn given_an_old_primary_when_the_new_primary_heartbeats_should_remain_in_the_new_view() {
+        for enters_election in [false, true] {
+            let consensus =
+                VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+            consensus.init();
+            for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+                let _ = consensus.tick(PlaneKind::Metadata);
+            }
+            assert_eq!(
+                consensus.heartbeat_watermark.get(),
+                (
+                    0,
+                    TimeoutManager::NORMAL_HEARTBEAT_TICKS / TimeoutManager::COMMIT_MESSAGE_TICKS
+                ),
+                "the old primary must have emitted a full timeout's worth of heartbeats"
+            );
+
+            if enters_election {
+                let _ = consensus.start_election(
+                    PlaneKind::Metadata,
+                    ViewChangeReason::NormalHeartbeatTimeout,
+                );
+            }
+            let start_view = test_bus::make_start_view(1, 0, 0, 1, 0);
+            let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+
+            for tick in 1..=TimeoutManager::NORMAL_HEARTBEAT_TICKS * 2 {
+                if tick % TimeoutManager::COMMIT_MESSAGE_TICKS == 0 {
+                    let heartbeat =
+                        test_bus::make_commit(1, 1, tick / TimeoutManager::COMMIT_MESSAGE_TICKS);
+                    consensus.handle_commit(heartbeat.header());
+                }
+                let _ = consensus.tick(PlaneKind::Metadata);
+                assert_eq!(
+                    consensus.view(),
+                    1,
+                    "fresh heartbeats must keep the adopted view alive at tick {tick}, \
+                     enters_election={enters_election}"
+                );
+            }
+
+            for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+                let _ = consensus.tick(PlaneKind::Metadata);
+            }
+            assert_eq!(
+                consensus.view(),
+                2,
+                "losing the new primary must still trigger an election"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_adopted_view_when_heartbeats_are_stale_or_foreign_should_time_out() {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let start_view = test_bus::make_start_view(1, 0, 0, 1, 0);
+        let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+        let heartbeat = test_bus::make_commit(1, 1, 1);
+        consensus.handle_commit(heartbeat.header());
+        // Re-adopting the same view restarts the timer but must keep the
+        // watermark; the replayed heartbeat below proves it.
+        let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+
+        let invalid_heartbeats = [
+            heartbeat,
+            test_bus::make_commit(1, 1, 0),
+            test_bus::make_commit(0, 0, u64::MAX),
+            test_bus::make_commit(1, 2, u64::MAX),
+        ];
+        for tick in 1..=TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if tick % TimeoutManager::COMMIT_MESSAGE_TICKS == 0 {
+                for heartbeat in &invalid_heartbeats {
+                    consensus.handle_commit(heartbeat.header());
+                }
+            }
+            let _ = consensus.tick(PlaneKind::Metadata);
+        }
+        assert_eq!(
+            consensus.view(),
+            2,
+            "replayed, older-view, and non-primary heartbeats must not suppress an election"
         );
     }
 
@@ -5792,6 +5997,109 @@ mod recovery_barrier_tests {
             consensus.recovery_barrier(),
             120,
             "a zero head must not disarm the gate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_answer_tests {
+    //! What a primary publishes when it answers a `RequestStartView` probe.
+    //!
+    //! The answer is not a bare frontier report. A prober can hold a different
+    //! entry at an op at or below the announced commit point, left from a view
+    //! whose entry the change truncated, and the canonical headers are its only
+    //! way to find that out before it adopts the commit point.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::NoopBus;
+    use crate::view_change_quorum::dvc_blank;
+
+    const PROBER: u8 = 1;
+
+    /// Replica 0 of 3, primary in view 0 with head `head` and commit point
+    /// `commit`, carrying a fresh suffix snapshot over `[commit + 1, head]`.
+    fn primary_with_suffix(head: u64, commit: u64) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(head);
+        consensus.advance_commit_max(commit);
+        // Tagged on `(head, commit)` as they stand now, so `local_dvc_suffix`
+        // returns it rather than falling back to empty.
+        let headers: Vec<PrepareHeader> = (commit + 1..=head).rev().map(dvc_blank).collect();
+        let present = (1u128 << headers.len()) - 1;
+        consensus.set_local_dvc_suffix(DvcSuffix::new(headers, 0, present));
+        consensus
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn probe(view: u32) -> RequestStartViewHeader {
+        RequestStartViewHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 1,
+            size: size_of::<RequestStartViewHeader>() as u32,
+            view,
+            release: 0,
+            command: Command::RequestStartView,
+            replica: PROBER,
+            reserved_frame: [0; 66],
+            group: METADATA_GROUP,
+            reserved: [0; 104],
+            incarnation: 0,
+        }
+    }
+
+    /// The suffix is the whole point: without it the prober cannot tell its own
+    /// op from the view's op at the same number, adopts the commit point, and
+    /// commits the stale entry.
+    #[test]
+    fn given_a_cached_suffix_when_answering_a_probe_should_publish_its_headers() {
+        let consensus = primary_with_suffix(7, 5);
+
+        let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &probe(0));
+
+        let [
+            VsrAction::SendStartView {
+                op,
+                commit,
+                suffix,
+                target,
+                ..
+            },
+        ] = &actions[..]
+        else {
+            panic!("a probe from a backup must be answered with one StartView: {actions:?}");
+        };
+        assert_eq!(*op, 7);
+        assert_eq!(*commit, 5);
+        assert_eq!(*target, Some(PROBER));
+        assert_eq!(
+            suffix.iter().map(|header| header.op).collect::<Vec<_>>(),
+            vec![7, 6],
+            "the answer must carry the view's canonical headers, high op first"
+        );
+    }
+
+    /// `commit_max` legitimately runs ahead of the head, since a replica learns
+    /// the commit point before it holds the prepares. `StartViewHeader::validate`
+    /// refuses `commit > op`, and the dispatcher turns that refusal into a panic,
+    /// so the announcement clamps the way `DoViewChange` already does.
+    #[test]
+    fn given_a_commit_point_above_the_head_when_answering_a_probe_should_clamp_it() {
+        let consensus = primary_with_suffix(7, 5);
+        consensus.advance_commit_max(9);
+        assert!(consensus.commit_max() > consensus.sequencer().current_sequence());
+
+        let actions = consensus.handle_request_start_view(PlaneKind::Metadata, &probe(0));
+
+        let [VsrAction::SendStartView { op, commit, .. }] = &actions[..] else {
+            panic!("expected one StartView: {actions:?}");
+        };
+        assert!(
+            commit <= op,
+            "announced commit {commit} exceeds head {op}, which StartViewHeader::validate \
+             rejects and the dispatcher panics on"
         );
     }
 }

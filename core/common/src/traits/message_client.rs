@@ -31,15 +31,39 @@ pub trait MessageClient {
     /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
     ///
-    /// With server-side auto-commit enabled, a new consumer offset key can be
+    /// With automatic commits enabled, a new consumer offset key can be
     /// rejected with `TooManyConsumerOffsets` at the partition's configured
     /// limit. That poll returns no messages. Existing keys remain writable,
-    /// and polling without auto-commit does not allocate a stored offset.
-    /// A refused auto-commit submission returns `TransientNotAccepted` with no
+    /// and polling without automatic commits does not allocate a stored offset.
+    /// A refused automatic commit submission returns `TransientNotAccepted` with no
     /// messages and may be retried. A capacity error requires capacity to be freed.
     /// Local cursors without a committed offset can be evicted at the limit.
     /// Their next `Next` poll resumes from the earliest retained messages,
     /// which can redeliver messages from earlier polls.
+    ///
+    /// # Recovering from a missing response
+    ///
+    /// A timeout or communication failure does not establish that the server
+    /// rejected the poll. With `auto_commit` enabled, the server can advance its
+    /// consumer cursor before the caller receives the messages. Retrying with
+    /// [`PollingStrategy::next()`] can then skip messages from the missing response.
+    /// Even a successful poll response does not acknowledge a durable offset commit.
+    ///
+    /// Keep a checkpoint for each partition: one past the last message successfully
+    /// processed in order, or the intended starting offset if none was processed.
+    /// Recover with [`PollingStrategy::offset(checkpoint)`](PollingStrategy::offset)
+    /// and advance the checkpoint only after processing the returned messages.
+    /// Use each message's header offset, not [`PolledMessages::current_offset`],
+    /// which reports the partition's current offset rather than the last message
+    /// returned. Persist checkpoints if recovery must survive a client restart.
+    ///
+    /// Continue using explicit offsets until all messages through the server's
+    /// cursor have been processed: replay does not rewind an advanced cursor.
+    /// For a consumer group, recover each partition with its own checkpoint and
+    /// respect the current assignment. [`Self::poll_messages_with_strategy_for`]
+    /// selects the strategy after the partition is known.
+    /// Recovery assumes the same partition message history and requires the
+    /// messages to remain retained. It can repeat messages already processed.
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,

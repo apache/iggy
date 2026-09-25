@@ -58,7 +58,7 @@ verbose_logging = false
 # max_retries = 3
 # retry_delay = "1s"
 # retry_max_delay = "5s"
-# Total readiness probes including the first; 1 disables retries.
+# Total attempts per readiness check including the first; 1 disables retries.
 # max_open_retries = 10
 # open_retry_max_delay = "30s"
 # timeout = "30s"

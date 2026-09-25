@@ -29,9 +29,7 @@ use bytes::BytesMut;
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
-use iggy_binary_protocol::codes::{
-    FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
-};
+use iggy_binary_protocol::codes::{FLUSH_UNSAVED_BUFFER_CODE, SEND_MESSAGES_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -127,8 +125,7 @@ async fn topic_partition_count<B: BinaryClient>(
     Ok(details.partitions_count)
 }
 
-/// Resolve `Balanced` / `MessagesKey` to an explicit `PartitionId` client-side
-/// (the VSR broker only routes explicit partitions, matching Kafka).
+/// Resolve `Balanced` / `MessagesKey` locally using the SDK's partition cache and cursor.
 async fn resolve_partitioning<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
@@ -212,10 +209,7 @@ async fn poll_group_messages<B: BinaryClient>(
             count,
             auto_commit,
         };
-        match client
-            .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
-            .await
-        {
+        match client.send_poll_with_response(&request).await {
             Ok(response) => {
                 let polled = PolledMessages::from_bytes(response)?;
                 // The coordinator can't yet signal a generation fence as a typed
@@ -268,10 +262,9 @@ pub fn decode_send_confirmations(response: &[u8]) -> Result<SendMessagesResponse
 ///
 /// An unreadable body degrades to no confirmations instead of an error. The
 /// producer retry loop filters nothing and resends on any `Err`, so failing
-/// here would turn one committed write into as many copies as the retry budget
-/// allows, on a plane that keeps no reply cache to deduplicate them. Reporting
-/// a zeroed entry instead would be no better: the caller cannot tell it from a
-/// genuine commit at offset 0 and would checkpoint the shape mismatch.
+/// here would resend a committed write under a new request id, outside the
+/// partition's retry deduplication. A zeroed entry would be indistinguishable
+/// from a genuine commit at offset 0 and would checkpoint the shape mismatch.
 fn committed_send_confirmations(response: &[u8]) -> SendMessagesResponse {
     decode_send_confirmations(response).unwrap_or_else(|_| SendMessagesResponse {
         confirmations: Vec::new(),
@@ -338,9 +331,7 @@ impl<B: BinaryClient> MessageClient for B {
             count,
             auto_commit,
         };
-        let response = self
-            .send_raw_with_response(POLL_MESSAGES_CODE, req.to_bytes())
-            .await?;
+        let response = self.send_poll_with_response(&req).await?;
         PolledMessages::from_bytes(response)
     }
 

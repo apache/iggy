@@ -18,6 +18,8 @@
 use crate::deps::SimClock;
 use crate::executor::{PendingSpawns, TimerHandle};
 use clock::Clock;
+#[cfg(test)]
+use futures::channel::oneshot;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
@@ -25,7 +27,7 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn,
-    SendError,
+    SendError, SharedTlsServerConfig,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -89,6 +91,8 @@ pub struct SimOutbox {
     /// fires it via `notify_client_connection_lost` to drive the real
     /// session-removal + logout path when it models a client disconnect.
     client_lost_fn: RefCell<Option<ClientConnectionLostFn>>,
+    #[cfg(test)]
+    next_replica_send: RefCell<Option<oneshot::Receiver<()>>>,
 }
 
 impl std::fmt::Debug for SimOutbox {
@@ -119,7 +123,17 @@ impl SimOutbox {
             spawns,
             client_metas: RefCell::new(HashMap::new()),
             client_lost_fn: RefCell::new(None),
+            #[cfg(test)]
+            next_replica_send: RefCell::new(None),
         }
+    }
+
+    /// Suspend the next replica send so tests can inspect owner reply ordering.
+    #[cfg(test)]
+    pub(crate) fn delay_next_replica_send(&self) -> oneshot::Sender<()> {
+        let (resume, wait) = oneshot::channel();
+        assert!(self.next_replica_send.borrow_mut().replace(wait).is_none());
+        resume
     }
 
     /// Drain all staged messages from this outbox.
@@ -213,6 +227,14 @@ impl MessageBus for SimOutbox {
     ) -> Result<(), SendError> {
         if !self.replicas.borrow().contains(&replica) {
             return Err(SendError::ReplicaNotConnected(replica));
+        }
+
+        #[cfg(test)]
+        {
+            let wait = self.next_replica_send.borrow_mut().take();
+            if let Some(wait) = wait {
+                let _ = wait.await;
+            }
         }
 
         self.pending_messages.borrow_mut().push_back(Envelope {
@@ -344,6 +366,26 @@ impl ConnectionInstaller for SharedSimOutbox {
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: ws client install is unreachable");
+    }
+
+    fn install_client_tcp_tls_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+        panic!("simulator has no fd transfer: tcp tls client install is unreachable");
+    }
+
+    fn install_client_wss_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _on_request: RequestHandler,
+    ) {
+        panic!("simulator has no fd transfer: wss client install is unreachable");
     }
 
     // Real, unlike the fd installs above: dispatch reads client_meta to seed

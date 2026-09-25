@@ -123,12 +123,16 @@ pub fn install_replica_inbound(
         async move {
             match ctx.tls.clone() {
                 None => {
+                    let read_buffer = bus.config().replica_read_buffer_size;
+                    let read_stats = bus.replica_read_stats();
                     accept_and_install(
                         &bus,
                         stream,
                         &ctx,
                         ChannelBinding::Plaintext,
-                        TcpTransportConn::new,
+                        move |stream| {
+                            TcpTransportConn::new(stream).with_replica_read(read_buffer, read_stats)
+                        },
                         on_message,
                         &peer,
                     )
@@ -232,13 +236,17 @@ pub fn install_replica_outbound(
         async move {
             match ctx.tls.clone() {
                 None => {
+                    let read_buffer = bus.config().replica_read_buffer_size;
+                    let read_stats = bus.replica_read_stats();
                     dial_and_install(
                         &bus,
                         stream,
                         &ctx,
                         peer_id,
                         ChannelBinding::Plaintext,
-                        TcpTransportConn::new,
+                        move |stream| {
+                            TcpTransportConn::new(stream).with_replica_read(read_buffer, read_stats)
+                        },
                         on_message,
                     )
                     .await
@@ -369,8 +377,6 @@ pub fn install_replica_conn<C: TransportConn>(
     // `notify_connection_lost` stands down whenever a live registry entry
     // exists - but the loser also drives `replica_dispatch_loop`, which
     // must never hand the winner's replica id to `on_message`.
-    // `compio::runtime::JoinHandle::drop` does not cancel the spawned
-    // task, so we have to tell the tasks to stand down in-band.
     let install_aborted = Rc::new(Cell::new(false));
 
     // Generation token published by the registry on a successful insert.
@@ -575,15 +581,9 @@ pub fn install_replica_conn<C: TransportConn>(
             install_aborted.set(true);
             let _ = bus.clear_replica_owned(peer_id);
             warn!(replica = peer_id, "replica registry insert raced");
-            // `drain_rejected_registration` triggers the per-connection
-            // shutdown (returned with `rejected`) to wake the transport
-            // off its `io_uring` read SQE, then awaits transport /
-            // dispatch handles. `compio::runtime::JoinHandle::drop` only
-            // detaches, so without this drain the reader would outlive
-            // the race on a half-open socket until peer EOF. Hand the
-            // handle to `track_background` so `IggyMessageBus::shutdown`
-            // awaits the drain before returning - `.detach()` would
-            // orphan it and leak the half-closed socket across shutdown.
+            // Allow bounded cooperative cleanup of the losing connection.
+            // Track the drain so bus shutdown awaits it; dropping its
+            // handle would cancel that cleanup.
             let drain_handle =
                 compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout));
             bus.track_background(drain_handle);

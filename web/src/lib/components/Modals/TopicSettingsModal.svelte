@@ -31,6 +31,7 @@ under the License.
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
+  import type { Pathname } from '$app/types';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
   import { browser } from '$app/environment';
@@ -41,7 +42,7 @@ under the License.
   interface Props {
     topic: TopicDetails;
     closeModal: CloseModalFn;
-    onDeleteRedirectPath: string;
+    onDeleteRedirectPath: Pathname;
   }
 
   let { topic, closeModal, onDeleteRedirectPath }: Props = $props();
@@ -71,9 +72,7 @@ under the License.
         path: `/streams/${+page.params.streamId}/topics/${topic.id}`,
         body: {
           name: form.data.name,
-          message_expiry: form.data.message_expiry,
-          compression_algorithm: topic.compressionAlgorithm,
-          max_topic_size: 0
+          message_expiry: form.data.message_expiry
         }
       });
 

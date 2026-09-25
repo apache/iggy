@@ -86,7 +86,7 @@ public class IggyConsumerBuilder
     /// <summary>
     ///     Configures the connection settings for the consumer.
     /// </summary>
-    /// <param name="protocol">The protocol to use for the connection (e.g., TCP, UDP).</param>
+    /// <param name="protocol">The protocol to use for the connection (TCP or HTTP).</param>
     /// <param name="address">The address of the server to connect to.</param>
     /// <param name="login">The login username for authentication.</param>
     /// <param name="password">The password for authentication.</param>
@@ -119,7 +119,7 @@ public class IggyConsumerBuilder
     /// <summary>
     ///     Configures the connection settings using a personal access token instead of a username and password.
     /// </summary>
-    /// <param name="protocol">The protocol to use for the connection (e.g., TCP, UDP).</param>
+    /// <param name="protocol">The protocol to use for the connection (TCP or HTTP).</param>
     /// <param name="address">The address of the server to connect to.</param>
     /// <param name="personalAccessToken">The personal access token to authenticate with.</param>
     /// <param name="receiveBufferSize">

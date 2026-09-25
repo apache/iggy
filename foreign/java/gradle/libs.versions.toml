@@ -36,7 +36,7 @@ hash4j = "0.30.0"
 httpclient5 = "5.6.4"
 
 # Logging
-slf4j = "2.0.18"
+slf4j = "2.0.19"
 logback = "1.6.3"
 
 # Testing
@@ -45,7 +45,7 @@ assertj = "3.27.7"
 testcontainers = "2.0.5"
 
 # Netty
-netty = "4.2.17.Final"
+netty = "4.2.18.Final"
 
 # Spotbugs
 spotbugs = "4.10.4"
@@ -55,7 +55,7 @@ typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.10.1"
+spotless = "8.10.2"
 shadow = "9.6.1"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"

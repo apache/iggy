@@ -63,7 +63,7 @@ jobs:
 
       - name: Setup uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Install PHP build dependencies
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
@@ -105,6 +105,16 @@ jobs:
         uses: ./.github/actions/utils/setup-go-with-cache
         with:
           download-deps: "false"
+
+      - name: Test Go examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
+        working-directory: examples/go
+        run: go test -race ./...
+
+      - name: Test Java examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
+        working-directory: examples/java
+        run: ./gradlew test
 
       - name: Build common binaries for all examples
         if: startsWith(inputs.component, 'examples-')

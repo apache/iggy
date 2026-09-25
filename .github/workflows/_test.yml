@@ -42,7 +42,7 @@ jobs:
     # Select runner based on build target
     runs-on: ${{
       (inputs.task == 'build-aarch64-gnu' || inputs.task == 'build-aarch64-musl') && 'ubuntu-24.04-arm' ||
-      inputs.task == 'build-macos-aarch64' && 'macos-14' ||
+      (inputs.task == 'build-macos-aarch64' || inputs.task == 'clippy-macos-aarch64') && 'macos-14' ||
       inputs.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-latest'
       }}
@@ -112,7 +112,7 @@ jobs:
           startsWith(inputs.component, 'rust') &&
           startsWith(inputs.task, 'test-') &&
           inputs.task != 'test-storage-compat'
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
@@ -125,7 +125,7 @@ jobs:
       # Python SDK
       - name: Set up Docker Buildx for Python
         if: inputs.component == 'sdk-python' && inputs.task == 'test'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Run Python SDK task
         if: inputs.component == 'sdk-python'
@@ -135,7 +135,7 @@ jobs:
 
       - name: Upload Python coverage to Codecov
         if: inputs.component == 'sdk-python' && inputs.task == 'test'
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/python-coverage.lcov
@@ -154,7 +154,7 @@ jobs:
 
       - name: Upload PHP coverage to Codecov
         if: inputs.component == 'sdk-php' && inputs.task == 'test'
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/php-coverage.lcov
@@ -176,7 +176,7 @@ jobs:
           inputs.component == 'sdk-node' &&
           (inputs.task == 'test' ||
           inputs.task == 'e2e')
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: >-
@@ -200,7 +200,7 @@ jobs:
 
       - name: Upload Go coverage to Codecov
         if: inputs.component == 'sdk-go' && (inputs.task == 'test' || inputs.task == 'e2e')
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/${{ inputs.task == 'test' && 'go-coverage.out' || 'go-coverage-e2e.out' }}
@@ -233,7 +233,7 @@ jobs:
 
       - name: Upload Java coverage to Codecov
         if: inputs.component == 'sdk-java' && inputs.task == 'test'
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/java-coverage/jacocoAggregated.xml
@@ -245,7 +245,7 @@ jobs:
 
       - name: Upload C# coverage to Codecov
         if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || startsWith(inputs.task, 'e2e'))
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/csharp/reports/coverage.cobertura.xml
@@ -256,6 +256,14 @@ jobs:
           override_pr: ${{ github.event.pull_request.number }}
 
       # Web UI
+      - name: Setup Node.js for Web UI
+        if: inputs.component == 'web-ui'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Run Web UI task
         if: inputs.component == 'web-ui'
         run: |
@@ -263,6 +271,8 @@ jobs:
           npm ci
           if [ "${{ inputs.task }}" = "lint" ]; then
             npm run lint
+          elif [ "${{ inputs.task }}" = "test" ]; then
+            npm test
           elif [ "${{ inputs.task }}" = "build" ]; then
             npm run build
           fi

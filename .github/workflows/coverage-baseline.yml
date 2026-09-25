@@ -90,7 +90,7 @@ jobs:
       - name: Install system dependencies
         run: |
           ./scripts/ci/apt-install.sh gnome-keyring keyutils dbus-x11 libsecret-tools
-          rm -f $HOME/.local/share/keyrings/*
+          rm -f "$HOME"/.local/share/keyrings/*
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -104,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.3
+        uses: taiki-e/install-action@v2.87.13
         with:
           tool: cargo-llvm-cov
 
@@ -141,7 +141,7 @@ jobs:
         shell: bash
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
@@ -186,7 +186,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml
@@ -271,7 +271,7 @@ jobs:
             -- --retry-failed-tests 3
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/csharp/reports/unit/coverage.cobertura.xml,foreign/csharp/reports/integration/coverage.cobertura.xml
@@ -299,12 +299,12 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.3
+        uses: taiki-e/install-action@v2.87.13
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Install dependencies
         run: |
@@ -318,7 +318,7 @@ jobs:
           export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
 
           # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
-          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> "$GITHUB_ENV"
 
           cargo llvm-cov clean --workspace
           echo "Building Python wheel with coverage instrumentation..."
@@ -395,7 +395,7 @@ jobs:
         shell: bash
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/python-coverage.lcov
@@ -418,7 +418,7 @@ jobs:
           task: test
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/php-coverage.lcov
@@ -436,7 +436,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7
         with:
           node-version: "23"
           cache: "npm"
@@ -485,7 +485,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/node-coverage/unit/lcov.info,reports/node-coverage/e2e/lcov.info
@@ -573,7 +573,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/go-coverage.out

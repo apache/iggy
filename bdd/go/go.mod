@@ -8,7 +8,7 @@ require (
 	github.com/apache/iggy/foreign/go v0.0.0-00010101000000-000000000000
 	github.com/cucumber/godog v0.16.0
 	github.com/google/uuid v1.6.0
-	github.com/onsi/ginkgo/v2 v2.32.1
+	github.com/onsi/ginkgo/v2 v2.32.2
 	github.com/onsi/gomega v1.43.0
 )
 
@@ -24,7 +24,7 @@ require (
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-memdb v1.3.5 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
-	github.com/klauspost/compress v1.19.2 // indirect
+	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect

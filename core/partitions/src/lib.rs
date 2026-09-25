@@ -30,6 +30,8 @@ mod messages_writer;
 pub mod offset_storage;
 mod persistence;
 mod poll_plan;
+#[cfg(feature = "simulator")]
+pub use persistence::CheckpointBarrier;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
@@ -64,9 +66,10 @@ pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
 
 /// Shipped per-kind durable consumer-offset limit for one partition.
 pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
+pub use iggy_partition::{PollCompletion, PollReplication};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
-pub use poll_plan::{AutoCommitApplied, PollPlan};
+pub use poll_plan::{PollPlan, PollReadResult};
 pub use segment::Segment;
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};

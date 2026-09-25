@@ -143,9 +143,8 @@ use crate::http::wire::{
     consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
     poll_wire_request, resync_required_polled_messages, store_offset_wire_request,
 };
-use crate::responses::{
-    build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
-};
+use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
+use crate::responses::connected_client_to_response;
 use crate::rewrite::{
     validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
     warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
@@ -168,7 +167,7 @@ const HTTP_READ_CLIENT_ID: u128 = 0;
 /// The completed topic policy after an awaited quorum commit. If namespace
 /// replacement prevents attesting its incarnation, report the proven quorum
 /// guarantee. [`DURABILITY_NONE`] means `?ack=none` dispatch acceptance.
-const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
+pub(super) const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
 
 const DURABILITY_NONE: &str = "none";
 

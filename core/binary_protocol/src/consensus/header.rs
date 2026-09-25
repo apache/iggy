@@ -287,8 +287,8 @@ pub struct RequestHeader {
     /// catch a `request` number reused for a different operation: a retry that
     /// disagrees with the stamp of the cached reply is refused rather than
     /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison. The Rust SDK stamps the ops the table dedups; partition and
-    /// non-replicated ops, and the other SDKs, leave it zero. The server
+    /// comparison. The Rust SDK stamps metadata/session ops and `DeleteSegments`;
+    /// partition and non-replicated ops leave it zero. The server
     /// verifies any nonzero stamp before routing.
     pub request_checksum: u128,
     pub timestamp: u64,
@@ -306,14 +306,13 @@ pub struct RequestHeader {
     /// cannot restart low after the server drops an entry and the client
     /// registers again.
     ///
-    /// Zero on `Register` itself (the client has no epoch to echo yet) and on
-    /// sessionless ops; header validation enforces both.
+    /// Header validation requires zero on `Register` itself. `NonReplicated`
+    /// operations also permit zero before a client has registered.
     pub session: u64,
-    /// Acting user id, stamped by the metadata primary at admission for every
-    /// gated client op so the in-apply RBAC gate resolves the same identity on
-    /// every replica; on `Register` it carries the freshly authenticated user.
-    /// The submitter's wire value is never trusted. Zero for `Logout`,
-    /// partition-plane, and server-internal ops.
+    /// Acting user id, stamped by the server for metadata and partition ops
+    /// so every replica uses the authenticated identity for RBAC and dedup.
+    /// On `Register` it carries the freshly authenticated user.
+    /// The submitter's wire value is never trusted.
     pub user_id: u32,
     pub reserved: [u8; 60],
 }
@@ -592,14 +591,12 @@ pub struct ReplyHeader {
     /// failure decided before commit (e.g. a dispatch-time authorization
     /// denial, or the partition primary rejecting a consumer-offset op).
     ///
-    /// Contract: this is nonzero ONLY on a pre-commit denial, and a deny
-    /// reply always carries an EMPTY body. So this header channel and the
-    /// committed per-sub-op results in the metadata result section are mutually
-    /// exclusive by construction: a reply either commits (status 0, result
-    /// section present) or is denied before commit (status set, no body), and a
-    /// consumer never reconciles the two. Carved from `reserved` exactly like
-    /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
-    /// moves and `validate` does not inspect it.
+    /// Contract: a nonzero status always carries an EMPTY body. With status
+    /// zero, result-framed operations must still decode the result section:
+    /// it can carry a committed result or a pre-commit transient rejection.
+    /// Neither a zero status nor a result section alone proves commitment.
+    /// Carved from `reserved` like `user_id` in `RequestHeader` / `PrepareHeader`;
+    /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
     pub reserved: [u8; 36],
 }
@@ -635,6 +632,64 @@ impl Default for ReplyHeader {
             operation_padding: [0; 7],
             status: 0,
             reserved: [0; 36],
+        }
+    }
+}
+
+impl ReplyHeader {
+    /// The reply to a committed prepare.
+    ///
+    /// Every field comes from the prepare or is zero, never from the primary's
+    /// live state, so a cached reply replayed by any replica carries the same
+    /// bytes for `(client, request)`: `view` is the commit-time view and
+    /// `replica` the original primary's id. `commit` is the prepare's `op`, not
+    /// `commit_max`, because it drives the `ClientTable` eviction order and
+    /// must be deterministic across replicas.
+    #[must_use]
+    pub fn from_prepare(prepare_header: &PrepareHeader, size: u32) -> Self {
+        Self {
+            cluster: prepare_header.cluster,
+            size,
+            view: prepare_header.view,
+            release: prepare_header.release,
+            command: Command::Reply,
+            replica: prepare_header.replica,
+            request_checksum: prepare_header.request_checksum,
+            client: prepare_header.client,
+            op: prepare_header.op,
+            commit: prepare_header.op,
+            timestamp: prepare_header.timestamp,
+            request: prepare_header.request,
+            operation: prepare_header.operation,
+            ..Self::default()
+        }
+    }
+
+    /// The base of a reply that answers `request_header` without a prepare
+    /// (rejections, denials, non-replicated reads): `cluster`, `view`,
+    /// `release`, `replica`, `request_checksum`, `timestamp`, `request` and
+    /// `operation` echo the request, `command` is `Reply`, `size` is the
+    /// caller's frame length, and every other field is zero.
+    ///
+    /// `client`, `op`, `commit` and `status` stay zero. Callers stamp two
+    /// deliberately different client identities (the transport client id on
+    /// the dispatch paths, the VSR client id elsewhere), so every site names
+    /// `client` itself instead of inheriting one that is right for only half
+    /// of them.
+    #[must_use]
+    pub fn echoing(request_header: &RoutedRequestHeader, size: u32) -> Self {
+        Self {
+            cluster: request_header.cluster,
+            size,
+            view: request_header.view,
+            release: request_header.release,
+            command: Command::Reply,
+            replica: request_header.replica,
+            request_checksum: request_header.request_checksum,
+            timestamp: request_header.timestamp,
+            request: request_header.request,
+            operation: request_header.operation,
+            ..Self::default()
         }
     }
 }
@@ -1041,8 +1096,8 @@ impl ConsensusHeader for PrepareHeader {
 
 /// `checksum` of a prepare no producer sealed.
 ///
-/// Written by a build predating the identity seal, or by the partition plane.
-/// Verification skips such entries so an older build's WAL still replays.
+/// Written by a build predating the identity seal. Verification skips such
+/// entries so an older build's WAL still replays.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
 /// The frame's body, bounded by `size`. What `checksum_body` covers.
@@ -1385,9 +1440,9 @@ impl ConsensusHeader for StartViewChangeHeader {
     }
 }
 
-// DoViewChangeHeader - view change vote (header-only)
+// DoViewChangeHeader - view change vote with log suffix
 
-/// Replica -> primary candidate: vote for view change. Header-only.
+/// Replica -> replicas: vote for view change, carrying a log-header suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct DoViewChangeHeader {
@@ -1559,9 +1614,9 @@ fn suffix_len_of(frame: &str, size: u32) -> Result<usize, ConsensusError> {
     Ok(suffix_len)
 }
 
-// StartViewHeader - new view announcement (header-only)
+// StartViewHeader - new view announcement with log suffix
 
-/// New primary -> all replicas: start new view. Header-only.
+/// New primary -> replicas: start a new view, with an optional log-header suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewHeader {
@@ -3133,6 +3188,101 @@ mod tests {
             ..ReplyHeader::default()
         };
         assert!(header.validate().is_ok());
+    }
+
+    #[test]
+    fn reply_from_prepare_echoes_the_prepare_and_positions_at_its_op() {
+        let prepare = PrepareHeader {
+            checksum: 1,
+            checksum_body: 2,
+            cluster: 3,
+            size: 4,
+            view: 5,
+            release: 6,
+            command: Command::Prepare,
+            replica: 7,
+            reserved_frame: [8; 66],
+            client: 9,
+            parent: 10,
+            request_checksum: 11,
+            op: 12,
+            commit: 13,
+            timestamp: 14,
+            request: 15,
+            operation: Operation::CreateStream,
+            operation_padding: [16; 7],
+            group: 17,
+            user_id: 18,
+            reserved: [19; 28],
+        };
+        let reply = ReplyHeader::from_prepare(&prepare, 20);
+        assert_eq!(reply.cluster, 3);
+        assert_eq!(reply.size, 20);
+        assert_eq!(reply.view, 5);
+        assert_eq!(reply.release, 6);
+        assert_eq!(reply.command, Command::Reply);
+        assert_eq!(reply.replica, 7);
+        assert_eq!(reply.request_checksum, 11);
+        assert_eq!(reply.client, 9);
+        assert_eq!(reply.op, 12);
+        assert_eq!(reply.commit, 12, "the prepare's op, not its commit");
+        assert_eq!(reply.timestamp, 14);
+        assert_eq!(reply.request, 15);
+        assert_eq!(reply.operation, Operation::CreateStream);
+        assert_eq!(reply.checksum, 0);
+        assert_eq!(reply.checksum_body, 0);
+        assert_eq!(reply.reserved_frame, [0; 66]);
+        assert_eq!(reply.context, 0);
+        assert_eq!(reply.operation_padding, [0; 7]);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.reserved, [0; 36]);
+    }
+
+    #[test]
+    fn reply_echoing_copies_the_frame_and_request_identity_only() {
+        let request = RoutedRequestHeader {
+            checksum: 1,
+            checksum_body: 2,
+            cluster: 3,
+            size: 4,
+            view: 5,
+            release: 6,
+            command: Command::Request,
+            replica: 7,
+            reserved_frame: [8; 66],
+            client: 9,
+            request_checksum: 10,
+            timestamp: 11,
+            request: 12,
+            operation: Operation::CreateTopic,
+            operation_padding: [13; 7],
+            session: 14,
+            user_id: 15,
+            reserved: [16; 52],
+            group: 17,
+        };
+        let reply = ReplyHeader::echoing(&request, 18);
+        assert_eq!(reply.cluster, 3);
+        assert_eq!(reply.size, 18);
+        assert_eq!(reply.view, 5);
+        assert_eq!(reply.release, 6);
+        assert_eq!(reply.command, Command::Reply);
+        assert_eq!(reply.replica, 7);
+        assert_eq!(reply.request_checksum, 10);
+        assert_eq!(reply.timestamp, 11);
+        assert_eq!(reply.request, 12);
+        assert_eq!(reply.operation, Operation::CreateTopic);
+        // Left to the caller: the client identity and the position fields.
+        assert_eq!(reply.client, 0);
+        assert_eq!(reply.op, 0);
+        assert_eq!(reply.commit, 0);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.checksum, 0);
+        assert_eq!(reply.checksum_body, 0);
+        assert_eq!(reply.reserved_frame, [0; 66]);
+        assert_eq!(reply.context, 0);
+        assert_eq!(reply.operation_padding, [0; 7]);
+        assert_eq!(reply.reserved, [0; 36]);
     }
 
     // Wire-discriminant pin: any change breaks SDK decoders.

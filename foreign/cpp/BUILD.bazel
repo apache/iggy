@@ -139,6 +139,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":iggy_cpp_static",
+        "@abseil-cpp//absl/numeric:int128",
     ],
 )
 

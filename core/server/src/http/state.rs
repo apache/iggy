@@ -146,7 +146,7 @@ pub(in crate::http) struct ForwardState {
     /// the same scheme as this node (uniform cluster HTTP config).
     pub(in crate::http) scheme: &'static str,
     pub(in crate::http) body_limit: usize,
-    pub(in crate::http) in_flight: Cell<u32>,
+    pub(in crate::http) in_flight: Rc<Cell<u32>>,
 }
 
 /// Shared shard-0 HTTP state.

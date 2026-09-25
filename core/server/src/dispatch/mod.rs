@@ -52,7 +52,7 @@ use crate::dispatch::session_ops::{
     handle_login_register_request, handle_logout_request, submit_disconnect_logout,
 };
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
-use crate::responses::build_raw_pat_reply;
+use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, RewriteStage, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
@@ -130,12 +130,11 @@ where
     })
 }
 
-/// Build the shard's one client-request handler: per-client FIFO queues
-/// drained one task per client, and the bus connection-lost hook that
-/// logs a dropped connection out. Every transport on the shard must
-/// share the instance (shard 0 hands it to its local QUIC, TCP-TLS and
-/// WSS listeners as well), or a client's ordering guarantee and the
-/// disconnect hook split by transport.
+/// Build the shard's client-request handler with per-client FIFO queues
+/// and a connection-lost hook. All connections installed on this shard
+/// share it to preserve ordering and disconnect cleanup across transports.
+/// The destination shard supplies it for delegated TCP/WS/TCP-TLS/WSS
+/// connections; shard 0 also supplies it for local QUIC connections.
 pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
@@ -225,9 +224,8 @@ where
 //     manager, so BOTH planes ran as the original registrant;
 //   - the pair carries far less entropy than "client-generated random
 //     u128" implies: HTTP mints `client_id` from the shard-0 sequential
-//     counter (`mint_shard_zero_client_id`, seeded at 1 per process) and no
-//     live path ever bumps an epoch past 1, so the token was `client=N,
-//     session=1` for small N;
+//     counter (`mint_shard_zero_client_id`) and the epoch is a metadata commit
+//     position, so neither value is an authentication secret;
 //   - `ClientEntry` carries no transport or plane tag, so a raw TCP peer
 //     could bind an HTTP-originated session;
 //   - `bind_session` demotes the evicted holder to `Connected`, the one
@@ -656,7 +654,12 @@ async fn handle_client_request<B, MJ, S, SB>(
                 server_config,
                 transport_client_id,
                 request,
-                (user_id, client_address, metadata_watermark),
+                ConnectionContext {
+                    bound,
+                    user_id,
+                    address: client_address,
+                    metadata_watermark,
+                },
             )
             .await;
         }
@@ -709,6 +712,29 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `bound` is Some here: `classify` sends unbound transports to
             // `UnboundReplicated`.
             let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
+            let consumer_session = if matches!(
+                request.header().operation,
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            ) {
+                let attachment = sessions
+                    .borrow()
+                    .attached_consumer_session(transport_client_id);
+                match attachment {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        send_deny_reply(
+                            shard,
+                            transport_client_id,
+                            request.header(),
+                            error.as_code(),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
             // `None` rather than trust that.
@@ -719,6 +745,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 bound_session,
                 transport_client_id,
                 user_id,
+                consumer_session,
             )
             .await;
         }
@@ -897,6 +924,9 @@ mod tests {
     /// A test shard wired to its own lanes (the held sender feeds them),
     /// for the reply-lane pump tests below.
     fn reply_lane_test_shard(name: &str) -> (SpyBus, shard::TaggedSender, Rc<TestShard>) {
+        // These tests do not dispatch disk polls, so keep that lane minimal.
+        const POLL_COMPLETION_CAPACITY: usize = 1;
+
         let bus = SpyBus::default();
         let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
         let partitions = IggyPartitions::new(
@@ -921,12 +951,12 @@ mod tests {
             Rc::new(|_, _| {}),
             Rc::new(|_| {}),
             Rc::new(|_| {}),
-            Rc::new(|_, _, _| {}),
             metadata,
             partitions,
             vec![sender],
             inbox_rx,
             reply_inbox_rx,
+            POLL_COMPLETION_CAPACITY,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
