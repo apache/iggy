@@ -267,6 +267,10 @@ where
 /// allow-list passes these ops (it has no session-scoped permissions), so
 /// this is the only topic-level gate on the binary transport. Returns
 /// `Some(status_code)` to deny, `None` to proceed.
+///
+/// Callers must gate entry to ext-auth users only (`uid == external_auth.user_id`).
+/// `session_perms == None` means the inline grant has expired, so the deny is
+/// correct; regular users never reach this function.
 pub(in crate::dispatch) fn authorize_consumer_group_op<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
@@ -366,7 +370,8 @@ where
     };
     let Some((stream_id, topic_id)) = resolve_topic_scope(shard, stream_id, topic_id) else {
         // Regular users: fall through to the builder's not-found reply.
-        // External auth users: fail closed (session-scoped check is the only gate).
+        // External auth users: Unauthorized (not NotFound) prevents resource
+        // enumeration through the inline-grant path.
         return session_perms
             .is_some()
             .then(|| IggyError::Unauthorized.as_code());
