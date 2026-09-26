@@ -24,9 +24,10 @@ use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
-    PURGE_GENERATION_FILE, delete_persisted_offset, delete_persisted_offset_with_storage,
-    persist_offset, persist_offset_max, persist_purge_generation_with_storage,
-    read_purge_generation,
+    PURGE_GENERATION_FILE, PURGE_RESET_FILE, PurgeReset, delete_persisted_offset,
+    delete_persisted_offset_with_storage, persist_offset, persist_offset_max,
+    persist_purge_generation_with_storage, persist_purge_reset_with_storage, read_purge_generation,
+    read_purge_reset,
 };
 use crate::persistence::{
     CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
@@ -252,6 +253,12 @@ where
     /// generation against this and resets only when it advances, so a redundant
     /// reconcile pass never re-wipes a partition already at this generation.
     pub(crate) applied_purge_generation: u64,
+    /// Durable message reset boundary. When its generation exceeds the applied
+    /// generation, retries finish bookmark cleanup without resetting messages again.
+    purge_reset: Option<PurgeReset>,
+    /// A reset survived without its operation journal. Only a selected empty
+    /// history or an installed snapshot can establish its replay boundary.
+    pub(crate) purge_recovery: PurgeRecovery,
     /// `Partition::created_revision` of the metadata row this partition was
     /// built for (the reconciler's "epoch"). Keys the durable `purge.gen`
     /// record: a delete whose on-disk cleanup failed leaves the directory
@@ -259,14 +266,11 @@ where
     /// the dead incarnation's record must not hydrate. `0` for partitions built
     /// without a metadata row (tests, in-memory storage).
     pub(crate) created_revision: u64,
-    /// Highest consensus op assigned when the last purge ran. INVARIANT: every
-    /// journal-apply path must no-op entries with `op <= purge_floor_op`. The
-    /// purge keeps journal entries resident (consensus history for backups,
-    /// repair and retransmission) while wiping the segments, so without the
-    /// floor a pre-purge op committing after the purge would flush purged
-    /// bytes back into a fresh segment or re-advance the reset offset. Not
-    /// persisted: the in-memory journal dies with the process, so no resident
-    /// pre-purge entry survives a restart.
+    /// Highest consensus operation invalidated by the last message reset.
+    /// Every journal apply path skips entries at or below this floor, preserving
+    /// consensus history without restoring purged messages. Cluster recovery
+    /// restores the floor from `purge.reset` and the durable journal marker.
+    /// Singleton recovery starts a new operation sequence and does not restore it.
     purge_floor_op: u64,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
@@ -290,15 +294,9 @@ where
     /// terminal policy.
     superblock_write_failures: Cell<u64>,
     superblock_retry_after_micros: Cell<u64>,
-    /// A committed purge this replica accepted but could not apply, because it
-    /// could not record the frontier reset first. Withholds `PrepareOk` until
-    /// the purge lands: the counter still names the PRE-purge offset space, so
-    /// every op acked meanwhile would be stamped from a `base_offset` the peers
-    /// that already purged do not share.
-    ///
-    /// The superblock persist gate cannot cover this on its own -- it fires on
-    /// `(view, log_view)` changes, and a replica with a stable view and a full
-    /// disk attempts no write, observes no failure, and fences nothing.
+    /// Withhold prepare acknowledgements until a committed purge finishes.
+    /// Committed entries from peers may still arrive during this interval, so
+    /// retries must preserve data above the durable message reset boundary.
     pub(crate) purge_deferred: bool,
     /// The `offset_frontier` the last successful superblock write recorded,
     /// seeded at boot from the record that write left behind.
@@ -432,13 +430,18 @@ enum Disposition {
     },
 }
 
-/// Why a purge did not complete, split by whether it had already mutated.
+/// Whether a recovered purge boundary has been matched to the selected history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeRecovery {
+    Ready,
+    AwaitingHistory,
+}
+
+/// How far purge progressed, determining whether to retry or fence the partition.
 ///
-/// The two need opposite handling, and conflating them is a data-loss bug:
-/// fencing a partition whose purge failed before it touched anything
-/// quarantines a complete healthy chain while the live counter still names the
-/// pre-purge offset space, and the fence's own frontier write then stamps that
-/// stale counter as durable truth.
+/// Before message reset, retry the whole operation. After a durable reset, retry
+/// bookmark cleanup and completion while preserving new messages. A reset without
+/// a usable chain or durable boundary requires fencing before accepting more work.
 #[derive(Debug)]
 pub enum PurgeError {
     /// The frontier reset could not be recorded. NOTHING was mutated: the
@@ -463,20 +466,14 @@ pub enum PurgeError {
     /// `ENOSPC` / `EIO` is logged by the superblock writer on the first failure
     /// and at every power-of-two thereafter.
     FrontierNotRecorded,
-    /// The wipe ran and the fresh chain is planted, but the applied purge
-    /// generation could not be recorded durably (`purge.gen`), so
-    /// `applied_purge_generation` stays at its pre-purge value and the
-    /// reconciler re-issues the purge. Retry, do not fence: the partition is
-    /// serviceable and re-purging an already-empty chain is cheap.
-    ///
-    /// Sets `purge_deferred` for the same reason as
-    /// [`Self::FrontierNotRecorded`]: an op acked between this failure and the
-    /// retry would be wiped by that retry while every peer that recorded the
-    /// generation keeps it.
+    /// Message reset is durable, but bookmark deletion or directory sync failed.
+    /// Retry cleanup at the same generation without resetting message history.
+    OffsetCleanupNotRecorded(IggyError),
+    /// Message reset and bookmark cleanup completed, but `purge.gen` could not
+    /// be recorded. Retry completion while preserving messages above the reset floor.
     GenerationNotRecorded(IggyError),
-    /// A step after the drain failed, so the partition holds no serviceable
-    /// segment chain and its next append would panic on `active_segment()`.
-    /// The caller must fence this group for rebuild.
+    /// Message reset could not establish a serviceable chain or a durable reset
+    /// boundary. Fence the group before accepting writes that a retry could erase.
     Unserviceable(IggyError),
 }
 
@@ -487,14 +484,18 @@ impl fmt::Display for PurgeError {
                 f,
                 "could not record the purge's offset-frontier reset; nothing was mutated"
             ),
+            Self::OffsetCleanupNotRecorded(source) => write!(
+                f,
+                "purge reset message history but bookmark cleanup is not durable: {source}"
+            ),
             Self::GenerationNotRecorded(source) => write!(
                 f,
                 "purge reset the partition but could not record its applied generation; \
-                 the purge will be re-issued: {source}"
+                 completion will be retried without resetting messages: {source}"
             ),
             Self::Unserviceable(source) => write!(
                 f,
-                "purge left the partition without a serviceable chain: {source}"
+                "purge could not establish a durable message reset: {source}"
             ),
         }
     }
@@ -640,6 +641,8 @@ where
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
             applied_purge_generation: 0,
+            purge_reset: None,
+            purge_recovery: PurgeRecovery::Ready,
             created_revision: 0,
             purge_floor_op: 0,
             superblock: None,
@@ -686,26 +689,23 @@ where
         self.created_revision = created_revision;
     }
 
-    /// Seed [`Self::applied_purge_generation`] from the partition dir's
-    /// `purge.gen` file at build time (both fresh create and recovery walk
-    /// this). Absent file reads 0, so a partition that never purged and a
-    /// repair-rebuilt dir both start below any committed generation and the
-    /// reconciler re-applies the purge; a crash AFTER a purge's durable
-    /// generation write correctly skips the re-wipe, keeping messages
-    /// appended since. A record left by a PREVIOUS incarnation of this
-    /// namespace reads 0 as well (see [`read_purge_generation`]). No-op
-    /// without a partition dir (in-memory storage).
+    /// Load the completed purge generation and durable message reset boundary.
+    ///
+    /// Recovery must set the partition directory and incarnation first, then call
+    /// this before replaying journal entries. A pending reset restores its original
+    /// floor without claiming that bookmark cleanup completed. The offset loader
+    /// calls [`Self::resume_purge_cleanup_with_storage`] before reading bookmarks.
+    /// Existing partitions without a reset record retain the legacy recovery path.
     ///
     /// # Errors
-    /// Propagates a real I/O failure reading `purge.gen`: booting with the
-    /// sentinel 0 instead would make the reconciler silently re-purge and
-    /// destroy post-purge messages, so the boot fails loud.
+    /// Propagates marker read failures and rejects damaged reset records. Treating
+    /// those as absence could reset history that already contains fresh messages.
     pub async fn hydrate_applied_purge_generation(&mut self) -> Result<(), IggyError> {
         self.hydrate_applied_purge_generation_with_storage(&DiskStorage)
             .await
     }
 
-    /// Restore the applied generation from the filesystem used for purge cleanup.
+    /// Restore the completed generation and message reset boundary from storage.
     ///
     /// Set the partition directory and its creation revision before calling this.
     /// A simulator must call this on a new partition after discarding its volatile
@@ -721,8 +721,162 @@ where
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
             self.applied_purge_generation =
                 read_purge_generation(storage, &path, self.created_revision).await?;
+            self.purge_reset = read_purge_reset(
+                storage,
+                &format!("{dir}/{PURGE_RESET_FILE}"),
+                self.created_revision,
+            )
+            .await?
+            .filter(|reset| reset.generation >= self.applied_purge_generation);
+            if let Some(reset) = self.purge_reset {
+                // A singleton starts a new operation sequence on restart. A cluster
+                // must establish the selected history before discarding its floor.
+                if self.consensus.replica_count() > 1 {
+                    self.purge_floor_op = self.purge_floor_op.max(reset.floor);
+                }
+                self.purge_deferred = reset.generation > self.applied_purge_generation;
+            }
+            // A snapshot can publish a purge generation without a local reset.
+            // Its journal is just as volatile as one cleared by a local purge.
+            if self.consensus.replica_count() > 1
+                && !self.durability().is_persisted()
+                && !self.consumer_offset_durability().is_persisted()
+                && (self.applied_purge_generation > 0 || self.purge_reset.is_some())
+            {
+                self.purge_recovery = PurgeRecovery::AwaitingHistory;
+            }
         }
         Ok(())
+    }
+
+    #[must_use]
+    /// The reset survived a restart without a durable operation journal.
+    /// Until history selection or snapshot installation resolves it, this replica
+    /// must not serve reads, accept writes or acknowledge replicated operations.
+    pub const fn purge_recovery_pending(&self) -> bool {
+        matches!(self.purge_recovery, PurgeRecovery::AwaitingHistory)
+    }
+
+    /// Resolve a reset whose operation journal was lost, after consensus selects
+    /// a history. Call before starting the selected view or replaying its entries.
+    /// The caller must establish freshness through a new election or a reply to
+    /// this boot's view probe before accepting an empty history.
+    /// An empty history starts a new sequence. A nonempty history needs a snapshot:
+    /// its operation numbers alone cannot distinguish fresh sends from purged ones.
+    ///
+    /// # Errors
+    /// A failed reset record write leaves recovery fenced for a later retry.
+    pub async fn recover_purge_boundary(&mut self, selected_head: u64) -> Result<(), IggyError> {
+        self.recover_purge_boundary_with_storage(&DiskStorage, selected_head)
+            .await
+    }
+
+    async fn recover_purge_boundary_with_storage<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+        selected_head: u64,
+    ) -> Result<(), IggyError> {
+        if !self.purge_recovery_pending() {
+            return Ok(());
+        }
+        if selected_head != 0 {
+            if self.consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
+                self.consensus.begin_state_transfer_await();
+            }
+            return Ok(());
+        }
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+        if let Some(reset) = self.purge_reset {
+            let rebased = PurgeReset { floor: 0, ..reset };
+            if let Some(directory) = self.partition_dir() {
+                persist_purge_reset_with_storage(
+                    storage,
+                    &format!("{directory}/{PURGE_RESET_FILE}"),
+                    rebased,
+                    self.created_revision,
+                )
+                .await?;
+            }
+            self.purge_reset = Some(rebased);
+        }
+        self.purge_floor_op = 0;
+        self.log.journal().inner.clear_poll_index(0);
+        self.transfer = None;
+        self.transfer_rearm = None;
+        if self.consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
+            self.consensus
+                .set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        }
+        self.purge_recovery = PurgeRecovery::Ready;
+        Ok(())
+    }
+
+    /// Finish a recovered message reset before loading consumer bookmarks.
+    /// Configure the offset directory paths first. No message data, journal
+    /// boundary, or fresh offset operation is reset by this recovery step.
+    ///
+    /// # Errors
+    /// Returns the cleanup or completion marker error. Recovery must not serve
+    /// the partition while files from the old history could still be loaded.
+    pub async fn resume_purge_cleanup_with_storage<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+    ) -> Result<(), IggyError> {
+        if let Some(reset) = self.purge_reset
+            && reset.generation > self.applied_purge_generation
+        {
+            self.complete_purge_with_storage(storage, reset.generation)
+                .await
+                .map_err(|error| match error {
+                    PurgeError::FrontierNotRecorded => IggyError::CannotSyncFile,
+                    PurgeError::OffsetCleanupNotRecorded(source)
+                    | PurgeError::GenerationNotRecorded(source)
+                    | PurgeError::Unserviceable(source) => source,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Keep the reset boundary within the history retained by a state transfer.
+    /// The caller has refused pending cleanup and any offer below the committed
+    /// operation, and holds the write lock through replacement of the history.
+    /// Lowering the durable floor requires an install backup so recovery can
+    /// restore the old boundary with its history if replacement is interrupted.
+    pub(crate) async fn rebase_purge_reset_for_install(
+        &mut self,
+        commit_op: u64,
+    ) -> Result<(), IggyError> {
+        if let Some(reset) = self.purge_reset {
+            let rebased = PurgeReset {
+                generation: reset.generation,
+                floor: reset.floor.min(commit_op),
+            };
+            if rebased != reset
+                && let Some(directory) = self.partition_dir()
+            {
+                persist_purge_reset_with_storage(
+                    &DiskStorage,
+                    &format!("{directory}/{PURGE_RESET_FILE}"),
+                    rebased,
+                    self.created_revision,
+                )
+                .await?;
+            }
+            self.purge_reset = Some(rebased);
+        }
+        self.purge_floor_op = self.purge_floor_op.min(commit_op);
+        Ok(())
+    }
+
+    pub(crate) fn purge_reset_needs_rebase(&self, commit_op: u64) -> bool {
+        self.purge_reset
+            .is_some_and(|reset| reset.floor > commit_op)
+    }
+
+    pub(crate) fn purge_cleanup_pending(&self) -> bool {
+        self.purge_reset
+            .is_some_and(|reset| reset.generation > self.applied_purge_generation)
     }
 
     #[must_use]
@@ -2801,10 +2955,14 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn persist_consumer_offset_commit(
         &self,
         pending: PendingConsumerOffsetCommit,
     ) -> Result<(), IggyError> {
+        if self.purge_cleanup_pending() {
+            return Err(IggyError::TransientNotAccepted);
+        }
         // For either offset policy, the WAL protects these updates until checkpoint
         // syncs their retained writers and directories before reclaiming history.
         let persisted =
@@ -2934,6 +3092,7 @@ where
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
+            || self.purge_recovery_pending()
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -3079,7 +3238,8 @@ where
     }
 
     fn auto_commit_admission_ready(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
-        self.observed_view == self.consensus.view()
+        !self.purge_cleanup_pending()
+            && self.observed_view == self.consensus.view()
             && !self.offset_reservations_need_resync.get()
             && (!self.consumer_offset_capacity_for(kind).is_uncertain()
                 || self.durable_consumer_offsets.contains(kind, consumer_id))
@@ -4303,6 +4463,7 @@ where
             // Reject it first with the only response that proves the request
             // was never admitted, so the caller may safely retry elsewhere.
             if self.materialization_missing
+                || self.purge_recovery_pending()
                 || consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
@@ -4774,6 +4935,7 @@ where
     #[must_use]
     pub fn queued_requests_ready(&self) -> bool {
         self.fatal.is_none()
+            && !self.purge_recovery_pending()
             && self.consensus.is_primary()
             && self.consensus.is_normal()
             && !self.consensus.is_transferring()
@@ -4794,6 +4956,9 @@ where
     /// which is unrecoverable in place.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
+        if self.purge_recovery_pending() {
+            return;
+        }
         self.resynchronize_consumer_offset_reservations();
         let header = *message.header();
         // Same reason as the metadata plane: `checksum` is compared as an opaque token
@@ -5163,7 +5328,7 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn on_ack(&mut self, message: Message<PrepareOkHeader>, config: &PartitionsConfig) {
-        if self.fatal.is_some() {
+        if self.fatal.is_some() || self.purge_recovery_pending() {
             return;
         }
         self.resynchronize_consumer_offset_reservations();
@@ -5245,6 +5410,7 @@ where
     pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
         if self.fatal.is_some()
             || self.materialization_missing
+            || self.purge_recovery_pending()
             || self.persistence_checkpoint_pending()
         {
             return;
@@ -5283,11 +5449,14 @@ where
     }
 
     fn drain_persistable_commits(&self, config: &PartitionsConfig) -> Vec<PipelineEntry> {
-        let Some(persistence) = &self.persistence else {
+        if self.persistence.is_none() && !self.purge_cleanup_pending() {
             return drain_committable_prefix(self.consensus());
-        };
+        }
         self.persist_repaired_prefix();
-        let through = self.consensus.commit_max().min(persistence.head());
+        let through = self.persistence.as_ref().map_or_else(
+            || self.consensus.commit_max(),
+            |persistence| self.consensus.commit_max().min(persistence.head()),
+        );
         let materialize = self.should_persist_messages(config);
         let mut drained = Vec::new();
         self.consensus.with_pipeline_mut(|pipeline| {
@@ -5320,6 +5489,17 @@ where
     }
 
     fn prepare_body_is_ready(&self, header: &PrepareHeader, materialize: bool) -> bool {
+        // Hold fresh bookmark mutations until the directory sweep has finished.
+        // Keep them journaled so the commit walk resumes after cleanup succeeds.
+        if self.purge_cleanup_pending()
+            && header.op > self.purge_floor_op
+            && matches!(
+                header.operation,
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            )
+        {
+            return false;
+        }
         header.operation != Operation::SendMessages
             || header.op <= self.purge_floor_op
             || (!self.durability().is_persisted() && !materialize)
@@ -7671,33 +7851,46 @@ where
         Err(PurgeError::FrontierNotRecorded)
     }
 
-    /// Reset the partition to a single empty segment at offset 0 and clear all
-    /// consumer / consumer-group offsets (memory + disk). This is the local
-    /// effect of a committed `PurgeTopic`: it wipes message data and offsets but
-    /// preserves the partition and its consumer-group membership. Mirrors the
-    /// legacy server's `purge_all_segments` + offset-file deletion.
+    /// Reset message history and remove consumer and group bookmarks for a purge.
     ///
-    /// Records `generation` as the applied purge generation so the reconciler
-    /// does not re-wipe a partition already purged at this generation (a later
-    /// `PurgeTopic` advances the committed generation and triggers a fresh pass).
+    /// A new generation resets the partition to one empty segment at offset 0,
+    /// preserving consumer group membership. Once that reset is durable, retries
+    /// finish bookmark cleanup without deleting fresh messages or moving the floor.
+    /// Completion records `generation` so redundant reconciler passes do no work.
     ///
     /// # Errors
-    /// [`PurgeError::FrontierNotRecorded`] before anything is mutated, which
-    /// the caller RETRIES: the reconciler re-issues the purge while
-    /// `committed > applied`, and fencing a partition that still holds its whole
-    /// chain would quarantine live data behind a counter that still names the
-    /// pre-purge offset space. [`PurgeError::Unserviceable`] once the drain has
-    /// run, which the caller FENCES (quarantine + retire for the reconciler to
-    /// rebuild), exactly as the state-transfer install's `ConvergeFailed` arm
-    /// does, or the next append panics on `active_segment()`.
-    #[allow(clippy::too_many_lines)]
+    /// [`PurgeError::FrontierNotRecorded`] leaves message history intact and can
+    /// be retried. Cleanup and completion marker failures retry only those steps.
+    /// [`PurgeError::Unserviceable`] requires fencing because the message reset
+    /// lacks a usable segment chain or a durable boundary for preserving new writes.
     pub async fn purge(
         &mut self,
         config: &PartitionsConfig,
         generation: u64,
     ) -> Result<(), PurgeError> {
+        self.purge_with_storage(config, generation, &DiskStorage)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn purge_with_storage<S: DurableStorage>(
+        &mut self,
+        config: &PartitionsConfig,
+        generation: u64,
+        storage: &S,
+    ) -> Result<(), PurgeError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
+
+        if generation <= self.applied_purge_generation {
+            return Ok(());
+        }
+        if self
+            .purge_reset
+            .is_some_and(|reset| reset.generation == generation)
+        {
+            return self.complete_purge_with_storage(storage, generation).await;
+        }
 
         let namespace = self.namespace();
 
@@ -7810,11 +8003,9 @@ where
         self.install_empty_segment(config, start_offset)
             .await
             .map_err(PurgeError::Unserviceable)?;
-        // Make the unlinks AND the replanted dirent durable together: without
-        // this a crash can resurrect pre-purge segments until the boot re-purge
-        // fires. Bounded and self-healing, so a failure is logged, not fenced:
-        // the generation write below has not run yet, so a crash after a failed
-        // fsync re-purges at boot anyway.
+        // Make segment removals and the replacement entry durable together.
+        // The reset marker publication below repeats this directory barrier and
+        // fences the partition if it fails, before cleanup can be retried alone.
         if let Some(partition_dir) = self.partition_dir.clone()
             && let Err(error) = crate::state_transfer::fsync_dir(&partition_dir).await
         {
@@ -7824,8 +8015,8 @@ where
                 namespace_raw = namespace.inner(),
                 generation,
                 %error,
-                "purge could not fsync the partition dir; a crash before the \
-                 generation record re-purges at boot"
+                "purge could not sync the partition directory; reset marker \
+                 publication must establish durability before cleanup"
             );
         }
         // The boot-time durable line marks recovered bytes that must not be
@@ -7838,44 +8029,42 @@ where
         self.installed_frontier = None;
         self.segment_checksum_cache.borrow_mut().clear();
 
-        self.complete_purge_with_storage(&DiskStorage, generation)
-            .await
+        self.complete_purge_with_storage(storage, generation).await
     }
 
-    /// Clear consumer progress and record completion after resetting message history.
+    /// Record a message reset, clear consumer bookmarks, and publish completion.
     ///
-    /// Completion proceeds through three stages:
-    /// 1. Clear live consumer and group bookmarks, delete their files, and sync
-    ///    each offset directory so the deletions can survive power loss.
-    /// 2. Reset offset bookkeeping and prevent old journal entries from being
-    ///    applied or served as messages again.
-    /// 3. Persist the purge generation before advancing the live generation,
-    ///    then invalidate cached state transfer offers and restamp the frontier.
+    /// For a new generation, message storage must already be reset and the caller
+    /// must exclude concurrent writes. This method fences old resident entries and
+    /// records the reset boundary before attempting bookmark cleanup. A retry for
+    /// that generation only removes bookmarks, syncs their directories, and writes
+    /// `purge.gen`; it preserves fresh messages and the original journal floor.
     ///
-    /// Message history must already be reset, as [`Self::purge`] does before
-    /// entering this phase. The caller must exclude concurrent writes throughout.
-    /// Retry behavior remains in [`Self::purge`], including its deferral and
-    /// message reset decisions. Storage controls the offset files and completion
-    /// marker; journal and superblock operations still use the implementations
-    /// attached to this partition.
-    ///
-    /// Offset deletion and directory sync failures are logged and completion
-    /// continues. Keeping that decision here makes a storage harness exercise the
-    /// same failure behavior as the server. Consequently, success does not prove
-    /// that all bookmark deletions are durable: syncing the generation marker's
-    /// parent does not sync the separate consumer and group directories.
+    /// The reset record survives power loss independently of `purge.gen`. Recovery
+    /// loads it before replay and finishes cleanup before loading bookmarks.
     ///
     /// # Errors
-    /// Returns [`PurgeError::GenerationNotRecorded`] if the completion marker
-    /// cannot be persisted. Cleanup is not rolled back, the applied generation
-    /// remains unchanged, and the flag that defers prepare acknowledgements is
-    /// set. The normal purge path manages that flag when retrying.
+    /// [`PurgeError::Unserviceable`] requires fencing if the reset record cannot be
+    /// made durable. [`PurgeError::OffsetCleanupNotRecorded`] and
+    /// [`PurgeError::GenerationNotRecorded`] leave a durable reset to retry, with
+    /// prepare acknowledgements deferred until completion succeeds.
     #[allow(clippy::too_many_lines)]
     pub async fn complete_purge_with_storage<S: DurableStorage>(
         &mut self,
         storage: &S,
         generation: u64,
     ) -> Result<(), PurgeError> {
+        if generation <= self.applied_purge_generation {
+            return Ok(());
+        }
+        if self
+            .purge_reset
+            .is_none_or(|reset| reset.generation != generation)
+        {
+            self.record_completed_purge_reset(storage, generation)
+                .await?;
+        }
+        self.purge_deferred = true;
         let namespace = self.namespace();
 
         // Clear consumer + consumer-group offsets (memory + disk). Collect the
@@ -7918,13 +8107,15 @@ where
             self.consumer_offsets_path.as_deref(),
             ConsumerKind::Consumer,
         )
-        .await;
+        .await
+        .map_err(PurgeError::OffsetCleanupNotRecorded)?;
         let strayed_groups = purge_offset_files(
             storage,
             self.consumer_group_offsets_path.as_deref(),
             ConsumerKind::ConsumerGroup,
         )
-        .await;
+        .await
+        .map_err(PurgeError::OffsetCleanupNotRecorded)?;
         for (kind, consumer_id, path) in consumer_paths
             .into_iter()
             .chain(group_paths)
@@ -7943,22 +8134,16 @@ where
                     %error,
                     "purge could not remove a consumer offset file"
                 );
-            } else {
-                if let Some(persistence) = &self.persistence {
-                    persistence.retire_offset_file(&path);
-                }
-                self.consumer_offset_capacity_for(kind)
-                    .clear_stranded(consumer_id);
+                return Err(PurgeError::OffsetCleanupNotRecorded(error));
             }
+            if let Some(persistence) = &self.persistence {
+                persistence.retire_offset_file(&path);
+            }
+            self.consumer_offset_capacity_for(kind)
+                .clear_stranded(consumer_id);
         }
-        // Directory fsync so those unlinks stick, mirroring the install path: a
-        // crash right after the purge otherwise resurrects the offset files at
-        // boot, and while recovery clamps a resurrected offset down to the
-        // rebuilt head, "consumed through 0" is not the intended "no entry at
-        // all" -- that consumer skips the first post-purge message. Logged on
-        // failure, sharper than the partition-dir fsync above: the generation
-        // write below still runs, so a crash would resurrect these files with
-        // no boot re-purge left to clear them.
+        // Sync each bookmark directory independently. Syncing the reset or
+        // completion marker's parent cannot make these deletions durable.
         for dir in self
             .consumer_offsets_path
             .clone()
@@ -7973,11 +8158,63 @@ where
                     generation,
                     dir = %dir,
                     %error,
-                    "purge could not fsync an offsets dir; a crash may resurrect \
-                     deleted offset files with the purge already recorded"
+                    "purge bookmark cleanup is not durable; completion remains pending"
                 );
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(PurgeError::OffsetCleanupNotRecorded(
+                        IggyError::CannotSyncFile,
+                    ));
+                }
             }
         }
+        // The reset record already protects fresh messages if this publication
+        // fails. Only cleanup and this marker are retried for the same generation.
+        if let Some(dir) = self.partition_dir() {
+            let path = format!("{dir}/{PURGE_GENERATION_FILE}");
+            if let Err(error) = persist_purge_generation_with_storage(
+                storage,
+                &path,
+                generation,
+                self.created_revision,
+            )
+            .await
+            {
+                self.purge_deferred = true;
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = namespace.inner(),
+                    generation,
+                    %error,
+                    "purge reset the partition but could not record its applied generation; \
+                     deferring PrepareOk until cleanup completion is recorded"
+                );
+                return Err(PurgeError::GenerationNotRecorded(error));
+            }
+        }
+        self.applied_purge_generation = generation;
+        self.purge_deferred = false;
+        self.transfer_offer_cache.borrow_mut().take();
+        // A cleanup retry may already hold fresh messages. Restamp their current
+        // frontier instead of reinstalling the zero from the original reset.
+        if !self.reset_offset_frontier().await {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                generation,
+                "purge could not record the current frontier after cleanup; \
+                 the existing durable frontier remains in effect"
+            );
+        }
+        Ok(())
+    }
+
+    async fn record_completed_purge_reset<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+        generation: u64,
+    ) -> Result<(), PurgeError> {
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
 
@@ -8030,56 +8267,23 @@ where
             .len();
         self.evict_committed_prefix(fenced_prefix).await;
 
-        // Last durable step: record the applied generation before the
-        // in-memory marker advances. On a write failure the marker stays old,
-        // the error propagates, and the reconciler retries the whole purge
-        // (idempotent, the chain is already empty). The reverse order would
-        // ack a purge that a crash then silently undoes: restart would
-        // hydrate the old generation, yet the reconciler believes the purge
-        // applied. Deferring PrepareOk mirrors the frontier-record failure:
-        // an op acked now would be wiped by the retry purge while peers that
-        // recorded the generation keep it.
+        let reset = PurgeReset {
+            generation,
+            floor: self.purge_floor_op,
+        };
+        self.purge_deferred = true;
+        self.transfer_offer_cache.borrow_mut().take();
         if let Some(dir) = self.partition_dir() {
-            let path = format!("{dir}/{PURGE_GENERATION_FILE}");
-            if let Err(error) = persist_purge_generation_with_storage(
+            persist_purge_reset_with_storage(
                 storage,
-                &path,
-                generation,
+                &format!("{dir}/{PURGE_RESET_FILE}"),
+                reset,
                 self.created_revision,
             )
             .await
-            {
-                self.purge_deferred = true;
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = namespace.inner(),
-                    generation,
-                    %error,
-                    "purge reset the partition but could not record its applied generation; \
-                     deferring PrepareOk until the re-issued purge records it"
-                );
-                return Err(PurgeError::GenerationNotRecorded(error));
-            }
+            .map_err(PurgeError::Unserviceable)?;
         }
-        self.applied_purge_generation = generation;
-        // Same commit frontier, different (now empty) bytes: a cached offer
-        // built pre-purge would advertise files the purge just unlinked.
-        self.transfer_offer_cache.borrow_mut().take();
-        // The reset itself already landed before the unlinks; this second write
-        // only re-stamps the record now that the view-scoped fields and the
-        // counter agree with it. A failure leaves the pre-unlink 0 on disk,
-        // which is the safe direction, so it is logged rather than refused.
-        if !self.reset_offset_frontier().await {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = namespace.inner(),
-                generation,
-                "purge could not re-stamp the superblock after resetting the partition; \
-                 the frontier reset written before the unlinks still stands"
-            );
-        }
+        self.purge_reset = Some(reset);
         Ok(())
     }
 
@@ -8098,7 +8302,7 @@ where
     /// op is already committed cluster-wide; there is nobody to ack to). The
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
-        if self.materialization_missing {
+        if self.materialization_missing || self.purge_recovery_pending() {
             return;
         }
         let header = *message.header();
@@ -8449,7 +8653,7 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
-        if self.fatal.is_some() || self.materialization_missing {
+        if self.fatal.is_some() || self.materialization_missing || self.purge_recovery_pending() {
             return false;
         }
         // Durable-before-send: a PrepareOk implies this replica's
@@ -8494,9 +8698,9 @@ async fn purge_offset_files<S: DurableStorage>(
     storage: &S,
     directory: Option<&str>,
     kind: ConsumerKind,
-) -> Vec<(ConsumerKind, u32, String)> {
+) -> Result<Vec<(ConsumerKind, u32, String)>, IggyError> {
     let Some(directory) = directory else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let entries = futures::stream::once(storage.regular_files(Path::new(directory))).try_flatten();
     futures::pin_mut!(entries);
@@ -8512,7 +8716,10 @@ async fn purge_offset_files<S: DurableStorage>(
                     %error,
                     "failed to scan consumer offset directory during purge"
                 );
-                continue;
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(IggyError::CannotReadFile);
             }
         };
         let Some(path) = path.to_str() else {
@@ -8522,7 +8729,7 @@ async fn purge_offset_files<S: DurableStorage>(
             offsets.push((kind, consumer_id, path.to_owned()));
         }
     }
-    offsets
+    Ok(offsets)
 }
 
 /// Automatic commits remain monotone because an earlier poll can commit after
@@ -9435,11 +9642,15 @@ mod tests {
     }
 
     pub(super) fn test_partition() -> IggyPartition<IggyMessageBus> {
+        test_partition_with_replicas(1)
+    }
+
+    pub(super) fn test_partition_with_replicas(replica_count: u8) -> IggyPartition<IggyMessageBus> {
         let namespace = IggyNamespace::new(1, 1, 0);
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
             0,
-            1,
+            replica_count,
             namespace.inner(),
             IggyMessageBus::new(0),
             LocalPipeline::new(),
@@ -9457,8 +9668,15 @@ mod tests {
     pub(super) async fn disk_poll_partition(
         config: &PartitionsConfig,
     ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+        Box::pin(disk_poll_partition_with_replicas(config, 1)).await
+    }
+
+    pub(super) async fn disk_poll_partition_with_replicas(
+        config: &PartitionsConfig,
+        replica_count: u8,
+    ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
         let directory = tempfile::tempdir().expect("create partition directory");
-        let mut partition = test_partition();
+        let mut partition = test_partition_with_replicas(replica_count);
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
         partition.log.retire_front().expect("retire empty segment");
         partition
@@ -11361,7 +11579,7 @@ mod tests {
         })
     }
 
-    fn store_offset_request(
+    pub(super) fn store_offset_request(
         client_id: u128,
         request_id: u64,
         kind: ConsumerKind,
@@ -17874,3 +18092,6 @@ mod purge_floor_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod purge_retry_tests;

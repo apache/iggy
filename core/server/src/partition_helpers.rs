@@ -150,8 +150,8 @@ pub async fn create_partition_file_hierarchy(
 ///
 /// # Errors
 ///
-/// Returns [`ServerError::ConsumerOffsetsLoad`] when an existing offset
-/// directory cannot be enumerated. A stored offset past the offset space is clamped
+/// Returns an error if pending purge cleanup cannot complete or an existing
+/// offset directory cannot be enumerated. A stored offset past the offset space is clamped
 /// to `current_offset` (with a warning), not an error.
 pub async fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
@@ -171,9 +171,10 @@ pub async fn configure_consumer_offsets(
 
 /// Recover consumer and group offsets from `storage` into a new partition.
 ///
-/// Restore the partition's message offset and reservation frontier before
-/// calling this, and pass its restored offset counter as `current_offset`.
-/// These values bound which saved consumer positions are plausible.
+/// Hydrate the purge markers and restore the message offset and reservation
+/// frontier before calling this. Pass the restored counter as `current_offset`.
+/// Pending purge cleanup finishes before any bookmark is loaded; the restored
+/// frontiers then bound which saved consumer positions are plausible.
 ///
 /// Missing directories produce empty maps. Valid records seed the visible
 /// offsets and their persistence state. Unreadable records and invalid records
@@ -184,9 +185,9 @@ pub async fn configure_consumer_offsets(
 /// read from storage.
 ///
 /// # Errors
-/// Returns [`ServerError::ConsumerOffsetsLoad`] if an existing offset directory
-/// cannot be enumerated. Consumer recovery may already have seeded the partition
-/// when group recovery fails, so callers must discard a failed recovery.
+/// Returns a cleanup error if an earlier message reset still has bookmarks that
+/// cannot be removed durably, or [`ServerError::ConsumerOffsetsLoad`] if an offset
+/// directory cannot be enumerated. Callers must discard a failed recovery.
 #[allow(clippy::too_many_lines)]
 pub async fn configure_consumer_offsets_with_storage<S: DurableStorage>(
     storage: &S,
@@ -201,6 +202,16 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage>(
     let consumer_offsets_path = config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
     let consumer_group_offsets_path =
         config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+    // A completed message reset may still have old bookmark files after power
+    // loss. Finish their cleanup before they can seed recovered progress.
+    partition.configure_consumer_offset_storage(
+        consumer_offsets_path.clone(),
+        consumer_group_offsets_path.clone(),
+        ConsumerOffsets::with_capacity(0),
+        ConsumerGroupOffsets::with_capacity(0),
+    );
+    partition.resume_purge_cleanup_with_storage(storage).await?;
+
     // The bound is the offset space this replica could have MINTED, not the data
     // it can still serve. A boot re-anchor leaves the append point a lease block
     // above the recovered chain, so on the restart after a crash that took
@@ -906,7 +917,7 @@ async fn load_partition(
                 .map(|state| (state.view, state.log_view)),
             view_fallback: None,
             seed_view: None,
-            incarnation: None,
+            incarnation: Some(rand::random::<u128>() | 1),
             join,
         },
     );
@@ -1451,7 +1462,7 @@ pub async fn build_partition_fresh(
             // is restamped per delivery), so every replica commits the same
             // one and a late materialiser lands at or below its peers.
             seed_view,
-            incarnation: None,
+            incarnation: Some(rand::random::<u128>() | 1),
             join,
         },
     );
@@ -1662,12 +1673,14 @@ pub async fn delete_partitions_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::prepare_message;
     use bytes::Bytes;
     use configs::server::ServerConfig;
+    use consensus::Sequencer;
     use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
     use iggy_binary_protocol::{Command, Operation, PrepareHeader};
-    use journal::DurableAppend;
     use journal::superblock::SuperblockStore;
+    use journal::{DurableAppend, Journal};
     use partitions::PartitionPathLayout;
     use server_common::Message;
     use server_common::send_messages::{
@@ -1678,6 +1691,104 @@ mod tests {
     const CLUSTER: u128 = 7;
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
+
+    #[compio::test]
+    async fn loading_replicated_purge_keeps_lost_history_fenced_with_a_new_boot_nonce() {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let runtime = TopicRuntimeOptions {
+            durability: iggy_common::Durability::Replicated,
+            consumer_offset_durability: iggy_common::Durability::Replicated,
+            preallocate_segments: Some(false),
+            ..Default::default()
+        };
+        let partitions = solo_partitions();
+        let metadata = Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0);
+        let mut partition = build_partition_fresh(
+            &config,
+            namespace,
+            Arc::new(PartitionStats::default()),
+            0,
+            runtime,
+            CLUSTER,
+            REPLICA,
+            REPLICAS,
+            0,
+            Rc::new(IggyMessageBus::new(0)),
+        )
+        .await
+        .unwrap();
+        let mut previous_nonce = partition.consensus().incarnation();
+        assert_ne!(previous_nonce, 0);
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader::default(),
+            payload: Bytes::from_static(b"before-purge"),
+            user_headers: None,
+        });
+        let mut batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
+        for op in 1..=3 {
+            batch.header.base_offset = op - 1;
+            batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+            let mut body = vec![0; batch.header.total_size()];
+            batch.header.encode_into(&mut body);
+            body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+            let prepare = prepare_message(Operation::SendMessages, 1, op, &body).transmute_header(
+                |original, header: &mut PrepareHeader| {
+                    *header = original;
+                    header.cluster = CLUSTER;
+                    header.group = namespace.inner();
+                    header.op = op;
+                    header.parent = partition.consensus().last_prepare_checksum();
+                },
+            );
+            let prepare = consensus::seal_prepare_checksum(prepare);
+            partition.consensus().sequencer().set_sequence(op);
+            partition
+                .consensus()
+                .set_last_prepare_checksum(prepare.header().checksum);
+            partition
+                .log
+                .journal()
+                .inner
+                .append(prepare.into_frozen())
+                .await
+                .unwrap();
+        }
+        partition.purge(partitions.config(), 1).await.unwrap();
+        assert_eq!(partition.purge_floor_op(), 3);
+        assert!(partition.log.journal().inner.header_by_op(3).is_some());
+        drop(partition);
+
+        // Only the directory survives each boot. Retaining a simulator journal
+        // here would conceal the mismatch between the old floor and new sequence.
+        for _ in 0..2 {
+            let recovered = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &metadata,
+                runtime,
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(recovered.applied_purge_generation(), 1);
+            assert_eq!(recovered.purge_floor_op(), 3);
+            assert_eq!(recovered.consensus().sequencer().current_sequence(), 0);
+            assert_eq!(recovered.log.journal().inner.last_op(), None);
+            assert!(recovered.purge_recovery_pending());
+            assert_ne!(recovered.consensus().incarnation(), 0);
+            assert_ne!(recovered.consensus().incarnation(), previous_nonce);
+            previous_nonce = recovered.consensus().incarnation();
+        }
+    }
 
     #[compio::test]
     async fn loading_after_retention_preserves_the_wal_owned_tail_when_the_logical_chain_is_empty()
