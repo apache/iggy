@@ -1095,6 +1095,11 @@ fn enqueue(
     body: Bytes,
     metrics: &Metrics,
 ) -> Response {
+    // Iggy refuses an empty payload, and the runtime NACKs the whole batch
+    // around it on every replay. Checked first, because no retry can fix it.
+    if body.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty body");
+    }
     // Checked before the header map is built and the body copied, since a full
     // bridge throws both away. Both handlers check once more before they read
     // the body at all; this one catches a bridge that filled during the read.
@@ -1574,6 +1579,41 @@ mod tests {
             StatusCode::NOT_FOUND,
             "expired must not be distinguishable from never-existed by an unauthenticated caller"
         );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_empty_body_when_posted_to_secret_path_should_answer_bad_request() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("the refusal must carry this API's json");
+        assert_eq!(body["error"], "empty body");
+        assert_eq!(
+            source.shared.sender.len(),
+            0,
+            "an empty body queued is a batch the runtime NACKs on every replay"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_empty_body_when_posted_to_named_path_should_answer_bad_request() {
+        let mut source = open(1, config(free_port(), free_port(), &[])).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(source.shared.sender.len(), 0);
         close(&mut source).await;
     }
 

@@ -119,7 +119,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. A misspelled key reads as unset, so it opens the path rather than failing; see the note on unknown keys below. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
-| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. |
+| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 64000000**, Iggy's message payload cap, since a body becomes the payload unchanged; a larger value fails `open()`. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
@@ -184,6 +184,7 @@ Content-Type: application/json
 | 401 | Bearer or HMAC validation failed | `{"error":"unauthorized"}` |
 | 404 | Unknown path, or a revoked or expired endpoint | `{"error":"not found"}` |
 | 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
+| 400 | Empty body, which Iggy cannot store as a message | `{"error":"empty body"}` |
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |

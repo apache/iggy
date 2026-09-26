@@ -54,7 +54,8 @@ fn strip_bearer(header_value: &str) -> Option<&str> {
 /// Unlike a revoke `reason`, which is written once onto a tombstone, these sit
 /// on active entries: every `mutate_registry` deep-clones them and every flush
 /// re-serializes the whole registry, so they are paid for repeatedly. Without a
-/// cap the only limit was the body limit, up to 64 MiB, times `MAX_ENDPOINTS`.
+/// cap the only limit was the body limit, up to `MAX_BODY_SIZE_BYTES_LIMIT`,
+/// times `MAX_ENDPOINTS`.
 ///
 /// Generous on purpose. A real HMAC secret is tens of bytes and a header name
 /// is shorter still; these refuse abuse without refusing anything an operator
