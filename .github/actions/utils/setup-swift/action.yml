@@ -1,0 +1,56 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: setup-swift
+description: Install the Swift toolchain and cache the SwiftPM dependency checkouts and build products
+inputs:
+  swift-version:
+    description: "Swift toolchain version to install"
+    required: false
+    default: "6.1"
+  cache-key:
+    description: "Cache key segment naming the package that builds in the job; one constant per package so every lane shares one cache"
+    required: false
+    default: "sdk"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Swift
+      uses: swift-actions/setup-swift@v2
+      with:
+        swift-version: ${{ inputs.swift-version }}
+
+    - name: Print Swift version
+      shell: bash
+      run: swift --version
+
+    # Package.resolved pins the dependency graph, so it keys the cache; the
+    # build directories hold the compiled dependencies, and SwiftPM's
+    # incremental build reuses them across source changes.
+    - name: Cache SwiftPM dependencies and build products
+      uses: actions/cache@v6.1.0
+      with:
+        path: |
+          foreign/swift/.build/checkouts
+          foreign/swift/.build/repositories
+          foreign/swift/.build/artifacts
+          foreign/swift/.build/debug
+          foreign/swift/.build/release
+        key: swiftpm-${{ runner.os }}-${{ inputs.swift-version }}-${{ inputs.cache-key }}-${{ hashFiles('foreign/swift/Package.resolved') }}
+        restore-keys: |
+          swiftpm-${{ runner.os }}-${{ inputs.swift-version }}-${{ inputs.cache-key }}-

@@ -76,7 +76,7 @@ All API keys not listed above close the connection (see Governance model above) 
 | 9 | OffsetFetch | Consumer group — later issue |
 | 10 | FindCoordinator | Consumer group — later issue |
 | 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
-| 17 | SaslHandshake | Auth — later issue |
+| 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
@@ -109,10 +109,37 @@ below it are still open for the issues that build on top of it.
       not part of `bridge/`'s own scope.
 - [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
       exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
-- [ ] Document partition mapping in `docs/BRIDGE_MAPPING.md`:
+- [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
-  - Iggy **consumer groups exist** — map Kafka group APIs to Iggy consumer group APIs
-  - Use `Partitioning::balanced()` only when Kafka sends `partition == -1`; otherwise use request partition ID
+  - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
+  - `Partitioning::partition_id(index)` on every Produce. A Kafka producer resolves the partition before it builds the request, so `Partitioning::balanced()` has no trigger there. The `-1` default-partition-count case belongs to CreateTopics
+- [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::high_watermarks` and
+      `EARLIEST` answers `0`. Any other requested timestamp (arbitrary-timestamp offset search,
+      including `offsetsForTimes`/`by_duration` resets) is unsupported - Iggy exposes no
+      per-message timestamp index - and answers `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43) per
+      partition rather than a fabricated offset; non-retriable, so a Java client resolves this
+      immediately instead of spinning until `default.api.timeout.ms`.
+      `src/protocol/handlers/list_offsets.rs`, `tests/list_offsets_real_bridge_tests.rs`. With the
+      bridge off, the stub from #3421 answers `NOT_LEADER_OR_FOLLOWER` (6) as before.
+  - `EARLIEST = 0` is real *only* for a partition this bridge has never had retention trim: Iggy
+    tracks no rolling low-watermark distinct from partition creation, so once a partition is
+    old enough for retention to purge its first segment, `0` names a log-start offset that no
+    longer exists - a real consumer with `auto.offset.reset=earliest` seeks into a hole. Not
+    fixable client-side; needs the bridge to expose a real start offset. Harmless *today* only
+    because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this returns.
+  - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
+    still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
+    one `high_watermarks` call before any bridge work starts (a name repeated across request
+    entries costs one round trip per entry), and a topic whose every partition asks for an
+    unsupported timestamp skips the call entirely. A request naming more than 100 distinct topics
+    resolves the first 100 and answers the rest `REQUEST_TIMED_OUT` (retriable) with no bridge call
+    at all, so a client that retries only its still-erroring topics narrows below the cap on its
+    own. The whole request's aggregate bridge work runs under one 20s wall-clock deadline
+    (`ListOffsets` carries no `timeout_ms` field in any version this gateway supports, so this is a
+    fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
+    batch: a topic already resolved when the deadline arrives keeps its real answer, and only the
+    not-yet-started topics answer `REQUEST_TIMED_OUT`.
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
@@ -130,13 +157,29 @@ above).
 
 ### Phase 3 — Consumer groups (~7 API keys)
 
+Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
+[`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
+
 - [ ] OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
 - [ ] JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning
 
-- [ ] SASL (17, 36) if required by deployment
+InitProducerId and idempotent producers
+([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
+
+Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
+[`AUTHENTICATION.md`](AUTHENTICATION.md).
+
+- [x] SASL/PLAIN (17, 36), opt-in via `IGGY_KAFKA_SASL_ENABLED`, credentials verified against Iggy.
+      Kept out of `SUPPORTED_RANGES` on purpose: the connection loop routes both keys through the
+      SASL state machine before dispatch, so a gateway with the feature off advertises neither key
+      and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
+      connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
+      silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
+      credential storage, not deferred
+- [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys
 

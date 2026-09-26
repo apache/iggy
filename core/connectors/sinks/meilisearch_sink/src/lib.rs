@@ -339,6 +339,7 @@ impl MeilisearchSink {
             payload,
         } = message;
 
+        let payload = payload.into_json_document();
         let mut document = match payload {
             Payload::Json(value) => {
                 Self::document_from_json_value(owned_value_into_serde_json(value))
@@ -360,7 +361,7 @@ impl MeilisearchSink {
                     ]),
                 }
             }
-            Payload::Text(text) => Map::from_iter([
+            Payload::Text(text) | Payload::Proto(text) => Map::from_iter([
                 ("text".to_string(), Value::String(text)),
                 ("data_type".to_string(), Value::String("text".to_string())),
             ]),
@@ -985,10 +986,23 @@ fn normalize_host(raw: &str) -> Result<String, Error> {
         ));
     }
 
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
+    // `://` (rather than a plain colon) is the marker of an explicit scheme,
+    // since a bare `host:port` also contains a colon. Detected
+    // case-insensitively so `HTTPS://host` isn't missed and mistaken for a
+    // schemeless host, which would otherwise get `http://` prepended and
+    // send the request to a bogus host built from the original string.
+    let with_scheme = match trimmed.split_once("://") {
+        Some((scheme, _))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            trimmed.to_string()
+        }
+        Some((scheme, _)) => {
+            return Err(Error::Connection(format!(
+                "Invalid Meilisearch URL: unsupported scheme '{scheme}', expected http or https"
+            )));
+        }
+        None => format!("http://{trimmed}"),
     };
     let url = Url::parse(&with_scheme)
         .map_err(|error| Error::Connection(format!("Invalid Meilisearch URL: {error}")))?;
@@ -1000,6 +1014,15 @@ fn normalize_host(raw: &str) -> Result<String, Error> {
     base_url.set_query(None);
     base_url.set_fragment(None);
     Ok(base_url.as_str().trim_end_matches('/').to_string())
+}
+
+// Case-insensitive for the same reason as `normalize_host`'s scheme check:
+// `HTTP://host` is an explicit scheme, just not a lowercase one.
+fn explicit_http_scheme_hint(raw: &str) -> &'static str {
+    match raw.trim().split_once("://") {
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("http") => "explicit http://",
+        _ => "implicit http://",
+    }
 }
 
 fn warn_if_api_key_uses_insecure_http(raw: &str, normalized: &str, has_api_key: bool) {
@@ -1020,11 +1043,7 @@ fn warn_if_api_key_uses_insecure_http(raw: &str, normalized: &str, has_api_key: 
         return;
     }
 
-    let scheme_hint = if raw.trim().starts_with("http://") {
-        "explicit http://"
-    } else {
-        "implicit http://"
-    };
+    let scheme_hint = explicit_http_scheme_hint(raw);
     warn!(
         "Meilisearch API key is configured with {scheme_hint} for non-loopback host '{host}'. Credentials will be sent without TLS; use https:// unless this is intentional."
     );
@@ -1162,6 +1181,41 @@ mod tests {
             max_retry_delay: None,
             max_open_retries: None,
         }
+    }
+
+    #[test]
+    fn proto_payloads_holding_json_are_indexed_as_documents() {
+        let sink = sink_with_config(base_config());
+        let message = message(Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_owned()));
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("proto text holding JSON is a document");
+
+        assert_eq!(
+            document.get("name"),
+            Some(&Value::String("row-1".to_string()))
+        );
+        assert_eq!(document.get("data_type"), None);
+    }
+
+    #[test]
+    fn proto_payloads_that_are_not_json_are_stored_as_text() {
+        let sink = sink_with_config(base_config());
+        let message = message(Payload::Proto("name: \"row-1\"".to_owned()));
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("proto text still indexes");
+
+        assert_eq!(
+            document.get("text"),
+            Some(&Value::String("name: \"row-1\"".to_string()))
+        );
+        assert_eq!(
+            document.get("data_type"),
+            Some(&Value::String("text".to_string()))
+        );
     }
 
     #[test]
@@ -1365,6 +1419,39 @@ mod tests {
             normalize_host("https://localhost:7700/path?foo=bar#section").expect("normalize host");
 
         assert_eq!(url, "https://localhost:7700");
+    }
+
+    #[test]
+    fn normalize_host_should_accept_uppercase_https_scheme() {
+        // Regression: a case-sensitive `starts_with("https://")` check fell
+        // through to the schemeless branch and produced
+        // `http://HTTPS://realhost:9200`, which `Url::parse` accepted with
+        // scheme=http, host="https" — silently dropping TLS and connecting
+        // to the wrong host.
+        let url = normalize_host("HTTPS://realhost:9200").expect("normalize host");
+
+        assert_eq!(url, "https://realhost:9200");
+    }
+
+    #[test]
+    fn normalize_host_should_accept_mixed_case_http_scheme() {
+        let url = normalize_host("HtTp://realhost:7700").expect("normalize host");
+
+        assert_eq!(url, "http://realhost:7700");
+    }
+
+    #[test]
+    fn normalize_host_should_reject_unsupported_scheme() {
+        let error = normalize_host("ftp://realhost:7700").expect_err("unsupported scheme");
+
+        assert!(matches!(error, Error::Connection(_)));
+    }
+
+    #[test]
+    fn explicit_http_scheme_hint_should_be_case_insensitive() {
+        assert_eq!(explicit_http_scheme_hint("HTTP://host"), "explicit http://");
+        assert_eq!(explicit_http_scheme_hint("http://host"), "explicit http://");
+        assert_eq!(explicit_http_scheme_hint("host"), "implicit http://");
     }
 
     #[test]

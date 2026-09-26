@@ -25,8 +25,10 @@ use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -126,6 +128,40 @@ pub struct PersistenceMetrics {
 }
 
 pub type PersistenceNotifier = Rc<dyn Fn(PersistenceCompletion)>;
+
+/// A file durability barrier that keeps the original writer alive until sync.
+#[must_use]
+pub struct CheckpointBarrier {
+    path: PathBuf,
+    sync: Pin<Box<dyn Future<Output = io::Result<()>> + 'static>>,
+}
+
+impl CheckpointBarrier {
+    /// Retain a simulator file's original writer until checkpoint synchronizes it.
+    #[cfg(feature = "simulator")]
+    pub fn from_file<F: DurableFile + 'static>(path: impl Into<PathBuf>, file: F) -> Self {
+        Self::from_future(path, async move { file.sync().await })
+    }
+
+    fn from_future(
+        path: impl Into<PathBuf>,
+        sync: impl Future<Output = io::Result<()>> + 'static,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            sync: Box::pin(sync),
+        }
+    }
+
+    pub(crate) fn already_synced(path: impl Into<PathBuf>) -> Self {
+        Self::from_future(path, async { Ok(()) })
+    }
+
+    async fn run(self) -> io::Result<PathBuf> {
+        self.sync.await?;
+        Ok(self.path)
+    }
+}
 
 pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     group: u64,
@@ -429,6 +465,7 @@ enum Mutation<S: DurableStorage> {
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
+        barriers: Vec<CheckpointBarrier>,
         offset_files: Vec<RetainedOffsetFile<S::File>>,
         synced_files: BTreeSet<PathBuf>,
     },
@@ -832,7 +869,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn checkpoint(&self, through_op: u64) {
-        self.checkpoint_files(through_op, Vec::new(), Vec::new());
+        self.checkpoint_files(through_op, Vec::new(), Vec::new(), Vec::new());
     }
 
     pub fn checkpoint_files(
@@ -840,6 +877,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         through_op: u64,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
+        barriers: Vec<CheckpointBarrier>,
     ) {
         if through_op <= self.checkpoint_requested.get() {
             return;
@@ -859,6 +897,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             through_op,
             files,
             directories,
+            barriers,
             offset_files,
             synced_files,
         });
@@ -1264,8 +1303,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 through_op,
                 files,
                 directories,
+                barriers,
                 offset_files,
-                synced_files,
+                mut synced_files,
                 ..
             } => {
                 self.checkpoint_running.set(true);
@@ -1273,6 +1313,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
                         .try_for_each_concurrent(16, |retained| retained.file.sync())
                         .await?;
+                    let barrier_paths = futures::future::try_join_all(
+                        barriers.into_iter().map(CheckpointBarrier::run),
+                    )
+                    .await?;
+                    synced_files.extend(barrier_paths);
                     journal
                         .checkpoint_files(through_op, &files, &directories, &synced_files)
                         .await

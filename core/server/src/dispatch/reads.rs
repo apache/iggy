@@ -33,10 +33,11 @@ use crate::dispatch::failure::{
 use crate::dispatch::partition::{
     handle_get_consumer_offset, handle_poll_messages, resolve_poll_request,
 };
+use crate::namespace::fence_and_resolve_offset_namespace;
+use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
-    build_empty_reply, build_get_me_response, build_get_personal_access_tokens_response,
-    build_non_replicated_response, connected_client_to_response, current_metadata_commit,
-    fence_and_resolve_offset_namespace,
+    build_get_me_response, build_get_personal_access_tokens_response,
+    build_non_replicated_response, connected_client_to_response,
 };
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
