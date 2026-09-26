@@ -1864,15 +1864,20 @@ class IggyClient:
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
         allow_replay: builtins.bool = False,
+        offset_drain_timeout: datetime.timedelta | None = None,
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
         `partition_id` is ignored for a consumer group: the member reads the partitions
         the server assigns to it.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-        `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-        `AutoCommit` interval is negative, or if any of those except `poll_interval`
-        is zero.
+        `poll_interval`, `polling_retry_interval`, `init_retry_interval`,
+        `offset_drain_timeout` or an `AutoCommit` interval is negative, or if any of
+        those except `poll_interval` and `offset_drain_timeout` is zero.
+
+        `offset_drain_timeout` bounds how long `IggyConsumer.shutdown()` waits for
+        in-flight offset commits to finish before aborting them; it defaults to 5
+        seconds.
 
         Consumer groups are not available over HTTP. With `auto_join_consumer_group`
         left on, this call fails at the join with `Feature is unavailable`.
@@ -1975,6 +1980,14 @@ class IggyConsumer:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Drains in-flight offset commits and leaves the consumer group, if this
+        consumer is a group member, so the server can hand its partitions to another
+        member right away instead of waiting for the connection to time out.
+        Repeated calls succeed: shutdown only runs once.
+        Raises `RuntimeError` if the operation fails.
         """
 
 class IggyExpiry:
