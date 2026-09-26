@@ -1,3 +1,4 @@
+// swift-tools-version: 6.0
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,14 +16,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Kafka wire protocol gateway foundation for Apache Iggy.
+import PackageDescription
 
-pub mod auth;
-pub mod bridge;
-pub mod env;
-pub mod error;
-pub mod protocol;
-pub mod records;
-pub mod server;
-
-pub use server::{GatewayConfig, KafkaGateway};
+let package = Package(
+    name: "apache-iggy",
+    platforms: [
+        .macOS(.v13),
+        .iOS(.v16),
+        .tvOS(.v16),
+        .watchOS(.v9),
+        .visionOS(.v1),
+    ],
+    products: [
+        .library(name: "Iggy", targets: ["Iggy"])
+    ],
+    targets: [
+        .target(name: "Iggy"),
+        .testTarget(
+            name: "IggyTests",
+            dependencies: ["Iggy"]
+        ),
+    ],
+    swiftLanguageModes: [.v6]
+)

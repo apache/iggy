@@ -7024,6 +7024,7 @@ name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "crc32c",
  "flate2",
