@@ -11,6 +11,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
 | **http_source** | Webhook gateway: an embedded HTTP server shared by every instance, with per-endpoint bearer/HMAC auth and a management API for endpoints registered at runtime |
 | **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
+| **mysql_source** | Polls rows from MySQL tables using a tracking-column cursor; supports custom queries, delete after read, and mark as processed |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
 
