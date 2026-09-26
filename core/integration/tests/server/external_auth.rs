@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Single-node external auth integration tests.
+//! External auth integration tests.
 
 use iggy::prelude::*;
 use integration::harness::TestHarnessBuilder;
@@ -27,6 +27,7 @@ use integration::harness::ext_auth_server::{
 };
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::time::{Instant, sleep};
 
 fn ext_auth_config(url: &str) -> TestServerConfig {
     ext_auth_config_with_timeout(url, "5 s")
@@ -91,7 +92,7 @@ async fn given_ext_auth_when_inline_grant_login_should_authorize_reads() {
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -119,7 +120,7 @@ async fn given_ext_auth_when_inline_grant_login_should_deny_manage_ops() {
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -189,7 +190,7 @@ async fn given_ext_auth_when_inline_grant_should_send_and_poll_messages() {
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -246,7 +247,7 @@ async fn given_ext_auth_when_inline_grant_should_store_and_get_consumer_offset()
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -305,7 +306,7 @@ async fn given_ext_auth_when_inline_grant_should_join_and_leave_consumer_group()
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -336,7 +337,7 @@ async fn given_ext_auth_when_inline_grant_should_deny_create_topic() {
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -365,8 +366,8 @@ async fn given_ext_auth_when_scoped_grant_should_allow_granted_stream_and_deny_o
     harness.start().await.unwrap();
 
     let root = harness.root_client_for_node(0).await.unwrap();
-    // The scoped grant targets stream id 1 (EXT_SCOPED_STREAM_ID).
-    // The first stream created gets id 1.
+    // The scoped grant targets stream id 0 (EXT_SCOPED_STREAM_ID).
+    // The first stream created gets slab index 0.
     let (allowed_stream, allowed_topic) =
         create_stream_and_topic(&root, "allowed", "allowed-topic").await;
     let (forbidden_stream, forbidden_topic) =
@@ -376,7 +377,7 @@ async fn given_ext_auth_when_scoped_grant_should_allow_granted_stream_and_deny_o
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_SCOPED_USERNAME, EXT_SCOPED_PASSWORD)
+        .with_reconnecting_login(EXT_SCOPED_USERNAME, EXT_SCOPED_PASSWORD)
         .connect()
         .await
         .unwrap();
@@ -549,7 +550,7 @@ async fn given_ext_auth_when_server_fails_should_deny_login() {
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await;
 
@@ -573,7 +574,7 @@ async fn given_ext_auth_when_server_timeout_should_deny_login() {
         .server()
         .tcp_client()
         .unwrap()
-        .with_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
         .connect()
         .await;
 
@@ -622,5 +623,71 @@ async fn given_ext_auth_when_local_user_exists_should_not_fallback() {
     assert!(
         wrong.is_err(),
         "wrong password for a local user must not trigger ext-auth fallback"
+    );
+}
+
+#[tokio::test]
+async fn given_ext_auth_when_node_drops_should_reconnect_and_reauth_on_another_node() {
+    let auth = ExtAuthServer::start().await;
+    let mut harness = TestHarnessBuilder::default()
+        .test_name(
+            "server__ext_auth__given_ext_auth_when_node_drops_should_reconnect_and_reauth_on_another_node",
+        )
+        .server(ext_auth_config(&auth.url()))
+        .build()
+        .unwrap();
+    harness.start().await.unwrap();
+
+    let root = harness.root_client_for_node(0).await.unwrap();
+    let (stream_id, _topic_id) =
+        create_stream_and_topic(&root, "reconnect-stream", "reconnect-topic").await;
+
+    let node0_addr = harness.node(0).raw_tcp_addr().unwrap();
+    let ext = harness
+        .node(0)
+        .tcp_client()
+        .unwrap()
+        .with_reconnecting_login(EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD)
+        .with_reestablish_after(IggyDuration::new(Duration::from_millis(100)))
+        .connect()
+        .await
+        .unwrap();
+
+    ext.get_stream(&stream_id)
+        .await
+        .expect("ext-auth user should read the stream before node drop");
+
+    let pre_drop = ext.get_connection_info().await.server_address;
+    assert_eq!(
+        pre_drop, node0_addr,
+        "initial connection should be to node 0"
+    );
+
+    harness.kill_node(0).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut reconnected = false;
+    while Instant::now() < deadline {
+        match ext.get_streams().await {
+            Ok(streams) => {
+                assert!(
+                    !streams.is_empty(),
+                    "reconnected session should still see streams"
+                );
+                reconnected = true;
+                break;
+            }
+            Err(_) => sleep(Duration::from_millis(200)).await,
+        }
+    }
+    assert!(
+        reconnected,
+        "ext-auth client must reconnect to a surviving node after the original drops"
+    );
+
+    let post_drop = ext.get_connection_info().await.server_address;
+    assert_ne!(
+        post_drop, node0_addr,
+        "after the original node drops the client must be on a different node"
     );
 }
