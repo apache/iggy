@@ -23,7 +23,7 @@ import { MAX_U32 } from '../constant.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
 const dummyOpt = 'nodelay=true' +
-  '&reconnection_retries=1' +
+  '&reconnection_max_retries=1' +
   '&reconnection_interval=1s' +
   '&heartbeat_interval=10s' +
   '&tls=false';
@@ -41,14 +41,14 @@ const optionCases: {
 }[] = [
   {
     name: 'unlimited retries at the default interval',
-    query: 'reconnection_retries=unlimited',
+    query: 'reconnection_max_retries=unlimited',
     expect: {
       reconnect: { enabled: true, interval: 1000, maxRetries: MAX_U32 }
     }
   },
   {
     name: 'bounded retries with a sub-second interval',
-    query: 'reconnection_retries=10&reconnection_interval=250ms',
+    query: 'reconnection_max_retries=10&reconnection_interval=250ms',
     expect: {
       reconnect: { enabled: true, interval: 250, maxRetries: 10 }
     }

@@ -117,7 +117,13 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                     parsed_options.heartbeat_interval = NonZeroIggyDuration::from_str(parts[1])
                         .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
-                "reconnection_retries" => {
+                "reconnection_max_retries" | "reconnection_retries" => {
+                    // TODO: Remove the deprecated `reconnection_retries` alias after the compatibility release.
+                    if parts[0] == "reconnection_retries" {
+                        tracing::warn!(
+                            "Connection string option 'reconnection_retries' is deprecated; use 'reconnection_max_retries'"
+                        );
+                    }
                     let retries = match parts[1] {
                         "unlimited" => None,
                         val => Some(

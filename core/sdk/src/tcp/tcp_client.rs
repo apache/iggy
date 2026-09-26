@@ -2893,9 +2893,9 @@ mod tests {
         let username = "user";
         let password = "secret";
         let heartbeat_interval = "10s";
-        let reconnection_retries = "10";
+        let reconnection_max_retries = "10";
         let value = format!(
-            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?heartbeat_interval={heartbeat_interval}&reconnection_retries={reconnection_retries}"
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?heartbeat_interval={heartbeat_interval}&reconnection_max_retries={reconnection_max_retries}"
         );
         let tcp_client = TcpClient::from_connection_string(&value);
         assert!(tcp_client.is_ok());
@@ -2924,7 +2924,7 @@ mod tests {
         assert!(tcp_client_config.reconnection.enabled);
         assert_eq!(
             tcp_client_config.reconnection.max_retries.unwrap(),
-            reconnection_retries.parse::<u32>().unwrap()
+            reconnection_max_retries.parse::<u32>().unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.interval,

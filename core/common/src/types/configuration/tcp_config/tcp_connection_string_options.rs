@@ -26,6 +26,7 @@ pub struct TcpConnectionStringOptions {
     tls_enabled: bool,
     tls_domain: String,
     tls_ca_file: Option<String>,
+    tls_validate_certificate: bool,
     reconnection: TcpClientReconnectionConfig,
     heartbeat_interval: NonZeroIggyDuration,
     nodelay: bool,
@@ -42,6 +43,10 @@ impl TcpConnectionStringOptions {
 
     pub fn tls_ca_file(&self) -> &Option<String> {
         &self.tls_ca_file
+    }
+
+    pub fn tls_validate_certificate(&self) -> bool {
+        self.tls_validate_certificate
     }
 
     pub fn reconnection(&self) -> &TcpClientReconnectionConfig {
@@ -67,6 +72,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
         let mut tls_enabled = false;
         let mut tls_domain = "".to_string();
         let mut tls_ca_file = None;
+        let mut tls_validate_certificate = true;
         let mut reconnection_retries = "unlimited".to_owned();
         let mut reconnection_interval = "1s".to_owned();
         let mut reestablish_after = "5s".to_owned();
@@ -88,7 +94,19 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                 "tls_ca_file" => {
                     tls_ca_file = Some(option_parts[1].to_string());
                 }
+                "tls_validate_certificate" => {
+                    tls_validate_certificate = option_parts[1]
+                        .parse()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
+                "reconnection_max_retries" => {
+                    reconnection_retries = option_parts[1].to_string();
+                }
+                // TODO: Remove the deprecated `reconnection_retries` alias after the compatibility release.
                 "reconnection_retries" => {
+                    tracing::warn!(
+                        "Connection string option 'reconnection_retries' is deprecated; use 'reconnection_max_retries'"
+                    );
                     reconnection_retries = option_parts[1].to_string();
                 }
                 "reconnection_interval" => {
@@ -128,7 +146,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
         let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
-        let connection_string_options = TcpConnectionStringOptions::new(
+        let mut connection_string_options = TcpConnectionStringOptions::new(
             tls_enabled,
             tls_domain,
             tls_ca_file,
@@ -137,6 +155,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
             nodelay,
         );
 
+        connection_string_options.tls_validate_certificate = tls_validate_certificate;
         Ok(connection_string_options)
     }
 }
@@ -154,6 +173,7 @@ impl TcpConnectionStringOptions {
             tls_enabled,
             tls_domain,
             tls_ca_file,
+            tls_validate_certificate: true,
             reconnection,
             heartbeat_interval,
             nodelay,
@@ -167,6 +187,7 @@ impl Default for TcpConnectionStringOptions {
             tls_enabled: false,
             tls_domain: "".to_string(),
             tls_ca_file: None,
+            tls_validate_certificate: true,
             reconnection: Default::default(),
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             nodelay: false,

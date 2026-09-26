@@ -445,7 +445,7 @@ class TestAutoLoginAgainstServer:
         )
         from_string = IggyClient.from_connection_string(
             f"iggy+tcp://iggy:iggy@{host}:{port}"
-            "?reconnection_retries=3&reconnection_interval=1s"
+            "?reconnection_max_retries=3&reconnection_interval=1s"
         )
 
         stream_name = unique_name()
