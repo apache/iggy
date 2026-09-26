@@ -19,6 +19,8 @@
 
 #[path = "common/codec.rs"]
 mod codec;
+#[path = "common/scope.rs"]
+mod scope;
 #[path = "common/server.rs"]
 mod server;
 #[path = "common/tcp.rs"]
@@ -357,7 +359,11 @@ async fn e2e_flexible_apiversions_v3_request_succeeds() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).unwrap();
-    assert_eq!(count, 6, "must advertise all six scoped API keys");
+    assert_eq!(
+        count,
+        scope::SCOPED_API_KEYS.len(),
+        "must advertise every scoped API key"
+    );
 }
 
 #[tokio::test]

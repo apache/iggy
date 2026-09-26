@@ -36,6 +36,7 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::auth::{AuthError, FailedLoginThrottle, SaslAuthenticator};
 use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::api::{
     API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise, DEFAULT_KAFKA_PORT,
     ERROR_ILLEGAL_SASL_STATE, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
@@ -116,6 +117,9 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
+    /// Consumer-group timeouts and capacity caps. No environment variable maps onto these yet;
+    /// Kafka's own defaults apply.
+    pub group: GroupCoordinatorConfig,
     /// Require SASL authentication before serving any other API.
     ///
     /// Off by default, and switching it on is a breaking change for every client already talking
@@ -164,6 +168,7 @@ impl Default for GatewayConfig {
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
+            group: GroupCoordinatorConfig::default(),
             sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
@@ -317,36 +322,24 @@ impl KafkaGateway {
         listener: TcpListener,
         mut shutdown: broadcast::Receiver<()>,
     ) -> Result<()> {
-        if !self.config.sasl_enabled && self.authenticator.is_some() {
-            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
-            // flag is off means every connection is served unauthenticated, with nothing in the log
-            // to say so. Refusing to start is the only way that failure is visible.
-            return Err(KafkaProtocolError::InvalidConfig(
-                "an authenticator is configured but SASL is disabled; every connection would be \
-                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
-                 authenticator"
-                    .into(),
-            ));
-        }
-        if self.config.sasl_enabled && self.authenticator.is_none() {
-            return Err(KafkaProtocolError::InvalidConfig(
-                "SASL is enabled but no authenticator is configured; every client would be \
-                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
-                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
-                    .into(),
-            ));
-        }
+        self.check_sasl_wiring()?;
         let local_addr = listener.local_addr()?;
         let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
         info!(
             "kafka listener bound on {} (advertised as {}:{})",
             local_addr, broker.host, broker.port
         );
+        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits until
+        // `idle_timeout` (or forever if that is raised). Created before the state so the group
+        // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
+        // otherwise hold the drain open for a full rebalance timeout.
+        let cancel = CancellationToken::new();
         let state = Arc::new(GatewayState::new(
             broker,
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.sasl_enabled,
+            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         ));
 
         let shared_auth = Arc::new(SharedAuth::new(
@@ -355,9 +348,6 @@ impl KafkaGateway {
         ));
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
-        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits
-        // until `idle_timeout` (or forever if that is raised).
-        let cancel = CancellationToken::new();
 
         let drain_timeout = self.config.shutdown_drain_timeout;
 
@@ -431,6 +421,30 @@ impl KafkaGateway {
                 }
 
             }
+        }
+        Ok(())
+    }
+
+    /// Refuses to start when the SASL flag and the configured authenticator disagree.
+    fn check_sasl_wiring(&self) -> Result<()> {
+        if !self.config.sasl_enabled && self.authenticator.is_some() {
+            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
+            // flag is off means every connection is served unauthenticated, with nothing in the log
+            // to say so. Refusing to start is the only way that failure is visible.
+            return Err(KafkaProtocolError::InvalidConfig(
+                "an authenticator is configured but SASL is disabled; every connection would be \
+                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
+                 authenticator"
+                    .into(),
+            ));
+        }
+        if self.config.sasl_enabled && self.authenticator.is_none() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "SASL is enabled but no authenticator is configured; every client would be \
+                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
+                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -640,7 +654,7 @@ async fn handle_connection(
         // supports, so `decode` cannot fail on the version argument itself; any error here is a
         // malformed header and closes the connection.
         let mut body = frame;
-        let req = RequestHeader::decode(&mut body, req_hdr_ver)
+        let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
             .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
 
         debug!(
@@ -651,6 +665,11 @@ async fn handle_connection(
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        // A group request can park for a whole rebalance timeout. `client_id` and the tagged
+        // fields are views into the frame, so keeping them would pin the frame for that long
+        // after the handler has let go of its own copy.
+        req.client_id = None;
+        req.unknown_tagged_fields.clear();
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
