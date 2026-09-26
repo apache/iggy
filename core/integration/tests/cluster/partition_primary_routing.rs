@@ -250,16 +250,29 @@ async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replica
 async fn given_split_primaries_when_go_group_auto_commits_should_preserve_membership(
     harness: &mut TestHarness,
 ) {
+    run_go_split_primary_test(
+        harness,
+        "^TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership$",
+    )
+    .await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[ignore = "requires Go; run this test explicitly with --ignored"]
+async fn given_split_primaries_when_go_group_commits_manually_should_preserve_membership(
+    harness: &mut TestHarness,
+) {
+    run_go_split_primary_test(
+        harness,
+        "^TestE2E_SplitPrimaryManualCommitPreservesMembership$",
+    )
+    .await;
+}
+
+async fn run_go_split_primary_test(harness: &mut TestHarness, test: &str) {
     let (_, metadata_primary, _) = seed_split_primaries(harness).await;
     let output = tokio::process::Command::new("go")
-        .args([
-            "test",
-            "./tests",
-            "-run",
-            "^TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership$",
-            "-count=1",
-            "-v",
-        ])
+        .args(["test", "./tests", "-run", test, "-count=1", "-v"])
         .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../foreign/go"))
         .env(
             "IGGY_TCP_ADDRESS",

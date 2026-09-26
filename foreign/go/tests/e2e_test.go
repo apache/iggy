@@ -269,6 +269,55 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 		primaryAddress, int(details.PartitionsCount)*messagesPerPartition, afterClient.ID, afterClient.ConsumerGroupsCount)
 }
 
+// A manual group commit on the same split-primary fixture. The Rust SDK routes
+// it to the partition primary over the consumer-session data connection and
+// keeps its coordinator membership; the Go client must do the same rather than
+// move its session to the primary, which registers a new client identity that
+// is not a member and gets the commit refused.
+func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
+	streamName := os.Getenv("IGGY_POLL_ROUTING_STREAM")
+	if streamName == "" {
+		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic")
+	}
+	stream, err := iggcon.NewIdentifier(streamName)
+	require.NoError(t, err)
+	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
+	require.NoError(t, err)
+	connected := connect(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	group, err := connected.CreateConsumerGroup(ctx, stream, topic, fmt.Sprintf("go-commit-%d", time.Now().UnixNano()))
+	require.NoError(t, err)
+	groupID, err := iggcon.NewIdentifier(group.Id)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
+	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
+	consumer := iggcon.NewGroupConsumer(groupID)
+	coordinator := connected.GetConnectionInfo().ServerAddress
+	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	require.NoError(t, err)
+	beforeClient := binaryserialization.DeserializeClient(before)
+	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
+
+	partition := uint32(0)
+	for offset := range uint64(2) {
+		err := connected.StoreConsumerOffset(ctx, consumer, stream, topic, offset, &partition)
+		require.NoError(t, err, "manual group commit of offset %d must reach the partition primary as a member (session %s -> %s)",
+			offset, coordinator, connected.GetConnectionInfo().ServerAddress)
+		assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress,
+			"the commit must not move the coordinator session")
+	}
+	stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, uint64(1), stored.StoredOffset)
+	after, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	require.NoError(t, err)
+	afterClient := binaryserialization.DeserializeClient(after)
+	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
+	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
+}
+
 func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
