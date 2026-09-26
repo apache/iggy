@@ -51,6 +51,9 @@ ublish = "ublish"
 mis = "mis"
 # CVE Numbering Authority; the ASF Security Team is the CNA for Apache projects
 CNA = "CNA"
+# MQTT command-line client and broker project name
+mosquitto = "mosquitto"
+Mosquitto = "Mosquitto"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]
