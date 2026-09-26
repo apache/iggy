@@ -27,6 +27,7 @@ mod iceberg;
 mod influxdb;
 mod meilisearch;
 mod mongodb;
+mod opendal;
 mod postgres;
 mod quickwit;
 mod rabbitmq;
@@ -80,6 +81,7 @@ pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
+pub use opendal::OpenDalSinkFixture;
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
     PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture, PostgresSourceByteaFixture,
