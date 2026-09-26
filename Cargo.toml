@@ -52,6 +52,7 @@ members = [
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/http_source",
     "core/connectors/sources/influxdb_source",
+    "core/connectors/sources/jdbc_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
@@ -213,6 +214,7 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.5.0" }
 indexmap = "2.14.2"
 integration = { path = "core/integration" }
 ipnet = "2.12.2"
+jni = { version = "0.21", features = ["invocation"] }
 journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
