@@ -1,3 +1,4 @@
+// swift-tools-version: 6.0
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -15,12 +16,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod container;
-mod redshift_mock;
-mod sink;
+import PackageDescription
 
-pub use container::{PostgresContainer, RedshiftContainer};
-pub use sink::{
-    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
-    RedshiftSinkVarbyteFixture,
-};
+let package = Package(
+    name: "apache-iggy",
+    platforms: [
+        .macOS(.v13),
+        .iOS(.v16),
+        .tvOS(.v16),
+        .watchOS(.v9),
+        .visionOS(.v1),
+    ],
+    products: [
+        .library(name: "Iggy", targets: ["Iggy"])
+    ],
+    targets: [
+        .target(name: "Iggy"),
+        .testTarget(
+            name: "IggyTests",
+            dependencies: ["Iggy"]
+        ),
+    ],
+    swiftLanguageModes: [.v6]
+)
