@@ -11344,6 +11344,20 @@ async fn reconcile_partition_view_divergence<B, SB>(
     B: MessageBus,
     SB: journal::superblock::SuperblockStore,
 {
+    // TODO(#4284): a replica that adopts a view newer than its `log_view` keeps
+    // every journaled op in `(commit_min, commit_max]` that `pending.headers`
+    // does not name, and the canonical headers only span `commit_max..=op_head`
+    // (and are absent for an empty `StartView` suffix). An uncommitted prepare
+    // left over from the old view therefore survives here, the journal commit
+    // walk (`collect_committable_from_journal`) applies it, and
+    // `apply_repaired_prepare` skips the canonical copy because `holds_op` is
+    // true. See `simulator::stale_prepare_commit_tests`. Suggested fix: when the
+    // adopted view is newer than the `log_view` this replica last held,
+    // truncate from `applied_floor + 1` (nothing above it is vouched for by the
+    // new view) and let journal repair refetch the canonical prepares, or keep
+    // the entries but verify the `parent` chain down from a canonical header
+    // before the commit walk may apply them.
+    //
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
     let announced_commit = pending.map_or(0, |pending| pending.commit_max);

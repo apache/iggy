@@ -8137,6 +8137,9 @@ where
             session.idle_ticks = 0;
             self.repair_attempts = 0;
         }
+        // TODO(#4284): presence, not identity. A stale prepare from an older
+        // view at this op makes the canonical one arriving here a no-op; see
+        // the TODO on `reconcile_partition_view_divergence` in the shard crate.
         if self.log.journal().inner.holds_op(header.op) {
             return;
         }
