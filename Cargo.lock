@@ -7508,7 +7508,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "apache-avro 0.22.0",

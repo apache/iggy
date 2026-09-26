@@ -36,6 +36,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -536,6 +537,9 @@ pub struct HttpSourceConfig {
     /// Maximum messages returned by a single `poll()`.
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
+    /// Omitted to keep retrying NACKed batches; a nonzero value enables the SDK breaker.
+    #[serde(default)]
+    pub max_consecutive_nacks: Option<NonZeroU32>,
     /// Path segment exposed as `POST /topics/{topic_path}`. Unset disables
     /// the named path, leaving only secret-path endpoints.
     #[serde(default)]
@@ -965,6 +969,11 @@ impl Source for HttpSource {
         opened
     }
 
+    fn batch_policy(&self) -> source::BatchPolicy {
+        source::BatchPolicy::default()
+            .with_max_consecutive_nacks(self.shared.config.max_consecutive_nacks)
+    }
+
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         let _polling = self.shared.enter_poll();
         // Published here rather than in `join`, because this is the first
@@ -1224,6 +1233,7 @@ pub(crate) mod test_support {
             max_body_size_bytes: DEFAULT_MAX_BODY_SIZE_BYTES,
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            max_consecutive_nacks: None,
             topic_path: topic_path.map(str::to_string),
             instance_name: None,
             auth_bearer_token: None,
@@ -1308,6 +1318,7 @@ mod tests {
         assert_eq!(config.max_body_size_bytes, DEFAULT_MAX_BODY_SIZE_BYTES);
         assert_eq!(config.buffer_capacity, DEFAULT_BUFFER_CAPACITY);
         assert_eq!(config.max_batch_size, DEFAULT_MAX_BATCH_SIZE);
+        assert_eq!(config.max_consecutive_nacks, None);
         assert!(config.include_http_metadata);
         assert!(config.topic_path.is_none());
         assert!(config.auth_bearer_token.is_none());
@@ -1319,6 +1330,32 @@ mod tests {
     #[test]
     fn given_minimal_config_when_validated_should_accept() {
         assert!(parse(minimal_config_json()).validate().is_ok());
+    }
+
+    #[test]
+    fn given_default_config_when_policy_read_should_disable_nack_breaker() {
+        let source = HttpSource::new(1, parse(minimal_config_json()), None);
+        assert_eq!(source.batch_policy().max_consecutive_nacks(), None);
+    }
+
+    #[test]
+    fn given_custom_nack_limit_when_policy_read_should_apply_limit() {
+        let config = parse(r#"{"listen_addr": "127.0.0.1:9090", "max_consecutive_nacks": 12}"#);
+        let source = HttpSource::new(1, config, None);
+        assert_eq!(
+            source.batch_policy().max_consecutive_nacks(),
+            NonZeroU32::new(12)
+        );
+    }
+
+    #[test]
+    fn given_zero_nack_limit_when_deserialized_should_reject() {
+        assert!(
+            serde_json::from_str::<HttpSourceConfig>(
+                r#"{"listen_addr": "127.0.0.1:9090", "max_consecutive_nacks": 0}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

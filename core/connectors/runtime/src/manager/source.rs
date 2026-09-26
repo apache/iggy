@@ -103,6 +103,27 @@ impl SourceManager {
         }
     }
 
+    pub async fn report_unexpected_stop(
+        &self,
+        key: &str,
+        error_message: &str,
+        metrics: &Arc<Metrics>,
+    ) -> bool {
+        let Some(source) = self.sources.get(key).map(|entry| entry.value().clone()) else {
+            return false;
+        };
+        let mut source = source.lock().await;
+        if matches!(
+            source.info.status,
+            ConnectorStatus::Stopping | ConnectorStatus::Stopped
+        ) {
+            return false;
+        }
+        source.apply_status(ConnectorStatus::Error, Some(metrics));
+        source.info.last_error = Some(ConnectorError::new(error_message));
+        true
+    }
+
     pub async fn recover_from_error(&self, key: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(source) = self.sources.get(key) {
             let mut source = source.lock().await;
@@ -258,6 +279,7 @@ impl SourceManager {
             };
 
         let handle_callback = container.iggy_source_handle_v2;
+        let register_stop_callback = container.iggy_source_register_stop_callback;
         let batch_result_callback = container.iggy_source_batch_result;
 
         // The lock is taken before the spawn so nothing can await between
@@ -286,6 +308,7 @@ impl SourceManager {
                 transforms,
                 state_storage,
                 handle_callback,
+                register_stop_callback,
                 batch_result_callback,
                 context.clone(),
             );
@@ -524,6 +547,52 @@ mod tests {
             .await;
 
         assert_eq!(metrics.get_sources_running(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_poll_task_exits_when_running_should_report_error_and_decrement_gauge() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert!(
+            manager
+                .report_unexpected_stop("pg", "polling stopped", &metrics)
+                .await
+        );
+        let source = manager.get("pg").await.expect("source exists");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert_eq!(metrics.get_sources_running(), 0);
+        assert!(source.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_user_shutdown_when_poll_task_exits_should_not_report_error() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .update_status("pg", ConnectorStatus::Stopping, Some(&metrics))
+            .await;
+
+        assert!(
+            !manager
+                .report_unexpected_stop("pg", "polling stopped", &metrics)
+                .await
+        );
+        let source = manager.get("pg").await.expect("source exists");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Stopping);
+        assert!(source.info.last_error.is_none());
     }
 
     #[tokio::test]

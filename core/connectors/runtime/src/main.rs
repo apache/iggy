@@ -32,7 +32,7 @@ use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     api::ConnectorStatus,
     sink::ConsumeCallback,
-    source::{BatchResultCallback, HandleCallback, SendCallback},
+    source::{BatchResultCallback, HandleCallback, SendCallback, SourceStoppedCallback},
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
@@ -84,6 +84,8 @@ pub(crate) struct SourceApi {
         log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
     iggy_source_handle_v2: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_register_stop_callback:
+        Option<extern "C" fn(id: u32, callback: SourceStoppedCallback) -> i32>,
     iggy_source_batch_result: extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32,
     iggy_source_close: extern "C" fn(id: u32) -> i32,
     iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
@@ -189,12 +191,14 @@ async fn main() -> Result<(), RuntimeError> {
     for (_path, source) in sources {
         let container = source.container;
         let handle_callback = container.iggy_source_handle_v2;
+        let register_stop_callback = container.iggy_source_register_stop_callback;
         let batch_result_callback = container.iggy_source_batch_result;
         for plugin in &source.plugins {
             source_containers_by_key.insert(plugin.key.clone(), container.clone());
         }
         source_wrappers.push(SourceConnectorWrapper {
             handle_callback,
+            register_stop_callback,
             batch_result_callback,
             plugins: source.plugins,
         });
@@ -506,6 +510,7 @@ struct SourceConnectorProducer {
 
 struct SourceConnectorWrapper {
     handle_callback: HandleCallback,
+    register_stop_callback: Option<extern "C" fn(u32, SourceStoppedCallback) -> i32>,
     batch_result_callback: BatchResultCallback,
     plugins: Vec<SourceConnectorPlugin>,
 }

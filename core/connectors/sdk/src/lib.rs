@@ -109,6 +109,24 @@ pub trait Source: Send + Sync {
     /// Invoked when the source is initialized, allowing it to perform any necessary setup.
     async fn open(&mut self) -> Result<(), Error>;
 
+    /// Controls how long this source waits for batch results and whether repeated NACKs stop it.
+    ///
+    /// The default stops after five consecutive NACKs. Sources that hold accepted input only in
+    /// memory can disable that limit so a transient broker outage does not strand their input.
+    fn batch_policy(&self) -> source::BatchPolicy {
+        source::BatchPolicy::default()
+    }
+
+    /// Decides whether a successfully handled NACK should trip the configured stop limit.
+    ///
+    /// `Retry` keeps polling with capped backoff. This is useful when the source can safely
+    /// replay a rejected batch and knows the failure is transient. The default applies the
+    /// policy's limit. An error from `on_batch_result` is always terminal: the source may not
+    /// have rolled back its staged work safely.
+    fn nack_disposition(&self) -> source::NackDisposition {
+        source::NackDisposition::ApplyPolicy
+    }
+
     /// Retrieves the next batch for the runtime to process and deliver.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 

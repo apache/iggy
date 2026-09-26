@@ -27,7 +27,7 @@ use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
     TopicMetadata,
-    source::{BatchResultCallback, HandleCallback, SourceBatchResult},
+    source::{BatchResultCallback, HandleCallback, SourceBatchResult, SourceStoppedCallback},
     transforms::Transform,
 };
 use std::{
@@ -54,6 +54,7 @@ use crate::{
 use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
@@ -61,6 +62,7 @@ const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
 
 pub(crate) struct SourceSenderEntry {
     pub(crate) sender: Sender<ProducedBatch>,
+    stop_sender: mpsc::UnboundedSender<()>,
     // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
     // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
     pub(crate) error_counter: Counter,
@@ -77,6 +79,12 @@ pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
 
 pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
+}
+
+extern "C" fn source_stopped(plugin_id: u32) {
+    if let Some(entry) = SOURCE_SENDERS.get(&plugin_id) {
+        let _ = entry.stop_sender.send(());
+    }
 }
 
 /// Initializes all enabled source connectors.
@@ -562,6 +570,7 @@ pub(crate) async fn source_forwarding_loop(
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
     receiver: Receiver<ProducedBatch>,
+    mut stop_receiver: mpsc::UnboundedReceiver<()>,
     batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
     labels: Arc<SourceLabels>,
@@ -588,7 +597,19 @@ pub(crate) async fn source_forwarding_loop(
         topic: producer.topic().to_string(),
     };
 
-    while let Ok(produced_batch) = receiver.recv_async().await {
+    let mut stopped_unexpectedly = false;
+    loop {
+        let produced_batch = tokio::select! {
+            biased;
+            batch = receiver.recv_async() => batch,
+            stopped = stop_receiver.recv() => {
+                stopped_unexpectedly = stopped.is_some();
+                break;
+            }
+        };
+        let Ok(produced_batch) = produced_batch else {
+            break;
+        };
         let total_start = Instant::now();
         let batch_id = produced_batch.id;
         let produced_messages = produced_batch.messages;
@@ -816,14 +837,29 @@ pub(crate) async fn source_forwarding_loop(
     }
 
     info!("Source connector with ID: {plugin_id} stopped.");
-    context
-        .sources
-        .update_status(
-            &plugin_key,
-            ConnectorStatus::Stopped,
-            Some(&context.metrics),
-        )
-        .await;
+    cleanup_sender(plugin_id);
+    if stopped_unexpectedly {
+        let error_msg = format!(
+            "Source polling stopped unexpectedly for connector with ID: {plugin_id}; restart required"
+        );
+        if context
+            .sources
+            .report_unexpected_stop(&plugin_key, &error_msg, &context.metrics)
+            .await
+        {
+            error!("{error_msg}");
+            context.metrics.inc_errors_with_labels(&labels.counter);
+        }
+    } else {
+        context
+            .sources
+            .update_status(
+                &plugin_key,
+                ConnectorStatus::Stopped,
+                Some(&context.metrics),
+            )
+            .await;
+    }
 }
 
 fn should_recover_source(batch_result: SourceBatchResult, sent_count: usize) -> bool {
@@ -841,22 +877,33 @@ pub(crate) fn spawn_source_handler(
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
     handle_callback: HandleCallback,
+    register_stop_callback: Option<extern "C" fn(u32, SourceStoppedCallback) -> i32>,
     batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
 ) -> Vec<JoinHandle<()>> {
     let (sender, receiver) = flume::unbounded();
+    let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
     let plugin_key = plugin_key.to_string();
     let labels = Arc::new(SourceLabels::new(&plugin_key));
     SOURCE_SENDERS.insert(
         plugin_id,
         SourceSenderEntry {
             sender,
+            stop_sender,
             error_counter: context.metrics.error_counter(&labels.counter),
         },
     );
 
     let blocking_handle = tokio::task::spawn_blocking(move || {
-        handle_callback(plugin_id, handle_produced_messages);
+        if let Some(register) = register_stop_callback
+            && register(plugin_id, source_stopped) != 0
+        {
+            source_stopped(plugin_id);
+            return;
+        }
+        if handle_callback(plugin_id, handle_produced_messages) != 0 {
+            source_stopped(plugin_id);
+        }
     });
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
@@ -869,6 +916,7 @@ pub(crate) fn spawn_source_handler(
             transforms,
             state_storage,
             receiver,
+            stop_receiver,
             batch_result_callback,
             context,
             labels,
@@ -912,6 +960,7 @@ pub fn handle(
                 plugin.transforms,
                 plugin.state_storage,
                 source.handle_callback,
+                source.register_stop_callback,
                 source.batch_result_callback,
                 context.clone(),
             );
@@ -1320,10 +1369,12 @@ mod tests {
         let plugin_id = next_plugin_id();
         let batch_id = 73;
         let (sender, receiver) = flume::unbounded();
+        let (stop_sender, _stop_receiver) = mpsc::unbounded_channel();
         SOURCE_SENDERS.insert(
             plugin_id,
             SourceSenderEntry {
                 sender,
+                stop_sender,
                 error_counter: Counter::default(),
             },
         );
@@ -1353,14 +1404,37 @@ mod tests {
     }
 
     #[test]
+    fn given_source_stop_when_callback_runs_should_signal_forwarder() {
+        let plugin_id = next_plugin_id();
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        source_stopped(plugin_id);
+        assert_eq!(stop_receiver.try_recv(), Ok(()));
+
+        cleanup_sender(plugin_id);
+        assert!(receiver.is_disconnected());
+    }
+
+    #[test]
     fn given_invalid_payload_when_callback_runs_should_reject_batch() {
         let plugin_id = next_plugin_id();
         let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, _stop_receiver) = mpsc::unbounded_channel();
         let error_counter = Counter::default();
         SOURCE_SENDERS.insert(
             plugin_id,
             SourceSenderEntry {
                 sender,
+                stop_sender,
                 error_counter: error_counter.clone(),
             },
         );
