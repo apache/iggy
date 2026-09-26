@@ -535,9 +535,9 @@ impl IggyClient {
     }
 
     /// Closes the connection and releases the client. For TCP, QUIC and
-    /// WebSocket this is terminal: later requests fail with
-    /// `RuntimeError("Client shutdown")`. Repeated calls are safe. Over HTTP
-    /// there is nothing to release and this call does nothing.
+    /// WebSocket this is terminal: later requests fail with `RuntimeError`.
+    /// Repeated calls are safe. Over HTTP there is nothing to release and this
+    /// call does nothing.
     ///
     /// Raises:
     ///     RuntimeError: If the client cannot be shut down.
