@@ -22,13 +22,14 @@ use pgwire::tokio::process_socket;
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor, wait::HttpWaitStrategy},
+    core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::connectors::fixtures::{
     self,
+    floci::{ACCESS_KEY, SECRET_KEY},
     redshift::redshift_mock::{handler::RedshiftHandlerFactory, load::S3Client},
 };
 
@@ -38,14 +39,7 @@ const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_DB: &str = "postgres";
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "postgres";
-const MINIO_IMAGE: &str = "quay.io/minio/minio";
-const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
-const MINIO_PORT: u16 = 9000;
-const MINIO_CONSOLE_PORT: u16 = 9001;
-
-pub const MINIO_ACCESS_KEY: &str = "admin";
-pub const MINIO_SECRET_KEY: &str = "password";
-pub const MINIO_BUCKET: &str = "iggystaging";
+pub const STAGING_BUCKET: &str = "iggystaging";
 pub const DEFAULT_SINK_TABLE: &str = "iggy_messages";
 pub const STAGING_REGION: &str = "us-east-1";
 pub const STAGING_PREFIX: &str = "iggy/messages";
@@ -77,61 +71,6 @@ pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
 
 pub const DEFAULT_POLL_ATTEMPTS: usize = 100;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
-
-pub struct MinioContainer {
-    #[allow(dead_code)]
-    container: ContainerAsync<GenericImage>,
-    pub endpoint: String,
-}
-
-impl MinioContainer {
-    pub async fn start(network: &str, container_name: &str) -> Result<Self, TestBinaryError> {
-        let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
-            .with_exposed_port(MINIO_PORT.tcp())
-            .with_exposed_port(MINIO_CONSOLE_PORT.tcp())
-            .with_wait_for(WaitFor::http(
-                HttpWaitStrategy::new("/minio/health/live")
-                    .with_port(MINIO_PORT.tcp())
-                    .with_expected_status_code(200u16),
-            ))
-            .with_network(network)
-            .with_container_name(container_name)
-            .with_env_var("MINIO_ROOT_USER", MINIO_ACCESS_KEY)
-            .with_env_var("MINIO_ROOT_PASSWORD", MINIO_SECRET_KEY)
-            .with_cmd(vec!["server", "/data", "--console-address", ":9001"])
-            .with_mapped_port(0, MINIO_PORT.tcp())
-            .with_mapped_port(0, MINIO_CONSOLE_PORT.tcp())
-            .start()
-            .await
-            .map_err(|error| TestBinaryError::FixtureSetup {
-                fixture_type: "MinioContainer".to_string(),
-                message: format!("Failed to start container: {error}"),
-            })?;
-
-        tracing::info!("Started MinIO container");
-
-        let mapped_port = container
-            .ports()
-            .await
-            .map_err(|error| TestBinaryError::FixtureSetup {
-                fixture_type: "MinioContainer".to_string(),
-                message: format!("Failed to get ports: {error}"),
-            })?
-            .map_to_host_port_ipv4(MINIO_PORT)
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "MinioContainer".to_string(),
-                message: "No mapping for MinIO port".to_string(),
-            })?;
-
-        let endpoint = format!("http://localhost:{mapped_port}");
-        tracing::info!("MinIO container available at {endpoint}");
-
-        Ok(Self {
-            container,
-            endpoint,
-        })
-    }
-}
 
 /// Base container management for PostgreSQL fixtures.
 pub struct PostgresContainer {
@@ -198,10 +137,10 @@ impl RedshiftContainer {
         s3_endpoint: String,
     ) -> Result<Self, TestBinaryError> {
         let s3_client = S3Client::new(
-            MINIO_BUCKET,
+            STAGING_BUCKET,
             &s3_endpoint,
-            MINIO_ACCESS_KEY,
-            MINIO_SECRET_KEY,
+            ACCESS_KEY,
+            SECRET_KEY,
             STAGING_REGION,
         )
         .await
