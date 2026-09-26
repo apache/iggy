@@ -64,6 +64,7 @@ file under `tests/` anymore.
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
 | [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
 | [`sasl_tests.rs`](../tests/sasl_tests.rs) | SASL/PLAIN over a socket — full handshake, every refusal path, and the disabled default. Drives a stub verifier implementing `SaslAuthenticator`, so no Iggy server is needed | No |
+| [`kafka_client_e2e_tests.rs`](../tests/kafka_client_e2e_tests.rs) | **Real Kafka clients** against the whole stack: a spawned `iggy-server`, the gateway in-process with a real authenticator, and kcat / the Java tools from containers. The only suite that can catch a client-compatibility bug, since every other one hand-builds frames | No, but needs Docker and a built `iggy-server` |
 | [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
 
 `tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `scope.rs`, `server.rs`,
@@ -72,6 +73,34 @@ is test-only primitive encode/decode scaffolding for hand-building legacy/advers
 `kafka_protocol`'s spec-correct encoder cannot produce - it is not the gateway's production codec.
 
 ---
+
+## Real-client end-to-end suite
+
+`kafka_client_e2e_tests.rs` needs two things the rest of the suite does not: Docker, and an
+already-built `iggy-server` in the same target directory. Missing either makes it skip with a
+printed reason rather than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable
+without either.
+
+Client containers run with `--pull never`, so pull the two images first. Without them the suite
+skips and names the missing one.
+
+```bash
+cargo build --bin iggy-server
+docker pull edenhill/kcat:1.7.1
+docker pull apache/kafka:3.9.0
+KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test kafka_client_e2e_tests
+```
+
+`KAFKA_E2E_REQUIRED=1` turns a skip into a failure, mirroring `KAFKA_FIXTURES_REQUIRED`, so a CI
+job that means to run these cannot report a pass over zero assertions. Set it there.
+
+The suite runs in its own `kafka_client_e2e` nextest group, capped at one thread, so its spawned
+servers are serialized against each other. It is kept apart from the `kafka_bridge` group so the
+container-driven tests do not queue behind the bridge tests, and both groups cap their servers'
+shard pools, so the two can run alongside each other.
+
+It automates categories S and T of [`MANUAL_TESTING.md`](MANUAL_TESTING.md). Those procedures stay,
+because they cover cases a test does not assert, but the load-bearing ones now run in CI.
 
 ## Adding new tests
 

@@ -22,15 +22,18 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::SemaphorePermit;
 
 use iggy_gateway_kafka::GatewayConfig;
-use iggy_gateway_kafka::auth::{AuthError, SaslAuthenticator};
+use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::sasl::{MAX_PRE_AUTH_API_VERSIONS, PlainCredentials};
 
 #[path = "common/codec.rs"]
@@ -54,6 +57,7 @@ const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
 const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
 const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
+const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 
 const HANDSHAKE_VERSION: i16 = 1;
 const AUTHENTICATE_VERSION: i16 = 1;
@@ -63,16 +67,25 @@ const AUTHENTICATE_VERSION: i16 = 1;
 struct FixedCredentialAuthenticator {
     username: &'static str,
     password: &'static str,
+    permissions: PrincipalPermissions,
 }
 
 #[async_trait]
 impl SaslAuthenticator for FixedCredentialAuthenticator {
-    async fn authenticate(&self, credentials: &PlainCredentials) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
         use secrecy::ExposeSecret;
         let matches = credentials.username == self.username
             && credentials.password.expose_secret() == self.password;
         if matches {
-            Ok(())
+            Ok(AuthenticatedPrincipal {
+                username: credentials.username.clone(),
+                permissions: self.permissions,
+                permissions_known: true,
+            })
         } else {
             Err(AuthError::Rejected)
         }
@@ -94,6 +107,7 @@ async fn spawn_sasl_gateway() -> SocketAddr {
     let authenticator = Arc::new(FixedCredentialAuthenticator {
         username: "alice",
         password: "s3cret",
+        permissions: PrincipalPermissions::default(),
     });
     let (addr, shutdown) = spawn_test_server_with_authenticator(sasl_config(), authenticator).await;
     // Held for the whole test: dropping the sender shuts the gateway down mid-exchange.
@@ -157,6 +171,102 @@ async fn send(
     let (echoed, response) = parse_response_payload(api_key, api_version, payload);
     assert_eq!(echoed, correlation_id, "correlation id must be echoed");
     response
+}
+
+/// `DescribeAcls` puts a `throttle_time_ms` (`i32`) *before* its error code, unlike the SASL
+/// responses. Reading offset 0 there returns the always-zero high half of the throttle field, so
+/// every assertion comparing it against 0 passes no matter what the gateway answered.
+fn acl_error_code(body: &Bytes) -> i16 {
+    assert!(body.len() >= 6, "DescribeAcls response is too short");
+    i16::from_be_bytes([body[4], body[5]])
+}
+
+/// Decodes a `DescribeAcls` v1 response into
+/// `(resource_type, resource_name, pattern_type, operation, permission_type)` tuples.
+///
+/// Pattern type and permission type are decoded rather than stepped over deliberately. They carry
+/// the security claim of the whole surface: a response that said DENY, or a prefixed pattern,
+/// would otherwise pass every test in this crate while meaning something entirely different.
+fn parse_acl_bindings(body: &Bytes) -> Vec<(i8, String, i8, i8, i8)> {
+    // Every read is bounds-checked by field name. A decoder that walks a response with raw
+    // indexing fails as an index-out-of-bounds naming no field, and the more dangerous case is
+    // quieter still: drift by a few bytes and it returns plausible-looking bindings decoded from
+    // the wrong offsets. That already happened once in this suite, where `error_code` read the
+    // first two bytes of a body whose first field is `throttle_time_ms`, so every assertion
+    // compared 0 against 0 and passed.
+    let need = |at: usize, count: usize, field: &str| {
+        assert!(
+            at + count <= body.len(),
+            "ran past the end of the response reading {field}: wanted {count} byte(s) at {at}, \
+             body holds {}. The decoder is out of step with the response shape.",
+            body.len()
+        );
+    };
+
+    let mut at = 6; // throttle_time_ms + error_code
+    // error_message: nullable string
+    need(at, 2, "error_message length");
+    let len = i16::from_be_bytes([body[at], body[at + 1]]);
+    at += 2;
+    if len >= 0 {
+        at += usize::try_from(len).expect("non-negative string length");
+    }
+    need(at, 4, "resource count");
+    let resource_count = i32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+    at += 4;
+
+    let mut out = Vec::new();
+    for _ in 0..resource_count.max(0) {
+        need(at, 3, "resource type and name length");
+        let resource_type = body[at].cast_signed();
+        at += 1;
+        let name_len = usize::try_from(i16::from_be_bytes([body[at], body[at + 1]]))
+            .expect("non-negative name length");
+        at += 2;
+        need(at, name_len, "resource name");
+        let name = String::from_utf8_lossy(&body[at..at + name_len]).to_string();
+        at += name_len;
+        need(at, 5, "pattern type and acl count");
+        let pattern_type = body[at].cast_signed();
+        at += 1;
+        let acl_count = i32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+        at += 4;
+        for _ in 0..acl_count.max(0) {
+            need(at, 2, "principal length");
+            let principal_len = usize::try_from(i16::from_be_bytes([body[at], body[at + 1]]))
+                .expect("non-negative principal length");
+            at += 2;
+            need(at, principal_len + 2, "principal and host length");
+            at += principal_len;
+            let host_len = usize::try_from(i16::from_be_bytes([body[at], body[at + 1]]))
+                .expect("non-negative host length");
+            at += 2;
+            need(at, host_len + 2, "host, operation and permission type");
+            at += host_len;
+            let operation = body[at].cast_signed();
+            at += 1;
+            let permission_type = body[at].cast_signed();
+            at += 1;
+            out.push((
+                resource_type,
+                name.clone(),
+                pattern_type,
+                operation,
+                permission_type,
+            ));
+        }
+    }
+
+    // Trailing bytes mean the walk is out of step even though every individual read fit, which is
+    // the failure that returns plausible bindings rather than panicking.
+    assert_eq!(
+        at,
+        body.len(),
+        "decoder stopped {} byte(s) short of the end, so the bindings above were read at the \
+         wrong offsets",
+        body.len() - at
+    );
+    out
 }
 
 /// First `i16` of a `SaslHandshake` or `SaslAuthenticate` response body is its error code.
@@ -621,6 +731,7 @@ async fn given_an_unauthenticated_connection_when_it_goes_quiet_should_be_droppe
     let authenticator = Arc::new(FixedCredentialAuthenticator {
         username: "alice",
         password: "s3cret",
+        permissions: PrincipalPermissions::default(),
     });
     let (addr, shutdown) = spawn_test_server_with_authenticator(config, authenticator).await;
     std::mem::forget(shutdown);
@@ -642,6 +753,7 @@ async fn given_an_authenticated_connection_when_it_goes_quiet_should_keep_the_lo
     let authenticator = Arc::new(FixedCredentialAuthenticator {
         username: "alice",
         password: "s3cret",
+        permissions: PrincipalPermissions::default(),
     });
     let (addr, shutdown) = spawn_test_server_with_authenticator(config, authenticator).await;
     std::mem::forget(shutdown);
@@ -699,7 +811,11 @@ struct UnavailableAuthenticator;
 
 #[async_trait]
 impl SaslAuthenticator for UnavailableAuthenticator {
-    async fn authenticate(&self, _credentials: &PlainCredentials) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        _credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
         Err(AuthError::Unavailable)
     }
 }
@@ -882,6 +998,7 @@ async fn given_an_authenticator_without_sasl_enabled_should_refuse_to_start() {
     let authenticator = Arc::new(FixedCredentialAuthenticator {
         username: "alice",
         password: "s3cret",
+        permissions: PrincipalPermissions::default(),
     });
     let config = GatewayConfig {
         sasl_enabled: false,
@@ -905,9 +1022,17 @@ struct StallingAuthenticator {
 
 #[async_trait]
 impl SaslAuthenticator for StallingAuthenticator {
-    async fn authenticate(&self, _credentials: &PlainCredentials) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
         let _held = self.release.acquire().await;
-        Ok(())
+        Ok(AuthenticatedPrincipal {
+            username: credentials.username.clone(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: true,
+        })
     }
 }
 
@@ -947,6 +1072,86 @@ async fn given_all_authentication_slots_are_busy_when_waiting_too_long_should_cl
     handshake_ok(&mut queued).await;
     queued.write_all(&frame).await.expect("write request");
     assert_closed(&mut queued).await;
+}
+
+/// Records the most verifications in flight at once, so a test can pin what bounds them.
+#[derive(Debug, Default)]
+struct ConcurrencyRecordingAuthenticator {
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[async_trait]
+impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(in_flight, Ordering::SeqCst);
+        // Long enough that unbounded verifications would visibly overlap, short enough that a
+        // bounded run still finishes well inside the pre-authentication budget.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(AuthenticatedPrincipal {
+            username: credentials.username.clone(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: true,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_a_single_authentication_slot_should_verify_one_credential_at_a_time() {
+    // Iggy hashes with Argon2 inline on its shard threads, which have no blocking pool, so
+    // unbounded concurrent verification is a denial-of-service vector rather than a throughput
+    // question. What pins that here is an authenticator that *completes*: the sibling test above
+    // stalls forever, so its client times out whether or not this semaphore holds, and it passes
+    // just as happily with the permit dropped the moment it is taken.
+    const CLIENTS: i32 = 6;
+    let config = GatewayConfig {
+        max_concurrent_authentications: 1,
+        pre_auth_timeout: Duration::from_secs(10),
+        ..sasl_config()
+    };
+    let authenticator = Arc::new(ConcurrencyRecordingAuthenticator::default());
+    let (addr, shutdown) =
+        spawn_test_server_with_authenticator(config, authenticator.clone()).await;
+    std::mem::forget(shutdown);
+
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|client| {
+            tokio::spawn(async move {
+                let mut stream = TcpStream::connect(addr).await.expect("connect");
+                handshake_ok(&mut stream).await;
+                let token = plain_token("alice", "s3cret");
+                let body = send(
+                    &mut stream,
+                    API_KEY_SASL_AUTHENTICATE,
+                    AUTHENTICATE_VERSION,
+                    client + 2,
+                    &authenticate_body(&token),
+                )
+                .await;
+                assert_eq!(
+                    error_code(&body),
+                    ERROR_NONE,
+                    "a queued credential must still be verified, not rejected"
+                );
+            })
+        })
+        .collect();
+    for client in clients {
+        client.await.expect("client task");
+    }
+
+    assert_eq!(
+        authenticator.peak.load(Ordering::SeqCst),
+        1,
+        "one slot must admit one verification at a time; anything higher means the limit bounds \
+         nothing and a burst of connections reaches Iggy's shard threads unthrottled"
+    );
 }
 
 #[tokio::test]
@@ -1070,6 +1275,413 @@ async fn given_a_refused_api_versions_when_retried_lower_should_still_be_answere
         ERROR_NONE,
         "the downgrade retry must not be refused for having spent the allowance"
     );
+}
+
+const API_KEY_DESCRIBE_ACLS: i16 = 29;
+const DESCRIBE_ACLS_VERSION: i16 = 1;
+
+/// `DescribeAcls` v1 filter body: an all-matching filter (`ANY` everywhere, no names).
+fn any_acl_filter_body() -> Bytes {
+    let mut buf = BytesMut::new();
+    buf.put_i8(1); // resource_type_filter = ANY
+    buf.put_i16(-1); // resource_name_filter = null
+    buf.put_i8(1); // pattern_type_filter = ANY
+    buf.put_i16(-1); // principal_filter = null
+    buf.put_i16(-1); // host_filter = null
+    buf.put_i8(1); // operation = ANY
+    buf.put_i8(1); // permission_type = ANY
+    buf.freeze()
+}
+
+/// `DescribeAcls` v3 filter body: flexible framing, so compact nullable strings and a trailing
+/// tagged-fields byte. This is what a real `AdminClient` negotiates against the advertised range,
+/// and it exercises request header v2 and response header v1 as well.
+fn any_acl_filter_body_v3() -> Bytes {
+    let mut buf = BytesMut::new();
+    buf.put_i8(1); // resource_type_filter = ANY
+    buf.put_u8(0); // resource_name_filter = null (compact: varint 0)
+    buf.put_i8(1); // pattern_type_filter = ANY
+    buf.put_u8(0); // principal_filter = null
+    buf.put_u8(0); // host_filter = null
+    buf.put_i8(1); // operation = ANY
+    buf.put_i8(1); // permission_type = ANY
+    buf.put_u8(0); // empty tagged fields
+    buf.freeze()
+}
+
+async fn spawn_gateway_for(permissions: PrincipalPermissions) -> SocketAddr {
+    let authenticator = Arc::new(FixedCredentialAuthenticator {
+        username: "alice",
+        password: "s3cret",
+        permissions,
+    });
+    let (addr, shutdown) = spawn_test_server_with_authenticator(sasl_config(), authenticator).await;
+    std::mem::forget(shutdown);
+    addr
+}
+
+async fn authenticate(stream: &mut TcpStream) {
+    handshake_ok(stream).await;
+    let token = plain_token("alice", "s3cret");
+    let body = send(
+        stream,
+        API_KEY_SASL_AUTHENTICATE,
+        AUTHENTICATE_VERSION,
+        2,
+        &authenticate_body(&token),
+    )
+    .await;
+    assert_eq!(error_code(&body), ERROR_NONE);
+}
+
+#[tokio::test]
+async fn given_a_principal_with_permissions_when_describing_acls_should_report_them() {
+    let addr = spawn_gateway_for(PrincipalPermissions {
+        poll_messages: true,
+        send_messages: true,
+        read_topics: true,
+        ..PrincipalPermissions::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &any_acl_filter_body(),
+    )
+    .await;
+    assert_eq!(
+        acl_error_code(&body),
+        ERROR_NONE,
+        "an ACL view is not an error"
+    );
+    // Decoded, not byte-scanned: the resource type, name and operation of every binding are the
+    // thing under test, and a substring scan asserts none of them.
+    let bindings = parse_acl_bindings(&body);
+    assert!(
+        bindings.contains(&(2, "*".to_string(), 3, 3, 3)),
+        "poll_messages must render TOPIC * READ, got {bindings:?}"
+    );
+    // Iggy has no deny rules and nothing here is prefix-scoped, so every binding must say ALLOW on
+    // a LITERAL pattern. Without asserting these two, a response meaning the opposite would pass.
+    assert!(
+        bindings
+            .iter()
+            .all(|(_, _, pattern, _, permission)| *pattern == 3 && *permission == 3),
+        "every binding must be an ALLOW on a LITERAL pattern, got {bindings:?}"
+    );
+    assert!(
+        bindings.contains(&(2, "*".to_string(), 3, 4, 3)),
+        "send_messages must render TOPIC * WRITE, got {bindings:?}"
+    );
+    assert!(
+        bindings.contains(&(3, "*".to_string(), 3, 3, 3)),
+        "a principal that may read topics must get the derived GROUP * READ, got {bindings:?}"
+    );
+    assert!(
+        body.windows(10).any(|w| w == b"User:alice"),
+        "every binding names the authenticated principal"
+    );
+}
+
+#[tokio::test]
+async fn given_only_poll_messages_should_not_render_a_group_binding() {
+    // Regression. Consumer-group operations route through Iggy's topic rule, which never consults
+    // `poll_messages`, so deriving the group binding from polling advertised access Iggy denies.
+    let addr = spawn_gateway_for(PrincipalPermissions {
+        poll_messages: true,
+        ..PrincipalPermissions::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &any_acl_filter_body(),
+    )
+    .await;
+    let bindings = parse_acl_bindings(&body);
+    assert!(
+        bindings.contains(&(2, "*".to_string(), 3, 3, 3)),
+        "polling still grants TOPIC READ, got {bindings:?}"
+    );
+    assert!(
+        !bindings.iter().any(|(resource, ..)| *resource == 3),
+        "no group binding without a topic read grant, got {bindings:?}"
+    );
+}
+
+#[tokio::test]
+async fn given_manage_servers_should_not_claim_an_unusable_cluster_alter() {
+    // A server flag renders DESCRIBE and nothing else. `manage_servers` cannot be set here on
+    // purpose: Iggy reads it in exactly one rule, as an alias for `read_servers`, so the
+    // projection folds the two together and this layer never sees it apart. Rendering CLUSTER
+    // ALTER from it advertised an ability with nowhere to be used, and the two write ACL APIs it
+    // implies are not even advertised.
+    let addr = spawn_gateway_for(PrincipalPermissions {
+        read_servers: true,
+        ..PrincipalPermissions::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &any_acl_filter_body(),
+    )
+    .await;
+    let bindings = parse_acl_bindings(&body);
+    assert!(
+        bindings.contains(&(4, "kafka-cluster".to_string(), 3, 8, 3)),
+        "server permissions must still render CLUSTER DESCRIBE, got {bindings:?}"
+    );
+    assert!(
+        !bindings.iter().any(|(.., operation, _)| *operation == 7),
+        "nothing may claim ALTER, got {bindings:?}"
+    );
+}
+
+#[tokio::test]
+async fn given_a_principal_with_no_permissions_should_report_an_empty_view_not_an_error() {
+    // Kafka draws a firm line between "nothing matched" and "the request failed", and an admin
+    // tool prints them very differently.
+    let addr = spawn_gateway_for(PrincipalPermissions::default()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &any_acl_filter_body(),
+    )
+    .await;
+    assert_eq!(
+        acl_error_code(&body),
+        ERROR_NONE,
+        "an empty ACL set is a successful answer"
+    );
+    assert!(
+        parse_acl_bindings(&body).is_empty(),
+        "no permissions means no bindings at all"
+    );
+}
+
+/// Accepts `alice` but reports that her permissions could not be read, the shape
+/// `IggyAuthenticator` produces when the login succeeds and the follow-up `get_user` does not.
+#[derive(Debug)]
+struct UnreadPermissionsAuthenticator;
+
+#[async_trait]
+impl SaslAuthenticator for UnreadPermissionsAuthenticator {
+    async fn authenticate(
+        &self,
+        credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
+        Ok(AuthenticatedPrincipal {
+            username: credentials.username.clone(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn given_unread_permissions_when_describing_acls_should_answer_an_error_and_stay_open() {
+    // The fallback permissions are empty, so answering from them would render the same zero
+    // bindings as a principal that genuinely holds nothing. Every other stub reports its
+    // permissions as known, so without this case the two answers could swap unnoticed.
+    let (addr, shutdown) = spawn_test_server_with_authenticator(
+        sasl_config(),
+        Arc::new(UnreadPermissionsAuthenticator),
+    )
+    .await;
+    std::mem::forget(shutdown);
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &any_acl_filter_body(),
+    )
+    .await;
+    assert_eq!(
+        acl_error_code(&body),
+        ERROR_UNKNOWN_SERVER_ERROR,
+        "a view that was never read must not be reported as an empty one"
+    );
+    assert!(
+        parse_acl_bindings(&body).is_empty(),
+        "an error answer carries no bindings"
+    );
+
+    // Kept open: the login was valid, and only the ACL view is missing.
+    let metadata = send(&mut stream, API_KEY_METADATA, 0, 4, &[0, 0, 0, 0]).await;
+    assert!(
+        !metadata.is_empty(),
+        "the connection must keep serving after the ACL error"
+    );
+}
+
+#[tokio::test]
+async fn given_an_unauthenticated_connection_when_describing_acls_should_be_answered_then_closed() {
+    let addr = spawn_gateway_for(PrincipalPermissions::default()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    // Answered with a parseable body rather than dropped silently. The key is outside the firewall
+    // table, so the generic error path closes without one, which leaves the client guessing on the
+    // one path an unauthenticated peer can actually reach.
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        1,
+        &any_acl_filter_body(),
+    )
+    .await;
+    assert_eq!(acl_error_code(&body), ERROR_ILLEGAL_SASL_STATE);
+    assert!(
+        parse_acl_bindings(&body).is_empty(),
+        "a refusal must disclose no bindings"
+    );
+    assert_closed(&mut stream).await;
+}
+
+#[tokio::test]
+async fn given_sasl_enabled_should_advertise_describe_acls() {
+    let addr = spawn_gateway_for(PrincipalPermissions::default()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let body = send(&mut stream, API_KEY_API_VERSIONS, 1, 1, &[]).await;
+    let rows = parse_api_versions(&body);
+    let acls = rows
+        .iter()
+        .find(|(key, _, _)| *key == API_KEY_DESCRIBE_ACLS)
+        .expect("DescribeAcls must be advertised while SASL is enabled");
+    assert_eq!((acls.1, acls.2), (1, 3));
+}
+
+#[tokio::test]
+async fn given_sasl_disabled_should_not_advertise_describe_acls() {
+    // With no principal there is nothing it could truthfully describe.
+    let (addr, shutdown) = server::spawn_test_server().await;
+    std::mem::forget(shutdown);
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let body = send(&mut stream, API_KEY_API_VERSIONS, 1, 1, &[]).await;
+    assert!(
+        !parse_api_versions(&body)
+            .iter()
+            .any(|(key, _, _)| *key == API_KEY_DESCRIBE_ACLS)
+    );
+}
+
+#[tokio::test]
+async fn given_describe_acls_v3_should_answer_over_the_flexible_framing() {
+    // v3 is the version a real AdminClient negotiates, and the only flexible one: compact strings,
+    // tagged fields, request header v2 and response header v1. v1 exercises none of that.
+    let addr = spawn_gateway_for(PrincipalPermissions {
+        poll_messages: true,
+        read_topics: true,
+        ..PrincipalPermissions::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        3,
+        3,
+        &any_acl_filter_body_v3(),
+    )
+    .await;
+    // v3 is flexible, so the decoder above (legacy framing) does not apply; the error code still
+    // sits after the throttle field.
+    assert_eq!(acl_error_code(&body), ERROR_NONE, "v3 must answer cleanly");
+    assert!(
+        body.windows(10).any(|w| w == b"User:alice"),
+        "the v3 response must carry the rendered bindings, not just a header"
+    );
+
+    // Still usable afterwards, which proves the flexible response framing did not desync the
+    // connection's correlation stream.
+    let again = send(&mut stream, API_KEY_METADATA, 0, 4, &[0, 0, 0, 0]).await;
+    assert!(!again.is_empty());
+}
+
+#[tokio::test]
+async fn given_describe_acls_above_the_advertised_range_should_be_refused() {
+    let addr = spawn_gateway_for(PrincipalPermissions::default()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    // v4 has no schema at either end, so there is no parseable body to answer with.
+    let frame = build_request_frame(
+        API_KEY_DESCRIBE_ACLS,
+        4,
+        3,
+        Some("sasl-test"),
+        &any_acl_filter_body_v3(),
+    );
+    stream.write_all(&frame).await.expect("write request");
+    assert_closed(&mut stream).await;
+}
+
+#[tokio::test]
+async fn given_a_malformed_acl_filter_should_answer_an_error_and_stay_open() {
+    // The handler's two error branches differ in liveness: a malformed filter is answered and the
+    // connection kept, while an out-of-range version closes. Only the second was covered, so the
+    // reachable one went untested.
+    let addr = spawn_gateway_for(PrincipalPermissions::default()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+
+    // Declares a 64-byte resource name in a body that holds two.
+    let mut truncated = BytesMut::new();
+    truncated.put_i8(1);
+    truncated.put_i16(64);
+    truncated.put_slice(b"xy");
+    let body = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        3,
+        &truncated.freeze(),
+    )
+    .await;
+    assert_eq!(
+        acl_error_code(&body),
+        42,
+        "a malformed filter is INVALID_REQUEST"
+    );
+
+    // Still usable: the client may send a well-formed filter next.
+    let good = send(
+        &mut stream,
+        API_KEY_DESCRIBE_ACLS,
+        DESCRIBE_ACLS_VERSION,
+        4,
+        &any_acl_filter_body(),
+    )
+    .await;
+    assert_eq!(acl_error_code(&good), ERROR_NONE);
 }
 
 #[tokio::test]

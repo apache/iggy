@@ -19,15 +19,22 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
+use kafka_protocol::messages::{
+    DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
+};
 
 use crate::bridge::IggyBridge;
 use crate::error::Result;
+use crate::protocol::acl::{
+    self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
+    encode_describe_acls_response,
+};
 use crate::protocol::bounds_guard::{
-    validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
+    validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
 use crate::protocol::handlers::{
     api_versions, create_topics, decode_guarded, dispatch, fetch, list_offsets, metadata, produce,
+    respond_or_close,
 };
 use crate::protocol::sasl::{
     SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
@@ -40,6 +47,7 @@ pub const API_KEY_METADATA: i16 = 3;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
@@ -320,6 +328,14 @@ static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
         min_version: 0,
         max_version: 2,
     },
+    // Grouped with the SASL keys rather than with `SUPPORTED_RANGES` because it answers about the
+    // authenticated principal. With SASL off there is no principal, so there is nothing it could
+    // truthfully describe, and advertising it would invite a question with no answer.
+    ApiVersionRange {
+        api_key: API_KEY_DESCRIBE_ACLS,
+        min_version: 1,
+        max_version: 3,
+    },
 ];
 
 /// Sent with every `SASL_AUTHENTICATION_FAILED`, whatever the real cause.
@@ -329,6 +345,71 @@ static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
 /// server-side care at the gateway. An unreachable Iggy reaches the client the same way, and the
 /// gateway's own log is where the difference is recorded.
 pub const SASL_AUTH_FAILED_MESSAGE: &str = "Authentication failed";
+
+/// Decodes a `DescribeAcls` filter.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a well-formed `DescribeAcls` request at `api_version`.
+pub fn decode_acl_filter(api_version: i16, body: Bytes) -> Result<AclFilter> {
+    let req = decode_guarded::<DescribeAclsRequest>(api_version, body, |v, b| {
+        validate_describe_acls_shape(v, b)
+    })?;
+    Ok(AclFilter {
+        resource_type: req.resource_type_filter,
+        resource_name: req.resource_name_filter.map(|name| name.to_string()),
+        pattern_type: req.pattern_type_filter,
+        principal: req.principal_filter.map(|name| name.to_string()),
+        host: req.host_filter.map(|name| name.to_string()),
+        operation: req.operation,
+        permission_type: req.permission_type,
+    })
+}
+
+/// Answers `DescribeAcls` for `principal`, selecting from what Iggy already grants them.
+#[must_use]
+pub fn describe_acls_outcome(
+    api_version: i16,
+    principal: &str,
+    permissions: &PrincipalPermissions,
+    filter: &AclFilter,
+) -> HandleOutcome {
+    let selected: Vec<AclBinding> = acl::bindings_for(permissions)
+        .into_iter()
+        .filter(|binding| filter.matches(binding, principal))
+        .collect();
+    respond_or_close(
+        encode_describe_acls_response(api_version, principal, &selected),
+        "DescribeAcls",
+    )
+}
+
+/// Versions of `DescribeAcls` this gateway answers, and the range `ApiVersions` advertises.
+///
+/// Public so the connection loop can enforce it. The key is deliberately absent from this module's
+/// `SUPPORTED_RANGES` firewall table, which is what makes this the only bound there is.
+pub const SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS: std::ops::RangeInclusive<i16> = 1..=3;
+
+/// `DescribeAcls` answer carrying only an error code.
+///
+/// `close` marks the refusals that must end the connection. A caller that keeps it open is saying
+/// the client may usefully send something else on it, which is true of a malformed filter and not
+/// of a state violation.
+#[must_use]
+pub fn respond_describe_acls_error(
+    api_version: i16,
+    error_code: i16,
+    close: bool,
+) -> HandleOutcome {
+    match encode_describe_acls_error_response(api_version, error_code) {
+        Ok(body) if close => HandleOutcome::RespondThenClose(body),
+        Ok(body) => HandleOutcome::Respond(body),
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode DescribeAcls error; closing connection");
+            HandleOutcome::Close
+        }
+    }
+}
 
 /// Reads the mechanism name out of a `SaslHandshake` body without consuming the caller's copy.
 ///

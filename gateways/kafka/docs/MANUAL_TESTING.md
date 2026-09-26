@@ -113,6 +113,58 @@ docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
 
+### Category T — ACL view
+
+Needs the same running stack as category S, plus two extra Iggy users so the view has something to
+distinguish. Create them over the HTTP API, logging in as root first:
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:3000/users/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"iggy","password":"iggy"}' | jq -r .access_token.token)
+
+curl -s -X POST http://127.0.0.1:3000/users -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"username":"consumer-only","password":"s3cretpass",
+  "status":"active","permissions":{"global":{"read_topics":true,"poll_messages":true,
+  "manage_servers":false,"read_servers":false,"manage_users":false,"read_users":false,
+  "manage_streams":false,"read_streams":false,"manage_topics":false,"send_messages":false},
+  "streams":null}}'
+
+curl -s -X POST http://127.0.0.1:3000/users -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"no-grants","password":"s3cretpass","status":"active","permissions":null}'
+```
+
+Then list each principal's ACLs with the real admin client, swapping the username and password in
+`client.properties`:
+
+```bash
+docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
+  apache/kafka:3.9.0 /opt/kafka/bin/kafka-acls.sh \
+  --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties --list
+```
+
+| ID | Principal | Pass criteria | Last run |
+| ---- | ----------- | --------------- | ---------- |
+| T1 | `iggy` (root) | `CLUSTER kafka-cluster` with DESCRIBE and no other cluster operation; `TOPIC *` with all six operations; `GROUP *` with READ | Pass |
+| T2 | `consumer-only` | `TOPIC *` with DESCRIBE and READ only, `GROUP *` with READ, **no** WRITE and **no** CLUSTER | Pass |
+| T3 | `no-grants` | No output at all, and no error | Pass |
+
+T2 is the one that matters. It proves the mapping distinguishes principals rather than echoing a
+fixed set, and that the derived group binding appears for a principal Iggy would admit to a group.
+T3 proves an empty view is a successful answer rather than a failure, which is a distinction an
+admin tool prints very differently.
+
+T1 asserts the absence of `CLUSTER ALTER` rather than its presence. Iggy reads `manage_servers` in
+one rule, as an alias for `read_servers`, so rendering an alter grant from it would advertise an
+ability with nowhere to be used; [`ACL_MAPPING.md`](ACL_MAPPING.md) carries the argument.
+
+This procedure is now automated, in `gateways/kafka/tests/kafka_client_e2e_tests.rs`, driving the
+same `kafka-acls.sh` image against the same stack. The automated version runs two principals this
+table does not: one holding only `poll_messages` and one holding only `send_messages`, which are
+what separate the group binding's real source from polling. Run the manual procedure when changing
+the mapping by hand; otherwise the test is the faster check and the one CI enforces.
+
 #### Login cost
 
 Every authenticated connection costs one Iggy login. Measured against a debug build of both

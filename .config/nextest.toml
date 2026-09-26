@@ -59,6 +59,18 @@ max-threads = 4
 filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests) or binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)'
 test-group = "kafka_bridge"
 
+# The real-client suite spawns its own server too, so it needs serializing for the same reason, but
+# in its own group rather than queued behind the bridge tests: sharing one group would put six
+# container-driven tests behind twenty-one unrelated ones, serially, for no isolation gained. Both
+# groups cap their servers' shard pools themselves, so running the two alongside each other is
+# bounded.
+[test-groups.kafka_client_e2e]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests)'
+test-group = "kafka_client_e2e"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 

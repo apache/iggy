@@ -77,7 +77,9 @@ All API keys not listed above close the connection (see Governance model above) 
 | 10 | FindCoordinator | Consumer group — later issue |
 | 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
 | 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
-| 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
+| 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
+| 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 20+ | DeleteTopics, InitProducerId, transactions, etc. | Later issues |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
 
@@ -179,6 +181,9 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
       connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
       silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
       credential storage, not deferred
+- [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
+      bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
+      (31) are not implemented and not advertised
 - [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys

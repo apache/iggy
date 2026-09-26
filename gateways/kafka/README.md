@@ -74,6 +74,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
+- [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
 
 ### Delivery guarantees
 
@@ -130,12 +131,25 @@ Four things to know before switching it on:
   would let a second connection present any password. Connection churn is therefore server load.
   `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
   whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
-- **Authentication only, for now.** The gateway verifies the credentials and then drops the
-  session, because no handler consumes one yet. Iggy's permissions will decide what a principal can
-  do once Produce and Fetch are wired to it
+- **Authentication and an ACL view, not enforcement.** The gateway verifies the credentials and
+  can describe what Iggy grants the principal, but nothing gates an operation yet. Iggy's
+  permissions decide that once Produce and Fetch are wired to it
   ([#3535](https://github.com/apache/iggy/issues/3535),
-  [#3536](https://github.com/apache/iggy/issues/3536)); until then this is an admission gate, not
-  an identity carried onto the data plane. Do not read it as per-topic authorization yet.
+  [#3536](https://github.com/apache/iggy/issues/3536)).
+
+### ACLs
+
+`DescribeAcls` renders the authenticated principal's Iggy permissions as Kafka ACL bindings, so
+`kafka-acls.sh --list` works against the gateway. It is read only: `CreateAcls` and `DeleteAcls`
+are not implemented and not advertised.
+
+`--list` here is a snapshot of the caller's own grants, not the broker-wide dump it is against a
+Kafka cluster. A principal sees its own permissions and nobody else's, because the gateway holds no
+administrative credentials, so filtering on another `User:` returns an empty listing whatever that
+user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings, and the view is a snapshot
+taken when the connection authenticated, so a permission changed afterwards is invisible until the
+client reconnects. [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is
+deliberately left out.
 
 Full reasoning, including what was rejected and why, is in
 [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
