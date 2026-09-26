@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connectors::create_test_messages;
-use crate::connectors::fixtures::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
@@ -25,6 +23,13 @@ use iggy_connector_sdk::api::{ConnectorStatus, SinkInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
+use s3::{
+    command::Command,
+    request::{Request, tokio_backend::ReqwestRequest},
+};
+
+use crate::connectors::create_test_messages;
+use crate::connectors::fixtures::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 
 const API_KEY: &str = "test-api-key";
 const S3_SINK_KEY: &str = "s3";
@@ -60,14 +65,28 @@ async fn s3_sink_initializes_and_runs(harness: &TestHarness, fixture: S3SinkFixt
         keys.is_empty(),
         "Startup must not publish probe objects: {keys:?}"
     );
-    let uploads = fixture
-        .bucket()
-        .list_multiparts_uploads(None, None)
+    // Floci 2.1.0 omits IsTruncated from empty listings, which rust-s3 requires.
+    let uploads_request = ReqwestRequest::new(
+        fixture.bucket(),
+        "/",
+        Command::ListMultipartUploads {
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            max_uploads: None,
+        },
+    )
+    .await
+    .expect("Prepare multipart listing");
+    let uploads_response = uploads_request
+        .response_data(false)
         .await
         .expect("List multipart uploads");
+    assert_eq!(uploads_response.status_code(), 200);
+    let uploads_xml = uploads_response.as_str().expect("Read multipart uploads");
     assert!(
-        uploads.iter().all(|page| page.uploads.is_empty()),
-        "Startup must abort its multipart probe: {uploads:?}"
+        !uploads_xml.contains("<Upload"),
+        "Startup must abort its multipart probe: {uploads_xml}"
     );
 
     drop(fixture);
