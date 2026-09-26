@@ -91,9 +91,22 @@ pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+/// `CreateTopics`: a manual partition `assignments` list whose partition indices are not exactly
+/// `0..assignments.len()` in some order, or repeat an index.
+///
+/// Matches real Kafka's `ReplicationControlManager.createTopic`, which validates the assignment
+/// map's keys the same way regardless of what a client's replica list under each key says (this
+/// bridge doesn't model replicas at all, so only the key set is checked).
+pub const ERROR_INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 /// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// `CreateTopics`: a requested topic carried one or more per-topic Kafka configs.
+///
+/// None of `retention.ms`, `cleanup.policy`, etc. maps onto an Iggy topic option this bridge
+/// applies, so every non-empty `configs` list is rejected outright rather than silently dropping
+/// a subset an operator might believe took effect.
+pub const ERROR_INVALID_CONFIG: i16 = 40;
 /// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
 ///
 /// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
@@ -101,6 +114,11 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// Non-retriable, so a Java client resolves immediately instead of retrying
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+/// `CreateTopics`: request addressed more distinct topics than this bridge admits in one call.
+///
+/// A server-imposed limit, not a malformed request - `INVALID_REQUEST` would blame the client for
+/// a request Kafka itself would accept.
+pub const ERROR_POLICY_VIOLATION: i16 = 44;
 /// A credential was refused. Deliberately undifferentiated: Iggy answers a bad password and an
 /// unknown user the same way, and distinguishing them here would reintroduce a user-enumeration
 /// oracle.

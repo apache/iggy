@@ -637,3 +637,270 @@ async fn high_watermark_rejects_a_padded_kafka_topic_name() {
         .expect_err("a padded Kafka topic name must be rejected before any Iggy lookup");
     assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
 }
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_returns_none_when_neither_stream_nor_topic_exists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup against a nonexistent stream must not error");
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_returns_none_when_the_stream_exists_but_the_topic_does_not() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    // Creates the mapped stream ("kafka", the default) without the "orders" topic in it, so the
+    // stream-exists / topic-missing branch is reachable independently of the neither-exists one.
+    bridge
+        .ensure_stream_and_topic("different-topic", 1)
+        .await
+        .expect("seed a different topic under the same default stream");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup against an existing stream with no matching topic must not error");
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_finds_a_topic_created_through_ensure_stream_and_topic() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("seed the topic this lookup should find");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup call")
+        .expect("topic was just created, must be found");
+    assert_eq!(found.name, "orders");
+    assert_eq!(found.partitions_count, 3);
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_reports_the_kafka_side_name_through_a_real_topic_mapping_override() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut topics = HashMap::new();
+    topics.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "commerce".to_string(),
+            topic: "orders-v2".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new("kafka".to_string(), topics)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the mapped stream/topic");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup call")
+        .expect("resolves through the override to the real Iggy topic");
+    // The Iggy-side name under the override ("orders-v2"), not the Kafka-side name asked about -
+    // TopicDetails carries only what the server itself knows the topic as.
+    assert_eq!(found.name, "orders-v2");
+}
+
+#[tokio::test]
+#[serial]
+async fn ensure_stream_and_topic_rejects_zero_partitions() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let err = bridge
+        .ensure_stream_and_topic("orders", 0)
+        .await
+        .expect_err("zero partitions must not provision an unproducible topic");
+
+    assert_eq!(
+        err.to_kafka_error_code(),
+        iggy_gateway_kafka::protocol::api::ERROR_INVALID_PARTITIONS
+    );
+    match err {
+        BridgeError::InvalidPartitionCount { kafka_topic } => {
+            assert_eq!(kafka_topic, "orders");
+        }
+        other => panic!("expected InvalidPartitionCount, got {other:?}"),
+    }
+
+    // No stream must have been created either - rejected before ensure_stream runs.
+    let raw = raw_client(&server).await;
+    let streams = raw.get_streams().await.expect("get_streams call");
+    assert!(
+        streams.is_empty(),
+        "zero-partition request must not leave a dangling stream behind"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_is_empty_when_nothing_exists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let topics = bridge
+        .list_kafka_topics()
+        .await
+        .expect("listing against a nonexistent default stream must not error");
+    assert!(topics.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_lists_every_default_stream_topic() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("seed orders");
+    bridge
+        .ensure_stream_and_topic("payments", 1)
+        .await
+        .expect("seed payments");
+
+    let mut topics = bridge.list_kafka_topics().await.expect("list call");
+    topics.sort_by(|a, b| a.kafka_topic.cmp(&b.kafka_topic));
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 3);
+    assert_eq!(topics[1].kafka_topic, "payments");
+    assert_eq!(topics[1].partitions_count, 1);
+}
+
+/// Regression test: an override's target Iggy topic, when it lives in the default stream, must
+/// be listed exactly once - under its Kafka-side (override) name - not a second time under its
+/// raw Iggy name when the default stream's topics are enumerated.
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_does_not_duplicate_an_override_target_living_in_the_default_stream() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let default_stream = config.topic_mapping.default_stream().to_string();
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: default_stream.clone(),
+            topic: "orders_internal".to_string(),
+        },
+    );
+    // Required by `TopicMapping::new`'s own anti-aliasing check: an override targeting the
+    // default stream must not leave its own target name `over.topic` free for an unmapped Kafka
+    // topic of that literal name to alias by accident. Never fires in this test - it exists only
+    // to satisfy that check, since no Kafka topic literally named "orders_internal" is ever used.
+    overrides.insert(
+        "orders_internal".to_string(),
+        TopicOverride {
+            stream: "elsewhere".to_string(),
+            topic: "orders_internal".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new(default_stream, overrides)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the mapped topic");
+
+    let topics = bridge.list_kafka_topics().await.expect("list call");
+    assert_eq!(
+        topics.len(),
+        1,
+        "must list the override's target exactly once, not once per (override name, raw Iggy \
+         name): {topics:?}"
+    );
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 2);
+}
+
+/// An override targeting a non-default stream is listed under its Kafka-side name, alongside
+/// whatever the default stream itself holds - the two enumeration sources don't interfere.
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_lists_an_override_target_in_a_non_default_stream_alongside_default_stream_topics()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "orders_v2".to_string(),
+        },
+    );
+    config.topic_mapping =
+        TopicMapping::new(config.topic_mapping.default_stream().to_string(), overrides)
+            .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the overridden topic in the billing stream");
+    bridge
+        .ensure_stream_and_topic("payments", 1)
+        .await
+        .expect("seed a plain default-stream topic");
+
+    let mut topics = bridge.list_kafka_topics().await.expect("list call");
+    topics.sort_by(|a, b| a.kafka_topic.cmp(&b.kafka_topic));
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 2);
+    assert_eq!(topics[1].kafka_topic, "payments");
+    assert_eq!(topics[1].partitions_count, 1);
+}

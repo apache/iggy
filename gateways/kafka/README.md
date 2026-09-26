@@ -2,13 +2,19 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
-> **Stub warning:** most APIs still don't persist or read real data. Produce and Fetch return
+> **Stub warning:** Produce and Fetch still don't persist or read real data - they return
 > retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. CreateTopics does **not** create topics; valid requests return
-> `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. ListOffsets is wired
-> to the Iggy bridge: with `IGGY_KAFKA_BRIDGE_ENABLED=true` it answers `EARLIEST`/`LATEST` from
-> real partition state; with the bridge off (the default) it stays a stub and answers
-> `NOT_LEADER_OR_FOLLOWER` (6). See [docs/SCOPE.md](docs/SCOPE.md).
+> trusting a fake success. CreateTopics, Metadata, and ListOffsets are wired to the Iggy bridge:
+> with `IGGY_KAFKA_BRIDGE_ENABLED=true`, CreateTopics creates a real Iggy stream/topic, Metadata
+> reports real topics and partition counts (a topic not requested by name and not found is
+> silently absent from a null-topics "list all" response, and `UNKNOWN_TOPIC_OR_PARTITION` when
+> named explicitly), and ListOffsets answers `EARLIEST`/`LATEST` from real partition state; with
+> the bridge off (the default), all three stay stubs - CreateTopics answers `NOT_CONTROLLER` (41),
+> Metadata reports every requested topic unknown, and ListOffsets answers `NOT_LEADER_OR_FOLLOWER`
+> (6). **CreateTopics has no authentication gate yet**: with the bridge on, any client that can
+> reach this port can create topics (up to 1000 partitions each) as the bridge's own Iggy user,
+> until SASL ([#3549](https://github.com/apache/iggy/issues/3549)) lands. See
+> [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
