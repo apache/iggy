@@ -108,6 +108,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Configures the binary transport to restore the session
+    /// automatically after a reconnect.
+    pub fn with_reconnecting_login(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auto_login = Some(AutoLoginConfig::new(username, password));
+        self.reconnecting_login = true;
+        self
+    }
+
     /// Enable TCP_NODELAY (only affects TCP transport).
     pub fn with_nodelay(mut self) -> Self {
         self.tcp_nodelay = true;

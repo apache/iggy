@@ -44,9 +44,8 @@ pub const EXT_SHORT_PASSWORD: &str = "ext-short-pass";
 pub const EXT_MAPPED_USER_ID: u32 = 42;
 
 /// Stream id the scoped grant targets. Tests must create a stream whose
-/// numeric id matches (the first stream created after the root stream is
-/// usually id 1).
-pub const EXT_SCOPED_STREAM_ID: usize = 1;
+/// numeric id matches (the first stream created gets slab index 0).
+pub const EXT_SCOPED_STREAM_ID: usize = 0;
 
 fn now_plus(secs: u64) -> u64 {
     std::time::SystemTime::now()
