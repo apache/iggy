@@ -100,8 +100,9 @@ Key new minimums:
 | 68 | **ConsumerGroupHeartbeat** | 0 | 1 | v0 | 🟠 Required Stub |
 | 69 | **ConsumerGroupDescribe** | 0 | 1 | v0 | 🟡 Optional Stub |
 
-> ⚠️ Kafka 4.0 clients use the **new group protocol by default** and will send key 68.
-> A gateway that hard-rejects this breaks all modern Kafka consumers.
+> ⚠️ Kafka 4.0 consumers still default to `group.protocol=classic`. Only a consumer configured
+> with `group.protocol=consumer` sends key 68, and a gateway that hard-rejects it breaks that
+> consumer.
 
 ---
 
@@ -276,20 +277,27 @@ Key new minimums:
 | Metadata | v0-v9 | v12 | 3 versions behind |
 | ApiVersions | v0-v3 | v4 | 1 version behind |
 | CreateTopics | v2-v5 | v7 | 2 versions behind |
+| FindCoordinator | v0-v4 | v6 | 2 versions behind |
+| JoinGroup | v0-v9 | v9 | current |
+| Heartbeat | v0-v4 | v4 | current |
+| LeaveGroup | v0-v5 | v5 | current |
+| SyncGroup | v0-v5 | v5 | current |
 
-### Missing from `SUPPORTED_RANGES` (82 of the 88 API keys in this document)
+### Missing from `SUPPORTED_RANGES` (77 of the 88 API keys in this document)
 
 Every key not in `SUPPORTED_RANGES` closes the connection - the same policy applied to every
 other unlisted key, not a special case for these. No api-specific response schema exists for an
 unlisted key, so any body the gateway could send would be misparsed by the client against the
 schema it expected. This includes:
 
-- **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
-- **Classic consumer group protocol**: JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
-- **New consumer group protocol**: ConsumerGroupHeartbeat (68) — default in Kafka 4.0
+- **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9)
+- **New consumer group protocol**: ConsumerGroupHeartbeat (68), opt-in via `group.protocol=consumer` (the 4.0 default is still `classic`)
 - **Share groups (KIP-932)**: ShareFetch, ShareGroupHeartbeat, ShareAcknowledge
 - **Auth flow**: SaslHandshake (17), SaslAuthenticate (36)
 - **All broker/KRaft-internal keys** (Group 14)
+
+The classic consumer group keys FindCoordinator (10), JoinGroup (11), Heartbeat (12),
+LeaveGroup (13) and SyncGroup (14) are supported - see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 Remaining scope (consumer groups, auth, admin/tuning) is tracked in `SCOPE.md`'s TODO section,
 not duplicated here.

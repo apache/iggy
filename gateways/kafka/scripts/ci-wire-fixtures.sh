@@ -24,7 +24,7 @@ set -euo pipefail
 FIXTURES_DIR="gateways/kafka/tools/kafka-tool/kafka_messages"
 
 # API keys requested by api_handler_tests, version_firewall_tests, and server_e2e_tests.
-FIXTURE_API_KEYS=(0 1 2 19)
+FIXTURE_API_KEYS=(0 1 2 10 11 12 13 14 19)
 
 usage() {
   echo "Usage: $0 {generate|cleanup}" >&2

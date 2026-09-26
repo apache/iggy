@@ -20,14 +20,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use kafka_protocol::messages::{SaslAuthenticateRequest, SaslHandshakeRequest};
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::IggyBridge;
 use crate::error::Result;
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::bounds_guard::{
     validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, list_offsets, metadata, produce,
+    api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
+    join_group, leave_group, list_offsets, metadata, produce, sync_group,
 };
 use crate::protocol::sasl::{
     SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
@@ -37,6 +40,11 @@ pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
+pub const API_KEY_FIND_COORDINATOR: i16 = 10;
+pub const API_KEY_JOIN_GROUP: i16 = 11;
+pub const API_KEY_HEARTBEAT: i16 = 12;
+pub const API_KEY_LEAVE_GROUP: i16 = 13;
+pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
@@ -68,6 +76,22 @@ pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// call is made - a real Kafka client library validates topic names client-side and would never
 /// send one of these, but a raw/non-conformant client could.
 pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
+/// Retriable. Sent when this coordinator is at one of its `GroupCoordinatorConfig` capacity
+/// caps: the client should back off and retry rather than treat the group as unusable.
+pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
+/// Retriable. Sent to a parked `JoinGroup`/`SyncGroup` waiter when the gateway starts draining,
+/// so a shutdown does not hold a connection open for a full rebalance timeout.
+pub const ERROR_NOT_COORDINATOR: i16 = 16;
+/// The member's generation is not the group's current one; it must rejoin.
+pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
+/// No protocol name is supported by every member, or the first member sent an empty protocol
+/// type / empty protocol list.
+pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+pub const ERROR_INVALID_GROUP_ID: i16 = 24;
+pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
+pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
+/// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
+pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
 /// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
 ///
 /// Still not `SASL_AUTHENTICATION_FAILED`, and now for a firmer reason than when this was written:
@@ -101,10 +125,21 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// Non-retriable, so a Java client resolves immediately instead of retrying
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+/// `FindCoordinator` for a transaction coordinator, which the gateway has none of.
+///
+/// The one code both the Java client and librdkafka treat as fatal for that lookup: anything else,
+/// `INVALID_REQUEST` included, sends librdkafka into a 500ms retry loop that never ends.
+pub const ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 /// A credential was refused. Deliberately undifferentiated: Iggy answers a bad password and an
 /// unknown user the same way, and distinguishing them here would reintroduce a user-enumeration
 /// oracle.
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
+/// KIP-394: a `JoinGroup` v4+ with an empty member id is answered with a freshly minted id and
+/// this code, and the client rejoins carrying it.
+pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
+pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
+/// Sent only by `LeaveGroup`: the member id does not hold the `group_instance_id` it named.
+pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -180,6 +215,11 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     metadata::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    find_coordinator::RANGE,
+    join_group::RANGE,
+    heartbeat::RANGE,
+    leave_group::RANGE,
+    sync_group::RANGE,
 ];
 
 #[must_use]
@@ -202,6 +242,9 @@ pub struct GatewayState {
     /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed. Kept on the
     /// shared state so `ApiVersions` can answer without a widened handler signature.
     pub sasl_enabled: bool,
+    /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
+    /// the connection that created it, and group coordination needs no Iggy call.
+    pub groups: GroupCoordinator,
 }
 
 impl GatewayState {
@@ -211,19 +254,29 @@ impl GatewayState {
         bridge: Option<Arc<IggyBridge>>,
         max_frame_size: usize,
         sasl_enabled: bool,
+        groups: GroupCoordinator,
     ) -> Self {
         Self {
             broker,
             bridge,
             max_frame_size,
             sasl_enabled,
+            groups,
         }
     }
 
     /// State with no bridge, so every handler takes its stub path.
+    ///
+    /// The coordinator is real but fresh, so two calls never share group state.
     #[must_use]
-    pub const fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
-        Self::new(broker, None, max_frame_size, false)
+    pub fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+        Self::new(
+            broker,
+            None,
+            max_frame_size,
+            false,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        )
     }
 }
 

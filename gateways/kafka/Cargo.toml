@@ -64,6 +64,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
@@ -71,7 +72,14 @@ zstd = { workspace = true }
 crc32c = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "test-util",
+] }
 
 [lints.clippy]
 enum_glob_use = "deny"

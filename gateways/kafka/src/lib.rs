@@ -21,6 +21,7 @@ pub mod auth;
 pub mod bridge;
 pub mod env;
 pub mod error;
+pub mod group;
 pub mod protocol;
 pub mod records;
 pub mod server;
