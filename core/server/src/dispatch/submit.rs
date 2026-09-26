@@ -83,15 +83,22 @@ where
                 shard::MetadataSubmit::Register {
                     vsr_client_id,
                     user_id,
+                    session_permissions,
                     reply,
                 } => {
-                    let bound =
-                        submit_register_local_or_forward(&shard, vsr_client_id, user_id).await;
+                    let bound = submit_register_local_or_forward(
+                        &shard,
+                        vsr_client_id,
+                        user_id,
+                        session_permissions.as_ref(),
+                    )
+                    .await;
                     let _ = reply.try_send(bound);
                 }
                 shard::MetadataSubmit::ForwardedRegister {
                     vsr_client_id,
                     user_id,
+                    session_permissions,
                     nonce,
                     origin_replica,
                 } => {
@@ -101,6 +108,7 @@ where
                         user_id,
                         nonce,
                         origin_replica,
+                        session_permissions.as_ref(),
                     )
                     .await;
                 }

@@ -537,7 +537,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, None);
         // Progress past registration; a rebind must dispatch regardless.
         let app_reply = synthesize_send_messages_reply(&consensus, client_id, 1, 18);
         client_table
@@ -602,11 +602,11 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, None);
         let rebind_reply = synthesize_register_reply(&consensus, client_id, 25);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, rebind_reply);
+            .commit_register(client_id, ACTING_USER_ID, rebind_reply, None);
 
         // Zombie still stamping epoch 1: fenced.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
@@ -642,7 +642,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, None);
 
         // Client claims epoch 99 (> 1), client bug.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
@@ -704,7 +704,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, None);
         for (request, commit) in [(3u64, 98u64), (5, 100)] {
             let reply = synthesize_send_messages_reply(&consensus, client_id, request, commit);
             client_table
@@ -741,7 +741,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, None);
         // Enough replies to exhaust the retention budget, so request 1's is
         // certain to have been dropped.
         let requests = (REPLY_RING_RETENTION_BYTES / size_of::<ReplyHeader>() + 8) as u64;
@@ -781,7 +781,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, OWNER, initial_reply);
+            .commit_register(client_id, OWNER, initial_reply, None);
 
         assert!(
             !register_preflight(&consensus, &client_table, client_id, IMPOSTOR),
@@ -813,7 +813,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, None);
         let advanced = synthesize_send_messages_reply(&consensus, client_id, 2, 99);
         client_table
             .borrow_mut()

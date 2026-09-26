@@ -22,6 +22,7 @@ use super::server::{
     TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use super::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
+use crate::server_config::external_auth::ExternalAuthConfig;
 
 static_toml::static_toml! {
     // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).
@@ -259,6 +260,21 @@ impl Default for TelemetryTracesConfig {
         TelemetryTracesConfig {
             transport: SERVER_CONFIG.telemetry.traces.transport.parse().unwrap(),
             endpoint: SERVER_CONFIG.telemetry.traces.endpoint.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for ExternalAuthConfig {
+    fn default() -> ExternalAuthConfig {
+        ExternalAuthConfig {
+            enabled: SERVER_CONFIG.external_auth.enabled,
+            url: SERVER_CONFIG.external_auth.url.parse().unwrap(),
+            timeout: SERVER_CONFIG.external_auth.timeout.parse().unwrap(),
+            forward_credentials: SERVER_CONFIG.external_auth.forward_credentials,
+            user_id: u32::try_from(SERVER_CONFIG.external_auth.user_id).expect(
+                "static_toml external_auth.user_id must fit in u32 (0..=4294967295); \
+                 fix core/server/config.toml",
+            ),
         }
     }
 }

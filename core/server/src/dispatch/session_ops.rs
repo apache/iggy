@@ -64,7 +64,7 @@ use server_common::Message;
 use server_common::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::warn;
 
@@ -119,14 +119,13 @@ where
             let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
             return Err(LoginRegisterError::InvalidCredentials);
         };
-        // Verify before the status check and collapse inactive to
-        // InvalidCredentials: an inactive account must answer exactly like a
-        // wrong password (same error, same Argon2 cost), or login could probe
-        // which accounts exist but are disabled.
+        // The user exists locally. Wrong password or inactive account is
+        // `LocalUserRejected` (not `InvalidCredentials`) so the external
+        // auth fallback is never attempted for known local users.
         if !crypto::verify_password(password, user.password_hash.as_ref())
             || user.status != UserStatus::Active
         {
-            return Err(LoginRegisterError::InvalidCredentials);
+            return Err(LoginRegisterError::LocalUserRejected);
         }
         Ok(user.id)
     })
@@ -202,6 +201,7 @@ where
 }
 
 #[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_arguments)]
 async fn complete_login_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -210,6 +210,7 @@ async fn complete_login_register<B, MJ, S, SB>(
     request_header: &RoutedRequestHeader,
     user_id: u32,
     client_version: &ClientVersionInfo,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Result<(), LoginRegisterError>
 where
     B: ShellBus,
@@ -256,15 +257,16 @@ where
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
-        // The wire reply carries only the fence epoch; the SDK numbers its
-        // own requests, so the bind watermark is not surfaced (see the
-        // BoundSession doc for who does consume it).
-        Ok(bound) => bound.epoch,
-        Err(error) => {
-            return Err(LoginRegisterError::Transient(error));
-        }
-    };
+    let session =
+        match submit_register_on_owner(shard, vsr_client_id, user_id, session_permissions).await {
+            // The wire reply carries only the fence epoch; the SDK numbers its
+            // own requests, so the bind watermark is not surfaced (see the
+            // BoundSession doc for who does consume it).
+            Ok(bound) => bound.epoch,
+            Err(error) => {
+                return Err(LoginRegisterError::Transient(error));
+            }
+        };
 
     // Post-commit: Connected -> Authenticated -> Bound in a single borrow with
     // no await in between, so the intermediate Authenticated state is never
@@ -383,7 +385,9 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials
+        | LoginRegisterError::LocalUserRejected
+        | LoginRegisterError::ExternalAuthDenied(_) => EvictionReason::InvalidCredentials,
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
@@ -505,6 +509,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     user_id: u32,
     nonce: u128,
     origin_replica: u8,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -525,7 +530,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     let bound = shard
         .plane
         .metadata()
-        .submit_register_in_process(vsr_client_id, user_id)
+        .submit_register_in_process(vsr_client_id, user_id, session_permissions)
         .await;
     // `view` predates the await above, which parks with no deadline, so the
     // sealed value can be stale by send time. The origin routes the result by
@@ -596,6 +601,7 @@ pub(in crate::dispatch) async fn submit_register_local_or_forward<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -620,15 +626,22 @@ where
         return shard
             .plane
             .metadata()
-            .submit_register_in_process(vsr_client_id, user_id)
+            .submit_register_in_process(vsr_client_id, user_id, session_permissions)
             .await;
     }
 
     let nonce = shard.next_forward_nonce(self_replica);
     let (reply, outcome) = shard::channel::<ForwardRegisterResultHeader>(1);
     shard.park_register_forward(nonce, vsr_client_id, reply);
-    let forward =
-        build_forward_register_message(cluster, view, self_replica, vsr_client_id, nonce, user_id);
+    let forward = build_forward_register_message(
+        cluster,
+        view,
+        self_replica,
+        vsr_client_id,
+        nonce,
+        user_id,
+        session_permissions,
+    );
     if let Err(error) = shard
         .bus
         .send_to_replica(target, forward.into_generic().into_frozen())
@@ -699,6 +712,8 @@ const fn forward_register_outcome(
     }
 }
 
+const MAX_FORWARD_REGISTER_BODY: usize = 4096 - HEADER_SIZE;
+
 #[allow(clippy::cast_possible_truncation)]
 fn build_forward_register_message(
     cluster: u128,
@@ -707,20 +722,31 @@ fn build_forward_register_message(
     client: u128,
     nonce: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Message<ForwardRegisterHeader> {
-    Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
-        |_, header: &mut ForwardRegisterHeader| {
-            header.command = Command::ForwardRegister;
-            header.cluster = cluster;
-            header.view = view;
-            header.replica = replica;
-            header.client = client;
-            header.nonce = nonce;
-            header.user_id = user_id;
-            header.size = HEADER_SIZE as u32;
-            header.seal();
-        },
-    )
+    let body_bytes = session_permissions
+        .and_then(|p| rmp_serde::to_vec(p).ok())
+        .filter(|b| b.len() <= MAX_FORWARD_REGISTER_BODY)
+        .unwrap_or_default();
+    let total_size = HEADER_SIZE + body_bytes.len();
+    let mut msg = Message::<ForwardRegisterHeader>::new(total_size);
+    {
+        let header = bytemuck::checked::try_from_bytes_mut::<ForwardRegisterHeader>(
+            &mut msg.as_mut_slice()[..HEADER_SIZE],
+        )
+        .expect("zeroed bytes are a valid ForwardRegisterHeader");
+        header.command = Command::ForwardRegister;
+        header.cluster = cluster;
+        header.view = view;
+        header.replica = replica;
+        header.client = client;
+        header.nonce = nonce;
+        header.user_id = user_id;
+        header.size = total_size as u32;
+        header.seal();
+    }
+    msg.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body_bytes);
+    msg
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -954,6 +980,7 @@ pub async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -963,12 +990,19 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return submit_register_local_or_forward(shard, vsr_client_id, user_id).await;
+        return submit_register_local_or_forward(
+            shard,
+            vsr_client_id,
+            user_id,
+            session_permissions,
+        )
+        .await;
     }
     let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
+        session_permissions: session_permissions.cloned(),
         reply,
     });
     // The owner's outcome, verbatim in both directions. `Canceled` is only for a
@@ -1159,6 +1193,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RoutedRequestHeader>,
+    external_auth: &Arc<configs::external_auth::ExternalAuthConfig>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1211,10 +1246,21 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     }
 
     let body_tail = &body[prefix_len..];
+
+    // Built-in credentials first so known users never hit the external
+    // auth callout. External auth runs only when built-in rejects.
+    //
+    // The external auth block (below the built-in check) needs the
+    // decoded wire request to build the callout payload. Decode once
+    // here and reuse.
+    let password_decode =
+        LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail).ok();
+    let pat_decode =
+        LoginRegisterWithPatRequest::decode_after_prefix(version_info.clone(), body_tail).ok();
+
+    // --- built-in credential check ---
     let mut credentials_rejected = false;
-    if let Ok((wire_request, _)) =
-        LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
-    {
+    if let Some((ref wire_request, _)) = password_decode {
         match verify_login_credentials(
             shard,
             wire_request.username.as_str(),
@@ -1229,6 +1275,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &wire_request.version_info,
+                    None,
                 )
                 .await
                 {
@@ -1254,9 +1301,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         }
     }
 
-    if let Ok((wire_request, _)) =
-        LoginRegisterWithPatRequest::decode_after_prefix(version_info, body_tail)
-    {
+    if let Some((ref wire_request, _)) = pat_decode {
         match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
             Ok(user_id) => {
                 if let Err(error) = complete_login_register(
@@ -1267,56 +1312,277 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &wire_request.version_info,
+                    None,
                 )
                 .await
                 {
-                    warn!(
-                        transport_client_id,
-                        error = %error,
-                        "login/register with PAT failed"
-                    );
+                    warn!(transport_client_id, error = %error, "login/register with PAT failed");
                     surface_login_failure(shard, transport_client_id, request.header(), &error)
                         .await;
                 }
                 return;
             }
             Err(error) => {
+                if error.is_invalid_credentials() {
+                    credentials_rejected = true;
+                } else {
+                    warn!(transport_client_id, error = %error, "login/register with PAT failed");
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    // --- external auth fallback (only on credential rejection) ---
+    if credentials_rejected && external_auth.enabled {
+        let transport_name = {
+            use message_bus::installer::conn_info::ClientTransportKind;
+            let mgr = sessions.borrow();
+            match mgr.connection_transport(transport_client_id) {
+                Some(ClientTransportKind::Tcp | ClientTransportKind::TcpTls) => "tcp",
+                Some(ClientTransportKind::Quic) => "quic",
+                Some(ClientTransportKind::Ws | ClientTransportKind::Wss) => "websocket",
+                Some(_) | None => "binary",
+            }
+        };
+        let ext_request = if let Some((ref wire_request, _)) = password_decode {
+            crate::external_auth::ExternalAuthRequest {
+                credential_type: crate::external_auth::CredentialType::Password,
+                credential: if external_auth.forward_credentials {
+                    Some(wire_request.password.expose_secret().to_owned())
+                } else {
+                    None
+                },
+                username: wire_request.username.to_string(),
+                transport: transport_name.to_owned(),
+                client_address: sessions
+                    .borrow()
+                    .connection_address(transport_client_id)
+                    .map_or_else(String::new, |a| a.to_string()),
+            }
+        } else if let Some((ref wire_request, _)) = pat_decode {
+            crate::external_auth::ExternalAuthRequest {
+                credential_type: crate::external_auth::CredentialType::PersonalAccessToken,
+                credential: if external_auth.forward_credentials {
+                    Some(wire_request.token.expose_secret().to_owned())
+                } else {
+                    None
+                },
+                username: String::new(),
+                transport: transport_name.to_owned(),
+                client_address: sessions
+                    .borrow()
+                    .connection_address(transport_client_id)
+                    .map_or_else(String::new, |a| a.to_string()),
+            }
+        } else {
+            warn!(
+                transport_client_id,
+                "rejecting register request with unsupported payload shape"
+            );
+            send_eviction(
+                shard,
+                transport_client_id,
+                vsr_client_id,
+                EvictionReason::MalformedLogin,
+                "login_rejection",
+            )
+            .await;
+            return;
+        };
+
+        match crate::external_auth::callout_external_auth(external_auth, ext_request).await {
+            Ok(crate::external_auth::ExternalAuthDecision::IggyUser { user_id }) => {
+                if user_id == 0 {
+                    warn!(
+                        transport_client_id,
+                        "external auth attempted to map login to root user"
+                    );
+                    send_eviction(
+                        shard,
+                        transport_client_id,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                        "login_rejection",
+                    )
+                    .await;
+                    return;
+                }
+                if user_id == external_auth.user_id {
+                    warn!(
+                        transport_client_id,
+                        user_id, "external auth returned the reserved user_id; rejecting"
+                    );
+                    send_eviction(
+                        shard,
+                        transport_client_id,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                        "login_rejection",
+                    )
+                    .await;
+                    return;
+                }
+                let user_valid = shard.plane.metadata().mux_stm.users().read(|users| {
+                    users
+                        .items
+                        .get(user_id as usize)
+                        .is_some_and(|u| u.status == UserStatus::Active)
+                });
+                if !user_valid {
+                    warn!(
+                        transport_client_id,
+                        user_id, "external auth mapped to non-existent or inactive user"
+                    );
+                    send_eviction(
+                        shard,
+                        transport_client_id,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                        "login_rejection",
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    transport_client_id,
+                    vsr_client_id,
+                    request.header(),
+                    user_id,
+                    &version_info,
+                    None,
+                )
+                .await
+                {
+                    warn!(transport_client_id, error = %error, "external auth login failed");
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
+                }
+                return;
+            }
+            Ok(crate::external_auth::ExternalAuthDecision::InlineGrant {
+                principal,
+                permissions,
+                expires_at,
+            }) => {
+                // Use the bus clock for consistency with PAT expiry.
+                // Under the deterministic simulator IggyTimestamp::now() diverges
+                // from the bus clock, which would cause replica disagreement on
+                // whether an inline grant is expired.
+                let now_secs = IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+                if expires_at <= now_secs {
+                    warn!(
+                        transport_client_id,
+                        expires_at, now_secs, "external auth inline grant already expired"
+                    );
+                    surface_login_failure(
+                        shard,
+                        transport_client_id,
+                        request.header(),
+                        &LoginRegisterError::ExternalAuthDenied(
+                            "inline grant already expired".to_owned(),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                let reserved_uid = external_auth.user_id;
+                tracing::debug!(
+                    transport_client_id,
+                    principal,
+                    expires_at,
+                    "external auth inline grant accepted"
+                );
+                let perms_arc = std::sync::Arc::new(permissions);
+                sessions.borrow_mut().set_session_permissions(
+                    transport_client_id,
+                    crate::external_auth::SessionPermissions {
+                        permissions: std::sync::Arc::clone(&perms_arc),
+                        expires_at,
+                    },
+                );
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    transport_client_id,
+                    vsr_client_id,
+                    request.header(),
+                    reserved_uid,
+                    &version_info,
+                    Some(&perms_arc),
+                )
+                .await
+                {
+                    warn!(transport_client_id, error = %error, "external auth inline grant login failed");
+                    sessions
+                        .borrow_mut()
+                        .clear_session_permissions(transport_client_id);
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
+                }
+                return;
+            }
+            Ok(crate::external_auth::ExternalAuthDecision::Deny { reason }) => {
+                warn!(
+                    transport_client_id,
+                    reason = reason,
+                    "external auth denied login"
+                );
+                surface_login_failure(
+                    shard,
+                    transport_client_id,
+                    request.header(),
+                    &LoginRegisterError::ExternalAuthDenied(reason),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
                 warn!(
                     transport_client_id,
                     error = %error,
-                    "login/register with PAT failed"
+                    "external auth callout failed"
                 );
-                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
+                surface_login_failure(
+                    shard,
+                    transport_client_id,
+                    request.header(),
+                    &LoginRegisterError::ExternalAuthDenied(error.to_string()),
+                )
+                .await;
                 return;
             }
         }
     }
 
-    if credentials_rejected {
+    if !credentials_rejected {
         warn!(
             transport_client_id,
-            "rejecting register request: invalid credentials"
+            "rejecting register request with unsupported payload shape"
         );
         send_eviction(
             shard,
             transport_client_id,
             request.header().client,
-            EvictionReason::InvalidCredentials,
+            EvictionReason::MalformedLogin,
             "login_rejection",
         )
         .await;
         return;
     }
-
     warn!(
         transport_client_id,
-        "rejecting register request with unsupported payload shape"
+        "rejecting register request: invalid credentials"
     );
     send_eviction(
         shard,
         transport_client_id,
         request.header().client,
-        EvictionReason::MalformedLogin,
+        EvictionReason::InvalidCredentials,
         "login_rejection",
     )
     .await;
@@ -1496,6 +1762,7 @@ mod tests {
                 client,
                 ACTING_USER,
                 register_reply(client, SESSION),
+                None,
             );
         }
         // A's transport connection, authenticated + bound — the state a
@@ -1589,7 +1856,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, USER).await
+                submit_register_local_or_forward(&shard, CLIENT, USER, None).await
             })
         };
         await_forward(&bus).await;
@@ -1707,7 +1974,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, 0xCAFE, 7).await
+                submit_register_local_or_forward(&shard, 0xCAFE, 7, None).await
             })
         };
         await_forward(&bus).await;
@@ -1736,7 +2003,7 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
 
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, None).await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         assert!(
             outcome.unwrap_err().is_transient(),
@@ -1835,7 +2102,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, 7).await
+                submit_register_local_or_forward(&shard, CLIENT, 7, None).await
             })
         };
         await_forward(&bus).await;
@@ -1882,7 +2149,7 @@ mod tests {
         // matters is that nothing left over the interconnect.
         let _ = compio::time::timeout(
             Duration::from_millis(50),
-            submit_register_local_or_forward(&shard, 0xCAFE, 7),
+            submit_register_local_or_forward(&shard, 0xCAFE, 7, None),
         )
         .await;
         assert!(
@@ -1898,7 +2165,7 @@ mod tests {
         let bus = SpyBus::default();
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, incarnation));
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, None).await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         bus.sole_replica_send::<ForwardRegisterHeader>().1.nonce
     }

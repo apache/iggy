@@ -26,9 +26,10 @@
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
 use crate::cluster_meta::ClusterRoster;
+use crate::external_auth::SessionPermissions;
 use ahash::AHashMap;
 use consensus::client_table::SessionAttachment;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, Permissions};
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::net::SocketAddr;
@@ -117,6 +118,7 @@ pub struct Connection {
     /// session it binds.
     pub metadata_watermark: u64,
     consumer_session: Option<(u128, SessionAttachment)>,
+    pub session_permissions: Option<SessionPermissions>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -185,6 +187,7 @@ impl SessionManager {
                 sdk: None,
                 metadata_watermark: 0,
                 consumer_session: None,
+                session_permissions: None,
             });
     }
 
@@ -255,10 +258,10 @@ impl SessionManager {
     /// one, so the caller can submit a session-matched `Logout` (the committed
     /// apply releases the client-table slot cluster-wide).
     pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
-        if let Some(conn) = self.connections.remove(&connection_id)
-            && let ConnectionState::Bound {
-                client_id, session, ..
-            } = conn.state
+        let conn = self.connections.remove(&connection_id)?;
+        if let ConnectionState::Bound {
+            client_id, session, ..
+        } = conn.state
         {
             self.client_to_connection.remove(&client_id);
             return Some((client_id, session));
@@ -465,6 +468,14 @@ impl SessionManager {
         }
     }
 
+    /// Transport kind (TCP, QUIC, WebSocket) of a connection.
+    #[must_use]
+    pub fn connection_transport(&self, connection_id: u128) -> Option<ClientTransportKind> {
+        self.connections
+            .get(&connection_id)
+            .map(|conn| conn.transport)
+    }
+
     /// Look up the authenticated user id for a connection.
     #[must_use]
     pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {
@@ -475,6 +486,15 @@ impl SessionManager {
             }
             ConnectionState::Connected => None,
         }
+    }
+
+    /// The transport-level peer address a connection arrived from, recorded by
+    /// [`Self::ensure_connection`] for every transport.
+    #[must_use]
+    pub fn connection_address(&self, connection_id: u128) -> Option<SocketAddr> {
+        self.connections
+            .get(&connection_id)
+            .map(|conn| conn.address)
     }
 
     /// Flatten one connection into a [`ConnectedClientInfo`] for `get_me`.
@@ -496,6 +516,46 @@ impl SessionManager {
         self.connections
             .iter()
             .map(|(&id, conn)| record_from(id, conn))
+    }
+
+    /// Store session-scoped permissions on a connection.
+    pub fn set_session_permissions(&mut self, connection_id: u128, perms: SessionPermissions) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.session_permissions = Some(perms);
+        }
+    }
+
+    /// Remove session-scoped permissions from a connection.
+    /// Used to roll back an inline-grant when `complete_login_register`
+    /// fails.
+    pub fn clear_session_permissions(&mut self, connection_id: u128) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.session_permissions = None;
+        }
+    }
+
+    /// Look up session-scoped permissions by connection ID. Returns `None`
+    /// when the connection has no grant or the grant has expired. Expired
+    /// grants are cleared from the connection so they do not accumulate
+    /// over long-lived TCP sessions.
+    ///
+    /// `now_secs` is the caller's authoritative wall-clock second. Pass
+    /// `IggyTimestamp::from(shard.bus.realtime_micros()).to_secs()` on the
+    /// binary transport so the expiry check uses the same clock as the
+    /// inline-grant login path.
+    #[must_use]
+    pub fn session_permissions_for_connection(
+        &mut self,
+        connection_id: u128,
+        now_secs: u64,
+    ) -> Option<std::sync::Arc<Permissions>> {
+        let conn = self.connections.get_mut(&connection_id)?;
+        let sp = conn.session_permissions.as_ref()?;
+        if sp.expires_at <= now_secs {
+            conn.session_permissions = None;
+            return None;
+        }
+        Some(std::sync::Arc::clone(&sp.permissions))
     }
 }
 
@@ -595,6 +655,7 @@ mod tests {
                 client,
                 USER,
                 build_empty_reply(&header, client, epoch, epoch),
+                None,
             );
             sessions.ensure_connection(client, addr(5000), ClientTransportKind::Tcp);
             sessions.login(client, USER).unwrap();

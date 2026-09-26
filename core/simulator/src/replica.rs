@@ -372,6 +372,9 @@ pub fn new_shard(
     }
     // Same seed the server bootstrap runs after its own replay.
     metadata.seed_applied_frontier_from_consensus();
+    metadata
+        .mux_stm
+        .set_external_auth_user_id(configs::external_auth::ExternalAuthConfig::default().user_id);
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
     let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());
@@ -417,6 +420,7 @@ pub fn new_shard(
             // Default-config PAT cap, like the system config above, so sim
             // ingress admits exactly what a default-configured server does.
             PersonalAccessTokenConfig::default().max_tokens_per_user,
+            Arc::new(configs::external_auth::ExternalAuthConfig::default()),
         )
     } else {
         ShellHandlers::noop()

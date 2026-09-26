@@ -33,6 +33,8 @@ use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{Identifier, IggyError};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+
+use crate::dispatch::authz::build_inline_permissioner;
 use send_wrapper::SendWrapper;
 use std::rc::Rc;
 
@@ -53,20 +55,28 @@ use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 /// Every read route reaches this through [`gate_local_read`], which is what
 /// pairs it with the two waits a local read must serve behind. Callable on its
 /// own only for a read that is NOT served from local state.
-fn authorize_read(
+pub(in crate::http) fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<(), ReadError> {
-    state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .users()
-        .authorize(|permissioner| rule(permissioner, identity.user_id))
-        .map_err(ReadError::Rejected)?;
+    if state.external_auth.enabled && identity.user_id == state.external_auth.user_id {
+        let perms = state
+            .session_grant_permissions(&identity.session_key)
+            .ok_or(ReadError::Rejected(IggyError::Unauthorized))?;
+        let inline_perm = build_inline_permissioner(identity.user_id, &perms);
+        rule(&inline_perm, identity.user_id).map_err(ReadError::Rejected)?;
+    } else {
+        state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .authorize(|permissioner| rule(permissioner, identity.user_id))
+            .map_err(ReadError::Rejected)?;
+    }
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
         return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));
     }
@@ -94,7 +104,7 @@ pub(in crate::http) async fn read_local(
     body: &[u8],
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
-    gate_local_read(state, identity, consistency, code, rule).await?;
+    gate_local_read(state, identity, consistency, code, &rule).await?;
     let clients_count = if code == GET_STATS_CODE {
         u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
             .unwrap_or(u32::MAX)
@@ -381,6 +391,7 @@ pub(in crate::http) fn resolve_gate_topic_ids(
 pub(in crate::http) fn authorize_data_plane(
     state: &HttpInner,
     user_id: u32,
+    session_key: &str,
     stream_id: &Identifier,
     topic_id: &Identifier,
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
@@ -388,11 +399,28 @@ pub(in crate::http) fn authorize_data_plane(
     let (Ok(wire_stream), Ok(wire_topic)) =
         (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
     else {
-        return Ok(());
+        return if state.external_auth.enabled && user_id == state.external_auth.user_id {
+            Err(IggyError::Unauthorized)
+        } else {
+            Ok(())
+        };
     };
     let Some((stream_id, topic_id)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
-        return Ok(());
+        return if state.external_auth.enabled && user_id == state.external_auth.user_id {
+            Err(IggyError::Unauthorized)
+        } else {
+            Ok(())
+        };
     };
+    if state.external_auth.enabled && user_id == state.external_auth.user_id {
+        let sk = crate::http::extractor::SessionKey::from_table_key(session_key)
+            .ok_or(IggyError::Unauthorized)?;
+        let perms = state
+            .session_grant_permissions(&sk)
+            .ok_or(IggyError::Unauthorized)?;
+        let inline_perm = build_inline_permissioner(user_id, &perms);
+        return rule(&inline_perm, user_id, stream_id, topic_id);
+    }
     state
         .shard
         .plane

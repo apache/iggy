@@ -36,6 +36,25 @@ use std::ops::Range;
 use configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use iggy_common::{IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+
+/// Algorithms accepted for trusted-issuer (JWKS-verified) tokens. Only
+/// asymmetric families are allowed; symmetric HS* is rejected so an attacker
+/// cannot set `alg: HS256` in the header and sign with a known public key
+/// (the classic algorithm-confusion attack). The JWKS resolver only stores
+/// RSA and EC keys, so the `jsonwebtoken` crate would also reject an HMAC
+/// signature against those key types, but an explicit allowlist makes the
+/// guarantee independent of library internals.
+const TRUSTED_ISSUER_ALGORITHMS: &[Algorithm] = &[
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::EdDSA,
+];
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use server_common::crypto;
 use tracing::{debug, error, info, warn};
@@ -79,6 +98,9 @@ pub struct JwtManager {
     /// `[[http.jwt.trusted_issuers]]` is configured, in which case `decode`
     /// takes the JWKS verification path for tokens from these issuers.
     trusted_issuers: HashMap<String, TrustedIssuerConfig>,
+    /// User IDs that trusted issuers must never map to (defense in depth).
+    /// Contains the external auth reserved `user_id` when that feature is enabled.
+    forbidden_user_ids: Vec<u32>,
 }
 
 impl JwtManager {
@@ -96,7 +118,11 @@ impl JwtManager {
     ///
     /// Returns [`IggyError`] if the configured algorithm is unsupported or a
     /// secret cannot be turned into an encoding/decoding key.
-    pub fn build(config: &HttpJwtConfig, cluster_psk: Option<&str>) -> Result<Self, IggyError> {
+    pub fn build(
+        config: &HttpJwtConfig,
+        cluster_psk: Option<&str>,
+        external_auth_user_id: Option<u32>,
+    ) -> Result<Self, IggyError> {
         let config = normalize_secrets(config.clone(), cluster_psk);
         let algorithm = config.get_algorithm()?;
         let encoding_key = config.get_encoding_key()?;
@@ -134,6 +160,14 @@ impl JwtManager {
                 );
                 return Err(IggyError::InvalidConfiguration);
             }
+            if external_auth_user_id == Some(issuer_config.user_id) {
+                error!(
+                    issuer = %issuer_config.issuer,
+                    user_id = issuer_config.user_id,
+                    "trusted issuer user_id collides with external_auth.user_id"
+                );
+                return Err(IggyError::InvalidConfiguration);
+            }
         }
         let trusted_issuers = config
             .trusted_issuers
@@ -157,6 +191,7 @@ impl JwtManager {
             validation,
             jwks_client: JwksClient::default(),
             trusted_issuers,
+            forbidden_user_ids: std::iter::once(0).chain(external_auth_user_id).collect(),
         })
     }
 
@@ -167,6 +202,17 @@ impl JwtManager {
     ///
     /// Returns [`IggyError::CannotGenerateJwt`] if signing fails.
     pub fn generate(&self, user_id: UserId) -> Result<GeneratedToken, IggyError> {
+        self.generate_capped(user_id, u64::MAX)
+    }
+
+    /// Generate a token whose `exp` is capped at `max_expiry_secs` (unix
+    /// seconds). Used by external auth inline-grant sessions to honor the
+    /// auth service's `expires_at`.
+    pub fn generate_capped(
+        &self,
+        user_id: UserId,
+        max_expiry_secs: u64,
+    ) -> Result<GeneratedToken, IggyError> {
         let header = Header::new(self.algorithm);
         let iat = IggyTimestamp::now().to_secs();
         let expiry_secs = match self.access_token_expiry {
@@ -174,7 +220,7 @@ impl JwtManager {
             IggyExpiry::ServerDefault => 0,
             IggyExpiry::ExpireDuration(duration) => duration.as_secs(),
         };
-        let exp = iat + u64::from(expiry_secs);
+        let exp = (iat + u64::from(expiry_secs)).min(max_expiry_secs);
         let nbf = iat + u64::from(self.not_before.as_secs());
         let claims = JwtClaims {
             jti: Uuid::now_v7().to_string(),
@@ -189,6 +235,7 @@ impl JwtManager {
             .map_err(|_| IggyError::CannotGenerateJwt)?;
         Ok(GeneratedToken {
             user_id,
+            jti: claims.jti,
             access_token,
             access_token_expiry: exp,
         })
@@ -242,11 +289,11 @@ impl JwtManager {
             return Err(IggyError::Unauthenticated);
         };
 
-        // A trusted external subject must never resolve to the root user.
-        if config.user_id == 0 {
+        if self.forbidden_user_ids.contains(&config.user_id) {
             error!(
                 issuer = %config.issuer,
-                "trusted-issuer token cannot map to root user (user_id = 0)"
+                user_id = config.user_id,
+                "trusted-issuer token maps to a forbidden user_id"
             );
             return Err(IggyError::Unauthenticated);
         }
@@ -279,11 +326,8 @@ impl JwtManager {
             }
         };
 
-        // The algorithm is taken from the token header (e.g. RS256), not the
-        // self-issued HS256; issuer and audience are pinned to the config, and
-        // the timing checks mirror the self-issued path (enforce `nbf`, honor
-        // the configured clock skew).
-        let mut validation = Validation::new(insecure.header.alg);
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.algorithms = TRUSTED_ISSUER_ALGORITHMS.to_vec();
         validation.set_issuer(std::slice::from_ref(&config.issuer));
         validation.set_audience(std::slice::from_ref(&config.audience));
         validation.validate_nbf = true;
@@ -485,6 +529,7 @@ pub(in crate::http) struct JwtClaims {
 #[derive(Debug)]
 pub(in crate::http) struct GeneratedToken {
     pub user_id: UserId,
+    pub jti: String,
     pub access_token: String,
     pub access_token_expiry: u64,
 }
@@ -510,7 +555,7 @@ mod tests {
     async fn token_presented_before_its_nbf_is_rejected() {
         // not_before well past the leeway window, so the freshly issued token
         // is not yet valid and decode must reject it.
-        let manager = JwtManager::build(&config("3600 s", "5 s"), None).expect("builds");
+        let manager = JwtManager::build(&config("3600 s", "5 s"), None, None).expect("builds");
         let token = manager.generate(7).expect("issues");
         assert!(
             manager.decode(&token.access_token).await.is_err(),
@@ -522,7 +567,7 @@ mod tests {
     async fn token_at_its_nbf_is_accepted() {
         // Default not_before (0s) => nbf == iat, so the token is valid now and
         // enabling nbf validation does not reject a normally issued token.
-        let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
+        let manager = JwtManager::build(&config("0 s", "5 s"), None, None).expect("builds");
         let token = manager.generate(7).expect("issues");
         let claims = manager
             .decode(&token.access_token)
@@ -542,10 +587,31 @@ mod tests {
             }]),
             ..HttpJwtConfig::default()
         };
-        match JwtManager::build(&jwt, None) {
+        match JwtManager::build(&jwt, None, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer mapping to the root user"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_trusted_issuer_mapping_to_external_auth_user() {
+        let jwt = HttpJwtConfig {
+            trusted_issuers: Some(vec![TrustedIssuerConfig {
+                issuer: "https://external.example".to_string(),
+                audience: "iggy".to_string(),
+                jwks_url: "https://external.example/.well-known/jwks.json".to_string(),
+                user_id: u32::MAX,
+            }]),
+            ..HttpJwtConfig::default()
+        };
+        match JwtManager::build(&jwt, None, Some(u32::MAX)) {
+            Err(IggyError::InvalidConfiguration) => {}
+            Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+            Ok(_) => panic!(
+                "build must reject a trusted issuer whose user_id \
+                 collides with external_auth.user_id"
+            ),
         }
     }
 
@@ -560,7 +626,7 @@ mod tests {
             }]),
             ..HttpJwtConfig::default()
         };
-        match JwtManager::build(&jwt, None) {
+        match JwtManager::build(&jwt, None, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer with an empty issuer"),
@@ -578,7 +644,7 @@ mod tests {
             }]),
             ..HttpJwtConfig::default()
         };
-        match JwtManager::build(&jwt, None) {
+        match JwtManager::build(&jwt, None, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer with an empty jwks_url"),

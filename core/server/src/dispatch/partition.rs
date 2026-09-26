@@ -54,6 +54,7 @@ use metadata::impls::metadata::{
     StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
 };
+use metadata::permissioner::Permissioner;
 use partitions::{PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -87,7 +88,11 @@ use tracing::{debug, warn};
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub async fn dispatch_partition_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
@@ -96,6 +101,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     transport_client_id: u128,
     acting_user_id: Option<u32>,
     consumer_session: Option<(u128, SessionAttachment)>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -114,13 +120,6 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
-            // A partition op against a stream/topic that no longer resolves
-            // (e.g. a consumer's trailing auto-commit racing a `delete_stream`,
-            // or an explicit partition id that skipped the client-side
-            // resolve). The op never reached the partition plane, so a status-0
-            // reply would read as a committed ack for work that never happened.
-            // A silent drop is no better: the SDK connection processes replies
-            // in lockstep and would wedge forever.
             warn!(
                 transport_client_id,
                 error = %error,
@@ -139,20 +138,6 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
             return;
         }
     };
-    // Dispatch-time RBAC. The partition plane is not replicated through the
-    // metadata STM, so the in-apply gate cannot cover it; authorize here, on
-    // the connection's own shard, before burning the routable wait or touching
-    // the plane. The namespace resolved above, so its stream/topic are the
-    // committed slab ids the permissioner keys on directly. A denial replies
-    // the op's frame with an empty body and a nonzero `status` the SDK peeks.
-    //
-    // Consistency: this reads THIS shard's local committed permissioner. On a
-    // peer shard that is a replicated read-mirror, so a permission revocation
-    // takes effect on the partition plane only once this shard applies the
-    // revoking commit -- an apply-lag window bounded by replication lag.
-    // Control-plane ops are exact (gated in-apply, in the same committed order
-    // on every replica); this local-read relaxation on the data plane is the
-    // accepted trade for keeping partition ops off the metadata consensus.
     let scope = IggyNamespace::from_raw(namespace);
     if let Some(status) = authorize_partition_op(
         shard,
@@ -160,6 +145,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         acting_user_id,
         scope.stream_id(),
         scope.topic_id(),
+        alt_permissioner,
     ) {
         warn!(
             transport_client_id,
@@ -403,6 +389,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     user_id: Option<u32>,
     consumer_client_id: u128,
     attachment: Option<SessionAttachment>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -446,6 +433,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.poll_messages(uid, stream_id, topic_id)
         },
+        alt_permissioner,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -647,6 +635,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -676,6 +665,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.get_consumer_offset(uid, stream_id, topic_id)
         },
+        alt_permissioner,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -1442,8 +1432,17 @@ mod tests {
         ));
         for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
             let request = request_message(operation, 1, 1, index as u64 + 1, &body);
-            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID), None)
-                .await;
+            dispatch_partition_request(
+                &shard,
+                request,
+                1,
+                1,
+                91,
+                Some(DEFAULT_ROOT_USER_ID),
+                None,
+                None,
+            )
+            .await;
             let replies = bus.client_replies.borrow();
             assert_eq!(
                 replies.len(),
@@ -1490,6 +1489,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
             None,
+            None,
         )
         .await;
 
@@ -1500,7 +1500,8 @@ mod tests {
             2,
             TRUNCATED_BODY,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID), None)
+            .await;
 
         let delete = request_message(
             Operation::DeleteSegments,
@@ -1569,6 +1570,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
             None,
+            None,
         )
         .await;
 
@@ -1586,7 +1588,8 @@ mod tests {
             2,
             &offset_body,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID), None)
+            .await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -1810,6 +1813,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             request.header().client,
             None,
+            None,
         )
         .await;
 
@@ -1951,6 +1955,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
             None,
         )
         .await;
