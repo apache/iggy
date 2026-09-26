@@ -159,6 +159,7 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
+        false,
     );
     (state, seed)
 }
@@ -278,6 +279,7 @@ async fn a_named_lookup_reports_the_kafka_side_name_through_a_topic_mapping_over
         BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
+        false,
     );
 
     let topics = send(&state, Some(&["orders"])).await;
@@ -309,7 +311,7 @@ async fn a_response_projected_over_max_frame_size_closes_instead_of_answering() 
 
     // 50 partitions * 64 bytes/partition (this crate's own conservative per-partition estimate)
     // = 3200 bytes, comfortably over a 512-byte max_frame_size.
-    let tiny_state = GatewayState::new(state.broker, state.bridge, 512);
+    let tiny_state = GatewayState::new(state.broker, state.bridge, 512, false);
     let body = build_request(Some(&["orders"]));
     let outcome = metadata::handle(&tiny_state, REQUEST_VERSION, body).await;
     assert!(outcome.is_close(), "expected Close, got {outcome:?}");
@@ -335,7 +337,7 @@ async fn an_all_topics_response_over_max_frame_size_truncates_instead_of_closing
     // 50 partitions * 64 bytes/partition (this crate's own conservative per-partition estimate)
     // = 3200 bytes, comfortably over a 512-byte max_frame_size - so the catalog as a whole cannot
     // fit, but neither topic's own partition count is malformed or attacker-shaped.
-    let tiny_state = GatewayState::new(state.broker, state.bridge, 512);
+    let tiny_state = GatewayState::new(state.broker, state.bridge, 512, false);
     let topics = send(&tiny_state, None).await;
     assert!(
         topics.len() < 2,
