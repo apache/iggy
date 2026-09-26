@@ -27,7 +27,7 @@ use journal::partition_journal::{
     PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
 };
 use journal::{DurableAppend, PartitionPrepareJournal};
-use partitions::{CheckpointBarrier, PartitionPersistence, PersistenceMetrics, install_backup};
+use partitions::{FileSyncBarrier, PartitionPersistence, PersistenceMetrics, install_backup};
 use server_common::send_messages::{
     BATCH_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
@@ -787,6 +787,8 @@ fn synchronized_corruption_in_any_record_block_is_refused() {
 
 async fn interrupted_install() -> SimStorage {
     let (storage, mut journal) = baseline().await;
+    // `baseline` completed its original-writer syncs before this test-only
+    // [`install_backup::begin_with_storage`] call.
     install_backup::begin_with_storage(Path::new(DIRECTORY), &storage)
         .await
         .unwrap();
@@ -800,9 +802,9 @@ async fn interrupted_install() -> SimStorage {
 }
 
 /// A hard link preserves the inode, not the writer's error cursor. Opening the
-/// backup name after writeback failed must not authorize destructive install.
+/// backup name after writeback failed must not authorize destructive install;
+/// [`FileSyncBarrier::from_file`] must retain the original error cursor.
 #[test]
-#[ignore = "`install_backup::link_tree` synchronizes hard links through handles opened after the writeback failure"]
 fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publication() {
     block_on(async {
         let storage = storage_for_partition().await;
@@ -812,12 +814,14 @@ fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publi
         storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
 
         storage.fail_writeback(path).unwrap();
-        let result = install_backup::begin_with_storage(Path::new(DIRECTORY), &storage).await;
+        let barrier = FileSyncBarrier::from_file(path, writer);
+        let result = install_backup::begin_with_storage_and_barriers(
+            Path::new(DIRECTORY),
+            vec![barrier],
+            &storage,
+        )
+        .await;
 
-        assert!(
-            writer.sync().await.is_err(),
-            "the original writer did not observe the injected writeback failure"
-        );
         assert!(
             result.is_err(),
             "install backup published after synchronizing a fresh hard-link handle past the writeback error"
@@ -1182,7 +1186,7 @@ fn checkpoint_barriers_complete_before_wal_reclamation() {
             .unwrap();
         let mut file = storage.open(path, OpenMode::Create).await.unwrap();
         file.write(0, b"committed".to_vec()).await.unwrap();
-        let barrier = CheckpointBarrier::from_file(path, file);
+        let barrier = FileSyncBarrier::from_file(path, file);
         persistence.checkpoint_files(
             4,
             vec![path.to_path_buf()],
@@ -2536,6 +2540,8 @@ async fn install(
     storage: &SimStorage,
     journal: &mut PartitionPrepareJournal<SimStorage>,
 ) -> io::Result<()> {
+    // Fault-matrix setup injects no background writeback error before this
+    // test-only [`install_backup::begin_with_storage`] call.
     install_backup::begin_with_storage(Path::new(DIRECTORY), storage).await?;
     replace(storage, Path::new("/partition/state"), b"new").await?;
     for path in MATERIALIZED_FILES {
@@ -2808,7 +2814,7 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
         let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
         writer.write(0, b"committed".to_vec()).await.unwrap();
-        let barrier = CheckpointBarrier::from_file(path, writer);
+        let barrier = FileSyncBarrier::from_file(path, writer);
 
         // The device drops the dirty pages before the checkpoint's barrier. The
         // writer that issued them is the only handle told; the descriptor
@@ -2861,8 +2867,8 @@ fn given_multiple_writers_for_one_checkpoint_file_when_one_has_not_observed_the_
         // checkpoint skip another writer that still has the error pending.
         assert!(first_writer.sync().await.is_err());
         let barriers = vec![
-            CheckpointBarrier::from_file(path, first_writer),
-            CheckpointBarrier::from_file(path, second_writer),
+            FileSyncBarrier::from_file(path, first_writer),
+            FileSyncBarrier::from_file(path, second_writer),
         ];
         persistence.checkpoint_files(
             4,

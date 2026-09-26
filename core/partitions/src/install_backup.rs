@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "simulator")]
+use crate::persistence::FileSyncBarrier;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
@@ -50,7 +53,7 @@ pub async fn recover_with_storage<S: DurableStorage>(
         }
         storage.remove_tree(&directory.join(&entry.name)).await?;
     }
-    link_tree(&backup, directory, false, storage).await?;
+    link_tree(&backup, directory, false, &BTreeSet::new(), storage).await?;
     finish_with_storage(directory, storage).await
 }
 
@@ -64,10 +67,40 @@ pub async fn begin(directory: &Path) -> io::Result<()> {
     begin_with_storage(directory, &DiskStorage).await
 }
 
+/// Storage-generic form of [`begin`] used by deterministic storage tests.
+///
 /// # Errors
 /// Returns an error when the install transaction cannot complete durably.
 pub async fn begin_with_storage<S: DurableStorage>(
     directory: &Path,
+    storage: &S,
+) -> io::Result<()> {
+    begin_with_synced_files(directory, BTreeSet::new(), storage).await
+}
+
+/// Simulator form of [`begin_with_storage`] that retains original writers in
+/// [`FileSyncBarrier`] values until their durability barriers complete.
+///
+/// # Errors
+/// Returns an error when an original-writer barrier fails or the install
+/// transaction cannot complete durably.
+#[cfg(feature = "simulator")]
+pub async fn begin_with_storage_and_barriers<S: DurableStorage>(
+    directory: &Path,
+    barriers: Vec<FileSyncBarrier>,
+    storage: &S,
+) -> io::Result<()> {
+    let synced_files =
+        futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run))
+            .await?
+            .into_iter()
+            .collect();
+    begin_with_synced_files(directory, synced_files, storage).await
+}
+
+async fn begin_with_synced_files<S: DurableStorage>(
+    directory: &Path,
+    synced_files: BTreeSet<std::path::PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     if storage.exists(&directory.join(BACKUP)).await? {
@@ -77,7 +110,7 @@ pub async fn begin_with_storage<S: DurableStorage>(
     storage.remove_tree(&building).await?;
     storage.remove_tree(&directory.join(RETIRED)).await?;
     storage.create_directories(&building).await?;
-    link_tree(directory, &building, true, storage).await?;
+    link_tree(directory, &building, true, &synced_files, storage).await?;
     storage.rename(&building, &directory.join(BACKUP)).await?;
     storage.sync_directory(directory).await
 }
@@ -110,6 +143,7 @@ async fn link_tree<S: DurableStorage>(
     source: &Path,
     target: &Path,
     skip_scratch: bool,
+    synced_files: &BTreeSet<std::path::PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
@@ -134,12 +168,15 @@ async fn link_tree<S: DurableStorage>(
             } else {
                 // Transfer unlinks or atomically replaces these frozen files.
                 // Hard links retain the old bytes without copying segment data.
-                storage.hard_link(&source.join(&name), &destination).await?;
-                storage
-                    .open(&destination, OpenMode::Read)
-                    .await?
-                    .sync()
-                    .await?;
+                let source_file = source.join(&name);
+                storage.hard_link(&source_file, &destination).await?;
+                if !synced_files.contains(&source_file) {
+                    storage
+                        .open(&destination, OpenMode::Read)
+                        .await?
+                        .sync()
+                        .await?;
+                }
             }
         }
     }
@@ -191,6 +228,8 @@ mod tests {
         ] {
             std::fs::write(root.join(name), name.as_bytes()).unwrap();
         }
+        // These std writes are closed before [`begin`], so no original writer
+        // remains to synchronize.
         begin(root).await.unwrap();
         // Model the install's unlink and atomic replacement operations.
         for name in ["0.log", "offsets/1", "prepares-1/frontier"] {
@@ -218,6 +257,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::write(root.join("0.log"), b"old").unwrap();
+        // The fixture has no live writer outside [`begin`].
         begin(root).await.unwrap();
         std::fs::remove_file(root.join("0.log")).unwrap();
         std::fs::write(root.join("0.log"), b"new").unwrap();
