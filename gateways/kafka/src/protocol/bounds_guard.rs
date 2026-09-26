@@ -708,6 +708,36 @@ pub fn validate_metadata_shape(version: i16, body: &Bytes, max_frame_size: usize
     Ok(())
 }
 
+/// Mirrors the field order `InitProducerIdRequest::decode` walks.
+///
+/// No response-size guard needed: the response is four fixed-width fields and echoes nothing
+/// from the request, so `usize::MAX` disables that check rather than plumbing `max_frame_size`
+/// through for no effect (same as [`validate_api_versions_shape`]).
+///
+/// # Errors
+///
+/// Returns an error when the declared `transactional_id` length cannot fit in the bytes
+/// remaining in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_init_producer_id_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 2;
+
+    if flexible {
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+    }
+    let _transaction_timeout_ms = c.read_i32()?;
+    if version >= 3 {
+        let _producer_id = c.read_i64()?;
+        let _producer_epoch = c.read_i16()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `ApiVersionsRequest::decode` walks. v0-2 have an empty body (no
 /// length-prefixed fields to bound), so this is a no-op below v3.
 ///
@@ -868,6 +898,36 @@ mod tests {
     fn metadata_v0_huge_topics_count_rejected() {
         let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
         assert!(validate_metadata_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Every sibling guard carries a rejection POC; without one, short-circuiting this guard to
+    /// `Ok(())` leaves the whole suite green, so nothing proved it rejected a hostile frame.
+    #[test]
+    fn init_producer_id_v5_huge_compact_string_rejected() {
+        // Compact string length varint far past the frame: nothing follows it to read.
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_init_producer_id_shape(5, &body).is_err());
+    }
+
+    #[test]
+    fn init_producer_id_v0_truncated_legacy_string_rejected() {
+        // Declares 32767 bytes of transactional id, supplies none.
+        let body = Bytes::from_static(&[0x7F, 0xFF]);
+        assert!(validate_init_producer_id_shape(0, &body).is_err());
+    }
+
+    #[test]
+    fn init_producer_id_v5_null_transactional_id_accepted() {
+        // Null compact string, transaction_timeout_ms, then the v3+ producer id/epoch pair
+        // (both -1, "no producer id"), then tagged fields.
+        let body = Bytes::from_static(&[
+            0x00, // transactional_id: null compact string
+            0x00, 0x00, 0x75, 0x30, // transaction_timeout_ms: 30000
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // producer_id: -1
+            0xFF, 0xFF, // producer_epoch: -1
+            0x00, // tagged fields
+        ]);
+        assert!(validate_init_producer_id_shape(5, &body).is_ok());
     }
 
     #[test]

@@ -357,7 +357,7 @@ async fn e2e_flexible_apiversions_v3_request_succeeds() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).unwrap();
-    assert_eq!(count, 6, "must advertise all six scoped API keys");
+    assert_eq!(count, 7, "must advertise all seven scoped API keys");
 }
 
 #[tokio::test]

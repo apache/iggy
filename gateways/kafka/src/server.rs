@@ -116,6 +116,11 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
+    /// This gateway's number among the gateways fronting one Iggy cluster
+    /// (`IGGY_KAFKA_INSTANCE_ID`). It is the high half of every producer id handed out by
+    /// `InitProducerId`, which Kafka requires to be cluster-unique; two gateways left on the
+    /// same number hand out the same ids.
+    pub instance_id: u16,
     /// Require SASL authentication before serving any other API.
     ///
     /// Off by default, and switching it on is a breaking change for every client already talking
@@ -164,6 +169,7 @@ impl Default for GatewayConfig {
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
+            instance_id: 0,
             sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
@@ -317,36 +323,22 @@ impl KafkaGateway {
         listener: TcpListener,
         mut shutdown: broadcast::Receiver<()>,
     ) -> Result<()> {
-        if !self.config.sasl_enabled && self.authenticator.is_some() {
-            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
-            // flag is off means every connection is served unauthenticated, with nothing in the log
-            // to say so. Refusing to start is the only way that failure is visible.
-            return Err(KafkaProtocolError::InvalidConfig(
-                "an authenticator is configured but SASL is disabled; every connection would be \
-                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
-                 authenticator"
-                    .into(),
-            ));
-        }
-        if self.config.sasl_enabled && self.authenticator.is_none() {
-            return Err(KafkaProtocolError::InvalidConfig(
-                "SASL is enabled but no authenticator is configured; every client would be \
-                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
-                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
-                    .into(),
-            ));
-        }
+        self.check_sasl_wiring()?;
         let local_addr = listener.local_addr()?;
         let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
+        // instance_id is logged because it is the only way to tell from a running process which
+        // half of the producer-id space this gateway owns. Two gateways left on the default
+        // collide silently, and a config file cannot be diffed against a live deployment.
         info!(
-            "kafka listener bound on {} (advertised as {}:{})",
-            local_addr, broker.host, broker.port
+            "kafka listener bound on {} (advertised as {}:{}, instance id {})",
+            local_addr, broker.host, broker.port, self.config.instance_id
         );
         let state = Arc::new(GatewayState::new(
             broker,
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.sasl_enabled,
+            self.config.instance_id,
         ));
 
         let shared_auth = Arc::new(SharedAuth::new(
@@ -431,6 +423,30 @@ impl KafkaGateway {
                 }
 
             }
+        }
+        Ok(())
+    }
+
+    /// Refuses to start when the SASL flag and the configured authenticator disagree.
+    fn check_sasl_wiring(&self) -> Result<()> {
+        if !self.config.sasl_enabled && self.authenticator.is_some() {
+            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
+            // flag is off means every connection is served unauthenticated, with nothing in the log
+            // to say so. Refusing to start is the only way that failure is visible.
+            return Err(KafkaProtocolError::InvalidConfig(
+                "an authenticator is configured but SASL is disabled; every connection would be \
+                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
+                 authenticator"
+                    .into(),
+            ));
+        }
+        if self.config.sasl_enabled && self.authenticator.is_none() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "SASL is enabled but no authenticator is configured; every client would be \
+                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
+                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
+                    .into(),
+            ));
         }
         Ok(())
     }

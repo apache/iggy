@@ -173,6 +173,7 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
         false,
+        0,
     );
     (state, seed_bridge)
 }

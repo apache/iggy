@@ -26,8 +26,10 @@ use crate::error::Result;
 use crate::protocol::bounds_guard::{
     validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
+use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, list_offsets, metadata, produce,
+    api_versions, create_topics, decode_guarded, dispatch, fetch, init_producer_id, list_offsets,
+    metadata, produce,
 };
 use crate::protocol::sasl::{
     SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
@@ -40,6 +42,7 @@ pub const API_KEY_METADATA: i16 = 3;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
@@ -173,6 +176,11 @@ pub struct ApiVersionRange {
     pub max_version: i16,
 }
 
+/// The version firewall, and the exact set `ApiVersions` advertises.
+///
+/// Absence is load-bearing for the transaction keys (24, 25, 26, 28): a conforming client that
+/// does not see a key here never sends it, which is the whole enforcement of "transactions are
+/// unsupported". See `docs/SCOPE.md`.
 static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     produce::RANGE,
     fetch::RANGE,
@@ -180,6 +188,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     metadata::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    init_producer_id::RANGE,
 ];
 
 #[must_use]
@@ -202,28 +211,33 @@ pub struct GatewayState {
     /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed. Kept on the
     /// shared state so `ApiVersions` can answer without a widened handler signature.
     pub sasl_enabled: bool,
+    /// Shared across every connection this gateway serves: a producer id has to be unique for
+    /// the process, not for the connection that asked for it.
+    pub producer_ids: ProducerIdAllocator,
 }
 
 impl GatewayState {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         broker: BrokerAdvertise,
         bridge: Option<Arc<IggyBridge>>,
         max_frame_size: usize,
         sasl_enabled: bool,
+        instance_id: u16,
     ) -> Self {
         Self {
             broker,
             bridge,
             max_frame_size,
             sasl_enabled,
+            producer_ids: ProducerIdAllocator::new(instance_id),
         }
     }
 
     /// State with no bridge, so every handler takes its stub path.
     #[must_use]
-    pub const fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
-        Self::new(broker, None, max_frame_size, false)
+    pub fn stub(broker: BrokerAdvertise, max_frame_size: usize) -> Self {
+        Self::new(broker, None, max_frame_size, false, 0)
     }
 }
 

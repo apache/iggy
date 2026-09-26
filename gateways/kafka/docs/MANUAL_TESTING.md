@@ -38,13 +38,14 @@ kafka listener bound on 127.0.0.1:9093
 
 ```bash
 # Terminal 2
-# Keys 0/1/2/19 match ci-wire-fixtures.sh: the only keys any test actually loads a .bin
-# fixture for. Metadata (3) and ApiVersions (18) requests are built synthetically in-test
-# instead, so fixtures for those keys are generated but unused - `generate` still accepts
-# them if you want them for manual `send`/`verify` below.
+# Keys 0/1/2/19/22 match ci-wire-fixtures.sh's FIXTURE_API_KEYS: the only keys any test
+# actually loads a .bin fixture for. Omit key 22 and the six InitProducerId cases skip
+# silently, which reads as a pass. Metadata (3) and ApiVersions (18) requests are built
+# synthetically in-test instead, so fixtures for those keys are generated but unused -
+# `generate` still accepts them if you want them for manual `send`/`verify` below.
 cargo run -p kafka-message-gen -- generate \
   --output gateways/kafka/tools/kafka-tool/kafka_messages \
-  --api-key 0 --api-key 1 --api-key 2 --api-key 19
+  --api-key 0 --api-key 1 --api-key 2 --api-key 19 --api-key 22
 ```
 
 ---
@@ -144,7 +145,8 @@ connection-refuses before any assertion runs.
 | A6 | Fetch v4 | `send --host 127.0.0.1:9093 --api-key 1 --version 4` | Decode + stub response | Top-level `ec=0`; per-partition `ec=6` (NOT_LEADER_OR_FOLLOWER) |
 | A7 | ListOffsets v1 | `send --host 127.0.0.1:9093 --api-key 2 --version 1` | Decode + stub offsets | Per-partition `ec=6` (NOT_LEADER_OR_FOLLOWER) - no top-level error field on this response |
 | A8 | CreateTopics v2 | `send --host 127.0.0.1:9093 --api-key 19 --version 2` | Decode + stub non-creation ack | `ec=41` (NOT_CONTROLLER) per topic |
-| A9 | Verify all scoped keys | `cargo run -p kafka-message-gen -- verify --host 127.0.0.1:9093 --api-key 0 --api-key 1 --api-key 2 --api-key 3 --api-key 18 --api-key 19` | Exit code 0 | No timeouts or I/O errors (`verify` already knows each stub's expected non-zero code - see `is_acceptable_verify_error` in `kafka-tool/src/response.rs`) |
+| A9 | InitProducerId v4 | `send --host 127.0.0.1:9093 --api-key 22 --version 4` | Producer id allocated | `ec=0`, `producer_id >= 0`, `producer_epoch=0`; a second send returns a different `producer_id` |
+| A10 | Verify all scoped keys | `cargo run -p kafka-message-gen -- verify --host 127.0.0.1:9093 --api-key 0 --api-key 1 --api-key 2 --api-key 3 --api-key 18 --api-key 19 --api-key 22` | Exit code 0 | No timeouts or I/O errors (`verify` already knows each stub's expected non-zero code - see `is_acceptable_verify_error` in `kafka-tool/src/response.rs`) |
 
 ### Category B — Version firewall (boundary validation)
 
@@ -158,16 +160,18 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
 | 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
+| 22 | InitProducerId | 0 | 5 | −1, 0, 5, 6 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 6 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 7 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
-| B3 | Produce/Fetch/ListOffsets/CreateTopics out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these four messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,18,19 only — no consumer-group keys |
+| B3 | Produce/Fetch/ListOffsets/CreateTopics/InitProducerId out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these five messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,18,19,22 only — no consumer-group keys, and no transaction keys (24, 25, 26, 28) |
 
-Only ApiVersions (B1) ever returns `error_code=35` on this gateway. Every other API key's
-out-of-range case closes the connection - see B2/B3.
+An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
+key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
+35 in range, for a transactional request - see Category H.
 
 **Validation tip:** Use `--hex` when generating to inspect request bytes:
 
@@ -251,6 +255,9 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | H1 | Truncated Produce body | Send valid header + incomplete body | **No response at all** - `kafka_protocol` decodes the whole request in one shot, so a failure anywhere leaves `acks` unknowable; answering risks desyncing an `acks=0` fire-and-forget client's correlation stream, so every Produce decode failure stays silent. Connection stays open (send A2 next to confirm); **no panic** |
 | H2 | Random bytes | `dd if=/dev/urandom bs=64 count=1 \| nc 127.0.0.1 9093` | Connection closed or protocol error; gateway stays up |
 | H3 | Empty body after header | ApiVersions with valid header, empty body | `ec=0` (ApiVersions accepts empty body) |
+| H4 | Transactional InitProducerId | Send key 22 v4 with a non-null `transactional_id` | `ec=35` (UNSUPPORTED_VERSION); connection stays open (send A2 next to confirm) |
+| H5 | Transactional Produce | Send key 0 v3 with a non-null `transactional_id` and `acks=1` | `ec=35` per partition, **not** `ec=6`; connection stays open. With `acks=0`: no response, and the gateway closes the connection |
+| H6 | Transaction API keys | `send --host 127.0.0.1:9093 --api-key 24` (also 25, 26, 28) | Connection closes, no response bytes - they are never advertised |
 
 ---
 
@@ -263,7 +270,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
 | 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub, per partition (retriable; payload not persisted) |
 | 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic |
-| 35 | UNSUPPORTED_VERSION | **ApiVersions only** (KIP-511 exception). Every other API key's out-of-range version closes the connection instead - see Category B |
+| 35 | UNSUPPORTED_VERSION | Out of range: **ApiVersions only** (KIP-511 exception); every other API key's out-of-range version closes the connection instead - see Category B. In range: InitProducerId with a `transactional_id`, and Produce with a non-empty `transactional_id` (per partition) - transactions are not supported, see `SCOPE.md` |
 | 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
@@ -286,6 +293,7 @@ Header version selection now delegates entirely to `kafka_protocol::messages::Ap
 | 1 Fetch | v12+ | v1 |
 | 2 ListOffsets | v6+ | v1 |
 | 19 CreateTopics | v5+ | v1 |
+| 22 InitProducerId | v2+ | v1 |
 
 ### Frame layout (for manual hex inspection)
 
@@ -326,14 +334,14 @@ Tester: ___________
 Gateway commit: ___________
 kcat version (if used): ___________
 
-[ ] A1–A9  Smoke tests
-[ ] B1–B4  Version firewall (all 6 keys × 4 boundary versions)
+[ ] A1–A10 Smoke tests
+[ ] B1–B4  Version firewall (all 7 keys × 4 boundary versions)
 [ ] C1–C4  Unsupported API keys
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
 [ ] F1–F6  TCP / connection behavior
 [ ] G1–G3  kcat client (record errors for G2/G3)
-[ ] H1–H3  Adversarial input
+[ ] H1–H6  Adversarial input
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist
