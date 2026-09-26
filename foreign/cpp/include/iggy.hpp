@@ -1672,7 +1672,11 @@ class IggyBlockingClient final {
      * - `tls_validate_certificate=<bool>`
      *
      * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
-     * Deprecated aliases:
+     * Deprecated aliases (will be removed in a later release):
+     * - TCP and WebSocket: `reconnection_retries` -> `reconnection_max_retries`.
+     * - QUIC: `reconnection_reestablish_after` -> `reestablish_after`.
+     * - QUIC: `validate_certificate` -> `tls_validate_certificate`.
+     *
      * When an option is repeated, including through a (deprecated) alias, the last occurrence takes effect.
      * Boolean values are `true` or `false`.
      *
