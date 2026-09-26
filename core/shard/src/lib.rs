@@ -3236,7 +3236,7 @@ where
             MessageBag::StateChunk(ref msg) => self.on_state_chunk(msg).await,
             // A forwarded proposal must leave the pump because its commit is
             // driven by this same pump. The metadata-submit handler spawns it.
-            MessageBag::ForwardRegister(ref msg) => self.on_forward_register(*msg.header()),
+            MessageBag::ForwardRegister(ref msg) => self.on_forward_register(msg),
             MessageBag::ForwardRegisterResult(ref msg) => {
                 self.on_forward_register_result(*msg.header());
             }
@@ -3247,7 +3247,8 @@ where
         }
     }
 
-    fn on_forward_register(&self, header: ForwardRegisterHeader) {
+    fn on_forward_register(&self, msg: &Message<ForwardRegisterHeader>) {
+        let header = *msg.header();
         if !self.peer_is_known(header.replica, "ForwardRegister") {
             return;
         }
@@ -3255,10 +3256,18 @@ where
             self.id, 0,
             "ForwardRegister routes to the metadata consensus owner"
         );
+        let header_len = std::mem::size_of::<ForwardRegisterHeader>();
+        let buf = msg.as_slice();
+        let end = (header.size as usize).min(buf.len());
+        let session_permissions = if end > header_len {
+            metadata::decode_register_body_permissions(&buf[header_len..end])
+        } else {
+            None
+        };
         (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
             vsr_client_id: header.client,
             user_id: header.user_id,
-            session_permissions: None,
+            session_permissions,
             nonce: header.nonce,
             origin_replica: header.replica,
         });

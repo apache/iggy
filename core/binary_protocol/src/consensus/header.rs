@@ -2558,7 +2558,31 @@ fn validate_forward_register_frame(
     nonce: u128,
     reserved: &[u8],
 ) -> Result<(), ConsensusError> {
-    validate_forward_frame(size, client, nonce, reserved)
+    const MAX_FORWARD_REGISTER_SIZE: u32 = 4096;
+    let header_size =
+        u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32 on every supported target");
+    if size < header_size || size > MAX_FORWARD_REGISTER_SIZE {
+        return Err(ConsensusError::InvalidSize {
+            expected: header_size,
+            found: size,
+        });
+    }
+    if client == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward client must be non-zero".to_string(),
+        ));
+    }
+    if nonce == 0 {
+        return Err(ConsensusError::InvalidField(
+            "forward nonce must be non-zero".to_string(),
+        ));
+    }
+    if reserved.iter().any(|&byte| byte != 0) {
+        return Err(ConsensusError::InvalidField(
+            "forward reserved bytes must be zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ForwardLogoutHeader - backup shard 0 -> primary shard 0
@@ -3497,10 +3521,17 @@ mod tests {
             Err(ConsensusError::InvalidField(_))
         ));
 
-        let mut wrong_size = forward_register();
-        wrong_size.size = 512;
+        let mut too_small = forward_register();
+        too_small.size = 16;
         assert!(matches!(
-            wrong_size.validate(),
+            too_small.validate(),
+            Err(ConsensusError::InvalidSize { .. })
+        ));
+
+        let mut too_large = forward_register();
+        too_large.size = 8192;
+        assert!(matches!(
+            too_large.validate(),
             Err(ConsensusError::InvalidSize { .. })
         ));
 

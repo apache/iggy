@@ -633,8 +633,15 @@ where
     let nonce = shard.next_forward_nonce(self_replica);
     let (reply, outcome) = shard::channel::<ForwardRegisterResultHeader>(1);
     shard.park_register_forward(nonce, vsr_client_id, reply);
-    let forward =
-        build_forward_register_message(cluster, view, self_replica, vsr_client_id, nonce, user_id);
+    let forward = build_forward_register_message(
+        cluster,
+        view,
+        self_replica,
+        vsr_client_id,
+        nonce,
+        user_id,
+        session_permissions,
+    );
     if let Err(error) = shard
         .bus
         .send_to_replica(target, forward.into_generic().into_frozen())
@@ -705,6 +712,8 @@ const fn forward_register_outcome(
     }
 }
 
+const MAX_FORWARD_REGISTER_BODY: usize = 4096 - HEADER_SIZE;
+
 #[allow(clippy::cast_possible_truncation)]
 fn build_forward_register_message(
     cluster: u128,
@@ -713,20 +722,31 @@ fn build_forward_register_message(
     client: u128,
     nonce: u128,
     user_id: u32,
+    session_permissions: Option<&iggy_common::Permissions>,
 ) -> Message<ForwardRegisterHeader> {
-    Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
-        |_, header: &mut ForwardRegisterHeader| {
-            header.command = Command::ForwardRegister;
-            header.cluster = cluster;
-            header.view = view;
-            header.replica = replica;
-            header.client = client;
-            header.nonce = nonce;
-            header.user_id = user_id;
-            header.size = HEADER_SIZE as u32;
-            header.seal();
-        },
-    )
+    let body_bytes = session_permissions
+        .and_then(|p| rmp_serde::to_vec(p).ok())
+        .filter(|b| b.len() <= MAX_FORWARD_REGISTER_BODY)
+        .unwrap_or_default();
+    let total_size = HEADER_SIZE + body_bytes.len();
+    let mut msg = Message::<ForwardRegisterHeader>::new(total_size);
+    {
+        let header = bytemuck::checked::try_from_bytes_mut::<ForwardRegisterHeader>(
+            &mut msg.as_mut_slice()[..HEADER_SIZE],
+        )
+        .expect("zeroed bytes are a valid ForwardRegisterHeader");
+        header.command = Command::ForwardRegister;
+        header.cluster = cluster;
+        header.view = view;
+        header.replica = replica;
+        header.client = client;
+        header.nonce = nonce;
+        header.user_id = user_id;
+        header.size = total_size as u32;
+        header.seal();
+    }
+    msg.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body_bytes);
+    msg
 }
 
 #[allow(clippy::cast_possible_truncation)]

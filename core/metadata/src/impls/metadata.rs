@@ -3812,7 +3812,7 @@ where
 /// `PrepareHeader` (also 256 bytes), no realloc.
 /// Decode inline-grant permissions from a Register prepare body. Empty body
 /// (the pre-ext-auth format) returns `None`.
-pub(crate) fn decode_register_body_permissions(body: &[u8]) -> Option<iggy_common::Permissions> {
+pub fn decode_register_body_permissions(body: &[u8]) -> Option<iggy_common::Permissions> {
     if body.is_empty() {
         return None;
     }
