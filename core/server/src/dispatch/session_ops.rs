@@ -1059,7 +1059,7 @@ pub(in crate::dispatch) fn submit_disconnect_logout<B, MJ, S, SB>(
             warn!(
                 vsr_client_id,
                 ?error,
-                "disconnect logout submit failed; peer slots may linger until eviction"
+                "disconnect logout submit failed; consumer-group cleanup will retry after session expiry"
             );
         }
     });

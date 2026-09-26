@@ -37,12 +37,16 @@
 //! - [`StartViewHeader`] - new primary -> all replicas (header-only)
 
 mod command;
+mod consumer_session;
 mod error;
 mod header;
 mod operation;
 mod reply_result;
 
 pub use command::Command;
+pub use consumer_session::{
+    ConsumerSession, ConsumerSessionHeartbeatHeader, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
+};
 pub use error::ConsensusError;
 pub use header::{
     CHECKSUM_UNSEALED, CommitHeader, ConsensusHeader, DVC_HEADERS_MAX, DoViewChangeHeader,

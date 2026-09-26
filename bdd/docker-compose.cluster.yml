@@ -59,6 +59,7 @@ x-cluster-topology: &cluster-topology
   # Keep role-specific scenarios on view 0 when a loaded CI runner delays
   # one replica during startup.
   IGGY_CLUSTER_HEARTBEAT_TIMEOUT: "30s"
+  IGGY_CONSUMER_GROUP_SESSION_TIMEOUT: "60s"
   IGGY_CLUSTER_NODES_0_NAME: leader-node
   IGGY_CLUSTER_NODES_0_IP: 172.28.0.101
   IGGY_CLUSTER_NODES_0_REPLICA_ID: "0"

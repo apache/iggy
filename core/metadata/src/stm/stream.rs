@@ -18,7 +18,8 @@
 use crate::stm::StateHandler;
 use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupSnapshot,
-    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RemoveConsumerGroupMemberRequest,
+    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RefreshConsumerGroupSessionRequest,
+    RemoveConsumerGroupMemberRequest,
 };
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
@@ -858,6 +859,9 @@ define_state! {
         // decide whether to wake the reconciler. Deterministic (same ops, same
         // recompute on every replica).
         pending_revocations_count: u64,
+        // Derived with the revocation count after membership changes and restore.
+        // Locations are (stream, topic, group, member); never persisted.
+        consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
         // Shared aggregate stats, one `Arc` per stream/topic across both
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
@@ -994,27 +998,33 @@ collect_handlers! {
         CompleteConsumerGroupRevocation,
         TruncatePartition,
     }
+    internal { RefreshConsumerGroupSession }
 }
 
 impl StreamsInner {
-    /// Recompute `pending_revocations_count` so the consensus tick's
-    /// `has_pending_revocations` read (and the reconciler's fast-skip) is O(1)
-    /// instead of walking every group each 10ms. Called only by the apply
-    /// handlers that can change pending revocations (join, leave, remove,
-    /// complete, and group-dropping deletes), so non-consumer-group commits pay
-    /// nothing. Recompute (not a delta) keeps the count drift-proof.
-    pub(crate) fn recompute_pending_revocations_count(&mut self) {
+    /// Rebuild derived group metadata after membership/revocation changes or restore.
+    /// Session refreshes use the membership index without rescanning unrelated clients.
+    pub(crate) fn recompute_consumer_group_metadata(&mut self) {
         let mut count: u64 = 0;
-        for (_, stream) in &self.items {
-            for (_, topic) in &stream.topics {
+        for memberships in self.consumer_group_members.values_mut() {
+            memberships.clear();
+        }
+        for (stream_id, stream) in &self.items {
+            for (topic_id, topic) in &stream.topics {
                 for group in topic.consumer_groups.values() {
-                    for (_, member) in &group.members {
+                    for (member_id, member) in &group.members {
                         count += member.pending_revocations.len() as u64;
+                        self.consumer_group_members
+                            .entry(member.client_id)
+                            .or_default()
+                            .push((stream_id, topic_id, group.id, member_id));
                     }
                 }
             }
         }
         self.pending_revocations_count = count;
+        self.consumer_group_members
+            .retain(|_, memberships| !memberships.is_empty());
     }
 
     /// Resolve a wire stream identifier to its committed slab id, `None` when
@@ -1553,6 +1563,48 @@ impl Streams {
         })
     }
 
+    /// The persisted session fence survives client-table eviction and replica restart.
+    #[must_use]
+    pub fn consumer_group_session(&self, client_id: u128) -> Option<u64> {
+        self.inner.read(|inner| {
+            inner
+                .consumer_group_members
+                .get(&client_id)?
+                .iter()
+                .filter_map(|&(stream_id, topic_id, group_id, member_id)| {
+                    inner
+                        .items
+                        .get(stream_id)?
+                        .topics
+                        .get(topic_id)?
+                        .consumer_groups
+                        .get(&group_id)?
+                        .members
+                        .get(member_id)?
+                        .session
+                })
+                .max()
+        })
+    }
+
+    /// Apply the session fence from a committed Register, including on replay.
+    pub fn refresh_consumer_group_session(&self, client_id: u128, session: u64) {
+        if session == 0
+            || !self
+                .inner
+                .read(|inner| inner.consumer_group_members.contains_key(&client_id))
+        {
+            return;
+        }
+        let cmd = StreamsCommand::RefreshConsumerGroupSession(
+            RefreshConsumerGroupSessionRequest { client_id, session },
+            IggyTimestamp::from(0),
+        );
+        if let Err(error) = self.inner.try_apply(cmd) {
+            tracing::error!(client_id, %error, "consumer session refresh dispatched to reader-only Streams STM");
+        }
+    }
+
     /// Drop a disconnected client from every consumer group it joined and
     /// rebalance. Applied through the left-right writer as a deterministic
     /// side-effect of the `Logout` commit on each replica (not a separate
@@ -2069,7 +2121,7 @@ impl StateHandler for DeleteStreamRequest {
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
         // The dropped stream may have held groups with pending revocations.
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -2399,7 +2451,7 @@ impl StateHandler for DeleteTopicRequest {
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
         // The dropped topic may have held groups with pending revocations.
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -2828,10 +2880,11 @@ impl StreamsInner {
             revision: snapshot.revision,
             // Recomputed from the restored groups just below.
             pending_revocations_count: 0,
+            consumer_group_members: AHashMap::new(),
             last_result: None,
             stats_registry,
         };
-        inner.recompute_pending_revocations_count();
+        inner.recompute_consumer_group_metadata();
         inner
     }
 }

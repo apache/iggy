@@ -61,6 +61,7 @@ pub type RecordedReplicaSends = Rc<RefCell<Vec<(u8, Vec<u8>)>>>;
 pub struct SpyBus {
     pub client_replies: RecordedReplies,
     pub replica_sends: RecordedReplicaSends,
+    pub replica_send_capacity: Rc<Cell<Option<usize>>>,
     /// Installs of the client connection-lost hook, one per handler built
     /// on this bus.
     pub connection_lost_hooks: Rc<Cell<usize>>,
@@ -103,6 +104,13 @@ impl MessageBus for SpyBus {
         replica: u8,
         data: Frozen<MESSAGE_ALIGN>,
     ) -> Result<(), SendError> {
+        if self
+            .replica_send_capacity
+            .get()
+            .is_some_and(|capacity| self.replica_sends.borrow().len() >= capacity)
+        {
+            return Err(SendError::Backpressure);
+        }
         self.replica_sends
             .borrow_mut()
             .push((replica, data.as_slice().to_vec()));

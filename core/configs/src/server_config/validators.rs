@@ -31,9 +31,15 @@ use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use crate::{ConfigEnvMappings, ConfigurationError};
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
+use server_common::sharding::{
+    CONSUMER_SESSION_REPORT_TIMEOUT, LIST_CLIENTS_GATHER_TIMEOUT,
+    MIN_CONSUMER_SESSION_HEARTBEAT_SIZE,
+};
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::Path;
+
+const CONSUMER_SESSION_MISSED_REPORT_TOLERANCE: u32 = 1;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -255,6 +261,12 @@ impl Validatable<ConfigurationError> for ServerConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if bus_cap < MIN_CONSUMER_SESSION_HEARTBEAT_SIZE as u64 {
+            eprintln!(
+                "{COMPONENT} message_bus.max_message_size ({bus_cap}) must hold a consumer-session heartbeat of at least {MIN_CONSUMER_SESSION_HEARTBEAT_SIZE} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         // WS frame chain: websocket.max_frame_size <= websocket.max_message_size
         // <= message_bus.max_message_size. The bus's WS / WSS install path takes
@@ -344,9 +356,37 @@ impl Validatable<ConfigurationError> for ServerConfig {
             format!("{COMPONENT} (error: {e}) - failed to validate quic config")
         })?;
 
-        // Both knobs below sit on shared section structs, so the rejects live
+        // These knobs sit on shared section structs, so the rejects live
         // here rather than in those types' own `Validatable` impls. `0` /
         // `disabled` / `unlimited` all parse to the same zero duration.
+        let session_timeout = self.consumer_group.session_timeout.get_duration();
+        let heartbeat_interval = self.consumer_group.heartbeat_interval.get_duration();
+        if heartbeat_interval.is_zero() {
+            eprintln!(
+                "{COMPONENT} consumer_group.heartbeat_interval ({heartbeat_interval:?}) must be nonzero; consumer_group.session_timeout is {session_timeout:?}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        // Cover a missed pass, gather/send deadlines, and one interval of scheduling headroom.
+        let minimum_timeout = heartbeat_interval
+            .saturating_add(LIST_CLIENTS_GATHER_TIMEOUT)
+            .saturating_add(CONSUMER_SESSION_REPORT_TIMEOUT)
+            .saturating_mul(CONSUMER_SESSION_MISSED_REPORT_TOLERANCE + 1)
+            .saturating_add(heartbeat_interval);
+        if session_timeout <= minimum_timeout {
+            eprintln!(
+                "{COMPONENT} consumer_group.session_timeout ({session_timeout:?}) must exceed {minimum_timeout:?}, covering three consumer_group.heartbeat_interval periods and two gather/send deadlines, allowing one missed report"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let cluster_timeout = self.cluster.heartbeat_timeout.get_duration();
+        if self.cluster.enabled && session_timeout <= cluster_timeout {
+            eprintln!(
+                "{COMPONENT} consumer_group.session_timeout ({session_timeout:?}) must exceed cluster.heartbeat_timeout ({cluster_timeout:?})"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if self
             .consumer_group
             .rebalancing_timeout
@@ -1058,6 +1098,62 @@ mod tests {
             "[cluster]\nrepair_chunk_max = 2000\n\n[message_bus]\npeer_queue_capacity = 4096\n",
         );
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_invalid_consumer_session_intervals_when_validating_should_reject() {
+        for settings in [
+            "heartbeat_interval = \"0\"",
+            "session_timeout = \"0\"",
+            "session_timeout = \"disabled\"",
+            "session_timeout = \"unlimited\"",
+            "heartbeat_interval = \"500ms\"\nsession_timeout = \"2s\"",
+            "heartbeat_interval = \"500ms\"\nsession_timeout = \"6500ms\"",
+            "heartbeat_interval = \"500ms\"\nsession_timeout = \"7500ms\"",
+            "heartbeat_interval = \"500ms\"\nsession_timeout = \"7700ms\"",
+            "heartbeat_interval = \"20s\"\nsession_timeout = \"27s\"",
+            "heartbeat_interval = \"20s\"\nsession_timeout = \"66s\"",
+            "heartbeat_interval = \"30s\"\nsession_timeout = \"30s\"",
+            "heartbeat_interval = \"31s\"\nsession_timeout = \"30s\"",
+        ] {
+            let config = config_with_override(&format!("[consumer_group]\n{settings}\n"));
+            assert!(config.validate().is_err(), "accepted {settings}");
+        }
+    }
+
+    #[test]
+    fn given_consumer_session_timeout_above_missed_report_budget_when_validating_should_pass() {
+        let config = config_with_override(
+            "[consumer_group]\nheartbeat_interval = \"500ms\"\nsession_timeout = \"7701ms\"\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_consumer_heartbeat_frame_limits_when_validating_should_require_one_session() {
+        for (cap, valid) in [
+            (MIN_CONSUMER_SESSION_HEARTBEAT_SIZE - 1, false),
+            (MIN_CONSUMER_SESSION_HEARTBEAT_SIZE, true),
+        ] {
+            let config =
+                config_with_override(&format!("[message_bus]\nmax_message_size = \"{cap} B\"\n"));
+            assert_eq!(config.validate().is_ok(), valid, "frame cap {cap}");
+        }
+    }
+
+    #[test]
+    fn given_consumer_session_timeout_within_cluster_liveness_window_when_validating_should_reject()
+    {
+        for timeout in ["15s", "20s"] {
+            let config = config_with_override(&format!(
+                "[cluster]\nenabled = true\nheartbeat_timeout = \"20s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\nsession_timeout = \"{timeout}\"\n"
+            ));
+            assert!(config.validate().is_err(), "accepted {timeout}");
+        }
+        let config = config_with_override(
+            "[cluster]\nenabled = true\nheartbeat_timeout = \"20s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\nsession_timeout = \"21s\"\n",
+        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

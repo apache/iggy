@@ -407,8 +407,18 @@ pub fn new_shard(
         on_client_request,
         on_metadata_submit,
         on_list_clients,
-        // Step 6 keeps this to register client sessions; unused shell-off.
+        // TODO: Model automatic consumer liveness in shell-mode simulations:
+        // - Retain both handles. Run heartbeat verification on every shard and
+        //   consumer_group::liveness::run on shard 0 of every replica for session
+        //   heartbeat reporting and expiry. Support simulated shard/bus types.
+        // - Drive client heartbeats, task timers, and connection/lease timestamps
+        //   with virtual time instead of compio timers and Instant::now().
+        // - Stop these tasks on replica shutdown/crash and recreate them on restart.
+        // - Test missed heartbeats and failed disconnect Logout by advancing virtual
+        //   time, without calling expiry cleanup directly. Verify partition reassignment,
+        //   saved offsets, and preservation of live or reconnected consumers.
         sessions: _,
+        consumer_group_liveness: _,
     } = if shell {
         wire_shell_handlers(
             &SharedSimOutbox(Rc::clone(bus)),
