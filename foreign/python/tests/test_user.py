@@ -15,10 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
+import urllib.request
+
 import pytest
 
 from apache_iggy import (
     GlobalPermissions,
+    IdentityInfo,
     IggyClient,
     Permissions,
     UserInfoDetails,
@@ -30,11 +34,52 @@ from .utils import (
     MAX_USERNAME_BYTES,
     MIN_PASSWORD_BYTES,
     MIN_USERNAME_BYTES,
+    get_http_server_config,
     get_server_config,
     unique_credentials,
     wait_for_ping,
     wait_for_server,
 )
+
+# IggyExpiry::NeverExpire serializes as u64::MAX.
+NEVER_EXPIRE = 18446744073709551615
+
+
+@pytest.fixture
+def personal_access_token(unique_name):
+    """Mint a PAT via HTTP so login tests do not need the Python create API."""
+    name = unique_name(min_bytes=16, max_bytes=30)
+    host, port = get_http_server_config()
+    api = f"http://{host}:{port}"
+    login_req = urllib.request.Request(  # noqa: S310
+        f"{api}/users/login",
+        data=json.dumps({"username": "iggy", "password": "iggy"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
+        jwt = json.loads(response.read())["access_token"]["token"]
+    create_req = urllib.request.Request(  # noqa: S310
+        f"{api}/personal-access-tokens",
+        data=json.dumps({"name": name, "expiry": NEVER_EXPIRE}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {jwt}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(create_req, timeout=10) as response:  # noqa: S310
+        token = json.loads(response.read())["token"]
+    try:
+        yield token
+    finally:
+        delete_req = urllib.request.Request(  # noqa: S310
+            f"{api}/personal-access-tokens/{name}",
+            headers={"Authorization": f"Bearer {jwt}"},
+            method="DELETE",
+        )
+        with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
+            pass
 
 
 class TestCreateUser:
@@ -114,7 +159,10 @@ class TestCreateUser:
         client = IggyClient(f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
-        await client.login_user(username, password)
+        identity = await client.login_user(username, password)
+        assert isinstance(identity, IdentityInfo)
+        assert identity.user_id == created.id
+        assert identity.access_token is None
 
         await iggy_client.delete_user(created.id)
 
@@ -206,6 +254,43 @@ class TestCreateUser:
         await client.login_user(username, password)
 
         await iggy_client.delete_user(created.id)
+
+
+class TestLoginIdentity:
+    """Test login returns IdentityInfo with transport-specific access_token."""
+
+    @pytest.mark.asyncio
+    async def test_login_user_returns_identity_without_access_token(
+        self, iggy_client: IggyClient
+    ):
+        """Test TCP login returns user_id and no HTTP access token."""
+        root = await iggy_client.get_user("iggy")
+        assert root is not None
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        identity = await client.login_user("iggy", "iggy")
+
+        assert isinstance(identity, IdentityInfo)
+        assert identity.user_id == root.id
+        assert identity.access_token is None
+
+    @pytest.mark.asyncio
+    async def test_login_with_personal_access_token(self, personal_access_token):
+        """Test PAT login with a token minted out of band."""
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        identity = await client.login_with_personal_access_token(personal_access_token)
+
+        assert isinstance(identity, IdentityInfo)
+        assert identity.access_token is None
+        user = await client.get_user("iggy")
+        assert user is not None
+        assert identity.user_id == user.id
+        assert personal_access_token not in repr(identity)
 
 
 class TestGetUser:

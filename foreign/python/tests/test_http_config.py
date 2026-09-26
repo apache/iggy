@@ -32,7 +32,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import Consumer, HttpConfig, IggyClient, PollingStrategy
+from apache_iggy import Consumer, HttpConfig, IdentityInfo, IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
 
 from .utils import get_http_server_config, wait_for_ping
@@ -231,6 +231,26 @@ class TestHttpConfigAgainstServer:
         client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
         await client.connect()
         await wait_for_ping(client)
+
+    @pytest.mark.asyncio
+    async def test_login_user_returns_http_access_token(self):
+        """Test HTTP login returns user_id and a session TokenInfo."""
+        host, port = get_http_server_config()
+        client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
+        await client.connect()
+        await wait_for_ping(client)
+
+        identity = await client.login_user("iggy", "iggy")
+        root = await client.get_user("iggy")
+        assert root is not None
+
+        assert isinstance(identity, IdentityInfo)
+        assert identity.user_id == root.id
+        assert identity.access_token is not None
+        assert identity.access_token.token
+        assert identity.access_token.expiry > 0
+        assert identity.access_token.token not in repr(identity)
+        assert identity.access_token.token not in repr(identity.access_token)
 
     @pytest.mark.asyncio
     async def test_client_sends_and_polls_a_message(self, unique_name):

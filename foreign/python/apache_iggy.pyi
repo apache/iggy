@@ -44,6 +44,7 @@ __all__ = [
     "HeaderKey",
     "HeaderValue",
     "HttpConfig",
+    "IdentityInfo",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
@@ -68,6 +69,7 @@ __all__ = [
     "StreamPermissions",
     "TcpConfig",
     "TcpReconnectionConfig",
+    "TokenInfo",
     "Topic",
     "TopicDetails",
     "TopicPermissions",
@@ -1104,6 +1106,23 @@ class HttpConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class IdentityInfo:
+    r"""
+    Identity returned by username/password login and PAT login.
+    """
+    @property
+    def user_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the authenticated user.
+        """
+    @property
+    def access_token(self) -> TokenInfo | None:
+        r"""
+        HTTP access token, or `None` on TCP/QUIC/WebSocket.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -1187,10 +1206,31 @@ class IggyClient:
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[IdentityInfo]:
         r"""
         Logs in the user with the given credentials.
-        Raises `RuntimeError` on failure.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo`.
+            `access_token` is set only on HTTP; binary transports leave it `None`.
+
+        Raises:
+            RuntimeError: If the request fails.
+        """
+    def login_with_personal_access_token(
+        self, token: builtins.str
+    ) -> collections.abc.Awaitable[IdentityInfo]:
+        r"""
+        Logs in with a personal access token minted out of band.
+
+        Args:
+            token: Raw PAT string.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo`.
+
+        Raises:
+            RuntimeError: If the request fails.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -3031,6 +3071,23 @@ class TcpReconnectionConfig:
                 range of an unsigned 32-bit integer, or if `interval` is zero.
             OverflowError: If `max_retries` does not fit a signed 64-bit integer,
                 raised by the underlying conversion before this constructor runs.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class TokenInfo:
+    r"""
+    HTTP session token returned by login. Binary transports leave this unset.
+    """
+    @property
+    def token(self) -> builtins.str:
+        r"""
+        The access token value. Present only after HTTP login.
+        """
+    @property
+    def expiry(self) -> builtins.int:
+        r"""
+        Unix-seconds expiry of the HTTP access token.
         """
     def __repr__(self) -> builtins.str: ...
 
