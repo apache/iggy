@@ -1161,7 +1161,14 @@ fn parse_bulk_response(
             .unwrap_or("unknown error");
         let failure = format!("status {status}: {reason}");
 
-        if StatusCode::from_u16(status).is_ok_and(is_transient_status) {
+        // A 2xx status reaching here always means `error` was present (the
+        // `error.is_none() && 2xx` case above already returned) - the same
+        // contradictory shape the errors:false fast path treats as untrusted.
+        // Retryable, not permanent: OpenSearch may have indexed the document
+        // already, and a resend is safe (idempotent by `_id`).
+        if (200..300).contains(&status)
+            || StatusCode::from_u16(status).is_ok_and(is_transient_status)
+        {
             attempt.retryable.push(position);
             if attempt.first_retryable_failure.is_none() {
                 attempt.first_retryable_failure = Some(failure);
@@ -1262,7 +1269,16 @@ fn headers_to_json(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Value {
             };
             (
                 key.to_string_value(),
-                json!({ "data": data, "data_encoding": encoding }),
+                // Built directly rather than via `json!`: that macro routes
+                // through `Serialize`, which only ever sees `&str` and so
+                // must copy `data` again even though it's already owned here.
+                Value::Object(Map::from_iter([
+                    ("data".to_string(), Value::String(data)),
+                    (
+                        "data_encoding".to_string(),
+                        Value::String(encoding.to_string()),
+                    ),
+                ])),
             )
         })
         .collect();
@@ -2420,6 +2436,22 @@ mod tests {
     }
 
     #[test]
+    fn given_errors_true_bulk_response_with_item_error_despite_2xx_status_should_be_retryable() {
+        let response = json!({
+            "errors": true,
+            "items": [
+                { "index": { "_id": "a", "status": 201, "error": { "reason": "conflict" } } }
+            ]
+        });
+
+        let attempt = parsed(&response, 1).expect("well-formed response");
+
+        assert_eq!(attempt.indexed, 0);
+        assert_eq!(attempt.permanent_failed, 0);
+        assert_eq!(attempt.retryable, vec![0]);
+    }
+
+    #[test]
     fn given_transient_item_failures_should_report_their_positions_for_retry() {
         let response = json!({
             "errors": true,
@@ -2574,7 +2606,7 @@ mod tests {
     // The invocation counter is bumped before the client is looked up, so a
     // batch that never reaches OpenSearch still counts as an invocation.
     #[tokio::test]
-    async fn given_unopened_sink_when_consuming_should_count_invocation_and_fail() {
+    async fn given_unopened_sink_should_count_invocation_and_fail() {
         let sink = sink_with_config(base_config());
 
         let error = sink
