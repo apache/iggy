@@ -17,9 +17,55 @@
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import (
+    AutoLogin,
+    HttpConfig,
+    IggyClient,
+    QuicConfig,
+    TcpConfig,
+    WebSocketConfig,
+)
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
+from .utils import (
+    get_http_server_config,
+    get_quic_server_config,
+    get_server_config,
+    get_websocket_server_config,
+    wait_for_ping,
+    wait_for_server,
+)
+
+
+def binary_transport_configs(
+    auto_login: AutoLogin | None = None, websocket_marks: tuple = ()
+) -> list:
+    """Return a config for every transport that holds a connection.
+
+    Auto-login is disabled by default: with credentials to replay, a ping sent
+    while disconnected reconnects on its own instead of failing.
+    """
+    tcp_host, tcp_port = get_server_config()
+    ws_host, ws_port = get_websocket_server_config()
+    quic_host, quic_port = get_quic_server_config()
+    return [
+        pytest.param(
+            TcpConfig(server_address=f"{tcp_host}:{tcp_port}", auto_login=auto_login),
+            id="tcp",
+        ),
+        pytest.param(
+            WebSocketConfig(
+                server_address=f"{ws_host}:{ws_port}", auto_login=auto_login
+            ),
+            id="websocket",
+            marks=websocket_marks,
+        ),
+        pytest.param(
+            QuicConfig(
+                server_address=f"{quic_host}:{quic_port}", auto_login=auto_login
+            ),
+            id="quic",
+        ),
+    ]
 
 
 class TestConnectivity:
@@ -168,3 +214,135 @@ class TestConnectivity:
     async def test_ping(self, iggy_client: IggyClient):
         """Test server ping functionality."""
         await iggy_client.ping()
+
+
+class TestLifecycle:
+    """Test the disconnect and shutdown lifecycle of the client."""
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_disconnect_is_idempotent_and_rejects_requests(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated disconnects succeed and requests fail while disconnected."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.disconnect()
+        await client.disconnect()
+
+        with pytest.raises(RuntimeError):
+            await client.ping()
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_disconnected_client_connects_again(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated disconnects leave the client able to connect again."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.disconnect()
+        await client.disconnect()
+        await client.connect()
+
+        await client.ping()
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_disconnected_client_reconnects_and_logs_in_again(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test a disconnected client needs a new login after it reconnects."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
+        await client.get_streams()
+
+        await client.disconnect()
+        await client.connect()
+        await wait_for_ping(client)
+
+        with pytest.raises(RuntimeError):
+            await client.get_streams()
+
+        await client.login_user("iggy", "iggy")
+        await client.get_streams()
+
+    @pytest.mark.parametrize(
+        "config",
+        binary_transport_configs(AutoLogin.username_password("iggy", "iggy")),
+    )
+    @pytest.mark.asyncio
+    async def test_disconnected_client_with_auto_login_signs_in_on_reconnect(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test a client with auto-login credentials signs in again on connect."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.disconnect()
+        await client.connect()
+
+        await client.get_streams()
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_shutdown_is_idempotent_and_rejects_requests(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated shutdowns succeed and later requests report the shutdown."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.shutdown()
+        await client.shutdown()
+
+        with pytest.raises(RuntimeError, match="Client shutdown"):
+            await client.ping()
+
+    @pytest.mark.parametrize(
+        "config",
+        binary_transport_configs(
+            websocket_marks=(
+                pytest.mark.xfail(
+                    reason="WebSocketClient connects again after shutdown: #4287",
+                    strict=True,
+                ),
+            )
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_shutdown_client_cannot_connect_again(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated shutdowns leave the client unable to connect again."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.shutdown()
+        await client.shutdown()
+
+        with pytest.raises(RuntimeError):
+            await client.connect()
+
+    @pytest.mark.asyncio
+    async def test_http_disconnect_and_shutdown_do_nothing(self):
+        """Test HTTP has no connection to close, so requests keep working."""
+        host, port = get_http_server_config()
+        client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.disconnect()
+        await client.ping()
+
+        await client.shutdown()
+        await client.ping()
