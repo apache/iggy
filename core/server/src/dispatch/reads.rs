@@ -558,6 +558,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     user_id,
                     client_address,
                     code,
+                    alt_permissioner.as_ref(),
                 )
                 .await
             };
@@ -733,6 +734,7 @@ async fn consumer_routing<B, MJ, S, SB>(
     user_id: Option<u32>,
     client_address: Option<SocketAddr>,
     code: u32,
+    alt_permissioner: Option<&Permissioner>,
 ) -> Result<Bytes, IggyError>
 where
     B: ShellBus,
@@ -767,7 +769,7 @@ where
             |permissioner, user_id, stream_id, topic_id| {
                 permissioner.poll_messages(user_id, stream_id, topic_id)
             },
-            None,
+            alt_permissioner,
         )
         .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
     })
