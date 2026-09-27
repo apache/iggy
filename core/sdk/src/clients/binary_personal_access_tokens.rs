@@ -97,6 +97,6 @@ impl PersonalAccessTokenClient for IggyClient {
                 Ok(identity)
             }
         };
-        self.run_tcp_request(operation).await
+        self.run_request_with_budget(operation).await
     }
 }

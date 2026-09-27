@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::client_wrappers::client_wrapper::ClientRequestPolicy;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
@@ -167,6 +168,20 @@ impl TcpRequestPolicy {
         if let Ok(mut state) = self.state.try_lock() {
             *state = ClientState::Disconnected;
         }
+    }
+}
+
+impl ClientRequestPolicy for TcpRequestPolicy {
+    fn timeout(&self) -> NonZeroIggyDuration {
+        TcpRequestPolicy::timeout(self)
+    }
+
+    fn should_budget_connect(&self) -> bool {
+        TcpRequestPolicy::has_sign_in_credentials(self)
+    }
+
+    fn expire(&self) {
+        TcpRequestPolicy::expire(self);
     }
 }
 

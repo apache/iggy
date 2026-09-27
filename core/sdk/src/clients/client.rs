@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::client_wrapper::{ClientRequestPolicy, ClientWrapper};
 use crate::client_wrappers::connection_info::ConnectionInfo;
 use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
@@ -25,7 +25,7 @@ use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
 use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::{TcpClient, TcpRequestPolicy};
+use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
@@ -229,7 +229,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 #[allow(dead_code)]
 pub struct IggyClient {
     pub(crate) client: IggyRwLock<ClientWrapper>,
-    tcp_request_policy: Option<TcpRequestPolicy>,
+    pub(crate) request_policy: Option<Arc<dyn ClientRequestPolicy>>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
     heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
@@ -450,11 +450,11 @@ impl IggyClient {
     /// [`TcpClient`]: crate::prelude::TcpClient
     /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn new(client: ClientWrapper) -> Self {
-        let tcp_request_policy = Self::tcp_request_policy(&client);
+        let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
-            tcp_request_policy,
+            request_policy,
             partitioner: None,
             encryptor: None,
             heartbeat_handle: Mutex::new(None),
@@ -564,32 +564,24 @@ impl IggyClient {
             info!("Client-side encryption is enabled.");
         }
 
-        let tcp_request_policy = Self::tcp_request_policy(&client);
+        let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
-            tcp_request_policy,
+            request_policy,
             partitioner,
             encryptor,
             heartbeat_handle: Mutex::new(None),
         }
     }
 
-    fn tcp_request_policy(client: &ClientWrapper) -> Option<TcpRequestPolicy> {
-        match client {
-            ClientWrapper::Tcp(client) => Some(client.request_policy()),
-            ClientWrapper::Iggy(client) => client.tcp_request_policy.clone(),
-            _ => None,
-        }
-    }
-
-    pub(crate) async fn run_tcp_request<T>(
+    pub(crate) async fn run_request_with_budget<T>(
         &self,
         future: impl Future<Output = Result<T, IggyError>>,
     ) -> Result<T, IggyError> {
-        let policy = self.tcp_request_policy.as_ref();
+        let policy = self.request_policy.as_ref();
         run_with_request_budget(
-            policy.map(TcpRequestPolicy::timeout),
+            policy.map(|policy| policy.timeout()),
             || {
                 if let Some(policy) = policy {
                     policy.expire();
@@ -1027,11 +1019,11 @@ impl Client for IggyClient {
         };
         if active_request_budget().is_some()
             || self
-                .tcp_request_policy
+                .request_policy
                 .as_ref()
-                .is_some_and(TcpRequestPolicy::has_sign_in_credentials)
+                .is_some_and(|policy| policy.should_budget_connect())
         {
-            self.run_tcp_request(operation).await
+            self.run_request_with_budget(operation).await
         } else {
             operation.await
         }
