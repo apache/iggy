@@ -16,34 +16,46 @@
 // under the License.
 
 use std::future::Future;
-use std::time::Duration;
 
-use crate::{IggyError, NonZeroIggyDuration};
 use tokio::time::{Instant, timeout_at};
 
+use crate::{IggyError, NonZeroIggyDuration};
+
 tokio::task_local! {
-    static ACTIVE_REQUEST_BUDGET: RequestBudget;
+    static REQUEST_DEADLINE: Instant;
 }
 
-pub fn active_request_budget() -> Option<RequestBudget> {
-    ACTIVE_REQUEST_BUDGET.try_with(|budget| *budget).ok()
+/// Returns the active request deadline, if this task has a budget.
+pub fn request_budget_deadline() -> Option<Instant> {
+    REQUEST_DEADLINE.try_with(|deadline| *deadline).ok()
 }
 
-pub async fn run_with_request_budget<T>(
+/// Runs a request under its existing deadline, or starts one from `timeout`.
+pub async fn with_request_budget<T>(
     timeout: Option<NonZeroIggyDuration>,
     on_expire: impl FnOnce(),
     future: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, IggyError> {
-    let budget = active_request_budget().or_else(|| timeout.map(RequestBudget::new));
-    let Some(budget) = budget else {
+    let existing_deadline = request_budget_deadline();
+    let deadline = existing_deadline
+        .or_else(|| timeout.map(|timeout| Instant::now() + timeout.get_duration()));
+    let Some(deadline) = deadline else {
         return future.await;
     };
-    let result = if active_request_budget().is_some() {
-        budget.run(future).await
-    } else {
-        ACTIVE_REQUEST_BUDGET
-            .scope(budget, budget.run(future))
+    // Login reconnects nest budgeted futures; boxing keeps their stack use bounded.
+    let future = Box::pin(future);
+    let run = async {
+        if deadline <= Instant::now() {
+            return Err(IggyError::RequestTimeoutOutcomeUnknown);
+        }
+        timeout_at(deadline, future)
             .await
+            .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?
+    };
+    let result = if existing_deadline.is_some() {
+        run.await
+    } else {
+        REQUEST_DEADLINE.scope(deadline, run).await
     };
     if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
         on_expire();
@@ -51,39 +63,27 @@ pub async fn run_with_request_budget<T>(
     result
 }
 
-/// One logical request's absolute deadline, shared by its attempts.
-#[derive(Clone, Copy)]
-pub struct RequestBudget {
-    deadline: Instant,
-}
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-impl RequestBudget {
-    pub fn new(timeout: NonZeroIggyDuration) -> Self {
-        Self {
-            deadline: Instant::now() + timeout.get_duration(),
-        }
-    }
+    use super::*;
 
-    pub fn deadline(self) -> Instant {
-        self.deadline
-    }
+    #[tokio::test]
+    async fn nested_operation_inherits_request_deadline() {
+        let timeout = NonZeroIggyDuration::new(Duration::from_secs(1)).unwrap();
+        let result = with_request_budget(Some(timeout), || {}, async {
+            let outer_deadline = request_budget_deadline();
+            let inner_deadline = with_request_budget(Some(timeout), || {}, async {
+                Ok(request_budget_deadline())
+            })
+            .await?;
+            assert_eq!(inner_deadline, outer_deadline);
+            Ok(())
+        })
+        .await;
 
-    pub fn remaining(self) -> Result<Duration, IggyError> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(IggyError::RequestTimeoutOutcomeUnknown)
-        } else {
-            Ok(remaining)
-        }
-    }
-
-    pub async fn run<T>(
-        self,
-        future: impl Future<Output = Result<T, IggyError>>,
-    ) -> Result<T, IggyError> {
-        self.remaining()?;
-        timeout_at(self.deadline, future)
-            .await
-            .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?
+        assert!(result.is_ok());
+        assert!(request_budget_deadline().is_none());
     }
 }

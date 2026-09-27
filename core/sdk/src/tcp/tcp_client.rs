@@ -41,7 +41,7 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 #[cfg(test)]
 use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
-use iggy_common::request_budget::{RequestBudget, active_request_budget, run_with_request_budget};
+use iggy_common::request_budget::{request_budget_deadline, with_request_budget};
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     Identifier, IggyDuration, IggyError, IggyTimestamp, NonZeroIggyDuration,
@@ -290,8 +290,8 @@ impl BinaryTransport for TcpClient {
         payload: Bytes,
         context: PartitionContext,
     ) -> Result<Bytes, IggyError> {
-        if is_login_register_code(code) && active_request_budget().is_none() {
-            return run_with_request_budget(
+        if is_login_register_code(code) && request_budget_deadline().is_none() {
+            return with_request_budget(
                 self.request_timeout(),
                 || self.expire_request(),
                 self.send_raw_with_response_inner(code, payload, context),
@@ -373,7 +373,8 @@ impl TcpClient {
 
         let error = result.unwrap_err();
         let mut retry_outcome = crate::vsr::RetryOutcome::for_reconnect(code, &error);
-        if active_request_budget().is_some_and(|budget| budget.remaining().is_err()) {
+        if request_budget_deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
             return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
         if !matches!(
@@ -418,14 +419,11 @@ impl TcpClient {
         let nested_connect = owner_context.is_some();
         let _routing_guard = if nested_connect {
             None
-        } else if let Some(budget) = active_request_budget() {
+        } else {
             Some(
-                budget
-                    .run(async { Ok(self.routing_lock.lock().await) })
+                with_request_budget(None, || {}, async { Ok(self.routing_lock.lock().await) })
                     .await?,
             )
-        } else {
-            Some(self.routing_lock.lock().await)
         };
         if !nested_connect && self.connect_coordinator.is_active() {
             self.connect()
@@ -438,16 +436,9 @@ impl TcpClient {
                 .await
                 .map_err(|error| retry_outcome.observe(error));
         }
-        if let Some(budget) = active_request_budget() {
-            budget
-                .run(self.disconnect_transport())
-                .await
-                .map_err(|error| retry_outcome.observe(error))?;
-        } else {
-            self.disconnect_transport()
-                .await
-                .map_err(|error| retry_outcome.observe(error))?;
-        }
+        with_request_budget(None, || {}, self.disconnect_transport())
+            .await
+            .map_err(|error| retry_outcome.observe(error))?;
 
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
@@ -482,15 +473,12 @@ impl TcpClient {
     }
 
     async fn wait_before_login_replay(result: &Result<Bytes, IggyError>) -> Result<(), IggyError> {
-        if result.is_err()
-            && let Some(budget) = active_request_budget()
-        {
-            budget
-                .run(async {
-                    sleep(NOT_READY_RETRY_INTERVAL).await;
-                    Ok(())
-                })
-                .await?;
+        if result.is_err() && request_budget_deadline().is_some() {
+            with_request_budget(None, || {}, async {
+                sleep(NOT_READY_RETRY_INTERVAL).await;
+                Ok(())
+            })
+            .await?;
         }
         Ok(())
     }
@@ -709,8 +697,8 @@ impl TcpClient {
     }
 
     async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
-        if active_request_budget().is_none() && self.request_policy().has_sign_in_credentials() {
-            return run_with_request_budget(
+        if request_budget_deadline().is_none() && self.request_policy().has_sign_in_credentials() {
+            return with_request_budget(
                 self.request_timeout(),
                 || self.expire_request(),
                 Box::pin(self.connect_with_settlement_inner(settle_off_leader)),
@@ -762,11 +750,7 @@ impl TcpClient {
                             }
                             Ok(())
                         };
-                        let result = if let Some(budget) = active_request_budget() {
-                            budget.run(operation).await
-                        } else {
-                            operation.await
-                        };
+                        let result = with_request_budget(None, || {}, operation).await;
                         if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
                             // A transport task may still hold the stream
                             // lock. Mark it stale now so its next user
@@ -791,7 +775,9 @@ impl TcpClient {
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         loop {
-            if active_request_budget().is_some_and(|budget| budget.remaining().is_err()) {
+            if request_budget_deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
                 self.fail_connect().await;
                 return Err(IggyError::RequestTimeoutOutcomeUnknown);
             }
@@ -862,19 +848,14 @@ impl TcpClient {
                     && let Some(remaining) = self.reestablish_wait().await
                 {
                     info!("Trying to connect to the server: {server_address} in: {remaining}");
-                    if let Some(budget) = active_request_budget() {
-                        if let Err(error) = budget
-                            .run(async {
-                                sleep(remaining.get_duration()).await;
-                                Ok(())
-                            })
-                            .await
-                        {
-                            self.fail_connect().await;
-                            return Err(error);
-                        }
-                    } else {
+                    if let Err(error) = with_request_budget(None, || {}, async {
                         sleep(remaining.get_duration()).await;
+                        Ok(())
+                    })
+                    .await
+                    {
+                        self.fail_connect().await;
+                        return Err(error);
                     }
                 }
 
@@ -884,13 +865,12 @@ impl TcpClient {
                 }
 
                 info!("{NAME} client is connecting to server: {server_address}...");
-                let established = if let Some(budget) = active_request_budget() {
-                    budget
-                        .run(self.establish_bounded(&server_address, &candidates))
-                        .await
-                } else {
-                    self.establish_bounded(&server_address, &candidates).await
-                };
+                let established = with_request_budget(
+                    None,
+                    || {},
+                    self.establish_bounded(&server_address, &candidates),
+                )
+                .await;
                 match established {
                     Ok(connection) => {
                         let dialed = server_address.clone();
@@ -1021,19 +1001,14 @@ impl TcpClient {
                          {} endpoint(s) in: {interval_str}",
                         candidates.len(),
                     );
-                    if let Some(budget) = active_request_budget() {
-                        if let Err(error) = budget
-                            .run(async {
-                                sleep(self.config.reconnection.interval.get_duration()).await;
-                                Ok(())
-                            })
-                            .await
-                        {
-                            self.fail_connect().await;
-                            return Err(error);
-                        }
-                    } else {
+                    if let Err(error) = with_request_budget(None, || {}, async {
                         sleep(self.config.reconnection.interval.get_duration()).await;
+                        Ok(())
+                    })
+                    .await
+                    {
+                        self.fail_connect().await;
+                        return Err(error);
                     }
                     continue;
                 }
@@ -1614,14 +1589,12 @@ impl TcpClient {
         // whole budget: the connect flow owns leader redirection for the
         // sign-in handshake, and reconnecting from underneath it would
         // recurse.
-        let request_budget = active_request_budget();
-        if request_budget.is_some_and(|budget| budget.remaining().is_err()) {
+        let request_deadline = request_budget_deadline();
+        if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
-        let overall_deadline = request_budget.map_or_else(
-            || tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT,
-            RequestBudget::deadline,
-        );
+        let overall_deadline =
+            request_deadline.unwrap_or_else(|| tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT);
         // Set once this request starts walking the roster past the metadata
         // leader, so later rounds keep walking instead of being redirected
         // back onto the node whose partition replica keeps refusing them.
@@ -1647,7 +1620,9 @@ impl TcpClient {
                 )
                 .await;
             header.header = encoded.or(header.header);
-            if request_budget.is_some_and(|budget| budget.remaining().is_err()) && result.is_err() {
+            if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                && result.is_err()
+            {
                 if let Ok(mut stream) = self.link.try_lock() {
                     stream.take();
                 }
@@ -1850,17 +1825,17 @@ impl TcpClient {
         Result<Bytes, IggyError>,
     ) {
         let discard_stream_on_next_lock = Arc::clone(&self.discard_stream_on_next_lock);
-        let request_budget = active_request_budget();
+        let request_deadline = request_budget_deadline();
         let read_deadline =
-            request_budget.map_or(read_deadline, |budget| read_deadline.min(budget.deadline()));
+            request_deadline.map_or(read_deadline, |deadline| read_deadline.min(deadline));
         let link = self.link.clone();
         let session_owner = Arc::clone(&self.session_owner);
         let mut outcome_so_far = std::mem::take(retry_outcome);
         // A task finishes the exchange when its caller goes away. An unbound
         // request that left before its reply would close the link.
         let joined = tokio::spawn(async move {
-            let mut link_guard = if let Some(budget) = request_budget {
-                match tokio::time::timeout_at(budget.deadline(), link.lock()).await {
+            let mut link_guard = if let Some(deadline) = request_deadline {
+                match tokio::time::timeout_at(deadline, link.lock()).await {
                     Ok(guard) => guard,
                     Err(_) => {
                         return (
@@ -1917,7 +1892,9 @@ impl TcpClient {
                     Err(error) => {
                         link_failed = true;
                         break Err(
-                            if request_budget.is_some_and(|budget| budget.remaining().is_err()) {
+                            if request_deadline
+                                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                            {
                                 IggyError::RequestTimeoutOutcomeUnknown
                             } else {
                                 outcome_so_far.observe_link_error(error, replay)
@@ -3185,7 +3162,7 @@ mod tests {
         let payload = Bytes::from(vec![0; payload_size]);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run_with_request_budget(
+            with_request_budget(
                 Some(client.config.request_timeout),
                 || client.expire_request(),
                 async {
