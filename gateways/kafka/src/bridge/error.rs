@@ -434,4 +434,25 @@ mod tests {
             );
         }
     }
+
+   #[test]
+    fn send_lost_maps_to_request_timed_out() {
+        // The SDK does not replay a send after a lost connection, so it may have landed.
+        let err = BridgeError::SendLost(IggyError::Disconnected);
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn rejected_bridge_login_is_told_apart_from_a_missing_permission() {
+        for rejected in [
+            IggyError::InvalidCredentials,
+            IggyError::InvalidUsername,
+            IggyError::InvalidPassword,
+        ] {
+            assert!(BridgeError::Iggy(rejected).is_bridge_login_rejected());
+        }
+        assert!(!BridgeError::Iggy(IggyError::Unauthorized).is_bridge_login_rejected());
+        assert!(!BridgeError::Timeout.is_bridge_login_rejected());
+    }
+
 }
