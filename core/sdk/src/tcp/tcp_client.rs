@@ -279,6 +279,9 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        // The configured request timeout currently covers TCP login/register
+        // and credentialed connect, including their retries. Other requests
+        // keep the response-read limit unless their caller supplies a budget.
         if is_login_register_code(code) && request_budget_deadline().is_none() {
             return with_request_budget(
                 self.request_timeout(),
@@ -311,16 +314,7 @@ impl TcpClient {
                 .await;
             if !is_login_register_code(code)
                 || !self.config.reconnection.enabled
-                || !matches!(
-                    result,
-                    Err(IggyError::Disconnected
-                        | IggyError::EmptyResponse
-                        | IggyError::Unauthenticated
-                        | IggyError::StaleClient
-                        | IggyError::NotConnected
-                        | IggyError::CannotEstablishConnection
-                        | IggyError::TcpError)
-                )
+                || !matches!(&result, Err(error) if is_reconnectable_request_error(error))
             {
                 return result;
             }
@@ -346,16 +340,7 @@ impl TcpClient {
         {
             return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
-        if !matches!(
-            error,
-            IggyError::Disconnected
-                | IggyError::EmptyResponse
-                | IggyError::Unauthenticated
-                | IggyError::StaleClient
-                | IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::TcpError
-        ) {
+        if !is_reconnectable_request_error(&error) {
             return Err(error);
         }
 
@@ -1554,6 +1539,8 @@ impl TcpClient {
         if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
+        // Replays and failovers share the caller's deadline. Without a budget,
+        // this path uses the existing 30-second response-read limit.
         let overall_deadline =
             request_deadline.unwrap_or_else(|| tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT);
         // Set once this request starts walking the roster past the metadata
@@ -1941,6 +1928,19 @@ impl TcpClient {
 
 const fn is_login_register_code(code: u32) -> bool {
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
+}
+
+fn is_reconnectable_request_error(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::Disconnected
+            | IggyError::EmptyResponse
+            | IggyError::Unauthenticated
+            | IggyError::StaleClient
+            | IggyError::NotConnected
+            | IggyError::CannotEstablishConnection
+            | IggyError::TcpError
+    )
 }
 
 fn tls_server_name(server_address: &str) -> String {

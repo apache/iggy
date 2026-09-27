@@ -450,6 +450,8 @@ impl IggyClient {
     /// [`TcpClient`]: crate::prelude::TcpClient
     /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn new(client: ClientWrapper) -> Self {
+        // Only TCP supplies a policy. It bounds login, PAT login, and connect
+        // when sign-in credentials are available, including their lock waits.
         let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
         IggyClient {
@@ -564,6 +566,8 @@ impl IggyClient {
             info!("Client-side encryption is enabled.");
         }
 
+        // Only TCP supplies a policy. It bounds login, PAT login, and connect
+        // when sign-in credentials are available, including their lock waits.
         let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
         IggyClient {
@@ -1047,6 +1051,22 @@ mod tests {
     use super::*;
     use iggy_common::{AutoLogin, Credentials, NonZeroIggyDuration, TcpClientConfig, UserClient};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn non_tcp_clients_have_no_request_policy() {
+        for protocol in [
+            TransportProtocol::Http,
+            TransportProtocol::Quic,
+            TransportProtocol::WebSocket,
+        ] {
+            let connection_string = format!("iggy+{protocol}://user:secret@127.0.0.1:1234");
+            let client = IggyClient::from_connection_string(&connection_string).unwrap();
+            assert!(
+                client.request_policy.is_none(),
+                "{protocol} must not have a request policy"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn tcp_login_deadline_includes_high_level_client_lock() {
