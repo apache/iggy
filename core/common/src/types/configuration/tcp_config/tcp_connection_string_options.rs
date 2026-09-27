@@ -139,17 +139,15 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
         let request_timeout = NonZeroIggyDuration::from_str(request_timeout.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
-        let mut connection_string_options = TcpConnectionStringOptions::new(
+        Ok(TcpConnectionStringOptions::new(
             tls_enabled,
             tls_domain,
             tls_ca_file,
             reconnection,
             heartbeat_interval,
+            request_timeout,
             nodelay,
-        );
-        connection_string_options.request_timeout = request_timeout;
-
-        Ok(connection_string_options)
+        ))
     }
 }
 
@@ -160,6 +158,7 @@ impl TcpConnectionStringOptions {
         tls_ca_file: Option<String>,
         reconnection: TcpClientReconnectionConfig,
         heartbeat_interval: NonZeroIggyDuration,
+        request_timeout: NonZeroIggyDuration,
         nodelay: bool,
     ) -> Self {
         Self {
@@ -168,7 +167,7 @@ impl TcpConnectionStringOptions {
             tls_ca_file,
             reconnection,
             heartbeat_interval,
-            request_timeout: NonZeroIggyDuration::from_str("30s").unwrap(),
+            request_timeout,
             nodelay,
         }
     }

@@ -140,7 +140,6 @@ impl ClientProviderConfig {
                     tls_ca_file: args.tcp_tls_ca_file,
                     tls_validate_certificate: true,
                     nodelay: args.tcp_nodelay,
-                    request_timeout: TcpClientConfig::default().request_timeout,
                     heartbeat_interval: NonZeroIggyDuration::from_str(&args.tcp_heartbeat_interval)
                         .map_err(|_| IggyError::InvalidConfiguration)?,
                     reconnection: TcpClientReconnectionConfig {
@@ -161,6 +160,7 @@ impl ClientProviderConfig {
                     } else {
                         AutoLogin::Disabled
                     },
+                    ..Default::default()
                 }));
             }
             TransportProtocol::WebSocket => {
