@@ -38,8 +38,8 @@ use crate::harness::config::{AutoLoginConfig, TlsConfig};
 use crate::harness::error::TestBinaryError;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
-    Client, HttpClientConfig, IggyClient, IggyDuration, QuicClientConfig, TcpClient,
-    TcpClientConfig, UserClient, WebSocketClientConfig,
+    Client, HttpClientConfig, IggyClient, IggyDuration, NonZeroIggyDuration, QuicClientConfig,
+    TcpClient, TcpClientConfig, UserClient, WebSocketClientConfig,
 };
 use iggy::quic::quic_client::QuicClient;
 use iggy::websocket::websocket_client::WebSocketClient;
@@ -71,6 +71,7 @@ pub struct ClientBuilder {
     auto_login: Option<AutoLoginConfig>,
     reconnecting_login: bool,
     tcp_nodelay: bool,
+    request_timeout: Option<NonZeroIggyDuration>,
     reestablish_after: Option<IggyDuration>,
     encryptor: Option<Arc<iggy_common::EncryptorKind>>,
 }
@@ -83,6 +84,7 @@ impl ClientBuilder {
             auto_login: None,
             reconnecting_login: false,
             tcp_nodelay: false,
+            request_timeout: None,
             reestablish_after: None,
             encryptor: None,
         }
@@ -111,6 +113,12 @@ impl ClientBuilder {
     /// Enable TCP_NODELAY (only affects TCP transport).
     pub fn with_nodelay(mut self) -> Self {
         self.tcp_nodelay = true;
+        self
+    }
+
+    /// Override the TCP login request timeout.
+    pub fn with_request_timeout(mut self, request_timeout: NonZeroIggyDuration) -> Self {
+        self.request_timeout = Some(request_timeout);
         self
     }
 
@@ -160,8 +168,36 @@ impl ClientBuilder {
                 message: "TCP transport not available".to_string(),
             })?;
 
+        let client = TcpClient::create(Arc::new(self.tcp_config(addr))).map_err(|error| {
+            TestBinaryError::ClientCreation {
+                transport: "TCP".to_string(),
+                address: addr.to_string(),
+                source: error.to_string(),
+            }
+        })?;
+
+        Client::connect(&client)
+            .await
+            .map_err(|e| TestBinaryError::ClientConnection {
+                transport: "TCP".to_string(),
+                address: addr.to_string(),
+                source: e.to_string(),
+            })?;
+
+        Ok(IggyClient::create(
+            iggy::prelude::ClientWrapper::Tcp(client),
+            None,
+            self.encryptor.clone(),
+        ))
+    }
+
+    fn tcp_config(&self, addr: SocketAddr) -> TcpClientConfig {
         let tls_enabled = self.connection.tls.is_some();
-        let tls_validate = self.connection.tls.as_ref().is_some_and(|t| !t.self_signed);
+        let tls_validate = self
+            .connection
+            .tls
+            .as_ref()
+            .is_some_and(|tls| !tls.self_signed);
 
         let mut config = TcpClientConfig {
             server_address: addr.to_string(),
@@ -180,27 +216,10 @@ impl ClientBuilder {
         if let Some(reestablish_after) = self.reestablish_after {
             config.reconnection.reestablish_after = reestablish_after;
         }
-
-        let client =
-            TcpClient::create(Arc::new(config)).map_err(|e| TestBinaryError::ClientCreation {
-                transport: "TCP".to_string(),
-                address: addr.to_string(),
-                source: e.to_string(),
-            })?;
-
-        Client::connect(&client)
-            .await
-            .map_err(|e| TestBinaryError::ClientConnection {
-                transport: "TCP".to_string(),
-                address: addr.to_string(),
-                source: e.to_string(),
-            })?;
-
-        Ok(IggyClient::create(
-            iggy::prelude::ClientWrapper::Tcp(client),
-            None,
-            self.encryptor.clone(),
-        ))
+        if let Some(request_timeout) = self.request_timeout {
+            config.request_timeout = request_timeout;
+        }
+        config
     }
 
     async fn create_http_client(&self) -> Result<IggyClient, TestBinaryError> {
@@ -399,5 +418,19 @@ mod tests {
         let login = builder.auto_login.unwrap();
         assert_eq!(login.username, "user");
         assert_eq!(login.password, "pass");
+    }
+
+    #[test]
+    fn tcp_request_timeout_defaults_and_accepts_override() {
+        let connection = dummy_connection();
+        let address = connection.tcp_addr.unwrap();
+        let default_timeout = TcpClientConfig::default().request_timeout;
+        let builder = ClientBuilder::new(TransportProtocol::Tcp, connection.clone());
+        assert_eq!(builder.tcp_config(address).request_timeout, default_timeout);
+
+        let request_timeout = "250ms".parse::<NonZeroIggyDuration>().unwrap();
+        let builder = ClientBuilder::new(TransportProtocol::Tcp, connection)
+            .with_request_timeout(request_timeout);
+        assert_eq!(builder.tcp_config(address).request_timeout, request_timeout);
     }
 }
