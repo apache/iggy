@@ -401,8 +401,43 @@ async fn given_timestamps_72_minutes_apart_when_handled_should_store_both() {
     );
     let messages = stored(&server, 0, 10).await;
     assert_eq!(messages.len(), 2);
-    let micros = u64::try_from(later * 1000).expect("positive");
-    assert_eq!(messages[1].header.origin_timestamp, micros);
+    let start = u64::try_from(CREATE_TIME * 1000).expect("positive");
+    assert_eq!(
+        messages[1].header.origin_timestamp,
+        start + u64::from(u32::MAX),
+        "clamped into the first record's window, so one send holds both"
+    );
+    let back = from_iggy(&messages[1], 1).expect("stored message must decode as a record");
+    assert_eq!(back.timestamp, later, "kafka.ts keeps the real one");
+}
+
+#[tokio::test]
+#[serial]
+async fn given_no_timestamp_among_stamped_records_when_handled_should_store_one_send() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+
+    let mut records = [record(0, None, b"a", &[]), record(1, None, b"b", &[])];
+    records[1].timestamp = -1;
+    let entries = [(0, batch(&records, Compression::None))];
+
+    assert_eq!(
+        produce(&state, 3, 1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 0)]
+    );
+    let messages = stored(&server, 0, 10).await;
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[1].header.origin_timestamp, messages[0].header.origin_timestamp,
+        "clamped to the window start, not stored as 0"
+    );
+    let back = from_iggy(&messages[1], 1).expect("stored message must decode as a record");
+    let server_millis = i64::try_from(messages[1].header.timestamp / 1000).expect("fits");
+    assert_eq!(
+        back.timestamp, server_millis,
+        "no timestamp reads as the server's"
+    );
 }
 
 #[tokio::test]

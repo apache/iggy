@@ -157,13 +157,12 @@ start a real `iggy-server`.
 
 ### Produce ([#3535](https://github.com/apache/iggy/issues/3535))
 
-One partition, one Iggy send, or more if its timestamps span over about 71 min. Each partition
-answers for itself.
+One partition, one Iggy send. Each partition answers for itself.
 
 | Field | Gateway |
 | ----- | ------- |
 | Partition | Index as sent. Both count from 0. |
-| Base offset | From the send confirmation. `-1` if none, or if another writer wrote between split sends. |
+| Base offset | From the send confirmation. `-1` if none. |
 | `log_start_offset` | Always `-1`. |
 | `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
 | `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
@@ -171,8 +170,9 @@ answers for itself.
 | `timeout_ms` | Honored, max 20 s. Past it: 7. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
 | Producer id, epoch, sequence | Ignored, so a retry writes twice. |
-| Timestamps over about 71 min apart | Several sends. A failure after the first can duplicate on retry. |
+| Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |
 | Several batches in one partition | 87, as Kafka. |
+| Bytes after the batch | 87. |
 | More records than the batch declares | 87, as Kafka. |
 | Same partition twice in one request | Written twice. Kafka keeps the last. |
 | Repeated header name in a record | 87. |
@@ -184,11 +184,14 @@ answers for itself.
 | 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
 | 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
 | 35 | Transactional or control batch | Fails. |
-| 6 | Earlier partitions used the request budget, and this one fits alone. Nothing written. | Retries. |
+| 6 | Request budget ran out. Nothing written. | Retries. |
 | 7 | Deadline passed, or connection lost mid-send. May be written. | Retries. Can duplicate. |
 
-Request budget: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
-per slot. 4 requests decode at once.
+Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
+per slot. Past it: 10.
+
+Request budget: 8 partition caps, refused partitions included. Past it: 6 for the rest, not
+decoded. 4 requests decode at once.
 
 [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 

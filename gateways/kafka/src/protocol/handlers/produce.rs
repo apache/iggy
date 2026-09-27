@@ -17,7 +17,6 @@
 
 //! Produce (API key 0).
 
-use std::ops::Range;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -42,7 +41,8 @@ use crate::protocol::handlers::{
     decode_guarded, encode_message, respond_or_close, unsupported_version_response,
 };
 use crate::records::{
-    DecompressionBudget, RecordCodecError, Zstd, decode_batch, is_compressed, to_iggy,
+    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
+    is_compressed, to_iggy,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -71,16 +71,20 @@ const UNKNOWN_OFFSET: i64 = -1;
 /// to a wide topic, and a client set on hogging the shared bridge just sends more requests.
 const MAX_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Frame bytes per record slot. Caps one 8 MiB request at 131,072 slots, about 40 MB.
+/// Frame bytes per record slot. Caps one partition at 131,072 slots, about 40 MB, at the default
+/// 8 MiB frame.
 ///
 /// `GatewayState` caps how many requests hold that at once.
 const FRAME_BYTES_PER_RECORD: usize = 64;
 
+/// Partition allowances one request may decode, refused partitions included.
+///
+/// 64 MiB at the default 8 MiB frame, so a 1 MB request can compress 64x before the rest of it
+/// answers 6.
+const REQUEST_ALLOWANCES: usize = 8;
+
 /// Blobs this large, or compressed ones, plan off the async worker.
 const BLOCKING_PLAN_BYTES: usize = 64 * 1024;
-
-/// Widest `origin_timestamp` span one Iggy send takes (`MAX_TIMESTAMP_DELTA_MICROS`).
-const MAX_SEND_SPAN_MICROS: u64 = u32::MAX as u64;
 
 const RESPONSE_BASE_BYTES: usize = 512;
 
@@ -162,10 +166,11 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             )
         };
     };
-    let budget = DecompressionBudget::new(
-        state.max_frame_size,
-        state.max_frame_size / FRAME_BYTES_PER_RECORD,
-    );
+    let partition = Allowance {
+        bytes: state.max_frame_size,
+        records: state.max_frame_size / FRAME_BYTES_PER_RECORD,
+    };
+    let budget = DecompressionBudget::new(partition, partition.times(REQUEST_ALLOWANCES));
     let zstd = if api_version >= ZSTD_MIN_VERSION {
         Zstd::Allowed
     } else {
@@ -244,9 +249,9 @@ impl From<RecordCodecError> for Refusal {
     }
 }
 
-/// Converts and sends one partition at a time, in request order.
+/// Converts and sends one partition at a time, in request order, one Iggy send each.
 ///
-/// One budget for the whole request, so many partitions cannot each take the full allowance.
+/// One budget for the whole request, so a small request cannot make this inflate without end.
 /// Only one partition's messages live at a time. The budget is owned here and borrowed only in
 /// sync calls: a borrow held across an await makes the connection task `!Send`.
 ///
@@ -272,11 +277,9 @@ async fn write_request(
                 Ok(target) => {
                     let planned = plan(&budget, zstd, name, partition, max_send);
                     match planned {
-                        Ok((id, messages)) => {
-                            send_runs(bridge, target, name, id, messages, deadline)
-                                .await
-                                .map_err(Refusal::from)
-                        }
+                        Ok((id, messages)) => send_by(bridge, target, name, id, messages, deadline)
+                            .await
+                            .map_err(Refusal::from),
                         Err(refusal) => Err(refusal),
                     }
                 }
@@ -305,10 +308,12 @@ fn plan(
     max_send: u64,
 ) -> std::result::Result<(u32, Vec<IggyMessage>), Refusal> {
     let run = || plan_partition(budget, zstd, kafka_topic, partition, max_send);
-    let heavy = partition
-        .records
-        .as_ref()
-        .is_some_and(|blob| blob.len() >= BLOCKING_PLAN_BYTES || is_compressed(blob));
+    // A spent budget refuses before it reads a byte, so there is nothing to move off the worker.
+    let heavy = !budget.is_spent()
+        && partition
+            .records
+            .as_ref()
+            .is_some_and(|blob| blob.len() >= BLOCKING_PLAN_BYTES || is_compressed(blob));
     if heavy && Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
         tokio::task::block_in_place(run)
     } else {
@@ -363,10 +368,12 @@ fn plan_partition(
         return Err(ERROR_INVALID_RECORD.into());
     }
 
+    // One window for the whole batch, so it fits one send.
+    let window = TimestampWindow::of(&records);
     let mut messages = Vec::with_capacity(records.len());
     let mut size = 0u64;
     for record in &records {
-        let message = to_iggy(record).map_err(refuse)?;
+        let message = to_iggy(record, window).map_err(refuse)?;
         size = size.saturating_add(message.get_size_bytes().as_bytes_u64());
         messages.push(message);
     }
@@ -396,76 +403,7 @@ fn request_timeout(timeout_ms: i32) -> Duration {
         .min(MAX_REQUEST_DEADLINE)
 }
 
-/// Splits `messages` into in-order runs whose timestamp span fits one Iggy send.
-///
-/// A record with no timestamp stores 0, so next to real timestamps it starts a new run.
-fn send_spans(messages: &[IggyMessage]) -> Vec<Range<usize>> {
-    let mut spans = Vec::with_capacity(1);
-    let mut start = 0;
-    let (mut low, mut high) = (u64::MAX, 0u64);
-    for (index, message) in messages.iter().enumerate() {
-        let timestamp = message.header.origin_timestamp;
-        let (next_low, next_high) = (low.min(timestamp), high.max(timestamp));
-        if next_high - next_low > MAX_SEND_SPAN_MICROS {
-            spans.push(start..index);
-            start = index;
-            (low, high) = (timestamp, timestamp);
-        } else {
-            (low, high) = (next_low, next_high);
-        }
-    }
-    spans.push(start..messages.len());
-    spans
-}
-
-/// `messages` cut into the runs of [`send_spans`], in order.
-fn split_runs(messages: Vec<IggyMessage>) -> Vec<Vec<IggyMessage>> {
-    let spans = send_spans(&messages);
-    if spans.len() == 1 {
-        return vec![messages];
-    }
-    let mut rest = messages.into_iter();
-    spans
-        .into_iter()
-        .map(|span| rest.by_ref().take(span.len()).collect())
-        .collect()
-}
-
-/// Sends each run of one partition. A failed run stops the rest. Runs already sent stay stored.
-async fn send_runs(
-    bridge: &IggyBridge,
-    target: &TopicTarget,
-    kafka_topic: &str,
-    partition_id: u32,
-    messages: Vec<IggyMessage>,
-    deadline: Deadline,
-) -> std::result::Result<Option<u64>, i16> {
-    let runs = split_runs(messages);
-    let mut sent = Vec::with_capacity(runs.len());
-    for run in runs {
-        let count = run.len();
-        let base_offset = send_by(bridge, target, kafka_topic, partition_id, run, deadline).await?;
-        sent.push((base_offset, count));
-    }
-    Ok(joined_base_offset(&sent))
-}
-
-/// The first run's base offset, if each later run starts where the one before it ended.
-///
-/// Another writer can append between runs, and a client counts every offset from the base.
-fn joined_base_offset(runs: &[(Option<u64>, usize)]) -> Option<u64> {
-    let base = runs.first()?.0?;
-    let mut next = base;
-    for &(base_offset, count) in runs {
-        if base_offset? != next {
-            return None;
-        }
-        next = next.checked_add(u64::try_from(count).ok()?)?;
-    }
-    Some(base)
-}
-
-/// Sends one run, or answers 7 once the deadline has passed.
+/// Sends one partition's messages, or answers 7 once the deadline has passed.
 ///
 /// 7 means nothing was written, or the send may still land and a retry duplicate it.
 async fn send_by(
@@ -529,8 +467,7 @@ const fn record_error_code(error: &RecordCodecError) -> i16 {
         | RecordCodecError::BudgetExceeded { .. }
         | RecordCodecError::RecordBudgetExceeded { .. }
         | RecordCodecError::EnvelopeTooLarge { .. } => ERROR_MESSAGE_TOO_LARGE,
-        // Earlier partitions spent the request budget. This one fits alone, and nothing was
-        // written.
+        // The request budget ran out. Nothing was written.
         RecordCodecError::RequestBudgetSpent => ERROR_NOT_LEADER_OR_FOLLOWER,
         // Transactional or control. 35 is a fatal code for these producers, so they stop instead
         // of retrying forever.
@@ -544,6 +481,7 @@ const fn record_error_code(error: &RecordCodecError) -> i16 {
         | RecordCodecError::TimestampOutOfRange(_)
         | RecordCodecError::Batch(_)
         | RecordCodecError::SeveralBatches(_)
+        | RecordCodecError::BatchTrailingBytes(_)
         | RecordCodecError::RecordCountTooLarge { .. }
         | RecordCodecError::RecordCountMismatch { .. }
         | RecordCodecError::HeaderCountTooLarge { .. }
@@ -555,7 +493,7 @@ const fn record_error_code(error: &RecordCodecError) -> i16 {
         | RecordCodecError::MappingVersion(_)
         | RecordCodecError::ValueMarker(_)
         | RecordCodecError::HeaderNameCollision(_)
-        | RecordCodecError::TimestampMarker(_)
+        | RecordCodecError::TimestampHeader(_)
         | RecordCodecError::EnvelopeTruncated { .. }
         | RecordCodecError::EnvelopeTrailingBytes(_)
         | RecordCodecError::EnvelopeVersion(_)
@@ -687,19 +625,16 @@ mod tests {
 
     fn planned(entry: &PartitionProduceData) -> std::result::Result<(u32, Vec<IggyMessage>), i16> {
         plan_with(
-            &DecompressionBudget::new(TEST_BUDGET, usize::MAX),
+            &partition_budget(TEST_BUDGET, usize::MAX),
             Zstd::Allowed,
             entry,
         )
     }
 
-    fn message_at(micros: u64) -> IggyMessage {
-        let mut message = IggyMessage::builder()
-            .payload(Bytes::from_static(b"v"))
-            .build()
-            .unwrap();
-        message.header.origin_timestamp = micros;
-        message
+    /// A request allowance of one partition's.
+    fn partition_budget(bytes: usize, records: usize) -> DecompressionBudget {
+        let allowance = Allowance { bytes, records };
+        DecompressionBudget::new(allowance, allowance)
     }
 
     #[test]
@@ -770,7 +705,7 @@ mod tests {
     #[test]
     fn given_zstd_before_v7_when_planned_should_answer_unsupported_compression() {
         let batch = compressed_batch(&[record(0, b"v")], Compression::Zstd);
-        let budget = DecompressionBudget::new(TEST_BUDGET, usize::MAX);
+        let budget = partition_budget(TEST_BUDGET, usize::MAX);
 
         assert_eq!(
             plan_with(&budget, Zstd::Refused, &entry(0, Some(batch.clone()))).unwrap_err(),
@@ -807,7 +742,7 @@ mod tests {
     #[test]
     fn given_a_batch_that_decompresses_past_the_budget_when_planned_should_answer_too_large() {
         let batch = gzip_batch(&[record(0, &[b'a'; 4096])]);
-        let budget = DecompressionBudget::new(16, usize::MAX);
+        let budget = partition_budget(16, usize::MAX);
 
         assert_eq!(
             plan_with(&budget, Zstd::Allowed, &entry(0, Some(batch))).unwrap_err(),
@@ -816,9 +751,9 @@ mod tests {
     }
 
     #[test]
-    fn given_more_records_than_the_request_allows_when_planned_should_answer_too_large() {
+    fn given_more_records_than_a_partition_allows_when_planned_should_answer_too_large() {
         let batch = encode_batch(&mut [record(0, b"a"), record(1, b"b")]).unwrap();
-        let budget = DecompressionBudget::new(TEST_BUDGET, 1);
+        let budget = partition_budget(TEST_BUDGET, 1);
 
         assert_eq!(
             plan_with(&budget, Zstd::Allowed, &entry(0, Some(batch))).unwrap_err(),
@@ -829,7 +764,7 @@ mod tests {
 
     #[test]
     fn given_an_earlier_partition_spent_the_budget_when_planned_should_answer_retriable() {
-        let budget = DecompressionBudget::new(6144, usize::MAX);
+        let budget = partition_budget(6144, usize::MAX);
         let first = entry(0, Some(gzip_batch(&[record(0, &[b'a'; 4096])])));
         let second = entry(1, Some(gzip_batch(&[record(0, &[b'b'; 4096])])));
 
@@ -842,9 +777,13 @@ mod tests {
     }
 
     #[test]
-    fn given_an_entry_over_the_whole_budget_after_another_when_planned_should_answer_too_large() {
-        // gzip writes 32 KiB at a time, so the second entry passes the budget in several writes.
-        let budget = DecompressionBudget::new(64 * 1024, usize::MAX);
+    fn given_an_entry_over_its_cap_after_another_when_planned_should_answer_too_large() {
+        // gzip writes 32 KiB at a time, so the second entry passes its cap in several writes.
+        let partition = Allowance {
+            bytes: 64 * 1024,
+            records: usize::MAX,
+        };
+        let budget = DecompressionBudget::new(partition, partition.times(8));
         let first = entry(0, Some(gzip_batch(&[record(0, &vec![b'a'; 60 * 1024])])));
         let second = entry(1, Some(gzip_batch(&[record(0, &vec![b'b'; 200 * 1024])])));
 
@@ -858,7 +797,7 @@ mod tests {
 
     #[test]
     fn given_an_earlier_partition_spent_the_record_budget_when_planned_should_answer_retriable() {
-        let budget = DecompressionBudget::new(TEST_BUDGET, 3);
+        let budget = partition_budget(TEST_BUDGET, 3);
         let two = || encode_batch(&mut [record(0, b"a"), record(1, b"b")]).unwrap();
 
         assert!(plan_with(&budget, Zstd::Allowed, &entry(0, Some(two()))).is_ok());
@@ -869,21 +808,41 @@ mod tests {
     }
 
     #[test]
-    fn given_close_timestamps_when_split_should_send_once() {
-        let messages = [message_at(5), message_at(MAX_SEND_SPAN_MICROS + 5)];
-        assert_eq!(send_spans(&messages), vec![0..2]);
+    fn given_a_spent_request_when_a_later_partition_is_planned_should_answer_retry_undecoded() {
+        let budget = partition_budget(6144, usize::MAX);
+        let fill = |index| entry(index, Some(gzip_batch(&[record(0, &[b'a'; 4096])])));
+        assert!(plan_with(&budget, Zstd::Allowed, &fill(0)).is_ok());
+        assert_eq!(
+            plan_with(&budget, Zstd::Allowed, &fill(1)).unwrap_err(),
+            ERROR_NOT_LEADER_OR_FOLLOWER
+        );
+
+        // Malformed, so a decode would answer 87.
+        let garbage = entry(2, Some(Bytes::from_static(b"not a record batch")));
+        assert_eq!(
+            plan_with(&budget, Zstd::Allowed, &garbage).unwrap_err(),
+            ERROR_NOT_LEADER_OR_FOLLOWER,
+            "nothing decodes once the request budget is gone"
+        );
     }
 
     #[test]
-    fn given_a_wide_timestamp_span_when_split_should_start_a_new_run() {
-        let far = MAX_SEND_SPAN_MICROS + 1;
-        let messages = [
-            message_at(far),
-            message_at(0),
-            message_at(1),
-            message_at(far + 1),
-        ];
-        assert_eq!(send_spans(&messages), vec![0..1, 1..3, 3..4]);
+    fn given_timestamps_past_one_send_when_planned_should_fit_one_send() {
+        let mut records = [record(0, b"a"), record(1, b"b"), record(2, b"c")];
+        records[1].timestamp = CREATE_TIME + 72 * 60 * 1000;
+        records[2].timestamp = -1;
+        let (_, messages) = planned(&entry(0, Some(encode_batch(&mut records).unwrap()))).unwrap();
+
+        let stamps: Vec<u64> = messages
+            .iter()
+            .map(|message| message.header.origin_timestamp)
+            .collect();
+        let low = stamps.iter().min().unwrap();
+        let high = stamps.iter().max().unwrap();
+        assert!(
+            u32::try_from(high - low).is_ok(),
+            "one Iggy send stores each as a u32 delta: {stamps:?}"
+        );
     }
 
     #[test]
@@ -955,6 +914,7 @@ mod tests {
                 walked: 2,
             },
             RecordCodecError::SeveralBatches(2),
+            RecordCodecError::BatchTrailingBytes(1),
             RecordCodecError::HeaderCountTooLarge {
                 count: i32::MAX,
                 limit: 1,
@@ -1007,46 +967,9 @@ mod tests {
     #[test]
     fn given_a_partition_past_the_send_cap_when_planned_should_answer_too_large() {
         let batch = encode_batch(&mut [record(0, b"value")]).unwrap();
-        let budget = DecompressionBudget::new(TEST_BUDGET, usize::MAX);
+        let budget = partition_budget(TEST_BUDGET, usize::MAX);
         let refusal =
             plan_partition(&budget, Zstd::Allowed, TOPIC, &entry(0, Some(batch)), 8).unwrap_err();
         assert_eq!(refusal.code, ERROR_MESSAGE_TOO_LARGE);
-    }
-
-    #[test]
-    fn given_runs_that_follow_on_when_joined_should_keep_the_first_base_offset() {
-        assert_eq!(joined_base_offset(&[(Some(5), 3)]), Some(5));
-        assert_eq!(joined_base_offset(&[(Some(5), 3), (Some(8), 1)]), Some(5));
-    }
-
-    #[test]
-    fn given_a_gap_between_runs_when_joined_should_name_no_offset() {
-        assert_eq!(
-            joined_base_offset(&[(Some(5), 3), (Some(9), 1)]),
-            None,
-            "another writer appended between the runs"
-        );
-        assert_eq!(joined_base_offset(&[(Some(5), 3), (None, 1)]), None);
-        assert_eq!(joined_base_offset(&[(None, 3)]), None);
-    }
-
-    #[test]
-    fn given_a_wide_timestamp_span_when_split_should_keep_the_record_order() {
-        let far = MAX_SEND_SPAN_MICROS + 1;
-        let runs = split_runs(vec![
-            message_at(far),
-            message_at(0),
-            message_at(1),
-            message_at(far + 1),
-        ]);
-        let stamps: Vec<Vec<u64>> = runs
-            .iter()
-            .map(|run| {
-                run.iter()
-                    .map(|message| message.header.origin_timestamp)
-                    .collect()
-            })
-            .collect();
-        assert_eq!(stamps, vec![vec![far], vec![0, 1], vec![far + 1]]);
     }
 }

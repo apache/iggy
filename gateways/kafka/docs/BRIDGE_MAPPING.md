@@ -39,7 +39,7 @@ Produce, per record:
 | record value | `payload` |
 | record key | `kafka.key` user header, `Raw` |
 | record header `name` | `kafka.h.<name>` user header, `Raw` |
-| record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds |
+| record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds, plus `kafka.ts` when that cannot hold it |
 | record offset | partition offset, assigned by Iggy |
 | partition index | partition index, both 0-based |
 | topic | stream and topic per `TopicMapping` |
@@ -100,28 +100,25 @@ A record that arrived through Produce survives the round trip exactly, because i
 value is always a whole number of milliseconds. A message an Iggy client wrote does not. Its
 sub-millisecond digits are lost on the way out, and Kafka has no field to keep them in.
 
-Kafka sends `-1` for a record with no timestamp. That is stored as `0`, and Fetch already reads
-a zero origin timestamp as an instruction to use the server-assigned timestamp instead. A real
-broker does the same thing under `LogAppendTime`, so the two agree.
+Kafka sends `-1` for a record with no timestamp. That is stored as `0`, and Fetch reads a zero
+origin timestamp as the server-assigned one. A real broker does the same under `LogAppendTime`.
 
-A record stamped at exactly `0` ms, the Unix epoch, is a different record that stores the same
-`0`. It carries a `kafka.ts` header holding `epoch` to say so, and Fetch reads that header before
-it reads the origin timestamp. Without it a producer that stamps a record `0` gets the server's
-clock back instead, and never learns that the value changed.
+One Iggy send holds origin timestamps at most `u32::MAX` µs apart, about 71.6 min
+(`core/binary_protocol/src/batch.rs:55`). Kafka has no such bound. So each produce batch gets one
+window, from its earliest real timestamp. A timestamp outside it is clamped in, and the `kafka.ts`
+header (`Int64`, ms) keeps the real one:
 
-One Iggy batch holds timestamps that span at most `MAX_TIMESTAMP_DELTA_MICROS`, which is
-`u32::MAX` microseconds, about 71.6 minutes (`core/binary_protocol/src/batch.rs:55`). The send
-encoder stores each message as a `u32` delta from the batch minimum and refuses a larger one
-(`core/binary_protocol/src/requests/messages/send_messages.rs:133`). Kafka puts no such bound on
-one produce batch, so two shapes fail:
+| Record timestamp | `origin_timestamp` | `kafka.ts` |
+| ---------------- | ------------------ | ---------- |
+| In the window | timestamp × 1000 | none |
+| After the window | window end | timestamp |
+| `-1`, no real timestamp in the batch | `0` | none |
+| `-1`, next to real timestamps | window start | `-1` |
+| `0`, the epoch | window start, or `0` | `0` |
 
-- a batch whose CreateTime values span more than 71.6 minutes, which replay and mirror producers
-  reach
-- a batch that mixes a record with no timestamp, stored as `0`, with normally stamped records
-
-Neither is fixable in the record mapping, which sees one record and has no batch minimum to work
-from. Produce ([#3535](https://github.com/apache/iggy/issues/3535)) owns splitting a produce
-batch into sends the server accepts.
+Fetch reads `kafka.ts` first. `-1` there means the server-assigned timestamp. An Iggy client sees
+the clamped `origin_timestamp`. Only a batch over 71.6 min, or one mixing `-1` with real
+timestamps, has one.
 
 ## Records Iggy cannot hold natively
 

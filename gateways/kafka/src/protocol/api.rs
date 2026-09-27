@@ -50,8 +50,8 @@ pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = ResponseError::UnknownServerError.code();
 pub const ERROR_NONE: i16 = 0;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = ResponseError::UnknownTopicOrPartition.code();
-/// Retriable, nothing written. The Produce stub, and a partition refused only because earlier
-/// partitions used the request budget.
+/// Retriable, nothing written. The Produce stub, and a partition refused because the request
+/// budget ran out.
 pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = ResponseError::NotLeaderOrFollower.code();
 /// Outcome unknown: the write may have landed. Retriable, so a retry can duplicate it.
 /// Idempotent produce (#3545) closes that.
@@ -216,7 +216,8 @@ pub struct GatewayState {
     pub(crate) produce_slots: Semaphore,
 }
 
-/// Four request budgets, about 160 MB at the default 8 MiB frame. Sends run one at a time anyway.
+/// Each holds one decoded partition at a time, so about 160 MB at the default 8 MiB frame. Sends
+/// run one at a time anyway.
 const PRODUCE_SLOTS: usize = 4;
 
 impl GatewayState {

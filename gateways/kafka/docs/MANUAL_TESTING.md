@@ -267,7 +267,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
 | 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or request budget used by earlier partitions and the entry fits alone |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out |
 | 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored) |
 | 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
@@ -279,7 +279,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
 | 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. Not Produce: it closes the connection (H1) |
 | 76 | UNSUPPORTED_COMPRESSION_TYPE | Produce with a bridge: zstd before v7 |
-| 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing, empty or second one |
+| 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing, empty or second one, or bytes after it |
 
 A malformed request header (before any API-specific body is even reached) has no parsed header to
 build a version-correct response against, so it closes the connection rather than returning any

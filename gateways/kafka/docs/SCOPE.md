@@ -44,7 +44,7 @@ it knows the server supports flexible encoding.
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
-| 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition, more for timestamps over ~71 min apart. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
+| 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
@@ -105,8 +105,8 @@ below it are still open for the issues that build on top of it.
 - [x] Add `bridge/` module (`iggy_bridge`) - connection lifecycle, topic mapping, provisioning,
       high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533).
 - [x] Produce → `send_messages` ([#3535](https://github.com/apache/iggy/issues/3535)) - one call
-      per partition (more for timestamps over ~71 min apart), base offset from the send
-      confirmation, one error code per partition. See [README.md](../README.md#produce-3535).
+      per partition, base offset from the send confirmation, one error code per partition. See
+      [README.md](../README.md#produce-3535).
 - [ ] Produce: `IggyClient` pool. Pin each partition to one client, so order holds.
 - [ ] Produce: write keyed records' header TLVs into one buffer (`records::to_iggy`). Benchmark
       first. Keep Iggy's TLV layout and the 100 KB header check.

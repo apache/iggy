@@ -48,8 +48,8 @@ pub const MAPPING_VERSION: u8 = 1;
 pub const KEY_HEADER: &str = "kafka.key";
 /// Iggy header naming which of null or empty a placeholder payload stands for.
 pub const VALUE_MARKER_HEADER: &str = "kafka.value";
-/// Iggy header marking a record stamped at the Unix epoch.
-pub const TIMESTAMP_MARKER_HEADER: &str = "kafka.ts";
+/// Iggy header holding the Kafka timestamp, `Int64` ms, when `origin_timestamp` cannot.
+pub const TIMESTAMP_HEADER: &str = "kafka.ts";
 /// Prefix every Kafka record header name is stored under.
 pub const HEADER_PREFIX: &str = "kafka.h.";
 /// Iggy header whose one-byte value is the envelope byte layout version.
@@ -61,6 +61,8 @@ pub const ENVELOPE_VERSION: u8 = 1;
 const NO_TIMESTAMP: i64 = -1;
 /// The one Kafka timestamp an `origin_timestamp` of zero cannot be told apart from.
 const EPOCH_TIMESTAMP: i64 = 0;
+/// Widest `origin_timestamp` span one Iggy send holds (`MAX_TIMESTAMP_DELTA_MICROS`).
+const MAX_SEND_SPAN_MICROS: u64 = u32::MAX as u64;
 /// Stored in place of a null or empty value, discarded on the way back.
 const PLACEHOLDER: &[u8] = &[0x00];
 /// Iggy caps one header name and one header value at this many bytes.
@@ -68,7 +70,6 @@ const MAX_FIELD: usize = 255;
 
 const MARKER_NULL: &[u8] = b"null";
 const MARKER_EMPTY: &[u8] = b"empty";
-const MARKER_EPOCH: &[u8] = b"epoch";
 
 const FLAG_KEY: u8 = 0b01;
 const FLAG_VALUE: u8 = 0b10;
@@ -120,8 +121,8 @@ pub enum RecordCodecError {
     ValueMarker(Bytes),
     #[error("two stored header keys both name {0}")]
     HeaderNameCollision(String),
-    #[error("timestamp marker {0:?} is not epoch")]
-    TimestampMarker(Bytes),
+    #[error("timestamp header {0:?} is not a Kafka timestamp")]
+    TimestampHeader(Bytes),
     #[error("envelope for this record is {size} bytes, over Iggy's {MAX_PAYLOAD_SIZE} byte limit")]
     EnvelopeTooLarge { size: usize },
     #[error("envelope is truncated: needed {needed} bytes, {remaining} remain")]
@@ -136,6 +137,8 @@ pub enum RecordCodecError {
     Batch(String),
     #[error("{0} record batches in one partition, Kafka allows 1")]
     SeveralBatches(usize),
+    #[error("{0} bytes follow the record batch")]
+    BatchTrailingBytes(usize),
     #[error("batch declares {count} records, and {limit} bytes can hold fewer")]
     RecordCountTooLarge { count: i32, limit: usize },
     #[error("batch declares {declared} records and holds {walked}")]
@@ -150,11 +153,11 @@ pub enum RecordCodecError {
     TransactionalBatch,
     #[error("control batches are not supported")]
     ControlBatch,
-    #[error("partition decompresses to {size} bytes, over the {limit} byte request budget")]
+    #[error("partition decompresses to at least {size} bytes, over its {limit} byte cap")]
     BudgetExceeded { size: usize, limit: usize },
-    #[error("partition needs {count} record slots, over the {limit} slot request budget")]
+    #[error("partition needs {count} record slots, over its {limit} slot cap")]
     RecordBudgetExceeded { count: usize, limit: usize },
-    #[error("earlier partitions used the request budget, retry")]
+    #[error("the request budget ran out, retry")]
     RequestBudgetSpent,
     #[error("zstd batch in a request older than Produce v7")]
     ZstdTooEarly,
@@ -164,7 +167,7 @@ pub enum RecordCodecError {
 
 type Result<T> = std::result::Result<T, RecordCodecError>;
 
-/// Encodes one Kafka record as one Iggy message.
+/// Encodes one Kafka record as one Iggy message, for a send whose timestamps fit `window`.
 ///
 /// Takes the native path when Iggy can hold every field, and the envelope otherwise. A caller
 /// cannot tell which from the return value, which is the point: `from_iggy` reverses both.
@@ -173,15 +176,16 @@ type Result<T> = std::result::Result<T, RecordCodecError>;
 ///
 /// Returns an error when the timestamp does not fit, when the envelope would exceed
 /// `MAX_PAYLOAD_SIZE`, or when Iggy rejects the message for a reason the envelope does not fix.
-pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
-    if let Some(value) = plain_value(record) {
-        return plain_message(value.clone(), record.timestamp);
+pub fn to_iggy(record: &Record, window: TimestampWindow) -> Result<IggyMessage> {
+    let stamp = window.stamp(record.timestamp)?;
+    if let Some(value) = plain_value(record, stamp) {
+        return plain_message(value.clone(), stamp.origin);
     }
     if needs_envelope(record) {
-        return envelope_message(record);
+        return envelope_message(record, stamp);
     }
     let (payload, marker) = split_value(record.value.as_ref());
-    let mut headers = gateway_headers(record.timestamp);
+    let mut headers = gateway_headers(stamp.header);
     if let Some(marker) = marker {
         headers.insert(header_key(VALUE_MARKER_HEADER), header_value(marker));
     }
@@ -201,7 +205,46 @@ pub fn to_iggy(record: &Record) -> Result<IggyMessage> {
 
     // The only limit left is the 100 KB budget over all headers together, which no per-field
     // check can see. Let the constructor rule on it rather than duplicating its arithmetic.
-    build(payload, headers, record.timestamp)?.map_or_else(|| envelope_message(record), Ok)
+    build(payload, headers, stamp.origin)?.map_or_else(|| envelope_message(record, stamp), Ok)
+}
+
+/// The `origin_timestamp` range one Iggy send holds: `u32::MAX` µs, about 71.6 min.
+///
+/// Starts at the batch's earliest real timestamp. A timestamp outside it is clamped into it, and
+/// `kafka.ts` keeps the real one, so a Kafka batch always fits one send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimestampWindow {
+    start: u64,
+}
+
+impl TimestampWindow {
+    /// The window for `records`, the batch one send carries. `-1` and the epoch do not move it.
+    #[must_use]
+    pub fn of(records: &[Record]) -> Self {
+        let start = records
+            .iter()
+            .filter(|record| record.timestamp > EPOCH_TIMESTAMP)
+            .filter_map(|record| timestamp_in(record.timestamp).ok())
+            .min()
+            .unwrap_or(0);
+        Self { start }
+    }
+
+    fn stamp(self, millis: i64) -> Result<Stamp> {
+        let native = timestamp_in(millis)?;
+        let origin = native.clamp(self.start, self.start.saturating_add(MAX_SEND_SPAN_MICROS));
+        // A zero origin reads back as "no timestamp", so the epoch needs the header unclamped too.
+        let header = (origin != native || millis == EPOCH_TIMESTAMP).then_some(millis);
+        Ok(Stamp { origin, header })
+    }
+}
+
+/// Where one record's timestamp is stored.
+#[derive(Clone, Copy)]
+struct Stamp {
+    origin: u64,
+    /// The `kafka.ts` value, when `origin` does not read back as the record's timestamp.
+    header: Option<i64>,
 }
 
 /// Decodes one Iggy message as one Kafka record at `offset`.
@@ -238,11 +281,12 @@ pub fn from_iggy(message: &IggyMessage, offset: i64) -> Result<Record> {
         Some(envelope) => decode_envelope(envelope.as_bytes(), &message.payload)?,
         None => gateway_fields(message, &stored)?,
     };
-    let timestamp = match stored.get(&header_key(TIMESTAMP_MARKER_HEADER)) {
+    let timestamp = match stored.get(&header_key(TIMESTAMP_HEADER)) {
         None => timestamp_out(message),
-        Some(marker) => match marker.as_bytes() {
-            MARKER_EPOCH => EPOCH_TIMESTAMP,
-            _ => return Err(RecordCodecError::TimestampMarker(marker.value())),
+        Some(header) => match header.as_int64() {
+            Ok(NO_TIMESTAMP) => server_timestamp(message),
+            Ok(millis) if millis >= EPOCH_TIMESTAMP => millis,
+            _ => return Err(RecordCodecError::TimestampHeader(header.value())),
         },
     };
     Ok(record(key, value, headers, offset, timestamp))
@@ -276,15 +320,17 @@ fn timestamp_in(millis: i64) -> Result<u64> {
 
 /// Zero means the producer sent no timestamp, so the server-assigned one stands in.
 ///
-/// A record stamped at the epoch stores that same zero, and `from_iggy` reads the `kafka.ts`
-/// marker before it calls this, because Iggy has no other way to hold the difference.
+/// `from_iggy` reads `kafka.ts` first: an epoch or clamped record stores a value that does not
+/// read back as its own.
 fn timestamp_out(message: &IggyMessage) -> i64 {
-    let micros = if message.header.origin_timestamp == 0 {
-        message.header.timestamp
-    } else {
-        message.header.origin_timestamp
-    };
-    i64::try_from(micros / 1000).unwrap_or(NO_TIMESTAMP)
+    match message.header.origin_timestamp {
+        0 => server_timestamp(message),
+        micros => i64::try_from(micros / 1000).unwrap_or(NO_TIMESTAMP),
+    }
+}
+
+fn server_timestamp(message: &IggyMessage) -> i64 {
+    i64::try_from(message.header.timestamp / 1000).unwrap_or(NO_TIMESTAMP)
 }
 
 /// Whether any field of `record` is one Iggy refuses to hold natively.
@@ -307,8 +353,8 @@ fn needs_envelope(record: &Record) -> bool {
 }
 
 /// The value, when `kafka.v` is the only header the record needs.
-fn plain_value(record: &Record) -> Option<&Bytes> {
-    if record.key.is_some() || !record.headers.is_empty() || record.timestamp == EPOCH_TIMESTAMP {
+fn plain_value(record: &Record, stamp: Stamp) -> Option<&Bytes> {
+    if record.key.is_some() || !record.headers.is_empty() || stamp.header.is_some() {
         return None;
     }
     record.value.as_ref().filter(|value| !value.is_empty())
@@ -317,12 +363,12 @@ fn plain_value(record: &Record) -> Option<&Bytes> {
 /// Reuses one encoded `kafka.v` header block, so the common record skips a map and an encode.
 ///
 /// Static bytes: a clone touches no refcount shared across workers.
-fn plain_message(value: Bytes, timestamp: i64) -> Result<IggyMessage> {
+fn plain_message(value: Bytes, origin: u64) -> Result<IggyMessage> {
     static VERSION_ONLY: OnceLock<&'static [u8]> = OnceLock::new();
     let headers = *VERSION_ONLY.get_or_init(|| {
         let block = IggyMessage::builder()
             .payload(Bytes::from_static(PLACEHOLDER))
-            .user_headers(gateway_headers(NO_TIMESTAMP))
+            .user_headers(gateway_headers(None))
             .build()
             .ok()
             .and_then(|message| message.user_headers)
@@ -333,7 +379,7 @@ fn plain_message(value: Bytes, timestamp: i64) -> Result<IggyMessage> {
     message.header.user_headers_length =
         u32::try_from(headers.len()).unwrap_or_else(|_| unreachable!("the kafka.v header is tiny"));
     message.user_headers = Some(Bytes::from_static(headers));
-    message.header.origin_timestamp = timestamp_in(timestamp)?;
+    message.header.origin_timestamp = origin;
     Ok(message)
 }
 
@@ -346,18 +392,13 @@ fn split_value(value: Option<&Bytes>) -> (Bytes, Option<&'static [u8]>) {
     }
 }
 
-/// The headers every gateway-written message carries, whichever path it takes.
-///
-/// Iggy reads an `origin_timestamp` of zero as no timestamp at all, so a record that really was
-/// stamped at the epoch needs a marker to hold the difference.
-fn gateway_headers(timestamp: i64) -> BTreeMap<HeaderKey, HeaderValue> {
+/// The headers every gateway-written message carries, whichever path it takes, plus `kafka.ts`
+/// when `timestamp` holds one.
+fn gateway_headers(timestamp: Option<i64>) -> BTreeMap<HeaderKey, HeaderValue> {
     let mut headers = BTreeMap::new();
     headers.insert(header_key(VERSION_HEADER), header_value(&[MAPPING_VERSION]));
-    if timestamp == EPOCH_TIMESTAMP {
-        headers.insert(
-            header_key(TIMESTAMP_MARKER_HEADER),
-            header_value(MARKER_EPOCH),
-        );
+    if let Some(millis) = timestamp {
+        headers.insert(header_key(TIMESTAMP_HEADER), HeaderValue::from(millis));
     }
     headers
 }
@@ -366,7 +407,7 @@ fn gateway_headers(timestamp: i64) -> BTreeMap<HeaderKey, HeaderValue> {
 fn build(
     payload: Bytes,
     headers: BTreeMap<HeaderKey, HeaderValue>,
-    timestamp: i64,
+    origin: u64,
 ) -> Result<Option<IggyMessage>> {
     let mut message = match IggyMessage::builder()
         .payload(payload)
@@ -377,11 +418,11 @@ fn build(
         Err(IggyError::TooBigUserHeaders) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    message.header.origin_timestamp = timestamp_in(timestamp)?;
+    message.header.origin_timestamp = origin;
     Ok(Some(message))
 }
 
-fn envelope_message(record: &Record) -> Result<IggyMessage> {
+fn envelope_message(record: &Record, stamp: Stamp) -> Result<IggyMessage> {
     // The envelope moves the key and the headers into the payload, so a record whose value alone
     // clears `MAX_PAYLOAD_SIZE` can be one the fallback cannot hold. Say so before spending the
     // allocation, since the native path has already been ruled out and nothing else is left.
@@ -390,12 +431,12 @@ fn envelope_message(record: &Record) -> Result<IggyMessage> {
         return Err(RecordCodecError::EnvelopeTooLarge { size });
     }
 
-    let mut headers = gateway_headers(record.timestamp);
+    let mut headers = gateway_headers(stamp.header);
     headers.insert(
         header_key(ENVELOPE_HEADER),
         header_value(&[ENVELOPE_VERSION]),
     );
-    build(encode_envelope(record, size), headers, record.timestamp)?
+    build(encode_envelope(record, size), headers, stamp.origin)?
         .ok_or(IggyError::TooBigUserHeaders)
         .map_err(Into::into)
 }
@@ -627,19 +668,43 @@ fn header_value(value: &[u8]) -> HeaderValue {
     HeaderValue::try_from(value).unwrap_or_else(|_| unreachable!("header value is out of range"))
 }
 
-/// What one Produce request may decompress to, in total.
+/// Decompressed bytes and record slots, the two things a decode spends.
 ///
-/// Charged across every partition in the request, so many partitions cannot each take it all.
-/// Writes go through `BudgetedWriter`, so an over-budget frame never inflates whole in memory.
+/// A record slot costs a `Record` and an `IggyMessage` in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Allowance {
+    pub bytes: usize,
+    pub records: usize,
+}
+
+impl Allowance {
+    #[must_use]
+    pub const fn times(self, factor: usize) -> Self {
+        Self {
+            bytes: self.bytes.saturating_mul(factor),
+            records: self.records.saturating_mul(factor),
+        }
+    }
+}
+
+/// What one Produce request may decode.
+///
+/// - One partition may take `partition`. Past it, it is too large alone (10).
+/// - All partitions together may take `request`. It counts work done, refused partitions too, so
+///   no refusal lets the same inflate run again for free. Once it runs out, the partition that
+///   ran it out and every later one answer 6, undecoded. A retry that comes first in its request
+///   gets the full allowance, so a partition too large alone still ends at 10.
+///
+/// Writes go through `BudgetedWriter`, so no partition inflates past either one in memory.
 pub struct DecompressionBudget {
-    bytes: usize,
-    remaining: Cell<usize>,
-    /// Records the request may decode. Each one costs a `Record` and an `IggyMessage` in memory.
-    records: usize,
-    records_remaining: Cell<usize>,
-    /// What the current partition charged. Tells "too large" (10) from "retry" (6).
+    partition: Allowance,
+    /// What the request has left.
+    bytes_left: Cell<usize>,
+    records_left: Cell<usize>,
+    /// What the current partition took.
     entry_bytes: Cell<usize>,
     entry_records: Cell<usize>,
+    spent: Cell<bool>,
     /// Why this module refused a batch, when it did. Everything this module reports from inside
     /// the decoder's decompression hook leaves as an `io::Error` or an `anyhow::Error`, which the
     /// decoder stringifies, so the typed reason is parked here and taken by `decode_batch`.
@@ -648,69 +713,69 @@ pub struct DecompressionBudget {
 
 impl DecompressionBudget {
     #[must_use]
-    pub const fn new(bytes: usize, records: usize) -> Self {
+    pub const fn new(partition: Allowance, request: Allowance) -> Self {
         Self {
-            bytes,
-            remaining: Cell::new(bytes),
-            records,
-            records_remaining: Cell::new(records),
+            partition,
+            bytes_left: Cell::new(request.bytes),
+            records_left: Cell::new(request.records),
             entry_bytes: Cell::new(0),
             entry_records: Cell::new(0),
+            spent: Cell::new(false),
             reason: Cell::new(None),
         }
     }
 
-    fn start_entry(&self) {
+    /// Whether the request allowance ran out, so nothing more decodes.
+    #[must_use]
+    pub const fn is_spent(&self) -> bool {
+        self.spent.get()
+    }
+
+    fn start_entry(&self) -> Result<()> {
+        if self.is_spent() {
+            return Err(RecordCodecError::RequestBudgetSpent);
+        }
         self.entry_bytes.set(0);
         self.entry_records.set(0);
+        Ok(())
     }
 
-    /// Takes `len` bytes if the request has them left.
-    fn take(&self, len: usize) -> bool {
-        let Some(remaining) = self.remaining.get().checked_sub(len) else {
-            return false;
-        };
-        self.remaining.set(remaining);
-        self.entry_bytes.set(self.entry_bytes.get() + len);
-        true
-    }
-
-    /// Takes `len` bytes at once, or refuses.
+    /// Takes `len` decoded bytes for the current partition, or refuses.
     fn charge(&self, len: usize) -> io::Result<()> {
-        if self.take(len) {
-            return Ok(());
-        }
-        self.check_alone(len)?;
-        Err(self.refuse(RecordCodecError::RequestBudgetSpent))
-    }
-
-    /// Refuses once this partition alone passes the budget. No retry can help it.
-    fn check_alone(&self, spilled: usize) -> io::Result<()> {
-        let size = self.entry_bytes.get().saturating_add(spilled);
-        if size > self.bytes {
+        let entry = self.entry_bytes.get().saturating_add(len);
+        if entry > self.partition.bytes {
             return Err(self.refuse(RecordCodecError::BudgetExceeded {
-                size,
-                limit: self.bytes,
+                size: entry,
+                limit: self.partition.bytes,
             }));
         }
+        let Some(left) = self.bytes_left.get().checked_sub(len) else {
+            return Err(self.refuse(self.spend()));
+        };
+        self.bytes_left.set(left);
+        self.entry_bytes.set(entry);
         Ok(())
     }
 
     fn charge_records(&self, count: usize) -> Result<()> {
         let entry = self.entry_records.get().saturating_add(count);
-        let Some(remaining) = self.records_remaining.get().checked_sub(count) else {
-            return Err(if entry > self.records {
-                RecordCodecError::RecordBudgetExceeded {
-                    count: entry,
-                    limit: self.records,
-                }
-            } else {
-                RecordCodecError::RequestBudgetSpent
+        if entry > self.partition.records {
+            return Err(RecordCodecError::RecordBudgetExceeded {
+                count: entry,
+                limit: self.partition.records,
             });
+        }
+        let Some(left) = self.records_left.get().checked_sub(count) else {
+            return Err(self.spend());
         };
-        self.records_remaining.set(remaining);
+        self.records_left.set(left);
         self.entry_records.set(entry);
         Ok(())
+    }
+
+    fn spend(&self) -> RecordCodecError {
+        self.spent.set(true);
+        RecordCodecError::RequestBudgetSpent
     }
 
     /// Parks the typed reason and returns the error the decoder stringifies.
@@ -734,11 +799,9 @@ impl DecompressionBudget {
 /// An `io::Write` sink that stops at the budget rather than after it.
 ///
 /// Charging the output once it exists is too late: the decompressor has already allocated it.
-/// Past the budget it counts and drops the bytes, to tell "too large" (10) from "retry" (6).
 struct BudgetedWriter<'a> {
     out: BytesMut,
     budget: &'a DecompressionBudget,
-    spilled: usize,
 }
 
 impl<'a> BudgetedWriter<'a> {
@@ -746,34 +809,18 @@ impl<'a> BudgetedWriter<'a> {
         Self {
             out: BytesMut::new(),
             budget,
-            spilled: 0,
         }
     }
 
-    /// Charges `len` bytes. `false` once past the budget: counted, not kept.
-    fn admit(&mut self, len: usize) -> io::Result<bool> {
-        if self.spilled == 0 && self.budget.take(len) {
-            return Ok(true);
-        }
-        self.spilled = self.spilled.saturating_add(len);
-        self.budget.check_alone(self.spilled)?;
-        Ok(false)
-    }
-
-    /// The output, or a refusal if any of it spilled.
-    fn into_output(self) -> io::Result<Bytes> {
-        if self.spilled > 0 {
-            return Err(self.budget.refuse(RecordCodecError::RequestBudgetSpent));
-        }
-        Ok(self.out.freeze())
+    fn into_output(self) -> Bytes {
+        self.out.freeze()
     }
 }
 
 impl Write for BudgetedWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.admit(buf.len())? {
-            self.out.extend_from_slice(buf);
-        }
+        self.budget.charge(buf.len())?;
+        self.out.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -800,15 +847,16 @@ pub fn is_compressed(blob: &[u8]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error when the blob holds more than one batch, when the batch is malformed or holds
-/// a record count other than the one it declares, when it is a control or transactional batch,
-/// when it is zstd and `zstd` refuses it, or when it passes `budget`.
+/// Returns an error when the blob holds more than one batch or bytes after it, when the batch is
+/// malformed or holds a record count other than the one it declares, when it is a control or
+/// transactional batch, when it is zstd and `zstd` refuses it, or when it passes `budget` or the
+/// budget is already spent.
 pub fn decode_batch(
     buf: &mut Bytes,
     budget: &DecompressionBudget,
     zstd: Zstd,
 ) -> Result<Vec<Record>> {
-    budget.start_entry();
+    budget.start_entry()?;
     preflight(buf, budget, zstd)?;
     if !buf.has_remaining() {
         return Ok(Vec::new());
@@ -838,20 +886,26 @@ pub fn decode_batch(
 
 /// Checks the batch header before anything decodes a record.
 ///
-/// - One batch per partition, as Kafka requires from Produce v3.
+/// - One batch per partition, as Kafka requires from Produce v3, and no bytes after it.
 /// - The decoder reserves from `record_count` (`kafka-protocol-0.18.0/src/records.rs:517`), so
-///   the count must fit the blob, plus the full budget when compressed.
+///   the count must fit the blob, plus the partition cap when compressed.
 /// - Control and transactional batches are refused: a stored message cannot carry their flags.
 ///   An idempotent batch passes, its producer id, epoch and sequence ignored, because a stock
 ///   Java producer is idempotent. `IDEMPOTENCE.md` has why a retry is then not deduplicated.
 fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()> {
-    let infos = RecordBatchDecoder::decode_batch_info(&mut buf.clone())
+    let mut rest = buf.clone();
+    let infos = RecordBatchDecoder::decode_batch_info(&mut rest)
         .map_err(|error| RecordCodecError::Batch(error.to_string()))?;
     let info = match infos.as_slice() {
         [] => return Ok(()),
         [info] => info,
         several => return Err(RecordCodecError::SeveralBatches(several.len())),
     };
+    // `decode_batch_info` stops at a magic byte other than 2 and leaves the rest unread, and so
+    // does the decoder. Unchecked, the tail is dropped and the partition answers success.
+    if rest.has_remaining() {
+        return Err(RecordCodecError::BatchTrailingBytes(rest.remaining()));
+    }
     if info.transactional {
         return Err(RecordCodecError::TransactionalBatch);
     }
@@ -865,7 +919,7 @@ fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()
     let limit = if info.compression == Compression::None {
         buf.len()
     } else {
-        buf.len().saturating_add(budget.bytes)
+        buf.len().saturating_add(budget.partition.bytes)
     };
     let declared = usize::try_from(info.record_count).unwrap_or(0);
     if declared.saturating_mul(MIN_RECORD_BYTES) > limit {
@@ -938,7 +992,7 @@ fn batch_size(records: &[Record]) -> usize {
             .sum::<usize>()
 }
 
-/// Decompresses one batch, refusing the write that would pass the request budget.
+/// Decompresses one batch, refusing the write that would pass the budget.
 ///
 /// `kafka_protocol`'s own decompressors write the whole stream into a growing buffer before they
 /// hand it over, so the four codecs are driven from here instead. Each one writes through
@@ -964,21 +1018,21 @@ fn decompress(
             let mut decoder = flate2::write::GzDecoder::new(&mut writer);
             decoder.write_all(&body)?;
             decoder.finish()?;
-            writer.into_output()?
+            writer.into_output()
         }
         Compression::Zstd => {
             zstd::stream::copy_decode(body.as_ref(), &mut writer)?;
-            writer.into_output()?
+            writer.into_output()
         }
         Compression::Lz4 => {
             let mut decoder = lz4::Decoder::new(body.as_ref())?;
             io::copy(&mut decoder, &mut writer)?;
             decoder.finish().1?;
-            writer.into_output()?
+            writer.into_output()
         }
         Compression::Snappy => {
             inflate_snappy(&body, &mut writer)?;
-            writer.into_output()?
+            writer.into_output()
         }
     };
 
@@ -1101,17 +1155,15 @@ fn skip_field(buf: &mut &[u8]) -> Result<()> {
 ///
 /// Snappy is the one codec that states its output size up front, which `snap` reads without
 /// allocating. Charge that number before the decoder runs, because the decoder needs the whole
-/// block laid out to write into and cannot be fed a bounded sink. Past the budget, blocks are
-/// counted and not inflated.
+/// block laid out to write into and cannot be fed a bounded sink.
 fn inflate_snappy(body: &Bytes, writer: &mut BudgetedWriter<'_>) -> anyhow::Result<()> {
     let mut decoder = snap::raw::Decoder::new();
     let mut inflate = |block: &[u8], writer: &mut BudgetedWriter<'_>| -> anyhow::Result<()> {
         let declared = snap::raw::decompress_len(block)?;
-        if writer.admit(declared)? {
-            let start = writer.out.len();
-            writer.out.resize(start.saturating_add(declared), 0);
-            decoder.decompress(block, &mut writer.out[start..])?;
-        }
+        writer.budget.charge(declared)?;
+        let start = writer.out.len();
+        writer.out.resize(start.saturating_add(declared), 0);
+        decoder.decompress(block, &mut writer.out[start..])?;
         Ok(())
     };
 
@@ -1191,9 +1243,20 @@ mod tests {
         message_with(payload, &all)
     }
 
+    /// `to_iggy` for a record sent on its own, so nothing clamps it.
+    fn to_iggy_alone(record: &Record) -> Result<IggyMessage> {
+        to_iggy(record, TimestampWindow::of(std::slice::from_ref(record)))
+    }
+
+    /// A request allowance of one partition's.
+    fn partition_budget(bytes: usize, records: usize) -> DecompressionBudget {
+        let allowance = Allowance { bytes, records };
+        DecompressionBudget::new(allowance, allowance)
+    }
+
     #[test]
     fn given_a_value_only_record_when_encoded_should_match_the_general_path() {
-        let plain = to_iggy(&record_with(None, Some(b"v"), &[])).unwrap();
+        let plain = to_iggy_alone(&record_with(None, Some(b"v"), &[])).unwrap();
         let general = gateway_message(b"v", &[]);
 
         assert_eq!(plain.user_headers, general.user_headers);
@@ -1228,7 +1291,7 @@ mod tests {
     #[test]
     fn given_a_plain_record_when_round_tripped_should_keep_key_value_and_headers() {
         let original = record_with(Some(b"k"), Some(b"v"), &[("trace", Some(b"abc"))]);
-        let message = to_iggy(&original).unwrap();
+        let message = to_iggy_alone(&original).unwrap();
         assert!(!is_enveloped(&message));
         assert_eq!(message.payload.as_ref(), b"v");
 
@@ -1245,7 +1308,7 @@ mod tests {
 
     #[test]
     fn given_a_null_value_when_round_tripped_should_stay_null() {
-        let message = to_iggy(&record_with(Some(b"k"), None, &[])).unwrap();
+        let message = to_iggy_alone(&record_with(Some(b"k"), None, &[])).unwrap();
         assert!(
             !is_enveloped(&message),
             "a tombstone stays on the fast path"
@@ -1256,7 +1319,7 @@ mod tests {
 
     #[test]
     fn given_an_empty_value_when_round_tripped_should_stay_empty_and_not_null() {
-        let message = to_iggy(&record_with(Some(b"k"), Some(b""), &[])).unwrap();
+        let message = to_iggy_alone(&record_with(Some(b"k"), Some(b""), &[])).unwrap();
         assert_eq!(message.payload.as_ref(), PLACEHOLDER);
         assert_eq!(
             from_iggy(&message, 0).unwrap().value.as_deref(),
@@ -1267,7 +1330,7 @@ mod tests {
     #[test]
     fn given_an_empty_key_when_stored_should_take_the_envelope() {
         let original = record_with(Some(b""), Some(b"v"), &[]);
-        let message = to_iggy(&original).unwrap();
+        let message = to_iggy_alone(&original).unwrap();
         assert!(is_enveloped(&message));
         let back = from_iggy(&message, 0).unwrap();
         assert_eq!(back.key.as_deref(), Some(&[][..]), "empty, not null");
@@ -1277,7 +1340,7 @@ mod tests {
     #[test]
     fn given_an_oversized_key_when_stored_should_take_the_envelope() {
         let key = vec![b'x'; MAX_FIELD + 1];
-        let message = to_iggy(&record_with(Some(&key), Some(b"v"), &[])).unwrap();
+        let message = to_iggy_alone(&record_with(Some(&key), Some(b"v"), &[])).unwrap();
         assert!(is_enveloped(&message));
         assert_eq!(
             from_iggy(&message, 0).unwrap().key.as_deref(),
@@ -1287,7 +1350,8 @@ mod tests {
 
     #[test]
     fn given_a_null_header_value_when_stored_should_take_the_envelope() {
-        let message = to_iggy(&record_with(Some(b"k"), Some(b"v"), &[("flag", None)])).unwrap();
+        let message =
+            to_iggy_alone(&record_with(Some(b"k"), Some(b"v"), &[("flag", None)])).unwrap();
         assert!(is_enveloped(&message));
         assert_eq!(
             from_iggy(&message, 0)
@@ -1303,7 +1367,7 @@ mod tests {
     fn given_an_oversized_header_name_when_stored_should_take_the_envelope() {
         let name = "n".repeat(MAX_FIELD - HEADER_PREFIX.len() + 1);
         let message =
-            to_iggy(&record_with(Some(b"k"), Some(b"v"), &[(&name, Some(b"v"))])).unwrap();
+            to_iggy_alone(&record_with(Some(b"k"), Some(b"v"), &[(&name, Some(b"v"))])).unwrap();
         assert!(is_enveloped(&message));
         assert!(
             from_iggy(&message, 0)
@@ -1378,7 +1442,7 @@ mod tests {
 
     #[test]
     fn given_unreadable_user_headers_when_read_should_fail() {
-        let mut message = to_iggy(&record_with(Some(b"k"), Some(b"v"), &[])).unwrap();
+        let mut message = to_iggy_alone(&record_with(Some(b"k"), Some(b"v"), &[])).unwrap();
         message.user_headers = Some(Bytes::from_static(b"not a header block"));
 
         assert!(
@@ -1412,17 +1476,89 @@ mod tests {
     }
 
     #[test]
-    fn given_an_unknown_timestamp_marker_on_a_gateway_message_when_read_should_fail() {
-        let message = gateway_message(b"v", &[(TIMESTAMP_MARKER_HEADER, b"later")]);
+    fn given_a_timestamp_header_that_is_not_int64_on_a_gateway_message_when_read_should_fail() {
+        let message = gateway_message(b"v", &[(TIMESTAMP_HEADER, b"epoch")]);
         assert!(matches!(
             from_iggy(&message, 0),
-            Err(RecordCodecError::TimestampMarker(_))
+            Err(RecordCodecError::TimestampHeader(_))
         ));
     }
 
     #[test]
+    fn given_a_timestamp_header_below_minus_one_when_read_should_fail() {
+        let mut headers = BTreeMap::new();
+        headers.insert(header_key(VERSION_HEADER), header_value(&[MAPPING_VERSION]));
+        headers.insert(header_key(TIMESTAMP_HEADER), HeaderValue::from(-2i64));
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"v"))
+            .user_headers(headers)
+            .build()
+            .unwrap();
+
+        assert!(
+            matches!(
+                from_iggy(&message, 0),
+                Err(RecordCodecError::TimestampHeader(_))
+            ),
+            "to_iggy refuses these, so no gateway message holds one"
+        );
+    }
+
+    #[test]
+    fn given_timestamps_past_one_send_when_stored_should_clamp_and_keep_the_real_one() {
+        let later = CREATE_TIME + 72 * 60 * 1000;
+        let records = [record_at(CREATE_TIME), record_at(later)];
+        let window = TimestampWindow::of(&records);
+        let first = to_iggy(&records[0], window).unwrap();
+        let second = to_iggy(&records[1], window).unwrap();
+
+        assert_eq!(
+            second.header.origin_timestamp - first.header.origin_timestamp,
+            MAX_SEND_SPAN_MICROS,
+            "clamped to the window end, so one send holds both"
+        );
+        assert_eq!(from_iggy(&first, 0).unwrap().timestamp, CREATE_TIME);
+        assert_eq!(from_iggy(&second, 1).unwrap().timestamp, later);
+    }
+
+    #[test]
+    fn given_no_timestamp_among_real_ones_when_round_tripped_should_read_the_server_timestamp() {
+        let records = [record_at(CREATE_TIME), record_at(NO_TIMESTAMP)];
+        let mut message = to_iggy(&records[1], TimestampWindow::of(&records)).unwrap();
+        assert_eq!(
+            message.header.origin_timestamp,
+            CREATE_TIME.cast_unsigned() * 1000,
+            "clamped to the window start"
+        );
+        message.header.timestamp = 5_000_000;
+        assert_eq!(from_iggy(&message, 0).unwrap().timestamp, 5_000);
+    }
+
+    #[test]
+    fn given_an_epoch_timestamp_among_real_ones_when_round_tripped_should_stay_at_the_epoch() {
+        let records = [record_at(CREATE_TIME), record_at(EPOCH_TIMESTAMP)];
+        let message = to_iggy(&records[1], TimestampWindow::of(&records)).unwrap();
+        assert_eq!(from_iggy(&message, 0).unwrap().timestamp, EPOCH_TIMESTAMP);
+    }
+
+    #[test]
+    fn given_a_batch_when_windowed_should_start_at_its_earliest_real_timestamp() {
+        let records = [
+            record_at(NO_TIMESTAMP),
+            record_at(EPOCH_TIMESTAMP),
+            record_at(CREATE_TIME + 5),
+            record_at(CREATE_TIME),
+        ];
+        assert_eq!(
+            TimestampWindow::of(&records).start,
+            CREATE_TIME.cast_unsigned() * 1000
+        );
+        assert_eq!(TimestampWindow::of(&[record_at(NO_TIMESTAMP)]).start, 0);
+    }
+
+    #[test]
     fn given_a_create_time_when_round_tripped_should_come_back_unchanged() {
-        let message = to_iggy(&record_at(CREATE_TIME)).unwrap();
+        let message = to_iggy_alone(&record_at(CREATE_TIME)).unwrap();
         assert_eq!(
             message.header.origin_timestamp,
             CREATE_TIME.cast_unsigned() * 1000
@@ -1449,7 +1585,7 @@ mod tests {
 
     #[test]
     fn given_an_epoch_timestamp_when_round_tripped_should_stay_at_the_epoch() {
-        let mut message = to_iggy(&record_at(EPOCH_TIMESTAMP)).unwrap();
+        let mut message = to_iggy_alone(&record_at(EPOCH_TIMESTAMP)).unwrap();
         message.header.timestamp = 5_000_000;
         assert_eq!(from_iggy(&message, 0).unwrap().timestamp, EPOCH_TIMESTAMP);
     }
@@ -1463,7 +1599,7 @@ mod tests {
             0,
             EPOCH_TIMESTAMP,
         );
-        let mut message = to_iggy(&original).unwrap();
+        let mut message = to_iggy_alone(&original).unwrap();
         assert!(is_enveloped(&message));
         message.header.timestamp = 5_000_000;
         assert_eq!(from_iggy(&message, 0).unwrap().timestamp, EPOCH_TIMESTAMP);
@@ -1471,14 +1607,14 @@ mod tests {
 
     #[test]
     fn given_no_timestamp_when_read_should_use_the_server_timestamp() {
-        let mut message = to_iggy(&record_at(NO_TIMESTAMP)).unwrap();
+        let mut message = to_iggy_alone(&record_at(NO_TIMESTAMP)).unwrap();
         message.header.timestamp = 5_000_000;
         assert_eq!(from_iggy(&message, 0).unwrap().timestamp, 5_000);
     }
 
     #[test]
     fn given_a_truncated_envelope_when_decoded_should_fail() {
-        let message = to_iggy(&record_with(Some(b""), Some(b"v"), &[])).unwrap();
+        let message = to_iggy_alone(&record_with(Some(b""), Some(b"v"), &[])).unwrap();
         assert!(matches!(
             decode_envelope(&[ENVELOPE_VERSION], &message.payload.slice(0..3)),
             Err(RecordCodecError::EnvelopeTruncated { .. })
@@ -1538,7 +1674,7 @@ mod tests {
             CREATE_TIME,
         );
         assert!(matches!(
-            to_iggy(&oversized),
+            to_iggy_alone(&oversized),
             Err(RecordCodecError::EnvelopeTooLarge { size })
                 if size == MAX_PAYLOAD_SIZE as usize + ENVELOPE_OVERHEAD
         ));
@@ -1586,7 +1722,7 @@ mod tests {
     fn given_an_uncompressed_batch_when_round_tripped_should_keep_every_record() {
         let mut records = vec![record_at_offset(0, b"1"), record_at_offset(1, b"2")];
         let mut encoded = encode_batch(&mut records).unwrap();
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[1].value.as_deref(), Some(&b"2"[..]));
@@ -1621,7 +1757,7 @@ mod tests {
         blob.extend_from_slice(&encode_batch(&mut [record_at_offset(0, b"1")]).unwrap());
         blob.extend_from_slice(&encode_batch(&mut [record_at_offset(1, b"2")]).unwrap());
 
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         assert!(
             matches!(
                 decode_batch(&mut blob.freeze(), &budget, Zstd::Allowed),
@@ -1632,11 +1768,28 @@ mod tests {
     }
 
     #[test]
+    fn given_bytes_after_the_batch_when_decoded_should_reject() {
+        let mut blob = BytesMut::new();
+        blob.extend_from_slice(&encode_batch(&mut [record_at_offset(0, b"1")]).unwrap());
+        // Byte 16 of the tail is its magic. Not 2, so `decode_batch_info` stops there, no error.
+        blob.extend_from_slice(&[0; 32]);
+        let budget = partition_budget(1024, usize::MAX);
+
+        assert!(
+            matches!(
+                decode_batch(&mut blob.freeze(), &budget, Zstd::Allowed),
+                Err(RecordCodecError::BatchTrailingBytes(32))
+            ),
+            "the decoder never reads the tail, so the partition would answer success"
+        );
+    }
+
+    #[test]
     fn given_more_records_than_the_batch_declares_when_decoded_should_reject() {
         let batch =
             encode_batch(&mut [record_at_offset(0, b"1"), record_at_offset(1, b"2")]).unwrap();
         let mut patched = patch_header(&batch, 57, &1i32.to_be_bytes());
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         assert!(
             matches!(
@@ -1662,7 +1815,7 @@ mod tests {
     fn given_a_gzip_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Gzip);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
@@ -1671,7 +1824,7 @@ mod tests {
     fn given_a_snappy_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Snappy);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
@@ -1680,7 +1833,7 @@ mod tests {
     fn given_an_lz4_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Lz4);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
@@ -1689,7 +1842,7 @@ mod tests {
     fn given_a_zstd_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Zstd);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
@@ -1698,7 +1851,7 @@ mod tests {
     fn given_a_budget_smaller_than_the_batch_when_decoded_should_reject() {
         let records = vec![record_at_offset(0, &[b'x'; 512])];
         let mut encoded = encode_with(&records, Compression::Gzip);
-        let budget = DecompressionBudget::new(8, usize::MAX);
+        let budget = partition_budget(8, usize::MAX);
         assert!(matches!(
             decode_batch(&mut encoded, &budget, Zstd::Allowed),
             Err(RecordCodecError::BudgetExceeded { .. })
@@ -1708,7 +1861,7 @@ mod tests {
     #[test]
     fn given_a_spent_budget_when_a_partition_fits_alone_should_ask_for_a_retry() {
         // Enough for one partition, not for both: the budget is per request.
-        let budget = DecompressionBudget::new(400, usize::MAX);
+        let budget = partition_budget(400, usize::MAX);
         let big = || encode_batch(&mut [record_at_offset(0, &[b'x'; 256])]).unwrap();
 
         assert!(decode_batch(&mut big(), &budget, Zstd::Allowed).is_ok());
@@ -1719,9 +1872,59 @@ mod tests {
     }
 
     #[test]
-    fn given_a_spent_budget_when_a_partition_is_too_large_alone_should_refuse_it() {
+    fn given_a_spent_budget_when_a_later_partition_arrives_should_refuse_it_undecoded() {
+        let budget = partition_budget(400, usize::MAX);
+        let big = || encode_batch(&mut [record_at_offset(0, &[b'x'; 256])]).unwrap();
+        assert!(decode_batch(&mut big(), &budget, Zstd::Allowed).is_ok());
+        assert!(decode_batch(&mut big(), &budget, Zstd::Allowed).is_err());
+
+        // Malformed, so a decode would refuse it as a bad batch instead.
+        let mut garbage = Bytes::from_static(b"not a record batch");
+        assert!(
+            matches!(
+                decode_batch(&mut garbage, &budget, Zstd::Allowed),
+                Err(RecordCodecError::RequestBudgetSpent)
+            ),
+            "one spent request inflates nothing more, so it cannot hold a slot inflating"
+        );
+    }
+
+    #[test]
+    fn given_a_partition_too_large_alone_when_others_follow_should_leave_them_room() {
+        let partition = Allowance {
+            bytes: 64 * 1024,
+            records: usize::MAX,
+        };
+        let budget = DecompressionBudget::new(partition, partition.times(2));
+        let mut bomb = encode_with(
+            &[record_at_offset(0, &vec![0; 1024 * 1024])],
+            Compression::Gzip,
+        );
+        let normal = || {
+            encode_with(
+                &[record_at_offset(0, &vec![b'n'; 32 * 1024])],
+                Compression::Gzip,
+            )
+        };
+
+        assert!(matches!(
+            decode_batch(&mut bomb, &budget, Zstd::Allowed),
+            Err(RecordCodecError::BudgetExceeded { .. })
+        ));
+        assert!(
+            decode_batch(&mut normal(), &budget, Zstd::Allowed).is_ok(),
+            "the bomb stops at its own cap, so the request has room left"
+        );
+    }
+
+    #[test]
+    fn given_a_partition_too_large_alone_when_decoded_should_refuse_it() {
         // gzip writes 32 KiB at a time, so the refusal comes several writes before the end.
-        let budget = DecompressionBudget::new(64 * 1024, usize::MAX);
+        let partition = Allowance {
+            bytes: 64 * 1024,
+            records: usize::MAX,
+        };
+        let budget = DecompressionBudget::new(partition, partition.times(8));
         let mut first = encode_with(
             &[record_at_offset(0, &vec![b'a'; 60 * 1024])],
             Compression::Gzip,
@@ -1737,7 +1940,7 @@ mod tests {
                 decode_batch(&mut second, &budget, Zstd::Allowed),
                 Err(RecordCodecError::BudgetExceeded { limit, .. }) if limit == 64 * 1024
             ),
-            "a retry cannot help a partition over the whole budget"
+            "a retry cannot help a partition over its own cap"
         );
     }
 
@@ -1745,7 +1948,7 @@ mod tests {
     fn given_a_compression_bomb_when_decoded_should_stop_before_it_is_whole() {
         let bomb = vec![0u8; 4 * 1024 * 1024];
         let mut compressed = Bytes::from(encode_gzip(&bomb));
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         let Err(error) = decompress(&mut compressed, Compression::Gzip, &budget) else {
             panic!("a 4 MB output against a 1 KB budget has to be refused");
@@ -1767,7 +1970,7 @@ mod tests {
         // A raw snappy stream whose leading varint claims u32::MAX bytes of output. `snap` reads
         // that length without allocating, so the declared size is checkable before the decode.
         let mut compressed = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0x0f, 0x00]);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         assert!(decompress(&mut compressed, Compression::Snappy, &budget).is_err());
         assert!(matches!(
             budget.reason.take(),
@@ -1779,7 +1982,7 @@ mod tests {
     fn given_a_record_count_past_the_frame_when_decoded_should_reject() {
         let batch = encode_batch(&mut [record_at_offset(0, b"v")]).unwrap();
         let mut patched = patch_header(&batch, 57, &i32::MAX.to_be_bytes());
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         assert!(
             matches!(
@@ -1791,13 +1994,13 @@ mod tests {
     }
 
     #[test]
-    fn given_a_compressed_batch_when_preflighting_should_grant_it_the_whole_budget() {
+    fn given_a_compressed_batch_when_preflighting_should_grant_it_the_partition_cap() {
         // 100 tiny records declare more than the blob and the bytes left can hold, and fit the
-        // whole budget. Earlier partitions spending it must not make them look malformed.
-        // One offset for all, so the encoder writes one batch.
+        // partition cap. Earlier partitions spending the request must not make them look
+        // malformed. One offset for all, so the encoder writes one batch.
         let records: Vec<_> = (0..100).map(|_| record_at_offset(0, b"")).collect();
         let mut batch = encode_with(&records, Compression::Gzip);
-        let budget = DecompressionBudget::new(4096, usize::MAX);
+        let budget = partition_budget(4096, usize::MAX);
         let mut spend = encode_batch(&mut [record_at_offset(0, &[b'x'; 4000])]).unwrap();
 
         assert!(decode_batch(&mut spend, &budget, Zstd::Allowed).is_ok());
@@ -1819,12 +2022,12 @@ mod tests {
         let mut batch = encode_batch(&mut [record_with(None, Some(b"v"), &headers)]).unwrap();
 
         // One slot for the record and two for its six headers.
-        let tight = DecompressionBudget::new(1024, 2);
+        let tight = partition_budget(1024, 2);
         assert!(matches!(
             decode_batch(&mut batch.clone(), &tight, Zstd::Allowed),
             Err(RecordCodecError::RecordBudgetExceeded { count: 3, limit: 2 })
         ));
-        let enough = DecompressionBudget::new(1024, 3);
+        let enough = partition_budget(1024, 3);
         assert!(decode_batch(&mut batch, &enough, Zstd::Allowed).is_ok());
     }
 
@@ -1887,7 +2090,7 @@ mod tests {
             .position(|window| window == [0x02, b'b', 0x02, b'y'])
             .unwrap();
         let mut batch = patch_header(&batch, at + 1, b"a");
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         assert!(matches!(
             decode_batch(&mut batch, &budget, Zstd::Allowed),
@@ -1900,7 +2103,7 @@ mod tests {
         // The batch header says one record, so the record count bound passes. The count that
         // matters is the one inside the record, and no batch header reports it.
         let mut batch = batch_declaring_headers(i32::MAX);
-        let budget = DecompressionBudget::new(8 * 1024 * 1024, usize::MAX);
+        let budget = partition_budget(8 * 1024 * 1024, usize::MAX);
 
         assert!(
             matches!(
@@ -1916,7 +2119,7 @@ mod tests {
         // The same builder with a count the record can hold, so the scan cannot be passing the
         // test above by rejecting every hand-built batch.
         let mut batch = batch_declaring_headers(0);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         assert_eq!(
             decode_batch(&mut batch, &budget, Zstd::Allowed)
                 .unwrap()
@@ -1934,7 +2137,7 @@ mod tests {
             &[("trace", Some(b"abc"))],
         )];
         let mut encoded = encode_batch(&mut with_headers).unwrap();
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
         assert_eq!(
@@ -1949,7 +2152,7 @@ mod tests {
         // the documented 8 MiB, which an uncompressed batch has no claim on.
         let batch = encode_batch(&mut [record_at_offset(0, b"v")]).unwrap();
         let mut patched = patch_header(&batch, 57, &100_000i32.to_be_bytes());
-        let budget = DecompressionBudget::new(8 * 1024 * 1024, usize::MAX);
+        let budget = partition_budget(8 * 1024 * 1024, usize::MAX);
 
         assert!(matches!(
             decode_batch(&mut patched, &budget, Zstd::Allowed),
@@ -2014,7 +2217,7 @@ mod tests {
         let mut transactional = record_at_offset(0, b"v");
         transactional.transactional = true;
         let mut encoded = encode_with(&[transactional], Compression::None);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         assert!(matches!(
             decode_batch(&mut encoded, &budget, Zstd::Allowed),
@@ -2027,7 +2230,7 @@ mod tests {
         let mut control = record_at_offset(0, b"v");
         control.control = true;
         let mut encoded = encode_with(&[control], Compression::None);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
 
         assert!(
             matches!(
@@ -2042,7 +2245,7 @@ mod tests {
     fn given_a_truncated_batch_when_decoded_should_reject() {
         let batch = encode_batch(&mut [record_at_offset(0, b"value")]).unwrap();
         let mut truncated = batch.slice(0..batch.len() - 4);
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         assert!(decode_batch(&mut truncated, &budget, Zstd::Allowed).is_err());
     }
 
@@ -2054,7 +2257,7 @@ mod tests {
         bytes[last] ^= 0xff;
         let mut corrupt = Bytes::from(bytes);
 
-        let budget = DecompressionBudget::new(1024, usize::MAX);
+        let budget = partition_budget(1024, usize::MAX);
         assert!(matches!(
             decode_batch(&mut corrupt, &budget, Zstd::Allowed),
             Err(RecordCodecError::Batch(_))
@@ -2064,7 +2267,7 @@ mod tests {
     #[test]
     fn given_an_earlier_overrun_when_a_later_batch_fails_should_not_reuse_the_budget_reason() {
         // A failed charge deducts nothing, so the budget still has room for the batch below.
-        let budget = DecompressionBudget::new(64, usize::MAX);
+        let budget = partition_budget(64, usize::MAX);
         let mut bomb = encode_with(&[record_at_offset(0, &[b'x'; 512])], Compression::Gzip);
         assert!(matches!(
             decode_batch(&mut bomb, &budget, Zstd::Allowed),
