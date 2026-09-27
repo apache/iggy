@@ -446,13 +446,11 @@ mod tests {
             (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
             (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
         ] {
-            assert!(BridgeError::Iggy(rejected).is_bridge_login_rejected());
+            assert_eq!(ours, theirs.code());
         }
-        assert!(!BridgeError::Iggy(IggyError::Unauthorized).is_bridge_login_rejected());
-        assert!(!BridgeError::Timeout.is_bridge_login_rejected());
     }
 
-   #[test]
+    #[test]
     fn send_lost_maps_to_request_timed_out() {
         // The SDK does not replay a send after a lost connection, so it may have landed.
         let err = BridgeError::SendLost(IggyError::Disconnected);
@@ -471,5 +469,4 @@ mod tests {
         assert!(!BridgeError::Iggy(IggyError::Unauthorized).is_bridge_login_rejected());
         assert!(!BridgeError::Timeout.is_bridge_login_rejected());
     }
-
 }
