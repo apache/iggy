@@ -327,7 +327,11 @@ impl JwtManager {
         };
 
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.algorithms = TRUSTED_ISSUER_ALGORITHMS.to_vec();
+        validation.algorithms = TRUSTED_ISSUER_ALGORITHMS
+            .iter()
+            .filter(|alg| alg.family() == decoding_key.family())
+            .copied()
+            .collect();
         validation.set_issuer(std::slice::from_ref(&config.issuer));
         validation.set_audience(std::slice::from_ref(&config.audience));
         validation.validate_nbf = true;
