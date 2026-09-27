@@ -39,7 +39,7 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
-# Each test in this binary spawns its own real iggy-server subprocess (isolated data dir, port
+# Each test in these binaries spawns its own real iggy-server subprocess (isolated data dir, port
 # from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
 # under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes
 # within one process (nextest does not support #[serial] macro, same gap the workaround above
@@ -55,8 +55,14 @@ test-group = "elasticsearch"
 [test-groups.kafka_bridge]
 max-threads = 4
 
+# Every gateway suite that spawns a server belongs here. A new one left out does not fail, it
+# just runs unbounded alongside these, which is the failure nobody notices until CI is slow.
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests) or binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)'
+filter = '''
+    binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)
+    + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)
+'''
 test-group = "kafka_bridge"
 
 [profile.default]
