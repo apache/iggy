@@ -90,6 +90,13 @@ pub struct ArgsOptional {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_reconnection_interval: Option<String>,
 
+    /// The TCP login request timeout
+    ///
+    /// [default: "30s"]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_request_timeout: Option<String>,
+
     /// Flag to enable TLS for the TCP transport
     #[arg(long, default_missing_value(Some("true")), num_args(0..1))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,6 +266,9 @@ pub struct Args {
     /// The optional heartbeat interval for the TCP transport
     pub tcp_heartbeat_interval: String,
 
+    /// The TCP login request timeout
+    pub tcp_request_timeout: String,
+
     /// Flag to enable TLS for the TCP transport
     pub tcp_tls_enabled: bool,
 
@@ -385,6 +395,7 @@ impl Default for Args {
             tcp_reconnection_interval: "1s".to_string(),
             tcp_reconnection_reestablish_after: "5s".to_string(),
             tcp_heartbeat_interval: "5s".to_string(),
+            tcp_request_timeout: "30s".to_string(),
             tcp_tls_enabled: false,
             tcp_tls_domain: "localhost".to_string(),
             tcp_tls_ca_file: None,
@@ -451,6 +462,9 @@ impl From<Vec<ArgsOptional>> for Args {
             }
             if let Some(tcp_reconnection_interval) = optional_args.tcp_reconnection_interval {
                 args.tcp_reconnection_interval = tcp_reconnection_interval;
+            }
+            if let Some(tcp_request_timeout) = optional_args.tcp_request_timeout {
+                args.tcp_request_timeout = tcp_request_timeout;
             }
             if let Some(tcp_tls_enabled) = optional_args.tcp_tls_enabled {
                 args.tcp_tls_enabled = tcp_tls_enabled;
