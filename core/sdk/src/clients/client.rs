@@ -26,7 +26,7 @@ use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
 use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
+use crate::tcp::tcp_client::{TcpClient, TcpRequestPolicy};
 use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
@@ -37,9 +37,11 @@ use iggy_binary_protocol::codes::{
 };
 use iggy_common::Consumer;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+use iggy_common::request_budget::{active_request_budget, run_with_request_budget};
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio::spawn;
@@ -236,6 +238,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 #[allow(dead_code)]
 pub struct IggyClient {
     pub(crate) client: IggyRwLock<ClientWrapper>,
+    tcp_request_policy: Option<TcpRequestPolicy>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
     heartbeat: Mutex<Heartbeat>,
@@ -465,9 +468,11 @@ impl IggyClient {
     /// [`TcpClient`]: crate::prelude::TcpClient
     /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn new(client: ClientWrapper) -> Self {
+        let tcp_request_policy = Self::tcp_request_policy(&client);
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
+            tcp_request_policy,
             partitioner: None,
             encryptor: None,
             heartbeat: Mutex::default(),
@@ -577,13 +582,40 @@ impl IggyClient {
             info!("Client-side encryption is enabled.");
         }
 
+        let tcp_request_policy = Self::tcp_request_policy(&client);
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
+            tcp_request_policy,
             partitioner,
             encryptor,
             heartbeat: Mutex::default(),
         }
+    }
+
+    fn tcp_request_policy(client: &ClientWrapper) -> Option<TcpRequestPolicy> {
+        match client {
+            ClientWrapper::Tcp(client) => Some(client.request_policy()),
+            ClientWrapper::Iggy(client) => client.tcp_request_policy.clone(),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn run_tcp_request<T>(
+        &self,
+        future: impl Future<Output = Result<T, IggyError>>,
+    ) -> Result<T, IggyError> {
+        let policy = self.tcp_request_policy.as_ref();
+        run_with_request_budget(
+            policy.map(TcpRequestPolicy::timeout),
+            || {
+                if let Some(policy) = policy {
+                    policy.expire();
+                }
+            },
+            future,
+        )
+        .await
     }
 
     /// Returns a handle to the underlying transport client.
@@ -1041,10 +1073,22 @@ impl IggyClient {
 #[async_trait]
 impl Client for IggyClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        self.heartbeat().stopped = false;
-        self.client.read().await.connect().await?;
-        self.start_heartbeat().await;
-        Ok(())
+        let operation = async {
+            self.heartbeat().stopped = false;
+            self.client.read().await.connect().await?;
+            self.start_heartbeat().await;
+            Ok(())
+        };
+        if active_request_budget().is_some()
+            || self
+                .tcp_request_policy
+                .as_ref()
+                .is_some_and(TcpRequestPolicy::has_sign_in_credentials)
+        {
+            self.run_tcp_request(operation).await
+        } else {
+            operation.await
+        }
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
@@ -1087,8 +1131,75 @@ impl Client for IggyClient {
 mod tests {
     use super::*;
     use crate::links::test_support::LOCALHOST;
-    use iggy_common::TcpClientConfig;
+    use iggy_common::{AutoLogin, Credentials, NonZeroIggyDuration, TcpClientConfig, UserClient};
+    use std::time::Duration;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn tcp_login_deadline_includes_high_level_client_lock() {
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            request_timeout: NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap(),
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let handle = client.client();
+        let lock = handle.write().await;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), client.login_user("iggy", "iggy"))
+                .await
+                .expect("login deadline must cover the high-level client lock");
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn tcp_auto_login_deadline_includes_high_level_client_lock() {
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_owned(),
+                "iggy".into(),
+            )),
+            request_timeout: NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap(),
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let handle = client.client();
+        let lock = handle.write().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("connect deadline must cover the high-level client lock");
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_without_credentials_keeps_existing_lock_wait() {
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            request_timeout: NonZeroIggyDuration::new(Duration::from_millis(20)).unwrap(),
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let handle = client.client();
+        let lock = handle.write().await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.connect())
+                .await
+                .is_err()
+        );
+        drop(lock);
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
