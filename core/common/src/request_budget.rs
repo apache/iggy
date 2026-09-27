@@ -18,42 +18,72 @@
 use std::future::Future;
 use std::time::Duration;
 
-use iggy_common::{IggyError, NonZeroIggyDuration};
+use crate::{IggyError, NonZeroIggyDuration};
 use tokio::time::{Instant, timeout_at};
+
+tokio::task_local! {
+    static ACTIVE_REQUEST_BUDGET: RequestBudget;
+}
+
+pub fn active_request_budget() -> Option<RequestBudget> {
+    ACTIVE_REQUEST_BUDGET.try_with(|budget| *budget).ok()
+}
+
+pub async fn run_with_request_budget<T>(
+    timeout: Option<NonZeroIggyDuration>,
+    on_expire: impl FnOnce(),
+    future: impl Future<Output = Result<T, IggyError>>,
+) -> Result<T, IggyError> {
+    let budget = active_request_budget().or_else(|| timeout.map(RequestBudget::new));
+    let Some(budget) = budget else {
+        return future.await;
+    };
+    let result = if active_request_budget().is_some() {
+        budget.run(future).await
+    } else {
+        ACTIVE_REQUEST_BUDGET
+            .scope(budget, budget.run(future))
+            .await
+    };
+    if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
+        on_expire();
+    }
+    result
+}
 
 /// One logical request's absolute deadline, shared by its attempts.
 #[derive(Clone, Copy)]
-pub(crate) struct RequestBudget {
+pub struct RequestBudget {
     deadline: Instant,
 }
 
 impl RequestBudget {
-    pub(crate) fn new(timeout: NonZeroIggyDuration) -> Self {
+    pub fn new(timeout: NonZeroIggyDuration) -> Self {
         Self {
             deadline: Instant::now() + timeout.get_duration(),
         }
     }
 
-    pub(crate) fn deadline(self) -> Instant {
+    pub fn deadline(self) -> Instant {
         self.deadline
     }
 
-    pub(crate) fn remaining(self) -> Result<Duration, IggyError> {
+    pub fn remaining(self) -> Result<Duration, IggyError> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            Err(IggyError::RequestTimeout)
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
         } else {
             Ok(remaining)
         }
     }
 
-    pub(crate) async fn run<T>(
+    pub async fn run<T>(
         self,
         future: impl Future<Output = Result<T, IggyError>>,
     ) -> Result<T, IggyError> {
         self.remaining()?;
         timeout_at(self.deadline, future)
             .await
-            .map_err(|_| IggyError::RequestTimeout)?
+            .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?
     }
 }

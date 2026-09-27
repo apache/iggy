@@ -27,6 +27,12 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait BinaryTransport {
+    fn request_timeout(&self) -> Option<NonZeroIggyDuration> {
+        None
+    }
+
+    fn expire_request(&self) {}
+
     /// Gets the state of the client.
     async fn get_state(&self) -> ClientState;
     /// Sets the state of the client.

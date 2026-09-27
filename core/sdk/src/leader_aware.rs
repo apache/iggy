@@ -533,7 +533,7 @@ impl ConnectCoordinator {
             if let Some(deadline) = deadline {
                 tokio::time::timeout_at(deadline, changed)
                     .await
-                    .map_err(|_| IggyError::RequestTimeout)?;
+                    .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?;
             } else {
                 changed.await;
             }

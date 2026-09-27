@@ -25,7 +25,6 @@ use crate::poll_routing::{
 };
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
-use crate::request_budget::RequestBudget;
 use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
@@ -40,6 +39,7 @@ use iggy_binary_protocol::codes::{
 #[cfg(test)]
 use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
+use iggy_common::request_budget::{RequestBudget, active_request_budget, run_with_request_budget};
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     IdKind, Identifier, IggyDuration, IggyError, IggyTimestamp, NonZeroIggyDuration,
@@ -89,14 +89,6 @@ const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Durati
 /// its dial stays unbounded.
 const FAILOVER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-tokio::task_local! {
-    static TCP_LOGIN_BUDGET: RequestBudget;
-}
-
-fn active_login_budget() -> Option<RequestBudget> {
-    TCP_LOGIN_BUDGET.try_with(|budget| *budget).ok()
-}
-
 /// TCP client for interacting with the Iggy API.
 /// It requires a valid server address.
 #[derive(Debug)]
@@ -106,8 +98,9 @@ pub struct TcpClient {
     /// A deadline may expire while another task holds the stream lock. Its
     /// next user must discard that old connection before sending a request.
     discard_stream_on_next_lock: Arc<AtomicBool>,
+    has_sign_in_credentials: Arc<AtomicBool>,
     pub(crate) config: Arc<TcpClientConfig>,
-    pub(crate) state: Mutex<ClientState>,
+    pub(crate) state: Arc<Mutex<ClientState>>,
     client_address: Mutex<Option<SocketAddr>>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
@@ -143,6 +136,38 @@ pub struct TcpClient {
     routing_lock: Mutex<()>,
     connect_coordinator: ConnectCoordinator,
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TcpRequestPolicy {
+    timeout: NonZeroIggyDuration,
+    has_sign_in_credentials: Arc<AtomicBool>,
+    discard_stream_on_next_lock: Arc<AtomicBool>,
+    stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
+    state: Arc<Mutex<ClientState>>,
+}
+
+impl TcpRequestPolicy {
+    pub(crate) fn timeout(&self) -> NonZeroIggyDuration {
+        self.timeout
+    }
+
+    pub(crate) fn has_sign_in_credentials(&self) -> bool {
+        self.has_sign_in_credentials.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn expire(&self) {
+        self.discard_stream_on_next_lock
+            .store(true, Ordering::SeqCst);
+        if let Ok(mut stream) = self.stream.try_lock() {
+            stream.take();
+            self.discard_stream_on_next_lock
+                .store(false, Ordering::SeqCst);
+        }
+        if let Ok(mut state) = self.state.try_lock() {
+            *state = ClientState::Disconnected;
+        }
+    }
 }
 
 /// The sign-in a manual login on this client succeeded with, and who it signed
@@ -202,6 +227,14 @@ impl Client for TcpClient {
 
 #[async_trait]
 impl BinaryTransport for TcpClient {
+    fn request_timeout(&self) -> Option<NonZeroIggyDuration> {
+        Some(self.config.request_timeout)
+    }
+
+    fn expire_request(&self) {
+        self.request_policy().expire();
+    }
+
     async fn send_offset_write_with_response(
         &self,
         code: u32,
@@ -231,13 +264,13 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        if is_login_register_code(code) && active_login_budget().is_none() {
-            return TCP_LOGIN_BUDGET
-                .scope(
-                    RequestBudget::new(self.config.request_timeout),
-                    self.send_raw_with_response_inner(code, payload),
-                )
-                .await;
+        if is_login_register_code(code) && active_request_budget().is_none() {
+            return run_with_request_budget(
+                self.request_timeout(),
+                || self.expire_request(),
+                self.send_raw_with_response_inner(code, payload),
+            )
+            .await;
         }
         self.send_raw_with_response_inner(code, payload).await
     }
@@ -294,8 +327,8 @@ impl TcpClient {
         }
 
         let error = result.unwrap_err();
-        if active_login_budget().is_some_and(|budget| budget.remaining().is_err()) {
-            return Err(IggyError::RequestTimeout);
+        if active_request_budget().is_some_and(|budget| budget.remaining().is_err()) {
+            return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
         if !matches!(
             error,
@@ -352,7 +385,7 @@ impl TcpClient {
         let nested_connect = owner_context.is_some();
         let _routing_guard = if nested_connect {
             None
-        } else if let Some(budget) = active_login_budget() {
+        } else if let Some(budget) = active_request_budget() {
             Some(
                 budget
                     .run(async { Ok(self.routing_lock.lock().await) })
@@ -369,7 +402,7 @@ impl TcpClient {
             drop(_routing_guard);
             return self.send_raw(code, payload).await;
         }
-        if let Some(budget) = active_login_budget() {
+        if let Some(budget) = active_request_budget() {
             budget.run(self.disconnect_transport()).await?;
         } else {
             self.disconnect_transport().await?;
@@ -414,7 +447,7 @@ impl TcpClient {
 
     async fn wait_before_login_replay(result: &Result<Bytes, IggyError>) -> Result<(), IggyError> {
         if result.is_err()
-            && let Some(budget) = active_login_budget()
+            && let Some(budget) = active_request_budget()
         {
             budget
                 .run(async {
@@ -473,11 +506,14 @@ impl iggy_common::VsrSessionControl for TcpClient {
                 credentials,
                 user_id,
             });
+        self.has_sign_in_credentials.store(true, Ordering::SeqCst);
         self.learn_roster_once().await;
     }
 
     async fn forget_session_credentials(&self) {
         self.session_credentials.lock().await.take();
+        self.has_sign_in_credentials
+            .store(self.auto_login_configured(), Ordering::SeqCst);
     }
 
     async fn refresh_session_password(&self, user: &Identifier, new_password: &str) {
@@ -649,13 +685,15 @@ impl TcpClient {
     /// Create a new TCP client based on the provided configuration.
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         let server_address = config.server_address.clone();
+        let has_sign_in_credentials = matches!(config.auto_login, AutoLogin::Enabled(_));
         Ok(Self {
             poll_router: PollRouter::default(),
             config,
             client_address: Mutex::new(None),
             stream: Arc::new(Mutex::new(None)),
             discard_stream_on_next_lock: Arc::new(AtomicBool::new(false)),
-            state: Mutex::new(ClientState::Disconnected),
+            has_sign_in_credentials: Arc::new(AtomicBool::new(has_sign_in_credentials)),
+            state: Arc::new(Mutex::new(ClientState::Disconnected)),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
@@ -682,15 +720,25 @@ impl TcpClient {
     }
 
     async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
-        if active_login_budget().is_none() && self.sign_in_credentials().await.is_some() {
-            return TCP_LOGIN_BUDGET
-                .scope(
-                    RequestBudget::new(self.config.request_timeout),
-                    self.connect_with_settlement_inner(settle_off_leader),
-                )
-                .await;
+        if active_request_budget().is_none() && self.request_policy().has_sign_in_credentials() {
+            return run_with_request_budget(
+                self.request_timeout(),
+                || self.expire_request(),
+                Box::pin(self.connect_with_settlement_inner(settle_off_leader)),
+            )
+            .await;
         }
         self.connect_with_settlement_inner(settle_off_leader).await
+    }
+
+    pub(crate) fn request_policy(&self) -> TcpRequestPolicy {
+        TcpRequestPolicy {
+            timeout: self.config.request_timeout,
+            has_sign_in_credentials: Arc::clone(&self.has_sign_in_credentials),
+            discard_stream_on_next_lock: Arc::clone(&self.discard_stream_on_next_lock),
+            stream: Arc::clone(&self.stream),
+            state: Arc::clone(&self.state),
+        }
     }
 
     async fn connect_with_settlement_inner(
@@ -699,7 +747,7 @@ impl TcpClient {
     ) -> Result<(), IggyError> {
         self.connect_coordinator
             .run_until(
-                active_login_budget().map(RequestBudget::deadline),
+                active_request_budget().map(RequestBudget::deadline),
                 |abandoned, token| async move {
                     let context =
                         self.connect_coordinator
@@ -712,12 +760,12 @@ impl TcpClient {
                                 }
                                 self.connect_inner(context).await
                             };
-                            let result = if let Some(budget) = active_login_budget() {
+                            let result = if let Some(budget) = active_request_budget() {
                                 budget.run(operation).await
                             } else {
                                 operation.await
                             };
-                            if matches!(result, Err(IggyError::RequestTimeout)) {
+                            if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
                                 // A transport task may still hold the stream
                                 // lock. Mark it stale now so its next user
                                 // discards it without extending this deadline.
@@ -742,9 +790,9 @@ impl TcpClient {
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         loop {
-            if active_login_budget().is_some_and(|budget| budget.remaining().is_err()) {
+            if active_request_budget().is_some_and(|budget| budget.remaining().is_err()) {
                 self.fail_connect().await;
-                return Err(IggyError::RequestTimeout);
+                return Err(IggyError::RequestTimeoutOutcomeUnknown);
             }
             // Read and claimed under one lock acquisition. Apart, two callers
             // both find `Disconnected` and both sweep: the loser's
@@ -809,7 +857,7 @@ impl TcpClient {
                     && let Some(remaining) = self.reestablish_wait().await
                 {
                     info!("Trying to connect to the server: {server_address} in: {remaining}");
-                    if let Some(budget) = active_login_budget() {
+                    if let Some(budget) = active_request_budget() {
                         if let Err(error) = budget
                             .run(async {
                                 sleep(remaining.get_duration()).await;
@@ -826,7 +874,7 @@ impl TcpClient {
                 }
 
                 info!("{NAME} client is connecting to server: {server_address}...");
-                let established = if let Some(budget) = active_login_budget() {
+                let established = if let Some(budget) = active_request_budget() {
                     budget
                         .run(self.establish_bounded(&server_address, &candidates))
                         .await
@@ -866,7 +914,7 @@ impl TcpClient {
                         {
                             Ok(should_redirect) => break should_redirect,
                             Err(failure) if failure.connection_lost => {
-                                if failure.error == IggyError::RequestTimeout {
+                                if failure.error == IggyError::RequestTimeoutOutcomeUnknown {
                                     self.fail_connect().await;
                                     return Err(failure.error);
                                 }
@@ -889,9 +937,9 @@ impl TcpClient {
                         }
                     }
                     Err(IggyError::CannotEstablishConnection) => {}
-                    Err(IggyError::RequestTimeout) => {
+                    Err(IggyError::RequestTimeoutOutcomeUnknown) => {
                         self.fail_connect().await;
-                        return Err(IggyError::RequestTimeout);
+                        return Err(IggyError::RequestTimeoutOutcomeUnknown);
                     }
                     Err(error) => config_fault = Some(error),
                 }
@@ -942,7 +990,7 @@ impl TcpClient {
                          {} endpoint(s) in: {interval_str}",
                         candidates.len(),
                     );
-                    if let Some(budget) = active_login_budget() {
+                    if let Some(budget) = active_request_budget() {
                         if let Err(error) = budget
                             .run(async {
                                 sleep(self.config.reconnection.interval.get_duration()).await;
@@ -1058,7 +1106,7 @@ impl TcpClient {
                 | IggyError::CannotEstablishConnection
                 | IggyError::TcpError
                 | IggyError::StaleClient
-                | IggyError::RequestTimeout
+                | IggyError::RequestTimeoutOutcomeUnknown
         );
         if connection_lost {
             if let Err(teardown_error) = self.disconnect_transport().await {
@@ -1512,9 +1560,9 @@ impl TcpClient {
         // whole budget: the connect flow owns leader redirection for the
         // sign-in handshake, and reconnecting from underneath it would
         // recurse.
-        let request_budget = active_login_budget();
+        let request_budget = active_request_budget();
         if request_budget.is_some_and(|budget| budget.remaining().is_err()) {
-            return Err(IggyError::RequestTimeout);
+            return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
         let overall_deadline = request_budget.map_or_else(
             || tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT,
@@ -1548,7 +1596,7 @@ impl TcpClient {
                     stream.take();
                 }
                 self.set_state(ClientState::Disconnected).await;
-                return Err(IggyError::RequestTimeout);
+                return Err(IggyError::RequestTimeoutOutcomeUnknown);
             }
             match result {
                 Err(IggyError::TransientNotAccepted)
@@ -1670,12 +1718,12 @@ impl TcpClient {
                     self.set_state(ClientState::Disconnected).await;
                     return Err(IggyError::Disconnected);
                 }
-                Err(IggyError::RequestTimeout) => {
+                Err(IggyError::RequestTimeoutOutcomeUnknown) => {
                     if let Ok(mut stream) = self.stream.try_lock() {
                         stream.take();
                     }
                     self.set_state(ClientState::Disconnected).await;
-                    return Err(IggyError::RequestTimeout);
+                    return Err(IggyError::RequestTimeoutOutcomeUnknown);
                 }
                 other => return other,
             }
@@ -1703,18 +1751,18 @@ impl TcpClient {
     ) {
         let stream = self.stream.clone();
         let discard_stream_on_next_lock = Arc::clone(&self.discard_stream_on_next_lock);
-        let request_budget = active_login_budget();
+        let request_budget = active_request_budget();
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         let joined = tokio::spawn(async move {
             let mut stream_guard = if let Some(budget) = request_budget {
                 if budget.remaining().is_err() {
-                    return (None, Err(IggyError::RequestTimeout));
+                    return (None, Err(IggyError::RequestTimeoutOutcomeUnknown));
                 }
                 match tokio::time::timeout_at(budget.deadline(), stream.lock()).await {
                     Ok(guard) => guard,
-                    Err(_) => return (None, Err(IggyError::RequestTimeout)),
+                    Err(_) => return (None, Err(IggyError::RequestTimeoutOutcomeUnknown)),
                 }
             } else {
                 stream.lock().await
@@ -1791,7 +1839,7 @@ impl TcpClient {
                             "Timed out waiting for VSR response header for TCP request with code: {code}",
                         );
                         return Err(if request_budget.is_some() {
-                            IggyError::RequestTimeout
+                            IggyError::RequestTimeoutOutcomeUnknown
                         } else {
                             IggyError::Disconnected
                         });
@@ -1817,7 +1865,7 @@ impl TcpClient {
                                 "Timed out waiting for VSR response body for TCP request with code: {code}",
                             );
                             return Err(if request_budget.is_some() {
-                                IggyError::RequestTimeout
+                                IggyError::RequestTimeoutOutcomeUnknown
                             } else {
                                 IggyError::Disconnected
                             });
@@ -1871,12 +1919,12 @@ impl TcpClient {
             let outcome = if let Some(budget) = request_budget {
                 match tokio::time::timeout_at(budget.deadline(), outcome).await {
                     Ok(result) => result,
-                    Err(_) => Err(IggyError::RequestTimeout),
+                    Err(_) => Err(IggyError::RequestTimeoutOutcomeUnknown),
                 }
             } else {
                 outcome.await
             };
-            if !frame_complete || matches!(outcome, Err(IggyError::RequestTimeout)) {
+            if !frame_complete || matches!(outcome, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
                 stream_guard.take();
             }
             (Some(request_header), outcome)
@@ -1951,7 +1999,10 @@ mod tests {
         )
         .await
         .expect("login must finish within its request budget");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         assert!(client.stream.lock().await.is_none());
         assert_ne!(client.get_state().await, ClientState::Authenticated);
     }
@@ -1974,7 +2025,7 @@ mod tests {
         let (mut stale_peer, _) = listener.accept().await.unwrap();
         assert!(matches!(
             client.login_user("iggy", "iggy").await,
-            Err(IggyError::RequestTimeout)
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
         ));
         assert!(client.stream.lock().await.is_none());
 
@@ -2050,7 +2101,10 @@ mod tests {
         )
         .await
         .expect("PAT login must finish within its request budget");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         assert!(client.stream.lock().await.is_none());
     }
 
@@ -2077,7 +2131,10 @@ mod tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), connect)
                 .await
                 .expect("auto login must finish within its request budget");
-            assert!(matches!(result, Err(IggyError::RequestTimeout)));
+            assert!(matches!(
+                result,
+                Err(IggyError::RequestTimeoutOutcomeUnknown)
+            ));
             assert!(client.stream.lock().await.is_none());
             assert_eq!(client.get_state().await, ClientState::Disconnected);
         }
@@ -2100,7 +2157,10 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), Client::connect(&client))
                 .await
                 .expect("connect must finish within its login budget");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         assert_eq!(client.get_state().await, ClientState::Disconnected);
     }
 
@@ -2118,19 +2178,20 @@ mod tests {
         }))
         .unwrap();
         client
-            .session_credentials
-            .lock()
-            .await
-            .replace(RememberedSignIn {
-                credentials: Credentials::UsernamePassword("iggy".to_owned(), "iggy".into()),
-                user_id: SESSION_USER_ID,
-            });
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_owned(), "iggy".into()),
+                SESSION_USER_ID,
+            )
+            .await;
 
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(1), Client::connect(&client))
                 .await
                 .expect("retry sleep must finish within the remembered sign-in budget");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         assert_eq!(client.get_state().await, ClientState::Disconnected);
     }
 
@@ -2164,7 +2225,7 @@ mod tests {
         );
         let result = result.unwrap();
         assert!(
-            matches!(result, Err(IggyError::RequestTimeout)),
+            matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)),
             "{result:?}"
         );
         assert!(dials.load(Ordering::SeqCst) >= 2);
@@ -2190,7 +2251,10 @@ mod tests {
         )
         .await
         .expect("stream wait must finish within the login budget");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         drop(lock);
     }
 
@@ -2226,7 +2290,10 @@ mod tests {
             accepted = listener.accept() => accepted.unwrap(),
         };
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), connect).await;
-        assert!(matches!(result, Ok(Err(IggyError::RequestTimeout))));
+        assert!(matches!(
+            result,
+            Ok(Err(IggyError::RequestTimeoutOutcomeUnknown))
+        ));
         assert_eq!(client.get_state().await, ClientState::Disconnected);
         drop(stream_lock);
         let now = tokio::time::Instant::now();
@@ -2264,7 +2331,10 @@ mod tests {
         )
         .await
         .expect("login must not wait for an unrelated connect owner");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         owner.abort();
     }
 
@@ -2304,7 +2374,10 @@ mod tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), login)
                 .await
                 .expect("partial reply must finish within the login budget");
-            assert!(matches!(result, Err(IggyError::RequestTimeout)));
+            assert!(matches!(
+                result,
+                Err(IggyError::RequestTimeoutOutcomeUnknown)
+            ));
             assert!(client.stream.lock().await.is_none());
         }
     }
@@ -2326,23 +2399,30 @@ mod tests {
         let payload = Bytes::from(vec![0; payload_size]);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            TCP_LOGIN_BUDGET.scope(RequestBudget::new(client.config.request_timeout), async {
-                client
-                    .send_raw_vsr_attempt(
-                        LOGIN_REGISTER_CODE,
-                        payload,
-                        None,
-                        now,
-                        now + std::time::Duration::from_secs(30),
-                        false,
-                    )
-                    .await
-                    .1
-            }),
+            run_with_request_budget(
+                Some(client.config.request_timeout),
+                || client.expire_request(),
+                async {
+                    client
+                        .send_raw_vsr_attempt(
+                            LOGIN_REGISTER_CODE,
+                            payload,
+                            None,
+                            now,
+                            now + std::time::Duration::from_secs(30),
+                            false,
+                        )
+                        .await
+                        .1
+                },
+            ),
         )
         .await
         .expect("stalled write must finish within the login budget");
-        assert!(matches!(result, Err(IggyError::RequestTimeout)));
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
         assert!(client.stream.lock().await.is_none());
         let mut received = 0;
         let mut buffer = [0; 64 * 1024];

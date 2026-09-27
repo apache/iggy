@@ -95,41 +95,48 @@ impl UserClient for IggyClient {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        let identity = self
-            .client
-            .read()
-            .await
-            .login_user(username, password)
-            .await?;
+        let operation = async {
+            let identity = self
+                .client
+                .read()
+                .await
+                .login_user(username, password)
+                .await?;
 
-        let should_redirect = {
-            let client = self.client.read().await;
-            match &*client {
-                ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
-                ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
-                ClientWrapper::WebSocket(ws_client) => {
-                    ws_client.handle_leader_redirection().await?
+            let should_redirect = {
+                let client = self.client.read().await;
+                match &*client {
+                    ClientWrapper::Tcp(tcp_client) => {
+                        tcp_client.handle_leader_redirection().await?
+                    }
+                    ClientWrapper::Quic(quic_client) => {
+                        quic_client.handle_leader_redirection().await?
+                    }
+                    ClientWrapper::WebSocket(ws_client) => {
+                        ws_client.handle_leader_redirection().await?
+                    }
+                    _ => false,
                 }
-                _ => false,
+            };
+
+            if should_redirect {
+                info!("Redirected to leader, reconnecting and re-authenticating");
+                self.connect().await?;
+                // The reconnect signs in with the credentials this very call just
+                // remembered, so on a client without a configured `AutoLogin` the
+                // session is already this user's: signing in again would cost a
+                // logout and a second login (an argon2 each, on the server) for
+                // nothing. With `AutoLogin::Enabled` the reconnect signed in the
+                // configured user, who may not be this one, so the login runs.
+                if redirect_login_settled(&*self.client.read().await).await {
+                    return Ok(identity);
+                }
+                self.login_user(username, password).await
+            } else {
+                Ok(identity)
             }
         };
-
-        if should_redirect {
-            info!("Redirected to leader, reconnecting and re-authenticating");
-            self.connect().await?;
-            // The reconnect signs in with the credentials this very call just
-            // remembered, so on a client without a configured `AutoLogin` the
-            // session is already this user's: signing in again would cost a
-            // logout and a second login (an argon2 each, on the server) for
-            // nothing. With `AutoLogin::Enabled` the reconnect signed in the
-            // configured user, who may not be this one, so the login runs.
-            if redirect_login_settled(&*self.client.read().await).await {
-                return Ok(identity);
-            }
-            self.login_user(username, password).await
-        } else {
-            Ok(identity)
-        }
+        self.run_tcp_request(operation).await
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {

@@ -300,7 +300,6 @@ mod leader_aware;
 mod poll_routing;
 pub mod prelude;
 pub mod quic;
-mod request_budget;
 pub mod session;
 pub mod stream_builder;
 pub mod tcp;
