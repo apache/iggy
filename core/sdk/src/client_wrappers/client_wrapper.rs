@@ -25,8 +25,11 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 pub(crate) trait ClientRequestPolicy: Debug + Send + Sync {
+    /// Returns the deadline used for supported requests.
     fn timeout(&self) -> NonZeroIggyDuration;
+    /// Whether connect includes sign-in and should share that deadline.
     fn should_budget_connect(&self) -> bool;
+    /// Invalidates the connection after the request deadline expires.
     fn expire(&self);
 }
 
@@ -41,6 +44,8 @@ pub enum ClientWrapper {
 }
 
 impl ClientWrapper {
+    /// Returns the TCP policy for login, PAT login, and credentialed connect.
+    /// HTTP, QUIC, and WebSocket currently have no request policy.
     pub(crate) fn request_policy(&self) -> Option<Arc<dyn ClientRequestPolicy>> {
         match self {
             Self::Tcp(client) => Some(Arc::new(client.request_policy())),
