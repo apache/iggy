@@ -388,6 +388,9 @@ zeroize = "1.9.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 zstd = "0.13.3"
 
+[workspace.metadata.cargo-machete]
+ignored = ["prost"]
+
 [profile.release]
 lto = true
 codegen-units = 1
