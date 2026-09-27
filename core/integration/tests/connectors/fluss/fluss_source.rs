@@ -18,12 +18,15 @@
 use super::{API_KEY, POLL_ATTEMPTS, POLL_INTERVAL_MS, SOURCE_KEY, STATE_FILE, TEST_ROW_COUNT};
 use crate::connectors::fixtures::{
     FlussSourceAllTypesFixture, FlussSourceFixture, FlussSourceLatestFixture,
-    FlussSourceSlowPollFixture,
+    FlussSourceProjectedFixture, FlussSourceReservedColumnFixture, FlussSourceSlowPollFixture,
+    FlussSourceUnconvertibleRowFixture,
 };
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
-use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStats, ConnectorStatus};
+use iggy_connector_sdk::api::{
+    ConnectorRuntimeStats, ConnectorStats, ConnectorStatus, SourceInfoResponse,
+};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
@@ -38,6 +41,7 @@ use tokio::time::{sleep, timeout};
 const REDELIVERY_ATTEMPTS: usize = POLL_ATTEMPTS * 3;
 const SEND_FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
 const STATE_FILE_TIMEOUT: Duration = Duration::from_secs(15);
+const SOURCE_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct FlussRecord {
@@ -249,6 +253,98 @@ async fn given_every_supported_column_type_should_map_each_to_json(
     }
 }
 
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_row_that_cannot_be_converted_should_skip_it_and_deliver_the_rest(
+    harness: &TestHarness,
+    fixture: FlussSourceUnconvertibleRowFixture,
+) {
+    fixture
+        .append_rows_around_an_unconvertible_date()
+        .await
+        .expect("Failed to append rows");
+
+    let client = harness.root_client().await.unwrap();
+    let received = poll_payloads(&client, 2, POLL_ATTEMPTS).await;
+    let delivered: HashSet<i64> = received
+        .iter()
+        .filter_map(|payload| payload["_fluss_offset"].as_i64())
+        .collect();
+
+    assert_eq!(
+        delivered,
+        HashSet::from([0, 2]),
+        "Only the rows around the unconvertible one should be delivered"
+    );
+    for payload in &received {
+        assert_eq!(
+            payload["id"], payload["_fluss_offset"],
+            "Each row should carry the id written at its offset"
+        );
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_projection_in_reverse_column_order_should_map_each_column_by_name(
+    harness: &TestHarness,
+    fixture: FlussSourceProjectedFixture,
+) {
+    let payloads = test_payloads();
+    fixture
+        .append_rows(&payloads)
+        .await
+        .expect("Failed to append rows");
+
+    let client = harness.root_client().await.unwrap();
+    let received = poll_payloads(&client, payloads.len(), POLL_ATTEMPTS).await;
+    for (index, payload) in payloads.iter().enumerate() {
+        let offset = index as i64;
+        let row = received
+            .iter()
+            .find(|row| row["_fluss_offset"] == offset)
+            .unwrap_or_else(|| panic!("Row at Fluss offset {offset} was never delivered"));
+        assert_eq!(
+            row,
+            &json!({
+                "id": index,
+                "payload": payload,
+                "_fluss_bucket": 0,
+                "_fluss_offset": offset,
+                "_fluss_timestamp": row["_fluss_timestamp"],
+            }),
+            "Only the projected columns should arrive, each under its own name"
+        );
+    }
+}
+
+/// The paired projection test reads the same table successfully, so the failure here comes from
+/// the reserved column rather than from the table.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_column_under_the_metadata_prefix_should_fail_to_start(
+    harness: &TestHarness,
+    _fixture: FlussSourceReservedColumnFixture,
+) {
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+
+    let source = wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Error).await;
+
+    assert!(
+        source.last_error.is_some(),
+        "A source that failed to open should report why"
+    );
+}
+
 fn test_payloads() -> Vec<String> {
     (0..TEST_ROW_COUNT)
         .map(|index| format!("fluss-payload-{index}"))
@@ -277,8 +373,11 @@ async fn poll_records(
 ) -> Vec<FlussRecord> {
     poll_payloads(client, expected_rows, attempts)
         .await
-        .into_iter()
-        .filter_map(|payload| serde_json::from_value(payload).ok())
+        .iter()
+        .map(|payload| {
+            FlussRecord::deserialize(payload)
+                .unwrap_or_else(|error| panic!("Unexpected Fluss row {payload}: {error}"))
+        })
         .collect()
 }
 
@@ -304,9 +403,13 @@ async fn poll_payloads(client: &IggyClient, expected_rows: usize, attempts: usiz
             .await
         {
             for message in polled.messages {
-                if let Ok(payload) = serde_json::from_slice(&message.payload) {
-                    received.push(payload);
-                }
+                let payload = serde_json::from_slice(&message.payload).unwrap_or_else(|error| {
+                    panic!(
+                        "Apache Iggy message is not JSON ({error}): {}",
+                        String::from_utf8_lossy(&message.payload)
+                    )
+                });
+                received.push(payload);
             }
             let distinct_rows: HashSet<i64> = received
                 .iter()
@@ -349,6 +452,31 @@ async fn wait_for_source_errors(http: &Client, api_url: &str, minimum_errors: u6
     })
     .await
     .expect("Apache Fluss source did not report the rejected batch");
+}
+
+async fn wait_for_source_status(
+    http: &Client,
+    api_url: &str,
+    status: ConnectorStatus,
+) -> SourceInfoResponse {
+    timeout(SOURCE_STATUS_TIMEOUT, async {
+        loop {
+            if let Ok(response) = http
+                .get(format!("{api_url}/sources"))
+                .header("api-key", API_KEY)
+                .send()
+                .await
+                && let Ok(sources) = response.json::<Vec<SourceInfoResponse>>().await
+                && let Some(source) = sources.into_iter().find(|source| source.key == SOURCE_KEY)
+                && source.status == status
+            {
+                return source;
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Apache Fluss source never reached status {status:?}"))
 }
 
 async fn wait_for_file(path: &Path) {

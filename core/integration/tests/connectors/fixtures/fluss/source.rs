@@ -16,10 +16,10 @@
 // under the License.
 
 use super::container::{
-    ENV_SOURCE_BOOTSTRAP_SERVERS, ENV_SOURCE_DATABASE, ENV_SOURCE_INCLUDE_METADATA,
-    ENV_SOURCE_PATH, ENV_SOURCE_POLL_INTERVAL, ENV_SOURCE_STARTING_OFFSET,
-    ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC,
-    ENV_SOURCE_TABLE, FlussContainer,
+    ENV_SOURCE_BOOTSTRAP_SERVERS, ENV_SOURCE_COLUMNS, ENV_SOURCE_DATABASE,
+    ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PATH, ENV_SOURCE_POLL_INTERVAL,
+    ENV_SOURCE_STARTING_OFFSET, ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM,
+    ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TABLE, FlussContainer,
 };
 use async_trait::async_trait;
 use fluss::client::FlussConnection;
@@ -349,10 +349,119 @@ impl TestFixture for FlussSourceAllTypesFixture {
     }
 }
 
+/// A log table whose middle row holds a date `chrono` cannot represent, so the source can only
+/// get past it by skipping that row.
+pub struct FlussSourceUnconvertibleRowFixture {
+    inner: FlussSourceFixture,
+}
+
+impl FlussSourceUnconvertibleRowFixture {
+    /// Appends rows with ids 0 to 2, where only the row with id 1 carries an unconvertible date.
+    pub async fn append_rows_around_an_unconvertible_date(&self) -> Result<(), TestBinaryError> {
+        let rows: Vec<GenericRow> = [(0, 19_782), (1, i32::MAX), (2, 19_783)]
+            .into_iter()
+            .map(|(id, days)| {
+                let mut row = GenericRow::new(2);
+                row.set_field(0, id);
+                row.set_field(1, Date::new(days));
+                row
+            })
+            .collect();
+        self.inner.append(&rows).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussSourceUnconvertibleRowFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: FlussSourceFixture::start(dated_events_schema).await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
+    }
+}
+
+/// A log table with a column under the `_fluss_` prefix that `include_metadata` reserves, read
+/// without a projection, so the source has to refuse to start.
+pub struct FlussSourceReservedColumnFixture {
+    _inner: FlussSourceFixture,
+}
+
+#[async_trait]
+impl TestFixture for FlussSourceReservedColumnFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            _inner: FlussSourceFixture::start(noted_events_schema).await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self._inner.connectors_runtime_envs()
+    }
+}
+
+/// The same table read through a projection that leaves the reserved column out and names the
+/// other two in reverse table order.
+pub struct FlussSourceProjectedFixture {
+    inner: FlussSourceFixture,
+}
+
+impl FlussSourceProjectedFixture {
+    /// Appends one row per payload, with the row index as its id and a note in the column the
+    /// projection leaves out.
+    pub async fn append_rows(&self, payloads: &[String]) -> Result<(), TestBinaryError> {
+        let rows: Vec<GenericRow> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let mut row = GenericRow::new(3);
+                row.set_field(0, index as i32);
+                row.set_field(1, payload.as_str());
+                row.set_field(2, "left out by the projection");
+                row
+            })
+            .collect();
+        self.inner.append(&rows).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussSourceProjectedFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: FlussSourceFixture::start(noted_events_schema).await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_COLUMNS.to_string(), "[payload,id]".to_string());
+        envs
+    }
+}
+
 fn events_schema() -> fluss::error::Result<Schema> {
     Schema::builder()
         .column("id", DataTypes::int())
         .column("payload", DataTypes::string())
+        .build()
+}
+
+fn noted_events_schema() -> fluss::error::Result<Schema> {
+    Schema::builder()
+        .column("id", DataTypes::int())
+        .column("payload", DataTypes::string())
+        .column("_fluss_note", DataTypes::string())
+        .build()
+}
+
+fn dated_events_schema() -> fluss::error::Result<Schema> {
+    Schema::builder()
+        .column("id", DataTypes::int())
+        .column("day", DataTypes::date())
         .build()
 }
 
