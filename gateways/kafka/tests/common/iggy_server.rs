@@ -32,7 +32,7 @@ use std::time::Duration;
 use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilder};
 use secrecy::SecretString;
 
-use iggy_gateway_kafka::bridge::{IggyBridgeConfig, TopicMapping};
+use iggy_gateway_kafka::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
 /// real ephemeral range leaves little room, but this crate never needs more than a handful live
@@ -336,6 +336,7 @@ impl TestServer {
             password: SecretString::from(self.password.clone()),
             topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 }
