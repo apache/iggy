@@ -36,7 +36,7 @@ use iggy_binary_protocol::codes::{
 };
 use iggy_common::Consumer;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-use iggy_common::request_budget::{active_request_budget, run_with_request_budget};
+use iggy_common::request_budget::{request_budget_deadline, with_request_budget};
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
@@ -580,7 +580,7 @@ impl IggyClient {
         future: impl Future<Output = Result<T, IggyError>>,
     ) -> Result<T, IggyError> {
         let policy = self.request_policy.as_ref();
-        run_with_request_budget(
+        with_request_budget(
             policy.map(|policy| policy.timeout()),
             || {
                 if let Some(policy) = policy {
@@ -1017,7 +1017,7 @@ impl Client for IggyClient {
             }));
             Ok(())
         };
-        if active_request_budget().is_some()
+        if request_budget_deadline().is_some()
             || self
                 .request_policy
                 .as_ref()
