@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::client_wrappers::client_wrapper::ClientRequestPolicy;
 use crate::driver::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::leader_aware::{
     LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
@@ -165,6 +166,20 @@ impl TcpRequestPolicy {
         if let Ok(mut state) = self.state.try_lock() {
             *state = ClientState::Disconnected;
         }
+    }
+}
+
+impl ClientRequestPolicy for TcpRequestPolicy {
+    fn timeout(&self) -> NonZeroIggyDuration {
+        TcpRequestPolicy::timeout(self)
+    }
+
+    fn should_budget_connect(&self) -> bool {
+        TcpRequestPolicy::has_sign_in_credentials(self)
+    }
+
+    fn expire(&self) {
+        TcpRequestPolicy::expire(self);
     }
 }
 

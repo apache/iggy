@@ -20,6 +20,15 @@ use crate::http::http_client::HttpClient;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
+use iggy_common::NonZeroIggyDuration;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+pub(crate) trait ClientRequestPolicy: Debug + Send + Sync {
+    fn timeout(&self) -> NonZeroIggyDuration;
+    fn should_budget_connect(&self) -> bool;
+    fn expire(&self);
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -29,4 +38,14 @@ pub enum ClientWrapper {
     Tcp(TcpClient),
     Quic(QuicClient),
     WebSocket(WebSocketClient),
+}
+
+impl ClientWrapper {
+    pub(crate) fn request_policy(&self) -> Option<Arc<dyn ClientRequestPolicy>> {
+        match self {
+            Self::Tcp(client) => Some(Arc::new(client.request_policy())),
+            Self::Iggy(client) => client.request_policy.clone(),
+            _ => None,
+        }
+    }
 }
