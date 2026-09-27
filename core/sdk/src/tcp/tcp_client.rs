@@ -761,44 +761,41 @@ impl TcpClient {
         settle_off_leader: bool,
     ) -> Result<(), IggyError> {
         self.connect_coordinator
-            .run_until(
-                active_request_budget().map(RequestBudget::deadline),
-                |abandoned, token| async move {
-                    let context =
-                        self.connect_coordinator
-                            .owner_context(token, settle_off_leader, false);
+            .run(|abandoned, token| async move {
+                let context =
                     self.connect_coordinator
-                        .scope_owner(context, async move {
-                            let operation = async {
-                                if abandoned {
-                                    self.clear_abandoned_connect().await?;
-                                }
-                                self.connect_inner(context).await
-                            };
-                            let result = if let Some(budget) = active_request_budget() {
-                                budget.run(operation).await
-                            } else {
-                                operation.await
-                            };
-                            if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
-                                // A transport task may still hold the stream
-                                // lock. Mark it stale now so its next user
-                                // discards it without extending this deadline.
-                                self.discard_stream_on_next_lock
-                                    .store(true, Ordering::SeqCst);
-                                if let Ok(mut stream) = self.stream.try_lock() {
-                                    stream.take();
-                                    self.discard_stream_on_next_lock
-                                        .store(false, Ordering::SeqCst);
-                                }
-                                self.reset_vsr_session().await?;
-                                self.set_state(ClientState::Disconnected).await;
+                        .owner_context(token, settle_off_leader, false);
+                self.connect_coordinator
+                    .scope_owner(context, async move {
+                        let operation = async {
+                            if abandoned {
+                                self.clear_abandoned_connect().await?;
                             }
-                            result
-                        })
-                        .await
-                },
-            )
+                            self.connect_inner(context).await
+                        };
+                        let result = if let Some(budget) = active_request_budget() {
+                            budget.run(operation).await
+                        } else {
+                            operation.await
+                        };
+                        if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
+                            // A transport task may still hold the stream
+                            // lock. Mark it stale now so its next user
+                            // discards it without extending this deadline.
+                            self.discard_stream_on_next_lock
+                                .store(true, Ordering::SeqCst);
+                            if let Ok(mut stream) = self.stream.try_lock() {
+                                stream.take();
+                                self.discard_stream_on_next_lock
+                                    .store(false, Ordering::SeqCst);
+                            }
+                            self.reset_vsr_session().await?;
+                            self.set_state(ClientState::Disconnected).await;
+                        }
+                        result
+                    })
+                    .await
+            })
             .await
     }
 
