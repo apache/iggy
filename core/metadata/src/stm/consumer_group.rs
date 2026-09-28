@@ -45,6 +45,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
+use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -66,6 +67,8 @@ pub struct PendingRevocation {
 pub struct ConsumerGroupMember {
     pub id: usize,
     pub client_id: u128,
+    /// Retained independently of client-table capacity eviction. None for legacy snapshots.
+    pub session: Option<u64>,
     pub partitions: Vec<usize>,
     /// Partitions marked for cooperative handoff away from this member but not
     /// yet moved. The member still owns them (poll + commit) until completion.
@@ -78,6 +81,7 @@ impl ConsumerGroupMember {
         Self {
             id,
             client_id,
+            session: None,
             partitions: Vec::new(),
             pending_revocations: Vec::new(),
         }
@@ -392,6 +396,8 @@ pub struct JoinConsumerGroupRequest {
     pub group_id: WireIdentifier,
     pub client_id: u128,
     pub in_flight: Vec<u32>,
+    /// Authenticated bind epoch, absent only in legacy records. `PrepareHeader` does not retain it.
+    pub session: Option<u64>,
 }
 
 impl WireEncode for JoinConsumerGroupRequest {
@@ -402,6 +408,7 @@ impl WireEncode for JoinConsumerGroupRequest {
             + 16
             + 4
             + self.in_flight.len() * 4
+            + self.session.map_or(0, |_| size_of::<u64>())
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -415,6 +422,9 @@ impl WireEncode for JoinConsumerGroupRequest {
         buf.put_u32_le(u32::try_from(self.in_flight.len()).expect("in_flight count fits u32"));
         for partition_id in &self.in_flight {
             buf.put_u32_le(*partition_id);
+        }
+        if let Some(session) = self.session {
+            buf.put_u64_le(session);
         }
     }
 }
@@ -440,6 +450,14 @@ impl WireDecode for JoinConsumerGroupRequest {
             in_flight.push(read_u32_le(buf, pos)?);
             pos += 4;
         }
+        // Old WAL records end after in_flight; new joins retain the request epoch.
+        let session = if pos == buf.len() {
+            None
+        } else {
+            let session = read_u64_le(buf, pos)?;
+            pos += size_of::<u64>();
+            Some(session).filter(|&epoch| epoch != 0)
+        };
         Ok((
             Self {
                 stream_id,
@@ -447,6 +465,7 @@ impl WireDecode for JoinConsumerGroupRequest {
                 group_id,
                 client_id,
                 in_flight,
+                session,
             },
             pos,
         ))
@@ -591,7 +610,7 @@ impl StateHandler for DeleteConsumerGroupRequest {
         // offsets on the topic's surviving partitions.
         state.revision = state.revision.wrapping_add(1);
         // The dropped group may have held pending revocations.
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -627,15 +646,17 @@ impl StateHandler for JoinConsumerGroupRequest {
         // Idempotent: a re-join from the same client keeps its membership.
         let already = group
             .members
-            .iter()
-            .any(|(_, m)| m.client_id == self.client_id);
-        if already {
+            .iter_mut()
+            .find(|(_, member)| member.client_id == self.client_id);
+        if let Some((_, member)) = already {
+            member.session = self.session.or(member.session);
             return ApplyReply::ok(Bytes::new());
         }
         let member_key = group
             .members
             .insert(ConsumerGroupMember::new(0, self.client_id));
         group.members[member_key].id = member_key;
+        group.members[member_key].session = self.session;
         // Cooperative handoff using the home-shard-gathered `in_flight` set:
         // never-polled/drained excess moves to the new member immediately (so a
         // fresh group distributes synchronously at join), while partitions with
@@ -644,7 +665,7 @@ impl StateHandler for JoinConsumerGroupRequest {
         let in_flight: std::collections::HashSet<usize> =
             self.in_flight.iter().map(|&p| p as usize).collect();
         group.rebalance_cooperative(&partition_ids, &in_flight, timestamp.as_micros());
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -692,7 +713,7 @@ impl StateHandler for LeaveConsumerGroupRequest {
         };
         group.members.remove(key);
         group.rebalance_members(&partition_ids);
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -757,7 +778,7 @@ impl StateHandler for RemoveConsumerGroupMemberRequest {
         // Only perturb the reconciler when a membership actually changed.
         if any_removed {
             state.revision = state.revision.wrapping_add(1);
-            state.recompute_pending_revocations_count();
+            state.recompute_consumer_group_metadata();
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -833,7 +854,35 @@ impl StateHandler for CompleteConsumerGroupRevocationRequest {
             });
         if completed {
             state.revision = state.revision.wrapping_add(1);
-            state.recompute_pending_revocations_count();
+            state.recompute_consumer_group_metadata();
+        }
+        ApplyReply::ok(Bytes::new())
+    }
+}
+
+/// A committed Register refreshes all memberships of that identity.
+#[derive(Debug, Clone)]
+pub struct RefreshConsumerGroupSessionRequest {
+    pub client_id: u128,
+    pub session: u64,
+}
+
+impl StateHandler for RefreshConsumerGroupSessionRequest {
+    type State = StreamsInner;
+
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        if let Some(memberships) = state.consumer_group_members.get(&self.client_id) {
+            for &(stream_id, topic_id, group_id, member_id) in memberships {
+                if let Some(member) = state
+                    .items
+                    .get_mut(stream_id)
+                    .and_then(|stream| stream.topics.get_mut(topic_id))
+                    .and_then(|topic| topic.consumer_groups.get_mut(&group_id))
+                    .and_then(|group| group.members.get_mut(member_id))
+                {
+                    member.session = Some(self.session);
+                }
+            }
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -856,6 +905,8 @@ pub struct ConsumerGroupMemberSnapshot {
     /// trailing element).
     #[serde(default)]
     pub pending_revocations: Vec<(usize, usize, u64)>,
+    #[serde(default)]
+    pub session: Option<u64>,
 }
 
 /// Consumer group snapshot representation for serialization (nested under the
@@ -884,6 +935,7 @@ impl ConsumerGroupSnapshot {
                     ConsumerGroupMemberSnapshot {
                         id: member.id,
                         client_id: member.client_id,
+                        session: member.session,
                         partitions: member.partitions.clone(),
                         pending_revocations: member
                             .pending_revocations
@@ -919,6 +971,7 @@ impl ConsumerGroupSnapshot {
                     ConsumerGroupMember {
                         id: member_snap.id,
                         client_id: member_snap.client_id,
+                        session: member_snap.session,
                         partitions: member_snap.partitions,
                         pending_revocations: member_snap
                             .pending_revocations
@@ -947,13 +1000,181 @@ impl ConsumerGroupSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::snapshot::Snapshotable;
+    use crate::stm::stream::Streams;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
-    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
     use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
     use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::IggyTimestamp;
+
+    #[test]
+    fn session_refresh_index_tracks_membership_removal_and_rejoin() {
+        const CLIENT: u128 = 7;
+        const OTHER: u128 = 8;
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "first").code, 0);
+        assert_eq!(create_group(&mut state, "second").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        assert_eq!(join(&mut state, 0, 0, 1, CLIENT).code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, OTHER).code, 0);
+        assert_eq!(state.consumer_group_members[&CLIENT].len(), 2);
+        assert_eq!(leave(&mut state, 0, 0, 0, CLIENT).code, 0);
+        assert_eq!(state.consumer_group_members[&CLIENT].len(), 1);
+        assert_eq!(
+            StateHandler::apply(
+                &DeleteConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    group_id: WireIdentifier::numeric(1),
+                },
+                &mut state,
+                IggyTimestamp::now(),
+            )
+            .code,
+            0
+        );
+        assert!(!state.consumer_group_members.contains_key(&CLIENT));
+        assert_eq!(
+            StateHandler::apply(
+                &RemoveConsumerGroupMemberRequest { client_id: OTHER },
+                &mut state,
+                IggyTimestamp::now(),
+            )
+            .code,
+            0
+        );
+        assert!(state.consumer_group_members.is_empty());
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        let streams = Streams::from(state);
+        streams.refresh_consumer_group_session(CLIENT, 11);
+        assert_eq!(streams.consumer_group_session(CLIENT), Some(11));
+        assert_eq!(streams.consumer_group_session(OTHER), None);
+    }
+
+    #[test]
+    fn deleting_a_parent_removes_its_session_refresh_index() {
+        const CLIENT: u128 = 7;
+        for delete_stream in [false, true] {
+            let mut state = streams_with_topic();
+            assert_eq!(create_group(&mut state, "group").code, 0);
+            assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+            let reply = if delete_stream {
+                StateHandler::apply(
+                    &DeleteStreamRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                    },
+                    &mut state,
+                    IggyTimestamp::now(),
+                )
+            } else {
+                StateHandler::apply(
+                    &DeleteTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                    },
+                    &mut state,
+                    IggyTimestamp::now(),
+                )
+            };
+            assert_eq!(reply.code, 0);
+            assert!(state.consumer_group_members.is_empty());
+        }
+    }
+
+    #[test]
+    fn session_refresh_preserves_other_clients_after_boot_and_in_place_restore() {
+        const CLIENT: u128 = 7;
+        const OTHER: u128 = 8;
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "first").code, 0);
+        assert_eq!(create_group(&mut state, "second").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        assert_eq!(join(&mut state, 0, 0, 1, CLIENT).code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, OTHER).code, 0);
+        let original = Streams::from(state);
+        let boot = Streams::from_snapshot(original.to_snapshot()).unwrap();
+        let mut restored = StreamsInner::new();
+        restored.restore_in_place(original.to_snapshot());
+        for streams in [boot, Streams::from(restored)] {
+            for epoch in [11, 12, 13] {
+                streams.refresh_consumer_group_session(CLIENT, epoch);
+                streams.refresh_consumer_group_session(u128::MAX, epoch);
+                assert!(streams.read(|inner| {
+                    let topic = &inner.items[0].topics[0];
+                    for group in topic.consumer_groups.values() {
+                        for (_, member) in &group.members {
+                            assert_eq!(
+                                member.session,
+                                (member.client_id == CLIENT).then_some(epoch)
+                            );
+                        }
+                    }
+                    !inner.consumer_group_members.contains_key(&u128::MAX)
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn member_session_snapshot_round_trip_preserves_fence_and_reads_legacy_members() {
+        const CLIENT: u128 = 7;
+        const SESSION: u64 = 11;
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        let mut member = ConsumerGroupMember::new(0, CLIENT);
+        member.session = Some(SESSION);
+        member.partitions.push(2);
+        group.members.insert(member);
+        let snapshot = ConsumerGroupSnapshot::from_group(&group);
+        let encoded = rmp_serde::to_vec(&snapshot).unwrap();
+        let restored = rmp_serde::from_slice::<ConsumerGroupSnapshot>(&encoded)
+            .unwrap()
+            .into_group();
+        assert_eq!(restored.members[0].session, Some(SESSION));
+        assert_eq!(restored.members[0].partitions, [2]);
+
+        let legacy = rmp_serde::to_vec(&(
+            0usize,
+            CLIENT,
+            vec![2usize],
+            Vec::<(usize, usize, u64)>::new(),
+        ))
+        .unwrap();
+        let restored = rmp_serde::from_slice::<ConsumerGroupMemberSnapshot>(&legacy).unwrap();
+        assert_eq!(restored.session, None);
+        assert_eq!(restored.client_id, CLIENT);
+        assert_eq!(restored.partitions, [2]);
+    }
+
+    #[test]
+    fn replicated_join_preserves_session_and_decodes_legacy_payloads() {
+        let mut join = JoinConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(0),
+            client_id: 7,
+            in_flight: vec![1, 2],
+            session: None,
+        };
+        let legacy = join.to_bytes();
+        assert_eq!(
+            JoinConsumerGroupRequest::decode_from(&legacy)
+                .unwrap()
+                .session,
+            None
+        );
+        join.session = Some(11);
+        let encoded = join.to_bytes();
+        let decoded = JoinConsumerGroupRequest::decode_from(&encoded).unwrap();
+        assert_eq!(decoded.session, join.session);
+        assert_eq!(decoded.in_flight, join.in_flight);
+        for length in legacy.len() + 1..encoded.len() {
+            assert!(JoinConsumerGroupRequest::decode_from(&encoded[..length]).is_err());
+        }
+    }
 
     // Groups co-locate in the topic node, so an apply resolves its parent through
     // `topic_mut`. Build a `StreamsInner` holding stream 0 / topic 0 via the same
@@ -1012,6 +1233,7 @@ mod tests {
                 group_id: WireIdentifier::numeric(group),
                 client_id,
                 in_flight: Vec::new(),
+                session: None,
             },
             state,
             IggyTimestamp::now(),

@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod flush_unsaved_buffer;
 pub mod poll_messages;
 pub mod send_messages;
 
-pub use flush_unsaved_buffer::FlushUnsavedBufferRequest;
 pub use poll_messages::PollMessagesRequest;
 pub use send_messages::{RawMessage, SendMessagesEncoder, SendMessagesHeader};
