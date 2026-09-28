@@ -29,8 +29,10 @@ name: PR Triage Collect
 # pr-triage-apply.yml.
 #
 # SECURITY: no actions/checkout, no exec of PR contents, no token export.
-# The artifact contents come from the GitHub-runner-written event_path,
-# not from PR code.
+# The token here is read-only. The artifact is NOT trustworthy: on the
+# pull_request_review path GitHub runs the PR head's copy of this file, so a
+# fork can change it and upload any payload. The consumers take only a
+# numeric id from the artifact and re-fetch everything else from the API.
 
 on:
   issue_comment:

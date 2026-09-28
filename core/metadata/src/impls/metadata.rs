@@ -27,12 +27,12 @@ use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
-    Consensus, EvictionContext, FatalReason, Pipeline, PipelineEntry, Plane, PlaneIdentity,
-    PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent,
-    Sequencer, SessionEnd, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
-    apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    build_reply_message_with, build_result_rejection_reply, emit_sim_event, fatal,
-    fence_old_prepare_by_commit, is_caught_up_primary,
+    Consensus, DISCONNECT_LOGOUT_REQUEST_ID, EvictionContext, FatalReason, Pipeline, PipelineEntry,
+    Plane, PlaneIdentity, PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext,
+    RequestLogEvent, Sequencer, SessionEnd, SimEventKind, VsrConsensus, ack_preflight,
+    ack_quorum_reached, apply_preflight_consensus_plane, build_eviction_message,
+    build_reply_message, build_reply_message_with, build_result_rejection_reply, emit_sim_event,
+    fatal, fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
     register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
     send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
@@ -599,7 +599,7 @@ fn require_shard_zero<'a, T>(
 ///
 /// The backup commit walk's per-op logic, shared so the simulator's WAL
 /// reconstruction reaches identical state from the same log through one apply path.
-/// Register creates or rebinds a session (no state-machine op); Logout drops the
+/// Register creates or rebinds a session and refreshes its memberships; Logout drops the
 /// session and rebalances consumer groups; every other op applies to the state
 /// machine and caches the reply for at-most-once dedup. `fire_notifier` runs the
 /// post-commit hook (a no-op during reconstruction, before it is wired). Does not
@@ -633,7 +633,9 @@ pub fn apply_committed_prepare<M>(
 {
     let header = *prepare.header();
     if header.operation == Operation::Register {
-        // Register: commit_register creates the session, no state-machine op.
+        mux_stm
+            .streams()
+            .refresh_consumer_group_session(header.client, header.op);
         if table_mutations_allowed {
             let reply = build_reply_message(&header, &bytes::Bytes::new());
             client_table
@@ -2313,6 +2315,68 @@ where
         }
     }
 
+    /// Remove an expired consumer-group member only if its session is unchanged.
+    /// The caller must establish timeout expiry on the caught-up metadata primary.
+    /// `None` fences legacy members with no persisted session or client-table entry.
+    /// Returns `Ok(None)` when the session changed or membership already ended.
+    ///
+    /// # Errors
+    /// Returns a submission error while consensus cannot accept or commit the logout.
+    ///
+    /// # Panics
+    /// Requires metadata shard 0 and a nonzero client id.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_expired_logout_in_process(
+        &self,
+        client_id: u128,
+        expected_session: Option<u64>,
+    ) -> Result<Option<u64>, MetadataSubmitError> {
+        assert_ne!(client_id, 0, "client_id 0 is reserved for internal use");
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("session expiry runs on shard 0");
+        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+            return Err(MetadataSubmitError::NotPrimary);
+        }
+        if !is_caught_up_primary(consensus) {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+        if consensus.pipeline_has_message_from_client(client_id) {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        if self
+            .client_table
+            .borrow()
+            .get_epoch(client_id)
+            .or_else(|| self.mux_stm.streams().consumer_group_session(client_id))
+            != expected_session
+            || !self
+                .mux_stm
+                .streams()
+                .read(|inner| inner.consumer_group_members.contains_key(&client_id))
+        {
+            return Ok(None);
+        }
+        // Do not enqueue this check: a later register must never be followed
+        // by a logout whose liveness proof belonged to the previous session.
+        let header = RoutedRequestHeader {
+            client: client_id,
+            request: DISCONNECT_LOGOUT_REQUEST_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = build_prepare_message(consensus, &header, Operation::Logout, &[]);
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(|reply| Some(reply.header().commit))
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
+    }
+
     /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
     /// metadata consensus group (shard 0). The partition reconciler calls this
     /// to complete a cooperative revocation once the source has drained the
@@ -2646,11 +2710,9 @@ where
     ) -> Result<Message<ReplyHeader>, Canceled> {
         consensus.verify_pipeline();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
-        // Register is the one op whose admission requires the catch-up gate
-        // (double-register epoch bump); its submit path checks the gate and
-        // the check-to-dispatch section is synchronous. Non-register ops
-        // dispatch mid-window by design (they pipeline behind the in-flight
-        // batch, like the wire path always has).
+        // Register and expired-session Logout require the catch-up gate for
+        // their epoch checks. Both check-to-dispatch sections are synchronous.
+        // Other submits can pipeline behind the in-flight batch.
         debug_assert!(
             prepare.header().operation != Operation::Register || is_caught_up_primary(consensus),
             "dispatch_prepare_and_await: register dispatched with the catch-up gate closed"
@@ -2870,7 +2932,9 @@ where
             // the single-threaded shard and keeps the head revalidation
             // sound.
             let reply = if prepare_header.operation == Operation::Register {
-                // Register: commit_register creates session, no SM.
+                self.mux_stm
+                    .streams()
+                    .refresh_consumer_group_session(prepare_header.client, prepare_header.op);
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
                 if self.client_table_mutation_allowed(prepare_header.op) {
                     self.client_table.borrow_mut().commit_register(
@@ -4199,12 +4263,16 @@ fn unreplayable_secret_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::stream::Streams;
+    use crate::stm::StateHandler;
+    use crate::stm::consumer_group::JoinConsumerGroupRequest;
+    use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::Users;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::WireOptions;
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_common::variadic;
+    use iggy_common::{IggyTimestamp, variadic};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::{
         BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
@@ -5687,6 +5755,333 @@ mod tests {
             None,
             "session removed by the committed logout"
         );
+    }
+
+    #[compio::test]
+    async fn expired_logout_waits_for_catchup_and_preserves_registered_members() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata
+            .submit_register_in_process(CLIENT, USER)
+            .await
+            .unwrap()
+            .epoch;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.advance_commit_max(session + 1);
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await,
+            Err(MetadataSubmitError::NotCaughtUp)
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .len(),
+            1
+        );
+    }
+
+    #[compio::test]
+    async fn expired_logout_removes_only_the_observed_session() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let session = metadata
+            .submit_register_in_process(CLIENT, USER)
+            .await
+            .unwrap()
+            .epoch;
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await
+                .unwrap(),
+            Some(session + 1)
+        );
+        assert!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .is_empty()
+        );
+        assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+        assert_eq!(metadata.mux_stm.streams().consumer_group_count(), 1);
+    }
+
+    #[compio::test]
+    async fn expired_logout_removes_a_member_without_a_client_table_entry() {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(1))
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        assert!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .is_empty()
+        );
+        assert_eq!(metadata.mux_stm.streams().consumer_group_count(), 1);
+        assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), 2);
+    }
+
+    #[compio::test]
+    async fn stale_logout_preserves_a_newer_session_and_its_membership() {
+        const CLIENT: u128 = 1;
+        const OLD_SESSION: u64 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let new_session = metadata
+            .submit_register_in_process(CLIENT, USER)
+            .await
+            .unwrap()
+            .epoch;
+
+        metadata
+            .submit_logout_in_process(CLIENT, OLD_SESSION, DISCONNECT_LOGOUT_REQUEST_ID)
+            .await
+            .unwrap();
+        for expired_session in [None, Some(OLD_SESSION)] {
+            assert_eq!(
+                metadata
+                    .submit_expired_logout_in_process(CLIENT, expired_session)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .len(),
+            1
+        );
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(CLIENT),
+            Some(new_session)
+        );
+        assert_eq!(
+            metadata.consensus.as_ref().unwrap().commit_min(),
+            new_session
+        );
+    }
+
+    #[compio::test]
+    async fn expired_logout_keeps_the_member_fence_after_capacity_and_fence_eviction() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        *metadata.client_table.borrow_mut() = ClientTable::new(1);
+        let old_session = metadata
+            .submit_register_in_process(CLIENT, USER)
+            .await
+            .unwrap()
+            .epoch;
+        let session = metadata
+            .submit_register_in_process(CLIENT, USER)
+            .await
+            .unwrap()
+            .epoch;
+        for (client, epoch) in [(CLIENT, session), (CLIENT + 1, session + 2)] {
+            if client != CLIENT {
+                assert_eq!(
+                    metadata
+                        .submit_register_in_process(client, USER)
+                        .await
+                        .unwrap()
+                        .epoch,
+                    epoch
+                );
+                assert_eq!(
+                    metadata
+                        .client_table
+                        .borrow()
+                        .user_id_for_session(CLIENT, session),
+                    Some(USER)
+                );
+            }
+            let mut request = create_stream_request(client, 1, &format!("fence-{client}"));
+            bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
+                &mut request.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+            )
+            .session = epoch;
+            metadata.submit_request_in_process(request).await.unwrap();
+        }
+        metadata
+            .submit_register_in_process(CLIENT + 2, USER)
+            .await
+            .unwrap();
+        assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+        assert_eq!(
+            metadata
+                .client_table
+                .borrow()
+                .user_id_for_session(CLIENT, session),
+            None
+        );
+        assert_eq!(
+            metadata.mux_stm.streams().consumer_group_session(CLIENT),
+            Some(session)
+        );
+        for stale in [None, Some(old_session)] {
+            assert_eq!(
+                metadata
+                    .submit_expired_logout_in_process(CLIENT, stale)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        assert!(
+            metadata
+                .submit_expired_logout_in_process(CLIENT, Some(session))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .is_empty()
+        );
+    }
+
+    #[compio::test]
+    async fn replayed_register_refreshes_member_epoch_even_below_the_table_frontier() {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
+        let request = RoutedRequestHeader {
+            client: CLIENT,
+            ..Default::default()
+        };
+        let prepare = build_prepare_message(
+            metadata.consensus.as_ref().unwrap(),
+            &request,
+            Operation::Register,
+            &[],
+        );
+        let epoch = prepare.header().op;
+        apply_committed_prepare(
+            &*metadata.mux_stm,
+            &metadata.client_table,
+            false,
+            |_| {},
+            prepare,
+        );
+        assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+        assert_eq!(
+            metadata.mux_stm.streams().consumer_group_session(CLIENT),
+            Some(epoch)
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn metadata_with_group_member(
+        client_id: u128,
+    ) -> (
+        tempfile::TempDir,
+        IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+    ) {
+        const USER: u32 = 7;
+        let mut inner = StreamsInner::new();
+        let timestamp = IggyTimestamp::now();
+        let _ = StateHandler::apply(
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &PersistedCreateTopicRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                created_view: 0,
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                }],
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("group").unwrap(),
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &JoinConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+                client_id,
+                in_flight: Vec::new(),
+                session: None,
+            },
+            &mut inner,
+            timestamp,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm = Rc::new(TestMux::new((Users::default(), (inner.into(), ()))));
+        metadata
+            .submit_register_in_process(client_id, USER)
+            .await
+            .unwrap();
+        metadata.client_table.borrow_mut().remove_client(
+            client_id,
+            USER,
+            SessionEnd::DisconnectCleanup,
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(client_id)
+                .len(),
+            1
+        );
+        (dir, metadata)
     }
 
     /// Register is the one op that still honors the catch-up gate (its

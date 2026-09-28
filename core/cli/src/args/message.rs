@@ -46,22 +46,6 @@ pub(crate) enum MessageAction {
     ///  iggy message poll --offset 0 stream topic 1
     #[clap(verbatim_doc_comment, visible_alias = "p")]
     Poll(PollMessagesArgs),
-    /// Legacy message flush command (unsupported by the server)
-    ///
-    /// Binary transports return FeatureUnavailable. HTTP has no flush route.
-    /// For acknowledgements backed by stable storage, create the topic with
-    /// --durability persisted.
-    ///
-    /// Stream ID can be specified as a stream name or ID
-    /// Topic ID can be specified as a topic name or ID
-    ///
-    /// Examples:
-    ///  iggy message flush 1 2 1
-    ///  iggy message flush stream 2 1
-    ///  iggy message flush 1 topic 1
-    ///  iggy message flush stream topic 1
-    #[clap(verbatim_doc_comment, visible_alias = "f")]
-    Flush(FlushMessagesArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -264,29 +248,6 @@ pub(crate) struct PollMessagesArgs {
     #[clap(verbatim_doc_comment)]
     #[clap(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) output_file: Option<String>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct FlushMessagesArgs {
-    /// Stream ID for the flush request
-    ///
-    /// Stream ID can be specified as a stream name or ID
-    #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) stream_id: Identifier,
-    /// Topic ID for the flush request
-    ///
-    /// Topic ID can be specified as a topic name or ID
-    #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) topic_id: Identifier,
-    /// Partition ID for the flush request
-    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
-    pub(crate) partition_id: u32,
-    /// Request fsync (unsupported by the server)
-    ///
-    /// The server rejects flush requests regardless of this flag.
-    #[clap(verbatim_doc_comment)]
-    #[clap(short, long, default_value_t = false)]
-    pub(crate) fsync: bool,
 }
 
 #[cfg(test)]

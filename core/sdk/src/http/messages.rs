@@ -25,7 +25,6 @@ use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
 use iggy_common::SendMessagesConfirmations;
-use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
 
 #[async_trait]
 impl MessageClient for HttpClient {
@@ -71,30 +70,6 @@ impl MessageClient for HttpClient {
             .post_messages(stream_id, topic_id, partitioning, messages)
             .await?;
         decode_send_response(response).await
-    }
-
-    async fn flush_unsaved_buffer(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        fsync: bool,
-    ) -> Result<(), IggyError> {
-        let _ = self
-            .get_with_query(
-                &get_path_flush_unsaved_buffer(
-                    &stream_id.as_cow_str(),
-                    &topic_id.as_cow_str(),
-                    partition_id,
-                    fsync,
-                ),
-                &FlushUnsavedBuffer {
-                    partition_id,
-                    fsync,
-                },
-            )
-            .await?;
-        Ok(())
     }
 }
 
@@ -170,15 +145,6 @@ async fn decode_send_response(
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/messages")
-}
-
-fn get_path_flush_unsaved_buffer(
-    stream_id: &str,
-    topic_id: &str,
-    partition_id: u32,
-    fsync: bool,
-) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/messages/flush/{partition_id}/fsync={fsync}")
 }
 
 #[cfg(test)]

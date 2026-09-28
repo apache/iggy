@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FlushUnsavedBuffer {
-    pub partition_id: u32,
-    pub fsync: bool,
+/// Version identity the SDK sends to the server during the login handshake.
+public enum IggyVersion {
+    /// Name of this SDK as reported to the server.
+    public static let sdkName = "swift-sdk"
+    /// Version of this SDK as reported to the server. Provisional until the
+    /// release wiring lands; the release tooling reads this constant.
+    public static let sdkVersion = "0.1.0"
 }
