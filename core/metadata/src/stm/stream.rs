@@ -318,7 +318,7 @@ pub struct Stream {
 
     pub stats: Arc<StreamStats>,
     pub topics: IdSlab<Topic>,
-    pub topic_index: AHashMap<Arc<str>, usize>,
+    pub(crate) topic_index: AHashMap<Arc<str>, usize>,
 }
 
 impl Default for Stream {
@@ -845,27 +845,27 @@ impl StatsRegistry {
 
 define_state! {
     Streams {
-        index: AHashMap<Arc<str>, usize>,
-        items: IdSlab<Stream>,
+        pub(crate) index: AHashMap<Arc<str>, usize>,
+        pub items: IdSlab<Stream>,
         // Monotonic counter bumped on every partition-shaping commit
         // (create/delete topic, create/delete partitions, delete stream).
         // Reconciler uses it for a fast-skip when nothing changed and stamps
         // it onto each new Partition::created_revision. Deterministic across
         // replicas: same ops, same order.
-        revision: u64,
+        pub revision: u64,
         // Total pending cooperative revocations across all groups, recomputed
         // once per commit by `post_apply`. The consensus tick reads it O(1)
         // every 10ms instead of walking every stream/topic/group/member to
         // decide whether to wake the reconciler. Deterministic (same ops, same
         // recompute on every replica).
-        pending_revocations_count: u64,
+        pub(crate) pending_revocations_count: u64,
         // Derived with the revocation count after membership changes and restore.
         // Locations are (stream, topic, group, member); never persisted.
-        consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
+        pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
         // Shared aggregate stats, one `Arc` per stream/topic across both
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
-        stats_registry: Arc<StatsRegistry>,
+        pub stats_registry: Arc<StatsRegistry>,
     }
 }
 
@@ -1176,6 +1176,29 @@ impl Streams {
         F: FnOnce(&StreamsInner) -> R,
     {
         self.inner.read(f)
+    }
+
+    /// Resolve a wire stream identifier to its committed slab id, `None` when
+    /// the stream does not exist.
+    #[must_use]
+    pub fn resolve_stream_id(&self, stream_id: &WireIdentifier) -> Option<usize> {
+        self.read(|inner| inner.resolve_stream_id(stream_id))
+    }
+
+    /// Resolve a wire (stream, topic) pair to committed slab ids, `None` when
+    /// the stream or topic does not exist. Both lookups run under one read
+    /// guard, so the pair comes from one committed state.
+    #[must_use]
+    pub fn resolve_topic_ids(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<(usize, usize)> {
+        self.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            Some((stream_id, topic_id))
+        })
     }
 
     /// Committed delete watermark for a partition (the offset below which

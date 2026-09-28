@@ -15112,7 +15112,6 @@ mod tests {
         PartitionsConfig {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
-
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,

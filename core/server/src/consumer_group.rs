@@ -305,8 +305,8 @@ mod tests {
     use shard::metrics::ShardMetrics;
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
-        LifecycleFrame, PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardIdentity,
-        channel, shard_channel,
+        LifecycleFrame, NoopHost, PartitionConsensusConfig, ReplicaTopology, ShardFrame,
+        ShardIdentity, channel, shard_channel,
     };
 
     use super::*;
@@ -787,10 +787,7 @@ mod tests {
             TestShard::new(
                 ShardIdentity::new(0, "consumer-group-test".to_string()),
                 bus.clone(),
-                Rc::new(|_, _| {}),
-                Rc::new(|_, _| {}),
-                Rc::new(|_| {}),
-                Rc::new(|_| {}),
+                Rc::new(NoopHost),
                 metadata,
                 partitions,
                 vec![sender],

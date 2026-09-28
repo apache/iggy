@@ -365,7 +365,7 @@ fn stream_scoped(
     stream_id: &WireIdentifier,
     rule: impl FnOnce(&Permissioner, usize) -> Result<(), IggyError>,
 ) -> Option<ApplyReply> {
-    let stream_id = streams.read(|inner| inner.resolve_stream_id(stream_id))?;
+    let stream_id = streams.resolve_stream_id(stream_id)?;
     check(users, |perm| rule(perm, stream_id))
 }
 
@@ -378,11 +378,7 @@ fn topic_scoped(
     topic_id: &WireIdentifier,
     rule: impl FnOnce(&Permissioner, usize, usize) -> Result<(), IggyError>,
 ) -> Option<ApplyReply> {
-    let (stream_id, topic_id) = streams.read(|inner| {
-        let stream_id = inner.resolve_stream_id(stream_id)?;
-        let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
-        Some((stream_id, topic_id))
-    })?;
+    let (stream_id, topic_id) = streams.resolve_topic_ids(stream_id, topic_id)?;
     check(users, |perm| rule(perm, stream_id, topic_id))
 }
 
