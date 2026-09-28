@@ -100,6 +100,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_WRITE_TIMEOUT_SECS",
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
     "IGGY_KAFKA_BRIDGE_ENABLED",
+    "IGGY_KAFKA_INSTANCE_ID",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -244,6 +245,19 @@ fn load_config() -> Result<GatewayConfig, String> {
             .map_err(|e| format!("invalid IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS `{raw}`: {e}"))?;
         config.shutdown_drain_timeout = Duration::from_secs(secs);
     }
+    // Not `parse_positive`: 0 is the default, and the right value for a single gateway.
+    if let Some(raw) = env_var("IGGY_KAFKA_INSTANCE_ID") {
+        config.instance_id = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_INSTANCE_ID `{raw}`: {e}"))?;
+    } else {
+        // A second gateway left on the default hands out the same producer ids as the first,
+        // and nothing in the cluster can detect it, so an unset value is surfaced at startup.
+        warn!(
+            "IGGY_KAFKA_INSTANCE_ID is not set, defaulting to 0: every gateway fronting the same \
+             Iggy cluster needs its own value, or they hand out colliding producer ids"
+        );
+    }
     reject_iggy_tls_without_sasl(config.sasl_enabled)?;
 
     Ok(config)
@@ -323,11 +337,14 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
-    use super::{parse_positive, reject_iggy_tls_without_sasl, reject_unknown_kafka_env_vars};
+    use super::{
+        load_config, parse_positive, reject_iggy_tls_without_sasl, reject_unknown_kafka_env_vars,
+    };
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
-    /// default group). The `#[serial]` tests in this module are the only ones compiled into *this*
-    /// binary (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `auth`'s,
+    /// default group), shared with the instance-id and TLS tests below since all of them touch the
+    /// process environment. The `#[serial]` tests in this module are the only ones compiled into
+    /// *this* binary (`main.rs` -> the `iggy-gateway-kafka` bin's own test harness) - `auth`'s,
     /// `bridge::config`'s and `server`'s env-touching tests compile into the separate lib test
     /// binary, and `serial_test`'s mutex is process-local, so it does not (and does not need to)
     /// coordinate with any of those; `server.rs`'s own `#[serial]` test makes the mirror-image
@@ -380,6 +397,67 @@ mod tests {
             bridge_var_result.is_ok(),
             "known bridge IGGY_KAFKA_ var must be accepted"
         );
+    }
+
+    /// `#[serial]` and `# Safety` as on
+    /// `reject_unknown_kafka_env_vars_flags_typo_but_accepts_known_keys` above.
+    ///
+    /// Covers both halves of adding this var: it has to be in `KNOWN_KAFKA_ENV_VARS` (or setting
+    /// it refuses to start the gateway) and it has to keep `0`, which `parse_positive` rejects.
+    #[test]
+    #[serial]
+    fn given_an_instance_id_env_var_when_loading_config_should_accept_and_parse_it() {
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "7");
+        }
+        let seven = load_config();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "0");
+        }
+        let zero = load_config();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "65536");
+        }
+        let overflow = load_config();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_INSTANCE_ID");
+        }
+
+        assert_eq!(seven.expect("instance id 7 must load").instance_id, 7);
+        assert_eq!(zero.expect("instance id 0 must load").instance_id, 0);
+        assert!(
+            overflow.is_err(),
+            "an instance id above u16::MAX must be rejected, not truncated"
+        );
+    }
+
+    /// A bad instance id must fail startup loudly. Silently defaulting to 0 would let two
+    /// gateways mint colliding producer ids, which Kafka requires to be unique cluster-wide,
+    /// and the message has to name the variable and the offending value or an operator cannot
+    /// act on it.
+    #[test]
+    #[serial]
+    fn given_an_unparsable_instance_id_when_loading_config_should_reject_and_name_it() {
+        for raw in ["abc", "-1", "", " 7", "7.0"] {
+            unsafe {
+                std::env::set_var("IGGY_KAFKA_INSTANCE_ID", raw);
+            }
+            let loaded = load_config();
+            unsafe {
+                std::env::remove_var("IGGY_KAFKA_INSTANCE_ID");
+            }
+            let error = loaded.err().unwrap_or_else(|| {
+                panic!("instance id `{raw}` must be rejected, not silently defaulted to 0")
+            });
+            assert!(
+                error.contains("IGGY_KAFKA_INSTANCE_ID"),
+                "`{raw}` rejection must name the variable, got: {error}"
+            );
+            assert!(
+                error.contains(raw),
+                "`{raw}` rejection must quote the offending value, got: {error}"
+            );
+        }
     }
 
     /// `#[serial]` for the same reason as the test above: it mutates process-wide env state.

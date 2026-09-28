@@ -35,16 +35,18 @@ mod tcp;
 mod wire;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use kafka_protocol::protocol::StrBytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, advance, timeout};
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::GatewayConfig;
-use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig, SyncRequest};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
     API_KEY_SYNC_GROUP, BrokerAdvertise, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
@@ -78,6 +80,7 @@ fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
         None,
         8 * 1024 * 1024,
         false,
+        0,
         GroupCoordinator::new(config, CancellationToken::new()),
     ))
 }
@@ -626,6 +629,120 @@ async fn given_a_stale_generation_when_syncing_should_return_illegal_generation(
     .await;
 
     assert_eq!(response.error, ERROR_ILLEGAL_GENERATION);
+}
+
+/// An assignment blob that records when its last reference is dropped.
+struct DropFlag {
+    bytes: Vec<u8>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl AsRef<[u8]> for DropFlag {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A follower can park for a whole rebalance waiting on the leader, and only the leader's
+/// assignments are ever applied.
+#[tokio::test(start_paused = true)]
+async fn given_a_follower_parked_in_sync_should_hold_none_of_its_assignment_blobs() {
+    let state = test_state(immediate_config());
+    let (leader, follower) = two_member_group(&state).await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let blob = Bytes::from_owner(DropFlag {
+        bytes: vec![0; 1024],
+        dropped: Arc::clone(&dropped),
+    });
+    let parked = {
+        let state = Arc::clone(&state);
+        let request = SyncRequest {
+            group_id: StrBytes::from_static_str(GROUP),
+            generation_id: 2,
+            member_id: StrBytes::from_string(follower.clone()),
+            protocol_type: None,
+            protocol_name: None,
+            assignments: vec![(StrBytes::from_string(follower), blob)],
+        };
+        tokio::spawn(async move { state.groups.sync(request).await })
+    };
+    yield_to_parked().await;
+
+    assert!(!parked.is_finished(), "the follower waits for the leader");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a parked follower must not keep its assignment blob alive"
+    );
+
+    let leader_sync = sync(
+        &state,
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: 2,
+            member_id: &leader,
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(leader_sync.error, ERROR_NONE);
+    let released = parked.await.expect("parked SyncGroup task");
+    assert_eq!(released.error, ERROR_NONE);
+}
+
+/// The handler must release the frame a parked sync arrived in, not only the coordinator's copy.
+#[tokio::test(start_paused = true)]
+async fn given_a_follower_parked_in_sync_should_release_its_request_frame() {
+    let state = test_state(immediate_config());
+    let (leader, follower) = two_member_group(&state).await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let body = build_sync_group_request(
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: 2,
+            member_id: &follower,
+            assignments: &[(follower.as_str(), &[0; 1024])],
+            ..SyncGroupParams::default()
+        },
+    );
+    let frame = Bytes::from_owner(DropFlag {
+        bytes: body.to_vec(),
+        dropped: Arc::clone(&dropped),
+    });
+    let parked = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            handle_request_bounded(&state, API_KEY_SYNC_GROUP, SYNC_VERSION, frame).await
+        })
+    };
+    yield_to_parked().await;
+
+    assert!(!parked.is_finished(), "the follower waits for the leader");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a parked follower must not keep its request frame alive"
+    );
+
+    let leader_sync = sync(
+        &state,
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: 2,
+            member_id: &leader,
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(leader_sync.error, ERROR_NONE);
+    parked.await.expect("parked SyncGroup task");
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────

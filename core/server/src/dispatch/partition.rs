@@ -1202,8 +1202,8 @@ mod tests {
     use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use shard::shards_table::PapayaShardsTable;
     use shard::{
-        LifecycleFrame, PartitionConsensusConfig, ReconcileOp, ReplicaTopology, ShardFrame,
-        ShardIdentity, shard_channel,
+        LifecycleFrame, NoopHost, PartitionConsensusConfig, ReconcileOp, ReplicaTopology,
+        ShardFrame, ShardIdentity, shard_channel,
     };
 
     #[cfg(target_os = "linux")]
@@ -1862,7 +1862,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -1989,7 +1988,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -2170,7 +2168,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -2186,10 +2183,7 @@ mod tests {
         let shard = TestShard::new(
             ShardIdentity::new(0, "discarded-parked-send-test".to_string()),
             bus.clone(),
-            Rc::new(|_, _| {}),
-            Rc::new(|_, _| {}),
-            Rc::new(|_| {}),
-            Rc::new(|_| {}),
+            Rc::new(NoopHost),
             metadata,
             partitions,
             vec![sender],

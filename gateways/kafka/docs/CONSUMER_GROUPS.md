@@ -162,6 +162,10 @@ A group id is capped at 246 bytes, not Kafka's 249: the Iggy offset key is `kafk
 an Iggy name caps at 255. A longer id is `INVALID_GROUP_ID` (24) here rather than a failure later
 at commit time.
 
+A JoinGroup may list at most `MAX_PROTOCOLS_PER_MEMBER` (16) protocols; more is `INVALID_REQUEST`
+(42). The byte cap above does not bound the count, protocol selection runs under the coordinator
+lock, and stock clients list one or two assignors.
+
 ## What a real consumer still cannot do
 
 A consumer completes JoinGroup and SyncGroup and then holds no partitions. Metadata is a stub that
@@ -183,4 +187,5 @@ That is exactly what Kafka does for a *crashed* consumer, so it is a degraded sh
 a wedge.
 
 `ConsumerGroupHeartbeat` (68), the KIP-848 protocol, is not implemented and a client cannot fall
-back from it. A Kafka 4.0 client may need `group.protocol=classic` to reach these keys at all.
+back from it. It is opt-in: a Kafka 4.0 client still defaults to `group.protocol=classic`, which reaches
+these keys.

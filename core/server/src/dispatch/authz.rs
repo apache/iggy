@@ -171,7 +171,12 @@ where
     let Some(user_id) = user_id else {
         return Some(IggyError::Unauthenticated.as_code());
     };
-    let (stream_id, topic_id) = resolve_topic_scope(shard, stream_id, topic_id)?;
+    let (stream_id, topic_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_topic_ids(stream_id, topic_id)?;
     shard
         .plane
         .metadata()
@@ -332,7 +337,13 @@ where
     let Ok(request) = T::decode_from(body) else {
         return Ok(());
     };
-    let Some(stream_id) = resolve_stream_scope(shard, stream_id(&request)) else {
+    let Some(stream_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_stream_id(stream_id(&request))
+    else {
         return Ok(());
     };
     authorize_uid(shard, user_id, |permissioner, uid| {
@@ -362,53 +373,17 @@ where
         return Ok(());
     };
     let (stream_id, topic_id) = ids(&request);
-    let Some((stream_id, topic_id)) = resolve_topic_scope(shard, stream_id, topic_id) else {
-        return Ok(());
-    };
-    authorize_uid(shard, user_id, |permissioner, uid| {
-        rule(permissioner, uid, stream_id, topic_id)
-    })
-}
-
-/// Resolve a wire stream identifier to its committed slab id, or `None` on a
-/// miss (the gate then falls through to the builder's not-found reply).
-fn resolve_stream_scope<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-) -> Option<usize>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard
+    let Some((stream_id, topic_id)) = shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| inner.resolve_stream_id(stream_id))
-}
-
-/// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
-/// either misses.
-fn resolve_topic_scope<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-) -> Option<(usize, usize)>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let stream_id = inner.resolve_stream_id(stream_id)?;
-        let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
-        Some((stream_id, topic_id))
+        .resolve_topic_ids(stream_id, topic_id)
+    else {
+        return Ok(());
+    };
+    authorize_uid(shard, user_id, |permissioner, uid| {
+        rule(permissioner, uid, stream_id, topic_id)
     })
 }
 
