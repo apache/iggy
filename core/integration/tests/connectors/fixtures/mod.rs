@@ -21,6 +21,7 @@ mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;
+mod floci;
 mod http;
 mod iceberg;
 mod influxdb;
