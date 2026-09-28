@@ -99,9 +99,8 @@ pub async fn run(harness: &mut TestHarness) {
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); graceful
-    // shutdown flushes the committed journal, which this scenario's restart
-    // exercises instead.
+    // No flush primitive exists; graceful shutdown flushes the committed
+    // journal, which this scenario's restart exercises instead.
     tokio::time::sleep(Duration::from_secs(2)).await;
     drop(setup_client);
 

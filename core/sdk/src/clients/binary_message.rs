@@ -125,18 +125,4 @@ impl MessageClient for IggyClient {
             .send_messages(stream_id, topic_id, partitioning, messages)
             .await
     }
-
-    async fn flush_unsaved_buffer(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        fsync: bool,
-    ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .flush_unsaved_buffer(stream_id, topic_id, partition_id, fsync)
-            .await
-    }
 }
