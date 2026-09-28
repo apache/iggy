@@ -157,6 +157,22 @@ jobs:
                 ? names.map((n) => `\`${n}\``).join(', ')
                 : 'none';
             };
+            // Write access comes from the permission endpoint, the one the run
+            // gates on. Read through this token, author_association reports a
+            // private org membership as CONTRIBUTOR, and most committers keep
+            // theirs private. A lookup that fails denies.
+            const hasWriteAccess = async (login) => {
+              try {
+                const { data } = await withRetry(() =>
+                  github.rest.repos.getCollaboratorPermissionLevel({
+                    owner, repo, username: login,
+                  }), 'getCollaboratorPermissionLevel');
+                return data.permission === 'write' || data.permission === 'admin';
+              } catch (e) {
+                core.warning(`write-access check failed for ${login}: ${e.message}`);
+                return false;
+              }
+            };
 
             // Every value this post acts on is read back from the API: the
             // comment that asked, its author and the pull request it sits on.
@@ -181,8 +197,6 @@ jobs:
               core.setFailed(`cannot read a pull request from ${comment.issue_url}`);
               return;
             }
-            const committer = ['MEMBER', 'COLLABORATOR', 'OWNER']
-              .includes(comment.author_association) && !author.endsWith('[bot]');
 
             // The command has to be a line of the comment, the same rule the
             // run workflow applies before it spends a runner. A comment that
@@ -193,7 +207,7 @@ jobs:
               core.info('the trigger comment carries no /skill command');
               return;
             }
-            if (!committer) {
+            if (author.endsWith('[bot]') || !(await hasWriteAccess(author))) {
               await react('confused');
               await reply('`/skill` is limited to repository committers, and ' +
                 `\`${author}\` does not have write access.`);
