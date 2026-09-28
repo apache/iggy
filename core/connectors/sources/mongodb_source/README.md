@@ -44,7 +44,7 @@ query = { status = "active" }
 
 | Field              | Required | Default         | Description                                                                 |
 | ------------------ | -------- | --------------- | --------------------------------------------------------------------------- |
-| `connection_uri`   | yes      |                 | MongoDB connection string. Treated as a secret and redacted when serialized |
+| `connection_uri`   | yes      |                 | MongoDB connection string. Redacted in debug output and never serialized    |
 | `database`         | yes      |                 | Database to read from                                                       |
 | `collection`       | yes      |                 | Collection to read from                                                     |
 | `max_pool_size`    | no       | driver default  | Maximum number of connections in the driver pool                            |
@@ -72,6 +72,7 @@ The connector tracks the following state information:
 - `last_poll_timestamp`: Highest `timestamp_field` value seen so far
 - `total_documents_fetched`: Total number of documents produced
 - `poll_count`: Number of polling cycles executed
+- `last_id`: `_id` of the document at `last_poll_timestamp`, stored as extended JSON and used to break timestamp ties
 
 ### Error Tracking
 
@@ -144,7 +145,8 @@ State is serialized with MessagePack, so the file is binary. Its content is equi
 {
   "last_poll_timestamp": "2024-01-15T10:30:00Z",
   "total_documents_fetched": 15000,
-  "poll_count": 150
+  "poll_count": 150,
+  "last_id": "{\"$oid\":\"65a4f0c2e1b2c3d4e5f60718\"}"
 }
 ```
 
@@ -164,9 +166,9 @@ Messages themselves are the documents serialized with `serde_json`, so BSON type
 ### Common Issues
 
 1. **Duplicate Messages on Every Poll**: Without `timestamp_field`, each poll reads every document that matches `query`. Set `timestamp_field` for incremental ingestion
-2. **Large First Poll**: With no saved timestamp, the first poll runs without `batch_size` or sort and reads the whole matching collection
+2. **Unbounded Polls Without `timestamp_field`**: Without `timestamp_field`, every poll runs without `batch_size` or sort and reads the whole matching collection into one batch
 3. **State Not Advancing**: `timestamp_field` values that are strings or numbers are ignored. Only BSON `Date` values update `last_poll_timestamp`
-4. **Skipped Documents**: The filter uses `$gt`, so documents sharing the last seen timestamp that fall past a `batch_size` boundary are not read on the next poll. Prefer unique, high-resolution timestamps
+4. **Shared Timestamps**: Batches are sorted by `(timestamp_field, _id)`, and the next poll reads documents with a later timestamp, or the same timestamp and a greater `_id`. Documents sharing a timestamp across a `batch_size` boundary are read on the next poll
 5. **Connection Failures**: Invalid URIs or unreachable hosts fail in `open()` with an init error. Check `connection_uri` and credentials
 6. **Starting Fresh**: Delete `source_<key>.state` to reset progress
 
@@ -185,7 +187,7 @@ To enable incremental processing on an existing connector:
 
 1. Add `timestamp_field` to `plugin_config`
 2. Restart the connector
-3. The first poll reads all matching documents, then later polls only fetch newer ones
+3. Polls read matching documents in timestamp order, `batch_size` at a time, then only fetch newer ones
 
 To migrate between state storage backends:
 

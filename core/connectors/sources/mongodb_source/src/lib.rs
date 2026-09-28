@@ -48,9 +48,8 @@ struct State {
     last_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MongoDbSourceConfig {
-    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
     pub connection_uri: SecretString,
     pub database: String,
     pub collection: String,
@@ -154,11 +153,15 @@ impl MongoDbSource {
         let coll: Collection<Document> = client
             .database(&self.config.database)
             .collection(&self.config.collection);
-        let sample = coll
-            .find_one(self.config.query.clone().unwrap_or_default())
-            .await
-            .map_err(|e| Error::InitError(format!("Failed to read a sample document: {e}")))?;
-        match sample {
+        let query = self.config.query.clone().unwrap_or_default();
+        let dated = doc! { "$and": [query.clone(), { timestamp_field: { "$type": "date" } }] };
+        let read_sample = |e: mongodb::error::Error| {
+            Error::InitError(format!("Failed to read a sample document: {e}"))
+        };
+        if coll.find_one(dated).await.map_err(read_sample)?.is_some() {
+            return Ok(());
+        }
+        match coll.find_one(query).await.map_err(read_sample)? {
             Some(doc) => validate_timestamp_field(&doc, timestamp_field),
             None => Ok(()),
         }
@@ -220,7 +223,7 @@ impl MongoDbSource {
             })?;
 
             let message = ProducedMessage {
-                id: None,
+                id: doc.get("_id").and_then(message_id),
                 headers: None,
                 checksum: None,
                 timestamp: None,
@@ -270,15 +273,19 @@ impl Source for MongoDbSource {
 
         let (messages, candidate_state) = self.search_documents(client).await?;
 
-        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
-            Error::Serialization("failed to serialize MongoDB source state".to_string())
-        })?;
+        let persisted_state = if messages.is_empty() {
+            None
+        } else {
+            Some(self.serialize_state(&candidate_state).ok_or_else(|| {
+                Error::Serialization("failed to serialize MongoDB source state".to_string())
+            })?)
+        };
         *self.pending_state.lock().await = Some(candidate_state);
 
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: Some(persisted_state),
+            state: persisted_state,
         })
     }
 
@@ -315,6 +322,19 @@ fn validate_timestamp_field(doc: &Document, timestamp_field: &str) -> Result<(),
         None => Err(Error::InvalidConfigValue(format!(
             "timestamp_field '{timestamp_field}' is missing from documents in the collection"
         ))),
+    }
+}
+
+fn message_id(id: &Bson) -> Option<u128> {
+    match id {
+        Bson::ObjectId(object_id) => {
+            let mut bytes = [0u8; 16];
+            bytes[4..].copy_from_slice(&object_id.bytes());
+            Some(u128::from_be_bytes(bytes))
+        }
+        Bson::Int32(value) => u128::try_from(*value).ok(),
+        Bson::Int64(value) => u128::try_from(*value).ok(),
+        _ => None,
     }
 }
 
@@ -402,6 +422,29 @@ mod tests {
         assert_eq!(state.poll_count, candidate.poll_count);
         assert_eq!(state.last_id, candidate.last_id);
         assert!(src.pending_state.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_no_state_should_start_fresh() {
+        let src = MongoDbSource::new(1, test_config(), None);
+
+        let state = src.state.lock().await;
+        assert!(state.last_poll_timestamp.is_none());
+        assert_eq!(state.total_documents_fetched, 0);
+        assert_eq!(state.poll_count, 0);
+        assert!(state.last_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_invalid_state_should_start_fresh() {
+        let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
+        let src = MongoDbSource::new(1, test_config(), Some(invalid_state));
+
+        let state = src.state.lock().await;
+        assert!(state.last_poll_timestamp.is_none());
+        assert_eq!(state.total_documents_fetched, 0);
+        assert_eq!(state.poll_count, 0);
+        assert!(state.last_id.is_none());
     }
 
     #[test]
@@ -492,5 +535,17 @@ mod tests {
                 "{doc:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn given_document_id_should_derive_stable_message_id() {
+        let object_id = ObjectId::parse_str("65a4f0c2e1b2c3d4e5f60718").unwrap();
+        assert_eq!(
+            message_id(&Bson::ObjectId(object_id)),
+            Some(0x65a4_f0c2_e1b2_c3d4_e5f6_0718)
+        );
+        assert_eq!(message_id(&Bson::Int64(42)), Some(42));
+        assert_eq!(message_id(&Bson::Int32(-1)), None);
+        assert_eq!(message_id(&Bson::String("doc-1".to_string())), None);
     }
 }

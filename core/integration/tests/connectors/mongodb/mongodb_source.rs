@@ -19,6 +19,7 @@ use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::MongoDbSourcePreCreatedFixture;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use std::time::Duration;
@@ -121,7 +122,27 @@ async fn mongodb_source_handles_empty_collection(
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
 
-    sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(500)).await;
+
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let sources: Vec<SourceInfoResponse> = reqwest::get(format!("{api_address}/sources"))
+        .await
+        .expect("Failed to query /sources")
+        .json()
+        .await
+        .expect("Failed to parse sources");
+    let source = sources
+        .iter()
+        .find(|source| source.key == "mongodb")
+        .expect("MongoDB source should be reported");
+    assert_eq!(
+        source.status,
+        ConnectorStatus::Running,
+        "Source should start against an empty collection"
+    );
 
     let polled = client
         .poll_messages(
@@ -133,11 +154,13 @@ async fn mongodb_source_handles_empty_collection(
             10,
             false,
         )
-        .await;
+        .await
+        .expect("Failed to poll messages");
 
     assert!(
-        polled.is_ok(),
-        "Should be able to poll from topic even with empty source"
+        polled.messages.is_empty(),
+        "Expected no messages from an empty collection, got {}",
+        polled.messages.len()
     );
 }
 
