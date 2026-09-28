@@ -41,7 +41,6 @@ pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
     (14, "SyncGroup"),
     (15, "DescribeGroups"),
     (16, "ListGroups"),
-    (17, "SaslHandshake"),
     (20, "DeleteTopics"),
 ];
 

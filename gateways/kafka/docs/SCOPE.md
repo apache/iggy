@@ -2,9 +2,9 @@
 
 ## Issue #3421 — in scope (this iteration)
 
-Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. **No Iggy backend integration.**
+Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it.
 
-**Stub semantics (important):** Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers with `NOT_CONTROLLER` (41) so clients do not believe topics were created. Do not treat `ec=0` stub success as durable storage — that arrives in the Iggy bridge phase.
+**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers `NOT_CONTROLLER` (41), so clients do not believe topics were created. Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores real data once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
@@ -44,7 +44,7 @@ it knows the server supports flexible encoding.
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
-| 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | Decode request; stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
+| 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
@@ -76,7 +76,7 @@ All API keys not listed above close the connection (see Governance model above) 
 | 9 | OffsetFetch | Consumer group — later issue |
 | 10 | FindCoordinator | Consumer group — later issue |
 | 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
-| 17 | SaslHandshake | Auth — later issue |
+| 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
@@ -88,8 +88,8 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
-| **3 — Iggy bridge** | Landed, not wired in | `bridge/` module (connection, topic mapping, provisioning, high watermark) landed; Produce/Fetch handler wiring itself is a follow-on ([#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536)) |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except Produce and ListOffsets with a bridge |
+| **3 — Iggy bridge** | Produce and ListOffsets wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) call it. Fetch does not call it yet ([#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
 
@@ -103,16 +103,120 @@ Items from the [hybrid architecture review](https://github.com/apache/iggy/discu
 below it are still open for the issues that build on top of it.
 
 - [x] Add `bridge/` module (`iggy_bridge`) - connection lifecycle, topic mapping, provisioning,
-      high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533). Produce →
-      `send_messages` / Fetch → `poll_messages` handler wiring itself is
-      [#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536),
-      not part of `bridge/`'s own scope.
+      high watermark, error mapping. See [README.md](../README.md#iggy-bridge-3533).
+- [x] Produce → `send_messages` ([#3535](https://github.com/apache/iggy/issues/3535)) - one call
+      per partition, base offset from the send confirmation, one error code per partition. See
+      [README.md](../README.md#produce-3535).
+- [ ] Produce: `IggyClient` pool. Pin each partition to one client, so order holds.
+- [ ] Produce: write keyed records' header TLVs into one buffer (`records::to_iggy`). Benchmark
+      first. Keep Iggy's TLV layout and the 100 KB header check.
+- [ ] Produce: skip the second batch CRC pass (`records::preflight`) only if profiling shows it
+      matters. A corrupt header must still answer 87.
+- [ ] Produce stub, `acks=0`: close the connection when the request names a partition, as Kafka
+      does. v0-2 needs the counts read from the raw body.
+- [ ] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)).
 - [x] Idempotent `ensure_stream_and_topic()` (create-if-not-exists) - `src/bridge/iggy_bridge.rs`,
       exercised end-to-end in `tests/bridge_iggy_integration_tests.rs`.
+- [x] Real CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, creates the Iggy stream/topic through
+      `IggyBridge::create_kafka_topic` - an atomic create-or-report-exists call, not a separate
+      existence read followed by an idempotent create (that sequence has a TOCTOU window: two
+      concurrent requests for the same new name could both observe "doesn't exist yet" and both
+      receive `NONE`, when Kafka guarantees exactly one caller does).
+      `src/protocol/handlers/create_topics.rs`, `tests/create_topics_real_bridge_tests.rs`. With
+      the bridge off, the stub from #3421 answers `NOT_CONTROLLER` (41) as before.
+  - Every occurrence of a duplicate topic name within one request is rejected with
+    `INVALID_REQUEST` (42) and nothing is created for it, matching real Kafka
+    (`ControllerApis.createTopics`) rather than creating the first occurrence and reporting the
+    rest as already existing.
+  - A manual partition `assignments` list combined with an explicit `num_partitions`/
+    `replication_factor` is rejected with `INVALID_REQUEST` (42) even when the count agrees with
+    `assignments.len()` - real Kafka's own `ReplicationControlManager` treats the two as mutually
+    exclusive inputs, not independently-checked values that happen to agree.
+  - A manual assignment's own partition indices are checked too, not just its length:
+    `ERROR_INVALID_REPLICA_ASSIGNMENT` (39) for a duplicate index or one that isn't exactly
+    `0..assignments.len()` - `{5: [...], 7: [...]}` has the right length for a 2-partition topic
+    but names neither partition `0` nor `1`, matching real Kafka's own
+    `ReplicationControlManager.createTopic` key-set validation.
+  - `IggyError::RequestAlreadyApplied` (the SDK's reconnect path replayed a write that already
+    committed) maps to `NONE`, not the `UNKNOWN_SERVER_ERROR` catch-all - the operation did
+    succeed, and a Java client treats `UNKNOWN_SERVER_ERROR` as non-retriable. Special-cased
+    locally in `create_topics.rs`, not in the shared `BridgeError -> Kafka error code` mapping
+    every handler's error path goes through: "the write already applied" is a write-only fact,
+    and a read (Metadata, ListOffsets) reaching this variant has no write to have applied.
+  - `error_message` on a rejected topic never re-embeds the topic name `CreatableTopicResult.name`
+    already carries - `BridgeError::InvalidKafkaTopicName`'s `Display` does, so using it directly
+    would roughly double the response cost per invalid name, for free (name validation runs before
+    any bridge I/O).
+  - `IggyBridge::get_kafka_topic` no longer probes `get_stream` separately before `get_topic` -
+    `get_topic` already answers `Ok(None)` when the stream itself is missing, so the probe was a
+    second round trip to learn something the one call already told it.
+  - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
+    still a pre-decode ceiling, not a usability one): a duplicate name never reaches the bridge at
+    all (rejected up front, see above), a request naming more than 100 distinct non-duplicate
+    topics is rejected outright (`INVALID_REQUEST`, no bridge call for any of them), and the
+    request's own wire `timeout_ms` (clamped to `[1s, 30s]`) now bounds the whole handler's
+    aggregate bridge work, not just decoded and discarded - a deadline that fires answers every
+    topic `REQUEST_TIMED_OUT` rather than continuing to hold the shared lockstep `IggyClient`.
 - [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
   - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
   - `Partitioning::partition_id(index)` on every Produce. A Kafka producer resolves the partition before it builds the request, so `Partitioning::balanced()` has no trigger there. The `-1` default-partition-count case belongs to CreateTopics
+- [x] Real Metadata topic/partition data ([#3534](https://github.com/apache/iggy/issues/3534)):
+      with `IGGY_KAFKA_BRIDGE_ENABLED=true`, a named lookup answers from
+      `IggyBridge::get_kafka_topic` (`UNKNOWN_TOPIC_OR_PARTITION` if not found) and a null
+      topics array ("all topics") answers from `IggyBridge::list_kafka_topics` - the target of
+      every configured `TopicMapping` override plus every other topic in the default stream, so
+      an Iggy stream this bridge has no mapping rule pointing at is never listed (nothing a Kafka
+      client ever named). Every reported partition names this gateway's single broker (node id 1)
+      as leader/replica/ISR, since there is only ever one. `src/protocol/handlers/metadata.rs`,
+      `src/bridge/iggy_bridge/topics.rs` (`get_kafka_topic`/`list_kafka_topics`),
+      `tests/metadata_real_bridge_tests.rs`. With the bridge off, the stub from #3421 reports
+      every requested topic unknown, as before.
+  - Fixed alongside: the stub's `decode_topics` collapsed a null topics array ("all topics") and
+    an explicit empty one (`Some(vec![])`, "these zero topics") to the same `Vec::new()` - the
+    real path's `decode_requested_topics` keeps `Option<Vec<_>>` so the two aren't conflated.
+    Also: at `api_version == 0` an explicit empty array is folded into "all topics" too, matching
+    Kafka's own `isAllTopics()` rule (`topics == null || (topics.isEmpty() && version == 0)`) -
+    there is no v0 wire shape for "cluster info only, zero topics" (that distinct shape, KIP-4's
+    `describeCluster()`, starts at v1).
+  - `get_kafka_topic` shares its implementation with CreateTopics' own existence check above -
+    both need "does this Kafka-side name resolve to a real Iggy topic," so this bridge exposes one
+    method returning the SDK's own `TopicDetails`, not two narrower, independently-maintained
+    lookups.
+  - The response-size cap above only covers the "all topics" and per-name-expansion cases. A
+    named lookup is separately bounded on the request side: names repeated in one request are
+    deduped up front to one response entry, not just one bridge round trip - real Kafka answers a
+    topic named twice in one request with one response entry, and re-expanding to match the
+    request would let a handful of repeats of one large topic name amplify a response sized off
+    the repeat count instead of the distinct count. No cap on distinct names: `bounds_guard`'s
+    `MAX_REQUEST_ELEMENTS` (4,096) is still the pre-decode ceiling, but `IggyBridge::get_kafka_topics`
+    batches by the *stream* each name resolves to rather than paying one round trip per name, so
+    the real bridge cost is bounded by distinct streams involved (config-time-bounded), not by
+    how many names the client asks about. A per-name cap here previously permanently broke a
+    long-lived Java producer once its `ProducerMetadata`'s cumulative tracked-topic set - resent
+    in full on every refresh - crossed the cap: every later request answered every topic
+    `INVALID_REQUEST`, and the producer had no way to shrink its own tracked set to recover. The
+    whole lookup's aggregate bridge work still runs under a fixed 20s wall-clock deadline
+    (`Metadata` carries no `timeout_ms` field in any version, unlike `CreateTopics`, so this cannot
+    be client-honored) - a deadline that fires answers every name `REQUEST_TIMED_OUT` rather than
+    continuing to hold the shared lockstep `IggyClient`.
+  - The "all topics" path is server-driven, not client-count-driven, so it has no distinct-topic
+    cap - only the response-size projection applies there, and it **truncates** rather than
+    closes on overflow: `list_kafka_topics()`'s result is trimmed to as many whole topics (in
+    listing order) as `max_frame_size` allows. Closing instead, as the named-lookup path still
+    does, would make every all-topics Metadata call - the bootstrap/refresh shape both librdkafka
+    and the Java client use - fail identically and permanently once the cluster's total partition
+    count crosses the trip point, since that size is the catalog's own, not anything the
+    requesting client chose or can shrink.
+- [ ] Multi-broker topology (this gateway is, and will stay, a single logical broker - node id 1
+      always leads every partition it reports; nothing here models an Iggy cluster as multiple
+      Kafka-visible brokers)
+- [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
+      against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
+      not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
+      session, so not carried forward as a fix here rather than guessed at. Needs fresh
+      reproduction against a real `kcat` before it's re-closed.
 - [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::high_watermarks` and
       `EARLIEST` answers `0`. Any other requested timestamp (arbitrary-timestamp offset search,
@@ -169,7 +273,17 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
-- [ ] SASL (17, 36) if required by deployment
+Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
+[`AUTHENTICATION.md`](AUTHENTICATION.md).
+
+- [x] SASL/PLAIN (17, 36), opt-in via `IGGY_KAFKA_SASL_ENABLED`, credentials verified against Iggy.
+      Kept out of `SUPPORTED_RANGES` on purpose: the connection loop routes both keys through the
+      SASL state machine before dispatch, so a gateway with the feature off advertises neither key
+      and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
+      connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
+      silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
+      credential storage, not deferred
+- [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys
 
