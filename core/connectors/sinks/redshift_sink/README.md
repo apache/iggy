@@ -193,7 +193,7 @@ COPY {staging_table} ({columns})
 FROM STDIN BINARY
 ```
 
-The `s3_path` is parsed and used to fetch the object from the MinIO instance backing the mock container, with access key and secret key supplied to the container via environment variables rather than an IAM role. Instead of Redshift pulling directly from S3, the connector reads the object itself and streams it into the mock over `COPY ... FROM STDIN BINARY`, so the `CREDENTIALS`, `FORMAT AS PARQUET`, and `REGION` clauses have no equivalent here.
+In integration tests, the mock uses the `s3_path` to fetch objects from Floci with test credentials. Instead of Redshift pulling directly from S3, the mock reads the object and streams it into PostgreSQL over `COPY ... FROM STDIN BINARY`, so the `CREDENTIALS`, `FORMAT AS PARQUET`, and `REGION` clauses have no equivalent here.
 
 ## 5. Staging → target insert (idempotent upsert)
 

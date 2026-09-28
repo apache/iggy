@@ -78,6 +78,7 @@ fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
         None,
         8 * 1024 * 1024,
         false,
+        0,
         GroupCoordinator::new(config, CancellationToken::new()),
     ))
 }

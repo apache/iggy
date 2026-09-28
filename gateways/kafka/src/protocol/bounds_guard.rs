@@ -747,6 +747,36 @@ pub fn validate_metadata_shape(version: i16, body: &Bytes, max_frame_size: usize
     Ok(())
 }
 
+/// Mirrors the field order `InitProducerIdRequest::decode` walks.
+///
+/// No response-size guard needed: the response is four fixed-width fields and echoes nothing
+/// from the request, so `usize::MAX` disables that check rather than plumbing `max_frame_size`
+/// through for no effect (same as [`validate_api_versions_shape`]).
+///
+/// # Errors
+///
+/// Returns an error when the declared `transactional_id` length cannot fit in the bytes
+/// remaining in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_init_producer_id_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 2;
+
+    if flexible {
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+    }
+    let _transaction_timeout_ms = c.read_i32()?;
+    if version >= 3 {
+        let _producer_id = c.read_i64()?;
+        let _producer_epoch = c.read_i16()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `ApiVersionsRequest::decode` walks. v0-2 have an empty body (no
 /// length-prefixed fields to bound), so this is a no-op below v3.
 ///
@@ -974,6 +1004,39 @@ pub fn validate_sync_group_shape(version: i16, body: &Bytes, max_frame_size: usi
 /// reaches `parse_plain`, and what a future mechanism would carry into a credential exchange.
 const MAX_SASL_AUTH_BYTES: usize = 4096;
 
+/// `DescribeAcls` carries a fixed-shape filter: four enums and three nullable strings.
+///
+/// No arrays and nothing echoed into the response, so there is no amplification to project. The
+/// walk exists to reject a truncated filter before `kafka_protocol` reads past the frame.
+///
+/// # Errors
+///
+/// Returns an error when a declared string length does not fit the remaining frame.
+pub fn validate_describe_acls_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 2;
+    c.read_i8()?;
+    if flexible {
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+    }
+    c.read_i8()?;
+    if flexible {
+        c.compact_string(true)?;
+        c.compact_string(true)?;
+    } else {
+        c.legacy_string(true)?;
+        c.legacy_string(true)?;
+    }
+    c.read_i8()?;
+    c.read_i8()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// `SaslHandshake` carries one non-nullable string, the mechanism name.
 ///
 /// `_version` is unused: the message is never flexible, so v0 and v1 share this shape, and the
@@ -1021,6 +1084,50 @@ mod tests {
     use super::*;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn describe_acls_v1_with_all_strings_present_accepted() {
+        // Both wire fixtures null every string, so without this the walk's string readers ran in
+        // no test, which is exactly where a byte-count desync hides.
+        let body = Bytes::from_static(&[
+            0x02, // resource_type_filter
+            0x00, 0x01, b'x', // resource_name_filter
+            0x03, // pattern_type_filter
+            0x00, 0x04, b'U', b's', b'e', b'r', // principal_filter
+            0x00, 0x01, b'*', // host_filter
+            0x03, // operation
+            0x03, // permission_type
+        ]);
+        assert!(validate_describe_acls_shape(1, &body).is_ok());
+    }
+
+    #[test]
+    fn describe_acls_v3_compact_strings_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // resource_type_filter
+            0x02, b'x', // compact name, len + 1
+            0x03, // pattern_type_filter
+            0x05, b'U', b's', b'e', b'r', // compact principal
+            0x02, b'*', // compact host
+            0x03, // operation
+            0x03, // permission_type
+            0x00, // tagged fields
+        ]);
+        assert!(validate_describe_acls_shape(3, &body).is_ok());
+    }
+
+    #[test]
+    fn describe_acls_declared_string_past_the_frame_rejected() {
+        let body = Bytes::from_static(&[0x02, 0x00, 0x40, b'x', b'y']);
+        assert!(validate_describe_acls_shape(1, &body).is_err());
+    }
+
+    #[test]
+    fn describe_acls_truncated_after_the_filter_rejected() {
+        // Every string null, then nothing where the two trailing enums belong.
+        let body = Bytes::from_static(&[0x02, 0xFF, 0xFF, 0x03, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_describe_acls_shape(1, &body).is_err());
+    }
 
     #[test]
     fn sasl_handshake_well_formed_mechanism_accepted() {
@@ -1099,6 +1206,36 @@ mod tests {
     fn metadata_v0_huge_topics_count_rejected() {
         let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
         assert!(validate_metadata_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Every sibling guard carries a rejection POC; without one, short-circuiting this guard to
+    /// `Ok(())` leaves the whole suite green, so nothing proved it rejected a hostile frame.
+    #[test]
+    fn init_producer_id_v5_huge_compact_string_rejected() {
+        // Compact string length varint far past the frame: nothing follows it to read.
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_init_producer_id_shape(5, &body).is_err());
+    }
+
+    #[test]
+    fn init_producer_id_v0_truncated_legacy_string_rejected() {
+        // Declares 32767 bytes of transactional id, supplies none.
+        let body = Bytes::from_static(&[0x7F, 0xFF]);
+        assert!(validate_init_producer_id_shape(0, &body).is_err());
+    }
+
+    #[test]
+    fn init_producer_id_v5_null_transactional_id_accepted() {
+        // Null compact string, transaction_timeout_ms, then the v3+ producer id/epoch pair
+        // (both -1, "no producer id"), then tagged fields.
+        let body = Bytes::from_static(&[
+            0x00, // transactional_id: null compact string
+            0x00, 0x00, 0x75, 0x30, // transaction_timeout_ms: 30000
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // producer_id: -1
+            0xFF, 0xFF, // producer_epoch: -1
+            0x00, // tagged fields
+        ]);
+        assert!(validate_init_producer_id_shape(5, &body).is_ok());
     }
 
     #[test]

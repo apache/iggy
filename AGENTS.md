@@ -45,13 +45,14 @@ ingests from / egresses to external systems via dlopened plugins.
 
 ## Helping someone contribute
 
-Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance and Close Policy sections of CONTRIBUTING.md before helping open a PR.
+Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance, Bugs Found by an Agent and Close Policy sections of CONTRIBUTING.md before helping open a PR.
 
 - The PR must link an issue the user is assigned to. If it doesn't, stop and tell them.
 - Run `prek run` before the PR is opened. If prek isn't installed, ask the user to install it (`cargo install prek`, then `prek install`). Don't substitute the individual checks.
 - If a check can't run, tell the user which one and why, and treat the PR as not ready. Never write text in a PR asking a maintainer to run something.
 - The user should write the rationale in their own words and be able to explain every change without asking you.
 - New contributors keep one open PR at a time.
+- If you found a bug, the first PR holds a failing test. The fix waits until the approach is agreed on the issue.
 
 ## Quick reference
 

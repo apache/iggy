@@ -15,24 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Server-owned segment recovery.
+//! Segment recovery: the boot-time reader for the segment files this crate's
+//! writers emit.
 //!
 //! Previously the bootstrap path borrowed `load_segments` from the legacy
 //! server implementation to hydrate persisted segments. That loader
 //! reads the legacy 16-byte dense per-message index through
 //! `server_common::IndexReader`, but the server persists a 24-byte sparse index
-//! (`partitions::IggyIndexWriter`: one entry per flush, absolute `offset`,
+//! ([`crate::IggyIndexWriter`]: one entry per flush, absolute `offset`,
 //! `timestamp`, and batch-start `position`). Reading the 24-byte file with the
 //! 16-byte parser mis-strides it (the "Index data must be exactly 16 bytes"
-//! recovery panic). This module is the server-owned loader, reading the same
-//! 24-byte format its writer emits.
+//! recovery panic). This module is that writer's matching loader, kept in the
+//! same crate and reading the same 24-byte format it emits.
 
-use crate::server_error::{PartitionRecoveryRefusal, ServerError};
-use configs::server::ServerConfig;
+use crate::iggy_index::IGGY_INDEX_SIZE;
+use crate::segment_anchor::ANCHOR_EXTENSION;
+use crate::state_transfer::STAGING_SUFFIX;
+use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
-use partitions::segment_anchor::ANCHOR_EXTENSION;
-use partitions::state_transfer::STAGING_SUFFIX;
-use partitions::{IggyIndex, IggyIndexReader, Segment};
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -44,14 +44,6 @@ use tracing::{error, info, warn};
 
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
-
-/// On-disk stride of one sparse index entry (`offset`, `timestamp`,
-/// `position`, each a little-endian u64). Mirrors `IGGY_INDEX_SIZE`, which is
-/// crate-private to `partitions` alongside the reader and writer that own the
-/// format: the reader's `entry_count` floors by it, and this module needs it
-/// to turn that count back into bytes, validate whole entries, and emit
-/// rebuilt ones.
-const SPARSE_INDEX_ENTRY_SIZE: usize = std::mem::size_of::<u64>() * 3;
 
 /// Window for the buffered walk, probe, and index scans. One allocation per
 /// partition load, refilled forward on demand; batches larger than this fall
@@ -137,6 +129,370 @@ const MAX_RECOVERABLE_BATCH_BYTES: u64 = MAX_MESSAGE_SIZE_UPPER_BYTES + COMMAND_
 /// the partition-level quarantine's bound.
 const FENCED_DIR_PROBE_LIMIT: u32 = 1000;
 
+/// Why a partition's recovered segments cannot be served.
+///
+/// Every shape here is structural -- the local files contradict themselves or
+/// each other -- but they are distinguished because they point at different
+/// causes, and not all of them are at-rest corruption: an empty non-tail
+/// segment is a failed rebuild's orphan pairing, a hole is a stray or
+/// half-unlinked file, interior damage is bit rot (or a resurrected tail
+/// appended over), and offsets that do not continue the chain can be minted
+/// into byte-clean files by an upstream crash window as well as by damage.
+///
+/// An index that contradicts itself is deliberately NOT here, and neither is
+/// one the log cannot back UNLESS the topic runs under `persisted durability` and the
+/// gap is deeper than the single in-flight entry: entries are derived from the
+/// log, so recovery drops such an index whole and rebuilds it from a byte-0
+/// walk of the log rather than believing any part of it. What `persisted durability`
+/// adds is evidence from serialized completed flushes: an entry above chunk N
+/// means the log fdatasync covering chunk N completed before the later flush
+/// began. This is independent of reply timing and turns a deeper gap into
+/// evidence about the LOG. Absent that evidence the index only locates data;
+/// recovery verifies the log from byte 0.
+#[derive(Debug)]
+pub enum PartitionRecoveryRefusal {
+    /// `recoverable_bytes` on the two chain-shape refusals is the sum of
+    /// walked, decodable bytes across the whole planned chain: the evidence
+    /// the single-replica boot arm needs to decide whether fencing and
+    /// rebuilding empty loses anything (0 means the chain provably held
+    /// nothing servable; anything else is data a rebuild would hide).
+    EmptyNonTailSegment {
+        empty_start: u64,
+        next_start: u64,
+        recoverable_bytes: u64,
+    },
+    Hole {
+        previous_start: u64,
+        previous_end: u64,
+        next_start: u64,
+        recoverable_bytes: u64,
+    },
+    /// A complete, checksum-verifying batch survives PAST bytes that do not
+    /// decode. A torn tail has nothing after it, so this is interior damage,
+    /// and truncating at it would silently discard the surviving batches.
+    InteriorDamage {
+        start_offset: u64,
+        damage_position: u64,
+        survivor_position: u64,
+    },
+    /// Bytes past the walked prefix that the damage probe could not
+    /// classify: it ran out of a work budget before proving or disproving a
+    /// survivor. The candidate budget is sized so a front-to-back scan of
+    /// every residue in the load always fits (its exhaustion means offsets
+    /// were re-examined -- a probe defect); the verification budget bounds
+    /// the bytes handed to checksum verifies, whose claimed slices overlap,
+    /// so residue packed with plausible headers can exhaust it from an
+    /// on-disk shape. The index anchor search charges the same verification
+    /// budget as it steps back through entries the log cannot back, so an
+    /// index packed with claims the log never proves ends here too instead
+    /// of paying a verify per entry. Truncation is only ever sound for a
+    /// proven torn tail, so giving up keeps the bytes. The residue width is
+    /// diagnostic only; it is not a gate.
+    UnverifiedResidue {
+        start_offset: u64,
+        damage_position: u64,
+        residue_bytes: u64,
+        candidates_examined: u64,
+        budget_units: u64,
+        verified_bytes: u64,
+        verify_budget_bytes: u64,
+    },
+    /// A batch whose checksum verifies does not continue the offset chain,
+    /// so offsets are not contiguous inside one segment file. The verify is
+    /// what earns the refusal: an UNVERIFIED mismatch is damage and goes to
+    /// the probe (a torn tail truncates). The cause is not necessarily
+    /// at-rest damage: a crash window that leaves the durable offset
+    /// frontier past the recovered end offset stamps the same shape into
+    /// byte-clean files.
+    OffsetDiscontinuity {
+        start_offset: u64,
+        expected_offset: u64,
+        found_offset: u64,
+        position: u64,
+    },
+    /// A batch whose checksum verifies carries another partition's own
+    /// `partition_id` stamp: a real record that landed in the wrong file (a
+    /// misdirected write, a recycled block, an operator copy), not damage.
+    /// Adopting it would seed this partition's offset space from foreign
+    /// data; truncating it would destroy the only evidence of the misdirect.
+    ForeignBatch {
+        start_offset: u64,
+        batch_partition_id: u64,
+        position: u64,
+    },
+    /// The sparse index of a topic running under `persisted durability` outruns its
+    /// log by more than the one entry a crash can legitimately strand there.
+    /// Persistence writes exactly one entry per flush chunk and chunks never
+    /// overlap. The WAL makes a body durable before acknowledging it and the
+    /// flush indexes it later, so every entry on disk names a chunk whose log
+    /// bytes completed their fdatasync. A completed
+    /// chunk can contain batches acknowledged before the flush threshold was
+    /// reached, while the in-flight chunk can do so too. Reply timing is not
+    /// the proof. Only the chunk in flight when the process died can have an
+    /// entry the log never backed. A deeper step-back therefore says the LOG
+    /// lost bytes it had already made durable, and rebuilding from what remains
+    /// could re-mint offsets, including offsets already returned to clients.
+    FsyncedLogLoss {
+        start_offset: u64,
+        entry_count: u64,
+        provable_entries: u64,
+        /// Position of the highest entry the log still proves; 0 when it
+        /// proves none, which `provable_entries` disambiguates.
+        provable_position: u64,
+        /// Entries the backward search actually probed, which its own cap
+        /// holds below `entry_count` on a long index: `provable_entries == 0`
+        /// then means nothing proved in the searched window, not that the log
+        /// backs nothing.
+        searched_entries: u64,
+    },
+    /// Under `persisted durability`, the byte-0 rebuild after a dropped index proved
+    /// the log only through `walked_position`, short of `durable_position`,
+    /// the byte the index's own last entry proves the log had already
+    /// fdatasynced through (the flush that wrote the entry began only after
+    /// the previous chunk's log sync completed). The step-back gate measures
+    /// loss at entry granularity; this catches the sub-chunk shape it cannot:
+    /// bytes a completed flush made durable are gone mid-chunk, so truncating
+    /// to the walked prefix would re-mint their offsets.
+    FsyncedRebuildShortfall {
+        start_offset: u64,
+        entry_count: u64,
+        walked_position: u64,
+        durable_position: u64,
+    },
+    PrepareWal {
+        directory: PathBuf,
+        source: std::io::Error,
+    },
+    CheckpointSizeMismatch {
+        start_offset: u64,
+        validated_bytes: u64,
+        expected_bytes: u64,
+    },
+    /// The physical file length differs from the required recovered boundary.
+    StorageSizeMismatch {
+        start_offset: u64,
+        on_disk_bytes: u64,
+        expected_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for PartitionRecoveryRefusal {
+    // One arm per refusal shape; length tracks the enum, not complexity.
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyNonTailSegment {
+                empty_start,
+                next_start,
+                recoverable_bytes,
+            } => write!(
+                f,
+                "segment {empty_start} is empty yet {next_start} follows it, so the \
+                 chain ({recoverable_bytes} recoverable bytes) cannot be served \
+                 past it"
+            ),
+            Self::Hole {
+                previous_start,
+                previous_end,
+                next_start,
+                recoverable_bytes,
+            } => write!(
+                f,
+                "segment {previous_start} ends at offset {previous_end} but the next \
+                 starts at {next_start}, leaving a hole in a chain holding \
+                 {recoverable_bytes} recoverable bytes"
+            ),
+            Self::InteriorDamage {
+                start_offset,
+                damage_position,
+                survivor_position,
+            } => write!(
+                f,
+                "segment {start_offset} holds undecodable bytes at {damage_position} \
+                 with a complete verifying batch after them at {survivor_position}; \
+                 not a torn tail, and truncating would discard durable batches"
+            ),
+            Self::UnverifiedResidue {
+                start_offset,
+                damage_position,
+                residue_bytes,
+                candidates_examined,
+                budget_units,
+                verified_bytes,
+                verify_budget_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} holds {residue_bytes} bytes past the walked \
+                 prefix at {damage_position} that the damage probe could not \
+                 classify before exhausting its work budgets ({candidates_examined} \
+                 candidate offsets examined of {budget_units} allowed; \
+                 {verified_bytes} bytes handed to verification of \
+                 {verify_budget_bytes} allowed); truncating unproven bytes could \
+                 destroy durable batches"
+            ),
+            Self::OffsetDiscontinuity {
+                start_offset,
+                expected_offset,
+                found_offset,
+                position,
+            } => write!(
+                f,
+                "segment {start_offset} holds a verified batch at byte {position} \
+                 whose base offset {found_offset} does not continue the chain at \
+                 {expected_offset}"
+            ),
+            Self::ForeignBatch {
+                start_offset,
+                batch_partition_id,
+                position,
+            } => write!(
+                f,
+                "segment {start_offset} holds a verified batch at byte {position} \
+                 stamped for partition {batch_partition_id}; a foreign record in \
+                 this log is preserved as evidence, not truncated"
+            ),
+            Self::FsyncedLogLoss {
+                start_offset,
+                entry_count,
+                provable_entries,
+                provable_position,
+                searched_entries,
+            } => write!(
+                f,
+                "segment {start_offset} runs under persisted durability with {entry_count} sparse \
+                 index entries, but its log backs only {provable_entries} of the \
+                 {searched_entries} searched from the top (up to byte {provable_position}); \
+                 every entry below the last describes a log chunk whose fdatasync had \
+                 completed, so the log has lost previously durable data rather than the \
+                 index having outrun it"
+            ),
+            Self::FsyncedRebuildShortfall {
+                start_offset,
+                entry_count,
+                walked_position,
+                durable_position,
+            } => write!(
+                f,
+                "segment {start_offset} runs under persisted durability with {entry_count} sparse \
+                 index entries, and the byte-0 rebuild proved its log only through byte \
+                 {walked_position}, short of byte {durable_position} which the last \
+                 entry's own fdatasync ordering proves the log had already made durable; \
+                 the log has lost previously durable bytes mid-chunk, so rebuilding \
+                 would re-mint their offsets"
+            ),
+            Self::PrepareWal { directory, source } => write!(
+                f,
+                "prepare WAL at {} cannot be recovered: {source}",
+                directory.display()
+            ),
+            Self::CheckpointSizeMismatch {
+                start_offset,
+                validated_bytes,
+                expected_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} validated prefix has {validated_bytes} bytes, \
+                 but the WAL checkpoint requires {expected_bytes}"
+            ),
+            Self::StorageSizeMismatch {
+                start_offset,
+                on_disk_bytes,
+                expected_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} file length {on_disk_bytes} diverged from \
+                 its required recovered size {expected_bytes}"
+            ),
+        }
+    }
+}
+
+/// Why a partition could not be brought back from its on-disk state.
+#[derive(Debug)]
+pub enum PartitionRecoveryError {
+    /// Per-partition, not fatal: the boot path fences this one group instead
+    /// of taking the node down for one damaged local chain. Only STRUCTURAL
+    /// refusals route here -- shapes where the local files contradict
+    /// themselves, so a retried boot cannot help. Transient recovery I/O
+    /// failures (stat, open, read, truncate, fsync) stay node-fatal on
+    /// purpose: a retried boot can still serve that partition, while fencing
+    /// it would quarantine healthy data.
+    ///
+    /// The Display text deliberately claims nothing about what happens to the
+    /// refused files: disposition (quarantine into `.fenced.N` vs tombstone
+    /// with files left in place) is decided by the caller's arms that catch
+    /// this error, and only they log it -- a claim here would render beside
+    /// theirs and contradict one branch or the other.
+    Refused {
+        dir: PathBuf,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        reason: PartitionRecoveryRefusal,
+    },
+    /// An existing offset directory could not be enumerated.
+    ConsumerOffsetsLoad {
+        consumer_kind: &'static str,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        path: String,
+        source: Box<IggyError>,
+    },
+    /// Transient I/O with no structural verdict attached. Boot fails on it
+    /// rather than fencing, so a retried boot can still serve the partition.
+    /// The reconciler logs it and retries the partition with backoff.
+    Iggy(IggyError),
+}
+
+impl std::fmt::Display for PartitionRecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused {
+                dir,
+                stream_id,
+                topic_id,
+                partition_id,
+                reason,
+            } => write!(
+                f,
+                "partition {stream_id}/{topic_id}/{partition_id} at {} refused storage \
+                 recovery: {reason}",
+                dir.display()
+            ),
+            Self::ConsumerOffsetsLoad {
+                consumer_kind,
+                stream_id,
+                topic_id,
+                partition_id,
+                path,
+                ..
+            } => write!(
+                f,
+                "failed to load persisted {consumer_kind} offsets for stream {stream_id}, \
+                 topic {topic_id}, partition {partition_id} from {path}"
+            ),
+            Self::Iggy(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for PartitionRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Refused { .. } => None,
+            Self::ConsumerOffsetsLoad { source, .. } => Some(source.as_ref()),
+            Self::Iggy(source) => std::error::Error::source(source),
+        }
+    }
+}
+
+impl From<IggyError> for PartitionRecoveryError {
+    fn from(source: IggyError) -> Self {
+        Self::Iggy(source)
+    }
+}
+
 /// A persisted segment recovered from disk: its metadata plus the storage
 /// handles (readers/writers) opened over its `.log` / `.index` files.
 pub struct RecoveredSegment {
@@ -167,7 +523,7 @@ pub struct RecoveredSegment {
 /// returned as-is and abort the boot so it can be retried. Structural
 /// contradictions -- a holed chain, damage with intact batches after it,
 /// residue the damage probe could not classify within its limits -- return
-/// [`ServerError::PartitionRecoveryRefused`] so the caller can fence this one
+/// [`PartitionRecoveryError::Refused`] so the caller can fence this one
 /// partition instead of taking the node down.
 ///
 /// `durable_segments` is the topic's own effective value, not a hint: it is what
@@ -179,12 +535,12 @@ pub struct RecoveredSegment {
 /// re-anchor writes beside the segment it plants, not inferred from how far the
 /// superblock's reservation happens to reach.
 pub async fn load_persisted_segments(
-    config: &ServerConfig,
+    config: &PartitionsConfig,
     namespace: IggyNamespace,
     segment_size: IggyByteSize,
     durable_segments: bool,
     stats: &PartitionStats,
-) -> Result<Vec<RecoveredSegment>, ServerError> {
+) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
     load_persisted_segments_with_checkpoint(
         config,
         namespace,
@@ -196,15 +552,29 @@ pub async fn load_persisted_segments(
     .await
 }
 
+/// [`load_persisted_segments`] bounded by the partition WAL's `checkpoint`.
+///
+/// The checkpointed segment's log is walked over exactly `checkpoint.length`
+/// bytes and never truncated, segments past it are left out, and every segment
+/// opens without a messages writer, because the WAL owns the bytes past the
+/// checkpoint.
+///
+/// # Errors
+///
+/// As [`load_persisted_segments`], plus [`PartitionRecoveryError::Refused`]
+/// with [`PartitionRecoveryRefusal::StorageSizeMismatch`] when the
+/// checkpointed file is shorter than the checkpoint, or with
+/// [`PartitionRecoveryRefusal::CheckpointSizeMismatch`] when the walk proves
+/// a different length.
 #[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments_with_checkpoint(
-    config: &ServerConfig,
+    config: &PartitionsConfig,
     namespace: IggyNamespace,
     segment_size: IggyByteSize,
     durable_segments: bool,
     stats: &PartitionStats,
     checkpoint: Option<journal::partition_journal::SegmentPosition>,
-) -> Result<Vec<RecoveredSegment>, ServerError> {
+) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -240,7 +610,7 @@ pub async fn load_persisted_segments_with_checkpoint(
     let mut planned = Vec::with_capacity(start_offsets.len());
     for start_offset in start_offsets {
         let messages_path =
-            config.get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
+            config.get_messages_path(stream_id, topic_id, partition_id, start_offset);
         let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
 
         let raw_messages_size = file_len(&messages_path)?;
@@ -484,8 +854,8 @@ struct PartitionIdentity<'load> {
 }
 
 impl PartitionIdentity<'_> {
-    fn refusal(&self, reason: PartitionRecoveryRefusal) -> ServerError {
-        ServerError::PartitionRecoveryRefused {
+    fn refusal(&self, reason: PartitionRecoveryRefusal) -> PartitionRecoveryError {
+        PartitionRecoveryError::Refused {
             dir: PathBuf::from(self.partition_path),
             stream_id: self.stream_id,
             topic_id: self.topic_id,
@@ -634,7 +1004,7 @@ struct ScanScratch {
 async fn ensure_contiguous_chain(
     identity: PartitionIdentity<'_>,
     planned: &[PlannedSegment],
-) -> Result<(), ServerError> {
+) -> Result<(), PartitionRecoveryError> {
     // Walked, decodable bytes across the whole chain: the refusals carry it
     // so the single-replica boot arm can tell a shape with nothing servable
     // at stake (fence and rebuild empty) from one guarding real data
@@ -677,18 +1047,17 @@ async fn ensure_contiguous_chain(
         // opens no file at all, and the ones that do are already walking this
         // pair. An unreadable anchor is unknown, not absent, and treating it as
         // absent would refuse a healthy chain for as long as the fault lasts.
-        let read =
-            partitions::segment_anchor::read_anchor(identity.partition_path, next.start_offset)
-                .await
-                .map_err(|error| {
-                    error!(
-                        partition_path = identity.partition_path,
-                        start_offset = next.start_offset,
-                        %error,
-                        "failed to read a segment anchor during recovery"
-                    );
-                    ServerError::from(IggyError::CannotReadFile)
-                })?;
+        let read = crate::segment_anchor::read_anchor(identity.partition_path, next.start_offset)
+            .await
+            .map_err(|error| {
+                error!(
+                    partition_path = identity.partition_path,
+                    start_offset = next.start_offset,
+                    %error,
+                    "failed to read a segment anchor during recovery"
+                );
+                PartitionRecoveryError::from(IggyError::CannotReadFile)
+            })?;
         let anchored = previous.end_offset < next.start_offset
             && read.is_some_and(|anchor| {
                 anchor.covers(
@@ -739,7 +1108,9 @@ async fn ensure_contiguous_chain(
 /// Sweeps boot-time scratch (`.staging` spill, orphan `.index`) and returns the
 /// start offset parsed out of every remaining zero-padded `.log` file name. A
 /// missing directory means a never-persisted partition.
-fn sweep_scratch_files_and_collect_offsets(partition_path: &str) -> Result<Vec<u64>, ServerError> {
+fn sweep_scratch_files_and_collect_offsets(
+    partition_path: &str,
+) -> Result<Vec<u64>, PartitionRecoveryError> {
     let entries = match fs::read_dir(partition_path) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -809,7 +1180,7 @@ fn sweep_scratch_files_and_collect_offsets(partition_path: &str) -> Result<Vec<u
 /// `EIO` into 0 would route a healthy segment into recover-as-empty, fencing
 /// it out of service (worst route: an index stat error floors a healthy
 /// sealed index to a 0-byte target while its entries still load).
-fn file_len(path: &str) -> Result<u64, ServerError> {
+fn file_len(path: &str) -> Result<u64, PartitionRecoveryError> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(0),
@@ -844,7 +1215,7 @@ fn file_len(path: &str) -> Result<u64, ServerError> {
 /// fsync bounds the crash window: a power cut right after `set_len` may
 /// re-present the torn tail on the next boot, which only walks and truncates
 /// again (idempotent), but the sync keeps the common case deterministic.
-fn truncate_to(path: &str, target_size: u64) -> Result<(), ServerError> {
+fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryError> {
     let current_size = file_len(path)?;
     if current_size == target_size {
         return Ok(());
@@ -879,7 +1250,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), ServerError> {
                 error = %source,
                 "failed to open a segment file for truncation during recovery"
             );
-            ServerError::from(IggyError::CannotWriteToFile)
+            PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })?;
     file.set_len(target_size).map_err(|source| {
         error!(
@@ -888,7 +1259,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), ServerError> {
             error = %source,
             "failed to truncate a segment file to its recovered bounds"
         );
-        ServerError::from(IggyError::CannotWriteToFile)
+        PartitionRecoveryError::from(IggyError::CannotWriteToFile)
     })?;
     file.sync_all().map_err(|source| {
         error!(
@@ -896,7 +1267,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), ServerError> {
             error = %source,
             "failed to fsync a segment file after truncation"
         );
-        ServerError::from(IggyError::CannotSyncFile)
+        PartitionRecoveryError::from(IggyError::CannotSyncFile)
     })?;
     Ok(())
 }
@@ -913,7 +1284,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), ServerError> {
 /// The staging file is pure scratch until pass C renames it into place: the
 /// boot sweep unlinks orphaned `*.staging` files, so a crash anywhere before
 /// the rename costs nothing.
-fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, ServerError> {
+fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, PartitionRecoveryError> {
     let staging_path = format!("{index_path}{STAGING_SUFFIX}");
     let file = fs::OpenOptions::new()
         .write(true)
@@ -926,7 +1297,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Serve
                 error = %source,
                 "failed to open a sparse index staging file during recovery"
             );
-            ServerError::from(IggyError::CannotWriteToFile)
+            PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })?;
     file.write_all_at(entries, 0).map_err(|source| {
         error!(
@@ -934,7 +1305,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Serve
             error = %source,
             "failed to write a rebuilt sparse index during recovery"
         );
-        ServerError::from(IggyError::CannotWriteToFile)
+        PartitionRecoveryError::from(IggyError::CannotWriteToFile)
     })?;
     file.sync_all().map_err(|source| {
         error!(
@@ -942,7 +1313,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Serve
             error = %source,
             "failed to fsync a rebuilt sparse index after recovery"
         );
-        ServerError::from(IggyError::CannotSyncFile)
+        PartitionRecoveryError::from(IggyError::CannotSyncFile)
     })?;
     Ok(staging_path)
 }
@@ -955,7 +1326,7 @@ fn install_rebuilt_index(
     staging_path: &str,
     index_path: &str,
     partition_path: &str,
-) -> Result<(), ServerError> {
+) -> Result<(), PartitionRecoveryError> {
     fs::rename(staging_path, index_path).map_err(|source| {
         error!(
             from = %staging_path,
@@ -963,14 +1334,14 @@ fn install_rebuilt_index(
             error = %source,
             "failed to rename a rebuilt sparse index into place during recovery"
         );
-        ServerError::from(IggyError::CannotWriteToFile)
+        PartitionRecoveryError::from(IggyError::CannotWriteToFile)
     })?;
     fsync_dir(partition_path)
 }
 
 /// Makes renames and new files in `dir` durable. Synchronous like every
 /// other mutation in this module (see [`FileScanner`]).
-fn fsync_dir(dir: &str) -> Result<(), ServerError> {
+fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::open(dir)
         .and_then(|handle| handle.sync_all())
         .map_err(|source| {
@@ -979,7 +1350,7 @@ fn fsync_dir(dir: &str) -> Result<(), ServerError> {
                 error = %source,
                 "failed to fsync a directory during recovery"
             );
-            ServerError::from(IggyError::CannotSyncFile)
+            PartitionRecoveryError::from(IggyError::CannotSyncFile)
         })
 }
 
@@ -999,7 +1370,7 @@ fn fence_unrecoverable_segment_files(
     messages_path: &str,
     index_path: &str,
     start_offset: u64,
-) -> Result<(), ServerError> {
+) -> Result<(), PartitionRecoveryError> {
     let log_bytes = file_len(messages_path)?;
     let index_bytes = file_len(index_path)?;
     if log_bytes == 0 && index_bytes == 0 {
@@ -1068,7 +1439,7 @@ fn fence_unrecoverable_segment_files(
 
 /// Destination of one fenced file: the fence directory plus the file's own
 /// name, so the fenced copy stays greppable by its segment stem.
-fn fenced_target(fenced_dir: &str, source_path: &str) -> Result<PathBuf, ServerError> {
+fn fenced_target(fenced_dir: &str, source_path: &str) -> Result<PathBuf, PartitionRecoveryError> {
     Path::new(source_path).file_name().map_or_else(
         || {
             error!(
@@ -1081,7 +1452,7 @@ fn fenced_target(fenced_dir: &str, source_path: &str) -> Result<PathBuf, ServerE
     )
 }
 
-fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), ServerError> {
+fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRecoveryError> {
     match fs::rename(source_path, target) {
         Ok(()) => Ok(()),
         // A missing index beside a present log has nothing to move.
@@ -1098,7 +1469,7 @@ fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), ServerError
     }
 }
 
-fn seed_empty_file(path: &str) -> Result<(), ServerError> {
+fn seed_empty_file(path: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::create(path)
         .and_then(|file| file.sync_all())
         .map_err(|source| {
@@ -1107,7 +1478,7 @@ fn seed_empty_file(path: &str) -> Result<(), ServerError> {
                 error = %source,
                 "failed to seed a fresh empty segment file after fencing"
             );
-            ServerError::from(IggyError::CannotWriteToFile)
+            PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })
 }
 
@@ -1119,14 +1490,14 @@ fn seed_empty_file(path: &str) -> Result<(), ServerError> {
 /// failed open between the two leaves precisely that pair, as does any
 /// operator restore that drops an index. The reader's open is bare
 /// `read(true)` and folds ENOENT into `CannotReadFile`, which propagates as a
-/// plain `ServerError::Iggy` -- not a `PartitionRecoveryRefused` the caller
+/// plain `PartitionRecoveryError::Iggy` -- not a `Refused` the caller
 /// can fence -- so it would abort the whole boot for a segment the walk
 /// rebuilds. Stat through the `NotFound`-lenient [`file_len`] first; every
 /// other stat failure still fails stop there.
 async fn load_index_anchors(
     identity: PartitionIdentity<'_>,
     index_path: &str,
-) -> Result<(u64, Option<IggyIndex>, Option<IggyIndex>), ServerError> {
+) -> Result<(u64, Option<IggyIndex>, Option<IggyIndex>), PartitionRecoveryError> {
     if file_len(index_path)? == 0 {
         return Ok((0, None, None));
     }
@@ -1206,7 +1577,7 @@ async fn recover_segment_bounds(
     messages_size: u64,
     durable_segments: bool,
     scratch: &mut ScanScratch,
-) -> Result<Option<WalkedBounds>, ServerError> {
+) -> Result<Option<WalkedBounds>, PartitionRecoveryError> {
     let (entry_count, first, last) = load_index_anchors(identity, index_path).await?;
 
     match (first, last) {
@@ -1382,7 +1753,7 @@ async fn recover_segment_bounds(
                         end_timestamp: full_walk.end_timestamp,
                         end_offset: full_walk.end_offset,
                         messages_size: full_walk.position,
-                        index_size: entry_count * SPARSE_INDEX_ENTRY_SIZE as u64,
+                        index_size: entry_count * IGGY_INDEX_SIZE as u64,
                         rebuilt_index: None,
                     }));
                 }
@@ -1416,7 +1787,7 @@ async fn recover_segment_bounds(
                 end_timestamp: walk.end_timestamp,
                 end_offset: walk.end_offset,
                 messages_size: walk.position,
-                index_size: entry_count * SPARSE_INDEX_ENTRY_SIZE as u64,
+                index_size: entry_count * IGGY_INDEX_SIZE as u64,
                 rebuilt_index: None,
             }))
         }
@@ -1458,7 +1829,7 @@ fn ensure_fsynced_rebuild_reaches(
     start_offset: u64,
     entry_count: u64,
     durable_position: u64,
-) -> Result<(), ServerError> {
+) -> Result<(), PartitionRecoveryError> {
     let walked_position = rebuilt.map_or(0, |bounds| bounds.messages_size);
     if walked_position < durable_position {
         return Err(
@@ -1488,7 +1859,7 @@ async fn recover_by_walking_log(
     messages_path: &str,
     start_offset: u64,
     messages_size: u64,
-) -> Result<Option<WalkedBounds>, ServerError> {
+) -> Result<Option<WalkedBounds>, PartitionRecoveryError> {
     let mut position = 0u64;
     let mut start_timestamp = None;
     let mut end_offset = start_offset;
@@ -1585,7 +1956,7 @@ async fn recover_by_walking_log(
         start_offset,
         messages_size,
         walked_size = position,
-        rebuilt_entries = rebuilt_index.len() / SPARSE_INDEX_ENTRY_SIZE,
+        rebuilt_entries = rebuilt_index.len() / IGGY_INDEX_SIZE,
         "recovered segment bounds by walking the log and rebuilding its \
          index from the walked batches"
     );
@@ -1621,7 +1992,7 @@ async fn walk_chain_from_anchor(
     start_offset: u64,
     messages_size: u64,
     anchor: IggyIndex,
-) -> Result<AnchoredWalk, ServerError> {
+) -> Result<AnchoredWalk, PartitionRecoveryError> {
     let mut position = anchor.position;
     let mut start_timestamp = None;
     let mut end_offset = anchor.offset;
@@ -1778,7 +2149,7 @@ impl<'scan> IndexLogScanner<'scan> {
         offset: u64,
         timestamp: u64,
         position: u64,
-    ) -> Result<bool, ServerError> {
+    ) -> Result<bool, PartitionRecoveryError> {
         let Some(header_end) = position.checked_add(COMMAND_HEADER_SIZE as u64) else {
             return Ok(false);
         };
@@ -1802,7 +2173,7 @@ impl<'scan> IndexLogScanner<'scan> {
                         error = %source,
                         "failed to read a segment log header for sparse index validation"
                     );
-                    ServerError::from(IggyError::CannotReadFile)
+                    PartitionRecoveryError::from(IggyError::CannotReadFile)
                 })?;
             self.window_start = position;
         }
@@ -1862,7 +2233,7 @@ async fn find_provable_index_anchor(
     start_offset: u64,
     entry_count: u64,
     messages_size: u64,
-) -> Result<IndexAnchorSearch, ServerError> {
+) -> Result<IndexAnchorSearch, PartitionRecoveryError> {
     // The last entry is the one that just failed to prove out.
     let Some(mut entry_index) = entry_count.checked_sub(2) else {
         return Ok(IndexAnchorSearch {
@@ -1880,15 +2251,15 @@ async fn find_provable_index_anchor(
             error = %source,
             "failed to open sparse index for anchor search during recovery"
         );
-        ServerError::from(IggyError::CannotReadFile)
+        PartitionRecoveryError::from(IggyError::CannotReadFile)
     })?;
-    let mut raw = [0u8; SPARSE_INDEX_ENTRY_SIZE];
+    let mut raw = [0u8; IGGY_INDEX_SIZE];
     // Lowest log byte a probed entry has already paid for; the next probed
     // entry is budgeted by the span from its own position up to here.
     let mut budgeted_down_to = messages_size;
     let mut searched_entries = 0u64;
     loop {
-        file.read_exact_at(&mut raw, entry_index * SPARSE_INDEX_ENTRY_SIZE as u64)
+        file.read_exact_at(&mut raw, entry_index * IGGY_INDEX_SIZE as u64)
             .map_err(|source| {
                 error!(
                     stream_id = identity.stream_id,
@@ -1898,7 +2269,7 @@ async fn find_provable_index_anchor(
                     error = %source,
                     "failed to read a sparse index entry for anchor search during recovery"
                 );
-                ServerError::from(IggyError::CannotReadFile)
+                PartitionRecoveryError::from(IggyError::CannotReadFile)
             })?;
         let entry = IggyIndex::new(
             read_u64_le(&raw, 0),
@@ -1995,7 +2366,7 @@ async fn index_is_consistent(
     entry_count: u64,
     messages_size: u64,
     scratch: &mut ScanScratch,
-) -> Result<IndexValidation, ServerError> {
+) -> Result<IndexValidation, PartitionRecoveryError> {
     let index_file = fs::File::open(index_path).map_err(|source| {
         error!(
             stream_id = identity.stream_id,
@@ -2005,7 +2376,7 @@ async fn index_is_consistent(
             error = %source,
             "failed to open sparse index for validation during recovery"
         );
-        ServerError::from(IggyError::CannotReadFile)
+        PartitionRecoveryError::from(IggyError::CannotReadFile)
     })?;
     let messages_file = fs::File::open(messages_path).map_err(|source| {
         error!(
@@ -2016,7 +2387,7 @@ async fn index_is_consistent(
             error = %source,
             "failed to open segment log for sparse index validation"
         );
-        ServerError::from(IggyError::CannotReadFile)
+        PartitionRecoveryError::from(IggyError::CannotReadFile)
     })?;
     let ScanScratch {
         window: index_window,
@@ -2030,7 +2401,7 @@ async fn index_is_consistent(
         messages_size,
         log_window,
     );
-    let per_chunk_entries = SCAN_WINDOW_CAPACITY / SPARSE_INDEX_ENTRY_SIZE;
+    let per_chunk_entries = SCAN_WINDOW_CAPACITY / IGGY_INDEX_SIZE;
     let mut previous: Option<(u64, u64)> = None;
     let mut mappings_match = true;
     let mut entry_index = 0u64;
@@ -2039,7 +2410,7 @@ async fn index_is_consistent(
         let chunk_entries = (entry_count - entry_index).min(per_chunk_entries as u64);
         // Bounded by the window capacity, so the try_from cannot fail.
         let chunk_bytes =
-            usize::try_from(chunk_entries).unwrap_or(per_chunk_entries) * SPARSE_INDEX_ENTRY_SIZE;
+            usize::try_from(chunk_entries).unwrap_or(per_chunk_entries) * IGGY_INDEX_SIZE;
         index_window.resize(chunk_bytes, 0);
         index_file
             .read_exact_at(&mut index_window[..], byte_position)
@@ -2052,9 +2423,9 @@ async fn index_is_consistent(
                     error = %source,
                     "failed to read sparse index entries for validation during recovery"
                 );
-                ServerError::from(IggyError::CannotReadFile)
+                PartitionRecoveryError::from(IggyError::CannotReadFile)
             })?;
-        for entry in index_window.as_chunks::<SPARSE_INDEX_ENTRY_SIZE>().0 {
+        for entry in index_window.as_chunks::<IGGY_INDEX_SIZE>().0 {
             let entry_offset = read_u64_le(entry, 0);
             let entry_timestamp = read_u64_le(entry, 8);
             let entry_position = read_u64_le(entry, 16);
@@ -2131,7 +2502,7 @@ async fn index_is_consistent(
 fn open_messages_file(
     identity: PartitionIdentity<'_>,
     messages_path: &str,
-) -> Result<fs::File, ServerError> {
+) -> Result<fs::File, PartitionRecoveryError> {
     fs::File::open(messages_path).map_err(|source| {
         error!(
             stream_id = identity.stream_id,
@@ -2141,7 +2512,7 @@ fn open_messages_file(
             error = %source,
             "failed to open a segment messages file during recovery"
         );
-        ServerError::from(IggyError::CannotReadFile)
+        PartitionRecoveryError::from(IggyError::CannotReadFile)
     })
 }
 
@@ -2152,7 +2523,7 @@ fn header_at(
     scanner: &mut FileScanner<'_>,
     messages_path: &str,
     position: u64,
-) -> Result<Option<BatchHeader>, ServerError> {
+) -> Result<Option<BatchHeader>, PartitionRecoveryError> {
     scanner
         .peek_header(position)
         .map_err(|source| scan_read_failure(identity, messages_path, &source))
@@ -2167,7 +2538,7 @@ fn batch_verifies(
     messages_path: &str,
     position: u64,
     total_size: usize,
-) -> Result<bool, ServerError> {
+) -> Result<bool, PartitionRecoveryError> {
     Ok(scanner
         .slice_at(position, total_size)
         .map_err(|source| scan_read_failure(identity, messages_path, &source))?
@@ -2181,7 +2552,7 @@ fn scan_read_failure(
     identity: PartitionIdentity<'_>,
     path: &str,
     source: &io::Error,
-) -> ServerError {
+) -> PartitionRecoveryError {
     error!(
         stream_id = identity.stream_id,
         topic_id = identity.topic_id,
@@ -2190,7 +2561,7 @@ fn scan_read_failure(
         error = %source,
         "failed to read a segment file during the recovery walk"
     );
-    ServerError::from(IggyError::CannotReadFile)
+    PartitionRecoveryError::from(IggyError::CannotReadFile)
 }
 
 /// Classifies bytes left past the walked prefix, porting the WAL repair's
@@ -2227,7 +2598,7 @@ async fn refuse_if_survivor_past_damage(
     messages_size: u64,
     chain_end_offset: Option<u64>,
     start_offset: u64,
-) -> Result<(), ServerError> {
+) -> Result<(), PartitionRecoveryError> {
     if damage_position >= messages_size {
         // The walk consumed the whole file: nothing to classify.
         return Ok(());
@@ -2266,7 +2637,7 @@ fn unverified_residue(
     start_offset: u64,
     damage_position: u64,
     messages_size: u64,
-) -> ServerError {
+) -> PartitionRecoveryError {
     identity.refusal(PartitionRecoveryRefusal::UnverifiedResidue {
         start_offset,
         damage_position,
@@ -2547,9 +2918,9 @@ fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PartitionPathLayout;
+    use crate::segment_anchor::SegmentAnchor;
     use bytes::Bytes;
-    use configs::server::ServerConfig;
-    use partitions::segment_anchor::SegmentAnchor;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, calculate_batch_checksum,
     };
@@ -2566,14 +2937,24 @@ mod tests {
     // region, so no prefix of it decodes as a batch.
     const GARBAGE: [u8; 384] = [0xAB; 384];
 
-    fn test_config(tmp: &TempDir) -> ServerConfig {
-        ServerConfig {
-            path: tmp.path().to_string_lossy().into_owned(),
-            ..ServerConfig::default()
+    /// Same relative shape as the default server config, rooted at the tempdir.
+    fn test_config(tmp: &TempDir) -> PartitionsConfig {
+        PartitionsConfig {
+            messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: IggyByteSize::from(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            validate_checksum: true,
+            segment_size: IggyByteSize::from(SEGMENT_MAX_SIZE),
+            preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            encryptor: None,
+            path_layout: PartitionPathLayout {
+                streams_root: tmp.path().join("streams").to_string_lossy().into_owned(),
+            },
         }
     }
 
-    fn prepare_partition_dir(config: &ServerConfig) -> String {
+    fn prepare_partition_dir(config: &PartitionsConfig) -> String {
         let partition_path = config.get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID);
         fs::create_dir_all(&partition_path).expect("create partition dir");
         partition_path
@@ -2682,13 +3063,13 @@ mod tests {
     /// Writes a segment's `.log` and `.index` fixtures and returns their
     /// paths as `(messages_path, index_path)`.
     fn write_segment(
-        config: &ServerConfig,
+        config: &PartitionsConfig,
         start_offset: u64,
         log: &[u8],
         index: &[u8],
     ) -> (String, String) {
         let messages_path =
-            config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
+            config.get_messages_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
         let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, start_offset);
         fs::write(&messages_path, log).expect("write log fixture");
         fs::write(&index_path, index).expect("write index fixture");
@@ -2696,8 +3077,8 @@ mod tests {
     }
 
     /// Path of the anchor beside the segment planted at `start_offset`.
-    fn anchor_fixture_path(config: &ServerConfig, start_offset: u64) -> String {
-        partitions::segment_anchor::anchor_path(
+    fn anchor_fixture_path(config: &PartitionsConfig, start_offset: u64) -> String {
+        crate::segment_anchor::anchor_path(
             &config.get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID),
             start_offset,
         )
@@ -2706,7 +3087,7 @@ mod tests {
     /// Write the anchor a plant at `planted_start` leaves behind, naming the tail
     /// it sealed.
     fn write_anchor_fixture(
-        config: &ServerConfig,
+        config: &PartitionsConfig,
         planted_start: u64,
         sealed_start: u64,
         sealed_end: u64,
@@ -2724,7 +3105,7 @@ mod tests {
     }
 
     /// Recover expecting a refusal, with `context` naming what should have failed.
-    async fn refusal(config: &ServerConfig, context: &str) -> ServerError {
+    async fn refusal(config: &PartitionsConfig, context: &str) -> PartitionRecoveryError {
         match recover(config).await {
             Ok(recovered) => panic!("{context}, got {} segments", recovered.len()),
             Err(error) => error,
@@ -2749,21 +3130,23 @@ mod tests {
         fs::read(Path::new(&fenced_dir).join(name)).expect("read fenced fixture file")
     }
 
-    async fn recover(config: &ServerConfig) -> Result<Vec<RecoveredSegment>, ServerError> {
+    async fn recover(
+        config: &PartitionsConfig,
+    ) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
         recover_with(config, false).await
     }
 
     async fn recover_under_fsync(
-        config: &ServerConfig,
+        config: &PartitionsConfig,
         durable_segments: bool,
-    ) -> Result<Vec<RecoveredSegment>, ServerError> {
+    ) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
         recover_with(config, durable_segments).await
     }
 
     async fn recover_with(
-        config: &ServerConfig,
+        config: &PartitionsConfig,
         durable_segments: bool,
-    ) -> Result<Vec<RecoveredSegment>, ServerError> {
+    ) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
         load_persisted_segments(
             config,
             IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
@@ -2796,7 +3179,7 @@ mod tests {
             valid_len,
             "torn tail bytes must be gone from disk"
         );
-        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
     }
 
     #[compio::test]
@@ -2815,7 +3198,7 @@ mod tests {
         assert_eq!(recovered[0].segment.end_offset, 1);
         assert_eq!(
             len_of(&index_path),
-            SPARSE_INDEX_ENTRY_SIZE as u64,
+            IGGY_INDEX_SIZE as u64,
             "partial index entry must be gone from disk"
         );
         assert_eq!(len_of(&messages_path), log.len() as u64);
@@ -2882,7 +3265,7 @@ mod tests {
         prepare_partition_dir(&config);
         let mut log = encoded_batch(0, 1);
         log.extend_from_slice(&GARBAGE);
-        let messages_path = config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let messages_path = config.get_messages_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         fs::write(&messages_path, &log).expect("write log fixture");
         // Self-referential symlink: every open or stat that follows it fails
@@ -2900,7 +3283,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::Iggy(inner) if matches!(**inner, IggyError::CannotReadFileMetadata)
+                PartitionRecoveryError::Iggy(IggyError::CannotReadFileMetadata)
             ),
             "expected CannotReadFileMetadata, got {error:?}"
         );
@@ -2916,7 +3299,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        let messages_path = config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let messages_path = config.get_messages_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         fs::write(&index_path, &GARBAGE[..10]).expect("write torn index fixture");
         // See the index variant above; the log stem is still collected by the
@@ -2932,7 +3315,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::Iggy(inner) if matches!(**inner, IggyError::CannotReadFileMetadata)
+                PartitionRecoveryError::Iggy(IggyError::CannotReadFileMetadata)
             ),
             "expected CannotReadFileMetadata, got {error:?}"
         );
@@ -2965,7 +3348,7 @@ mod tests {
         assert_eq!(segment.end_offset, 3);
         assert!(!segment.sealed, "the tail segment must accept writes");
         assert_eq!(len_of(&messages_path), log.len() as u64);
-        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
     }
 
     #[compio::test]
@@ -3018,7 +3401,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage { .. },
                     ..
                 }
@@ -3054,7 +3437,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage { .. },
                     ..
                 }
@@ -3082,7 +3465,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
                         expected_offset: 2,
                         found_offset: 5,
@@ -3162,7 +3545,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -3204,7 +3587,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -3248,7 +3631,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -3274,7 +3657,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -3306,7 +3689,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -3359,7 +3742,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole {
                         previous_start: 10,
                         previous_end: 11,
@@ -3409,7 +3792,7 @@ mod tests {
                 assert!(
                     matches!(
                         result,
-                        Err(ServerError::PartitionRecoveryRefused {
+                        Err(PartitionRecoveryError::Refused {
                             reason: PartitionRecoveryRefusal::FsyncedLogLoss { .. },
                             ..
                         })
@@ -3471,7 +3854,7 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(ServerError::PartitionRecoveryRefused {
+            Err(PartitionRecoveryError::Refused {
                 reason: PartitionRecoveryRefusal::Hole { .. },
                 ..
             })
@@ -3499,7 +3882,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -3736,9 +4119,9 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].segment.end_offset, 1);
         let rebuilt = bytes_of(&index_path);
-        assert_eq!(rebuilt.len(), 2 * SPARSE_INDEX_ENTRY_SIZE);
+        assert_eq!(rebuilt.len(), 2 * IGGY_INDEX_SIZE);
         let entry = |index: usize| {
-            let at = index * SPARSE_INDEX_ENTRY_SIZE;
+            let at = index * IGGY_INDEX_SIZE;
             (
                 read_u64_le(&rebuilt, at),
                 read_u64_le(&rebuilt, at + 8),
@@ -3779,7 +4162,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue { .. },
                     ..
                 }
@@ -3820,7 +4203,7 @@ mod tests {
             valid_len,
             "the zero-filled residue must be gone from disk"
         );
-        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
     }
 
     #[compio::test]
@@ -3850,7 +4233,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue {
                         residue_bytes,
                         verified_bytes,
@@ -3896,7 +4279,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue { .. },
                     ..
                 }
@@ -3987,7 +4370,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue {
                         damage_position,
                         residue_bytes,
@@ -4045,7 +4428,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue { .. },
                     ..
                 }
@@ -4076,7 +4459,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
                         expected_offset: 101,
                         found_offset: 5,
@@ -4112,7 +4495,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
                         expected_offset: 2,
                         found_offset: 5,
@@ -4158,7 +4541,7 @@ mod tests {
             valid_len,
             "the unverified gap batch must be gone from disk"
         );
-        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
     }
 
     #[compio::test]
@@ -4188,7 +4571,7 @@ mod tests {
             valid_len,
             "the unverified regressing batch must be gone from disk"
         );
-        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
     }
 
     #[compio::test]
@@ -4215,7 +4598,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage { .. },
                     ..
                 }
@@ -4251,7 +4634,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage { .. },
                     ..
                 }
@@ -4380,7 +4763,7 @@ mod tests {
         assert_eq!(reopened[0].segment.end_offset, 1);
         assert_eq!(
             (len_of(&messages_path), len_of(&index_path)),
-            (torn_position, SPARSE_INDEX_ENTRY_SIZE as u64),
+            (torn_position, IGGY_INDEX_SIZE as u64),
             "a second recovery must not move the files"
         );
     }
@@ -4413,7 +4796,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage { .. },
                     ..
                 }
@@ -4465,7 +4848,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage {
                         damage_position: at,
                         survivor_position: past,
@@ -4488,7 +4871,7 @@ mod tests {
         prepare_partition_dir(&config);
         let (log, mut index, damage_position, survivor_position) =
             segment_damaged_below_its_last_provable_entry();
-        index.truncate(index.len() - SPARSE_INDEX_ENTRY_SIZE);
+        index.truncate(index.len() - IGGY_INDEX_SIZE);
         let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
 
         let error = recover(&config)
@@ -4499,7 +4882,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage {
                         damage_position: at,
                         survivor_position: past,
@@ -4535,7 +4918,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage {
                         damage_position: at,
                         ..
@@ -4575,7 +4958,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
                         expected_offset: 1,
                         found_offset: 5,
@@ -4781,7 +5164,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::FsyncedLogLoss {
                         entry_count: 4,
                         provable_entries: 2,
@@ -4862,7 +5245,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::FsyncedRebuildShortfall {
                         walked_position,
                         durable_position,
@@ -4903,7 +5286,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
                         expected_offset: 0,
                         found_offset: 5,
@@ -4965,7 +5348,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::FsyncedLogLoss {
                         entry_count: 2,
                         provable_entries: 0,
@@ -5008,7 +5391,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::FsyncedLogLoss {
                         entry_count,
                         provable_entries: 0,
@@ -5100,7 +5483,7 @@ mod tests {
         assert_eq!(reopened[0].segment.end_offset, 1);
         assert_eq!(
             (len_of(&messages_path), len_of(&index_path)),
-            (torn_position, SPARSE_INDEX_ENTRY_SIZE as u64),
+            (torn_position, IGGY_INDEX_SIZE as u64),
             "a second recovery must not move the files"
         );
     }
@@ -5143,7 +5526,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue {
                         verified_bytes,
                         verify_budget_bytes,
@@ -5188,7 +5571,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::ForeignBatch {
                         batch_partition_id: 7,
                         ..
@@ -5219,7 +5602,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::ForeignBatch {
                         batch_partition_id: 7,
                         ..
@@ -5277,7 +5660,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::InteriorDamage {
                         damage_position,
                         survivor_position,
@@ -5313,7 +5696,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ServerError::PartitionRecoveryRefused {
+                PartitionRecoveryError::Refused {
                     reason: PartitionRecoveryRefusal::Hole { .. },
                     ..
                 }
@@ -5352,7 +5735,7 @@ mod tests {
             "an orphaned staging file must be swept at boot"
         );
         assert_eq!(len_of(&messages_path), log.len() as u64);
-        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
     }
     #[compio::test]
     async fn given_absent_index_when_recovering_should_walk_index_less_and_rebuild() {
@@ -5360,7 +5743,7 @@ mod tests {
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
         let log = encoded_batch(0, 4);
-        let messages_path = config.get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let messages_path = config.get_messages_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         let index_path = config.get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
         fs::write(&messages_path, &log).expect("write log fixture");
 
@@ -5373,7 +5756,7 @@ mod tests {
         assert_eq!(len_of(&messages_path), log.len() as u64);
         assert_eq!(
             len_of(&index_path),
-            SPARSE_INDEX_ENTRY_SIZE as u64,
+            IGGY_INDEX_SIZE as u64,
             "the walk must install a rebuilt index over the missing one"
         );
     }

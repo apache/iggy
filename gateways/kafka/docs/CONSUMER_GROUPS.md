@@ -129,4 +129,5 @@ default Java consumer) for an eviction. That is exactly what Kafka does for a *c
 so it is a degraded shutdown rather than a wedge.
 
 `ConsumerGroupHeartbeat` (68), the KIP-848 protocol, is not implemented and a client cannot fall
-back from it. A Kafka 4.0 client may need `group.protocol=classic` to reach these keys at all.
+back from it. It is opt-in: a Kafka 4.0 client still defaults to `group.protocol=classic`, which reaches
+these keys.

@@ -175,6 +175,7 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
         false,
+        0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     );
     (state, seed_bridge)
