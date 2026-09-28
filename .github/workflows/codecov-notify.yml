@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Codecov notify
+
+# Sends the single Codecov notification (PR comment and commit statuses)
+# for a finished coverage run. codecov.yml sets notify.manual_trigger, so
+# the uploads of the test legs never notify on their own.
+#
+# Why workflow_run: the Codecov endpoint behind send-notifications rejects
+# tokenless calls, and a fork pull request gets no secrets in Pre-merge.
+# This workflow runs from the default branch with the secrets. It takes only
+# head_sha from the event and runs no pull request code, so a fork that
+# names its own workflow "Pre-merge" can only notify for its own commit.
+
+on:
+  workflow_run:
+    workflows: ["Pre-merge", "Coverage baseline"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  notify:
+    # Concurrency cancels a run when a newer one starts for the same pull
+    # request or branch, and the newer run sends its own trigger.
+    if: github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Send Codecov notifications
+        uses: codecov/codecov-action@v7.1.1
+        with:
+          run_command: send-notifications
+          token: ${{ secrets.CODECOV_TOKEN }}
+          # Under workflow_run GITHUB_SHA is the default branch tip, not the
+          # commit the finished run uploaded coverage for.
+          override_commit: ${{ github.event.workflow_run.head_sha }}
+          fail_ci_if_error: false
+          verbose: true
