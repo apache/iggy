@@ -2,25 +2,20 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it. Everything else is a stub.
 
-> **Stub warning:** Produce and Fetch still don't persist or read real data - they return
+> **Stub warning:** Fetch does not read real data yet: with or without a bridge it returns
 > retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. CreateTopics, Metadata, and ListOffsets are wired to the Iggy bridge:
-> with `IGGY_KAFKA_BRIDGE_ENABLED=true`, CreateTopics creates a real Iggy stream/topic, Metadata
-> reports real topics and partition counts (a topic not requested by name and not found is
-> silently absent from a null-topics "list all" response, and `UNKNOWN_TOPIC_OR_PARTITION` when
-> named explicitly), and ListOffsets answers `EARLIEST`/`LATEST` from real partition state; with
-> the bridge off (the default), all three stay stubs - CreateTopics answers `NOT_CONTROLLER` (41),
-> Metadata reports every requested topic unknown, and ListOffsets answers `NOT_LEADER_OR_FOLLOWER`
-> (6). **CreateTopics has no authentication gate yet**: with the bridge on, any client that can
-> reach this port can create topics (up to 1000 partitions each) as the bridge's own Iggy user,
-> until SASL ([#3549](https://github.com/apache/iggy/issues/3549)) lands. See
-> **Stub warning:** When you set `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy and
-> ListOffsets answers `EARLIEST`/`LATEST` from real partition state. No other API stores or reads
-> real data. Produce and ListOffsets without a bridge, and Fetch with or without one, answer
-> retriable `NOT_LEADER_OR_FOLLOWER` (6). Clients then keep their data and do not trust a fake
-> success. CreateTopics answers `NOT_CONTROLLER` (41) and creates nothing. Metadata reports every
-> topic as unknown, so a real client cannot reach Produce or ListOffsets yet. See
+> trusting a fake success. With `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy,
+> CreateTopics creates a real Iggy stream/topic, Metadata reports real topics and partition counts
+> (a topic not requested by name and not found is silently absent from a null-topics "list all"
+> response, and `UNKNOWN_TOPIC_OR_PARTITION` when named explicitly), and ListOffsets answers
+> `EARLIEST`/`LATEST` from real partition state. With the bridge off (the default) these stay stubs: Produce and
+> ListOffsets answer `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics answers `NOT_CONTROLLER` (41), and
+> Metadata reports every requested topic unknown. **CreateTopics runs as the bridge's own Iggy
+> user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can
+> reach this port can create topics (up to 1000 partitions each). See
 > [docs/SCOPE.md](docs/SCOPE.md).
+>
+> InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 
 ## Run
 
@@ -41,6 +36,7 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
+| `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Require SASL/PLAIN authentication before serving any other API (`true` or `false`, nothing else) |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
@@ -65,7 +61,7 @@ cargo test -p iggy-gateway-kafka
 Or generate only the keys the tests need:
 
 ```bash
-for key in 0 1 2 19; do
+for key in 0 1 2 19 22; do
   cargo run -p kafka-message-gen -- generate \
     --output gateways/kafka/tools/kafka-tool/kafka_messages \
     --api-key "$key"
@@ -91,16 +87,21 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 ### Delivery guarantees
 
 Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
-restart. Transactions are not supported, and will not be. A retry after a timeout can write a
-record twice.
-
-Java producers must set `enable.idempotence=false` until the gateway serves `InitProducerId`
-([#3545](https://github.com/apache/iggy/issues/3545)). Produce already stores idempotent batches.
-It ignores their producer id, epoch and sequence, so it does not deduplicate a retry.
+restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
+a producer id so that it starts, but its retries are not deduplicated: Produce stores idempotent
+batches but ignores their producer id, epoch and sequence, so a retry after a network timeout
+writes the record twice, and both copies reach the stream with their own offsets.
 
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
 [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+
+Transactions are **not supported**, and will not be. AddPartitionsToTxn (24), AddOffsetsToTxn
+(25), EndTxn (26) and TxnOffsetCommit (28) are never advertised, so a conforming client never
+sends one; `InitProducerId` with a `transactional_id` answers `UNSUPPORTED_VERSION` (35); and a
+Produce request carrying a `transactional_id` gets `UNSUPPORTED_VERSION` (35) on every partition
+rather than having its records stored as if they were ordinary ones. None of those closes the
+connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
 ## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
 

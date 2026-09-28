@@ -41,23 +41,25 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=6 (compact array: N+1=7)
-    // key 0  (Produce)      min=0  max=9  (advertised)
-    // key 1  (Fetch)        min=4  max=12
-    // key 2  (ListOffsets)  min=1  max=6
-    // key 3  (Metadata)     min=0  max=9
-    // key 18 (ApiVersions)  min=0  max=3
-    // key 19 (CreateTopics) min=2  max=5
+    // error_code=0, api_count=7 (compact array: N+1=8)
+    // key 0  (Produce)        min=0  max=9  (advertised)
+    // key 1  (Fetch)          min=4  max=12
+    // key 2  (ListOffsets)    min=1  max=6
+    // key 3  (Metadata)       min=0  max=9
+    // key 18 (ApiVersions)    min=0  max=3
+    // key 19 (CreateTopics)   min=2  max=5
+    // key 22 (InitProducerId) min=0  max=5
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 50] = [
+    let expected: [u8; 57] = [
         0x00, 0x00, // error_code
-        0x07, // compact array count (6+1)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce      0-9 (advertised)
-        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch        4-12
-        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets  1-6
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, 0x00, // key 3:  Metadata     0-9
-        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key 18: ApiVersions  0-3
-        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, 0x00, // key 19: CreateTopics 2-5
+        0x08, // compact array count (7+1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce        0-9 (advertised)
+        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch          4-12
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets    1-6
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, 0x00, // key 3:  Metadata       0-9
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key 18: ApiVersions    0-3
+        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, 0x00, // key 19: CreateTopics   2-5
+        0x00, 0x16, 0x00, 0x00, 0x00, 0x05, 0x00, // key 22: InitProducerId 0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
         0x00, // top-level tagged fields
     ];
@@ -71,23 +73,25 @@ async fn golden_apiversions_v1_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=6
-    // key 0  (Produce)      min=0  max=9 (KAFKA-18659 advertise min=0)
-    // key 1  (Fetch)        min=4  max=12
-    // key 2  (ListOffsets)  min=1  max=6
-    // key 3  (Metadata)     min=0  max=9
-    // key 18 (ApiVersions)  min=0  max=3
-    // key 19 (CreateTopics) min=2  max=5
+    // error_code=0, api_count=7
+    // key 0  (Produce)        min=0  max=9 (KAFKA-18659 advertise min=0)
+    // key 1  (Fetch)          min=4  max=12
+    // key 2  (ListOffsets)    min=1  max=6
+    // key 3  (Metadata)       min=0  max=9
+    // key 18 (ApiVersions)    min=0  max=3
+    // key 19 (CreateTopics)   min=2  max=5
+    // key 22 (InitProducerId) min=0  max=5
     // throttle_ms=0
-    let expected: [u8; 46] = [
+    let expected: [u8; 52] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x06, // api count = 6
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce      0–9 (advertised)
-        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch        4–12
-        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets  1–6
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, // key 3:  Metadata     0–9
-        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, // key 18: ApiVersions  0–3
-        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, // key 19: CreateTopics 2–5
+        0x00, 0x00, 0x00, 0x07, // api count = 7
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce        0–9 (advertised)
+        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch          4–12
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets    1–6
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, // key 3:  Metadata       0–9
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, // key 18: ApiVersions    0–3
+        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, // key 19: CreateTopics   2–5
+        0x00, 0x16, 0x00, 0x00, 0x00, 0x05, // key 22: InitProducerId 0–5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
     ];
     assert_eq!(actual.as_ref(), &expected);

@@ -194,12 +194,12 @@ async fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
     let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker())
         .await
         .expect_response("test request has acks != 0 and expects a response");
-    // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 - no throttle_time_ms.
-    assert_eq!(body.len(), 42);
+    // v0: error_code(2) + api_keys i32 count(4) + 7 entries × 6 bytes = 48 - no throttle_time_ms.
+    assert_eq!(body.len(), 48);
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_i32().unwrap(), 6);
-    assert_eq!(d.remaining(), 36);
+    assert_eq!(d.read_i32().unwrap(), 7);
+    assert_eq!(d.remaining(), 42);
 }
 
 #[tokio::test]

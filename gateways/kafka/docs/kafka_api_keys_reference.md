@@ -15,6 +15,7 @@
 | 🟠 Required Stub | Client state-machine API — must return a well-formed response or clients will stall/crash |
 | 🟡 Optional Stub | Admin/observability — can safely return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` |
 | ❌ Reject | Internal broker / KRaft only — return `INVALID_REQUEST` with a well-formed frame; **do not close the connection** |
+| ❌ Unadvertised | Deliberately absent from `ApiVersions`, so a conforming client never sends one; an arriving request closes the connection |
 
 > This table no longer carries a per-key header-framing status column. `src/protocol/header.rs`
 > has no per-key table of its own to be behind or caught up on: it delegates entirely to
@@ -122,13 +123,19 @@ Key new minimums:
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Gateway Action |
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
-| 22 | **InitProducerId** | 2 | 5 | v2 | 🟡 Optional Stub |
+| 22 | **InitProducerId** | 2 | 5 | v2 | 🟠 Required Stub |
 | 23 | **OffsetForLeaderEpoch** | 1 | 5 | v4 | 🟡 Optional Stub |
-| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | 🟡 Optional Stub |
-| 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | 🟡 Optional Stub |
-| 26 | **EndTxn** | 1 | 4 | v3 | 🟡 Optional Stub |
+| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | ❌ Unadvertised |
+| 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | ❌ Unadvertised |
+| 26 | **EndTxn** | 1 | 4 | v3 | ❌ Unadvertised |
 | 27 | **WriteTxnMarkers** | 0 | 1 | v1 | 🟡 Optional Stub |
-| 28 | **TxnOffsetCommit** | 2 | 5 | v3 | 🟡 Optional Stub |
+| 28 | **TxnOffsetCommit** | 2 | 5 | v3 | ❌ Unadvertised |
+
+> InitProducerId is implemented, not stubbed: it allocates a producer id so a stock idempotent
+> producer starts, and answers `UNSUPPORTED_VERSION` (35) only when the request carries a
+> `transactional_id`. The four keys marked Unadvertised are never listed in `ApiVersions`, which
+> is what stops a conforming client from opening a transaction at all. See
+> [`IDEMPOTENCE.md`](IDEMPOTENCE.md) and `SCOPE.md`'s Transactions section.
 
 ---
 
@@ -257,8 +264,9 @@ Key new minimums:
 | Category | Count | Notes |
 | ---------- | :-----: | ------- |
 | 🔴 Bridge (data path) | 7 | Produce, Fetch, Metadata, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
-| 🟠 Required Stub (client state machine) | 12 | ListOffsets, consumer group (8-14), CreateTopics, ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
-| 🟡 Optional Stub (admin/observability) | 47 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
+| 🟠 Required Stub (client state machine) | 13 | ListOffsets, consumer group (8-14), CreateTopics, InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
+| 🟡 Optional Stub (admin/observability) | 42 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
+| ❌ Unadvertised (transactions) | 4 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28). Absent from ApiVersions, so a conforming client never sends one |
 | ❌ Reject (broker/KRaft internal) | 22 | Return `INVALID_REQUEST` with valid frame — never close the TCP connection |
 | **Total API Keys in this document** | **88** | Key IDs 0-88 with a gap at 73 |
 
@@ -277,12 +285,12 @@ Key new minimums:
 | ApiVersions | v0-v3 | v4 | 1 version behind |
 | CreateTopics | v2-v5 | v7 | 2 versions behind |
 
-### Missing from `SUPPORTED_RANGES` (82 of the 88 API keys in this document)
+### Missing from `SUPPORTED_RANGES` (81 of the 88 API keys in this document)
 
 Every key not in `SUPPORTED_RANGES` closes the connection - the same policy applied to every
-other unlisted key, not a special case for these. No api-specific response schema exists for an
-unlisted key, so any body the gateway could send would be misparsed by the client against the
-schema it expected. This includes:
+other unlisted key, not a special case for these. The gateway declines to define a response for a
+key it does not advertise, and a conforming client never sends one, so no response shape has to
+be agreed. This includes:
 
 - **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
 - **Classic consumer group protocol**: JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)

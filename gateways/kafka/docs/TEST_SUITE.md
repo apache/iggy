@@ -59,6 +59,7 @@ file under `tests/` anymore.
 | [`golden_wire_fixtures_tests.rs`](../tests/golden_wire_fixtures_tests.rs) | Byte-exact golden responses (ApiVersions v1, Metadata v0) | No |
 | [`fixtures_canary_tests.rs`](../tests/fixtures_canary_tests.rs) | Fails loudly if `KAFKA_FIXTURES_REQUIRED=1` and no `.bin` fixtures exist, so a broken generation step can't leave the fixture-backed suites green-but-empty | Canary only |
 | [`version_firewall_tests.rs`](../tests/version_firewall_tests.rs) | Version boundary matrix, unsupported keys, corrupt bodies | Partial |
+| [`idempotence_tests.rs`](../tests/idempotence_tests.rs) | `InitProducerId` allocation across every supported version, and the transactional refusals on `InitProducerId`/Produce | No |
 | [`broker_advertise_tests.rs`](../tests/broker_advertise_tests.rs) | `BrokerAdvertise::from_server_config` parsing | No |
 | [`server_integration_tests.rs`](../tests/server_integration_tests.rs) | `read_frame` unit-level I/O | No |
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |

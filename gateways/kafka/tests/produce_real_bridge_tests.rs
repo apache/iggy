@@ -76,6 +76,7 @@ async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayStat
         Some(Arc::new(bridge)),
         MAX_FRAME_SIZE,
         false,
+        0,
     )
 }
 
