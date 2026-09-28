@@ -1781,6 +1781,7 @@ mod tests {
             group_id: WireIdentifier::numeric(group_id),
             client_id,
             in_flight: Vec::new(),
+            session: None,
         };
         mux.update(build_prepare(op, Operation::JoinConsumerGroup, &req))
             .expect("JoinConsumerGroup apply succeeds");

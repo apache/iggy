@@ -172,11 +172,11 @@ async fn e2e_produce_v3_acks_zero_sends_no_response() {
 }
 
 #[tokio::test]
-async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
+async fn e2e_produce_v3_acks_zero_malformed_topics_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    // acks=0, claims one topic, no topic bytes - decode fails after acks is read.
+    // acks=0, claims one topic, no topic bytes.
     let body = build_produce_v3_body(0, 1);
     let frame = build_request_frame(API_KEY_PRODUCE, 3, 99, Some("review-test"), &body);
     stream
@@ -184,26 +184,10 @@ async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
         .await
         .expect("write produce acks=0 malformed");
 
-    let response =
-        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_millis(500))
-            .await;
-
-    assert!(
-        response.is_none(),
-        "Produce with acks=0 must stay silent even when the body is malformed; got {} bytes",
-        response.as_ref().map_or(0, Bytes::len)
-    );
-
-    // A silence assertion alone cannot distinguish "stayed open and correctly silent" from "the
-    // server dropped the connection" - both look like no bytes arrive. Probe with a request that
-    // must answer, so a regression that closes on decode failure fails here instead of passing.
-    let follow_up = build_request_frame(API_KEY_API_VERSIONS, 1, 100, Some("review-test"), &[]);
-    stream.write_all(&follow_up).await.expect("follow-up");
-    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert_eq!(
-        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
-        100,
-        "connection must stay usable after the silent malformed acks=0 Produce"
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "a Produce that fails to decode must close the connection"
     );
 }
 

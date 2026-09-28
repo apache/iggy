@@ -28,3 +28,13 @@ pub use namespace::{
 };
 pub use partition_location::PartitionLocation;
 pub use shard_id::ShardId;
+
+/// Maximum time a client-list gather waits for all shard replies.
+pub const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Maximum time spent retrying one gathered consumer-session report.
+pub const CONSUMER_SESSION_REPORT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+pub const MIN_CONSUMER_SESSION_HEARTBEAT_SIZE: usize =
+    iggy_binary_protocol::HEADER_SIZE + iggy_binary_protocol::ConsumerSession::ENCODED_SIZE;
