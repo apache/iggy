@@ -93,7 +93,7 @@ jobs:
     # One place for the pins. The install step reads them, and the control
     # file carries them so the posted review names what produced it.
     env:
-      CLAUDE_CODE_VERSION: 2.1.278
+      CLAUDE_CODE_VERSION: 2.1.284
       DEEPSEEK_MODEL: deepseek-flash[1m]
     runs-on: ubuntu-latest
     timeout-minutes: 60

@@ -18,6 +18,8 @@ The run reads the skill file, so a skill marked `disable-model-invocation: true`
 
 The review body opens with the summary and a count per severity. A finding with no anchor goes into the body as text. When the head moved during the run, the whole set goes to the body. The poster answers every conclusion, a cancelled run included. It also answers a pull request that closed while the run worked, and a post that the API refused.
 
+The agent also writes `flip_author_label`, which says whether the findings need the author before merge. If it is `true` and the review shows a critical or warning finding, the poster replaces `S-waiting-on-review` with `S-waiting-on-author`. That is the same move as `/author`. The label moves in that direction only. A review that asks for nothing leaves the label as it is, and `/ready` moves the pull request back to the review queue. A draft gets no state label.
+
 ## What the agent can do
 
 The agent reads. It cannot run a command, build the workspace or start a test. The run installs no Rust toolchain, so no build script, proc macro, cargo configuration or rustc wrapper from the pull request can execute.
@@ -63,5 +65,5 @@ A run installs one npm package and reads code. Expect a few minutes of wall cloc
 - Project configuration files, hooks and MCP servers never load. `--restricted` ignores the project configuration files, and `--strict-mcp-config` with no MCP configuration loads no server.
 - The pull request text is data. The prompt says so, and a comment in the diff that addresses the reviewer can become a finding, never a command. That is a rule for the model, not a fence. A model that follows such a comment can still only read the tree and write its own directory.
 - The pull request can still steer the words that the model writes. The poster first deletes the invisible characters from every model string: Unicode tags, bidi controls, zero-width characters and variation selectors. Then it adds a zero-width space that stops HTML, mentions, links and math.
-- The review shows counts per severity, not a verdict from the model. The prompt keeps the verdict of a skill out of the summary. The poster also deletes a `Verdict: APPROVE` or `Verdict: REQUEST CHANGES` that opens a sentence.
+- The review shows counts per severity, not a verdict from the model. The prompt keeps the verdict of a skill out of the summary. The poster also deletes a `Verdict: APPROVE` or `Verdict: REQUEST CHANGES` that opens a sentence. The verdict reaches the pull request only through `flip_author_label`, as the label move above. A pull request that steers the model can therefore at most keep its own label, or send itself to the author queue.
 - No cache is read or written. The run has no build, so it has no cache to poison.
