@@ -519,9 +519,10 @@ impl IggyClient {
 
     /// Closes the current connection. Repeated calls are safe. Call `connect`
     /// to use the client again. The sign-in made with `login_user` is dropped,
-    /// so it must be repeated after reconnecting, while a client configured
-    /// with auto-login credentials signs in again on `connect`. Over HTTP
-    /// there is no connection to close and this call does nothing.
+    /// so it must be repeated after reconnecting. A client configured with
+    /// auto-login credentials signs in again on `connect`, and its heartbeat
+    /// also connects it again and signs in within one heartbeat interval. Over
+    /// HTTP there is no connection to close and this call does nothing.
     ///
     /// Raises:
     ///     RuntimeError: If the connection cannot be closed.
@@ -534,10 +535,9 @@ impl IggyClient {
         })
     }
 
-    /// Closes the connection and releases the client. For TCP, QUIC and
-    /// WebSocket this is terminal: later requests fail with `RuntimeError`.
-    /// Repeated calls are safe. Over HTTP there is nothing to release and this
-    /// call does nothing.
+    /// Closes the connection and releases the client. Later requests fail with
+    /// `RuntimeError`. Repeated calls are safe. Over HTTP there is nothing to
+    /// release and this call does nothing.
     ///
     /// Raises:
     ///     RuntimeError: If the client cannot be shut down.

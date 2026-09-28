@@ -335,14 +335,15 @@ class TestLifecycle:
 
     @pytest.mark.asyncio
     async def test_http_disconnect_and_shutdown_do_nothing(self):
-        """Test HTTP has no connection to close, so requests keep working."""
+        """Test HTTP has no connection to close, so the session keeps working."""
         host, port = get_http_server_config()
         client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
         await client.connect()
         await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
 
         await client.disconnect()
-        await client.ping()
+        await client.get_streams()
 
         await client.shutdown()
-        await client.ping()
+        await client.get_streams()
