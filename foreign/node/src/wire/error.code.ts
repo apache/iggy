@@ -146,6 +146,7 @@ export const translateErrorCode = (code: number): string => {
     case '2019': return "Invalid partitions count";
     case '2020': return "Topic directory: {0} not found";
     case '2021': return "Too many topics";
+    case '2022': return "Partitions limit reached, raise [metadata] partitions_max";
 
     // TOPIC
     case '3000': return "Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}";

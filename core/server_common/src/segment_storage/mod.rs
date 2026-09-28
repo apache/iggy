@@ -20,6 +20,7 @@ mod index_writer;
 mod messages_reader;
 mod messages_writer;
 
+use crate::fatal::ExitOnDescriptorExhaustion;
 use iggy_common::IggyError;
 use std::path::Path;
 use std::rc::Rc;
@@ -60,6 +61,7 @@ impl SegmentStorage {
                 .truncate(false)
                 .open(messages_path)
                 .await
+                .exit_on_descriptor_exhaustion(|| format!("opening {messages_path}"))
                 .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.to_owned()))?;
             let mut changed = !file_exists;
             if let Some(size) = preallocate_size

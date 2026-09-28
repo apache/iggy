@@ -31,6 +31,7 @@
 use crate::state_transfer::STAGING_SUFFIX;
 use compio::io::AsyncWriteAtExt;
 use consensus::state_artifact_checksum;
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use std::io;
 
 /// File extension for an anchor record, `{start_offset:020}.anchor` beside the
@@ -155,7 +156,9 @@ pub async fn write_anchor(partition_dir: &str, anchor: SegmentAnchor) -> io::Res
     // unlinks it unconditionally, boot included, so a torn write leaves nothing
     // a later guard can read.
     let tmp_path = format!("{path}{STAGING_SUFFIX}");
-    let mut file = compio::fs::File::create(&tmp_path).await?;
+    let mut file = compio::fs::File::create(&tmp_path)
+        .await
+        .exit_on_descriptor_exhaustion(|| format!("creating {tmp_path}"))?;
     let (result, _buf) = file
         .write_all_at(anchor.to_bytes().to_vec(), 0)
         .await

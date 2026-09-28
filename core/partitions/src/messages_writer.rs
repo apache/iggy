@@ -20,6 +20,7 @@ use compio::{
     io::AsyncWriteAtExt,
 };
 use iggy_common::{IggyByteSize, IggyError};
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use server_common::fs_utils::preallocate_file;
 use server_common::iobuf::{Frozen, IOV_MAX};
 use std::{
@@ -59,6 +60,7 @@ impl MessagesWriter {
         let file = opts
             .open(file_path)
             .await
+            .exit_on_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if let Some(preallocate_size) = preallocate_size {

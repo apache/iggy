@@ -18,6 +18,7 @@
 import type { CommandResponse } from '../../client/index.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { wrapCommand } from '../command.utils.js';
+import { deserializeError } from '../error.utils.js';
 
 export type Stats = {
   processId: number,
@@ -41,8 +42,17 @@ export type Stats = {
   hostname: string,
   osName: string,
   osVersion: string,
-  kernelVersion: string
+  kernelVersion: string,
+  openFilesCount: bigint,
+  openFilesLimit: bigint
 }
+
+// stream_id, topic_id, partition_id, hits, misses, hit_ratio
+const CACHE_METRIC_SIZE = 4 + 4 + 4 + 8 + 8 + 4;
+// threads_count, free_disk_space, total_disk_space
+const THREADS_AND_DISK_SIZE = 4 + 8 + 8;
+// open_files_count, open_files_limit
+const OPEN_FILES_SIZE = 8 + 8;
 
 const deserializeGetStats = (b: Buffer) => {
   const processId = b.readUInt32LE(0);
@@ -91,6 +101,26 @@ const deserializeGetStats = (b: Buffer) => {
     position + 4,
     position + 4 + kernelVersionLength
   ).toString();
+  position += 4 + kernelVersionLength;
+
+  // iggy_server_version, iggy_server_semver
+  const iggyServerVersionLength = b.readUInt32LE(position);
+  position += 4 + iggyServerVersionLength + 4;
+
+  const cacheMetricsCount = b.readUInt32LE(position);
+  position += 4 + cacheMetricsCount * CACHE_METRIC_SIZE + THREADS_AND_DISK_SIZE;
+  if (position > b.length)
+    deserializeError('stats', position, b.length);
+
+  // Servers that predate the open-files fields end the reply here.
+  let openFilesCount = 0n;
+  let openFilesLimit = 0n;
+  if (b.length > position) {
+    if (b.length < position + OPEN_FILES_SIZE)
+      deserializeError('stats', position + OPEN_FILES_SIZE, b.length);
+    openFilesCount = b.readBigUInt64LE(position);
+    openFilesLimit = b.readBigUInt64LE(position + 8);
+  }
 
   return {
     processId,
@@ -114,7 +144,9 @@ const deserializeGetStats = (b: Buffer) => {
     hostname,
     osName,
     osVersion,
-    kernelVersion
+    kernelVersion,
+    openFilesCount,
+    openFilesLimit
   };
 };
 

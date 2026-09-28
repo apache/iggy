@@ -481,10 +481,21 @@ fn aggregate_stats_totals(
     ))
 }
 
-fn build_stats_response<B, MJ, S, SB>(
+/// Node-wide object and message totals, shared by the `GetStats` reply and
+/// the periodic sysinfo log line.
+pub struct StatsTotals {
+    pub streams_count: u32,
+    pub topics_count: u32,
+    pub partitions_count: u32,
+    pub segments_count: u32,
+    pub messages_size_bytes: u64,
+    pub messages_count: u64,
+    pub consumer_groups_count: u32,
+}
+
+pub fn stats_totals<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    clients_count: u32,
-) -> Result<StatsResponse, IggyError>
+) -> Result<StatsTotals, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -513,7 +524,29 @@ where
             .streams()
             .consumer_group_count(),
     )?;
+    Ok(StatsTotals {
+        streams_count,
+        topics_count,
+        partitions_count,
+        segments_count,
+        messages_size_bytes,
+        messages_count,
+        consumer_groups_count,
+    })
+}
 
+fn build_stats_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    clients_count: u32,
+) -> Result<StatsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let totals = stats_totals(shard)?;
     let system = probe_system_stats();
     let (free_disk_space, total_disk_space) = stats_disk_space();
     Ok(StatsResponse {
@@ -527,14 +560,14 @@ where
         start_time: system.start_time,
         read_bytes: system.read_bytes,
         written_bytes: system.written_bytes,
-        messages_size_bytes,
-        streams_count,
-        topics_count,
-        partitions_count,
-        segments_count,
-        messages_count,
+        messages_size_bytes: totals.messages_size_bytes,
+        streams_count: totals.streams_count,
+        topics_count: totals.topics_count,
+        partitions_count: totals.partitions_count,
+        segments_count: totals.segments_count,
+        messages_count: totals.messages_count,
         clients_count,
-        consumer_groups_count,
+        consumer_groups_count: totals.consumer_groups_count,
         hostname: system.hostname,
         os_name: system.os_name,
         os_version: system.os_version,
@@ -545,6 +578,8 @@ where
         threads_count: system.threads_count,
         free_disk_space,
         total_disk_space,
+        open_files_count: system.open_files_count,
+        open_files_limit: system.open_files_limit,
     })
 }
 

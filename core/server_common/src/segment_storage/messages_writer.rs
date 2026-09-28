@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::fatal::ExitOnDescriptorExhaustion;
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
 use iggy_common::IggyError;
@@ -56,6 +57,7 @@ impl MessagesWriter {
         let file = opts
             .open(file_path)
             .await
+            .exit_on_descriptor_exhaustion(|| format!("opening {file_path}"))
             .error(|err: &std::io::Error| {
                 format!("Failed to open messages file: {file_path}, error: {err}")
             })

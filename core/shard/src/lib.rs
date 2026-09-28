@@ -61,7 +61,7 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
-use message_bus::{BusMessage, MessageBus, SharedTlsServerConfig};
+use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfig};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
@@ -709,10 +709,13 @@ pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
-    /// 16 bits of `meta.client_id`.
+    /// 16 bits of `meta.client_id`. `permit` is the socket's slot in the
+    /// node's connection cap. It travels with the fd, so a frame dropped
+    /// unprocessed frees the slot with the socket.
     ClientConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+        permit: ConnectionPermit,
     },
     /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
     /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
@@ -735,6 +738,7 @@ pub enum LifecycleFrame {
     ClientWsConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+        permit: ConnectionPermit,
     },
     /// Delegate TCP-TLS before reading TLS bytes. The destination wraps the
     /// fd on its runtime and owns the handshake and connection tasks.
@@ -742,6 +746,7 @@ pub enum LifecycleFrame {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     },
     /// Delegate WSS before either handshake. The listener's configuration
     /// travels with the socket; all TLS and WebSocket state stays local to
@@ -750,6 +755,7 @@ pub enum LifecycleFrame {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.

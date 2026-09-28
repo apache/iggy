@@ -727,7 +727,7 @@ where
                 );
                 self.bus.clear_replica_dial_pending(replica_id);
             }
-            LifecycleFrame::ClientConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -735,19 +735,28 @@ where
                     "installing delegated client fd"
                 );
                 self.bus
-                    .install_client_fd(fd, meta, self.on_client_request.clone());
+                    .install_client_fd(fd, meta, Some(permit), self.on_client_request.clone());
             }
-            LifecycleFrame::ClientWsConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientWsConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
                     raw_fd = fd.as_raw_fd(),
                     "installing delegated WS client fd (pre-upgrade)"
                 );
-                self.bus
-                    .install_client_ws_fd(fd, meta, self.on_client_request.clone());
+                self.bus.install_client_ws_fd(
+                    fd,
+                    meta,
+                    Some(permit),
+                    self.on_client_request.clone(),
+                );
             }
-            LifecycleFrame::ClientTcpTlsConnectionSetup { fd, meta, config } => {
+            LifecycleFrame::ClientTcpTlsConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -758,18 +767,29 @@ where
                     fd,
                     meta,
                     config,
+                    Some(permit),
                     self.on_client_request.clone(),
                 );
             }
-            LifecycleFrame::ClientWssConnectionSetup { fd, meta, config } => {
+            LifecycleFrame::ClientWssConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
                     raw_fd = fd.as_raw_fd(),
                     "installing delegated WSS client fd (pre-handshake)"
                 );
-                self.bus
-                    .install_client_wss_fd(fd, meta, config, self.on_client_request.clone());
+                self.bus.install_client_wss_fd(
+                    fd,
+                    meta,
+                    config,
+                    Some(permit),
+                    self.on_client_request.clone(),
+                );
             }
             LifecycleFrame::ForwardReplicaSend { replica_id, msg } => {
                 if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {

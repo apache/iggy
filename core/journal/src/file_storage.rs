@@ -18,6 +18,7 @@
 use crate::Storage;
 use compio::buf::IoBuf;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use std::cell::{Cell, UnsafeCell};
 use std::fs;
 use std::io;
@@ -45,7 +46,8 @@ impl FileStorage {
             .create(true)
             .truncate(false)
             .open(path)
-            .await?;
+            .await
+            .exit_on_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
         let len = file.metadata().await?.len();
         Ok(Self {
             file: UnsafeCell::new(file),
@@ -79,7 +81,13 @@ impl FileStorage {
     pub(crate) fn truncate(&self, len: u64) -> io::Result<()> {
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &*self.file.get() };
-        let file = fs::File::from(file.as_fd().try_clone_to_owned()?);
+        let file = fs::File::from(
+            file.as_fd()
+                .try_clone_to_owned()
+                .exit_on_descriptor_exhaustion(|| {
+                    format!("duplicating the descriptor of {}", self.path.display())
+                })?,
+        );
         file.set_len(len)?;
         self.write_offset.set(len);
         file.sync_all()
@@ -162,7 +170,8 @@ impl FileStorage {
             .read(true)
             .write(true)
             .open(&self.path)
-            .await?;
+            .await
+            .exit_on_descriptor_exhaustion(|| format!("reopening {}", self.path.display()))?;
         let len = file.metadata().await?.len();
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         unsafe { *self.file.get() = file };

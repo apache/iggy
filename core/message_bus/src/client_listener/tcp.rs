@@ -27,6 +27,7 @@
 //! writer + reader tasks via [`crate::installer`].
 
 use crate::AcceptedClientFn;
+use crate::accept::pause_after_accept_error;
 use crate::client_listener::bind_nodelay_listener;
 use crate::lifecycle::ShutdownToken;
 use compio::net::TcpListener;
@@ -77,6 +78,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                     }
                     Err(e) => {
                         error!("Client listener (TCP) accept failed: {e}");
+                        pause_after_accept_error(&e).await;
                     }
                 }
             }

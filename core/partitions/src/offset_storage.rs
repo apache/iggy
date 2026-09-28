@@ -26,6 +26,7 @@
 //! directory sync makes creation, replacement, or deletion durable. Offset callers
 //! own that directory sync, while purge marker writes include it before returning.
 
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use std::{io, path::Path};
 
 use compio::{
@@ -184,6 +185,7 @@ pub async fn persist_offset_retained(
             .truncate(true)
             .open(path)
             .await
+            .exit_on_descriptor_exhaustion(|| format!("opening {path}"))
             .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
     };
     let result = file.write_all_at(encode_offset_record(offset), 0).await.0;

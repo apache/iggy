@@ -34,6 +34,7 @@
 //! TCP does not carry over.
 
 use crate::AcceptedTlsClientFn;
+use crate::accept::pause_after_accept_error;
 use crate::client_listener::bind_nodelay_listener;
 use crate::lifecycle::ShutdownToken;
 use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
@@ -122,6 +123,7 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!("Client listener (TCP-TLS) accept failed: {e}");
+                        pause_after_accept_error(&e).await;
                     }
                 }
             }

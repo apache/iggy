@@ -23,6 +23,7 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use futures::channel::oneshot;
 use futures::lock::Mutex;
 use futures::{Stream, stream};
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use std::ffi::OsString;
 use std::io;
@@ -249,7 +250,13 @@ impl DurableStorage for DiskStorage {
                 .create(true)
                 .truncate(matches!(mode, OpenMode::Create | OpenMode::CreateWriteOnly));
         }
-        options.open(path).await
+        let opened = options.open(path).await;
+        // A failed read fails only its own request. See `ExitOnDescriptorExhaustion`.
+        // A caller that opens read-only to sync wraps the result itself.
+        if mode == OpenMode::Read {
+            return opened;
+        }
+        opened.exit_on_descriptor_exhaustion(|| format!("opening {}", path.display()))
     }
 
     async fn create_directories(&self, path: &Path) -> io::Result<()> {
@@ -257,7 +264,11 @@ impl DurableStorage for DiskStorage {
     }
 
     async fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        File::open(path).await?.sync_all().await
+        File::open(path)
+            .await
+            .exit_on_descriptor_exhaustion(|| format!("opening directory {}", path.display()))?
+            .sync_all()
+            .await
     }
 
     async fn rename(&self, source: &Path, target: &Path) -> io::Result<()> {
@@ -443,7 +454,11 @@ impl DurableFile for File {
     async fn truncate(&self, length: u64) -> io::Result<()> {
         // Older kernels lack IORING_OP_FTRUNCATE and shard fallback pools are
         // disabled. Own the inode until the worker completes, even on cancellation.
-        let descriptor = std::os::fd::AsFd::as_fd(self).try_clone_to_owned()?;
+        let descriptor = std::os::fd::AsFd::as_fd(self)
+            .try_clone_to_owned()
+            .exit_on_descriptor_exhaustion(|| {
+                "duplicating a file descriptor to truncate".to_owned()
+            })?;
         run_blocking("iggy-file-truncate", move || {
             std::fs::File::from(descriptor).set_len(length)
         })

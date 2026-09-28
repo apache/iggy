@@ -38,6 +38,7 @@
 //! carry over.
 //!
 use crate::AcceptedWssClientFn;
+use crate::accept::pause_after_accept_error;
 use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
@@ -116,6 +117,7 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!("Client listener (WSS) accept failed: {e}");
+                        pause_after_accept_error(&e).await;
                     }
                 }
             }

@@ -1646,7 +1646,7 @@ where
         if !committed_restored && !append_restored {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             namespace_raw = self.consensus().group(),
             offset_frontier = frontier,
             offset_reserved = reserved,

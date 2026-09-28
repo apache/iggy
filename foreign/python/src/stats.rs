@@ -327,6 +327,24 @@ impl Stats {
         self.inner.total_disk_space.as_bytes_u64()
     }
 
+    /// The number of file descriptors the server process holds open.
+    ///
+    /// 0 when unknown. Where the kernel cannot count them without a scan
+    /// (Linux before 6.2, macOS), this is the count from the server's last
+    /// periodic sysinfo log line.
+    #[getter]
+    pub fn open_files_count(&self) -> u64 {
+        self.inner.open_files_count
+    }
+
+    /// The soft limit on open file descriptors of the server process.
+    ///
+    /// 0 when unknown.
+    #[getter]
+    pub fn open_files_limit(&self) -> u64 {
+        self.inner.open_files_limit
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Stats(hostname='{}', iggy_server_version='{}', streams_count={}, \
@@ -409,6 +427,8 @@ mod tests {
             threads_count: 0,
             free_disk_space: IggyByteSize::default(),
             total_disk_space: IggyByteSize::default(),
+            open_files_count: 0,
+            open_files_limit: 0,
         }
     }
 

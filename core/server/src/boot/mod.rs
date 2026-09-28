@@ -24,6 +24,7 @@
 //! the leaves hold the support it calls into.
 
 mod credentials;
+mod fd_limit;
 mod handoff;
 mod listeners;
 mod recovery;
@@ -34,12 +35,14 @@ mod topology;
 
 pub use crate::dispatch::host::ServerHost;
 pub use credentials::apply_default_root_credentials;
+pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
 use crate::boot::credentials::{
     ensure_default_root_user, load_replica_auth, load_replica_tls_ctx,
     validate_root_credentials_env,
 };
+use crate::boot::fd_limit::client_connection_cap;
 use crate::boot::handoff::{
     BootstrapBarrier, MetadataHandoff, await_bootstrap_complete, await_metadata_bundle,
     broadcast_metadata_bundle, signal_bootstrap_complete,
@@ -600,6 +603,7 @@ async fn shard_main(
     // table from scratch, so running it afterwards would drop every resumed
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
+    metadata.set_partitions_max(config.metadata.partitions_max);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
     // clients that kept their identity across the restart (IGGY-137). Recovery
@@ -829,6 +833,7 @@ async fn shard_main(
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
         segment_cleaner: segment_cleaner_stop,
+        sysinfo_printer: None,
         consumer_group_liveness: None,
     };
 
@@ -906,8 +911,13 @@ async fn shard_main(
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
-        let accepted_client =
-            make_shard_zero_client_accept_fns(coord, &bus, shard.client_request_handler());
+        let connections = Rc::new(client_connection_cap(config.message_bus.connections_max));
+        let accepted_client = make_shard_zero_client_accept_fns(
+            coord,
+            &bus,
+            shard.client_request_handler(),
+            &connections,
+        );
         let roster = sessions.borrow().cluster_roster();
 
         if let Err(error) = start_tcp_runtime(
@@ -918,6 +928,7 @@ async fn shard_main(
             accepted_replica,
             dialed_replica,
             accepted_client,
+            &connections,
             &shard_metrics_all,
         )
         .await
@@ -958,6 +969,22 @@ async fn shard_main(
         });
         bus.track_background(handle);
         stop_signals.consumer_group_liveness = Some(stop_tx);
+    }
+
+    // Shard 0 only, since the line describes the whole process. After the
+    // bootstrap barrier: before it, a peer that still recovers times out the
+    // client gather, and each tick would warn and print zero clients. A zero
+    // interval disables it.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval;
+    if shard_id == 0 && !sysinfo_print_interval.is_zero() {
+        let (stop_tx, stop_rx) = channel(1);
+        let printer_shard = Rc::clone(&shard);
+        let interval = sysinfo_print_interval.get_duration();
+        let handle = compio::runtime::spawn(async move {
+            crate::sysinfo_printer::run_sysinfo_printer(printer_shard, stop_rx, interval).await;
+        });
+        bus.track_background(handle);
+        stop_signals.sysinfo_printer = Some(stop_tx);
     }
 
     bus.token().wait().await;

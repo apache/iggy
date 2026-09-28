@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::fatal::ExitOnDescriptorExhaustion;
 use compio::fs::File;
 use compio::fs::OpenOptions;
 use err_trail::ErrContext;
@@ -50,6 +51,7 @@ impl IndexWriter {
         let file = opts
             .open(file_path)
             .await
+            .exit_on_descriptor_exhaustion(|| format!("opening {file_path}"))
             .error(|e: &std::io::Error| format!("Failed to open index file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 

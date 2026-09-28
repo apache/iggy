@@ -50,6 +50,7 @@
 //! directional check itself runs on the owning shard, inside the
 //! handshake.
 
+use crate::accept::pause_after_accept_error;
 use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
@@ -109,6 +110,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                     }
                     Err(e) => {
                         error!("Replica listener accept failed: {e}");
+                        pause_after_accept_error(&e).await;
                     }
                 }
             }

@@ -19,17 +19,19 @@
 //! sampling of this process, the cached host identity, and disk usage of the
 //! volume holding the data directory.
 
+use nix::sys::resource::{Resource, getrlimit};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use sysinfo::System as SysinfoSystem;
-use system_stats::SystemProbe;
+use system_stats::{SystemProbe, count_open_files, count_open_files_without_scan};
 
 /// Process- and host-level portion of the stats reply, probed via `sysinfo`.
 /// These describe the whole process, not shard or metadata state, so any one
-/// shard can serve them without aggregation. The CPU fields are deltas over the
-/// serving thread's own [`SYSINFO`] refresh history, so they vary by serving
-/// shard (a shard's first probe reports zero CPU).
+/// shard can serve them without aggregation. The CPU fields are deltas since
+/// the previous refresh of the probed `System`, so they vary by serving shard
+/// (a shard's first probe reports zero CPU).
 pub struct SystemStats {
     pub process_id: u32,
     pub cpu_usage: f32,
@@ -42,6 +44,11 @@ pub struct SystemStats {
     pub read_bytes: u64,
     pub written_bytes: u64,
     pub threads_count: u32,
+    /// 0 when unknown. See [`publish_open_files_count`] for where the count
+    /// comes from without a kernel count.
+    pub open_files_count: u64,
+    /// Soft `RLIMIT_NOFILE`, the ceiling `open()` fails at. 0 when unknown.
+    pub open_files_limit: u64,
     pub hostname: String,
     pub os_name: String,
     pub os_version: String,
@@ -88,6 +95,11 @@ static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 /// bootstrap.
 static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+/// Last open-descriptor count from [`publish_open_files_count`], 0 before
+/// the first. Process-global because the printer runs on shard 0 and any
+/// shard can serve `GetStats`.
+static PUBLISHED_OPEN_FILES_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Capture the configured data directory for `GetStats` disk reporting.
 /// Idempotent: only the first call (process bootstrap) takes effect.
 pub fn init_stats_data_path(path: PathBuf) {
@@ -105,32 +117,52 @@ pub fn stats_disk_space() -> (u64, u64) {
     })
 }
 
-pub fn probe_system_stats() -> SystemStats {
-    let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
-    let probe = SYSINFO.with_borrow_mut(|slot| {
-        let sys = slot.get_or_insert_with(SysinfoSystem::new);
-        SystemProbe::capture(sys)
-    });
+/// Count open descriptors, scanning where the kernel keeps no count, and
+/// publish the result for [`probe_system_stats`].
+///
+/// Only the sysinfo printer calls this, once per interval. The scan cost
+/// grows with the count, so `GetStats` reads the published value instead of
+/// scanning on the request path. The value is as old as the printer interval,
+/// and stays 0 while the printer is disabled.
+pub fn publish_open_files_count() {
+    PUBLISHED_OPEN_FILES_COUNT.store(count_open_files().unwrap_or(0), Ordering::Relaxed);
+}
 
-    SystemStats {
-        process_id: probe.process_id,
-        cpu_usage: probe.cpu_usage,
-        total_cpu_usage: probe.total_cpu_usage,
-        memory_usage: probe.memory_usage,
-        total_memory: probe.total_memory,
-        available_memory: probe.available_memory,
-        // sysinfo reports whole seconds; the wire fields are micros (the
-        // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
-        // micro-based).
-        run_time: probe.run_time_secs.saturating_mul(1_000_000),
-        start_time: probe.start_time_secs.saturating_mul(1_000_000),
-        read_bytes: probe.read_bytes,
-        written_bytes: probe.written_bytes,
-        threads_count: probe.threads_count,
-        hostname: host.hostname.clone(),
-        os_name: host.os_name.clone(),
-        os_version: host.os_version.clone(),
-        kernel_version: host.kernel_version.clone(),
+/// Probe through this thread's [`SYSINFO`], the `GetStats` path.
+pub fn probe_system_stats() -> SystemStats {
+    SYSINFO
+        .with_borrow_mut(|slot| SystemStats::capture(slot.get_or_insert_with(SysinfoSystem::new)))
+}
+
+impl SystemStats {
+    /// Probe through `sys`. A caller that keeps its own `sys` gets CPU deltas
+    /// over its own interval, and does not reset the window of `GetStats`.
+    pub fn capture(sys: &mut SysinfoSystem) -> Self {
+        let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
+        let probe = SystemProbe::capture(sys);
+        Self {
+            process_id: probe.process_id,
+            cpu_usage: probe.cpu_usage,
+            total_cpu_usage: probe.total_cpu_usage,
+            memory_usage: probe.memory_usage,
+            total_memory: probe.total_memory,
+            available_memory: probe.available_memory,
+            // sysinfo reports whole seconds; the wire fields are micros (the
+            // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
+            // micro-based).
+            run_time: probe.run_time_secs.saturating_mul(1_000_000),
+            start_time: probe.start_time_secs.saturating_mul(1_000_000),
+            read_bytes: probe.read_bytes,
+            written_bytes: probe.written_bytes,
+            threads_count: probe.threads_count,
+            open_files_count: count_open_files_without_scan()
+                .unwrap_or_else(|| PUBLISHED_OPEN_FILES_COUNT.load(Ordering::Relaxed)),
+            open_files_limit: getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(soft, _)| soft),
+            hostname: host.hostname.clone(),
+            os_name: host.os_name.clone(),
+            os_version: host.os_version.clone(),
+            kernel_version: host.kernel_version.clone(),
+        }
     }
 }
 

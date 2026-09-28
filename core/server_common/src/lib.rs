@@ -22,6 +22,7 @@ mod consensus_message;
 pub mod crypto;
 pub mod diagnostics;
 pub mod executor;
+pub mod fatal;
 pub mod fs_utils;
 pub mod iobuf;
 pub mod log;

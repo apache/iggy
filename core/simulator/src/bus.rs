@@ -26,8 +26,8 @@ use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn,
-    SendError, SharedTlsServerConfig,
+    BusMessage, ClientConnectionLostFn, ConnectionInstaller, ConnectionPermit, MessageBus,
+    ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -355,7 +355,13 @@ impl ConnectionInstaller for SharedSimOutbox {
 
     fn clear_replica_dial_pending(&self, _replica_id: u8) {}
 
-    fn install_client_fd(&self, _fd: DupedFd, _meta: ClientConnMeta, _on_request: RequestHandler) {
+    fn install_client_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _permit: Option<ConnectionPermit>,
+        _on_request: RequestHandler,
+    ) {
         panic!("simulator has no fd transfer: client install is unreachable");
     }
 
@@ -363,6 +369,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
+        _permit: Option<ConnectionPermit>,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: ws client install is unreachable");
@@ -373,6 +380,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
+        _permit: Option<ConnectionPermit>,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: tcp tls client install is unreachable");
@@ -383,6 +391,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
+        _permit: Option<ConnectionPermit>,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: wss client install is unreachable");

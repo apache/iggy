@@ -33,6 +33,7 @@ use crate::segment_anchor::ANCHOR_EXTENSION;
 use crate::state_transfer::STAGING_SUFFIX;
 use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -1244,6 +1245,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
+        .exit_on_descriptor_exhaustion(|| format!("opening {path}"))
         .map_err(|source| {
             error!(
                 path,
@@ -1291,6 +1293,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Parti
         .create(true)
         .truncate(true)
         .open(&staging_path)
+        .exit_on_descriptor_exhaustion(|| format!("opening {staging_path}"))
         .map_err(|source| {
             error!(
                 path = %staging_path,
@@ -1343,6 +1346,7 @@ fn install_rebuilt_index(
 /// other mutation in this module (see [`FileScanner`]).
 fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::open(dir)
+        .exit_on_descriptor_exhaustion(|| format!("opening directory {dir}"))
         .and_then(|handle| handle.sync_all())
         .map_err(|source| {
             error!(
@@ -1471,6 +1475,7 @@ fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRe
 
 fn seed_empty_file(path: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::create(path)
+        .exit_on_descriptor_exhaustion(|| format!("creating {path}"))
         .and_then(|file| file.sync_all())
         .map_err(|source| {
             error!(

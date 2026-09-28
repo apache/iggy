@@ -348,8 +348,10 @@ fn local_shape_error(
 /// defaults on that path), so sending it to the client risks sending a wrong claim rather than no
 /// claim. The two client-caused variants are the exception - their text is fixed and always
 /// correct, so it's safe to forward and logged at `debug!` (attacker/misuse-controlled, not
-/// operator-actionable); everything else points at the bridge or Iggy itself and is logged at
-/// `error!` (`bridge/error.rs:155`'s own guidance: handlers log the real Iggy error).
+/// operator-actionable). `PartitionsLimitReached` carries no data, so its fixed text is correct
+/// too, and it is logged at `warn!` for the operator who set the cap. Everything else points at
+/// the bridge or Iggy itself and is logged at `error!` (`bridge/error.rs:155`'s own guidance:
+/// handlers log the real Iggy error).
 fn bridge_error_result(
     result: CreatableTopicResult,
     kafka_topic: &str,
@@ -376,6 +378,17 @@ fn bridge_error_result(
                 .with_error_code(error_code)
                 .with_error_message(Some(StrBytes::from(
                     "partition count must be at least 1".to_string(),
+                )))
+        }
+        BridgeError::Iggy(IggyError::PartitionsLimitReached) => {
+            tracing::warn!(
+                kafka_topic,
+                "CreateTopics refused: the Iggy node is at metadata.partitions_max"
+            );
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
+                    "the Iggy node has reached its partition limit".to_string(),
                 )))
         }
         other => {

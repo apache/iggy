@@ -35,6 +35,7 @@
 //! without pulling `shard` in as a doc-only dep.
 
 use crate::AcceptedWsClientFn;
+use crate::accept::pause_after_accept_error;
 use crate::client_listener::bind_nodelay_listener;
 use crate::lifecycle::ShutdownToken;
 use compio::net::TcpListener;
@@ -91,6 +92,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                     }
                     Err(e) => {
                         error!("Client listener (WS) accept failed: {e}");
+                        pause_after_accept_error(&e).await;
                     }
                 }
             }

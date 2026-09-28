@@ -29,8 +29,9 @@ use message_bus::installer::ConnectionInstaller;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus,
-    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, ConnectionPermit,
+    JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    SharedTlsServerConfig,
 };
 use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::stream::Streams;
@@ -144,11 +145,19 @@ impl ConnectionInstaller for SpyBus {
     }
     fn release_replica_handshake_slot(&self, _slot: u64) {}
     fn clear_replica_dial_pending(&self, _replica_id: u8) {}
-    fn install_client_fd(&self, _fd: DupedFd, _meta: ClientConnMeta, _on_request: RequestHandler) {}
+    fn install_client_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _permit: Option<ConnectionPermit>,
+        _on_request: RequestHandler,
+    ) {
+    }
     fn install_client_ws_fd(
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
+        _permit: Option<ConnectionPermit>,
         _on_request: RequestHandler,
     ) {
     }
@@ -157,6 +166,7 @@ impl ConnectionInstaller for SpyBus {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
+        _permit: Option<ConnectionPermit>,
         _on_request: RequestHandler,
     ) {
     }
@@ -165,6 +175,7 @@ impl ConnectionInstaller for SpyBus {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
+        _permit: Option<ConnectionPermit>,
         _on_request: RequestHandler,
     ) {
     }

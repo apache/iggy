@@ -90,6 +90,10 @@ class TestStats:
         assert stats.available_memory <= stats.total_memory
         assert stats.total_disk_space > 0
         assert stats.free_disk_space <= stats.total_disk_space
+        # The count can be 0 (unknown) before the first sysinfo line on
+        # kernels without their own count, but the limit is always readable.
+        assert stats.open_files_limit > 0
+        assert stats.open_files_count <= stats.open_files_limit
 
         assert isinstance(stats.run_time, datetime.timedelta)
         assert stats.run_time >= stats_before.run_time

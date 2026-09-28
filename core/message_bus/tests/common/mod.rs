@@ -220,7 +220,7 @@ pub fn install_clients_locally(
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
         let meta = test_client_meta(client_id, ClientTransportKind::Tcp);
-        installer::install_client_tcp(&bus, meta, stream, on_request.clone());
+        installer::install_client_tcp(&bus, meta, stream, None, on_request.clone());
     })
 }
 
@@ -264,7 +264,7 @@ pub fn install_ws_clients_locally(
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
         let meta = test_client_meta(client_id, ClientTransportKind::Ws);
-        bus.install_client_ws_fd(fd, meta, on_request.clone());
+        bus.install_client_ws_fd(fd, meta, None, on_request.clone());
     })
 }
 
@@ -286,7 +286,7 @@ pub fn install_tls_clients_locally(
         let meta = test_client_meta(client_id, ClientTransportKind::TcpTls);
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
-        bus.install_client_tcp_tls_fd(fd, meta, config, on_request.clone());
+        bus.install_client_tcp_tls_fd(fd, meta, config, None, on_request.clone());
     })
 }
 
@@ -308,7 +308,7 @@ pub fn install_wss_clients_locally(
         let meta = test_client_meta(client_id, ClientTransportKind::Wss);
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
-        bus.install_client_wss_fd(fd, meta, config, on_request.clone());
+        bus.install_client_wss_fd(fd, meta, config, None, on_request.clone());
     })
 }
 

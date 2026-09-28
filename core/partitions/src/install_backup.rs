@@ -17,6 +17,7 @@
 
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use std::io;
 use std::path::Path;
 
@@ -135,9 +136,11 @@ async fn link_tree<S: DurableStorage>(
                 // Transfer unlinks or atomically replaces these frozen files.
                 // Hard links retain the old bytes without copying segment data.
                 storage.hard_link(&source.join(&name), &destination).await?;
+                // Read-only, but only to sync, so it stops like a write open.
                 storage
                     .open(&destination, OpenMode::Read)
-                    .await?
+                    .await
+                    .exit_on_descriptor_exhaustion(|| format!("opening {}", destination.display()))?
                     .sync()
                     .await?;
             }

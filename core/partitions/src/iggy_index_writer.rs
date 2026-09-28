@@ -18,6 +18,7 @@
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncWriteAtExt;
 use iggy_common::IggyError;
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, trace};
@@ -51,6 +52,7 @@ impl IggyIndexWriter {
         let file = opts
             .open(file_path)
             .await
+            .exit_on_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {

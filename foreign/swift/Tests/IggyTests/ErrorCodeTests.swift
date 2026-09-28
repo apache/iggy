@@ -30,6 +30,7 @@ struct ErrorCodeTests {
         #expect(IggyErrorCode(rawValue: 58) == .transientNotAccepted)
         #expect(IggyErrorCode(rawValue: 1009) == .streamIdNotFound)
         #expect(IggyErrorCode(rawValue: 2010) == .topicIdNotFound)
+        #expect(IggyErrorCode(rawValue: 2022) == .partitionsLimitReached)
         #expect(IggyErrorCode(rawValue: 4042) == .invalidOptionValue)
         #expect(IggyErrorCode(rawValue: 5006) == .consumerGroupMemberNotFound)
         #expect(IggyErrorCode.streamIdNotFound.name == "stream_id_not_found")

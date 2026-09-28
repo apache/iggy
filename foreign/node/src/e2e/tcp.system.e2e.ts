@@ -43,7 +43,8 @@ describe('e2e -> system', async () => {
         'availableMemory', 'runTime', 'startTime', 'readBytes', 'writtenBytes',
         'messagesSizeBytes', 'streamsCount', 'topicsCount', 'partitionsCount',
         'segmentsCount', 'messagesCount', 'clientsCount', 'consumersGroupsCount',
-        'hostname', 'osName', 'osVersion', 'kernelVersion'
+        'hostname', 'osName', 'osVersion', 'kernelVersion',
+        'openFilesCount', 'openFilesLimit'
       ]
     );
   });

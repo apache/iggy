@@ -53,7 +53,7 @@ use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::{LifecycleFrame, ShardCtorError, ShardFrame, TaggedSender, validate_sender_ordering};
 use compio::net::TcpStream;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
-use message_bus::{SendError, SharedTlsServerConfig, fd_transfer};
+use message_bus::{ConnectionPermit, SendError, SharedTlsServerConfig, fd_transfer};
 use std::cell::Cell;
 use std::rc::Rc;
 use tracing::warn;
@@ -312,6 +312,8 @@ impl ShardZeroCoordinator {
     }
 
     /// Ship a client TCP connection to the next round-robin target shard.
+    /// `permit` is the socket's slot in the node's connection cap. It rides
+    /// in the setup frame, so every failure below frees it with the socket.
     ///
     /// On success returns the minted client id. On failure closes the
     /// duplicated fd and returns an error.
@@ -322,9 +324,13 @@ impl ShardZeroCoordinator {
     /// fails or `dup(2)` fails. Returns [`SendError::RoutingFailed`]
     /// when the target shard's inbox refuses the setup frame (full or
     /// disconnected).
-    pub fn delegate_client(&self, stream: TcpStream) -> Result<u128, SendError> {
+    pub fn delegate_client(
+        &self,
+        stream: TcpStream,
+        permit: ConnectionPermit,
+    ) -> Result<u128, SendError> {
         self.ship_client_fd(stream, ClientTransportKind::Tcp, |fd, meta| {
-            LifecycleFrame::ClientConnectionSetup { fd, meta }
+            LifecycleFrame::ClientConnectionSetup { fd, meta, permit }
         })
     }
 
@@ -343,9 +349,13 @@ impl ShardZeroCoordinator {
     /// Returns [`SendError::DupFailed`] if `stream.peer_addr()` lookup
     /// fails or `dup(2)` fails. Returns [`SendError::RoutingFailed`]
     /// when the target shard's inbox refuses the setup frame.
-    pub fn delegate_ws_client(&self, stream: TcpStream) -> Result<u128, SendError> {
+    pub fn delegate_ws_client(
+        &self,
+        stream: TcpStream,
+        permit: ConnectionPermit,
+    ) -> Result<u128, SendError> {
         self.ship_client_fd(stream, ClientTransportKind::Ws, |fd, meta| {
-            LifecycleFrame::ClientWsConnectionSetup { fd, meta }
+            LifecycleFrame::ClientWsConnectionSetup { fd, meta, permit }
         })
     }
 
@@ -360,9 +370,15 @@ impl ShardZeroCoordinator {
         &self,
         stream: TcpStream,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     ) -> Result<u128, SendError> {
         self.ship_client_fd(stream, ClientTransportKind::TcpTls, |fd, meta| {
-            LifecycleFrame::ClientTcpTlsConnectionSetup { fd, meta, config }
+            LifecycleFrame::ClientTcpTlsConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            }
         })
     }
 
@@ -377,9 +393,15 @@ impl ShardZeroCoordinator {
         &self,
         stream: TcpStream,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     ) -> Result<u128, SendError> {
         self.ship_client_fd(stream, ClientTransportKind::Wss, |fd, meta| {
-            LifecycleFrame::ClientWssConnectionSetup { fd, meta, config }
+            LifecycleFrame::ClientWssConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            }
         })
     }
 
@@ -447,6 +469,7 @@ mod tests {
     use super::*;
     use compio::io::AsyncRead;
     use compio::net::{TcpListener, TcpStream};
+    use message_bus::ConnectionCap;
     use message_bus::client_listener::tcp_tls;
     use message_bus::transports::tls::self_signed_for_loopback;
     use std::collections::HashSet;
@@ -888,7 +911,9 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let client_id = coord.delegate_client(client).expect("delegate ok");
+        let client_id = coord
+            .delegate_client(client, test_permit())
+            .expect("delegate ok");
         let target = (client_id >> 112) as u16;
         assert!(
             (0..4).contains(&target),
@@ -897,7 +922,7 @@ mod tests {
 
         let setup_frame = receivers[target as usize].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta }) => {
+            ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta, .. }) => {
                 assert_eq!(meta.client_id, client_id);
                 assert!(matches!(meta.transport, ClientTransportKind::Tcp));
                 drop(fd);
@@ -924,7 +949,9 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let client_id = coord.delegate_ws_client(client).expect("delegate ok");
+        let client_id = coord
+            .delegate_ws_client(client, test_permit())
+            .expect("delegate ok");
         let target = (client_id >> 112) as u16;
         assert!(
             (0..4).contains(&target),
@@ -933,7 +960,7 @@ mod tests {
 
         let setup_frame = receivers[target as usize].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta }) => {
+            ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta, .. }) => {
                 assert_eq!(meta.client_id, client_id);
                 assert!(
                     matches!(meta.transport, ClientTransportKind::Ws),
@@ -1084,6 +1111,14 @@ mod tests {
         (accepted.unwrap().0, connected.unwrap())
     }
 
+    /// A permit from an uncapped cap. The count is process-wide, so tests
+    /// here do not assert it: other tests hold permits at the same time.
+    fn test_permit() -> ConnectionPermit {
+        ConnectionCap::new(None)
+            .try_acquire()
+            .expect("an uncapped cap admits every socket")
+    }
+
     fn delegate_test_client(
         coord: &ShardZeroCoordinator,
         stream: TcpStream,
@@ -1091,12 +1126,14 @@ mod tests {
         config: &SharedTlsServerConfig,
     ) -> Result<u128, SendError> {
         match transport {
-            ClientTransportKind::Tcp => coord.delegate_client(stream),
-            ClientTransportKind::Ws => coord.delegate_ws_client(stream),
+            ClientTransportKind::Tcp => coord.delegate_client(stream, test_permit()),
+            ClientTransportKind::Ws => coord.delegate_ws_client(stream, test_permit()),
             ClientTransportKind::TcpTls => {
-                coord.delegate_tcp_tls_client(stream, Arc::clone(config))
+                coord.delegate_tcp_tls_client(stream, Arc::clone(config), test_permit())
             }
-            ClientTransportKind::Wss => coord.delegate_wss_client(stream, Arc::clone(config)),
+            ClientTransportKind::Wss => {
+                coord.delegate_wss_client(stream, Arc::clone(config), test_permit())
+            }
             _ => panic!("transport has no TCP delegation path: {transport:?}"),
         }
     }
@@ -1109,11 +1146,11 @@ mod tests {
         match (transport, frame) {
             (
                 ClientTransportKind::Tcp,
-                ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta }),
+                ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta, .. }),
             )
             | (
                 ClientTransportKind::Ws,
-                ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta }),
+                ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta, .. }),
             ) => (fd, meta),
             (
                 ClientTransportKind::TcpTls,
@@ -1121,6 +1158,7 @@ mod tests {
                     fd,
                     meta,
                     config,
+                    ..
                 }),
             )
             | (
@@ -1129,6 +1167,7 @@ mod tests {
                     fd,
                     meta,
                     config,
+                    ..
                 }),
             ) => {
                 assert!(Arc::ptr_eq(&config, expected_config));
