@@ -79,7 +79,7 @@ const MIN_INDEX_ENTRIES: usize = 4;
 /// into (`partitions::state_transfer::quarantine_partition_files`).
 const FENCED_DIR_MARKER: &str = ".fenced.";
 /// Boot log line recovery emits when the log cannot back the last entry of an
-/// index (`server::segment_recovery::recover_segment_bounds`): the positive
+/// index (`partitions::segment_recovery::recover_segment_bounds`): the positive
 /// evidence that path ran, as opposed to the clean anchored walk or a refusal.
 /// Distinct from the line the self-contradicting-index check emits, which ends
 /// "rebuilding it from the log".

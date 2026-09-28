@@ -194,20 +194,22 @@ async fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
     let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker())
         .await
         .expect_response("test request has acks != 0 and expects a response");
-    // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 - no throttle_time_ms.
-    assert_eq!(body.len(), 42);
+    // v0: error_code(2) + api_keys i32 count(4) + one 6-byte entry per scoped key - no
+    // throttle_time_ms.
+    let entries = scope::SCOPED_API_KEYS.len();
+    assert_eq!(body.len(), 6 + entries * 6);
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_i32().unwrap(), 6);
-    assert_eq!(d.remaining(), 36);
+    assert_eq!(
+        usize::try_from(d.read_i32().unwrap()).expect("api count fits usize"),
+        entries
+    );
+    assert_eq!(d.remaining(), entries * 6);
 }
 
 #[tokio::test]
-async fn produce_malformed_body_with_acks_one_stays_silent() {
-    // `kafka_protocol` decodes Produce in one shot, so a decode failure never exposes `acks`
-    // (unlike the pre-migration field-by-field decoder, which could still answer with
-    // INVALID_REQUEST once it knew acks was nonzero). Every Produce decode failure now stays
-    // silent rather than risk desyncing an acks=0 fire-and-forget client's correlation stream.
+async fn produce_malformed_body_with_acks_one_closes() {
+    // `acks` is unknown after a failed decode, so no reply is safe. Kafka closes too.
     let body = Bytes::from_static(&[
         0xff, 0xff, // null transactional_id
         0x00, 0x01, // acks = 1
@@ -217,8 +219,8 @@ async fn produce_malformed_body_with_acks_one_stays_silent() {
     assert!(
         handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
             .await
-            .is_no_response(),
-        "malformed Produce body must stay silent regardless of acks"
+            .is_close(),
+        "malformed Produce body must close regardless of acks"
     );
 }
 
@@ -806,19 +808,17 @@ async fn create_topics_decodes_request_with_real_topic_and_assignment() {
     assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
 }
 
-// ── Produce acks=0 (broker must stay silent even on a malformed body) ──────
+// ── Produce acks=0 with a malformed body closes ──────
 
 #[tokio::test]
-async fn produce_acks_zero_malformed_body_stays_silent() {
-    // topics array declares 1 element but no topic data follows - decode fails after acks=0
-    // was on the wire, though `kafka_protocol`'s one-shot decode no longer exposes that acks
-    // was read. The handler must stay silent regardless.
+async fn produce_acks_zero_malformed_body_closes() {
+    // topics array declares 1 element but no topic data follows.
     let body = build_produce_v3_body(0, 1);
     assert!(
         handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
             .await
-            .is_no_response(),
-        "handler must not respond when acks=0 even if decode fails after acks"
+            .is_close(),
+        "handler must close, not answer, when decode fails"
     );
 }
 

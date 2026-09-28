@@ -27,9 +27,7 @@ use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
-use crate::common::system::{
-    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig,
-};
+use crate::common::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
 use configs::{
     ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
     RelocatedTarget, TypedEnvProvider,
@@ -365,78 +363,6 @@ impl ServerConfig {
             self.get_partitions_path(stream_id, topic_id),
             partition_id
         )
-    }
-
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_segment_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        format!(
-            "{}/{:0>20}",
-            self.get_partition_path(stream_id, topic_id, partition_id),
-            start_offset
-        )
-    }
-
-    pub fn get_messages_file_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{LOG_EXTENSION}")
-    }
-
-    pub fn get_index_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{INDEX_EXTENSION}")
     }
 }
 
