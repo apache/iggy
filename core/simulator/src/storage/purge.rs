@@ -49,9 +49,8 @@ use partitions::offset_storage::{
 };
 use partitions::{
     IggyPartition, IggyPartitions, Partition, PartitionPathLayout, PartitionsConfig, PollingArgs,
-    PollingConsumer,
+    PollingConsumer, configure_consumer_offsets_with_storage,
 };
-use server::configure_consumer_offsets_with_storage;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, ShardId};
 use std::path::{Path, PathBuf};
@@ -75,7 +74,7 @@ type TestPartition = IggyPartition<Rc<IggyMessageBus>>;
 /// separate message journal supplies history for rebuilding each new partition.
 struct PurgeStorageHarness {
     storage: SimStorage,
-    config: ServerConfig,
+    config: PartitionsConfig,
     namespace: IggyNamespace,
     /// Policy for consumer offsets; message durability is established by the fixture.
     policy: Durability,
@@ -86,11 +85,17 @@ impl PurgeStorageHarness {
     /// All files and their directory entries are durable before the test starts,
     /// including when the selected offset policy does not require an immediate sync.
     async fn with_stored_progress(policy: Durability) -> Self {
+        let server_config = ServerConfig {
+            path: "/purge".to_owned(),
+            ..ServerConfig::default()
+        };
         let harness = Self {
             storage: SimStorage::default(),
-            config: ServerConfig {
-                path: "/purge".to_owned(),
-                ..ServerConfig::default()
+            config: PartitionsConfig {
+                path_layout: PartitionPathLayout {
+                    streams_root: server_config.get_streams_path(),
+                },
+                ..partition_config()
             },
             namespace: IggyNamespace::new(0, 0, 42),
             policy,

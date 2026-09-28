@@ -54,7 +54,7 @@ for getting them to the external system reliably and efficiently.
 
 ### Payloads (efficiency-critical)
 
-- Dispatch on `messages_metadata.schema` and the `Payload` variant. Handle `Json`, `Raw`, `Text` at minimum. Unsupported -> `Error::InvalidPayloadType` or fall back to base64 (`elasticsearch_sink`).
+- Dispatch on the `Payload` variant. Handle `Json`, `Raw`, `Text` and `Proto` at minimum. `Proto` holds text that is a JSON document when `proto_convert` had no descriptor or could not encode, and arbitrary text otherwise: call `Payload::json_document()` first and fall back to the text handling when it returns `None`. Unsupported -> `Error::InvalidPayloadType` or fall back to base64 (`elasticsearch_sink`).
 - For `Payload::Json`, call `try_to_bytes(&self)` - single-pass serialization without cloning the `OwnedValue` tree (`sdk/src/lib.rs::Payload::try_to_bytes`). Never `payload.clone().try_into_vec()`.
 - To take a payload out of `ConsumedMessage` without cloning: `std::mem::replace(&mut message.payload, Payload::Raw(vec![]))`. Standard pattern across `http_sink::send_individual` / `send_ndjson` / `send_json_array`.
 - Pre-allocate per-batch buffers with `Vec::with_capacity(messages.len())` (or `* factor` for serialized bodies). Used across `postgres_sink`, `mongodb_sink`, `quickwit_sink`, `elasticsearch_sink`, `http_sink`.

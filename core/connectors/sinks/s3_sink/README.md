@@ -129,7 +129,7 @@ Each line:
 {"offset":42,"timestamp":"2026-03-16T14:02:31Z","stream":"application_logs","topic":"api_requests","partition_id":1,"payload":{"method":"GET","path":"/api/users","status":200}}
 ```
 
-Both JSON formats wrap the payload under `payload`, including when metadata is disabled. JSON values retain their shape; text and Proto variants become strings. Valid JSON raw bytes are parsed; other raw bytes, Avro and FlatBuffer variants become base64 strings without an encoding tag.
+Both JSON formats wrap the payload under `payload`, including when metadata is disabled. JSON values retain their shape; text variants become strings, and Proto variants become the JSON document they hold when the text parses as JSON (the descriptor-less `proto_convert` fallback) or a string otherwise. Valid JSON raw bytes are parsed; other raw bytes, Avro and FlatBuffer variants become base64 strings without an encoding tag.
 Metadata timestamps use UTC second precision; IDs, checksums and origin timestamps are omitted. Headers are independent of metadata: strings remain strings, raw values become base64, booleans remain booleans, supported numeric values become JSON numbers, and other values use strings.
 
 Raw output concatenates payload bytes without delimiters and ignores both inclusion flags. Use `schema = "raw"` without payload-changing transforms to preserve original bytes; JSON decoding followed by raw output can reserialize the payload.

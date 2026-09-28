@@ -339,6 +339,7 @@ impl MeilisearchSink {
             payload,
         } = message;
 
+        let payload = payload.into_json_document();
         let mut document = match payload {
             Payload::Json(value) => {
                 Self::document_from_json_value(owned_value_into_serde_json(value))
@@ -360,7 +361,7 @@ impl MeilisearchSink {
                     ]),
                 }
             }
-            Payload::Text(text) => Map::from_iter([
+            Payload::Text(text) | Payload::Proto(text) => Map::from_iter([
                 ("text".to_string(), Value::String(text)),
                 ("data_type".to_string(), Value::String("text".to_string())),
             ]),
@@ -1180,6 +1181,41 @@ mod tests {
             max_retry_delay: None,
             max_open_retries: None,
         }
+    }
+
+    #[test]
+    fn proto_payloads_holding_json_are_indexed_as_documents() {
+        let sink = sink_with_config(base_config());
+        let message = message(Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_owned()));
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("proto text holding JSON is a document");
+
+        assert_eq!(
+            document.get("name"),
+            Some(&Value::String("row-1".to_string()))
+        );
+        assert_eq!(document.get("data_type"), None);
+    }
+
+    #[test]
+    fn proto_payloads_that_are_not_json_are_stored_as_text() {
+        let sink = sink_with_config(base_config());
+        let message = message(Payload::Proto("name: \"row-1\"".to_owned()));
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("proto text still indexes");
+
+        assert_eq!(
+            document.get("text"),
+            Some(&Value::String("name: \"row-1\"".to_string()))
+        );
+        assert_eq!(
+            document.get("data_type"),
+            Some(&Value::String("text".to_string()))
+        );
     }
 
     #[test]

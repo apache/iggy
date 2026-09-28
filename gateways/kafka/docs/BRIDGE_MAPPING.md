@@ -35,19 +35,60 @@ Produce, per record:
 
 | Kafka | Iggy |
 | ------- | ------ |
+| (nothing) | `kafka.v` user header, one byte, the mapping version |
 | record value | `payload` |
 | record key | `kafka.key` user header, `Raw` |
 | record header `name` | `kafka.h.<name>` user header, `Raw` |
-| record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds |
+| record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds, plus `kafka.ts` when that cannot hold it |
 | record offset | partition offset, assigned by Iggy |
 | partition index | partition index, both 0-based |
 | topic | stream and topic per `TopicMapping` |
 
-Fetch reverses it. A message with no `kafka.*` headers is a message an Iggy client wrote, and
-encodes as a Kafka record with a null key, its Iggy user headers as Kafka headers, and
-`origin_timestamp` as the record timestamp (falling back to the server-assigned `timestamp`
-when the origin timestamp is zero). Iggy header kinds other than `Raw` and `String` are emitted
-as their raw value bytes.
+Fetch reverses it. A message with no `kafka.v` header is a message an Iggy client wrote. It
+encodes as a Kafka record with a null key, and its Iggy user headers become Kafka headers under
+their own names. The record timestamp comes from `origin_timestamp`. If the origin timestamp is zero, it comes
+from the server-assigned `timestamp` instead.
+
+An Iggy header key carries a kind as well as bytes. If the bytes are UTF-8, they are the Kafka
+header name, whatever the kind says. The kind is the producer's choice, and a Kafka name is a
+string either way. Iggy header values are emitted as their raw bytes.
+
+### Provenance
+
+`kafka.v` is on every message the gateway writes and on no other. Fetch reads it first, and
+everything else in this document follows from what it says.
+
+Present and equal to the version this build implements: the gateway wrote this message. Every
+marker on it is authoritative, and a marker this build does not recognize is an error rather than
+a guess. Only `kafka.h.` headers reach the consumer as Kafka headers.
+
+Present and some other value: a later mapping wrote this message. Fetch refuses it rather than
+reading it under rules that changed after it was written.
+
+Absent: an Iggy client wrote this message. No `kafka.` header on it means anything, every header
+passes through under its own name, and the payload is the record value.
+
+The alternative was to take any `kafka.`-prefixed header as proof of provenance. This document
+reserves the namespace and nothing in the server enforces it, so that proof was worthless. One
+stray `kafka.` header hid every other header on a message, and a `kafka.value` of `null` turned
+the message into a tombstone. One version header costs about 14 bytes against the 100 KB header
+budget and settles all of it.
+
+The native path is versioned for a second reason. It is the storage form for nearly every record,
+and open questions 2 and 3 below can still change it. Without a version on the stored message, a
+change to either one decodes older records wrongly and gives no way to notice.
+
+What `kafka.v` does not give is enforcement. It is a claim the message makes. The server keeps no
+namespace for it, so an Iggy writer can set `kafka.v` to a version no build implements. Every read
+of that message then fails. Fetch cannot serve a record it cannot decode, and a Kafka consumer
+cannot step over one. One such message therefore stalls the partition for every Kafka consumer.
+
+This is the open end of the provenance design, and it belongs to Fetch rather than to the mapping.
+The handler in [#3536](https://github.com/apache/iggy/issues/3536) owns the policy for a message
+the mapping refuses. Two shapes are on the table. Skipping serves the records around it and
+leaves a gap, which Kafka consumers already tolerate on a compacted topic. Its cost is that a
+message goes missing with no signal. Quarantining records the offset and surfaces a metric. Its
+cost is somewhere to keep the record. Neither is decided here.
 
 ### Timestamps
 
@@ -59,9 +100,25 @@ A record that arrived through Produce survives the round trip exactly, because i
 value is always a whole number of milliseconds. A message an Iggy client wrote does not. Its
 sub-millisecond digits are lost on the way out, and Kafka has no field to keep them in.
 
-Kafka sends `-1` for a record with no timestamp. That is stored as `0`, and Fetch already reads
-a zero origin timestamp as an instruction to use the server-assigned timestamp instead. A real
-broker does the same thing under `LogAppendTime`, so the two agree.
+Kafka sends `-1` for a record with no timestamp. That is stored as `0`, and Fetch reads a zero
+origin timestamp as the server-assigned one. A real broker does the same under `LogAppendTime`.
+
+One Iggy send holds origin timestamps at most `u32::MAX` µs apart, about 71.6 min
+(`core/binary_protocol/src/batch.rs:55`). Kafka has no such bound. So each produce batch gets one
+window, from its earliest real timestamp. A timestamp outside it is clamped in, and the `kafka.ts`
+header (`Int64`, ms) keeps the real one:
+
+| Record timestamp | `origin_timestamp` | `kafka.ts` |
+| ---------------- | ------------------ | ---------- |
+| In the window | timestamp × 1000 | none |
+| After the window | window end | timestamp |
+| `-1`, no real timestamp in the batch | `0` | none |
+| `-1`, next to real timestamps | window start | `-1` |
+| `0`, the epoch | window start, or `0` | `0` |
+
+Fetch reads `kafka.ts` first. `-1` there means the server-assigned timestamp. An Iggy client sees
+the clamped `origin_timestamp`. Only a batch over 71.6 min, or one mixing `-1` with real
+timestamps, has one.
 
 ## Records Iggy cannot hold natively
 
@@ -95,12 +152,19 @@ A record takes the fallback when any of these hold:
 - the key is longer than 255 bytes
 - a header name, prefixed with `kafka.h.`, is longer than 255 bytes
 - a header value is null, empty, or longer than 255 bytes
-- two headers share a name
 - the headers together would exceed the 100 KB user-header budget
 
-Such a record is stored with a `kafka.envelope` header whose value is one byte, the format
-version, currently `1`. The payload holds the key, the value and the headers in the layout
-below. Fetch checks for that header first and takes the plain path only when it is absent.
+A repeated header name is refused with `INVALID_RECORD` (87). Kafka allows one, but
+`kafka_protocol` decodes headers into an `IndexMap` and keeps only the last value. The gateway
+checks the raw record bytes first (`scan_records`).
+
+Such a record is stored with a `kafka.envelope` header whose value is one byte, the byte layout
+version, currently `1`. The payload holds the key, the value and the headers in the layout below.
+Fetch checks for that header first and takes the plain path only when it is absent.
+
+That byte numbers the layout below and nothing else. `kafka.v` numbers the mapping as a whole.
+Both exist because the envelope layout can change while the rest of the mapping stands. A record
+on the native path also needs a version, and it has no envelope to carry one.
 
 The layout is fixed here rather than left to the implementation, because `kafka_protocol` hands
 a handler a decoded `Record` and never a raw slice of the record, so there is no verbatim body
@@ -129,6 +193,12 @@ The cost is that these messages are opaque to Iggy consumers and connectors. Tha
 of confining the fallback to record shapes that are rare in practice, rather than making it the
 default storage form.
 
+The envelope moves the key and the headers into the payload, so it cannot hold every record the
+native path cannot. A value close enough to `MAX_PAYLOAD_SIZE`, on a record whose key is empty or
+over 255 bytes, comes to more than `MAX_PAYLOAD_SIZE` once the envelope wraps it, and Produce
+rejects the record with `MESSAGE_TOO_LARGE` (10). The gateway measures the envelope before it
+builds one, so the answer does not depend on allocating a payload already known to be too big.
+
 ## Batch-level fields
 
 Per-record storage drops what the Kafka record batch header carries: producer id, producer
@@ -148,9 +218,45 @@ Whether producer id `-1` is what Fetch actually sends depends on the InitProduce
 [`IDEMPOTENCE.md`](IDEMPOTENCE.md). Allocating producer ids does not change what is stored, only
 what Produce accepts, so this section holds under either answer.
 
-Produce decompresses gzip, snappy, lz4 and zstd batches, which means turning those features back
-on for the `kafka-protocol` dependency (`Cargo.toml:217` currently builds it with
-`default-features = false, features = ["broker"]`). Fetch emits uncompressed batches.
+Produce refuses a control batch and a transactional batch. A stored message carries neither flag.
+A control record admitted here therefore reaches consumers as ordinary application data, and a
+consumer filters control records by exactly that flag. Transactions are out of scope in
+[`IDEMPOTENCE.md`](IDEMPOTENCE.md), so refusing is the answer that leaves a consumer's view
+intact.
+
+Fetch writes one batch per response rather than one per record. The encoder groups records while
+`offset - sequence` holds, so each record's `sequence` is numbered from the first offset in the
+response. The record constructor leaves `sequence` at `-1` on every record. That breaks the group
+on every record, and each one then carries its own 61-byte batch header.
+
+Two counts in a batch drive an allocation, and upstream checks each one for sign alone. Both are
+bounded here, in different places, because no single place can see them both.
+
+The batch header's record count sits in the header, and `RecordBatchDecoder` reserves a `Vec` from
+it (`kafka-protocol-0.18.0/src/records.rs:517`). A 61-byte batch declaring `i32::MAX` records asks
+for 377 GB. Produce reads the batch header before it decodes a record and refuses a count the
+blob cannot produce. That ceiling is the blob's own length. If the batch is compressed, the whole
+decompression budget is added to it. An uncompressed batch's records are already
+in the blob, and granting it the budget as well lets a 70-byte batch declare a million records.
+
+The per-record header count sits inside a record body, as a varint, so no batch header reports it
+and the header pass cannot see it. `Record::decode_new` reserves an `IndexMap` from it
+(`kafka-protocol-0.18.0/src/records.rs:896`), and that allocation is resident rather than virtual,
+because hashbrown writes its control bytes. A 72-byte batch declaring one record and `i32::MAX`
+headers aborts the process. Produce therefore walks the record bytes in the decompression step,
+which runs for every batch including an uncompressed one. It refuses a header count the record's
+own bytes cannot hold, at two length varints per header.
+
+- One batch per partition, as Kafka from v3. A second one: 87.
+- More records than the batch declares: 87. The decoder would drop the extra ones.
+
+Neither bound changes the ratio between a wire record and a decoded `Record`. Produce therefore
+also caps record slots per request at `max_frame_size / 64` (131,072 for 8 MiB). Headers take 1
+slot per 3. Past it: 10, or 6 if earlier partitions used the slots and this one fits alone.
+
+Produce decompresses gzip, snappy, lz4 and zstd batches. `gateways/kafka/Cargo.toml` turns those
+four features on for `kafka-protocol` and the workspace entry stays on `broker` alone, so the
+codecs are declared by the crate that needs them. Fetch emits uncompressed batches.
 
 Decompression needs its own bound, and the bound is per request rather than per batch.
 `max_frame_size` bounds the frame a client sent, which is the compressed size, and zstd reaches
@@ -161,13 +267,26 @@ therefore still admit 4096 times that much output.
 
 Produce keeps a single decompression budget for the whole request, set to `max_frame_size`, so a
 compressed request can never yield more than the same client could have sent uncompressed. A
-batch that exhausts the budget is rejected with `MESSAGE_TOO_LARGE` (10) before the output is
-allocated. Each decompressed record value has to clear Iggy's own `MAX_PAYLOAD_SIZE` (64 MB,
-`iggy_message.rs:44`) separately, since one record becomes one message.
+partition over the whole budget: `MESSAGE_TOO_LARGE` (10). One that fits alone after earlier
+partitions used the budget: `NOT_LEADER_OR_FOLLOWER` (6). Each decompressed
+record value has to clear Iggy's own `MAX_PAYLOAD_SIZE` (64 MB, `iggy_message.rs:44`) separately,
+since one record becomes one message.
 
-Nothing decompresses today. The record batch stays an opaque `Bytes` on both paths, so the bound
-above is a requirement on [#3535](https://github.com/apache/iggy/issues/3535) rather than a
-description of current behavior.
+The budget bounds the peak, not just the total. `kafka_protocol`'s own decompressors write the
+whole stream into a growing buffer before they hand it over (`compression/gzip.rs:46` and its
+three siblings). A batch decoded through them reaches its full decompressed size in memory, and
+the budget then reports an overrun that already happened.
+
+The gateway therefore drives the four codecs itself, through an `io::Write` sink that refuses the
+write past the budget. Gzip, zstd and lz4 stream through that sink. Snappy is the one codec that
+states its output size up front, and `snap` reads that number without allocating. The declared
+size is charged before the decoder runs, for Kafka's own block framing and for raw snappy alike.
+
+`records::decode_batch` decompresses, and `records::DecompressionBudget` is the bound. The
+budget is a parameter, and the Produce handler
+([#3535](https://github.com/apache/iggy/issues/3535)) sets it to `max_frame_size` once per
+request. The handler converts and sends one entry at a time. It borrows the budget only in sync
+calls, because a borrow held across an await makes the connection task `!Send`.
 
 ## Offsets
 
@@ -194,6 +313,22 @@ carries meaning. The envelope does preserve order, since it stores the headers a
 record only reaches the envelope for one of the reasons above. A consumer that depends on header
 order therefore sees a different order through the gateway than a real broker would give it.
 
+### Header name collisions
+
+An Iggy header key is bytes plus a kind, and the key orders on kind before bytes
+(`core/common/src/types/message/user_headers.rs:209`). Two keys holding the same bytes under
+different kinds are therefore two stored headers. A Kafka header name is a string, so both map to
+one name.
+
+Kafka carries headers as a list and holds both. A `kafka_protocol` `Record` keys them in an
+`IndexMap`, so nothing here keeps the pair, and the later key in stored order wins.
+
+On a message the gateway wrote this cannot happen, because `to_iggy` writes one key kind. Fetch
+therefore refuses such a message, rather than dropping a header from it quietly. On a message an
+Iggy client wrote it can happen, and Fetch keeps one header and loses the other. Refusing that
+message lets one Iggy writer stall the partition for every Kafka consumer of it, which is the
+worse of the two.
+
 ## Partitioning
 
 Both systems number partitions from 0, so the partition index passes through unchanged in each
@@ -212,9 +347,25 @@ Iggy's group registry is used as an offset key and for nothing else, which
 
 ## Reserved header namespace
 
-`kafka.` is reserved on messages the gateway writes and reads. An Iggy producer that sets a
-header in that namespace on a topic a Kafka consumer reads will have it interpreted as gateway
+`kafka.` is reserved on messages the gateway writes. Nothing in the server enforces it, so the
+reservation buys nothing on its own. `kafka.v` carries the provenance instead, as the Provenance
+section above describes. An Iggy producer that sets `kafka.value` or `kafka.envelope` without
+`kafka.v` gets those headers back under their own names. The gateway reads none of them as
 metadata.
+
+A producer that sets `kafka.v` as well is claiming to be this gateway, and Fetch takes the claim:
+a marker or an envelope that does not parse is then an error for that message. The header block
+and the envelope payload are still treated as untrusted throughout, so the error is a rejection
+and never an allocation. The envelope decoder charges the nine bytes each header needs against
+the payload before it reserves for one, and it rejects a payload with bytes left over after the
+last header.
+
+One more case is not a namespace question. Iggy folds a user-header block it cannot parse into
+"this message has no headers" (`core/common/src/types/message/iggy_message.rs:240`). Read that
+way, an enveloped message loses its `kafka.envelope` marker. Its envelope bytes then reach the
+consumer as the record value, and a tombstone arrives as a one-byte message. Fetch tells an
+unreadable block from an absent one by the stored `user_headers_length`, and refuses the
+message.
 
 ## Open questions
 
@@ -239,7 +390,8 @@ Every Kafka header name is stored as `kafka.h.<name>`, which spends 8 of the 255
 header name has, on every header of every record. A shorter prefix buys those bytes back and
 costs readability for anyone reading a stream by hand.
 
-Default: keep `kafka.`.
+Default: keep `kafka.`. `kafka.v` makes the answer revisable: a later mapping version can use a
+shorter prefix, and already stored records keep decoding under the version they carry.
 
 ### 3. Is the placeholder byte acceptable for tombstones?
 
@@ -250,7 +402,8 @@ The alternative is the envelope, which costs a tombstone the fast path. Tombston
 traffic on compacted Kafka topics, and Iggy has no compaction, so they are stored and served
 like any other record.
 
-Default: keep the placeholder byte.
+Default: keep the placeholder byte. `kafka.v` makes this answer revisable too, on the same
+terms as question 2.
 
 ### 4. Recompress on Fetch, or always emit uncompressed?
 

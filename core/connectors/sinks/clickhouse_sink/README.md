@@ -60,7 +60,7 @@ verbose_logging = false
 
 ### `json_each_row` (Default)
 
-Accepts messages with a `Payload::Json` payload. Each payload is serialized on its own line using ClickHouse's `JSONEachRow` format. Send JSON objects whose fields and values are compatible with the existing table and its ClickHouse input settings. The connector does not validate JSON rows against the table schema before sending them.
+Accepts messages with a `Payload::Json` payload, or a `Payload::Proto` payload whose text is a JSON document (what a `proto_convert` transform hands over when it has no descriptor or cannot encode a message). Each document is serialized on its own line using ClickHouse's `JSONEachRow` format. Send JSON objects whose fields and values are compatible with the existing table and its ClickHouse input settings. The connector does not validate JSON rows against the table schema before sending them.
 
 ```toml
 [plugin_config]
@@ -71,7 +71,7 @@ insert_format = "json_each_row"
 
 ### `row_binary`
 
-Accepts messages with a `Payload::Json` payload. At startup the connector fetches the table schema from `system.columns` and validates that all column types are supported. Messages are then serialised to ClickHouse's `RowBinaryWithDefaults` binary format, which is more efficient than JSON for large volumes.
+Accepts messages with a `Payload::Json` payload, or a `Payload::Proto` payload whose text is a JSON document. At startup the connector fetches the table schema from `system.columns` and validates that all column types are supported. Messages are then serialised to ClickHouse's `RowBinaryWithDefaults` binary format, which is more efficient than JSON for large volumes.
 
 Requires [ClickHouse 23.7 or newer](https://presentations.clickhouse.com/2023-release-23.7/index.html), when `RowBinaryWithDefaults` was introduced. Older servers reject the format; use `json_each_row` instead.
 
@@ -92,7 +92,7 @@ insert_format = "row_binary"
 
 ### `string`
 
-Accepts messages with a `Payload::Text` payload and appends a newline to each payload that does not already end with one. Set the stream `schema = "text"` and use `string_format` to tell ClickHouse which format to expect.
+Accepts messages with a `Payload::Text` or `Payload::Proto` payload and appends a newline to each payload that does not already end with one. Set the stream `schema = "text"` and use `string_format` to tell ClickHouse which format to expect. Nothing is re-serialized in this mode, so a `proto_convert` transform with `pretty_json = true` combined with `string_format = "json_each_row"` is a misconfiguration: the multi-line document is written as several lines and ClickHouse rejects the insert.
 
 ```toml
 [plugin_config]
@@ -170,7 +170,7 @@ On shutdown the connector logs the total number of messages processed.
 
 ### Bad rows in a batch
 
-A message whose payload type does not match the chosen format (for example a text payload in JSON mode) is skipped with an error log. The rest of the batch is still sent.
+A message whose payload type does not match the chosen format (for example a text payload in JSON mode, or proto text that is not a JSON document) is skipped with an error log. The rest of the batch is still sent.
 
 The `row_binary` format fails the whole batch on the first JSON row whose values cannot be converted to the target columns. This occurs before any insert request, so the batch does not enter the plugin's insert retry loop. No partial binary row is sent.
 

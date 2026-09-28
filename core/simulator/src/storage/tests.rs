@@ -27,7 +27,7 @@ use journal::partition_journal::{
     PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
 };
 use journal::{DurableAppend, PartitionPrepareJournal};
-use partitions::{PartitionPersistence, PersistenceMetrics, install_backup};
+use partitions::{CheckpointBarrier, PartitionPersistence, PersistenceMetrics, install_backup};
 use server_common::send_messages::{
     BATCH_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
@@ -652,6 +652,7 @@ fn replacing_a_retained_offset_writer_keeps_both_inodes_until_checkpoint() {
             1,
             vec![path.to_path_buf()],
             vec![Path::new(DIRECTORY).to_path_buf()],
+            Vec::new(),
         );
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
@@ -731,6 +732,7 @@ fn checkpoint_skips_duplicate_offset_sync_but_still_refuses_a_missing_path() {
                 1,
                 vec![path.to_path_buf()],
                 vec![Path::new(DIRECTORY).to_path_buf()],
+                Vec::new(),
             );
             storage.clear_trace();
             assert!(persistence.start());
@@ -795,6 +797,39 @@ async fn interrupted_install() -> SimStorage {
     drop(journal);
     storage.crash(Crash::PowerLoss);
     storage
+}
+
+/// A hard link preserves the inode, not the writer's error cursor. Opening the
+/// backup name after writeback failed must not authorize destructive install.
+#[test]
+#[ignore = "`install_backup::link_tree` synchronizes hard links through handles opened after the writeback failure"]
+fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publication() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let path = Path::new("/partition/materialized");
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"pending".to_vec()).await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        let result = install_backup::begin_with_storage(Path::new(DIRECTORY), &storage).await;
+
+        assert!(
+            writer.sync().await.is_err(),
+            "the original writer did not observe the injected writeback failure"
+        );
+        assert!(
+            result.is_err(),
+            "install backup published after synchronizing a fresh hard-link handle past the writeback error"
+        );
+        assert!(
+            !storage
+                .exists(Path::new("/partition/.install-backup"))
+                .await
+                .unwrap(),
+            "a failed backup was published"
+        );
+    });
 }
 
 #[test]
@@ -1114,7 +1149,12 @@ fn checkpoint_syncs_the_retained_writer_before_reclaiming_its_history() {
         );
         storage.remove_file(path).await.unwrap();
         persistence.retire_offset_file(path.to_str().unwrap());
-        persistence.checkpoint_files(4, Vec::new(), vec![Path::new(DIRECTORY).to_path_buf()]);
+        persistence.checkpoint_files(
+            4,
+            Vec::new(),
+            vec![Path::new(DIRECTORY).to_path_buf()],
+            Vec::new(),
+        );
         storage.fail_at(0, FaultMode::Before);
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
@@ -1142,10 +1182,12 @@ fn checkpoint_barriers_complete_before_wal_reclamation() {
             .unwrap();
         let mut file = storage.open(path, OpenMode::Create).await.unwrap();
         file.write(0, b"committed".to_vec()).await.unwrap();
+        let barrier = CheckpointBarrier::from_file(path, file);
         persistence.checkpoint_files(
             4,
             vec![path.to_path_buf()],
             vec![Path::new(DIRECTORY).to_path_buf()],
+            vec![barrier],
         );
         assert!(persistence.checkpoint_pending());
         assert!(!persistence.needs_checkpoint());
@@ -1185,7 +1227,7 @@ fn failed_materialization_keeps_wal_coverage_and_fences_completion() {
             } else {
                 (missing, Vec::new())
             };
-            persistence.checkpoint_files(4, files, directories);
+            persistence.checkpoint_files(4, files, directories, Vec::new());
             assert!(persistence.start());
             Rc::clone(&persistence).run().await;
             assert_eq!(
@@ -2758,7 +2800,6 @@ fn given_a_silent_short_write_when_recovering_then_the_record_should_be_refused(
 }
 
 #[test]
-#[ignore = "PR #4092 review: `checkpoint_files` syncs materialized files through a descriptor opened after the writeback failure, which samples errseq too late and reports success over lost bytes; it must sync through the writer that issued them"]
 fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_reclaimed() {
     block_on(async {
         let (storage, persistence) = queued_batch(4).await;
@@ -2767,6 +2808,7 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
         let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
         writer.write(0, b"committed".to_vec()).await.unwrap();
+        let barrier = CheckpointBarrier::from_file(path, writer);
 
         // The device drops the dirty pages before the checkpoint's barrier. The
         // writer that issued them is the only handle told; the descriptor
@@ -2777,6 +2819,7 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
             4,
             vec![path.to_path_buf()],
             vec![Path::new(DIRECTORY).to_path_buf()],
+            vec![barrier],
         );
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
@@ -2796,6 +2839,48 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
             0,
             "WAL history was reclaimed although its materialization never reached stable storage"
         );
+        assert_eq!(recovered.head(), 4);
+    });
+}
+
+#[test]
+fn given_multiple_writers_for_one_checkpoint_file_when_one_has_not_observed_the_writeback_failure_then_wal_history_should_not_be_reclaimed()
+ {
+    block_on(async {
+        let (storage, persistence) = queued_batch(4).await;
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let path = Path::new("/partition/materialized");
+        let mut first_writer = storage.open(path, OpenMode::Create).await.unwrap();
+        first_writer.write(0, b"first".to_vec()).await.unwrap();
+        let mut second_writer = storage.open(path, OpenMode::ReadWrite).await.unwrap();
+        second_writer.write(5, b"second".to_vec()).await.unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        // Consuming the inode error through one file description must not let
+        // checkpoint skip another writer that still has the error pending.
+        assert!(first_writer.sync().await.is_err());
+        let barriers = vec![
+            CheckpointBarrier::from_file(path, first_writer),
+            CheckpointBarrier::from_file(path, second_writer),
+        ];
+        persistence.checkpoint_files(
+            4,
+            vec![path.to_path_buf()],
+            vec![Path::new(DIRECTORY).to_path_buf()],
+            barriers,
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+
+        assert!(persistence.failure().is_some());
+        assert_eq!(persistence.checkpoint_op(), 0);
+        storage.crash(Crash::PowerLoss);
+        let recovered =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert_eq!(recovered.checkpoint_op(), 0);
         assert_eq!(recovered.head(), 4);
     });
 }

@@ -168,6 +168,7 @@ pub struct Metrics {
     messages_processed: Family<ConnectorLabels, Counter>,
     messages_filtered: Family<ConnectorLabels, Counter>,
     errors: Family<ConnectorLabels, Counter>,
+    sink_runs: Family<ConnectorLabels, Counter>,
     stage_duration_seconds: Family<StageLabels, Histogram, fn() -> Histogram>,
 }
 
@@ -185,6 +186,7 @@ impl Metrics {
         let messages_processed = Family::<ConnectorLabels, Counter>::default();
         let messages_filtered = Family::<ConnectorLabels, Counter>::default();
         let errors = Family::<ConnectorLabels, Counter>::default();
+        let sink_runs = Family::<ConnectorLabels, Counter>::default();
         let stage_duration_seconds: Family<StageLabels, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(stage_histogram);
 
@@ -240,6 +242,13 @@ impl Metrics {
             "Errors encountered",
             errors.clone(),
         );
+        // One batch is one `stage_duration_seconds{stage="total"}` sample, so
+        // runs per batch is this counter over that sample count.
+        registry.register(
+            "iggy_connector_sink_runs",
+            "FFI consume() calls made for sink batches, one per contiguous payload-variant run",
+            sink_runs.clone(),
+        );
         registry.register(
             "iggy_connector_stage_duration_seconds",
             "Per-batch processing stage duration in seconds",
@@ -258,6 +267,7 @@ impl Metrics {
             messages_processed,
             messages_filtered,
             errors,
+            sink_runs,
             stage_duration_seconds,
         }
     }
@@ -434,6 +444,10 @@ impl Metrics {
         }
     }
 
+    pub fn inc_sink_runs_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        self.sink_runs.get_or_create(labels).inc_by(count);
+    }
+
     /// Owned `errors` counter (Arc-shared atomic) for lookup-free hot-path increments.
     pub fn error_counter(&self, labels: &ConnectorLabels) -> Counter {
         self.errors.get_or_create(labels).clone()
@@ -468,6 +482,16 @@ impl Metrics {
 
     pub fn get_messages_processed(&self, key: &str) -> u64 {
         self.messages_processed
+            .get_or_create(&ConnectorLabels {
+                connector_key: key.to_owned(),
+                connector_type: ConnectorType::Sink,
+            })
+            .get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_sink_runs(&self, key: &str) -> u64 {
+        self.sink_runs
             .get_or_create(&ConnectorLabels {
                 connector_key: key.to_owned(),
                 connector_type: ConnectorType::Sink,
@@ -525,7 +549,7 @@ mod tests {
     /// Every series the registry renders once each family holds a sample.
     /// Counters carry exactly one `_total`, gauges and histogram buckets carry
     /// the suffixes the OpenMetrics encoder gives them.
-    const RENDERED_SERIES_NAMES: [&str; 13] = [
+    const RENDERED_SERIES_NAMES: [&str; 14] = [
         "iggy_connectors_sources_total",
         "iggy_connectors_sources_running",
         "iggy_connectors_sinks_total",
@@ -536,6 +560,7 @@ mod tests {
         "iggy_connector_messages_processed_total",
         "iggy_connector_messages_filtered_total",
         "iggy_connector_errors_total",
+        "iggy_connector_sink_runs_total",
         "iggy_connector_stage_duration_seconds_sum",
         "iggy_connector_stage_duration_seconds_count",
         "iggy_connector_stage_duration_seconds_bucket",
@@ -556,6 +581,13 @@ mod tests {
         metrics.increment_messages_processed("k", 1);
         metrics.increment_messages_filtered("k", ConnectorType::Sink, 1);
         metrics.increment_errors("k", ConnectorType::Sink);
+        metrics.inc_sink_runs_with_labels(
+            &ConnectorLabels {
+                connector_key: "k".to_owned(),
+                connector_type: ConnectorType::Sink,
+            },
+            1,
+        );
         metrics.observe_stage_duration(
             "k",
             ConnectorType::Sink,

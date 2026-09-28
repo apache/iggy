@@ -162,9 +162,7 @@
 //! discriminator, like `checkpoint_id` on every prepare
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
-use crate::partition_helpers::{
-    build_partition_fresh, delete_partitions_from_disk, load_partition_or_fence,
-};
+use crate::partition_helpers::{build_partition_fresh, load_partition_or_fence};
 use crate::shell::ServerShard;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -180,6 +178,7 @@ use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Partition, StatsRegistry};
+use partitions::delete_partitions_from_disk;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -781,6 +780,7 @@ async fn reconcile_additions(
         } else {
             build_partition_fresh(
                 ctx.config.as_ref(),
+                partitions.config(),
                 ns,
                 partition_stats,
                 created_revision,
@@ -1019,7 +1019,7 @@ async fn tear_down_owned_partition(
         ns.stream_id(),
         ns.topic_id(),
         ns.partition_id(),
-        ctx.config.as_ref(),
+        partitions.config(),
     )
     .await
     {
@@ -1488,6 +1488,7 @@ mod tests {
         Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
         RequestPreparesHeader, RoutedRequestHeader, WireIdentifier, WireOptions,
     };
+    use journal::Journal;
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
     use metadata::MuxStateMachine;
@@ -1780,6 +1781,7 @@ mod tests {
             group_id: WireIdentifier::numeric(group_id),
             client_id,
             in_flight: Vec::new(),
+            session: None,
         };
         mux.update(build_prepare(op, Operation::JoinConsumerGroup, &req))
             .expect("JoinConsumerGroup apply succeeds");
@@ -1808,12 +1810,15 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
                 encryptor: None,
-                path_layout: PartitionPathLayout::default(),
+                // The reconciler reads segment and offset paths off this layout,
+                // so it must root where `test_config` rooted the server's own.
+                path_layout: PartitionPathLayout {
+                    streams_root: config.get_streams_path(),
+                },
             },
         );
         let shards_table = PapayaShardsTable::new();
@@ -2235,6 +2240,7 @@ mod tests {
             fetch_partition_build_inputs(&ctx, ns).expect("committed namespace has stats");
         let live = build_partition_fresh(
             &config,
+            ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
@@ -2265,6 +2271,7 @@ mod tests {
 
         let redundant = build_partition_fresh(
             &config,
+            ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
@@ -3084,6 +3091,72 @@ mod tests {
         );
     }
 
+    /// Receive half of the inverted-range fix: a `RepairDone` landing on a
+    /// session whose floor the commit walk already passed must close the
+    /// session. Verifying the moot floor kept it armed while the walk ran to
+    /// the fetch ceiling, and the next chunk request was `9..=8`.
+    #[compio::test]
+    async fn repair_done_over_a_passed_floor_closes_the_session() {
+        const NONCE: u128 = 13;
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-repair-ceiling");
+        seed_topic(&mux, 2, 0, "topic-repair-ceiling", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        let served = CreateStreamRequest {
+            name: WireName::new("served-op").expect("test stream name fits WireName"),
+            options: WireOptions::empty(),
+        };
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_mut_by_ns(&ns)
+                .expect("partition is materialised");
+            // Ops 5..=7 committed and evicted after the request went out, op 8
+            // is the served remainder, and the window's first batch sits above
+            // the boot-recovered durable end.
+            partition.consensus().restore_commit_state(7, 8);
+            partition.recovered_durable_offset = Some(10);
+            partition
+                .log
+                .journal()
+                .inner
+                .append(build_prepare(8, Operation::CreateStream, &served).into_frozen())
+                .await
+                .expect("journal the served op");
+            partition.repair = Some(RepairSession {
+                nonce: NONCE,
+                view: 0,
+                commit_to_op: 8,
+                fetch_to_op: 8,
+                floor: Some(5),
+                peer: 1,
+                first_batch_offset: Some(20),
+                idle_ticks: 0,
+            });
+        }
+
+        shard
+            .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+            .await;
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&ns)
+            .expect("partition survives the reply");
+        assert_eq!(partition.consensus().commit_min(), 8);
+        assert!(
+            partition.repair.is_none(),
+            "a walk that reached the fetch ceiling leaves nothing to request"
+        );
+    }
+
     /// Serve half of the purge gate in `on_request_prepares`: while a
     /// committed purge has not applied locally, the journal still holds
     /// pre-purge entries with no floor to fence them, so serving a rejoiner
@@ -3498,7 +3571,7 @@ mod tests {
             ns.stream_id(),
             ns.topic_id(),
             ns.partition_id(),
-            ctx.config.as_ref(),
+            partitions.config(),
         )
         .await
         .expect("teardown disk delete succeeds");
