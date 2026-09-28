@@ -67,8 +67,10 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'r', verbatim_doc_comment)]
     pub rate_limit: Option<IggyByteSize>,
 
-    /// Warmup time in human readable format, e.g. "1s", "2m", "3h"
-    #[arg(long, short = 'w', default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
+    /// Warmup time in human readable format, e.g. "1s", "2m", "3h".
+    /// After the warmup, consumer-only runs read the topic again from the start,
+    /// and group members delete the offsets that the warmup committed.
+    #[arg(long, short = 'w', verbatim_doc_comment, default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
     pub warmup_time: IggyDuration,
 
     /// Sampling time for metrics collection. It is also used as bucket size for time series calculations.

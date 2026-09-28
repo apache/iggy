@@ -35,6 +35,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
 
+const CONSUMER_CATCH_UP_WINDOW: Duration = Duration::from_secs(1);
+
 pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
     pub client: C,
     pub benchmark_kind: BenchmarkKind,
@@ -71,14 +73,37 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
     pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         self.client.setup().await?;
 
+        let make_rate_limiter = || {
+            self.limit_bytes_per_second.map(|rate| {
+                if self.config.origin_timestamp_latency_calculation {
+                    BenchmarkRateLimiter::with_burst_window(rate, CONSUMER_CATCH_UP_WINDOW)
+                } else {
+                    BenchmarkRateLimiter::new(rate)
+                }
+            })
+        };
+
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
+            let rate_limiter = make_rate_limiter();
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
             while Instant::now() < warmup_end {
-                let _ = self.client.consume_batch().await?;
+                if let Some(batch) = self.client.consume_batch().await?
+                    && let Some(rate_limiter) = &rate_limiter
+                {
+                    rate_limiter
+                        .wait_until_necessary(batch.user_data_bytes)
+                        .await;
+                }
+            }
+            // Consumer-only runs replay the warmup data. Paired producers keep writing,
+            // and replay would also inflate message age in the low-level client.
+            if !self.config.origin_timestamp_latency_calculation {
+                self.client.reset_offsets().await?;
             }
         }
 
+        let rate_limiter = make_rate_limiter();
         self.log_setup_info();
 
         let max_capacity = self.finish_condition.max_capacity();
@@ -88,7 +113,6 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         let mut bytes_processed = 0;
         let mut user_data_bytes_processed = 0;
         let start_timestamp = Instant::now();
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
         while !self.finish_condition.is_done() {
             let batch_opt = self.client.consume_batch().await?;
@@ -385,4 +409,120 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
 
         println!("\n{table}");
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::ready;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use clap::Parser;
+
+    use super::*;
+    use crate::actors::consumer::client::interface::ConsumerClient;
+    use crate::actors::{ApiLabel, BenchmarkInit};
+    use crate::args::common::IggyBenchArgs;
+    use crate::utils::finish_condition::BenchmarkFinishConditionMode;
+
+    const CONSUMED_BYTES: u64 = 32;
+    const NO_WARMUP: &str = "0s";
+    const SHORT_WARMUP: &str = "10ms";
+
+    #[tokio::test]
+    async fn given_no_warmup_when_consuming_should_preserve_committed_offsets() {
+        assert_eq!(resets_after_run(NO_WARMUP, false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn given_consumer_only_warmup_when_consuming_should_reset_offsets_once() {
+        assert_eq!(resets_after_run(SHORT_WARMUP, false).await, 1);
+    }
+
+    #[tokio::test]
+    async fn given_message_age_warmup_when_consuming_should_preserve_committed_offsets() {
+        assert_eq!(resets_after_run(SHORT_WARMUP, true).await, 0);
+    }
+
+    async fn resets_after_run(
+        warmup_time: &str,
+        origin_timestamp_latency_calculation: bool,
+    ) -> usize {
+        let args = IggyBenchArgs::parse_from([
+            "iggy-bench",
+            "--total-data",
+            "256B",
+            "--messages-per-batch",
+            "1",
+            "--message-size",
+            "32",
+            "--warmup-time",
+            warmup_time,
+            "balanced-consumer-group",
+            "--consumers",
+            "1",
+            "--streams",
+            "1",
+            "--consumer-groups",
+            "1",
+            "tcp",
+        ]);
+        let resets = Arc::new(AtomicUsize::new(0));
+        let consumer = BenchmarkConsumer::new(
+            RecordingClient {
+                resets: resets.clone(),
+            },
+            args.kind(),
+            BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::Shared),
+            args.sampling_time(),
+            args.moving_average_window(),
+            None,
+            BenchmarkConsumerConfig {
+                consumer_id: 1,
+                consumer_group_id: Some(1),
+                stream_id: "bench-stream-1".to_owned(),
+                messages_per_batch: args.messages_per_batch(),
+                warmup_time: args.warmup_time(),
+                polling_kind: PollingKind::Next,
+                origin_timestamp_latency_calculation,
+                pretty: false,
+            },
+        );
+
+        consumer.run().await.unwrap();
+        resets.load(Ordering::Relaxed)
+    }
+
+    struct RecordingClient {
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl ConsumerClient for RecordingClient {
+        fn consume_batch(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<crate::actors::BatchMetrics>, IggyError>> {
+            ready(Ok(Some(crate::actors::BatchMetrics {
+                messages: 1,
+                user_data_bytes: CONSUMED_BYTES,
+                total_bytes: CONSUMED_BYTES,
+                latency: Duration::ZERO,
+            })))
+        }
+
+        fn reset_offsets(&mut self) -> impl Future<Output = Result<(), IggyError>> {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(()))
+        }
+    }
+
+    impl BenchmarkInit for RecordingClient {
+        fn setup(&mut self) -> impl Future<Output = Result<(), IggyError>> {
+            ready(Ok(()))
+        }
+    }
+
+    impl ApiLabel for RecordingClient {
+        const API_LABEL: &'static str = "recording";
+    }
+
+    impl BenchmarkConsumerClient for RecordingClient {}
 }
