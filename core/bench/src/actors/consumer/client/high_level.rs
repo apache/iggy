@@ -19,7 +19,7 @@ use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
     consumer::client::{
         BenchmarkConsumerClient,
-        interface::{BenchmarkConsumerConfig, ConsumerClient},
+        interface::{BenchmarkConsumerConfig, ConsumerClient, clear_consumer_offsets},
     },
 };
 
@@ -28,7 +28,9 @@ use futures_util::StreamExt;
 use iggy::prelude::*;
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout};
-use tracing::{error, warn};
+use tracing::warn;
+
+const TOPIC_ID: &str = "topic-1";
 
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
@@ -39,7 +41,6 @@ pub struct HighLevelConsumerClient {
     /// low-level client is the smaller of `TypedBenchmarkConsumer`'s two
     /// variants, and inlining the client here spreads them past what
     /// `clippy::large_enum_variant` allows.
-    #[allow(dead_code)]
     client: Option<Box<IggyClient>>,
     consumer: Option<IggyConsumer>,
 }
@@ -52,6 +53,45 @@ impl HighLevelConsumerClient {
             client: None,
             consumer: None,
         }
+    }
+
+    /// The name the SDK registers for this actor, which is also its identity inside a group.
+    /// Building the consumer and clearing its offsets have to agree on it.
+    fn consumer_name(&self) -> String {
+        self.config.consumer_group_id.map_or_else(
+            || format!("hl_consumer_{}", self.config.consumer_id),
+            |cg_id| format!("cg_{cg_id}"),
+        )
+    }
+
+    /// The consumer the SDK registers for this actor, rebuilt from the config: the built
+    /// `IggyConsumer` keeps its own copy, and the offset reset has to name the same one.
+    fn consumer_identifier(&self) -> Result<Consumer, IggyError> {
+        let name = self.consumer_name();
+        Ok(match self.config.consumer_group_id {
+            Some(_) => Consumer::group(name.as_str().try_into()?),
+            None => Consumer::new(name.as_str().try_into()?),
+        })
+    }
+
+    fn build_consumer(&self, client: &IggyClient) -> Result<IggyConsumer, IggyError> {
+        let name = self.consumer_name();
+        let stream_id_str = &self.config.stream_id;
+        let builder = if self.config.consumer_group_id.is_some() {
+            client
+                .consumer_group(&name, stream_id_str, TOPIC_ID)?
+                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .create_consumer_group_if_not_exists()
+                .auto_join_consumer_group()
+        } else {
+            client
+                .consumer(&name, stream_id_str, TOPIC_ID, 0)?
+                .polling_strategy(PollingStrategy::offset(0))
+                .auto_commit(AutoCommit::Disabled)
+        };
+        Ok(builder
+            .batch_length(self.config.messages_per_batch.get())
+            .build())
     }
 }
 
@@ -75,12 +115,7 @@ impl ConsumerClient for HighLevelConsumerClient {
                         batch_total_bytes +=
                             received_message.message.get_size_bytes().as_bytes_u64();
 
-                        let offset = received_message.message.header.offset;
-
                         if batch_messages >= self.config.messages_per_batch.get() {
-                            if let Err(error) = consumer.store_offset(offset, None).await {
-                                error!("Failed to store offset: {offset}. {error}");
-                            }
                             break;
                         }
                     }
@@ -105,41 +140,36 @@ impl ConsumerClient for HighLevelConsumerClient {
             }))
         }
     }
+
+    async fn reset_offsets(&mut self) -> Result<(), IggyError> {
+        let client = self.client.as_deref().expect("Client not initialized");
+
+        let mut replacement = self.build_consumer(client)?;
+
+        // Dropping the old consumer stops its polling. A bare drop does not leave the
+        // group, so the re-join below is the same member and keeps its partitions.
+        self.consumer = None;
+
+        if self.config.consumer_group_id.is_some() {
+            clear_consumer_offsets(
+                client,
+                &self.consumer_identifier()?,
+                replacement.stream(),
+                replacement.topic(),
+            )
+            .await?;
+        }
+
+        replacement.init().await?;
+        self.consumer = Some(replacement);
+        Ok(())
+    }
 }
 
 impl BenchmarkInit for HighLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let topic_id_str = "topic-1";
         let client = self.client_factory.create_authenticated_client().await?;
-
-        let stream_id_str = self.config.stream_id.clone();
-
-        let mut consumer = if let Some(cg_id) = self.config.consumer_group_id {
-            let consumer_group_name = format!("cg_{cg_id}");
-            client
-                .consumer_group(&consumer_group_name, &stream_id_str, topic_id_str)?
-                .batch_length(self.config.messages_per_batch.get())
-                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
-                .create_consumer_group_if_not_exists()
-                .auto_join_consumer_group()
-                .build()
-        } else {
-            // TODO(hubcio): as of now, there is no way to mimic the behavior of
-            // PollingKind::Offset, because high level API doesn't provide method
-            // to commit local offset manually, only auto-commit on server.
-            client
-                .consumer(
-                    &format!("hl_consumer_{}", self.config.consumer_id),
-                    &stream_id_str,
-                    topic_id_str,
-                    0,
-                )?
-                .polling_strategy(PollingStrategy::offset(0))
-                .batch_length(self.config.messages_per_batch.get())
-                .auto_commit(AutoCommit::Disabled)
-                .build()
-        };
-
+        let mut consumer = self.build_consumer(&client)?;
         consumer.init().await?;
         self.consumer = Some(consumer);
         self.client = Some(Box::new(client));
