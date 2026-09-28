@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Store consumer bookmarks and the partition's applied purge generation.
+//! Store consumer bookmarks and the partition's purge progress.
 //!
-//! A bookmark records the last consumed offset. The purge marker instead records
-//! which reset was applied to this incarnation of the partition. Recovery uses
-//! them to restore progress and decide whether a purge must be repeated.
+//! A bookmark records the last consumed offset. The reset marker records the
+//! durable message reset boundary, while the applied generation records completion
+//! of the remaining bookmark cleanup. Recovery uses these records to resume cleanup
+//! without deleting messages acknowledged after the reset.
 //!
 //! Functions ending in `_with_storage` share the persistence sequence between
 //! real disk and simulated storage. File sync makes record contents durable;
@@ -52,11 +53,29 @@ pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 /// partition incarnation it was applied for.
 pub const PURGE_GENERATION_FILE: &str = "purge.gen";
 
+/// File retaining the durable message reset boundary independently of cleanup.
+pub(crate) const PURGE_RESET_FILE: &str = "purge.reset";
+
 /// Sibling name an atomic offset replacement writes before its rename lands.
 const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
 
 /// `[generation][created_revision]`, both LE u64.
 const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
+
+/// `[generation][created_revision][floor][checksum]`, all LE u64.
+const PURGE_RESET_RECORD_SIZE: usize = 3 * OFFSET_SIZE + CHECKSUM_SIZE;
+
+/// A durable message reset whose bookmark cleanup may still be pending.
+///
+/// The marker remains after cleanup completes so recovery retains the reset floor.
+/// The next successful message reset replaces it; `purge.gen` separately records
+/// which purge has completed both reset and cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PurgeReset {
+    pub generation: u64,
+    /// Highest journal operation invalidated by the reset, inclusive.
+    pub floor: u64,
+}
 
 /// What a consumer-offset file was found to hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,6 +436,75 @@ pub async fn persist_purge_generation_with_storage<S: DurableStorage>(
     record[..OFFSET_SIZE].copy_from_slice(&generation.to_le_bytes());
     record[OFFSET_SIZE..].copy_from_slice(&created_revision.to_le_bytes());
     replace_file(storage, path, record, true, true).await
+}
+
+/// Durably record the message reset boundary before completing bookmark cleanup.
+///
+/// The caller must first make the message reset durable. Atomic replacement syncs
+/// both the record and its parent directory. Calls for one path must be serialized
+/// because they share a temporary filename.
+///
+/// # Errors
+/// Returns an error if directory creation, replacement, or either sync fails.
+pub(crate) async fn persist_purge_reset_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    reset: PurgeReset,
+    created_revision: u64,
+) -> Result<(), IggyError> {
+    let mut record = [0u8; PURGE_RESET_RECORD_SIZE];
+    record[..OFFSET_SIZE].copy_from_slice(&reset.generation.to_le_bytes());
+    record[OFFSET_SIZE..2 * OFFSET_SIZE].copy_from_slice(&created_revision.to_le_bytes());
+    record[2 * OFFSET_SIZE..3 * OFFSET_SIZE].copy_from_slice(&reset.floor.to_le_bytes());
+    let checksum = calculate_checksum(&record[..3 * OFFSET_SIZE]);
+    record[3 * OFFSET_SIZE..].copy_from_slice(&checksum.to_le_bytes());
+    replace_file(storage, path, record, true, true).await
+}
+
+/// Read the durable reset boundary for this incarnation of the partition.
+///
+/// Only a missing file or a valid record from another incarnation returns `None`.
+/// An unreadable or damaged marker must stop recovery: treating it as absent could
+/// repeat the message reset and delete messages acknowledged after that reset.
+///
+/// # Errors
+/// Returns an error if the existence probe, open, read, or checksum validation fails.
+pub(crate) async fn read_purge_reset<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    created_revision: u64,
+) -> Result<Option<PurgeReset>, IggyError> {
+    if !storage
+        .exists_following_links(Path::new(path))
+        .await
+        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?
+    {
+        return Ok(None);
+    }
+    let file = storage
+        .open(Path::new(path), OpenMode::Read)
+        .await
+        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
+    let bytes = file
+        .read(0, PURGE_RESET_RECORD_SIZE)
+        .await
+        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
+    let record: [u8; PURGE_RESET_RECORD_SIZE] = bytes
+        .try_into()
+        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
+    let words: [[u8; OFFSET_SIZE]; 4] = record
+        .as_chunks::<OFFSET_SIZE>()
+        .0
+        .try_into()
+        .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?;
+    let [generation, stored_revision, floor, checksum] = words.map(u64::from_le_bytes);
+    if checksum != calculate_checksum(&record[..3 * OFFSET_SIZE]) {
+        return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
+    }
+    if stored_revision != created_revision {
+        return Ok(None);
+    }
+    Ok(Some(PurgeReset { generation, floor }))
 }
 
 /// Read the purge generation this replica applied for the `created_revision`
@@ -841,6 +929,158 @@ mod tests {
                 .await
                 .expect("now stale"),
             0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_absent_file_has_no_reset_boundary() {
+        let dir = unique_temp_dir();
+        let path = dir.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+
+        assert_eq!(
+            read_purge_reset(&DiskStorage, &path, 11)
+                .await
+                .expect("read absent reset marker"),
+            None,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_round_trips_generation_and_floor() {
+        let dir = unique_temp_dir();
+        let path = dir.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+        let reset = PurgeReset {
+            generation: 3,
+            floor: 114,
+        };
+
+        persist_purge_reset_with_storage(&DiskStorage, &path, reset, 11)
+            .await
+            .expect("persist reset boundary");
+
+        assert_eq!(std::fs::metadata(&path).expect("reset marker").len(), 32);
+        assert_eq!(
+            read_purge_reset(&DiskStorage, &path, 11)
+                .await
+                .expect("read reset boundary"),
+            Some(reset),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_from_another_incarnation_has_no_reset_boundary() {
+        let dir = unique_temp_dir();
+        let path = dir.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+        let reset = PurgeReset {
+            generation: 9,
+            floor: 114,
+        };
+        persist_purge_reset_with_storage(&DiskStorage, &path, reset, 41)
+            .await
+            .expect("persist reset boundary for old incarnation");
+
+        assert_eq!(
+            read_purge_reset(&DiskStorage, &path, 42)
+                .await
+                .expect("ignore boundary from old incarnation"),
+            None,
+        );
+        assert_eq!(
+            read_purge_reset(&DiskStorage, &path, 41)
+                .await
+                .expect("read boundary for original incarnation"),
+            Some(reset),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_truncated_record_rejects_recovery() {
+        let dir = unique_temp_dir();
+        let path = dir.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+        let reset = PurgeReset {
+            generation: 3,
+            floor: 114,
+        };
+        persist_purge_reset_with_storage(&DiskStorage, &path, reset, 11)
+            .await
+            .expect("persist reset boundary");
+        let record = std::fs::read(&path).expect("read complete reset marker");
+
+        for length in 0..record.len() {
+            std::fs::write(&path, &record[..length]).expect("truncate reset marker");
+            let result = read_purge_reset(&DiskStorage, &path, 11).await;
+            assert!(
+                matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+                "a reset marker truncated to {length} bytes must stop recovery, got {result:?}",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_corrupt_record_rejects_recovery() {
+        let dir = unique_temp_dir();
+        let path = dir.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+        let reset = PurgeReset {
+            generation: 3,
+            floor: 114,
+        };
+        persist_purge_reset_with_storage(&DiskStorage, &path, reset, 11)
+            .await
+            .expect("persist reset boundary");
+        let record = std::fs::read(&path).expect("read intact reset marker");
+
+        for byte_index in 0..record.len() {
+            let mut corrupt_record = record.clone();
+            corrupt_record[byte_index] ^= 0x01;
+            std::fs::write(&path, corrupt_record).expect("corrupt reset marker");
+            let result = read_purge_reset(&DiskStorage, &path, 11).await;
+            assert!(
+                matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+                "corruption at byte {byte_index} must stop recovery, got {result:?}",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_existence_probe_error_rejects_recovery() {
+        let dir = unique_temp_dir();
+        let parent = dir.join("not-a-directory");
+        std::fs::write(&parent, []).expect("block traversal to reset marker");
+        let path = parent.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+
+        let result = read_purge_reset(&DiskStorage, &path, 11).await;
+        assert!(
+            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+            "a failed existence probe must stop recovery, got {result:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn purge_reset_read_error_rejects_recovery() {
+        let dir = unique_temp_dir();
+        let path = dir.join(PURGE_RESET_FILE).to_string_lossy().into_owned();
+        // A directory opens successfully but fails reads, exercising a storage
+        // failure independently of short records or checksum corruption.
+        std::fs::create_dir(&path).expect("make reset marker unreadable as a file");
+
+        let result = read_purge_reset(&DiskStorage, &path, 11).await;
+        assert!(
+            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+            "an unreadable reset marker must stop recovery, got {result:?}",
         );
 
         let _ = std::fs::remove_dir_all(&dir);

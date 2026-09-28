@@ -29,7 +29,7 @@
 
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
-    PURGE_GENERATION_FILE, commit_offset_replacement, delete_persisted_offset,
+    PURGE_GENERATION_FILE, PURGE_RESET_FILE, commit_offset_replacement, delete_persisted_offset,
     discard_offset_replacement, offset_replacement_id, persist_purge_generation,
     stage_offset_replacement,
 };
@@ -644,6 +644,457 @@ const fn validate_consumer_offset_transfer_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::MessageLookup;
+    use crate::offset_storage::{PurgeReset, persist_purge_reset_with_storage, read_purge_reset};
+    use crate::{Partition, PartitionPathLayout};
+    use bytes::Bytes;
+    use consensus::{LocalPipeline, VsrConsensus};
+    use iggy_binary_protocol::{Command, RoutedRequestHeader};
+    use iggy_common::{ConsumerGroupOffsets, ConsumerOffsets, PartitionStats};
+    use message_bus::IggyMessageBus;
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
+    use server_common::sharding::IggyNamespace;
+    use std::sync::Arc;
+
+    #[compio::test]
+    async fn given_purge_reset_when_quarantining_should_move_it_with_discarded_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let partition_dir = directory.path().join("partition");
+        std::fs::create_dir(&partition_dir).unwrap();
+        let reset_path = partition_dir.join(PURGE_RESET_FILE);
+        let reset = PurgeReset {
+            generation: 5,
+            floor: 3,
+        };
+        persist_purge_reset_with_storage(&DiskStorage, reset_path.to_str().unwrap(), reset, 7)
+            .await
+            .unwrap();
+        std::fs::write(partition_dir.join("0.log"), b"discarded history").unwrap();
+        std::fs::write(partition_dir.join("superblock.a"), b"durable view").unwrap();
+        std::fs::write(partition_dir.join("unrelated.reset"), b"unrelated record").unwrap();
+
+        let quarantined = quarantine_partition_files(partition_dir.to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        assert!(!reset_path.exists());
+        assert_eq!(
+            read_purge_reset(
+                &DiskStorage,
+                Path::new(&quarantined)
+                    .join(PURGE_RESET_FILE)
+                    .to_str()
+                    .unwrap(),
+                7,
+            )
+            .await
+            .unwrap(),
+            Some(reset)
+        );
+        assert_eq!(
+            std::fs::read(Path::new(&quarantined).join("0.log")).unwrap(),
+            b"discarded history"
+        );
+        assert_eq!(
+            std::fs::read(partition_dir.join("superblock.a")).unwrap(),
+            b"durable view"
+        );
+        assert_eq!(
+            std::fs::read(partition_dir.join("unrelated.reset")).unwrap(),
+            b"unrelated record"
+        );
+    }
+
+    #[compio::test]
+    async fn given_pending_purge_cleanup_when_installing_should_preserve_partition_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let consumer_directory = root.join("consumer_offsets");
+        let group_directory = root.join("consumer_group_offsets");
+        std::fs::create_dir(&consumer_directory).unwrap();
+        std::fs::create_dir(&group_directory).unwrap();
+        std::fs::write(root.join("0.log"), b"current message history").unwrap();
+        std::fs::write(consumer_directory.join("7"), 2u64.to_le_bytes()).unwrap();
+        let reset_path = root.join(PURGE_RESET_FILE);
+        persist_purge_reset_with_storage(
+            &DiskStorage,
+            reset_path.to_str().unwrap(),
+            PurgeReset {
+                generation: 5,
+                floor: 3,
+            },
+            7,
+        )
+        .await
+        .unwrap();
+        let reset_bytes = std::fs::read(&reset_path).unwrap();
+        let consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+        partition.set_partition_dir(root.to_string_lossy().into_owned());
+        partition.set_created_revision(7);
+        partition.configure_consumer_offset_storage(
+            consumer_directory.to_string_lossy().into_owned(),
+            group_directory.to_string_lossy().into_owned(),
+            ConsumerOffsets::with_capacity(0),
+            ConsumerGroupOffsets::with_capacity(0),
+        );
+        partition.hydrate_applied_purge_generation().await.unwrap();
+        assert!(partition.purge_cleanup_pending());
+        let config = PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+            validate_checksum: true,
+            segment_size: IggyByteSize::from(1024 * 1024),
+            preallocate_segments: false,
+            encryptor: None,
+            path_layout: PartitionPathLayout::default(),
+        };
+        let mut offered_offsets = table();
+        offered_offsets.purge_generation = 5;
+        let offered_bytes = offered_offsets.encode();
+
+        let result = partition
+            .install_state_transfer(&config, 4, Vec::new(), &offered_bytes, 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PartitionInstallError::PurgeCleanupPending)
+        ));
+        assert!(partition.purge_cleanup_pending());
+        assert_eq!(partition.applied_purge_generation(), 0);
+        assert_eq!(partition.purge_floor_op(), 3);
+        assert_eq!(std::fs::read(&reset_path).unwrap(), reset_bytes);
+        assert_eq!(
+            std::fs::read(root.join("0.log")).unwrap(),
+            b"current message history"
+        );
+        assert_eq!(
+            std::fs::read(consumer_directory.join("7")).unwrap(),
+            2u64.to_le_bytes()
+        );
+        assert!(!root.join(PURGE_GENERATION_FILE).exists());
+        assert!(
+            !root.join("00000000000000000043.log").exists(),
+            "the offered empty chain must not be planted"
+        );
+    }
+
+    #[compio::test]
+    async fn given_completed_purge_when_installing_lower_head_should_recover_rebased_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut partition = transfer_test_partition(root);
+        for op in 1..=9 {
+            append_transfer_test_message(&mut partition, op).await;
+        }
+        assert_eq!(
+            partition.log.journal().inner.oldest_resident_offset(),
+            Some(0)
+        );
+        partition.purge(&transfer_test_config(), 5).await.unwrap();
+        assert_eq!(partition.purge_floor_op(), 9);
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 9);
+        assert!(partition.log.journal().inner.resident_entries().is_empty());
+        assert!(partition.log.journal().inner.header_by_op(9).is_some());
+        let mut offered = table();
+        offered.purge_generation = 5;
+
+        partition
+            .install_state_transfer(&transfer_test_config(), 4, Vec::new(), &offered.encode(), 5)
+            .await
+            .expect("install replacement history below the old uncommitted floor");
+
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 4);
+        assert_eq!(partition.purge_floor_op(), 4);
+
+        // Replacement operations reuse numbers below the old purge floor.
+        // They must enter the resident poll tier before any segment flush.
+        append_transfer_test_message(&mut partition, 5).await;
+        let journal = &partition.log.journal().inner;
+        let resident = journal.resident_entries();
+        assert_eq!(
+            resident.len(),
+            1,
+            "the replacement send must remain visible"
+        );
+        assert_eq!(journal.resident_message_entries().len(), 1);
+        assert_eq!(journal.oldest_resident_offset(), Some(offered.next_offset));
+        for query in [
+            MessageLookup::Offset {
+                offset: offered.next_offset,
+                count: 1,
+                ceiling: u64::MAX,
+            },
+            MessageLookup::Timestamp {
+                timestamp: 5,
+                count: 1,
+                ceiling: u64::MAX,
+            },
+        ] {
+            let (fragments, last_offset) = journal.get_sync(&query).expect("poll replacement send");
+            assert!(!fragments.is_empty());
+            assert_eq!(last_offset, Some(offered.next_offset));
+        }
+        drop(partition);
+        let mut restarted = transfer_test_partition(root);
+        restarted.hydrate_applied_purge_generation().await.unwrap();
+        assert_eq!(restarted.applied_purge_generation(), 5);
+        assert_eq!(restarted.purge_floor_op(), 4);
+        assert!(!restarted.purge_cleanup_pending());
+        assert!(restarted.purge_recovery_pending());
+        restarted.recover_purge_boundary(4).await.unwrap();
+        offered.purge_generation = 6;
+        restarted
+            .install_state_transfer(&transfer_test_config(), 4, Vec::new(), &offered.encode(), 6)
+            .await
+            .expect("a snapshot resolves the lost journal after restart");
+        assert!(!restarted.purge_recovery_pending());
+        drop(restarted);
+
+        // The snapshot advanced the generation beyond the local reset record.
+        // Losing its journal on another restart must still require recovery.
+        let mut after_snapshot = transfer_test_partition(root);
+        after_snapshot
+            .hydrate_applied_purge_generation()
+            .await
+            .unwrap();
+        assert_eq!(after_snapshot.applied_purge_generation(), 6);
+        assert!(after_snapshot.purge_recovery_pending());
+    }
+
+    async fn append_transfer_test_message(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
+                id: u128::from(op),
+                ..Default::default()
+            },
+            payload: Bytes::from_static(b"message"),
+            user_headers: None,
+        });
+        let message = SendMessagesOwned::from_messages(
+            IggyNamespace::from_raw(partition.consensus().group()),
+            &messages,
+        )
+        .unwrap()
+        .encode_request(RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::SendMessages,
+            client: 1,
+            session: 1,
+            request: op,
+            group: partition.consensus().group(),
+            ..Default::default()
+        })
+        .unwrap()
+        .transmute_header(
+            |request: RoutedRequestHeader, prepare: &mut PrepareHeader| {
+                prepare.command = Command::Prepare;
+                prepare.operation = Operation::SendMessages;
+                prepare.group = partition.consensus().group();
+                prepare.op = op;
+                prepare.timestamp = op;
+                prepare.size = request.size;
+            },
+        );
+        partition.append_messages(message).await.unwrap();
+        partition.consensus().sequencer().set_sequence(op);
+    }
+
+    #[compio::test]
+    async fn given_failed_purge_floor_rebase_when_installing_should_preserve_files_without_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut partition = Box::pin(partition_with_completed_reset(root)).await;
+        std::fs::write(root.join("0.log"), b"existing history").unwrap();
+        let reset_path = root.join(PURGE_RESET_FILE);
+        let reset_bytes = std::fs::read(&reset_path).unwrap();
+        // Refuse only the marker's replacement, after the offer passes validation.
+        std::fs::create_dir(root.join("purge.reset.tmp")).unwrap();
+        let mut offered = table();
+        offered.purge_generation = 5;
+
+        let result = partition
+            .install_state_transfer(&transfer_test_config(), 4, Vec::new(), &offered.encode(), 5)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PartitionInstallError::PurgeResetNotDurable(_))
+        ));
+        assert_eq!(partition.purge_floor_op(), 9);
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 9);
+        assert!(partition.fatal().is_some());
+        assert!(root.join(".install-backup").is_dir());
+        assert_eq!(
+            std::fs::read(root.join("0.log")).unwrap(),
+            b"existing history"
+        );
+        assert_eq!(std::fs::read(&reset_path).unwrap(), reset_bytes);
+        assert!(!root.join("00000000000000000043.log").exists());
+    }
+
+    #[compio::test]
+    async fn given_install_failure_after_rebase_without_wal_when_recovering_should_restore_history()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut partition = Box::pin(partition_with_completed_reset(root)).await;
+        assert!(partition.persistence.is_none());
+        drop(partition.log.retire_front().unwrap());
+        partition
+            .install_empty_segment(&transfer_test_config(), 0)
+            .await
+            .unwrap();
+        let original_log = root.join("00000000000000000000.log");
+        std::fs::write(&original_log, b"original history").unwrap();
+        let mut offered = table();
+        offered.purge_generation = 5;
+        // Missing staging files fail the swap after the floor changes and old
+        // segments are removed, exercising the production backup decision.
+        let missing_segment = StagedSegmentMeta {
+            start_offset: 0,
+            end_offset: 0,
+            index_size: 0,
+            size: 8,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            max_timestamp: 0,
+            log_staging: root.join("00000000000000000000.log.staging"),
+            index_staging: root.join("00000000000000000000.index.staging"),
+        };
+
+        let result = partition
+            .install_state_transfer(
+                &transfer_test_config(),
+                4,
+                vec![missing_segment],
+                &offered.encode(),
+                5,
+            )
+            .await;
+
+        assert!(matches!(result, Err(PartitionInstallError::SwapIo { .. })));
+        assert!(partition.fatal().is_some());
+        assert!(root.join(".install-backup").is_dir());
+        assert!(!original_log.clone().exists());
+        assert_eq!(partition.purge_floor_op(), 4);
+        assert_eq!(
+            read_purge_reset(
+                &DiskStorage,
+                root.join(PURGE_RESET_FILE).to_str().unwrap(),
+                7
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .floor,
+            4,
+        );
+
+        drop(partition);
+        crate::install_backup::recover(root).await.unwrap();
+        let mut restarted = transfer_test_partition(root);
+        restarted.hydrate_applied_purge_generation().await.unwrap();
+        assert_eq!(restarted.applied_purge_generation(), 5);
+        assert_eq!(restarted.purge_floor_op(), 9);
+        assert_eq!(
+            std::fs::read(original_log.clone()).unwrap(),
+            b"original history"
+        );
+    }
+
+    #[compio::test]
+    async fn given_interrupted_install_when_rolled_back_should_restore_purge_floor_with_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut partition = Box::pin(partition_with_completed_reset(root)).await;
+        std::fs::write(root.join("0.log"), b"original history").unwrap();
+        crate::install_backup::begin(root).await.unwrap();
+
+        partition.rebase_purge_reset_for_install(4).await.unwrap();
+        assert_eq!(partition.purge_floor_op(), 4);
+        std::fs::remove_file(root.join("0.log")).unwrap();
+        std::fs::write(root.join("0.log"), b"replacement history").unwrap();
+        drop(partition);
+        crate::install_backup::recover(root).await.unwrap();
+
+        let mut restarted = transfer_test_partition(root);
+        restarted.hydrate_applied_purge_generation().await.unwrap();
+        assert_eq!(restarted.purge_floor_op(), 9);
+        assert_eq!(restarted.applied_purge_generation(), 5);
+        assert_eq!(
+            std::fs::read(root.join("0.log")).unwrap(),
+            b"original history"
+        );
+    }
+
+    async fn partition_with_completed_reset(root: &Path) -> IggyPartition<IggyMessageBus> {
+        let mut partition = transfer_test_partition(root);
+        persist_purge_generation(root.join(PURGE_GENERATION_FILE).to_str().unwrap(), 5, 7)
+            .await
+            .unwrap();
+        persist_purge_reset_with_storage(
+            &DiskStorage,
+            root.join(PURGE_RESET_FILE).to_str().unwrap(),
+            PurgeReset {
+                generation: 5,
+                floor: 9,
+            },
+            7,
+        )
+        .await
+        .unwrap();
+        partition.hydrate_applied_purge_generation().await.unwrap();
+        partition.consensus().sequencer().set_sequence(9);
+        assert!(!partition.purge_cleanup_pending());
+        partition
+    }
+
+    fn transfer_test_partition(root: &Path) -> IggyPartition<IggyMessageBus> {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+        partition.set_partition_dir(root.to_string_lossy().into_owned());
+        partition.set_created_revision(7);
+        let consumer_directory = root.join("consumer_offsets");
+        let group_directory = root.join("consumer_group_offsets");
+        std::fs::create_dir_all(&consumer_directory).unwrap();
+        std::fs::create_dir_all(&group_directory).unwrap();
+        partition.configure_consumer_offset_storage(
+            consumer_directory.to_string_lossy().into_owned(),
+            group_directory.to_string_lossy().into_owned(),
+            ConsumerOffsets::with_capacity(0),
+            ConsumerGroupOffsets::with_capacity(0),
+        );
+        partition
+    }
+
+    fn transfer_test_config() -> PartitionsConfig {
+        PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+            validate_checksum: true,
+            segment_size: IggyByteSize::from(1024 * 1024),
+            preallocate_segments: false,
+            encryptor: None,
+            path_layout: PartitionPathLayout::default(),
+        }
+    }
 
     #[compio::test]
     async fn given_transient_offset_io_failure_when_retried_should_succeed_without_exhausting_budget()
@@ -1384,6 +1835,10 @@ pub struct PartitionInstallOutcome {
 #[derive(Debug)]
 pub enum PartitionInstallError {
     NoPartitionDir,
+    /// Pending purge cleanup must finish before imported bookmarks replace the old table.
+    PurgeCleanupPending,
+    /// The old purge floor could not be rebased before replacing message history.
+    PurgeResetNotDurable(iggy_common::IggyError),
     NoOffsetDir {
         kind: ConsumerKind,
     },
@@ -1459,6 +1914,18 @@ pub enum PartitionInstallError {
 impl fmt::Display for PartitionInstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PurgeResetNotDurable(source) => {
+                write!(
+                    f,
+                    "could not rebase the purge floor before state transfer: {source}"
+                )
+            }
+            Self::PurgeCleanupPending => {
+                write!(
+                    f,
+                    "purge cleanup must finish before state transfer can install"
+                )
+            }
             Self::NoPartitionDir => write!(f, "partition has no on-disk directory"),
             Self::NoOffsetDir { kind } => {
                 write!(f, "partition has no {kind:?} offset directory configured")
@@ -1680,11 +2147,14 @@ pub async fn quarantine_partition_files(
         ));
     };
     for path in segment_dir_entries(partition_dir)? {
-        let quarantined = path.to_str().is_some_and(|path| {
-            [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
-                .iter()
-                .any(|suffix| path.ends_with(suffix))
-        });
+        let quarantined = path
+            .file_name()
+            .is_some_and(|name| name == PURGE_RESET_FILE)
+            || path.to_str().is_some_and(|path| {
+                [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
+                    .iter()
+                    .any(|suffix| path.ends_with(suffix))
+            });
         if !quarantined {
             continue;
         }
@@ -2565,6 +3035,9 @@ where
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         // ---- check phase: nothing below may mutate live state. Staging
         // writes only sibling files the install can abandon. ----
+        if self.purge_cleanup_pending() {
+            return Err(PartitionInstallError::PurgeCleanupPending);
+        }
         let Some(partition_dir) = self.partition_dir.clone() else {
             return Err(PartitionInstallError::NoPartitionDir);
         };
@@ -2700,6 +3173,10 @@ where
 
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
+        // Lowering a durable purge floor and replacing its history must roll back
+        // together, including partitions that do not keep a durable journal.
+        let backup_required =
+            self.persistence.is_some() || self.purge_reset_needs_rebase(commit_op);
         if let Some(persistence) = &self.persistence {
             self.start_persistence();
             persistence.drain_with_timeout().await.map_err(|source| {
@@ -2708,15 +3185,17 @@ where
                     source,
                 }
             })?;
-            if let Err(source) = crate::install_backup::begin(Path::new(&partition_dir)).await {
-                // The backup rename may have landed before its directory barrier failed.
-                // Further commits could then be erased by rollback on the next boot.
-                self.fence_install_failure(commit_op);
-                return Err(PartitionInstallError::SwapIo {
-                    path: partition_dir.clone(),
-                    source,
-                });
-            }
+        }
+        if backup_required
+            && let Err(source) = crate::install_backup::begin(Path::new(&partition_dir)).await
+        {
+            // The backup rename may have landed before its directory barrier failed.
+            // Further commits could then be erased by rollback on the next boot.
+            self.fence_install_failure(commit_op);
+            return Err(PartitionInstallError::SwapIo {
+                path: partition_dir.clone(),
+                source,
+            });
         }
 
         // ---- mutate phase ----
@@ -2755,13 +3234,23 @@ where
                 .await
         };
         if !frontier_durable {
-            if self.persistence.is_some() {
+            if backup_required {
                 self.fence_install_failure(commit_op);
             }
             discard_offset_writes(&planned_offsets).await;
             return Err(PartitionInstallError::FrontierNotDurable {
                 frontier: offsets_wire.next_offset,
             });
+        }
+        // The install may replace an uncommitted suffix below the old purge
+        // floor. Rebase its durable record before any replacement can survive
+        // a crash. The install backup restores the old floor with its history.
+        if let Err(source) = self.rebase_purge_reset_for_install(commit_op).await {
+            if backup_required {
+                self.fence_install_failure(commit_op);
+            }
+            discard_offset_writes(&planned_offsets).await;
+            return Err(PartitionInstallError::PurgeResetNotDurable(source));
         }
         // The write lock spans the convergence too: a mutate failure leaves
         // the segment vectors drained, and a concurrent replicated append
@@ -2783,7 +3272,7 @@ where
             )
             .await;
         if outcome.is_err() {
-            if self.persistence.is_some() {
+            if backup_required {
                 // Keep the rollback snapshot intact until boot reopens every file.
                 self.fence_install_failure(commit_op);
                 return outcome;
@@ -2830,7 +3319,7 @@ where
                  the durable record stays at the pre-swap claim until the next view change"
             );
         }
-        if self.persistence.is_some()
+        if backup_required
             && let Err(source) = crate::install_backup::finish(Path::new(&partition_dir)).await
         {
             self.fence_install_failure(commit_op);
@@ -2847,6 +3336,9 @@ where
                     source,
                 })?;
             self.materialization_missing = false;
+        }
+        if outcome.is_ok() {
+            self.purge_recovery = crate::iggy_partition::PurgeRecovery::Ready;
         }
         outcome
     }

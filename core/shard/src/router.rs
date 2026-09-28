@@ -1002,32 +1002,25 @@ where
                                  the reconciler re-issues it while the generation stays unapplied"
                             );
                         }
-                        Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
-                            // NOT fenced: the wipe ran and a fresh chain is
-                            // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
-                            // Same pacing argument as the frontier deferral
-                            // above; the caches already describe wiped bytes.
+                        Err(
+                            error @ (partitions::PurgeError::OffsetCleanupNotRecorded(_)
+                            | partitions::PurgeError::GenerationNotRecorded(_)),
+                        ) => {
+                            // Message reset is durable. The reconciler retries only
+                            // cleanup and completion, preserving fresh message history.
                             self.drop_partition_transfer_state(namespace, partition);
                             tracing::warn!(
                                 shard = self.id,
                                 namespace_raw = namespace.inner(),
                                 generation,
                                 %error,
-                                "purge-partition deferred: reset applied but the generation \
-                                 record failed; the reconciler re-issues it"
+                                "purge-partition deferred: message reset is durable but cleanup \
+                                 completion must be retried"
                             );
                         }
                         Err(error @ partitions::PurgeError::Unserviceable(_)) => {
-                            // Past the drain, so this group has no serviceable
-                            // chain and the next append panics on
-                            // `active_segment()`. Fence it for rebuild, exactly
-                            // as a failed state-transfer convergence does. The
-                            // counters were already reset to 0 before the
-                            // fallible plant, so the fence's advancing write
-                            // records the post-purge frontier.
+                            // The reset lacks a usable chain or a durable boundary.
+                            // Fence before new writes could be erased by a full retry.
                             tracing::error!(
                                 shard = self.id,
                                 namespace_raw = namespace.inner(),

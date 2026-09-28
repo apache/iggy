@@ -1381,6 +1381,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             checkpoint_prepare: false,
             ..self.state
         };
+        if truncate == Some(0) {
+            // Replacement history can rewind the operation sequence. Keeping a
+            // higher purge floor would discard new operations after the install.
+            state.purge_floor = state.purge_floor.min(checkpoint);
+        }
         if let Some(segments) = &mut state.segment_storage {
             if checkpoint > self.state.checkpoint {
                 segments.checkpoint = self
@@ -2612,6 +2617,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal.certified_log_view(), None);
+    }
+
+    #[compio::test]
+    async fn transferred_checkpoint_clamps_the_purge_floor_after_restart() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let mut parent_checksum = 0;
+        for op in 1..=9 {
+            let message = prepare(op, parent_checksum);
+            parent_checksum = message.header().checksum;
+            journal.append(message.into_frozen()).await.unwrap();
+        }
+        journal.mark_purge(3, 9).await.unwrap();
+        assert_eq!(journal.purge_marker(), (3, 9));
+
+        // The installed history restarts new operations at 5. Its purge floor
+        // must not classify those operations as part of the discarded history.
+        journal.reset(4, None).await.unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.checkpoint_op(), 4);
+        assert_eq!(journal.purge_marker(), (3, 4));
+        let fresh = prepare(5, 1234);
+        journal.append(fresh.clone().into_frozen()).await.unwrap();
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert!(journal.contains(fresh.header()));
+        assert!(fresh.header().op > journal.purge_marker().1);
     }
 
     #[compio::test]
