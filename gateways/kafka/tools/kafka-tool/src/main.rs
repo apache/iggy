@@ -365,9 +365,16 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("OffsetFetch")?;
         }
         10 => {
-            FindCoordinatorRequest::default()
-                .with_key(StrBytes::from_static_str("test-group"))
-                .with_key_type(0)
+            let key = StrBytes::from_static_str("test-group");
+            let request = FindCoordinatorRequest::default().with_key_type(0);
+            // v4 replaced the single key with `coordinator_keys`; the encoder refuses whichever
+            // field the version does not carry.
+            let request = if version >= 4 {
+                request.with_coordinator_keys(vec![key])
+            } else {
+                request.with_key(key)
+            };
+            request
                 .encode(&mut buf, version)
                 .context("FindCoordinator")?;
         }
@@ -862,4 +869,23 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A version the gateway advertises but this tool cannot build leaves the fixture-backed
+    /// suites without a fixture, which `KAFKA_FIXTURES_REQUIRED=1` turns into a CI failure.
+    #[test]
+    fn given_every_gateway_scoped_version_should_build_a_request() {
+        for (api_key, name, min_version, max_version) in gateway_verify_registry() {
+            for version in min_version..=max_version {
+                assert!(
+                    build_framed(api_key, version, 1).is_ok(),
+                    "{name} v{version} must build"
+                );
+            }
+        }
+    }
 }

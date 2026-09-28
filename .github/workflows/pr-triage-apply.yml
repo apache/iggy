@@ -76,9 +76,13 @@ name: PR Triage Apply
 # - pull_request_target runs the base-repo workflow with a write token so
 #   fork-PR lifecycle labels can be applied. workflow_run also runs against
 #   base ref. Both are safe because we never run fork code: no checkout,
-#   no exec of PR contents, no token export. The review/comment body
-#   reaches us via the artifact uploaded by pr-triage-collect.yml; it is
-#   treated as untrusted text, parsed only by the command regex. See
+#   no exec of PR contents, no token export.
+# - The artifact from pr-triage-collect.yml is NOT trusted for identity. On
+#   the pull_request_review path collect runs the PR head's own copy of
+#   itself, so a fork can upload any payload. The resolve step reads only a
+#   numeric id from it and re-fetches the author, association, PR number,
+#   review state and body from the API, which a fork cannot forge. The body
+#   stays in a file and is parsed only by the command regex. See
 #   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 
 on:
@@ -139,52 +143,191 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: payload/
 
-      - name: Parse triage event payload
+      - name: Resolve the trigger from the API
+        id: resolve
         if: github.event_name == 'workflow_run'
         env:
           UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_CREATED: ${{ github.event.workflow_run.created_at }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # The artifact contains exactly one file: the JSON event payload
-          # uploaded as `${{ github.event_path }}`. Its on-disk name is
-          # whatever the runner used (e.g. event.json); resolve it dynamically.
-          payload=( payload/*.json payload/event.json )
-          f=""
-          for candidate in "${payload[@]}"; do
-            [[ -f "$candidate" ]] && f="$candidate" && break
-          done
+          # The collect workflow runs the PR head's own copy of itself on the
+          # pull_request_review path, so a fork can upload any payload it likes.
+          # Nothing in the artifact is trusted for identity. It is read only for
+          # the numeric trigger id, and every field the gate depends on - author,
+          # association, PR number, body, review state - is re-fetched from the
+          # API below, which a fork cannot forge. A forged id resolves to a real
+          # object (whose real properties are used) or 404s; it cannot invent a
+          # committer command. The collect run's commit must also belong to the
+          # claimed PR and the review must be as new as the run, so an old review
+          # cannot be replayed onto another PR or onto the fork's own.
+          # The case below routes on UPSTREAM_EVENT, which GitHub sets from the
+          # collect run itself, not from the artifact. GitHub only runs
+          # issue_comment workflows from the default branch, so a fork's copy
+          # of collect can never fire on that event: a fork's run always
+          # arrives as pull_request_review and takes the checked path, while
+          # the issue_comment path only ever sees an artifact written by the
+          # default branch's collect. Any other event is rejected.
+          payload=( payload/*.json )
+          f="${payload[0]:-}"
           if [[ -z "$f" ]]; then
             echo "triage payload not found under payload/" >&2
             ls -la payload/ >&2 || true
             exit 1
           fi
-          # Body is attacker-controlled. Route it via a file rather than
-          # $GITHUB_ENV: heredoc terminators can be forged inside the body
-          # to close the block early and inject arbitrary env vars (e.g.
-          # NODE_OPTIONS, GITHUB_PATH) into the subsequent github-script
-          # step, which holds a write GITHUB_TOKEN. The other fields below
-          # are constrained single-line values (numeric ids, enum states,
-          # GH login charset) and can stay in $GITHUB_ENV.
-          jq -r '.comment.body // .review.body // ""' "$f" > payload/body.txt
+
+          # A forged newline in an artifact id must never reach a step output.
+          require_num() {
+            case "$1" in
+              ''|*[!0-9]*) echo "non-numeric ${2}: '${1}'" >&2; exit 1 ;;
+            esac
+          }
+
+          # Retry 5xx, 429 and network failures, as withRetry does for the
+          # script path. Anything else fails at once with gh's own message;
+          # a 404 returns 44 so a caller can tell it apart.
+          gh_api() {
+            local err out code="" delay
+            err="$(mktemp)"
+            for delay in 0.5 1.5 4 ""; do
+              if out="$(gh api "$@" 2>"$err")"; then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              code="$(grep -oE 'HTTP [0-9]{3}' "$err" | tail -n1 | cut -d' ' -f2 || true)"
+              case "$code" in
+                ''|429|5??) ;;
+                *) break ;;
+              esac
+              [[ -n "$delay" ]] || break
+              echo "gh api $1: transient failure (${code:-network}), retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+            cat "$err" >&2
+            rm -f "$err"
+            if [[ "$code" == 404 ]]; then return 44; fi
+            return 1
+          }
+
+          author=""; assoc=""; state=""; pr=""; cid=""
+          : > payload/body.txt
+
+          case "$UPSTREAM_EVENT" in
+            issue_comment)
+              cid="$(jq -r '.comment.id // ""' "$f")"
+              require_num "$cid" comment_id
+              c="$(gh_api "repos/${REPO}/issues/comments/${cid}")"
+              author="$(jq -r '.user.login // ""' <<<"$c")"
+              assoc="$(jq -r '.author_association' <<<"$c")"
+              jq -r '.body // ""' <<<"$c" > payload/body.txt
+              # issue_url ends in the PR (issue) number.
+              pr="$(jq -r '.issue_url' <<<"$c" | grep -oE '[0-9]+$' || true)"
+              ;;
+            pull_request_review)
+              rid="$(jq -r '.review.id // ""' "$f")"
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              require_num "$rid" review_id
+              require_num "$cpr" pr_number
+              # Fetching the review under the claimed PR verifies the pair: a
+              # review id that does not belong to that PR 404s here, so the
+              # claimed PR number cannot be steered to another PR. Skip it
+              # rather than fail the run, as the PR lookup below does.
+              rc=0
+              r="$(gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}")" || rc=$?
+              if (( rc == 44 )); then
+                echo "review ${rid} is not on PR ${cpr}, skipping"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              elif (( rc != 0 )); then
+                exit "$rc"
+              fi
+              # The pair is real but may be someone else's old review on any
+              # PR. HEAD_SHA is set by GitHub, not the fork, and is the head
+              # the collect run fired on. Requiring it to be one of the claimed
+              # PR's commits is what confines a forged payload to the fork's
+              # own PR: a forged run fires on the fork's own commit, which is
+              # in no other PR's commit list.
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
+                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
+                exit 1
+              fi
+              # That leaves a fork replaying an old review on its own PR, for
+              # example a committer's /pin. RUN_CREATED is set by GitHub, and a
+              # real run is created seconds after its review is submitted.
+              sub="$(jq -r '.submitted_at // ""' <<<"$r")"
+              if [[ -z "$sub" ]]; then
+                echo "review ${rid} has no submitted_at" >&2
+                exit 1
+              fi
+              age=$(( $(date -u -d "$RUN_CREATED" +%s) - $(date -u -d "$sub" +%s) ))
+              if (( age < -60 || age > 300 )); then
+                echo "review ${rid} was submitted at ${sub} and the collect run created at ${RUN_CREATED}, outside the allowed window" >&2
+                exit 1
+              fi
+              author="$(jq -r '.user.login // ""' <<<"$r")"
+              assoc="$(jq -r '.author_association' <<<"$r")"
+              state="$(jq -r '.state' <<<"$r" | tr '[:upper:]' '[:lower:]')"
+              jq -r '.body // ""' <<<"$r" > payload/body.txt
+              pr="$cpr"
+              # Reviews carry no issue-comment id, so reactions stay skipped
+              # for them, as before.
+              ;;
+            *)
+              echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
+              exit 1
+              ;;
+          esac
+
+          require_num "$pr" resolved_pr
+          # Constrain the API-derived scalars before they leave this step. The
+          # API cannot return a newline in a login or an association; this is
+          # defence in depth on top of the source already being trusted.
+          # A bash match tests the whole string. grep tests each line, so a
+          # value with a newline in it would pass on any one matching line.
+          login_re='^[A-Za-z0-9-]+(\[bot\])?$'
+          if [[ ! "$author" =~ $login_re ]]; then
+            echo "unexpected login: '${author}'" >&2
+            exit 1
+          fi
+          case "$assoc" in
+            OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR|FIRST_TIME_CONTRIBUTOR|FIRST_TIMER|MANNEQUIN|NONE) ;;
+            *) echo "unexpected association: '${assoc}'" >&2; exit 1 ;;
+          esac
+          # Empty on the issue_comment path. A newline here could add a second
+          # pr_number line to the outputs below.
+          case "$state" in
+            ''|approved|changes_requested|commented|dismissed|pending) ;;
+            *) echo "unexpected review state: '${state}'" >&2; exit 1 ;;
+          esac
+          # Step outputs, not $GITHUB_ENV: an output is read only through a
+          # steps.*.outputs.* expression and never becomes a process env var in
+          # a later step, so it cannot smuggle NODE_OPTIONS or BASH_ENV even if
+          # a value slipped the checks above. The values are single-line here.
           {
-            echo "COMMENT_AUTHOR=$(jq -r '.comment.user.login // .review.user.login // ""' "$f")"
-            echo "COMMENT_ASSOC=$(jq -r '.comment.author_association // .review.author_association // ""' "$f")"
-            echo "COMMENT_ID=$(jq -r '.comment.id // ""' "$f")"
-            echo "PR_NUMBER=$(jq -r '.pull_request.number // .issue.number // ""' "$f")"
-            echo "REVIEW_STATE=$(jq -r '.review.state // ""' "$f")"
-            echo "TRIAGE_EVENT_NAME=${UPSTREAM_EVENT}"
-          } >> "$GITHUB_ENV"
+            echo "comment_author=${author}"
+            echo "comment_assoc=${assoc}"
+            echo "comment_id=${cid}"
+            echo "pr_number=${pr}"
+            echo "review_state=${state}"
+            echo "triage_event_name=${UPSTREAM_EVENT}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch
+        if: steps.resolve.outputs.skip != 'true'
         uses: actions/github-script@v9
         env:
-          COMMENT_AUTHOR: ${{ env.COMMENT_AUTHOR }}
-          COMMENT_ASSOC: ${{ env.COMMENT_ASSOC }}
-          COMMENT_ID: ${{ env.COMMENT_ID }}
-          PR_NUMBER: ${{ env.PR_NUMBER || github.event.pull_request.number }}
-          REVIEW_STATE: ${{ env.REVIEW_STATE }}
-          TRIAGE_EVENT_NAME: ${{ env.TRIAGE_EVENT_NAME || github.event_name }}
+          COMMENT_AUTHOR: ${{ steps.resolve.outputs.comment_author }}
+          COMMENT_ASSOC: ${{ steps.resolve.outputs.comment_assoc }}
+          COMMENT_ID: ${{ steps.resolve.outputs.comment_id }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number || github.event.pull_request.number }}
+          REVIEW_STATE: ${{ steps.resolve.outputs.review_state }}
+          TRIAGE_EVENT_NAME: ${{ steps.resolve.outputs.triage_event_name || github.event_name }}
         with:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
@@ -212,11 +355,11 @@ jobs:
               return;
             }
 
-            // Effective event name. On the workflow_run leg the artifact
-            // payload was produced by issue_comment / pull_request_review,
-            // and the upstream event name was preserved into the env in
-            // the parse step. On the pull_request_target leg we read the
-            // GH-provided context.eventName directly.
+            // Effective event name. On the workflow_run leg the trigger was
+            // issue_comment / pull_request_review, and the upstream event name
+            // was preserved into the env by the resolve step. On the
+            // pull_request_target leg we read the GH-provided context.eventName
+            // directly.
             const eventName = process.env.TRIAGE_EVENT_NAME || context.eventName;
 
             // Welcome comment posted once when a non-draft PR is opened.
@@ -547,13 +690,13 @@ jobs:
 
             // ----- issue_comment / pull_request_review commands -----
             // Both event types feed the same path: COMMENT_AUTHOR/_ASSOC/
-            // _ID, PR_NUMBER and REVIEW_STATE resolve from the artifact
-            // uploaded by pr-triage-collect.yml via the parse step above.
-            // body is routed through a file (payload/body.txt) rather
-            // than $GITHUB_ENV -- see the parse step's comment for the
-            // injection rationale. The file is absent on the
-            // pull_request_target leg (no parse step), and lifecycle
-            // returned above, so falling back to '' is safe.
+            // _ID, PR_NUMBER, REVIEW_STATE and body were re-fetched from the
+            // API by the resolve step above, not taken from the fork-supplied
+            // artifact. body stays in a file (payload/body.txt) rather than a
+            // step output: it is multi-line text its author controls, and a
+            // multi-line output needs a delimiter the body could forge. The file
+            // is absent on the pull_request_target leg (no resolve step), and
+            // lifecycle returned above, so falling back to '' is safe.
             const fs = require('fs');
             const body = fs.existsSync('payload/body.txt')
               ? fs.readFileSync('payload/body.txt', 'utf8')
