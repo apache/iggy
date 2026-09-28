@@ -65,6 +65,9 @@ func newPrimaryPollFixture(t *testing.T,
 				partition := routedPollPartition(t, read)
 				require.Equal(t, primary, int(partition), "poll must reach its own partition primary")
 				return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(partition))
+			case read.operation() == vsr.OperationStoreConsumerOffset || read.operation() == vsr.OperationDeleteConsumerOffset:
+				require.Equal(t, primary, int(polledPartition(t, read)), "offset write must reach its own partition primary")
+				return replyFrame(read.operation(), resultSection())
 			default:
 				t.Errorf("unexpected data command %d, operation %d", read.code(), read.operation())
 				return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrInvalidCommand.Code()), nil)
@@ -86,7 +89,7 @@ func newPrimaryPollFixture(t *testing.T,
 			return clusterMetadataFrame(t, 0, fixture.coordinator.address(), fixture.primaries[0].address(), fixture.primaries[1].address())
 		case read.code() == uint32(command.SyncGroupCode):
 			return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 0, 1))
-		case read.code() == uint32(command.GetPollRoutingCode):
+		case read.code() == uint32(command.GetPollRoutingCode) || read.code() == uint32(command.GetOffsetRoutingCode):
 			partition := routedPollPartition(t, read)
 			return pollRoutingReply(t, read, fixture.primaries[partition].address(), 1)
 		case read.code() == uint32(command.PollMessagesCode):
@@ -137,6 +140,17 @@ func requestCount(reads []request, code command.Code) int {
 	count := 0
 	for _, read := range reads {
 		if read.code() == uint32(code) {
+			count++
+		}
+	}
+	return count
+}
+
+// Replicated frames carry the operation, not the command code.
+func operationCount(reads []request, operation vsr.Operation) int {
+	count := 0
+	for _, read := range reads {
+		if read.operation() == operation {
 			count++
 		}
 	}
@@ -276,6 +290,41 @@ func TestPrimaryPoll_CancellationClosesUnfinishedExchangeAndBoundsPooledWaiter(t
 	assert.Zero(t, polled.PartitionId, "the late canceled reply must never answer the next poll")
 	assert.Equal(t, 2, fixture.primaries[0].connections())
 	assert.Equal(t, 1, fixture.coordinator.connections())
+}
+
+func TestPrimaryPoll_AbandonedAutoCommitPollIsNotIssuedAgain(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	var polls atomic.Int32
+	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+		if read.code() == uint32(command.PollMessagesOnPrimaryCode) && polls.Add(1) == 1 {
+			close(entered)
+			<-release
+			return nil, true
+		}
+		return nil, false
+	}, nil)
+	completed := make(chan error, 1)
+	go func() { _, err := pollPrimaryPartition(context.Background(), fixture.client, 0); completed <- err }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("primary did not receive the poll")
+	}
+	fixture.client.polls.mu.Lock()
+	slot := fixture.client.polls.connections[fixture.primaries[0].address()]
+	fixture.client.polls.mu.Unlock()
+	// Ends the slot's lifetime but leaves its socket open, so the exchange is
+	// still in flight when the poll gives up on it.
+	slot.cancel()
+	select {
+	case err := <-completed:
+		require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	case <-time.After(time.Second):
+		t.Fatal("the poll did not give up on its retired data connection")
+	}
+	assert.Equal(t, int32(1), polls.Load(), "the server may have committed the abandoned poll")
 }
 
 func TestPrimaryPoll_LogoutRetiresPendingDataAndDoesNotResurrectMembership(t *testing.T) {
@@ -422,12 +471,12 @@ func TestPrimaryPoll_RetirementDuringAttachmentIsNotCallerCancellation(t *testin
 	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
 		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
 	require.NoError(t, err)
-	key := string(payload[:len(payload)-pollParametersSize])
+	key := pollRouteKey(payload)
 	route, err := fixture.client.pollRoute(context.Background(), key, payload)
 	require.NoError(t, err)
 	completed := make(chan error, 1)
 	go func() {
-		_, err := fixture.client.pollOnRoute(context.Background(), key, payload, route)
+		_, err := fixture.client.pollOnRoute(context.Background(), uint32(command.PollMessagesOnPrimaryCode), key, payload, route)
 		completed <- err
 	}()
 	select {
@@ -461,13 +510,13 @@ func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
 					PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}
 				payload, err := poll.MarshalBinary()
 				require.NoError(t, err)
-				key := string(payload[:len(payload)-pollParametersSize])
+				key := pollRouteKey(payload)
 				route := pollRoute{endpoint: "127.0.0.1:9000", parent: coordinator.pollSession.Load().parent}
 				lifetime, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				slot := &pollConnection{gate: make(chan struct{}, 1), ctx: lifetime, cancel: cancel,
 					conn: primary.conn, client: primary, parent: route.parent, attached: true}
-				coordinator.polls.routes = map[string]pollRoute{key: route}
+				coordinator.polls.routes = map[routeKey]pollRoute{key: route}
 				coordinator.polls.connections = map[string]*pollConnection{route.endpoint: slot}
 				serve(coordinatorConn, func(_ int, read request) []byte {
 					return pollRoutingReply(t, read, route.endpoint, 0)
@@ -700,6 +749,42 @@ func TestPrimaryPoll_PlainConsumerRoutesAndNonAutoCommitStaysOnCoordinator(t *te
 	assert.Equal(t, 2, requestCount(fixture.primaries[0].recorded(), command.PollMessagesOnPrimaryCode))
 }
 
+func TestPrimaryOffsetWrite_SplitPrimariesKeepCoordinatorSessionAndShareRoutes(t *testing.T) {
+	fixture := newPrimaryPollFixture(t, nil, nil)
+	stream, topic, consumer := groupConsumer(t)
+	parent := fixture.client.session.ClientID()
+	session := fixture.client.session.SessionID()
+	for partition := range uint32(2) {
+		require.NoError(t, fixture.client.StoreConsumerOffset(context.Background(), consumer, stream, topic, 5, &partition))
+		require.NoError(t, fixture.client.DeleteConsumerOffset(context.Background(), consumer, stream, topic, &partition))
+	}
+	assert.Equal(t, 1, fixture.coordinator.connections(), "offset writes must not move the group coordinator")
+	assert.Equal(t, parent, fixture.client.session.ClientID())
+	assert.Equal(t, session, fixture.client.session.SessionID())
+	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetOffsetRoutingCode))
+	assert.Zero(t, operationCount(fixture.coordinator.recorded(), vsr.OperationStoreConsumerOffset))
+	assert.Zero(t, operationCount(fixture.coordinator.recorded(), vsr.OperationDeleteConsumerOffset))
+	for _, primary := range fixture.primaries {
+		assert.Equal(t, 1, primary.connections())
+		assert.Equal(t, 1, requestCount(primary.recorded(), command.AttachConsumerSessionCode))
+		assert.Equal(t, 1, operationCount(primary.recorded(), vsr.OperationStoreConsumerOffset))
+		assert.Equal(t, 1, operationCount(primary.recorded(), vsr.OperationDeleteConsumerOffset))
+	}
+}
+
+func TestPrimaryOffsetWrite_StandaloneStaysOnCoordinator(t *testing.T) {
+	fixture := newPrimaryPollFixture(t, nil, nil)
+	fixture.client.clustered.Store(false)
+	stream, topic, consumer := groupConsumer(t)
+	partition := uint32(1)
+	require.NoError(t, fixture.client.StoreConsumerOffset(context.Background(), consumer, stream, topic, 5, &partition))
+	require.NoError(t, fixture.client.DeleteConsumerOffset(context.Background(), consumer, stream, topic, &partition))
+	assert.Equal(t, 1, operationCount(fixture.coordinator.recorded(), vsr.OperationStoreConsumerOffset))
+	assert.Equal(t, 1, operationCount(fixture.coordinator.recorded(), vsr.OperationDeleteConsumerOffset))
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetOffsetRoutingCode))
+	assert.Zero(t, fixture.primaries[1].connections())
+}
+
 func TestPrimaryPoll_WarmRouteDoesNotWaitForCoordinatorIOAndColdRouteHonorsDeadline(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -756,13 +841,13 @@ func TestPrimaryPoll_MetadataAcknowledgedWhileQueuedRefreshesBeforeAdmission(t *
 	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
 		Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true, PartitionId: &partition}).MarshalBinary()
 	require.NoError(t, err)
-	key := string(payload[:len(payload)-pollParametersSize])
+	key := pollRouteKey(payload)
 	fixture.client.polls.mu.Lock()
 	route := fixture.client.polls.routes[key]
 	fixture.client.polls.mu.Unlock()
 	completed := make(chan error, 1)
 	go func() {
-		_, err := fixture.client.pollOnRoute(context.Background(), key, payload, route)
+		_, err := fixture.client.pollOnRoute(context.Background(), uint32(command.PollMessagesOnPrimaryCode), key, payload, route)
 		completed <- err
 	}()
 	_, err = fixture.client.SendBinaryRequest(context.Background(), uint32(command.PurgeTopicCode), nil)

@@ -40,31 +40,50 @@ func (c *IggyTcpClient) GetConsumerOffset(ctx context.Context, consumer iggcon.C
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
-	// TODO(#4292): a group commit for a partition whose primary is not the
-	// coordinator goes out on the coordinator session, is refused as not
-	// admitted, and sendFrame walks the roster to the primary. That reconnect
-	// registers a new client identity, which is not a member of the group, so
-	// the replayed commit fails with ConsumerGroupPartitionNotOwned and the
-	// membership is gone. Route clustered group commits (and deletes) to the
-	// partition primary through the attached consumer session, as pollPrimary
-	// does for auto-commit polls and the Rust SDK's PollRouter::write_offset
-	// does for offset writes.
-	_, err := c.do(ctx, &command.StoreConsumerOffsetRequest{
+	target := command.GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: partitionId}
+	return c.writeOffset(ctx, &target, &command.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
 		Consumer:    consumer,
 		PartitionId: partitionId,
 	})
-	return err
 }
 
 func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
-	_, err := c.do(ctx, &command.DeleteConsumerOffset{
+	target := command.GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: partitionId}
+	return c.writeOffset(ctx, &target, &command.DeleteConsumerOffset{
 		Consumer:    consumer,
 		StreamId:    streamId,
 		TopicId:     topicId,
 		PartitionId: partitionId,
 	})
+}
+
+// writeOffset sends a clustered offset write to the partition primary on the
+// attached data connection. On the coordinator session, a partition refusal
+// would walk the roster and register a new client identity, which is not a
+// member of the group, so a group commit would be refused and the membership
+// lost.
+func (c *IggyTcpClient) writeOffset(ctx context.Context, target *command.GetConsumerOffset, write command.Command) error {
+	if !c.topologyKnown.Load() {
+		if _, err := c.GetClusterMetadata(ctx); err != nil {
+			return err
+		}
+	}
+	if !c.clustered.Load() {
+		_, err := c.do(ctx, write)
+		return err
+	}
+	routing, err := target.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	payload, err := write.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	key := routeKey{code: uint32(command.GetOffsetRoutingCode), target: string(routing)}
+	_, err = c.sendRouted(ctx, uint32(write.Code()), key, routing, payload)
 	return err
 }

@@ -21,10 +21,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"net"
-	"os"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -187,135 +183,77 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 	require.NoError(t, connected.DeleteConsumerGroup(ctx, streamId, topicId, groupId))
 }
 
-// The shared cluster fixture seeds these partitions before moving only metadata
-// leadership. Creating a fresh topic here would put both primaries together.
-func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
-	streamName := os.Getenv("IGGY_POLL_ROUTING_STREAM")
-	if streamName == "" {
-		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic with eight messages per partition")
-	}
-	messagesPerPartition := 8
-	if value := os.Getenv("IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION"); value != "" {
-		var err error
-		messagesPerPartition, err = strconv.Atoi(value)
-		require.NoError(t, err, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
-		require.Positive(t, messagesPerPartition, "IGGY_POLL_ROUTING_MESSAGES_PER_PARTITION must be a positive integer")
-	}
-	stream, err := iggcon.NewIdentifier(streamName)
-	require.NoError(t, err)
-	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
-	require.NoError(t, err)
+// A poll the caller gives up on mid-read must not cost the group membership:
+// a closed socket is a disconnect to the server, which logs the client out
+// and drops its member.
+func TestE2E_AbandonedPollKeepsGroupMembership(t *testing.T) {
+	const (
+		partitionsCount = 3
+		batches         = 10
+		batchSize       = 1000
+		messageSize     = 1000
+		pollCount       = batches * batchSize
+		pollDeadline    = 500 * time.Microsecond
+		pollAttempts    = 10
+	)
 	connected := connect(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	details, err := connected.GetTopic(ctx, stream, topic)
-	require.NoError(t, err)
-	group, err := connected.CreateConsumerGroup(ctx, stream, topic, fmt.Sprintf("go-primary-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	groupID, err := iggcon.NewIdentifier(group.Id)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
-	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
-	consumer := iggcon.NewGroupConsumer(groupID)
-	partition := uint32(0)
-	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
-		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
-	require.NoError(t, err)
-	route, err := connected.SendBinaryRequest(ctx, uint32(command.GetPollRoutingCode), payload)
-	require.NoError(t, err)
-	require.Greater(t, len(route), 32)
-	var primary iggcon.ClusterNode
-	require.NoError(t, primary.UnmarshalBinary(route[32:]))
-	coordinator := connected.GetConnectionInfo().ServerAddress
-	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
-	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
-	require.NoError(t, err)
-	primaryEndpoint, err := net.ResolveTCPAddr("tcp", primaryAddress)
-	require.NoError(t, err)
-	require.False(t, coordinatorEndpoint.Port == primaryEndpoint.Port && coordinatorEndpoint.IP.Equal(primaryEndpoint.IP),
-		"the fixture must separate metadata and partition primaries")
-	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
-	require.NoError(t, err)
-	beforeClient := binaryserialization.DeserializeClient(before)
-	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
-	counts := make(map[uint32]int)
-	for range int(details.PartitionsCount) * messagesPerPartition {
-		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, nil)
-		require.NoError(t, err)
-		require.Len(t, polled.Messages, 1)
-		counts[polled.PartitionId]++
-	}
-	for partition := range details.PartitionsCount {
-		assert.Equal(t, messagesPerPartition, counts[partition])
-		require.Eventually(t, func() bool {
-			offset, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
-			return err == nil && offset != nil && offset.StoredOffset == uint64(messagesPerPartition-1)
-		}, 5*time.Second, 50*time.Millisecond,
-			"partition %d auto-commit must replicate to the coordinator's backup", partition)
-		polled, err := connected.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, true, &partition)
-		require.NoError(t, err)
-		assert.Empty(t, polled.Messages, "the group auto-commit advanced on the primary")
-		polled, err = connected.PollMessages(ctx, stream, topic, iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 1, true, &partition)
-		require.NoError(t, err)
-		require.Len(t, polled.Messages, 1)
-	}
-	after, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
-	require.NoError(t, err)
-	afterClient := binaryserialization.DeserializeClient(after)
-	assert.Equal(t, beforeClient.ID, afterClient.ID)
-	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount)
-	assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress)
-	t.Logf("coordinator=%s primary=%s messages=%d client=%d groups=%d", coordinator,
-		primaryAddress, int(details.PartitionsCount)*messagesPerPartition, afterClient.ID, afterClient.ConsumerGroupsCount)
-}
+	ctx := context.Background()
+	streamId, topicId := scratchTopic(t, connected, partitionsCount)
 
-// A manual group commit on the same split-primary fixture. The Rust SDK routes
-// it to the partition primary over the consumer-session data connection and
-// keeps its coordinator membership; the Go client must do the same rather than
-// move its session to the primary, which registers a new client identity that
-// is not a member and gets the commit refused.
-func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
-	streamName := os.Getenv("IGGY_POLL_ROUTING_STREAM")
-	if streamName == "" {
-		t.Skip("set IGGY_POLL_ROUTING_STREAM and IGGY_POLL_ROUTING_TOPIC to a split-primary topic")
+	// About 10 MB in partition 0, so a poll of all of it outlasts the
+	// deadline. Every partition needs a message for an offset to be stored.
+	payload := make([]byte, messageSize)
+	for range batches {
+		batch := make([]iggcon.IggyMessage, 0, batchSize)
+		for range batchSize {
+			message, err := iggcon.NewIggyMessage(payload)
+			require.NoError(t, err)
+			batch = append(batch, message)
+		}
+		_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(0), batch)
+		require.NoError(t, err)
 	}
-	stream, err := iggcon.NewIdentifier(streamName)
+	for partition := uint32(1); partition < partitionsCount; partition++ {
+		_, err := connected.SendMessages(ctx, streamId, topicId,
+			iggcon.PartitionId(partition), testMessages(t, 1))
+		require.NoError(t, err)
+	}
+
+	group, err := connected.CreateConsumerGroup(ctx, streamId, topicId, "go-e2e-abandoned-poll")
 	require.NoError(t, err)
-	topic, err := iggcon.NewIdentifier(os.Getenv("IGGY_POLL_ROUTING_TOPIC"))
+	groupId, err := iggcon.NewIdentifier(group.Id)
 	require.NoError(t, err)
-	connected := connect(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	group, err := connected.CreateConsumerGroup(ctx, stream, topic, fmt.Sprintf("go-commit-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	groupID, err := iggcon.NewIdentifier(group.Id)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
-	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
-	consumer := iggcon.NewGroupConsumer(groupID)
-	coordinator := connected.GetConnectionInfo().ServerAddress
+	require.NoError(t, connected.JoinConsumerGroup(ctx, streamId, topicId, groupId))
+	consumer := iggcon.NewGroupConsumer(groupId)
 	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
 	require.NoError(t, err)
 	beforeClient := binaryserialization.DeserializeClient(before)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
 
-	partition := uint32(0)
-	for offset := range uint64(2) {
-		err := connected.StoreConsumerOffset(ctx, consumer, stream, topic, offset, &partition)
-		require.NoError(t, err, "manual group commit of offset %d must reach the partition primary as a member (session %s -> %s)",
-			offset, coordinator, connected.GetConnectionInfo().ServerAddress)
-		assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress,
-			"the commit must not move the coordinator session")
+	partitionId := uint32(0)
+	for range pollAttempts {
+		pollCtx, cancel := context.WithTimeout(ctx, pollDeadline)
+		_, err = connected.PollMessages(pollCtx, streamId, topicId, consumer,
+			iggcon.NextPollingStrategy(), pollCount, false, &partitionId)
+		cancel()
+		if err != nil {
+			break
+		}
 	}
-	stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	assert.Equal(t, uint64(1), stored.StoredOffset)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "no poll outlasted its deadline")
+
+	for partition := range uint32(partitionsCount) {
+		require.NoError(t, connected.StoreConsumerOffset(ctx, consumer, streamId, topicId, 0, &partition),
+			"partition %d: the member no longer owns it", partition)
+	}
 	after, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
 	require.NoError(t, err)
 	afterClient := binaryserialization.DeserializeClient(after)
-	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
-	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
+	assert.Equal(t, beforeClient.ID, afterClient.ID, "the client lost its server identity")
+	assert.Equal(t, uint32(1), afterClient.ConsumerGroupsCount)
+	details, err := connected.GetConsumerGroup(ctx, streamId, topicId, groupId)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), details.MembersCount)
 }
 
 func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {

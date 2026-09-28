@@ -20,7 +20,9 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -350,18 +352,200 @@ func TestExchange_InvalidatesTheConnectionWhenTheReplyIsCutShort(t *testing.T) {
 	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
 }
 
-func TestExchange_InvalidatesTheConnectionWhenTheContextIsCancelledMidRead(t *testing.T) {
+func TestExchange_KeepsTheConnectionWhenTheCallerGivesUpMidRead(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		cancel  bool
+		want    error
+	}{
+		{name: "cancelled", timeout: time.Hour, cancel: true, want: context.Canceled},
+		{name: "deadline passed", timeout: 50 * time.Millisecond, want: context.DeadlineExceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client, serverConn := newPipeClient(t)
+				client.config.reconnection.enabled = false
+				identity := client.session.ClientID()
+				entered := make(chan struct{})
+				release := make(chan struct{})
+				server := serve(serverConn, func(index int, _ request) []byte {
+					if index == 0 {
+						close(entered)
+						<-release
+						return replyFrame(vsr.OperationNonReplicated, []byte("late"))
+					}
+					return replyFrame(vsr.OperationNonReplicated, []byte("next"))
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), test.timeout)
+				defer cancel()
+
+				returned := make(chan error, 1)
+				go func() {
+					_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
+					returned <- err
+				}()
+				<-entered
+				if test.cancel {
+					cancel()
+				}
+				select {
+				case err := <-returned:
+					require.ErrorIs(t, err, test.want)
+				case <-time.After(time.Second):
+					t.Fatal("the caller waited for the reply instead of giving up")
+				}
+				close(release)
+
+				response, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+				require.NoError(t, err)
+				assert.Equal(t, []byte("next"), response, "the late reply must never answer the next request")
+				recorded := server.recorded()
+				require.Len(t, recorded, 2)
+				assert.Equal(t, recorded[0].clientID(), recorded[1].clientID())
+				assert.Equal(t, recorded[0].sessionID(), recorded[1].sessionID())
+				assert.Equal(t, identity, client.session.ClientID())
+				assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
+			})
+		})
+	}
+}
+
+func TestExchange_ReplaysTheOriginalFrameAfterTheCallerGaveUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client, serverConn := newPipeClient(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		answer := make(chan struct{})
+		server := serve(serverConn, func(index int, _ request) []byte {
+			if index == 0 {
+				cancel()
+				<-answer
+				return statusReplyFrame(vsr.OperationCreateStream,
+					uint32(ierror.TransientNotCommittedCode), nil)
+			}
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		})
+
+		results := make(chan error, 2)
+		go func() {
+			_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
+			results <- err
+			// Takes a pooled buffer and queues behind the replay.
+			_, err = client.do(context.Background(), &command.CreateStream{Name: "payments"})
+			results <- err
+		}()
+		require.ErrorIs(t, <-results, context.Canceled)
+		synctest.Wait()
+		close(answer)
+		require.NoError(t, <-results)
+
+		recorded := server.recorded()
+		require.Len(t, recorded, 3)
+		assert.Equal(t, recorded[0].header, recorded[1].header,
+			"the replay must carry the original client and request id")
+		assert.Equal(t, recorded[0].payload, recorded[1].payload,
+			"the replay must resend the original bytes")
+		assert.NotEqual(t, recorded[0].payload, recorded[2].payload)
+	})
+}
+
+func TestClose_DoesNotWaitForAnExchangeItsCallerGaveUpOn(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	client.config.reconnection.enabled = false
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	serve(serverConn, func(_ int, _ request) []byte {
 		cancel()
 		return nil
 	})
 
 	_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	require.ErrorIs(t, err, context.Canceled)
+
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close() }()
+	select {
+	case err := <-closed:
+		assert.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close waited out the request budget of an exchange nobody waits for")
+	}
+}
+
+func TestExchange_DropsTheConnectionWhenTheAbandonedReplyNeverArrives(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.config.reconnection.enabled = false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	abandoned := make(chan struct{})
+	serve(serverConn, func(_ int, _ request) []byte {
+		cancel()
+		<-abandoned
+		_ = serverConn.Close()
+		return nil
+	})
+
+	_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
+	require.ErrorIs(t, err, context.Canceled)
+	close(abandoned)
+
+	// The abandoned exchange holds the lock until its drain ends.
+	client.mtx.Lock()
+	defer client.mtx.Unlock()
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState,
+		"the stream is at an unknown boundary, so the connection is dropped")
+	assert.False(t, client.session.Bound())
+}
+
+func TestExchange_CancelledSessionControlAndUnboundExchangesDropTheConnection(t *testing.T) {
+	tests := []struct {
+		name    string
+		client  func(*testing.T) (*IggyTcpClient, net.Conn)
+		request func(context.Context, *IggyTcpClient) error
+	}{
+		{
+			name:   "unbound session",
+			client: newUnboundPipeClient,
+			request: func(ctx context.Context, client *IggyTcpClient) error {
+				_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
+				return err
+			},
+		},
+		{
+			name:   "logout",
+			client: newPipeClient,
+			request: func(ctx context.Context, client *IggyTcpClient) error {
+				return client.LogoutUser(ctx)
+			},
+		},
+		{
+			name:   "sign-in roster read",
+			client: newUnboundPipeClient,
+			request: func(ctx context.Context, client *IggyTcpClient) error {
+				_, err := client.LoginUser(ctx, "iggy", "iggy")
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, serverConn := test.client(t)
+			client.config.reconnection.enabled = false
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			serve(serverConn, func(_ int, read request) []byte {
+				if read.operation() == vsr.OperationRegister {
+					return registerReplyFrame(7, 128)
+				}
+				cancel()
+				return nil
+			})
+
+			assert.ErrorIs(t, test.request(ctx, client), context.Canceled)
+			assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+		})
+	}
 }
 
 func TestSendMessages_DecodesTheConfirmations(t *testing.T) {

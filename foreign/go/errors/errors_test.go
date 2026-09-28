@@ -35,6 +35,7 @@ func TestIggyError_Error(t *testing.T) {
 	}{
 		{name: "with field", err: ErrInvalidTopicId, expected: "invalid topic id"},
 		{name: "without field", err: TopicIdNotFound{1, 1}, expected: "topic with id: 1 for stream with id: 1 was not found."},
+		{name: "code only", err: FromCode(TopicIdNotFoundCode), expected: "topic with id: ? for stream with id: ? was not found."},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

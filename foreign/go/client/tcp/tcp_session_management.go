@@ -110,10 +110,9 @@ func (c *IggyTcpClient) register(
 func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
-	frame := append(reserveHeader(*bp), body...)
-	*bp = frame
+	*bp = append(reserveHeader(*bp), body...)
 
-	response, err := c.exchange(ctx, code, frame)
+	response, err := c.exchange(ctx, code, bp)
 	if err != nil {
 		return nil, err
 	}
