@@ -52,6 +52,7 @@ it knows the server supports flexible encoding.
 | 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
 | 11 | JoinGroup | 0 | 9 | 0 … 9 | Real membership; parks on the group's join barrier; flexible encoding at v6+ |
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
+| 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 
@@ -72,6 +73,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 10 | FindCoordinator | 0–4 | v3 |
 | 11 | JoinGroup | 0–9 | v6 |
 | 12 | Heartbeat | 0–4 | v4 |
+| 13 | LeaveGroup | 0–5 | v4 |
 | 14 | SyncGroup | 0–5 | v4 |
 | 18 | ApiVersions | 0–3 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
@@ -87,7 +89,6 @@ All API keys not listed above close the connection (see Governance model above) 
 | --------- | ------ | ------- |
 | 8 | OffsetCommit | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542) |
 | 9 | OffsetFetch | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542); sent right after SyncGroup, so a joined consumer loops on it today ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)) |
-| 13 | LeaveGroup | Graceful shutdown — [#3543](https://github.com/apache/iggy/issues/3543); without it a departing member is evicted by session expiry instead |
 | 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
 | 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
@@ -131,7 +132,7 @@ untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 11 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the four consumer-group keys, and CreateTopics, Metadata, Produce and ListOffsets with a bridge |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 12 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the five consumer-group keys, and CreateTopics, Metadata, Produce and ListOffsets with a bridge |
 | **3 — Iggy bridge** | CreateTopics, Metadata, Produce and ListOffsets wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`). CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), Produce ([#3535](https://github.com/apache/iggy/issues/3535)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) call it. Fetch does not call it yet ([#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
@@ -311,9 +312,9 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
 
 - [x] FindCoordinator (10), JoinGroup (11), Heartbeat (12), SyncGroup (14) -
-      [#3541](https://github.com/apache/iggy/issues/3541), see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
+      [#3541](https://github.com/apache/iggy/issues/3541); LeaveGroup (13) -
+      [#3543](https://github.com/apache/iggy/issues/3543); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 - [ ] OffsetCommit (8), OffsetFetch (9)
-- [ ] LeaveGroup (13)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning

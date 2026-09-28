@@ -17,7 +17,12 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
-> Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat` and `SyncGroup` are real, with real membership, rebalances and session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off, Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions. With it on, partitions are assigned, but offset commit/fetch is not implemented and Fetch is still a stub, so nothing can be consumed yet.
+> Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
+> `LeaveGroup` and `SyncGroup` are real, with real membership, rebalances, graceful leave and
+> session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
+> Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
+> With it on, partitions are assigned, but offset commit/fetch is not implemented and Fetch is
+> still a stub, so nothing can be consumed yet.
 
 ## Run
 
@@ -63,7 +68,7 @@ cargo test -p iggy-gateway-kafka
 Or generate only the keys the tests need:
 
 ```bash
-for key in 0 1 2 10 11 12 14 19 22; do
+for key in 0 1 2 10 11 12 13 14 19 22; do
   cargo run -p kafka-message-gen -- generate \
     --output gateways/kafka/tools/kafka-tool/kafka_messages \
     --api-key "$key"

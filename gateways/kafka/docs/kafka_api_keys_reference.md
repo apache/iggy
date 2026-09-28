@@ -288,9 +288,10 @@ Key new minimums:
 | FindCoordinator | v0-v4 | v6 | 2 versions behind |
 | JoinGroup | v0-v9 | v9 | current |
 | Heartbeat | v0-v4 | v4 | current |
+| LeaveGroup | v0-v5 | v5 | current |
 | SyncGroup | v0-v5 | v5 | current |
 
-### Missing from `SUPPORTED_RANGES` (77 of the 88 API keys in this document)
+### Missing from `SUPPORTED_RANGES` (76 of the 88 API keys in this document)
 
 Every key not in `SUPPORTED_RANGES` closes the connection - the same policy applied to every
 other unlisted key, not a special case for these. The gateway declines to define a response for a
@@ -298,11 +299,13 @@ key it does not advertise, and a conforming client never sends one, so no respon
 be agreed. This includes:
 
 - **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9)
-- **Classic consumer group protocol**: LeaveGroup (13). FindCoordinator (10), JoinGroup (11), Heartbeat (12) and SyncGroup (14) are supported - see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 - **New consumer group protocol**: ConsumerGroupHeartbeat (68), opt-in via `group.protocol=consumer` (the 4.0 default is still `classic`)
 - **Share groups (KIP-932)**: ShareFetch, ShareGroupHeartbeat, ShareAcknowledge
 - **Auth flow**: SaslHandshake (17), SaslAuthenticate (36)
 - **All broker/KRaft-internal keys** (Group 14)
+
+The classic consumer group keys FindCoordinator (10), JoinGroup (11), Heartbeat (12),
+LeaveGroup (13) and SyncGroup (14) are supported - see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 Remaining scope (consumer groups, auth, admin/tuning) is tracked in `SCOPE.md`'s TODO section,
 not duplicated here.

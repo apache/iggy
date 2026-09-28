@@ -33,6 +33,7 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (10, "FindCoordinator", 0, 4),
     (11, "JoinGroup", 0, 9),
     (12, "Heartbeat", 0, 4),
+    (13, "LeaveGroup", 0, 5),
     (14, "SyncGroup", 0, 5),
     (18, "ApiVersions", 0, 3),
     (19, "CreateTopics", 2, 5),

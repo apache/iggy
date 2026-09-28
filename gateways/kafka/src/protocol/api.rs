@@ -38,7 +38,8 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
     api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, list_offsets, metadata, produce, respond_or_close, sync_group,
+    init_producer_id, join_group, leave_group, list_offsets, metadata, produce, respond_or_close,
+    sync_group,
 };
 use crate::protocol::sasl::{
     SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
@@ -51,6 +52,7 @@ pub const API_KEY_METADATA: i16 = 3;
 pub const API_KEY_FIND_COORDINATOR: i16 = 10;
 pub const API_KEY_JOIN_GROUP: i16 = 11;
 pub const API_KEY_HEARTBEAT: i16 = 12;
+pub const API_KEY_LEAVE_GROUP: i16 = 13;
 pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
@@ -168,6 +170,8 @@ pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 =
 /// this code, and the client rejoins carrying it.
 pub const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
 pub const ERROR_GROUP_MAX_SIZE_REACHED: i16 = 81;
+/// Sent only by `LeaveGroup`: the member id does not hold the `group_instance_id` it named.
+pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// Produce: a record or batch this gateway cannot map.
 ///
 /// Not `CORRUPT_MESSAGE` (2), whose text fits but which `kafka-protocol`'s table marks
@@ -258,6 +262,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     find_coordinator::RANGE,
     join_group::RANGE,
     heartbeat::RANGE,
+    leave_group::RANGE,
     sync_group::RANGE,
 ];
 
