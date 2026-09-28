@@ -22,7 +22,11 @@ use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     source::SourceBatchResult, source_connector,
 };
-use mongodb::{Client, Collection, bson::Document, bson::doc, options::ClientOptions};
+use mongodb::{
+    Client, Collection,
+    bson::{Bson, Document, doc},
+    options::ClientOptions,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -37,6 +41,10 @@ struct State {
     last_poll_timestamp: Option<DateTime<Utc>>,
     total_documents_fetched: usize,
     poll_count: usize,
+    // `_id` of the document at `last_poll_timestamp`, so documents sharing that
+    // millisecond but cut off by `limit` are picked up on the next poll.
+    #[serde(default)]
+    last_id: Option<Bson>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +101,7 @@ impl MongodbSource {
                 last_poll_timestamp: None,
                 total_documents_fetched: 0,
                 poll_count: 0,
+                last_id: None,
             })),
             pending_state: Mutex::new(None),
         }
@@ -126,18 +135,16 @@ impl MongodbSource {
             .database(&self.config.database.to_string())
             .collection(&self.config.collection.to_string());
 
-        let mut cursor = if let Some(timestamp_field) = &self.config.timestamp_field
-            && let Some(last_timestamp) = state.last_poll_timestamp
-        {
-            let mut filter = self.config.query.clone().unwrap_or_default();
-            filter.insert(
-                timestamp_field.clone(),
-                doc! { "$gt": mongodb::bson::DateTime::from_millis(last_timestamp.timestamp_millis()) },
-            );
+        let mut cursor = if let Some(timestamp_field) = &self.config.timestamp_field {
+            let cursor_filter = cursor_filter(timestamp_field, &state);
+            let filter = match &self.config.query {
+                Some(query) if !query.is_empty() => doc! { "$and": [query.clone(), cursor_filter] },
+                _ => cursor_filter,
+            };
 
-            coll.find(filter.clone())
+            coll.find(filter)
                 .limit(*limit)
-                .sort(doc! { timestamp_field: 1 })
+                .sort(doc! { timestamp_field: 1, "_id": 1 })
                 .await
                 .map_err(|e| Error::InitError(format!("Failed to execute search: {e}")))?
         } else {
@@ -148,7 +155,7 @@ impl MongodbSource {
         };
 
         let mut messages = Vec::new();
-        let mut latest_timestamp = None;
+        let mut latest_position = None;
 
         while let Some(doc) = cursor
             .try_next()
@@ -161,9 +168,9 @@ impl MongodbSource {
                     iggy_common::DateTime::<iggy_common::Utc>::from_timestamp_millis(
                         timestamp_dt.timestamp_millis(),
                     )
-                && latest_timestamp.is_none_or(|current| timestamp > current)
             {
-                latest_timestamp = Some(timestamp);
+                // Results are sorted by (timestamp, _id), so the last one seen is the newest.
+                latest_position = Some((timestamp, doc.get("_id").cloned()));
             }
 
             let payload = serde_json::to_vec(&doc).map_err(|e| {
@@ -180,10 +187,15 @@ impl MongodbSource {
             };
             messages.push(message);
         }
+        let (last_poll_timestamp, last_id) = match latest_position {
+            Some((timestamp, id)) => (Some(timestamp), id),
+            None => (state.last_poll_timestamp, state.last_id),
+        };
         let candidate_state = State {
-            last_poll_timestamp: latest_timestamp.or(state.last_poll_timestamp),
+            last_poll_timestamp,
             total_documents_fetched: state.total_documents_fetched + messages.len(),
             poll_count: state.poll_count + 1,
+            last_id,
         };
         Ok((messages, candidate_state))
     }
@@ -249,9 +261,28 @@ impl Source for MongodbSource {
     }
 }
 
+fn cursor_filter(timestamp_field: &str, state: &State) -> Document {
+    let Some(last_timestamp) = state.last_poll_timestamp else {
+        return doc! { timestamp_field: { "$type": "date" } };
+    };
+    let last_timestamp = mongodb::bson::DateTime::from_millis(last_timestamp.timestamp_millis());
+    match &state.last_id {
+        Some(last_id) => doc! {
+            "$or": [
+                { timestamp_field: { "$gt": last_timestamp } },
+                { timestamp_field: last_timestamp, "_id": { "$gt": last_id.clone() } },
+            ]
+        },
+        // State saved before `last_id` existed. `$gte` re-delivers the boundary
+        // documents once instead of risking skipping them.
+        None => doc! { timestamp_field: { "$gte": last_timestamp } },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mongodb::bson::oid::ObjectId;
 
     fn test_config() -> MongodbSourceConfig {
         MongodbSourceConfig {
@@ -271,6 +302,7 @@ mod tests {
             last_poll_timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000),
             total_documents_fetched: 10,
             poll_count: 1,
+            last_id: Some(Bson::ObjectId(ObjectId::new())),
         }
     }
 
@@ -307,6 +339,77 @@ mod tests {
             candidate.total_documents_fetched
         );
         assert_eq!(state.poll_count, candidate.poll_count);
+        assert_eq!(state.last_id, candidate.last_id);
         assert!(src.pending_state.lock().await.is_none());
+    }
+
+    #[test]
+    fn given_persisted_state_should_restore_cursor_with_last_id() {
+        let original = staged_state();
+        let connector_state = ConnectorState::serialize(&original, CONNECTOR_NAME, 1)
+            .expect("state should be serializable");
+
+        let restored = connector_state
+            .deserialize::<State>(CONNECTOR_NAME, 1)
+            .expect("state should be deserializable");
+
+        assert_eq!(restored.last_poll_timestamp, original.last_poll_timestamp);
+        assert_eq!(restored.last_id, original.last_id);
+    }
+
+    #[test]
+    fn given_state_saved_without_last_id_should_restore_with_none() {
+        #[derive(Serialize)]
+        struct StateWithoutLastId {
+            last_poll_timestamp: Option<DateTime<Utc>>,
+            total_documents_fetched: usize,
+            poll_count: usize,
+        }
+        let legacy = StateWithoutLastId {
+            last_poll_timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000),
+            total_documents_fetched: 10,
+            poll_count: 1,
+        };
+        let connector_state = ConnectorState::serialize(&legacy, CONNECTOR_NAME, 1)
+            .expect("state should be serializable");
+
+        let restored = connector_state
+            .deserialize::<State>(CONNECTOR_NAME, 1)
+            .expect("state without last_id should still deserialize");
+
+        assert_eq!(restored.last_poll_timestamp, legacy.last_poll_timestamp);
+        assert_eq!(restored.total_documents_fetched, 10);
+        assert!(restored.last_id.is_none());
+    }
+
+    #[test]
+    fn given_last_id_when_building_filter_should_break_timestamp_ties_on_id() {
+        let state = staged_state();
+        let filter = cursor_filter("timestamp", &state);
+        let last_timestamp = mongodb::bson::DateTime::from_millis(1_700_000_000_000);
+
+        assert_eq!(
+            filter,
+            doc! {
+                "$or": [
+                    { "timestamp": { "$gt": last_timestamp } },
+                    { "timestamp": last_timestamp, "_id": { "$gt": state.last_id.unwrap() } },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn given_no_last_id_when_building_filter_should_include_boundary_timestamp() {
+        let state = State {
+            last_id: None,
+            ..staged_state()
+        };
+        let filter = cursor_filter("timestamp", &state);
+
+        assert_eq!(
+            filter,
+            doc! { "timestamp": { "$gte": mongodb::bson::DateTime::from_millis(1_700_000_000_000) } }
+        );
     }
 }
