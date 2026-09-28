@@ -100,7 +100,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// - [`SegmentClient`]: delete closed segments from a partition.
 /// - [`ConsumerGroupClient`]: create, get, delete, and join or leave consumer groups.
 /// - [`ConsumerOffsetClient`]: store, read, and delete consumer offsets.
-/// - [`MessageClient`]: send and poll messages, and flush the unsaved buffer.
+/// - [`MessageClient`]: send and poll messages.
 ///
 /// Additionally, you can bypass invoking methods from these traits and directly talk to the server with [`send_binary_request`] and [`send_http_request`] for http.
 /// Both trade typed API's safety for low-level control. You need to know the server codes and the wire format.
