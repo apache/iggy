@@ -5,7 +5,7 @@ This MongoDB source connector polls a MongoDB collection, produces each document
 ## Features
 
 - **Incremental Data Processing**: Track the last processed timestamp (`timestamp_field`) to avoid reprocessing documents
-- **Timestamp-ordered Batches**: Incremental polls filter with `$gt`, sort ascending on the timestamp field, and cap each batch with `limit`
+- **Timestamp-ordered Batches**: Incremental polls filter with `$gt`, sort ascending on the timestamp field, and cap each batch with `batch_size`
 - **Custom Filters**: Restrict the documents read with a MongoDB `query` filter
 - **Connection Pooling**: Configurable driver pool size via `max_pool_size`
 - **Persistent State Storage**: State is persisted by the connectors runtime (file or HTTP backend)
@@ -37,7 +37,7 @@ database = "test_source"
 collection = "test_messages"
 max_pool_size = 10
 polling_interval = "30s"
-limit = 100
+batch_size = 100
 timestamp_field = "timestamp"
 query = { status = "active" }
 ```
@@ -50,7 +50,7 @@ query = { status = "active" }
 | `max_pool_size`    | no       | driver default  | Maximum number of connections in the driver pool                            |
 | `query`            | no       | `{}`            | MongoDB filter document applied to every poll                               |
 | `timestamp_field`  | no       | none            | BSON `Date` field used for incremental polling                              |
-| `limit`            | no       | `100`           | Maximum documents per incremental poll                                      |
+| `batch_size`       | no       | `100`           | Maximum documents per incremental poll. Must be greater than 0              |
 | `polling_interval` | no       | `"10s"`         | Delay before each poll (humantime format). Invalid values fall back to 10s  |
 
 ### State Management Configuration
@@ -113,10 +113,10 @@ timeout = "5s"
 The connectors runtime normally drives this lifecycle. Calling it directly looks like this:
 
 ```rust
-use iggy_connector_mongodb_source::{MongodbSource, MongodbSourceConfig};
+use iggy_connector_mongodb_source::{MongoDbSource, MongoDbSourceConfig};
 
 // `state` is the previously persisted ConnectorState, if any
-let mut connector = MongodbSource::new(id, config, state);
+let mut connector = MongoDbSource::new(id, config, state);
 
 // Open connector (creates the MongoDB client)
 connector.open().await?;
@@ -156,7 +156,7 @@ Messages themselves are the documents serialized with `serde_json`, so BSON type
 2. **Index the Timestamp Field**: Create an index on `timestamp_field` so the sorted `$gt` query stays fast
 3. **Use BSON Dates**: Store `timestamp_field` as a BSON `Date`. Other types do not advance the state
 4. **Storage Location**: Point `[state].path` at persistent storage in production
-5. **Batch Tuning**: Balance `limit` and `polling_interval` against your write rate
+5. **Batch Tuning**: Balance `batch_size` and `polling_interval` against your write rate
 6. **Credentials**: Keep real credentials in `connection_uri` out of committed config files
 
 ## Troubleshooting
@@ -164,9 +164,9 @@ Messages themselves are the documents serialized with `serde_json`, so BSON type
 ### Common Issues
 
 1. **Duplicate Messages on Every Poll**: Without `timestamp_field`, each poll reads every document that matches `query`. Set `timestamp_field` for incremental ingestion
-2. **Large First Poll**: With no saved timestamp, the first poll runs without `limit` or sort and reads the whole matching collection
+2. **Large First Poll**: With no saved timestamp, the first poll runs without `batch_size` or sort and reads the whole matching collection
 3. **State Not Advancing**: `timestamp_field` values that are strings or numbers are ignored. Only BSON `Date` values update `last_poll_timestamp`
-4. **Skipped Documents**: The filter uses `$gt`, so documents sharing the last seen timestamp that fall past a `limit` boundary are not read on the next poll. Prefer unique, high-resolution timestamps
+4. **Skipped Documents**: The filter uses `$gt`, so documents sharing the last seen timestamp that fall past a `batch_size` boundary are not read on the next poll. Prefer unique, high-resolution timestamps
 5. **Connection Failures**: Invalid URIs or unreachable hosts fail in `open()` with an init error. Check `connection_uri` and credentials
 6. **Starting Fresh**: Delete `source_<key>.state` to reset progress
 

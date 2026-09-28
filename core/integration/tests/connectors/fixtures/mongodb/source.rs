@@ -17,7 +17,7 @@
 
 use super::container::{
     DEFAULT_SOURCE_COLLECTION, DEFAULT_SOURCE_DATABASE, DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC,
-    ENV_SOURCE_COLLECTION, ENV_SOURCE_CONNECTION_URI, ENV_SOURCE_DATABASE, ENV_SOURCE_LIMIT,
+    ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_COLLECTION, ENV_SOURCE_CONNECTION_URI, ENV_SOURCE_DATABASE,
     ENV_SOURCE_PATH, ENV_SOURCE_POLLING_INTERVAL, ENV_SOURCE_STREAMS_0_SCHEMA,
     ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TIMESTAMP_FIELD,
     MongoDbContainer, MongoDbOps,
@@ -28,27 +28,17 @@ use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
 use std::collections::HashMap;
 
 /// MongoDB source fixture for basic document polling.
-pub struct MongodbSourceFixture {
+pub struct MongoDbSourceFixture {
     container: MongoDbContainer,
 }
 
-impl MongoDbOps for MongodbSourceFixture {
+impl MongoDbOps for MongoDbSourceFixture {
     fn container(&self) -> &MongoDbContainer {
         &self.container
     }
 }
 
-impl MongodbSourceFixture {
-    #[allow(dead_code)]
-    pub fn database_name(&self) -> &str {
-        DEFAULT_SOURCE_DATABASE
-    }
-
-    #[allow(dead_code)]
-    pub fn collection_name(&self) -> &str {
-        DEFAULT_SOURCE_COLLECTION
-    }
-
+impl MongoDbSourceFixture {
     pub async fn insert_document_at(
         &self,
         doc_id: i32,
@@ -109,14 +99,14 @@ impl MongodbSourceFixture {
             db.list_collection_names()
                 .await
                 .map_err(|e| TestBinaryError::FixtureSetup {
-                    fixture_type: "MongodbSourceFixture".to_string(),
+                    fixture_type: "MongoDbSourceFixture".to_string(),
                     message: format!("Failed to list collections: {e}"),
                 })?;
         if !names.contains(&DEFAULT_SOURCE_COLLECTION.to_string()) {
             db.create_collection(DEFAULT_SOURCE_COLLECTION)
                 .await
                 .map_err(|e| TestBinaryError::FixtureSetup {
-                    fixture_type: "MongodbSourceFixture".to_string(),
+                    fixture_type: "MongoDbSourceFixture".to_string(),
                     message: format!("Failed to create collection: {e}"),
                 })?;
         }
@@ -125,7 +115,7 @@ impl MongodbSourceFixture {
 }
 
 #[async_trait]
-impl TestFixture for MongodbSourceFixture {
+impl TestFixture for MongoDbSourceFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = MongoDbContainer::start().await?;
         Ok(Self { container })
@@ -150,7 +140,7 @@ impl TestFixture for MongodbSourceFixture {
             ENV_SOURCE_TIMESTAMP_FIELD.to_string(),
             "timestamp".to_string(),
         );
-        envs.insert(ENV_SOURCE_LIMIT.to_string(), "100".to_string());
+        envs.insert(ENV_SOURCE_BATCH_SIZE.to_string(), "100".to_string());
         envs.insert(
             ENV_SOURCE_STREAMS_0_STREAM.to_string(),
             DEFAULT_TEST_STREAM.to_string(),
@@ -169,27 +159,27 @@ impl TestFixture for MongodbSourceFixture {
 }
 
 /// MongoDB source fixture with pre-created collection.
-pub struct MongodbSourcePreCreatedFixture {
-    inner: MongodbSourceFixture,
+pub struct MongoDbSourcePreCreatedFixture {
+    inner: MongoDbSourceFixture,
 }
 
-impl std::ops::Deref for MongodbSourcePreCreatedFixture {
-    type Target = MongodbSourceFixture;
+impl std::ops::Deref for MongoDbSourcePreCreatedFixture {
+    type Target = MongoDbSourceFixture;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl MongoDbOps for MongodbSourcePreCreatedFixture {
+impl MongoDbOps for MongoDbSourcePreCreatedFixture {
     fn container(&self) -> &MongoDbContainer {
         &self.inner.container
     }
 }
 
 #[async_trait]
-impl TestFixture for MongodbSourcePreCreatedFixture {
+impl TestFixture for MongoDbSourcePreCreatedFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let inner = MongodbSourceFixture::setup().await?;
+        let inner = MongoDbSourceFixture::setup().await?;
         inner.create_collection().await?;
         Ok(Self { inner })
     }

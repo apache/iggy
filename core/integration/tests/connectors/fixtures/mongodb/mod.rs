@@ -24,4 +24,4 @@ pub use sink::{
     MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
-pub use source::MongodbSourcePreCreatedFixture;
+pub use source::MongoDbSourcePreCreatedFixture;

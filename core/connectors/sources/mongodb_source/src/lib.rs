@@ -29,12 +29,13 @@ use mongodb::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::info;
 
-source_connector!(MongodbSource);
+source_connector!(MongoDbSource);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
@@ -42,13 +43,13 @@ struct State {
     total_documents_fetched: usize,
     poll_count: usize,
     // `_id` of the document at `last_poll_timestamp`, so documents sharing that
-    // millisecond but cut off by `limit` are picked up on the next poll.
+    // millisecond but cut off by `batch_size` are picked up on the next poll.
     #[serde(default)]
     last_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MongodbSourceConfig {
+pub struct MongoDbSourceConfig {
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
     pub connection_uri: SecretString,
     pub database: String,
@@ -56,14 +57,14 @@ pub struct MongodbSourceConfig {
     pub max_pool_size: Option<u32>,
     pub query: Option<Document>,
     pub timestamp_field: Option<String>,
-    pub limit: Option<i64>,
+    pub batch_size: Option<NonZeroU32>,
     pub polling_interval: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct MongodbSource {
+pub struct MongoDbSource {
     id: u32,
-    config: MongodbSourceConfig,
+    config: MongoDbSourceConfig,
     client: Option<Client>,
     polling_interval: Duration,
     state: Mutex<State>,
@@ -72,8 +73,8 @@ pub struct MongodbSource {
 
 const CONNECTOR_NAME: &str = "MongoDB source";
 
-impl MongodbSource {
-    pub fn new(id: u32, config: MongodbSourceConfig, state: Option<ConnectorState>) -> Self {
+impl MongoDbSource {
+    pub fn new(id: u32, config: MongoDbSourceConfig, state: Option<ConnectorState>) -> Self {
         let polling_interval = config
             .polling_interval
             .as_deref()
@@ -92,7 +93,7 @@ impl MongodbSource {
                 );
             });
 
-        MongodbSource {
+        MongoDbSource {
             id,
             config,
             client: None,
@@ -124,6 +125,26 @@ impl MongodbSource {
         Ok(client)
     }
 
+    async fn check_collection(&self, client: &Client) -> Result<(), Error> {
+        let database = client.database(&self.config.database);
+        database
+            .run_command(doc! { "ping": 1 })
+            .await
+            .map_err(|e| Error::InitError(format!("Failed to ping MongoDB: {e}")))?;
+        let collections = database
+            .list_collection_names()
+            .filter(doc! { "name": &self.config.collection })
+            .await
+            .map_err(|e| Error::InitError(format!("Failed to list collections: {e}")))?;
+        if collections.is_empty() {
+            return Err(Error::InvalidConfigValue(format!(
+                "collection '{}' not found in database '{}'",
+                self.config.collection, self.config.database
+            )));
+        }
+        Ok(())
+    }
+
     /// The cursor only advances on BSON `Date` values, so a string, number or
     /// missing `timestamp_field` would leave the connector silently producing nothing.
     async fn check_timestamp_field(&self, client: &Client) -> Result<(), Error> {
@@ -148,11 +169,11 @@ impl MongodbSource {
         client: &Client,
     ) -> Result<(Vec<ProducedMessage>, State), Error> {
         let state = self.state.lock().await.clone();
-        let limit = &self.config.limit.unwrap_or(100);
+        let batch_size = i64::from(self.config.batch_size.map_or(100, NonZeroU32::get));
 
         let coll: Collection<Document> = client
-            .database(&self.config.database.to_string())
-            .collection(&self.config.collection.to_string());
+            .database(&self.config.database)
+            .collection(&self.config.collection);
 
         let mut cursor = if let Some(timestamp_field) = &self.config.timestamp_field {
             let cursor_filter = cursor_filter(timestamp_field, &state);
@@ -162,15 +183,14 @@ impl MongodbSource {
             };
 
             coll.find(filter)
-                .limit(*limit)
+                .limit(batch_size)
                 .sort(doc! { timestamp_field: 1, "_id": 1 })
                 .await
-                .map_err(|e| Error::InitError(format!("Failed to execute search: {e}")))?
+                .map_err(|e| Error::Storage(format!("Failed to execute search: {e}")))?
         } else {
-            let filter = &self.config.query.clone().unwrap_or_else(|| doc! {});
-            coll.find(filter.clone())
+            coll.find(self.config.query.clone().unwrap_or_default())
                 .await
-                .map_err(|e| Error::InitError(format!("Failed to execute search: {e}")))?
+                .map_err(|e| Error::Storage(format!("Failed to execute search: {e}")))?
         };
 
         let mut messages = Vec::new();
@@ -179,7 +199,7 @@ impl MongodbSource {
         while let Some(doc) = cursor
             .try_next()
             .await
-            .map_err(|e| Error::InitError(format!("Failed to move cursor {e}")))?
+            .map_err(|e| Error::Storage(format!("Failed to move cursor {e}")))?
         {
             if let Some(timestamp_field) = &self.config.timestamp_field
                 && let Some(timestamp_dt) = doc.get(timestamp_field).and_then(|v| v.as_datetime())
@@ -224,7 +244,7 @@ impl MongodbSource {
 }
 
 #[async_trait]
-impl Source for MongodbSource {
+impl Source for MongoDbSource {
     async fn open(&mut self) -> Result<(), Error> {
         info!(
             "Opening Mongodb source connector with ID: {}, collection: {}",
@@ -232,6 +252,7 @@ impl Source for MongodbSource {
         );
 
         let client = self.create_client().await?;
+        self.check_collection(&client).await?;
         self.check_timestamp_field(&client).await?;
         self.client = Some(client);
 
@@ -277,7 +298,7 @@ impl Source for MongodbSource {
         let state = self.state.lock().await;
 
         info!(
-            "PostgreSQL source connector ID: {} closed. Total documents processed: {}",
+            "Mongodb source connector ID: {} closed. Total documents processed: {}",
             self.id, state.total_documents_fetched
         );
         Ok(())
@@ -324,15 +345,15 @@ mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
 
-    fn test_config() -> MongodbSourceConfig {
-        MongodbSourceConfig {
+    fn test_config() -> MongoDbSourceConfig {
+        MongoDbSourceConfig {
             connection_uri: SecretString::from("mongodb://localhost:27017"),
             database: "test_db".to_string(),
             collection: "test_collection".to_string(),
             max_pool_size: None,
             query: None,
             timestamp_field: Some("timestamp".to_string()),
-            limit: Some(100),
+            batch_size: NonZeroU32::new(100),
             polling_interval: Some("100ms".to_string()),
         }
     }
@@ -348,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
-        let src = MongodbSource::new(1, test_config(), None);
+        let src = MongoDbSource::new(1, test_config(), None);
         *src.pending_state.lock().await = Some(staged_state());
 
         src.on_batch_result(SourceBatchResult::Nack)
@@ -364,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
-        let src = MongodbSource::new(1, test_config(), None);
+        let src = MongoDbSource::new(1, test_config(), None);
         let candidate = staged_state();
         *src.pending_state.lock().await = Some(candidate.clone());
 

@@ -16,7 +16,7 @@
 // under the License.
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
-use crate::connectors::fixtures::MongodbSourcePreCreatedFixture;
+use crate::connectors::fixtures::MongoDbSourcePreCreatedFixture;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use integration::harness::seeds;
@@ -30,7 +30,7 @@ use tokio::time::sleep;
 )]
 async fn mongodb_source_produces_messages_to_iggy(
     harness: &TestHarness,
-    fixture: MongodbSourcePreCreatedFixture,
+    fixture: MongoDbSourcePreCreatedFixture,
 ) {
     let client = harness.root_client().await.unwrap();
 
@@ -107,7 +107,7 @@ async fn mongodb_source_produces_messages_to_iggy(
 )]
 async fn mongodb_source_handles_empty_collection(
     harness: &TestHarness,
-    fixture: MongodbSourcePreCreatedFixture,
+    fixture: MongoDbSourcePreCreatedFixture,
 ) {
     let client = harness.root_client().await.unwrap();
 
@@ -147,7 +147,7 @@ async fn mongodb_source_handles_empty_collection(
 )]
 async fn mongodb_source_produces_bulk_messages(
     harness: &TestHarness,
-    fixture: MongodbSourcePreCreatedFixture,
+    fixture: MongoDbSourcePreCreatedFixture,
 ) {
     let client = harness.root_client().await.unwrap();
     let bulk_count = 10;
@@ -200,7 +200,7 @@ async fn mongodb_source_produces_bulk_messages(
 )]
 async fn state_persists_across_connector_restart(
     harness: &mut TestHarness,
-    fixture: MongodbSourcePreCreatedFixture,
+    fixture: MongoDbSourcePreCreatedFixture,
 ) {
     fixture
         .insert_documents(TEST_MESSAGE_COUNT)

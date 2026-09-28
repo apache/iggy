@@ -32,6 +32,6 @@ batch_length = 100
 connection_uri = "mongodb://admin:admin123@localhost:27017"
 database = "test_source"
 collection = "test_messages"
-limit = 100
+batch_size = 100
 polling_interval = "100ms"
 timestamp_field = "timestamp"
