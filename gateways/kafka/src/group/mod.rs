@@ -166,18 +166,24 @@ pub struct SyncRequest {
     pub assignments: Vec<(StrBytes, Bytes)>,
 }
 
+/// Copied out of the frame for the same reason as [`JoinRequest`]: a sync can park.
 impl From<&SyncGroupRequest> for SyncRequest {
     fn from(request: &SyncGroupRequest) -> Self {
         Self {
-            group_id: request.group_id.0.clone(),
+            group_id: owned_str(&request.group_id.0),
             generation_id: request.generation_id,
-            member_id: request.member_id.clone(),
-            protocol_type: request.protocol_type.clone(),
-            protocol_name: request.protocol_name.clone(),
+            member_id: owned_str(&request.member_id),
+            protocol_type: request.protocol_type.as_ref().map(owned_str),
+            protocol_name: request.protocol_name.as_ref().map(owned_str),
             assignments: request
                 .assignments
                 .iter()
-                .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
+                .map(|assignment| {
+                    (
+                        owned_str(&assignment.member_id),
+                        Bytes::copy_from_slice(&assignment.assignment),
+                    )
+                })
                 .collect(),
         }
     }
@@ -295,7 +301,7 @@ impl GroupCoordinator {
     }
 
     /// Delivers `request`'s member its assignment, parking a follower until the leader syncs.
-    pub async fn sync(&self, request: &SyncRequest) -> SyncResult {
+    pub async fn sync(&self, mut request: SyncRequest) -> SyncResult {
         let mut parked = false;
         loop {
             let outcome = {
@@ -310,7 +316,7 @@ impl GroupCoordinator {
                         now,
                     )
                 } else {
-                    state::sync_step(&mut groups, &self.config, request, now)
+                    state::sync_step(&mut groups, &self.config, &request, now)
                 };
                 let outcome = park_outcome(&groups, &request.group_id, step, |_| {
                     SyncResult::error(ERROR_UNKNOWN_MEMBER_ID)
@@ -322,6 +328,8 @@ impl GroupCoordinator {
                 Parked::Done(result) => return result,
                 Parked::Wait(_, wake_at, receiver) => (wake_at, receiver),
             };
+            // `sync_resume_step` never reads them, so a parked member holds none of its blobs.
+            request.assignments = Vec::new();
             if !self.wait_until(receiver, wake_at).await {
                 return SyncResult::error(ERROR_NOT_COORDINATOR);
             }
@@ -390,6 +398,7 @@ fn millis_to_duration(millis: i32) -> Duration {
 mod tests {
     use kafka_protocol::messages::GroupId;
     use kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol;
+    use kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment;
 
     use super::*;
 
@@ -450,5 +459,35 @@ mod tests {
             JoinRequest::from((4, &request)).rebalance_timeout,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn given_a_decoded_sync_when_normalizing_should_not_point_into_the_frame() {
+        let frame = Bytes::from_static(b"g m consumer range f blob");
+        let text = |range| StrBytes::from_utf8(frame.slice(range)).unwrap();
+        let request = SyncGroupRequest::default()
+            .with_group_id(GroupId(text(0..1)))
+            .with_member_id(text(2..3))
+            .with_protocol_type(Some(text(4..12)))
+            .with_protocol_name(Some(text(13..18)))
+            .with_assignments(vec![
+                SyncGroupRequestAssignment::default()
+                    .with_member_id(text(19..20))
+                    .with_assignment(frame.slice(21..25)),
+            ]);
+
+        let normalized = SyncRequest::from(&request);
+
+        let within = |ptr: *const u8| frame.as_ptr_range().contains(&ptr);
+        let (member_id, assignment) = &normalized.assignments[0];
+        let pointers = [
+            normalized.group_id.as_ptr(),
+            normalized.member_id.as_ptr(),
+            normalized.protocol_type.as_ref().unwrap().as_ptr(),
+            normalized.protocol_name.as_ref().unwrap().as_ptr(),
+            member_id.as_ptr(),
+            assignment.as_ptr(),
+        ];
+        assert!(pointers.into_iter().all(|ptr| !within(ptr)));
     }
 }

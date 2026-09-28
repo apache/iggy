@@ -49,6 +49,10 @@ use crate::protocol::api::{
 /// group id this gateway admits must leave room for that prefix (`docs/OFFSET_STORAGE.md`).
 pub const MAX_GROUP_ID_BYTES: usize = 246;
 
+/// Protocol selection is polynomial in this count under the coordinator lock. Stock clients list
+/// one or two assignors.
+pub const MAX_PROTOCOLS_PER_MEMBER: usize = 16;
+
 /// Prefix for a generated member id when the client sent no `group_instance_id`. Kafka uses the
 /// header's `client_id`, which handlers do not receive.
 const DEFAULT_MEMBER_PREFIX: &str = "member";
@@ -584,6 +588,9 @@ fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) ->
     if request.protocol_type.is_empty() || request.protocols.is_empty() {
         return Some(ERROR_INCONSISTENT_GROUP_PROTOCOL);
     }
+    if request.protocols.len() > MAX_PROTOCOLS_PER_MEMBER {
+        return Some(ERROR_INVALID_REQUEST);
+    }
     // Names count too: they are retained alongside the metadata, and a request can carry many
     // long ones while declaring almost no metadata at all.
     let retained_bytes: usize = request
@@ -1115,6 +1122,29 @@ mod tests {
             groups.is_empty(),
             "a rejected join must not leave a group that nothing can ever reclaim"
         );
+    }
+
+    #[test]
+    fn given_more_protocols_than_the_cap_when_joining_should_answer_invalid_request() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let names: Vec<String> = (0..=MAX_PROTOCOLS_PER_MEMBER)
+            .map(|index| format!("p{index}"))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let over_cap = join_step(&mut groups, &config, &request("", &names), now);
+        assert_eq!(error_of(&over_cap), ERROR_INVALID_REQUEST);
+        assert!(groups.is_empty(), "a rejected join must not create a group");
+
+        let at_cap = join_step(
+            &mut groups,
+            &config,
+            &request("", &names[..MAX_PROTOCOLS_PER_MEMBER]),
+            now,
+        );
+        assert_ne!(error_of_or_none(&at_cap), Some(ERROR_INVALID_REQUEST));
     }
 
     fn request(member_id: &str, protocols: &[&str]) -> JoinRequest {

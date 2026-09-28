@@ -62,7 +62,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
-    let result = state.groups.sync(&SyncRequest::from(&request)).await;
+    let sync_request = SyncRequest::from(&request);
+    // The sync can park, and the decoded request is a view into the frame it arrived in.
+    drop(request);
+    let result = state.groups.sync(sync_request).await;
     respond_or_close(encode_response(api_version, &result), "SyncGroup")
 }
 

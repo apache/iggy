@@ -104,6 +104,10 @@ A group id is capped at 246 bytes, not Kafka's 249: the Iggy offset key is `kafk
 an Iggy name caps at 255. A longer id is `INVALID_GROUP_ID` (24) here rather than a failure later
 at commit time.
 
+A JoinGroup may list at most `MAX_PROTOCOLS_PER_MEMBER` (16) protocols; more is `INVALID_REQUEST`
+(42). The byte cap above does not bound the count, protocol selection runs under the coordinator
+lock, and stock clients list one or two assignors.
+
 ## What a real consumer still cannot do
 
 A consumer completes JoinGroup and SyncGroup and then holds no partitions. Metadata is a stub that
