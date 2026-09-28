@@ -71,8 +71,7 @@ internal static class VsrOperations
 
     /// <summary>
     ///     Non-replicated codes this build knows to leave no server-side state behind, so re-sending one after a
-    ///     lost connection is indistinguishable from sending it once. Flushing an unsaved buffer is included: it
-    ///     is idempotent by construction, a second flush writes nothing new.
+    ///     lost connection is indistinguishable from sending it once.
     /// </summary>
     private static readonly HashSet<int> NonReplicatedReadCodes =
     [
@@ -86,7 +85,6 @@ internal static class VsrOperations
         CommandCodes.GET_USER_CODE,
         CommandCodes.GET_USERS_CODE,
         CommandCodes.GET_PERSONAL_ACCESS_TOKENS_CODE,
-        CommandCodes.FLUSH_UNSAVED_BUFFER_CODE,
         CommandCodes.GET_CONSUMER_OFFSET_CODE,
         CommandCodes.GET_STREAM_CODE,
         CommandCodes.GET_STREAMS_CODE,

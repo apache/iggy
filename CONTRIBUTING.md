@@ -175,9 +175,10 @@ line in a regular PR comment (not an inline review reply):
 | `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
 | `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
-Some labels move on their own: opening or marking a non-draft PR ready sets
-`S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
-closing or converting to draft clears both.
+Some labels move on their own. Opening a non-draft PR, or marking a draft
+ready, sets `S-waiting-on-review`. A "Request changes" review sets
+`S-waiting-on-author`, and so does a `/skill` bot review with findings for the
+author. Closing a PR, or converting it to a draft, clears both.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the

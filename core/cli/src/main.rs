@@ -61,10 +61,7 @@ use iggy_cli::commands::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
     binary_context::get_contexts::GetContextsCmd,
-    binary_message::{
-        flush_messages::FlushMessagesCmd, poll_messages::PollMessagesCmd,
-        send_messages::SendMessagesCmd,
-    },
+    binary_message::{poll_messages::PollMessagesCmd, send_messages::SendMessagesCmd},
     binary_partitions::{
         create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
     },
@@ -305,12 +302,6 @@ fn get_command(
                 poll_args.consumer.clone(),
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
-            )),
-            MessageAction::Flush(flush_args) => Box::new(FlushMessagesCmd::new(
-                flush_args.stream_id.clone(),
-                flush_args.topic_id.clone(),
-                flush_args.partition_id,
-                flush_args.fsync,
             )),
         },
         Command::ConsumerOffset(command) => match command {
