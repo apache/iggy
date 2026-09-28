@@ -38,7 +38,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, respond_or_close, unsupported_version_response,
+    decode_guarded, encode_message, is_transactional, respond_or_close,
+    unsupported_version_response,
 };
 use crate::records::{
     Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
@@ -135,6 +136,22 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             return HandleOutcome::Close;
         }
     };
+
+    // Ahead of the bridge check, so neither the stub nor the write path answers a transactional
+    // request as ordinary records: nothing here tracks a last stable offset or writes an abort
+    // marker, so an aborted transaction's records would reach every consumer. 35 is fatal for the
+    // producer. acks=0 has no response to carry it, so the refusal is a close, which is what a
+    // Kafka broker does on an acks=0 produce error.
+    if is_transactional(request.transactional_id.as_ref()) {
+        return if request.acks == ACKS_NONE {
+            HandleOutcome::Close
+        } else {
+            respond_or_close(
+                encode_uniform_response(api_version, &request, ERROR_UNSUPPORTED_VERSION),
+                "Produce",
+            )
+        };
+    }
 
     let Some(bridge) = state.bridge.as_deref() else {
         return stub_outcome(api_version, &request);

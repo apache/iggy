@@ -33,8 +33,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use iggy::prelude::{Identifier, StreamClient, TopicClient};
 use serial_test::serial;
+use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     BrokerAdvertise, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
@@ -172,6 +174,8 @@ async fn connected_state(server: &TestServer) -> GatewayState {
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
         false,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
 }
 

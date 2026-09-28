@@ -305,11 +305,6 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 )
                 .await
                 .map(|_| ()),
-            FLUSH_UNSAVED_BUFFER_CODE => {
-                client
-                    .flush_unsaved_buffer(&ctx.stream_id, &ctx.topic_id, 0, false)
-                    .await
-            }
 
             // Consumer Offsets
             GET_CONSUMER_OFFSET_ROUTING_CODE => client

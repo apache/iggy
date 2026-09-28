@@ -1689,9 +1689,279 @@ mod tests {
     use bytes::Bytes;
     use consensus::Status;
     use futures::FutureExt;
-    use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
+    use iggy_binary_protocol::{AckLevel, RoutedRequestHeader, WireIdentifier};
     use iggy_common::ConsumerKind;
-    use server_common::sharding::IggyNamespace;
+    use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT};
+
+    const DISCONNECT_STREAM: &str = "sim-stream-0";
+    const DISCONNECT_TOPIC: &str = "sim-topic-0-0";
+    const DISCONNECT_GROUP: &str = "disconnect-recovery";
+    const DISCONNECT_PROGRESS_STEPS: usize = 200;
+
+    #[test]
+    fn given_pending_metadata_when_disconnected_session_expires_should_reassign_partition() {
+        let (mut sim, original, replacement) = consumer_group_disconnect_fixture(3, 2);
+        let pending = original.create_stream("disconnect-in-flight");
+        sim.submit_request(original.client_id(), 0, pending.into_generic());
+        assert!(
+            (0..DISCONNECT_PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.metadata_consensus(0)
+                    .unwrap()
+                    .pipeline_has_message_from_client(original.client_id())
+            }),
+            "disconnect must happen while the original client's metadata request is pending"
+        );
+        sim.outboxes[0].notify_client_connection_lost(original.client_id());
+        sim.run_pumps();
+        assert!(
+            (0..DISCONNECT_PROGRESS_STEPS).any(|_| {
+                sim.step();
+                !sim.metadata_consensus(0)
+                    .unwrap()
+                    .pipeline_has_message_from_client(original.client_id())
+            }),
+            "the pending request must finish after the disconnect"
+        );
+        sim.shell_login(&replacement);
+        let joined = submit_and_wait_for_reply(
+            &mut sim,
+            replacement.client_id(),
+            0,
+            replacement.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        );
+        assert_eq!(joined.header().status, 0);
+        for _ in 0..DISCONNECT_PROGRESS_STEPS {
+            sim.step();
+        }
+        recover_disconnected_group(&mut sim, &original, &replacement);
+    }
+
+    #[test]
+    fn given_evicted_client_table_entry_when_disconnected_session_expires_should_reassign_partition()
+     {
+        let (mut sim, original, replacement) = consumer_group_disconnect_fixture(1, 1);
+        sim.shell_login(&replacement);
+        assert_eq!(
+            sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .client_table
+                .borrow()
+                .get_epoch(original.client_id()),
+            None,
+            "the new registration must evict the original client-table entry"
+        );
+        sim.outboxes[0].notify_client_connection_lost(original.client_id());
+        sim.run_pumps();
+        let joined = submit_and_wait_for_reply(
+            &mut sim,
+            replacement.client_id(),
+            0,
+            replacement.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        );
+        assert_eq!(joined.header().status, 0);
+        for _ in 0..DISCONNECT_PROGRESS_STEPS {
+            sim.step();
+        }
+        recover_disconnected_group(&mut sim, &original, &replacement);
+    }
+
+    fn consumer_group_disconnect_fixture(
+        replica_count: u8,
+        client_capacity: usize,
+    ) -> (Simulator, SimClient, SimClient) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let original = SimClient::new(1);
+        let replacement = SimClient::new(2);
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            [original.client_id(), replacement.client_id()].into_iter(),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 2,
+                seed: 0x4273,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        for replica in &sim.replicas {
+            replica.shards[0]
+                .plane
+                .metadata()
+                .client_table
+                .borrow_mut()
+                .set_capacity(client_capacity);
+        }
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.init_partition(namespace);
+        sim.seed_stream_topic_partition(namespace);
+        sim.shell_login(&original);
+        for request in [
+            original.create_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+            original.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        ] {
+            let reply = submit_and_wait_for_reply(&mut sim, original.client_id(), 0, request);
+            assert_eq!(reply.header().status, 0);
+        }
+        assert_eq!(
+            disconnect_group_assignment(&sim, original.client_id()),
+            Some(vec![0]),
+            "original consumer must own the only partition before disconnecting"
+        );
+        (sim, original, replacement)
+    }
+
+    fn disconnect_group_assignment(sim: &Simulator, client_id: u128) -> Option<Vec<u32>> {
+        sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_member_assignment(
+                &WireIdentifier::numeric(0),
+                &WireIdentifier::numeric(0),
+                &WireIdentifier::named(DISCONNECT_GROUP).unwrap(),
+                client_id,
+            )
+            .map(|(_, partitions)| partitions)
+    }
+
+    fn recover_disconnected_group(
+        sim: &mut Simulator,
+        original: &SimClient,
+        replacement: &SimClient,
+    ) {
+        assert_eq!(
+            disconnect_group_assignment(sim, original.client_id()),
+            Some(vec![0]),
+            "failed disconnect cleanup must leave the original owning the only partition"
+        );
+        assert_eq!(
+            disconnect_group_assignment(sim, replacement.client_id()),
+            Some(vec![]),
+            "the replacement joins successfully but cannot poll any partition"
+        );
+        let owner = Rc::clone(&sim.replicas[0].shards[0]);
+        let session = owner
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_session(original.client_id())
+            .expect("the orphan retains its session even after client-table eviction");
+        let original_id = original.client_id();
+        let replacement_id = replacement.client_id();
+        let (complete, completed) = shard::channel(1);
+        // The simulator does not run the wall-clock liveness task. Exercise its
+        // committed cleanup separately from timeout selection and reporting.
+        sim.executor.spawn(async move {
+            let live = owner.gather_consumer_sessions().await;
+            assert!(live.complete);
+            assert!(
+                live.clients
+                    .iter()
+                    .all(|client| client.client_id != original_id),
+                "the real disconnect callback must remove the original connection"
+            );
+            assert!(
+                live.clients
+                    .iter()
+                    .any(|client| client.client_id == replacement_id)
+            );
+            let cleanup = owner
+                .plane
+                .metadata()
+                .submit_expired_logout_in_process(original_id, Some(session))
+                .await;
+            complete.try_send(cleanup).unwrap();
+        });
+        let cleanup = (0..DISCONNECT_PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                completed.recv().now_or_never()
+            })
+            .expect("session expiry cleanup must complete")
+            .expect("cleanup result channel stays open")
+            .expect("the primary must accept expiry cleanup");
+        assert!(cleanup.is_some(), "expiry must commit a Logout");
+        assert_eq!(disconnect_group_assignment(sim, original_id), None);
+        assert_eq!(
+            disconnect_group_assignment(sim, replacement_id),
+            Some(vec![0]),
+            "expiry must give the existing replacement the orphan's partition"
+        );
+    }
+
+    #[test]
+    fn given_a_shard_that_stops_answering_when_gathering_clients_should_report_incomplete() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let network_options = packet::PacketSimulatorOptions {
+            node_count: 1,
+            client_count: 1,
+            seed: 0x4273,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(1, 2, std::iter::once(1), network_options);
+        sim.shell_login(&SimClient::new(1));
+        for missing_shard in [false, true] {
+            if missing_shard {
+                sim.executor.abort(sim.replicas[0].pump_tasks[1]);
+            }
+            let shard = Rc::clone(&sim.replicas[0].shards[0]);
+            let result = Rc::new(RefCell::new(None));
+            let gathered = Rc::clone(&result);
+            sim.executor.spawn(async move {
+                *gathered.borrow_mut() = Some(futures::join!(
+                    shard.gather_clients(),
+                    shard.gather_consumer_sessions()
+                ));
+            });
+            assert!(matches!(
+                sim.executor.run_until_stalled(POLL_BUDGET),
+                RunOutcome::Quiescent { .. }
+            ));
+            if missing_shard {
+                assert!(
+                    result.borrow().is_none(),
+                    "gather must wait for the missing shard until its deadline"
+                );
+                sim.executor.advance_time(LIST_CLIENTS_GATHER_TIMEOUT);
+                assert!(matches!(
+                    sim.executor.run_until_stalled(POLL_BUDGET),
+                    RunOutcome::Quiescent { .. }
+                ));
+            }
+            let (gathered, sessions) = result
+                .borrow_mut()
+                .take()
+                .expect("gather must complete within its deadline");
+            assert_eq!(gathered.complete, !missing_shard);
+            assert_eq!(sessions.complete, !missing_shard);
+            if !missing_shard {
+                assert!(
+                    gathered
+                        .clients
+                        .iter()
+                        .any(|client| client.vsr_client_id == Some(1))
+                );
+                assert!(
+                    sessions
+                        .clients
+                        .iter()
+                        .any(|session| session.client_id == 1)
+                );
+            }
+        }
+    }
 
     pub fn submit_and_wait_for_reply(
         sim: &mut Simulator,

@@ -33,10 +33,9 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -332,22 +331,10 @@ where
         }
         GET_CONSUMER_GROUP_CODE => build_consumer_group_response(shard, body),
         GET_CONSUMER_GROUPS_CODE => build_consumer_groups_response(shard, body),
-        // The server has no on-demand flush primitive, so it denies honestly.
-        // The non-replicated catch-all's empty-ok would otherwise attest a
-        // durability guarantee the server never gave.
-        FLUSH_UNSAVED_BUFFER_CODE => Err(IggyError::FeatureUnavailable),
-        // Snapshot collection blocks on shell-outs, so the dedicated dispatch
-        // and HTTP handlers await it off-thread; this synchronous builder
-        // cannot, and reaching it here is a routing bug. Fail closed rather
-        // than let the catch-all's empty-ok attest an artifact that was never
-        // produced.
-        GET_SNAPSHOT_FILE_CODE => Err(IggyError::InvalidCommand),
-        // Sequenced AFTER the named arms above, so flush keeps answering
-        // `FeatureUnavailable`. A table-listed non-replicated code with no arm
-        // is a routing bug and an unknown code is a client bug; the empty-ok
-        // that used to cover both attested a read that never ran. Only the
-        // named arms return `Empty`, and there it means "resolved to nothing"
-        // (the 404 the HTTP path maps).
+        // A table-listed non-replicated code with no arm is a routing bug and
+        // an unknown code is a client bug; the empty-ok that used to cover both
+        // attested a read that never ran. Only the named arms return `Empty`,
+        // and there it means "resolved to nothing" (the 404 the HTTP path maps).
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
             Some(meta) if meta.is_replicated() => Err(IggyError::FeatureUnavailable),
             _ => Err(IggyError::InvalidCommand),

@@ -125,6 +125,17 @@ impl Decoder {
         Ok(Some(self.bytes.copy_to_bytes(len)))
     }
 
+    /// Compact nullable bytes (flexible versions): varint(len+1) prefix, 0 = null.
+    pub fn read_compact_nullable_bytes(&mut self) -> Result<Option<Bytes>> {
+        let len_plus_one = self.read_varint()?;
+        if len_plus_one == 0 {
+            return Ok(None);
+        }
+        let len = usize::try_from(len_plus_one - 1).map_err(|e| e.to_string())?;
+        self.ensure(len)?;
+        Ok(Some(self.bytes.copy_to_bytes(len)))
+    }
+
     pub fn read_bytes(&mut self, len: usize) -> Result<Bytes> {
         self.ensure(len)?;
         Ok(self.bytes.copy_to_bytes(len))

@@ -7039,6 +7039,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "zstd 0.13.3",
 ]
 

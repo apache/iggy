@@ -334,16 +334,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         return SendMessagesCoreAsync(streamId, topicId, partitioning, span, token);
     }
 
-    /// <summary>
-    ///     This feature is not supported by the server.
-    /// </summary>
-    /// <exception cref="FeatureUnavailableException"></exception>
-    public Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
-        CancellationToken token = default)
-    {
-        throw new FeatureUnavailableException();
-    }
-
     /// <inheritdoc />
     public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
