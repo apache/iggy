@@ -845,6 +845,7 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) heartbeat: Option<Sender<()>>,
     pub(in crate::boot) pat_cleaner: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
+    pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
 
 impl StopSignals {
@@ -852,9 +853,14 @@ impl StopSignals {
     pub(in crate::boot) fn fire(&self) {
         let _ = self.pump.try_send(());
         let _ = self.reconciler.try_send(());
-        for stop in [&self.heartbeat, &self.pat_cleaner, &self.segment_cleaner]
-            .into_iter()
-            .flatten()
+        for stop in [
+            &self.heartbeat,
+            &self.pat_cleaner,
+            &self.segment_cleaner,
+            &self.consumer_group_liveness,
+        ]
+        .into_iter()
+        .flatten()
         {
             let _ = stop.try_send(());
         }

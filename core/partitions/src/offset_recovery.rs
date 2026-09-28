@@ -15,32 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Server-owned consumer offset recovery.
+//! Consumer offset recovery: the boot-time reader for the offset files
+//! [`crate::offset_storage`] writes.
 //!
 //! Forked from `server::streaming::partitions::storage` (the legacy
-//! `load_consumer_offsets` / `load_consumer_group_offsets`) so server
-//! owns the loaders for the offset files its own persistence path writes,
-//! without depending on the legacy `server` crate. One file per consumer (numeric
-//! file name = consumer id) holding a little-endian `u64` offset then a checksum over
-//! it; see [`partitions::offset_storage`]. The legacy server stays compatible both
-//! ways: it reads the first eight bytes and stops, and a file it wrote itself decodes
+//! `load_consumer_offsets` / `load_consumer_group_offsets`) so the crate that
+//! owns the offset persistence path also owns the loaders for the files it
+//! writes. One file per consumer (numeric file name = consumer id) holding a
+//! little-endian `u64` offset then a checksum over it; see
+//! [`crate::offset_storage`]. The legacy server stays compatible both ways: it
+//! reads the first eight bytes and stops, and a file it wrote itself decodes
 //! here as unchecksummed.
 
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
+use crate::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
 use futures::StreamExt;
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
 #[cfg(test)]
 use journal::durable_storage::DiskStorage;
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
-use partitions::offset_storage::{OffsetRecord, decode_offset_record, offset_replacement_id};
 use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
 
+/// Offsets read back from one offset directory.
 pub struct RecoveredOffsets<T> {
+    /// Every offset whose file decoded.
     pub entries: Vec<T>,
+    /// Consumer or group ids whose file could not be read, unlinked, or durably
+    /// unlinked; each keeps its capacity slot until the file is updated or
+    /// deleted.
     pub stranded_ids: Vec<u32>,
 }
 

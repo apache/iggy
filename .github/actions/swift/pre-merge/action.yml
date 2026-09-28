@@ -1,0 +1,75 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: swift-pre-merge
+description: Swift pre-merge testing github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, test, build, build-macos)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # The macOS lane uses the Swift that ships with Xcode on the runner.
+    - name: Setup Swift
+      if: inputs.task != 'build-macos'
+      uses: ./.github/actions/utils/setup-swift
+
+    # swift-format ships with the toolchain; the configuration lives in
+    # foreign/swift/.swift-format.
+    - name: Format Check
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/swift
+        swift format lint --strict --recursive Sources Tests Package.swift
+
+    # A warning-free build is the lint gate the Swift compiler provides: the
+    # SDK builds in Swift 6 language mode with strict concurrency checking.
+    - name: Build with warnings as errors
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/swift
+        swift build -Xswiftc -warnings-as-errors
+
+    - name: Test
+      shell: bash
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/swift
+        swift test --parallel
+
+    - name: Build
+      shell: bash
+      if: inputs.task == 'build'
+      run: |
+        cd foreign/swift
+        swift build -c release
+
+    # The manifest declares the Apple platforms, so one lane compiles and tests
+    # on macOS with Xcode's toolchain rather than trusting the Linux build.
+    - name: Build and test on macOS
+      shell: bash
+      if: inputs.task == 'build-macos'
+      run: |
+        cd foreign/swift
+        swift --version
+        swift build -Xswiftc -warnings-as-errors
+        swift test --parallel

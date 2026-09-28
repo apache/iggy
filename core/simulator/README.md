@@ -202,6 +202,7 @@ Constructors: `Simulator::new` (one shard per replica), `with_shards` (metadata 
 
 ## Not modelled
 
+- Client heartbeat verification and periodic consumer-group session expiry. Shell mode runs the real disconnect callback, so tests can reproduce a rejected or skipped disconnect `Logout`. The consumer-group disconnect tests invoke the expiry cleanup operation explicitly; they do not cover the production timer or automatic liveness reporting.
 - Storage faults, beyond two knobs on the superblock. `SimSuperblock::set_fail_writes` and `set_yield_writes` inject a persistent write fault and an fsync-wide suspension point; `MemStorage` under the journal never fails and never tears a write. Partition superblocks are storeless, which leaves partition view recovery untested.
 - Segment files. Partition messages live in memory; they survive a restart only because the harness carries `RetainedPartitionState` across the rebuild.
 - Partition-plane durability. Production's `load_partition` restores the view alone, so a restarted replica rejoins at op 0, invisible to quorum. `--restore-partition-frontier` looks past that at a system more durable than Iggy is.
