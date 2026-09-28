@@ -16,6 +16,13 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
+>
+> Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
+> `LeaveGroup` and `SyncGroup` are real, with real membership, rebalances, graceful leave and
+> session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
+> Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
+> With it on, partitions are assigned, but offset commit/fetch is not implemented and Fetch is
+> still a stub, so nothing can be consumed yet.
 
 ## Run
 
@@ -61,7 +68,7 @@ cargo test -p iggy-gateway-kafka
 Or generate only the keys the tests need:
 
 ```bash
-for key in 0 1 2 19 22; do
+for key in 0 1 2 10 11 12 13 14 19 22; do
   cargo run -p kafka-message-gen -- generate \
     --output gateways/kafka/tools/kafka-tool/kafka_messages \
     --api-key "$key"
@@ -81,6 +88,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
+- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
 

@@ -36,6 +36,7 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::auth::{AuthError, AuthenticatedPrincipal, FailedLoginThrottle, SaslAuthenticator};
 use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
     DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST, ERROR_NONE,
@@ -118,6 +119,9 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
+    /// Consumer-group timeouts and capacity caps. No environment variable maps onto these yet;
+    /// Kafka's own defaults apply.
+    pub group: GroupCoordinatorConfig,
     /// This gateway's number among the gateways fronting one Iggy cluster
     /// (`IGGY_KAFKA_INSTANCE_ID`). It is the high half of every producer id handed out by
     /// `InitProducerId`, which Kafka requires to be cluster-unique; two gateways left on the
@@ -171,6 +175,7 @@ impl Default for GatewayConfig {
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
+            group: GroupCoordinatorConfig::default(),
             instance_id: 0,
             sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
@@ -335,12 +340,18 @@ impl KafkaGateway {
             "kafka listener bound on {} (advertised as {}:{}, instance id {})",
             local_addr, broker.host, broker.port, self.config.instance_id
         );
+        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits until
+        // `idle_timeout` (or forever if that is raised). Created before the state so the group
+        // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
+        // otherwise hold the drain open for a full rebalance timeout.
+        let cancel = CancellationToken::new();
         let state = Arc::new(GatewayState::new(
             broker,
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.sasl_enabled,
             self.config.instance_id,
+            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         ));
 
         let shared_auth = Arc::new(SharedAuth::new(
@@ -349,9 +360,6 @@ impl KafkaGateway {
         ));
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
-        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits
-        // until `idle_timeout` (or forever if that is raised).
-        let cancel = CancellationToken::new();
 
         let drain_timeout = self.config.shutdown_drain_timeout;
 
@@ -670,7 +678,7 @@ async fn handle_connection(
         // supports, so `decode` cannot fail on the version argument itself; any error here is a
         // malformed header and closes the connection.
         let mut body = frame;
-        let req = RequestHeader::decode(&mut body, req_hdr_ver)
+        let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
             .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
 
         debug!(
@@ -681,6 +689,11 @@ async fn handle_connection(
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        // A group request can park for a whole rebalance timeout. `client_id` and the tagged
+        // fields are views into the frame, so keeping them would pin the frame for that long
+        // after the handler has let go of its own copy.
+        req.client_id = None;
+        req.unknown_tagged_fields.clear();
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.

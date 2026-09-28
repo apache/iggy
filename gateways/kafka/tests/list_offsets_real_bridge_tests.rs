@@ -26,8 +26,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use iggy::prelude::{Identifier, IggyMessage, MessageClient, Partitioning};
 use serial_test::serial;
+use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     BrokerAdvertise, ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
     ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, GatewayState,
@@ -174,6 +176,7 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         TEST_MAX_FRAME_SIZE,
         false,
         0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     );
     (state, seed_bridge)
 }

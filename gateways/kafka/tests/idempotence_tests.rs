@@ -33,8 +33,10 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::GatewayConfig;
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_NONE,
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNSUPPORTED_VERSION, GatewayState, handle_request,
@@ -97,7 +99,14 @@ async fn init_producer_id(
 }
 
 fn stub_state(instance_id: u16) -> GatewayState {
-    GatewayState::new(default_broker(), None, MAX_FRAME_SIZE, false, instance_id)
+    GatewayState::new(
+        default_broker(),
+        None,
+        MAX_FRAME_SIZE,
+        false,
+        instance_id,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+    )
 }
 
 /// Produce v3 body with one topic and one partition, so a per-partition error code has somewhere

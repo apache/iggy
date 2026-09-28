@@ -27,10 +27,10 @@ Source of truth for supported ranges: `SUPPORTED_RANGES` in [`src/protocol/api.r
 Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows.
 
 **Every unsupported-version case closes the connection, for every listed key** - not just above
-the encoder max. `kafka_protocol`'s schema floor for each of the seven supported messages
-happens to equal `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1,
-Metadata 0, ApiVersions 0, CreateTopics 2, InitProducerId 0), so there is no version below an
-API's min that the crate can actually encode a response for either - `unsupported_version_response`
+the encoder max. `kafka_protocol`'s schema floor for each supported message happens to equal
+`SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0, ApiVersions 0,
+CreateTopics 2, InitProducerId 0, and 0 for the four consumer-group keys), so there is no version below an API's
+min that the crate can actually encode a response for either - `unsupported_version_response`
 still tries, but the encode attempt fails and the connection closes rather than sending a
 malformed body.
 **ApiVersions is the sole exception** (KIP-511): out of range still answers with a v0 error body,
@@ -49,6 +49,11 @@ it knows the server supports flexible encoding.
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
+| 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
+| 11 | JoinGroup | 0 | 9 | 0 … 9 | Real membership; parks on the group's join barrier; flexible encoding at v6+ |
+| 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
+| 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
+| 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
@@ -65,6 +70,11 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 1 | Fetch | 4–12 | v12 |
 | 2 | ListOffsets | 1–6 | v6 |
 | 3 | Metadata | 0–9 | v9 |
+| 10 | FindCoordinator | 0–4 | v3 |
+| 11 | JoinGroup | 0–9 | v6 |
+| 12 | Heartbeat | 0–4 | v4 |
+| 13 | LeaveGroup | 0–5 | v4 |
+| 14 | SyncGroup | 0–5 | v4 |
 | 18 | ApiVersions | 0–3 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
 | 22 | InitProducerId | 0–5 | v2 |
@@ -77,16 +87,16 @@ All API keys not listed above close the connection (see Governance model above) 
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
-| 8 | OffsetCommit | Consumer group — later issue |
-| 9 | OffsetFetch | Consumer group — later issue |
-| 10 | FindCoordinator | Consumer group — later issue |
-| 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
+| 8 | OffsetCommit | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542) |
+| 9 | OffsetFetch | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542); sent right after SyncGroup, so a joined consumer loops on it today ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)) |
+| 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
 | 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
 | 20, 23, 27, 30–35, 37+ | DeleteTopics, `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
+| 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
 
@@ -147,7 +157,7 @@ nor moved by retention. That is the same core change the ListOffsets `EARLIEST` 
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 7 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId, and CreateTopics, Metadata, Produce and ListOffsets with a bridge |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 12 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the five consumer-group keys, and CreateTopics, Metadata, Produce and ListOffsets with a bridge |
 | **3 — Iggy bridge** | CreateTopics, Metadata, Produce and ListOffsets wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`). CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), Produce ([#3535](https://github.com/apache/iggy/issues/3535)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) call it. Fetch does not call it yet ([#3536](https://github.com/apache/iggy/issues/3536)) |
 
 ---
@@ -310,21 +320,26 @@ below it are still open for the issues that build on top of it.
 This TODO originally proposed a selective, feature-gated adoption (`kafka-protocol-cold`)
 alongside the hand-rolled `requests.rs`/`responses.rs` codecs, keeping custom code for the
 Produce/Fetch hot paths. That hybrid approach was not taken: `kafka_protocol` (broker feature
-only) now decodes/encodes all seven supported message types wholesale, and the hand-rolled
+only) now decodes/encodes every supported message type wholesale, and the hand-rolled
 `codec.rs`/`requests.rs` were deleted. RecordBatch bytes stay opaque (`Option<Bytes>`, never
 decoded) on the Produce/Fetch hot paths, preserving the one property this TODO was protecting.
 `bounds_guard.rs` covers the DoS-bound gap the crate itself leaves open (see Governance model
 above).
 
-- [ ] Consumer-group API keys (8–14, 10) and complex Metadata/FindCoordinator responses remain unimplemented (see Phase 3 below) - the crate can decode them when that phase starts
+- [ ] Offset-related consumer-group API keys (8, 9) and real Metadata topology remain unimplemented (see Phase 3 below) - the crate can decode them when that phase starts
 
 ### Phase 3 — Consumer groups (~7 API keys)
+
+Coordination ([#3541](https://github.com/apache/iggy/issues/3541)) has landed:
+[`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
 
-- [ ] OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
-- [ ] JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
+- [x] FindCoordinator (10), JoinGroup (11), Heartbeat (12), SyncGroup (14) -
+      [#3541](https://github.com/apache/iggy/issues/3541); LeaveGroup (13) -
+      [#3543](https://github.com/apache/iggy/issues/3543); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
+- [ ] OffsetCommit (8), OffsetFetch (9)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning
