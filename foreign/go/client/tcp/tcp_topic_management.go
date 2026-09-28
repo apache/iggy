@@ -111,9 +111,6 @@ func (c *IggyTcpClient) UpdateTopic(
 
 func (c *IggyTcpClient) DeleteTopic(ctx context.Context, streamId, topicId iggcon.Identifier) error {
 	_, err := c.do(ctx, &command.DeleteTopic{StreamId: streamId, TopicId: topicId})
-	if err != nil {
-		return err
-	}
 	c.dropTopicCache(streamId, topicId)
-	return nil
+	return err
 }

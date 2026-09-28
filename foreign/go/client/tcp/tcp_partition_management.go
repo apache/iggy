@@ -30,11 +30,9 @@ func (c *IggyTcpClient) CreatePartitions(ctx context.Context, streamId iggcon.Id
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
 	})
-	if err != nil {
-		return err
-	}
+	// The request can still commit when the call fails, for example on a cancel.
 	c.invalidateTopicCache(streamId, topicId)
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
@@ -43,11 +41,8 @@ func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Id
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
 	})
-	if err != nil {
-		return err
-	}
 	c.invalidateTopicCache(streamId, topicId)
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) invalidateTopicCache(streamId, topicId iggcon.Identifier) {

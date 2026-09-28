@@ -113,11 +113,10 @@ func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.
 		},
 		GroupId: groupId,
 	})
-	if err != nil {
-		return err
-	}
+	// The leave may commit after the caller stops waiting. Preserve its intent
+	// so a later group poll cannot silently join again.
 	c.groups.markLeft(newGroupKey(streamId, topicId, groupId))
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) SyncConsumerGroup(

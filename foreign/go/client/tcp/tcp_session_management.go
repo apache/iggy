@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"log/slog"
+	"net"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -173,6 +174,7 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 	}
 
 	var settled *iggcon.IdentityInfo
+	var hop net.Conn
 	for {
 		// The roster read runs while register holds the sign-in lock, so it must
 		// not enter the reconnect path: the reconnect's automatic sign-in would
@@ -182,6 +184,9 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 		c.mtx.Unlock()
 		redirect, err := c.redirectToLeader(
 			context.WithValue(ctx, connectScoped{}, struct{}{}), generation)
+		if err != nil && hop != nil {
+			_ = c.dropConn(hop)
+		}
 		if err != nil || !redirect {
 			return settled, err
 		}
@@ -191,8 +196,14 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
 			return nil, err
 		}
+		c.mtx.Lock()
+		hop = c.conn
+		c.mtx.Unlock()
 		settled, err = c.signIn(ctx, code, body)
 		if err != nil {
+			if hop != nil {
+				_ = c.dropConn(hop)
+			}
 			return nil, err
 		}
 	}
@@ -315,7 +326,7 @@ func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64)
 	}
 	c.mtx.Unlock()
 
-	torn, err := c.disconnectGeneration(generation)
+	torn, err := c.disconnectGeneration(ctx, generation)
 	if err != nil {
 		return false, err
 	}
@@ -341,7 +352,7 @@ func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64)
 // targets, and only walking the roster reaches that group's primary. The
 // refusal marks the request as never admitted and safe to re-issue anywhere;
 // the caller's request budget bounds the walk.
-func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool, error) {
+func (c *IggyTcpClient) settleOnNextEndpoint(ctx context.Context, visited map[string]struct{}) (bool, error) {
 	c.mtx.Lock()
 	current := c.currentServerAddress
 	roster := append([]string(nil), c.knownServerAddresses...)
@@ -357,7 +368,7 @@ func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool,
 		slog.String("current", current),
 		slog.String("next", next),
 	)
-	if err := c.disconnect(); err != nil {
+	if err := c.disconnect(ctx); err != nil {
 		return false, err
 	}
 

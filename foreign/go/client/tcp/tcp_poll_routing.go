@@ -409,6 +409,7 @@ func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) 
 	configuration.serverAddress = route.endpoint
 	configuration.reconnection.enabled = false
 	client := NewIggyTcpClient(c.logger, func(options *Options) { options.config = configuration })
+	client.dataConnection = true
 	if err := client.Connect(suppressLeaderSettlement(ctx)); err != nil {
 		_ = client.Close()
 		return nil, err

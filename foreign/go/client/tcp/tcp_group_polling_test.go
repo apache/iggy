@@ -190,29 +190,45 @@ func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 }
 
 func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
-	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
-		switch {
-		case read.code() == uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		case read.operation() == vsr.OperationLeaveConsumerGroup:
-			return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
-		default:
-			return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
-		}
-	})
+	for _, outcome := range []string{"acknowledged", "cancelled"} {
+		t.Run(outcome, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			release := make(chan struct{})
+			server := serve(serverConn, func(_ int, read request) []byte {
+				switch {
+				case read.code() == uint32(command.SyncGroupCode):
+					return replyFrame(vsr.OperationNonReplicated, nil)
+				case read.operation() == vsr.OperationLeaveConsumerGroup:
+					if outcome == "cancelled" {
+						cancel()
+						<-release
+					}
+					return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
+				default:
+					return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+				}
+			})
 
-	streamId, topicId, consumer := groupConsumer(t)
-	require.NoError(t, client.LeaveConsumerGroup(
-		context.Background(), streamId, topicId, consumer.Id))
+			streamId, topicId, consumer := groupConsumer(t)
+			err := client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id)
+			close(release)
+			if outcome == "cancelled" {
+				require.ErrorIs(t, err, context.Canceled)
+			} else {
+				require.NoError(t, err)
+			}
 
-	_, err := pollOnce(t, client)
-	assert.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound,
-		"an explicit leave stays left until an explicit join")
+			_, err = pollOnce(t, client)
+			assert.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound,
+				"an explicit leave stays left until an explicit join")
 
-	for _, read := range server.recorded() {
-		assert.NotEqual(t, vsr.OperationJoinConsumerGroup, read.operation(),
-			"the poll must not undo the leave")
+			for _, read := range server.recorded() {
+				assert.NotEqual(t, vsr.OperationJoinConsumerGroup, read.operation(),
+					"the poll must not undo the leave")
+			}
+		})
 	}
 }
 

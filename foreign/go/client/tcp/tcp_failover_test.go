@@ -750,8 +750,8 @@ func TestConnect_ConcurrentReconnectsThroughExchangeShareOneAttempt(t *testing.T
 
 // The teardown that follows a failure belongs to the connection the request
 // ran on. Connect marks the client connected before it signs in, so a caller
-// parked on c.mtx for that sign-in wakes to a healthy-looking state that says
-// nothing about which connection is installed.
+// parked on the exchange gate during that sign-in wakes to a healthy-looking
+// state that says nothing about which connection is installed.
 func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
 	var server *testListener
 	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
@@ -763,12 +763,12 @@ func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
 	// What a request that fails on this connection carries with it.
 	failed := client.connGeneration
 
-	require.NoError(t, client.disconnect())
+	require.NoError(t, client.disconnect(context.Background()))
 	require.NoError(t, client.Connect(context.Background()))
 	require.NotEqual(t, failed, client.connGeneration,
 		"a reconnect installs a connection of its own")
 
-	torn, err := client.disconnectGeneration(failed)
+	torn, err := client.disconnectGeneration(context.Background(), failed)
 	require.NoError(t, err)
 	assert.False(t, torn, "the stale generation reported a teardown it did not make")
 	assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
@@ -777,7 +777,7 @@ func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
 	assert.Equal(t, 2, server.connections(), "the stale teardown forced a third connection")
 
 	// The connection the caller did fail on is still torn down.
-	torn, err = client.disconnectGeneration(client.connGeneration)
+	torn, err = client.disconnectGeneration(context.Background(), client.connGeneration)
 	require.NoError(t, err)
 	assert.True(t, torn)
 	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)

@@ -172,6 +172,11 @@ func TestPrimaryPoll_SplitPrimariesKeepCoordinatorMembershipAndReuseConnections(
 	assert.Equal(t, 1, fixture.coordinator.connections(), "poll routing must not move the group coordinator")
 	assert.Equal(t, parent, fixture.client.session.ClientID())
 	assert.Equal(t, session, fixture.client.session.SessionID())
+	fixture.client.polls.mu.Lock()
+	for _, slot := range fixture.client.polls.connections {
+		assert.True(t, slot.client.dataConnection, "each primary slot client must be marked as a data connection")
+	}
+	fixture.client.polls.mu.Unlock()
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
 	assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.SyncGroupCode))
 	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
@@ -501,6 +506,7 @@ func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
 				coordinator, coordinatorConn := newPipeClient(t)
 				defer func() { _ = coordinator.Close() }()
 				primary, primaryConn := newPipeClient(t)
+				primary.dataConnection = true
 				defer func() { _ = primary.Close() }()
 				coordinator.rememberLogin(NewUsernamePasswordCredentials("iggy", "secret"))
 				coordinator.clustered.Store(true)

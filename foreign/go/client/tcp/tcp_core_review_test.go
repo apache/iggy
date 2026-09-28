@@ -145,7 +145,7 @@ func TestConnect_SuppressedSignInSendsNothing(t *testing.T) {
 
 	// And it is that context, not the client, that carries the suppression:
 	// a Connect without it signs in.
-	require.NoError(t, client.disconnect())
+	require.NoError(t, client.disconnect(context.Background()))
 	require.NoError(t, client.Connect(context.Background()))
 	assert.NotEmpty(t, server.recorded(),
 		"the suppression outlived the call that meant it")

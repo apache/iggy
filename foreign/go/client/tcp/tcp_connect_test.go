@@ -26,6 +26,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -455,6 +456,185 @@ func TestConnect_DropsTheConnectionWhenAutomaticSignInFails(t *testing.T) {
 	assert.Nil(t, client.conn)
 }
 
+type connectStageHandler struct {
+	slog.Handler
+	message string
+	hook    func()
+}
+
+func (h connectStageHandler) Handle(_ context.Context, record slog.Record) error {
+	if record.Message == h.message {
+		h.hook()
+	}
+	return nil
+}
+
+func TestConnect_CancellationDropsOnlyTheUnfinishedConnection(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		message  string
+		redirect bool
+	}{
+		{name: "unbound", message: "Iggy client has connected to the Iggy server"},
+		{name: "bound", message: "Iggy client has signed in successfully."},
+		{name: "redirect unbound", message: "Iggy client has connected to the Iggy server", redirect: true},
+		{name: "redirect bound", message: "Iggy client has signed in successfully.", redirect: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			defer close(release)
+			var leader *testListener
+			leader = listenVSR(t, nil, func(_, _ int, read request) []byte {
+				if read.code() == uint32(command.PingCode) {
+					close(entered)
+					<-release
+				}
+				return singleNodeHandler(t, leader.address)(0, 0, read)
+			})
+			address := leader.address()
+			generation := uint64(1)
+			if test.redirect {
+				var follower *testListener
+				follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
+					if read.code() == uint32(command.GetClusterMetadataCode) {
+						return clusterMetadataFrame(t, 1, follower.address(), leader.address())
+					}
+					return registerReplyFrame(7, 100)
+				})
+				address = follower.address()
+				generation++
+			}
+			client := newDialingClient(t, address,
+				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			client.config.reconnection.enabled = false
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pingDone := make(chan error, 1)
+			var once sync.Once
+			client.logger = slog.New(connectStageHandler{
+				Handler: slog.NewTextHandler(io.Discard, nil),
+				message: test.message,
+				hook: func() {
+					client.mtx.Lock()
+					matches := client.connGeneration == generation
+					client.mtx.Unlock()
+					if matches {
+						once.Do(func() {
+							go func() { pingDone <- client.Ping(context.Background()) }()
+							<-entered
+							cancel()
+						})
+					}
+				},
+			})
+			connected := make(chan error, 1)
+			go func() { connected <- client.Connect(ctx) }()
+			select {
+			case err := <-connected:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				t.Fatal("Connect waited for the exchange after cancellation")
+			}
+			client.mtx.Lock()
+			assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+			assert.Nil(t, client.conn)
+			assert.False(t, client.session.Bound())
+			assert.Nil(t, client.pollSession.Load())
+			client.mtx.Unlock()
+			select {
+			case err := <-pingDone:
+				assert.ErrorIs(t, err, ierror.ErrDisconnected)
+			case <-time.After(time.Second):
+				t.Fatal("the unfinished connection still holds an exchange")
+			}
+			require.NoError(t, client.Connect(context.Background()))
+			assert.True(t, client.session.Bound())
+			assert.NotNil(t, client.pollSession.Load(), "a new sign-in must restore routed requests")
+		})
+	}
+}
+
+func TestConnect_FailedSignInDoesNotCloseAReplacementConnection(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var replacement net.Conn
+	client.logger = slog.New(connectStageHandler{
+		Handler: slog.NewTextHandler(io.Discard, nil),
+		message: "Iggy client has signed in successfully.",
+		hook: func() {
+			require.NoError(t, client.disconnect(context.Background()))
+			require.NoError(t, client.Connect(suppressAutoLogin(context.Background())))
+			replacement = client.conn
+			cancel()
+		},
+	})
+
+	require.ErrorIs(t, client.Connect(ctx), context.Canceled)
+	assert.Same(t, replacement, client.conn)
+	assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
+	require.NoError(t, client.Ping(context.Background()))
+}
+
+func TestConnect_CancelledLoginReplayDropsItsConnection(t *testing.T) {
+	for _, redirect := range []bool{false, true} {
+		name := "direct"
+		if redirect {
+			name = "redirected"
+		}
+		t.Run(name, func(t *testing.T) {
+			var leader *testListener
+			leader = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				if connection == 0 && read.operation() == vsr.OperationRegister {
+					return nil
+				}
+				return singleNodeHandler(t, leader.address)(connection, index, read)
+			})
+			address := leader.address()
+			replayGeneration := uint64(2)
+			if redirect {
+				var follower *testListener
+				follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
+					if read.code() == uint32(command.GetClusterMetadataCode) {
+						return clusterMetadataFrame(t, 1, follower.address(), leader.address())
+					}
+					return registerReplyFrame(7, 100)
+				})
+				address = follower.address()
+				replayGeneration++
+			}
+			client := newDialingClient(t, address,
+				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			client.logger = slog.New(connectStageHandler{
+				Handler: slog.NewTextHandler(io.Discard, nil),
+				message: "Iggy client has connected to the Iggy server",
+				hook: func() {
+					client.mtx.Lock()
+					replaying := client.connGeneration == replayGeneration
+					client.mtx.Unlock()
+					if replaying {
+						cancel()
+					}
+				},
+			})
+
+			require.ErrorIs(t, client.Connect(ctx), context.Canceled)
+			assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+			assert.Nil(t, client.conn)
+			assert.False(t, client.session.Bound())
+			require.NoError(t, client.Connect(context.Background()))
+			assert.True(t, client.session.Bound(), "the next Connect must complete a fresh sign-in")
+			assert.NotNil(t, client.pollSession.Load())
+		})
+	}
+}
+
 func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 	var server *testListener
 	registers := 0
@@ -498,7 +678,7 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 
 	// The suppression rides the replay's own context, so nothing about it
 	// outlives that call: the next Connect signs in again.
-	require.NoError(t, client.disconnect())
+	require.NoError(t, client.disconnect(context.Background()))
 	require.NoError(t, client.Connect(context.Background()))
 	signIns = 0
 	for _, recorded := range server.recorded() {
