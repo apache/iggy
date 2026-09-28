@@ -4548,9 +4548,13 @@ where
                 // request room -> buffer; both full -> drop+warn (client retries
                 // via read-timeout).
                 if consensus.pipeline_is_full() {
-                    let push_result = consensus.push_queued_request(
-                        consensus::RequestEntry::with_sender(message, reply.take()),
-                    );
+                    let entry = consensus::RequestEntry::with_sender(message, reply.take());
+                    let entry = if consumer_offset.is_some() {
+                        entry.with_consumer_offset_history(self.poll_history)
+                    } else {
+                        entry
+                    };
+                    let push_result = consensus.push_queued_request(entry);
                     if let Err(mut refused) = push_result {
                         emit_partition_diag(
                             tracing::Level::WARN,
@@ -4681,6 +4685,40 @@ where
             // Taken before the preflight so a refusal answers the parked waiter
             // instead of waking it with `Canceled`.
             let mut reply_sender = req.take_reply_sender();
+            if req
+                .consumer_offset_history()
+                .is_some_and(|history| history != self.poll_history)
+            {
+                // A numeric offset can fit the replacement history. Refuse
+                // before projection, with a terminal error: transient errors
+                // let clients replay the old mutation into that new history.
+                let error = Self::parse_consumer_offset_request(
+                    req.message.header().operation,
+                    &req.message,
+                )
+                .map_or(
+                    IggyError::InvalidCommand,
+                    |(_, consumer_id, offset, _)| {
+                        offset.map_or_else(
+                            || IggyError::ConsumerOffsetNotFound(consumer_id as usize),
+                            IggyError::InvalidOffset,
+                        )
+                    },
+                );
+                Self::send_partition_deny_or_log(
+                    self.consensus(),
+                    req.message.header(),
+                    error.as_code(),
+                    "queued offset history deny reply send failed",
+                    reply_sender.take(),
+                )
+                .await;
+                consecutive_denials += 1;
+                if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    break;
+                }
+                continue;
+            }
             if !self
                 .admit_reserved_send(&req.message, &mut reply_sender)
                 .await

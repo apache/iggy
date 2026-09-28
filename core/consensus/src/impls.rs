@@ -283,6 +283,9 @@ pub struct AutoCommitRequestContext {
 pub struct RequestEntry {
     /// Automatic commit context owned by this entry until promotion or removal.
     auto_commit: Option<AutoCommitRequestContext>,
+    /// Offset writes must not cross a reset of the owner's message history.
+    /// Explicit stores keep their overwrite and client-dedup behavior.
+    consumer_offset_history: Option<PollHistoryId>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
     /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
@@ -330,6 +333,18 @@ impl RequestEntry {
         self.auto_commit.as_ref()
     }
 
+    /// Bind an explicit offset mutation to the history at owner admission.
+    #[must_use]
+    pub const fn with_consumer_offset_history(mut self, history: PollHistoryId) -> Self {
+        self.consumer_offset_history = Some(history);
+        self
+    }
+
+    #[must_use]
+    pub const fn consumer_offset_history(&self) -> Option<PollHistoryId> {
+        self.consumer_offset_history
+    }
+
     /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
@@ -359,6 +374,7 @@ impl RequestEntry {
     ) -> Self {
         Self {
             auto_commit: None,
+            consumer_offset_history: None,
             message,
             received_at: 0,
             reply_sender,
