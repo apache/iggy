@@ -44,7 +44,7 @@ struct State {
     // `_id` of the document at `last_poll_timestamp`, so documents sharing that
     // millisecond but cut off by `limit` are picked up on the next poll.
     #[serde(default)]
-    last_id: Option<Bson>,
+    last_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +124,25 @@ impl MongodbSource {
         Ok(client)
     }
 
+    /// The cursor only advances on BSON `Date` values, so a string, number or
+    /// missing `timestamp_field` would leave the connector silently producing nothing.
+    async fn check_timestamp_field(&self, client: &Client) -> Result<(), Error> {
+        let Some(timestamp_field) = &self.config.timestamp_field else {
+            return Ok(());
+        };
+        let coll: Collection<Document> = client
+            .database(&self.config.database)
+            .collection(&self.config.collection);
+        let sample = coll
+            .find_one(self.config.query.clone().unwrap_or_default())
+            .await
+            .map_err(|e| Error::InitError(format!("Failed to read a sample document: {e}")))?;
+        match sample {
+            Some(doc) => validate_timestamp_field(&doc, timestamp_field),
+            None => Ok(()),
+        }
+    }
+
     async fn search_documents(
         &self,
         client: &Client,
@@ -170,7 +189,10 @@ impl MongodbSource {
                     )
             {
                 // Results are sorted by (timestamp, _id), so the last one seen is the newest.
-                latest_position = Some((timestamp, doc.get("_id").cloned()));
+                latest_position = Some((
+                    timestamp,
+                    doc.get("_id").and_then(|id| serde_json::to_string(id).ok()),
+                ));
             }
 
             let payload = serde_json::to_vec(&doc).map_err(|e| {
@@ -210,6 +232,7 @@ impl Source for MongodbSource {
         );
 
         let client = self.create_client().await?;
+        self.check_timestamp_field(&client).await?;
         self.client = Some(client);
 
         Ok(())
@@ -261,16 +284,33 @@ impl Source for MongodbSource {
     }
 }
 
+fn validate_timestamp_field(doc: &Document, timestamp_field: &str) -> Result<(), Error> {
+    match doc.get(timestamp_field) {
+        Some(Bson::DateTime(_)) => Ok(()),
+        Some(value) => Err(Error::InvalidConfigValue(format!(
+            "timestamp_field '{timestamp_field}' must hold a BSON Date, found {:?}",
+            value.element_type()
+        ))),
+        None => Err(Error::InvalidConfigValue(format!(
+            "timestamp_field '{timestamp_field}' is missing from documents in the collection"
+        ))),
+    }
+}
+
 fn cursor_filter(timestamp_field: &str, state: &State) -> Document {
     let Some(last_timestamp) = state.last_poll_timestamp else {
         return doc! { timestamp_field: { "$type": "date" } };
     };
     let last_timestamp = mongodb::bson::DateTime::from_millis(last_timestamp.timestamp_millis());
-    match &state.last_id {
+    match state
+        .last_id
+        .as_deref()
+        .and_then(|id| serde_json::from_str::<Bson>(id).ok())
+    {
         Some(last_id) => doc! {
             "$or": [
                 { timestamp_field: { "$gt": last_timestamp } },
-                { timestamp_field: last_timestamp, "_id": { "$gt": last_id.clone() } },
+                { timestamp_field: last_timestamp, "_id": { "$gt": last_id } },
             ]
         },
         // State saved before `last_id` existed. `$gte` re-delivers the boundary
@@ -302,7 +342,7 @@ mod tests {
             last_poll_timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000),
             total_documents_fetched: 10,
             poll_count: 1,
-            last_id: Some(Bson::ObjectId(ObjectId::new())),
+            last_id: Some(serde_json::to_string(&Bson::ObjectId(ObjectId::new())).unwrap()),
         }
     }
 
@@ -393,7 +433,7 @@ mod tests {
             doc! {
                 "$or": [
                     { "timestamp": { "$gt": last_timestamp } },
-                    { "timestamp": last_timestamp, "_id": { "$gt": state.last_id.unwrap() } },
+                    { "timestamp": last_timestamp, "_id": { "$gt": serde_json::from_str::<Bson>(&state.last_id.unwrap()).unwrap() } },
                 ]
             }
         );
@@ -411,5 +451,25 @@ mod tests {
             filter,
             doc! { "timestamp": { "$gte": mongodb::bson::DateTime::from_millis(1_700_000_000_000) } }
         );
+    }
+
+    #[test]
+    fn given_non_date_timestamp_field_should_reject_config() {
+        let date = doc! { "timestamp": mongodb::bson::DateTime::now() };
+        assert!(validate_timestamp_field(&date, "timestamp").is_ok());
+
+        for doc in [
+            doc! { "timestamp": "2024-01-15T10:30:00Z" },
+            doc! { "timestamp": 1_700_000_000_000_i64 },
+            doc! { "name": "no timestamp" },
+        ] {
+            assert!(
+                matches!(
+                    validate_timestamp_field(&doc, "timestamp"),
+                    Err(Error::InvalidConfigValue(_))
+                ),
+                "{doc:?} should be rejected"
+            );
+        }
     }
 }
