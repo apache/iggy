@@ -406,6 +406,9 @@ pub(in crate::http) async fn partition_write_replicated(
             );
             PartitionWriteError::Unavailable
         })?;
+    let alt_permissioner = state
+        .resolve_session_perms(session)
+        .map(|perms| crate::dispatch::authz::build_inline_permissioner(session.user_id, &perms));
     dispatch_partition_request(
         &state.shard,
         message,
@@ -414,6 +417,7 @@ pub(in crate::http) async fn partition_write_replicated(
         session.client_id,
         Some(session.user_id),
         None,
+        alt_permissioner.as_ref(),
     )
     .await;
     drop(next_data_request_id);
@@ -463,6 +467,9 @@ pub(in crate::http) async fn produce_unacked(
         request_id,
         body,
     );
+    let alt_permissioner = state
+        .resolve_session_perms(session)
+        .map(|perms| crate::dispatch::authz::build_inline_permissioner(session.user_id, &perms));
     dispatch_partition_request(
         &state.shard,
         message,
@@ -471,6 +478,7 @@ pub(in crate::http) async fn produce_unacked(
         session.client_id,
         Some(session.user_id),
         None,
+        alt_permissioner.as_ref(),
     )
     .await;
     drop(next_data_request_id);

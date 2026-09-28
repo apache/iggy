@@ -757,11 +757,13 @@ mod tests {
         });
         let request_header = *request.header();
 
+        let external_auth = Arc::new(configs::external_auth::ExternalAuthConfig::default());
         handle_client_request(
             &shard,
             &sessions,
             &server_config,
             MAX_TOKENS_PER_USER,
+            &external_auth,
             TRANSPORT,
             request.into_generic(),
         )

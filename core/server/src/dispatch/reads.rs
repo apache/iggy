@@ -26,7 +26,10 @@
 //! the HTTP layer), never in the builder.
 
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::authz::{authorize_default_read, authorize_partition_read, authorize_uid};
+use crate::dispatch::authz::{
+    authorize_default_read, authorize_partition_read, authorize_uid, build_inline_permissioner,
+    inline_grant_lacks_stream_scope,
+};
 use crate::dispatch::failure::{
     FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
 };
@@ -354,6 +357,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
+    external_auth: &Arc<configs::external_auth::ExternalAuthConfig>,
     transport_client_id: u128,
     request: Message<RoutedRequestHeader>,
     // Acting user, peer address and read-your-writes floor for the read gates
@@ -377,6 +381,15 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
+    let alt_permissioner = user_id
+        .filter(|&uid| external_auth.enabled && uid == external_auth.user_id)
+        .and_then(|uid| {
+            let now_secs = iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+            let perms = sessions
+                .borrow_mut()
+                .session_permissions_for_connection(transport_client_id, now_secs)?;
+            Some(build_inline_permissioner(uid, &perms))
+        });
     match code {
         PING_CODE => {
             // No `record_heartbeat` here: the funnel records one for EVERY
@@ -400,10 +413,22 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         GET_ME_CODE => {
             // Self-scoped, so no permissioner rule -- but the consumer-group
             // list it carries is read off the streams STM, so it is gated like
-            // any other metadata read.
+            // any other metadata read. External auth sessions with no stream
+            // grants are denied: an all-false inline grant should not learn
+            // transport details or consumer-group memberships.
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
+                return;
+            }
+            if inline_grant_lacks_stream_scope(alt_permissioner.as_ref(), user_id.unwrap_or(0)) {
+                send_non_replicated_deny(
+                    shard,
+                    &request,
+                    transport_client_id,
+                    IggyError::Unauthorized.as_code(),
+                )
+                .await;
                 return;
             }
             handle_get_me(shard, sessions, transport_client_id, &request).await;
@@ -418,7 +443,12 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         GET_CLIENTS_CODE => {
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-                authorize_uid(shard, user_id, Permissioner::get_clients)
+                authorize_uid(
+                    shard,
+                    user_id,
+                    Permissioner::get_clients,
+                    alt_permissioner.as_ref(),
+                )
             })
             .await
             {
@@ -447,7 +477,12 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         GET_CLIENT_CODE => {
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-                authorize_uid(shard, user_id, Permissioner::get_client)
+                authorize_uid(
+                    shard,
+                    user_id,
+                    Permissioner::get_client,
+                    alt_permissioner.as_ref(),
+                )
             })
             .await
             {
@@ -500,7 +535,15 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
-            handle_get_snapshot(shard, server_config, transport_client_id, &request, user_id).await;
+            handle_get_snapshot(
+                shard,
+                server_config,
+                transport_client_id,
+                &request,
+                user_id,
+                alt_permissioner.as_ref(),
+            )
+            .await;
         }
         GET_POLL_ROUTING_CODE | GET_CONSUMER_OFFSET_ROUTING_CODE | ATTACH_CONSUMER_SESSION_CODE => {
             let result = if code == ATTACH_CONSUMER_SESSION_CODE {
@@ -515,6 +558,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                     user_id,
                     client_address,
                     code,
+                    alt_permissioner.as_ref(),
                 )
                 .await
             };
@@ -556,6 +600,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                         user_id,
                         consumer_client_id,
                         attachment,
+                        alt_permissioner.as_ref(),
                     )
                     .await;
                 }
@@ -566,15 +611,34 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             }
         }
         GET_CONSUMER_OFFSET_CODE => {
-            handle_get_consumer_offset(shard, transport_client_id, &request, user_id).await;
+            handle_get_consumer_offset(
+                shard,
+                transport_client_id,
+                &request,
+                user_id,
+                alt_permissioner.as_ref(),
+            )
+            .await;
         }
         SYNC_CONSUMER_GROUP_CODE => {
             // Self-scoped: serves the caller's own assignment keyed by the
             // header client id, so it carries no permissioner rule. The
             // assignment itself is metadata-STM state, hence the gate.
+            // External auth sessions with no stream grants are denied (same
+            // rationale as GET_ME above).
             if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
+                return;
+            }
+            if inline_grant_lacks_stream_scope(alt_permissioner.as_ref(), user_id.unwrap_or(0)) {
+                send_non_replicated_deny(
+                    shard,
+                    &request,
+                    transport_client_id,
+                    IggyError::Unauthorized.as_code(),
+                )
+                .await;
                 return;
             }
             handle_sync_consumer_group(shard, transport_client_id, &request).await;
@@ -598,6 +662,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 watermark,
                 &roster,
                 client_ip,
+                alt_permissioner.as_ref(),
             )
             .await;
         }
@@ -669,6 +734,7 @@ async fn consumer_routing<B, MJ, S, SB>(
     user_id: Option<u32>,
     client_address: Option<SocketAddr>,
     code: u32,
+    alt_permissioner: Option<&Permissioner>,
 ) -> Result<Bytes, IggyError>
 where
     B: ShellBus,
@@ -703,6 +769,7 @@ where
             |permissioner, user_id, stream_id, topic_id| {
                 permissioner.poll_messages(user_id, stream_id, topic_id)
             },
+            alt_permissioner,
         )
         .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
     })
@@ -755,6 +822,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -768,7 +836,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     // read-your-writes hold sits INSIDE the same call, behind that denial: an
     // unauthorized read must fail now, not after the whole poll budget.
     if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
-        authorize_default_read(shard, code, request_body(request), user_id)
+        authorize_default_read(
+            shard,
+            code,
+            request_body(request),
+            user_id,
+            alt_permissioner,
+        )
     })
     .await
     {
@@ -856,6 +930,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    alt_permissioner: Option<&Permissioner>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -863,7 +938,8 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot) {
+    if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot, alt_permissioner)
+    {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }

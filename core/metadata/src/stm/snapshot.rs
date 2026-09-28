@@ -47,7 +47,11 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 5: `PartitionSnapshot` gained `created_view` as a trailing, defaulted
 /// field.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
+///
+/// Version 6: `MetadataSnapshot` gained `external_auth_user_id` as a trailing,
+/// defaulted field so the in-apply authorization gate uses replicated state
+/// rather than node-local config.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 6;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -231,6 +235,12 @@ pub struct MetadataSnapshot {
     /// The release that wrote this snapshot, as a packed `iggy_binary_protocol`
     /// semver. Provenance only, never a gate. See [`SNAPSHOT_WRITER_RELEASE`].
     pub writer_release: u32,
+    /// Reserved user ID for external auth inline-grant sessions. Replicated so
+    /// the in-apply authorization gate produces identical decisions on every
+    /// node regardless of local config. `None` when external auth was not
+    /// enabled on the node that took the snapshot.
+    #[serde(default)]
+    pub external_auth_user_id: Option<u32>,
 }
 
 impl Default for MetadataSnapshot {
@@ -256,6 +266,7 @@ impl MetadataSnapshot {
             streams: None,
             client_table: None,
             writer_release: SNAPSHOT_WRITER_RELEASE,
+            external_auth_user_id: None,
         }
     }
 
@@ -563,8 +574,8 @@ mod tests {
         // turns "shape changed, version did not" into a failing test rather than an
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
-        const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 5;
+        const FIELD_COUNT: u32 = 8;
+        const PINNED_VERSION: u32 = 6;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -767,6 +778,7 @@ mod tests {
                         watermark: 3,
                         watermark_checksum: 0,
                         reply: vec![1, 2, 3],
+                        session_permissions: None,
                     },
                 )],
             }),
