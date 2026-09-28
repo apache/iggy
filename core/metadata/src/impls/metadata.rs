@@ -5807,7 +5807,7 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER)
+            .submit_register_in_process(CLIENT, USER, None)
             .await
             .unwrap()
             .epoch;
@@ -5835,7 +5835,7 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER)
+            .submit_register_in_process(CLIENT, USER, None)
             .await
             .unwrap()
             .epoch;
@@ -5895,7 +5895,7 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let new_session = metadata
-            .submit_register_in_process(CLIENT, USER)
+            .submit_register_in_process(CLIENT, USER, None)
             .await
             .unwrap()
             .epoch;
@@ -5939,12 +5939,12 @@ mod tests {
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         *metadata.client_table.borrow_mut() = ClientTable::new(1);
         let old_session = metadata
-            .submit_register_in_process(CLIENT, USER)
+            .submit_register_in_process(CLIENT, USER, None)
             .await
             .unwrap()
             .epoch;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER)
+            .submit_register_in_process(CLIENT, USER, None)
             .await
             .unwrap()
             .epoch;
@@ -5952,7 +5952,7 @@ mod tests {
             if client != CLIENT {
                 assert_eq!(
                     metadata
-                        .submit_register_in_process(client, USER)
+                        .submit_register_in_process(client, USER, None)
                         .await
                         .unwrap()
                         .epoch,
@@ -5974,7 +5974,7 @@ mod tests {
             metadata.submit_request_in_process(request).await.unwrap();
         }
         metadata
-            .submit_register_in_process(CLIENT + 2, USER)
+            .submit_register_in_process(CLIENT + 2, USER, None)
             .await
             .unwrap();
         assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
@@ -6109,7 +6109,7 @@ mod tests {
         );
         metadata.mux_stm = Rc::new(TestMux::new((Users::default(), (inner.into(), ()))));
         metadata
-            .submit_register_in_process(client_id, USER)
+            .submit_register_in_process(client_id, USER, None)
             .await
             .unwrap();
         metadata.client_table.borrow_mut().remove_client(
