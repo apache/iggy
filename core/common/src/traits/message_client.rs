@@ -134,14 +134,4 @@ pub trait MessageClient {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError>;
-
-    /// Force flush of the `unsaved_messages` buffer to disk, optionally fsyncing the data.
-    #[allow(clippy::too_many_arguments)]
-    async fn flush_unsaved_buffer(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        fsync: bool,
-    ) -> Result<(), IggyError>;
 }

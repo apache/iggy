@@ -19,8 +19,6 @@
 // the server's ported trusted-issuer path verify them.
 mod a2a_jwt;
 mod cg;
-// Flush (FLUSH_UNSAVED_BUFFER) has no the server primitive; it must deny typed.
-mod flush_vsr;
 // Raw TCP framing (connect, hand-crafted frames, root register) for the
 // server suites that send what the SDK cannot.
 pub(crate) mod raw_tcp;
