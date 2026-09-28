@@ -334,12 +334,16 @@ impl RequestEntry {
     }
 
     /// Bind an explicit offset mutation to the history at owner admission.
+    /// `None` leaves other request kinds without an explicit-offset binding.
     #[must_use]
-    pub const fn with_consumer_offset_history(mut self, history: PollHistoryId) -> Self {
-        self.consumer_offset_history = Some(history);
+    pub const fn with_consumer_offset_history(mut self, history: Option<PollHistoryId>) -> Self {
+        self.consumer_offset_history = history;
         self
     }
 
+    /// History captured when an explicit offset mutation queues on its owner.
+    /// A mismatch at promotion rejects the mutation before it can affect replacement progress.
+    /// `None` means this entry has no explicit-offset history binding.
     #[must_use]
     pub const fn consumer_offset_history(&self) -> Option<PollHistoryId> {
         self.consumer_offset_history

@@ -479,21 +479,7 @@ fn store(
         ack: AckLevel::Quorum,
     }
     .to_bytes();
-    let size = size_of::<RoutedRequestHeader>() + body.len();
-    let mut message = Message::<RoutedRequestHeader>::new(size);
-    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
-    message.transmute_header(|_, header: &mut RoutedRequestHeader| {
-        *header = RoutedRequestHeader {
-            command: Command::Request,
-            operation: Operation::StoreConsumerOffset,
-            size: u32::try_from(size).unwrap(),
-            client,
-            session: 1,
-            request,
-            group: namespace().inner(),
-            ..Default::default()
-        };
-    })
+    offset_request(Operation::StoreConsumerOffset, client, request, &body)
 }
 
 fn delete(kind: ConsumerKind, request: u64) -> Message<RoutedRequestHeader> {
@@ -508,15 +494,24 @@ fn delete(kind: ConsumerKind, request: u64) -> Message<RoutedRequestHeader> {
         ack: AckLevel::Quorum,
     }
     .to_bytes();
+    offset_request(Operation::DeleteConsumerOffset, 42, request, &body)
+}
+
+fn offset_request(
+    operation: Operation,
+    client: u128,
+    request: u64,
+    body: &[u8],
+) -> Message<RoutedRequestHeader> {
     let size = size_of::<RoutedRequestHeader>() + body.len();
     let mut message = Message::<RoutedRequestHeader>::new(size);
-    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
     message.transmute_header(|_, header: &mut RoutedRequestHeader| {
         *header = RoutedRequestHeader {
             command: Command::Request,
-            operation: Operation::DeleteConsumerOffset,
+            operation,
             size: u32::try_from(size).unwrap(),
-            client: 42,
+            client,
             session: 1,
             request,
             group: namespace().inner(),
