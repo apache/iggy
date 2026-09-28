@@ -44,6 +44,9 @@ on:
       cpp_matrix:
         description: "Matrix for C++ SDK"
         value: ${{ jobs.detect.outputs.cpp_matrix }}
+      swift_matrix:
+        description: "Matrix for Swift SDK"
+        value: ${{ jobs.detect.outputs.swift_matrix }}
       bdd_matrix:
         description: "Matrix for BDD tests"
         value: ${{ jobs.detect.outputs.bdd_matrix }}
@@ -69,6 +72,7 @@ jobs:
       java_matrix: ${{ steps.mk.outputs.java_matrix }}
       csharp_matrix: ${{ steps.mk.outputs.csharp_matrix }}
       cpp_matrix: ${{ steps.mk.outputs.cpp_matrix }}
+      swift_matrix: ${{ steps.mk.outputs.swift_matrix }}
       bdd_matrix: ${{ steps.mk.outputs.bdd_matrix }}
       examples_matrix: ${{ steps.mk.outputs.examples_matrix }}
       other_matrix: ${{ steps.mk.outputs.other_matrix }}
@@ -237,7 +241,7 @@ jobs:
               console.log(`Total files changed: ${files.length}`);
             }
 
-            const groups = { rust:[], python:[], php:[], node:[], go:[], java:[], csharp:[], cpp:[], bdd:[], examples:[], other:[] };
+            const groups = { rust:[], python:[], php:[], node:[], go:[], java:[], csharp:[], cpp:[], swift:[], bdd:[], examples:[], other:[] };
 
             // Process affected components and generate tasks
             console.log('');
@@ -266,6 +270,7 @@ jobs:
               else if (name === 'sdk-java') groups.java.push(...entries);
               else if (name === 'sdk-csharp') groups.csharp.push(...entries);
               else if (name === 'sdk-cpp') groups.cpp.push(...entries);
+              else if (name === 'sdk-swift') groups.swift.push(...entries);
               else if (name.startsWith('bdd-')) {
                 // Individual BDD tests should run separately with proper Docker setup
                 groups.bdd.push(...entries);
@@ -313,6 +318,7 @@ jobs:
               groups.java = [];
               groups.csharp = [];
               groups.cpp = [];
+              groups.swift = [];
               groups.bdd = [];
               groups.examples = [];
               groups.other = [];
@@ -328,6 +334,7 @@ jobs:
                 else if (name === 'sdk-java') groups.java.push(...entries);
                 else if (name === 'sdk-csharp') groups.csharp.push(...entries);
                 else if (name === 'sdk-cpp') groups.cpp.push(...entries);
+                else if (name === 'sdk-swift') groups.swift.push(...entries);
                 else if (name.startsWith('bdd-')) groups.bdd.push(...entries);
                 else if (name.startsWith('examples-')) groups.examples.push(...entries);
                 else groups.other.push(...entries);
@@ -365,6 +372,7 @@ jobs:
               { name: 'Java SDK', tasks: groups.java },
               { name: 'C# SDK', tasks: groups.csharp },
               { name: 'C++ SDK', tasks: groups.cpp },
+              { name: 'Swift SDK', tasks: groups.swift },
               { name: 'BDD Tests', tasks: groups.bdd },
               { name: 'Examples', tasks: groups.examples },
               { name: 'Other', tasks: groups.other }
@@ -398,6 +406,7 @@ jobs:
             setOutput('java_matrix', JSON.stringify(matrix(groups.java)));
             setOutput('csharp_matrix', JSON.stringify(matrix(groups.csharp)));
             setOutput('cpp_matrix', JSON.stringify(matrix(groups.cpp)));
+            setOutput('swift_matrix', JSON.stringify(matrix(groups.swift)));
             setOutput('bdd_matrix', JSON.stringify(matrix(groups.bdd)));
             setOutput('examples_matrix', JSON.stringify(matrix(groups.examples)));
             setOutput('other_matrix', JSON.stringify(matrix(groups.other)));
