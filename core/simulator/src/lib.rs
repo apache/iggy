@@ -1682,6 +1682,9 @@ fn materialise_partition(
 }
 
 #[cfg(test)]
+mod stale_prepare_commit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::SimClient;
