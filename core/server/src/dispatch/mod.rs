@@ -72,7 +72,7 @@ use journal::{Journal, JournalHandle};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use server_common::Message;
-use shard::{ConnectedClientInfo, ListClientsHandler};
+use shard::{ListClientsHandler, ListClientsReply};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -104,11 +104,13 @@ type ActiveClientRequests = Rc<RefCell<AHashSet<u128>>>;
 /// [`shard::IggyShard::list_all_clients`].
 pub fn make_list_clients_handler(sessions: &Rc<RefCell<SessionManager>>) -> ListClientsHandler {
     let sessions = Rc::clone(sessions);
-    Rc::new(move |reply| {
-        let clients: Vec<ConnectedClientInfo> = sessions.borrow().iter_clients().collect();
-        // Best-effort: the gather side bounds itself by count + timeout, so
-        // a dropped reply (receiver gone) just means this shard is omitted.
-        let _ = reply.try_send(clients);
+    Rc::new(move |reply| match reply {
+        ListClientsReply::Clients(reply) => {
+            let _ = reply.try_send(sessions.borrow().iter_clients().collect());
+        }
+        ListClientsReply::Sessions(reply) => {
+            let _ = reply.try_send(sessions.borrow().iter_consumer_sessions().collect());
+        }
     })
 }
 

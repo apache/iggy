@@ -115,6 +115,8 @@ where
     SB: SuperblockStore + 'static,
 {
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let consumer_group_liveness = Rc::default();
+    let session_timeout = server_config.consumer_group.session_timeout.get_duration();
     ShellHandlers {
         on_replica_message: make_deferred_replica_message_handler(shard_handle),
         on_client_request: make_deferred_client_request_handler(
@@ -124,9 +126,14 @@ where
             server_config,
             max_tokens_per_user,
         ),
-        on_metadata_submit: make_metadata_submit_handler(shard_handle),
+        on_metadata_submit: make_metadata_submit_handler(
+            shard_handle,
+            &consumer_group_liveness,
+            session_timeout,
+        ),
         on_list_clients: make_list_clients_handler(&sessions),
         sessions,
+        consumer_group_liveness,
     }
 }
 
@@ -529,10 +536,17 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
-                |mux_stm, client, stamp| {
-                    mux_stm
-                        .streams()
-                        .remove_consumer_group_member(client, stamp);
+                |mux_stm, header| {
+                    if header.operation == iggy_binary_protocol::Operation::Register {
+                        mux_stm
+                            .streams()
+                            .refresh_consumer_group_session(header.client, header.op);
+                    } else {
+                        mux_stm.streams().remove_consumer_group_member(
+                            header.client,
+                            iggy_common::IggyTimestamp::from(header.timestamp),
+                        );
+                    }
                 },
             )
             .await
@@ -668,6 +682,7 @@ async fn shard_main(
     let ShardBuild {
         shard,
         sessions,
+        consumer_group_liveness,
         on_client_request,
         shard_handle,
     } = Box::pin(build_shard_for_thread(
@@ -862,12 +877,13 @@ async fn shard_main(
     } else {
         None
     };
-    let stop_signals = StopSignals {
+    let mut stop_signals = StopSignals {
         pump: stop_tx,
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
         segment_cleaner: segment_cleaner_stop,
+        consumer_group_liveness: None,
     };
 
     // One keep-alive per process, so shard 0 owns it. Started before the
@@ -976,6 +992,25 @@ async fn shard_main(
         // this is the first point at which a unit ordered after us may dial.
         #[cfg(feature = "systemd")]
         systemd::notify_ready();
+    }
+
+    if shard_id == 0 {
+        let (stop_tx, stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.consumer_group.heartbeat_interval.get_duration();
+        let timeout = config.consumer_group.session_timeout.get_duration();
+        let handle = compio::runtime::spawn(async move {
+            crate::consumer_group::liveness::run(
+                cleaner_shard,
+                consumer_group_liveness,
+                stop_rx,
+                interval,
+                timeout,
+            )
+            .await;
+        });
+        bus.track_background(handle);
+        stop_signals.consumer_group_liveness = Some(stop_tx);
     }
 
     bus.token().wait().await;

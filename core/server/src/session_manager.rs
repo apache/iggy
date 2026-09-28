@@ -28,6 +28,7 @@
 use crate::cluster_meta::ClusterRoster;
 use ahash::AHashMap;
 use consensus::client_table::SessionAttachment;
+use iggy_binary_protocol::ConsumerSession;
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
@@ -497,6 +498,19 @@ impl SessionManager {
             .iter()
             .map(|(&id, conn)| record_from(id, conn))
     }
+
+    pub fn iter_consumer_sessions(&self) -> impl Iterator<Item = ConsumerSession> + '_ {
+        self.connections.values().filter_map(|connection| {
+            if let ConnectionState::Bound {
+                client_id, session, ..
+            } = connection.state
+            {
+                Some(ConsumerSession { client_id, session })
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl Default for SessionManager {
@@ -535,15 +549,12 @@ impl std::error::Error for SessionError {}
 
 /// Flatten a connection + its id into a [`ConnectedClientInfo`].
 fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
-    let user_id = match conn.state {
-        ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
-            Some(user_id)
-        }
-        ConnectionState::Connected => None,
-    };
-    let vsr_client_id = match conn.state {
-        ConnectionState::Bound { client_id, .. } => Some(client_id),
-        ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+    let (user_id, vsr_client_id) = match conn.state {
+        ConnectionState::Bound {
+            user_id, client_id, ..
+        } => (Some(user_id), Some(client_id)),
+        ConnectionState::Authenticated { user_id } => (Some(user_id), None),
+        ConnectionState::Connected => (None, None),
     };
     ConnectedClientInfo {
         client_id: connection_id,
@@ -666,6 +677,47 @@ mod tests {
             },
         );
         assert_eq!(mgr.iter_clients().count(), 1);
+    }
+
+    #[test]
+    fn consumer_session_gather_includes_only_live_bound_connections() {
+        const CLIENT: u128 = 7;
+        const USER: u32 = 1;
+        let mut sessions = SessionManager::new();
+        for connection in [1, 2] {
+            sessions.ensure_connection(connection, addr(5000), ClientTransportKind::Tcp);
+            sessions.record_sdk_info(
+                connection,
+                ClientSdkInfo {
+                    sdk_name: "rust-sdk".to_owned(),
+                    sdk_version: "1.0.0".to_owned(),
+                    protocol_version: 1,
+                },
+            );
+        }
+        assert_eq!(sessions.iter_consumer_sessions().count(), 0);
+        sessions.login(1, USER).unwrap();
+        assert_eq!(sessions.iter_consumer_sessions().count(), 0);
+        sessions.bind_session(1, CLIENT, 11).unwrap();
+        assert_eq!(
+            sessions.iter_consumer_sessions().collect::<Vec<_>>(),
+            [ConsumerSession {
+                client_id: CLIENT,
+                session: 11
+            }]
+        );
+        sessions.login(2, USER).unwrap();
+        sessions.bind_session(2, CLIENT, 12).unwrap();
+        assert_eq!(sessions.iter_clients().count(), 2);
+        assert_eq!(
+            sessions.iter_consumer_sessions().collect::<Vec<_>>(),
+            [ConsumerSession {
+                client_id: CLIENT,
+                session: 12
+            }]
+        );
+        sessions.remove_connection(2);
+        assert_eq!(sessions.iter_consumer_sessions().count(), 0);
     }
 
     #[test]
