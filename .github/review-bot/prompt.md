@@ -48,6 +48,8 @@ A finding that only a build or a test can settle stays out of the review, unless
 }
 ```
 
+`summary` never states a verdict, because the publisher prints a count per severity instead. A skill that ends on `Verdict: APPROVE | REQUEST CHANGES` keeps that line in its own report.
+
 `severity` is `critical`, `warning`, `nit` or `simplification`:
 
 - `critical` - correctness, safety, data loss, security. Blocks merge.

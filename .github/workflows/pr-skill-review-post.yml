@@ -315,13 +315,19 @@ jobs:
             };
 
             // The model read the pull request under review, so the pull request
-            // can steer every word it wrote. A zero-width space keeps each
-            // character visible and stops what it would start: an HTML tag or
-            // comment, a mention, a link or reference definition, and math,
-            // which needs the space before the dollar sign. Code spans look
-            // the same, so generics survive, and a comment is one paragraph.
+            // can steer every word it wrote. The default-ignorable characters
+            // go first: Unicode tags, bidi controls, zero-width characters and
+            // variation selectors show nothing on screen, but the next agent
+            // that reads the thread reads them. Deleting them first joins what
+            // they split, and it keeps the zero-width space added below, which
+            // is one of them. That space keeps each character visible and
+            // stops what it would start: an HTML tag or comment, a mention, a
+            // link or reference definition, and math, which needs the space
+            // before the dollar sign. Code spans look the same, so generics
+            // survive, and a comment is one paragraph.
             const ZWSP = '\u200b';
             const inert = (text) => String(text ?? '')
+              .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
               .replace(/\s+/g, ' ').trim()
               .replace(/[<@\]]/g, (c) => c + ZWSP)
               .replace(/\$/g, ZWSP + '$')
@@ -370,8 +376,16 @@ jobs:
               .splice(MAX_INLINE)
               .map((c) => ({ path: c.path, line: c.line, text: c.body }));
 
+            // team-review and team-review-slim end on a `Verdict: APPROVE |
+            // REQUEST CHANGES` line. The prompt keeps it out of the summary,
+            // and a copy that opens a line or a sentence loses the verdict
+            // here, because the review states counts, not the word of the
+            // model. A space replaces it, so two sentences stay apart.
+            const VERDICT_PREFIX =
+              /(?:^|(?<=[.!?]))\W*verdict\W+(?:approve|request[\s_]+changes)\b[\s\p{Pd}\p{Pe}*_.,:;]*/gimu;
             const parts = [];
-            const summary = inert(payload.summary);
+            const summary = inert(String(payload.summary ?? '')
+              .replace(VERDICT_PREFIX, ' '));
             const unanchored = [...loose, ...overflow];
             const posted = inline.length + unanchored.length;
 
