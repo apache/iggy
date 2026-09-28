@@ -16,11 +16,11 @@
 // under the License.
 
 use async_trait::async_trait;
-use core::mem::drop;
 use futures::stream::TryStreamExt;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use mongodb::{Client, Collection, bson::Document, bson::doc, options::ClientOptions};
 use secrecy::{ExposeSecret, SecretString};
@@ -59,6 +59,7 @@ pub struct MongodbSource {
     client: Option<Client>,
     polling_interval: Duration,
     state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
 }
 
 const CONNECTOR_NAME: &str = "MongoDB source";
@@ -93,6 +94,7 @@ impl MongodbSource {
                 total_documents_fetched: 0,
                 poll_count: 0,
             })),
+            pending_state: Mutex::new(None),
         }
     }
 
@@ -113,8 +115,11 @@ impl MongodbSource {
         Ok(client)
     }
 
-    async fn search_documents(&self, client: &Client) -> Result<Vec<ProducedMessage>, Error> {
-        let state = self.state.lock().await;
+    async fn search_documents(
+        &self,
+        client: &Client,
+    ) -> Result<(Vec<ProducedMessage>, State), Error> {
+        let state = self.state.lock().await.clone();
         let limit = &self.config.limit.unwrap_or(100);
 
         let coll: Collection<Document> = client
@@ -141,8 +146,6 @@ impl MongodbSource {
                 .await
                 .map_err(|e| Error::InitError(format!("Failed to execute search: {e}")))?
         };
-
-        drop(state);
 
         let mut messages = Vec::new();
         let mut latest_timestamp = None;
@@ -177,13 +180,12 @@ impl MongodbSource {
             };
             messages.push(message);
         }
-        let mut state = self.state.lock().await;
-        state.total_documents_fetched += messages.len();
-        state.poll_count += 1;
-        if let Some(timestamp) = latest_timestamp {
-            state.last_poll_timestamp = Some(timestamp);
-        }
-        Ok(messages)
+        let candidate_state = State {
+            last_poll_timestamp: latest_timestamp.or(state.last_poll_timestamp),
+            total_documents_fetched: state.total_documents_fetched + messages.len(),
+            poll_count: state.poll_count + 1,
+        };
+        Ok((messages, candidate_state))
     }
 }
 
@@ -210,24 +212,30 @@ impl Source for MongodbSource {
             .as_ref()
             .ok_or_else(|| Error::Storage("Mongodb client not initialized".to_string()))?;
 
-        let messages = match self.search_documents(client).await {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        let (messages, candidate_state) = self.search_documents(client).await?;
 
-        let persisted_state = {
-            let state = self.state.lock().await;
-            self.serialize_state(&state)
-        };
+        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
+            Error::Serialization("failed to serialize MongoDB source state".to_string())
+        })?;
+        *self.pending_state.lock().await = Some(candidate_state);
 
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: persisted_state,
+            state: Some(persisted_state),
         })
     }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
+    }
+
     async fn close(&mut self) -> Result<(), Error> {
         info!("Mongodb Connector with ID: {} is closing", self.id);
 
@@ -238,5 +246,67 @@ impl Source for MongodbSource {
             self.id, state.total_documents_fetched
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> MongodbSourceConfig {
+        MongodbSourceConfig {
+            connection_uri: SecretString::from("mongodb://localhost:27017"),
+            database: "test_db".to_string(),
+            collection: "test_collection".to_string(),
+            max_pool_size: None,
+            query: None,
+            timestamp_field: Some("timestamp".to_string()),
+            limit: Some(100),
+            polling_interval: Some("100ms".to_string()),
+        }
+    }
+
+    fn staged_state() -> State {
+        State {
+            last_poll_timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000),
+            total_documents_fetched: 10,
+            poll_count: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn given_nack_when_batch_is_staged_should_keep_committed_state() {
+        let src = MongodbSource::new(1, test_config(), None);
+        *src.pending_state.lock().await = Some(staged_state());
+
+        src.on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("NACK should be applied");
+
+        let state = src.state.lock().await;
+        assert!(state.last_poll_timestamp.is_none());
+        assert_eq!(state.total_documents_fetched, 0);
+        assert_eq!(state.poll_count, 0);
+        assert!(src.pending_state.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
+        let src = MongodbSource::new(1, test_config(), None);
+        let candidate = staged_state();
+        *src.pending_state.lock().await = Some(candidate.clone());
+
+        src.on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ACK should be applied");
+
+        let state = src.state.lock().await;
+        assert_eq!(state.last_poll_timestamp, candidate.last_poll_timestamp);
+        assert_eq!(
+            state.total_documents_fetched,
+            candidate.total_documents_fetched
+        );
+        assert_eq!(state.poll_count, candidate.poll_count);
+        assert!(src.pending_state.lock().await.is_none());
     }
 }
