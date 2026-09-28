@@ -19,9 +19,9 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -45,18 +45,13 @@ pub enum BridgeError {
     /// from an actual server rejection are affected.
     #[error("Iggy client error: {0}")]
     Iggy(#[from] IggyError),
-    /// A bridge call exceeded its wall-clock budget (`with_request_timeout`'s `REQUEST_TIMEOUT`)
-    /// without a definitive answer from Iggy.
-    ///
-    /// Distinct from `Iggy(IggyError::CannotEstablishConnection)`: that variant means the SDK
-    /// itself gave up on establishing or using the connection, a known failure safe to retry. A
-    /// timeout here means only that *this caller* stopped waiting - the SDK does its write/read
-    /// inside a detached task this timeout cannot abort (`with_request_timeout`'s own doc has the
-    /// mechanism), so the request may already be on the wire, or already applied server-side, by
-    /// the time this fires. That is the same unknown-outcome shape `IggyError::TransientNotCommitted`
-    /// is, which is why this maps like that variant, not like a known connection failure.
+    /// A bridge call ran past its deadline. The SDK cannot cancel its detached write, so the
+    /// call may still land: 7, like `IggyError::TransientNotCommitted`.
     #[error("bridge call timed out waiting for a reply from Iggy")]
     Timeout,
+    /// The connection broke during a send, and the SDK does not replay it. It may have landed.
+    #[error("Iggy connection lost during a send: {0}")]
+    SendLost(IggyError),
     /// `high_watermark` was asked about a partition index the topic doesn't have.
     #[error(
         "partition {partition} out of range for topic '{topic}' ({partitions_count} partitions)"
@@ -85,6 +80,12 @@ pub enum BridgeError {
     /// raw or non-conformant client, not an expected path.
     #[error("invalid Kafka topic name '{kafka_topic}': {reason}")]
     InvalidKafkaTopicName { kafka_topic: String, reason: String },
+    /// `ensure_stream_and_topic` was asked for `partition_count == 0`. Enforced here, not only
+    /// at the `CreateTopics` wire-validation layer that's this bridge's only caller today - the
+    /// method is `pub`, so a future caller (a test, or a later Produce auto-create path)
+    /// bypassing that layer must not be able to provision a topic nothing can produce to.
+    #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
+    InvalidPartitionCount { kafka_topic: String },
 }
 
 impl BridgeError {
@@ -102,10 +103,13 @@ impl BridgeError {
     pub const fn to_kafka_error_code(&self) -> i16 {
         match self {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
-            Self::Timeout => ERROR_REQUEST_TIMED_OUT,
+            Self::Timeout | Self::SendLost(_) => ERROR_REQUEST_TIMED_OUT,
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
             Self::InvalidKafkaTopicName { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
+            // Same code the wire-validation layer already uses for this exact condition - this
+            // is the same failure reached through a different door, not a new kind of error.
+            Self::InvalidPartitionCount { .. } => ERROR_INVALID_PARTITIONS,
             // Not a wire-response case in practice: an invalid bridge config is caught at
             // `IggyBridge::connect` before any handler exists to answer a Kafka request, so this
             // is reachable only if a future caller starts constructing configs at request time.
@@ -113,6 +117,19 @@ impl BridgeError {
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
             Self::InvalidConfig(_) => ERROR_UNKNOWN_SERVER_ERROR,
         }
+    }
+
+    /// True when Iggy rejected the bridge's own login. The Kafka client only sees -1.
+    #[must_use]
+    pub const fn is_bridge_login_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::Iggy(
+                IggyError::InvalidCredentials
+                    | IggyError::InvalidUsername
+                    | IggyError::InvalidPassword
+            )
+        )
     }
 }
 
@@ -127,11 +144,20 @@ impl BridgeError {
 /// `ClientState::Connected`, the ordinary window between a reconnect's TCP handshake completing
 /// and its auto-sign-in landing, not for a rejected login.
 ///
+/// `ResourceNotFound` joins them despite naming no resource. `dispatch_partition_request`
+/// (`core/server/src/dispatch/partition.rs`) flattens every unresolved stream, topic and
+/// partition into it, so a `send_messages` to a missing topic or partition arrives as this and
+/// never as the typed variants, which only the bridge's own `get_topic` paths build locally.
+/// Every resource this bridge addresses is one of those three.
+///
 /// `TransientNotAccepted` (Iggy replica-side "retry, on any replica") is retriable the same way.
 /// `TransientNotCommitted` is not folded into that set: its outcome is genuinely unknown rather
 /// than known-safe-to-retry, so it maps to `REQUEST_TIMED_OUT` instead of
 /// `NOT_LEADER_OR_FOLLOWER` - a caller must not treat it as an ordinary retriable failure and risk
 /// a duplicate write.
+///
+/// 6 and 7 do not prove whether a send landed. For example, a reconnect that fails after a
+/// written send returns `CannotEstablishConnection` (6). Java retries both.
 ///
 /// `Unauthorized` is the only one of the four credential-shaped variants that stays on
 /// `TOPIC_AUTHORIZATION_FAILED` (29): it means the authenticated user lacks a permission, which is
@@ -143,16 +169,16 @@ impl BridgeError {
 /// startup-only: the SDK re-runs sign-in on every reconnect (`tcp_client.rs`), so a since-rotated
 /// bridge password surfaces this mid-request, not just at boot. They fall to
 /// `UNKNOWN_SERVER_ERROR` instead - correctly fatal (retrying won't fix a wrong password), but
-/// without asserting a cause the Kafka client cannot act on. A handler wiring this in
-/// (`#3535`/`#3536`) should log the real `IggyError` at `error!` level server-side, since the
-/// Kafka client will never see more than "-1" for it.
+/// without asserting a cause the Kafka client cannot act on. Produce logs them at `error!`
+/// (see [`BridgeError::is_bridge_login_rejected`]).
 const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
     match err {
         IggyError::StreamIdNotFound(_)
         | IggyError::StreamNameNotFound(_)
         | IggyError::TopicIdNotFound(_, _)
         | IggyError::TopicNameNotFound(_, _)
-        | IggyError::PartitionNotFound(_, _, _) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        | IggyError::PartitionNotFound(_, _, _)
+        | IggyError::ResourceNotFound(_) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
         IggyError::Unauthorized => ERROR_TOPIC_AUTHORIZATION_FAILED,
         IggyError::Disconnected
         | IggyError::EmptyResponse
@@ -163,7 +189,19 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
         IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
-        IggyError::TooManyPartitions => ERROR_INVALID_PARTITIONS,
+        // Not `ERROR_INVALID_PARTITIONS` (37): that code's own text, per `kafka-protocol`'s
+        // table, is "Number of partitions is below 1" - the opposite condition from "too many"
+        // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
+        // client-visible error message that contradicts the actual request it sent.
+        IggyError::TooManyPartitions => ERROR_INVALID_REQUEST,
+        // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
+        // handler's error path, but "the operation did commit, so report success" only holds for
+        // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
+        // first attempt already applied, and the server's client-table dedup caught the replay.
+        // A read that somehow reaches this variant has no write to have "already applied"; a
+        // write-side caller (CreateTopics) special-cases it locally, close to the write it
+        // concerns, instead of baking a write-only assumption into a mapping every read also
+        // goes through.
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -195,6 +233,14 @@ mod tests {
     }
 
     #[test]
+    fn resource_not_found_maps_to_unknown_topic_or_partition() {
+        // The only code a `send_messages` to a missing topic or partition ever comes back as:
+        // the server flattens both to this one rather than to the typed variants above.
+        let err = BridgeError::Iggy(IggyError::ResourceNotFound(String::new()));
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
     fn unauthenticated_maps_to_not_leader_or_follower_for_retry() {
         // Not a credential rejection: fail_if_not_authenticated (binary_auth.rs) returns this for
         // ClientState::Connected, the ordinary window mid-reconnect before auto-sign-in lands.
@@ -211,8 +257,28 @@ mod tests {
     }
 
     #[test]
-    fn too_many_partitions_maps_to_invalid_partitions() {
+    fn too_many_partitions_maps_to_invalid_request_not_invalid_partitions() {
+        // INVALID_PARTITIONS (37) means "count is below 1" (kafka-protocol's own error table) -
+        // the opposite condition from "too many": reusing it here would send a client-visible
+        // message that contradicts the request it just sent.
         let err = BridgeError::Iggy(IggyError::TooManyPartitions);
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn request_already_applied_falls_to_the_generic_mapping_here() {
+        // This shared mapping has no write to know "already applied" refers to - CreateTopics
+        // (the only caller for whom that's a success, not a fault) special-cases it locally
+        // instead (`create_topics.rs`), close to the write it concerns.
+        let err = BridgeError::Iggy(IggyError::RequestAlreadyApplied);
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
+    #[test]
+    fn invalid_partition_count_maps_to_invalid_partitions() {
+        let err = BridgeError::InvalidPartitionCount {
+            kafka_topic: "orders".to_string(),
+        };
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PARTITIONS);
     }
 
@@ -347,11 +413,6 @@ mod tests {
         assert_eq!(err.to_kafka_error_code(), ERROR_TOPIC_ALREADY_EXISTS);
     }
 
-    /// Every `ERROR_*` constant this module sends, checked against `kafka-protocol`'s own
-    /// `ResponseError` table - the crate's canonical copy of Kafka's real wire numbers, not this
-    /// module's own. Every other test above pins routing (which `IggyError` maps to which
-    /// constant); without this, a wrong constant value would still pass all of them, since they
-    /// only ever compare against the same constants the function returns.
     #[test]
     fn every_sent_error_code_matches_kafka_protocols_own_table() {
         use kafka_protocol::error::ResponseError;
@@ -383,13 +444,29 @@ mod tests {
                 ResponseError::TopicAlreadyExists,
             ),
             (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
+            (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
         ] {
-            assert_eq!(
-                ours,
-                theirs.code(),
-                "{theirs:?} is {} in kafka-protocol, not {ours}",
-                theirs.code()
-            );
+            assert_eq!(ours, theirs.code());
         }
+    }
+
+    #[test]
+    fn send_lost_maps_to_request_timed_out() {
+        // The SDK does not replay a send after a lost connection, so it may have landed.
+        let err = BridgeError::SendLost(IggyError::Disconnected);
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn rejected_bridge_login_is_told_apart_from_a_missing_permission() {
+        for rejected in [
+            IggyError::InvalidCredentials,
+            IggyError::InvalidUsername,
+            IggyError::InvalidPassword,
+        ] {
+            assert!(BridgeError::Iggy(rejected).is_bridge_login_rejected());
+        }
+        assert!(!BridgeError::Iggy(IggyError::Unauthorized).is_bridge_login_rejected());
+        assert!(!BridgeError::Timeout.is_bridge_login_rejected());
     }
 }

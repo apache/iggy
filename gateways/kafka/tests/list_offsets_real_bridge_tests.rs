@@ -172,6 +172,7 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
+        false,
     );
     (state, seed_bridge)
 }

@@ -1,14 +1,26 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it. Everything else is a stub.
 
-> **Stub warning:** most APIs still don't persist or read real data. Produce and Fetch return
+> **Stub warning:** Produce and Fetch still don't persist or read real data - they return
 > retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. CreateTopics does **not** create topics; valid requests return
-> `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. ListOffsets is wired
-> to the Iggy bridge: with `IGGY_KAFKA_BRIDGE_ENABLED=true` it answers `EARLIEST`/`LATEST` from
-> real partition state; with the bridge off (the default) it stays a stub and answers
-> `NOT_LEADER_OR_FOLLOWER` (6). See [docs/SCOPE.md](docs/SCOPE.md).
+> trusting a fake success. CreateTopics, Metadata, and ListOffsets are wired to the Iggy bridge:
+> with `IGGY_KAFKA_BRIDGE_ENABLED=true`, CreateTopics creates a real Iggy stream/topic, Metadata
+> reports real topics and partition counts (a topic not requested by name and not found is
+> silently absent from a null-topics "list all" response, and `UNKNOWN_TOPIC_OR_PARTITION` when
+> named explicitly), and ListOffsets answers `EARLIEST`/`LATEST` from real partition state; with
+> the bridge off (the default), all three stay stubs - CreateTopics answers `NOT_CONTROLLER` (41),
+> Metadata reports every requested topic unknown, and ListOffsets answers `NOT_LEADER_OR_FOLLOWER`
+> (6). **CreateTopics has no authentication gate yet**: with the bridge on, any client that can
+> reach this port can create topics (up to 1000 partitions each) as the bridge's own Iggy user,
+> until SASL ([#3549](https://github.com/apache/iggy/issues/3549)) lands. See
+> **Stub warning:** When you set `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy and
+> ListOffsets answers `EARLIEST`/`LATEST` from real partition state. No other API stores or reads
+> real data. Produce and ListOffsets without a bridge, and Fetch with or without one, answer
+> retriable `NOT_LEADER_OR_FOLLOWER` (6). Clients then keep their data and do not trust a fake
+> success. CreateTopics answers `NOT_CONTROLLER` (41) and creates nothing. Metadata reports every
+> topic as unknown, so a real client cannot reach Produce or ListOffsets yet. See
+> [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
@@ -30,6 +42,9 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
+| `IGGY_KAFKA_SASL_ENABLED` | `false` | Require SASL/PLAIN authentication before serving any other API (`true` or `false`, nothing else) |
+| `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
+| `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
 
 ## Test
 
@@ -70,27 +85,127 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
+- [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 
 ### Delivery guarantees
 
 Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
-restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
-a producer id so that it starts, but its retries are not deduplicated: a retry after a network
-timeout writes the record twice, and both copies reach the stream with their own offsets.
+restart. Transactions are not supported, and will not be. A retry after a timeout can write a
+record twice.
+
+Java producers must set `enable.idempotence=false` until the gateway serves `InitProducerId`
+([#3545](https://github.com/apache/iggy/issues/3545)). Produce already stores idempotent batches.
+It ignores their producer id, epoch and sequence, so it does not deduplicate a retry.
 
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
 [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+
+## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
+
+Off by default. With `IGGY_KAFKA_SASL_ENABLED=true` the gateway requires SASL/PLAIN before it serves
+any other API, and it verifies the credentials by logging into Iggy with them.
+
+The username and password a Kafka client sends are an **Iggy** username and password. There is no
+mapping table and no credential store in the gateway: create an Iggy user for each Kafka principal
+and point the client at it. Credentials are verified against `IGGY_KAFKA_IGGY_ADDR`.
+
+```bash
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 cargo run -p iggy-gateway-kafka
+```
+
+Transport security to Iggy is configured separately from the Kafka side, because the two protect
+different hops. These variables cover only the connection the credential check makes, and are
+refused while SASL is off. The bridge's own client connects without TLS at any setting, and that
+connection carries `IGGY_KAFKA_IGGY_PASSWORD` in the clear:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IGGY_KAFKA_IGGY_TLS_ENABLED` | `false` | Encrypt the credential check's connection to Iggy (`true` or `false`, nothing else). The bridge connection is not covered. Required if the Iggy server only accepts TLS, otherwise every verification fails as unreachable |
+| `IGGY_KAFKA_IGGY_TLS_DOMAIN` | derived from the address | Name checked against the Iggy server certificate |
+| `IGGY_KAFKA_IGGY_TLS_CA_FILE` | SDK bundled roots | PEM roots to trust. Note the SDK does not use the system trust store |
+
+Client side, for example with `kcat`:
+
+```bash
+kcat -b 127.0.0.1:9093 -X security.protocol=SASL_PLAINTEXT -X sasl.mechanisms=PLAIN \
+     -X sasl.username=alice -X sasl.password=s3cret -L
+```
+
+Four things to know before switching it on:
+
+- **PLAIN sends the password in the clear**, on the Kafka hop and on the Iggy hop. The gateway
+  listener has no TLS yet, so this is only safe on a trusted network until that lands. SCRAM cannot
+  be offered at all, because Iggy stores one Argon2 hash per user and SCRAM needs PBKDF2-derived
+  keys that cannot come from it.
+- **Enabling it breaks every existing client at once.** The two SASL keys appear in the
+  `ApiVersions` advertisement only while it is on, and unauthenticated clients are refused.
+- **Every connection costs a login**, meaning one password hash on an Iggy shard thread and one
+  replicated registration. Verification is deliberately not cached, since caching it per username
+  would let a second connection present any password. Connection churn is therefore server load.
+  `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
+  whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
+- **Authentication only, for now.** The gateway verifies the credentials and then drops the
+  session, because no handler consumes one yet. Iggy's permissions will decide what a principal can
+  do once Produce and Fetch are wired to it
+  ([#3535](https://github.com/apache/iggy/issues/3535),
+  [#3536](https://github.com/apache/iggy/issues/3536)); until then this is an admission gate, not
+  an identity carried onto the data plane. Do not read it as per-topic authorization yet.
+
+Full reasoning, including what was rejected and why, is in
+[docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
 
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
 streams/topics, provisions them on demand, and looks up high watermarks (one or many partitions of
 a topic per call) for `ListOffsets`.
-**Not wired into the live Produce/Fetch dispatch path yet** - that lands with
-[#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
-Exercised today by `bridge`'s own unit tests and `tests/bridge_iggy_integration_tests.rs` (spawns a
-real `iggy-server`).
+ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) and Produce
+([#3535](https://github.com/apache/iggy/issues/3535), see below) call it. Fetch does not call it
+yet ([#3536](https://github.com/apache/iggy/issues/3536)).
+Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs`,
+`tests/list_offsets_real_bridge_tests.rs` and `tests/produce_real_bridge_tests.rs`. The last three
+start a real `iggy-server`.
+
+### Produce ([#3535](https://github.com/apache/iggy/issues/3535))
+
+One partition, one Iggy send. Each partition answers for itself.
+
+| Field | Gateway |
+| ----- | ------- |
+| Partition | Index as sent. Both count from 0. |
+| Base offset | From the send confirmation. `-1` if none. |
+| `log_start_offset` | Always `-1`. |
+| `acks` | `0`, `1`, `-1` write the same. Other values: 21, before any per-partition check. |
+| `acks=0` | Writes, answers nothing. Any failed partition closes the connection. |
+| Topics | Creates none. Missing: 3. Bad name: 17. |
+| `timeout_ms` | Honored, max 20 s. Past it: 7. |
+| Compression | gzip, snappy, lz4. zstd from v7, else 76. |
+| Producer id, epoch, sequence | Ignored, so a retry writes twice. |
+| Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |
+| Several batches in one partition | 87, as Kafka. |
+| Bytes after the batch | 87. |
+| More records than the batch declares | 87, as Kafka. |
+| Same partition twice in one request | Written twice. Kafka keeps the last. |
+| Repeated header name in a record | 87. |
+| Produce v0-2, `acks=0` | Closes the connection. |
+| Undecodable request | Closes the connection. |
+
+| Code | When | Client |
+| ---- | ---- | ------ |
+| 10 | Record, send or partition too large, even alone | Java splits multi-record batches. Else fails. |
+| 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
+| 35 | Transactional or control batch | Fails. |
+| 6 | Request budget ran out. Nothing written. | Retries. |
+| 7 | Deadline passed, or connection lost mid-send. May be written. | Retries. Can duplicate. |
+
+Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
+per slot. Past it: 10.
+
+Request budget: 8 partition caps, refused partitions included. Past it: 6 for the rest, not
+decoded. 4 requests decode at once.
+
+[docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 
 ### Connection config
 
@@ -101,6 +216,7 @@ real `iggy-server`).
 | `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only); otherwise it generates a random password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
 | `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
+| `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE` | `64MiB` | Iggy's `message_bus.max_message_size`. Set both together. Larger partitions answer 10 |
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
@@ -112,16 +228,11 @@ reconnects internally, mid-call, on a transport error, through the same undead-l
 bridge call made well after the initial connect can still hit this if Iggy becomes unreachable
 later.
 
-This timeout only bounds the *caller's* wait, not the SDK's own work: the SDK writes and reads on
-a detached background task specifically so that dropping the awaiting future - what this timeout
-does on expiry - cannot abort it mid-flight. A timed-out call can leave that task holding the
-shared client's connection lock for up to another 30s (the SDK's own reply deadline), queuing
-every other bridge call behind it. `IggyBridge` holds one `IggyClient` with no pooling (see
-Concurrency ceiling below) and no semaphore bounding concurrent bridge calls - no longer a
-hypothetical now that ListOffsets (`#3537`) calls it from a real handler; more pressing once
-CreateTopics (`#3538`), Metadata (`#3534`), Produce (`#3535`) and Fetch (`#3536`) add their own
-concurrent callers. See `IggyBridge`'s own doc comment (its rustdoc is private, so this isn't a
-followable link outside the crate - read the source at `src/bridge/iggy_bridge.rs`).
+`send_records` uses the Produce deadline instead:
+
+- One send runs in the SDK at a time.
+- A send past its deadline keeps that slot until it ends, up to 45 s. Other sends answer 7 meanwhile.
+- ListOffsets needs no slot, but it waits behind a stuck send in the SDK. Past `REQUEST_TIMEOUT` it answers 7.
 
 ### Topic mapping
 
@@ -176,27 +287,26 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-One `IggyBridge` (one `IggyClient`) is meant to serve every Kafka connection this gateway handles,
-and the Iggy SDK's TCP transport is lockstep - one request in flight per client, its stream mutex
-held across write, flush, and read. Every concurrent Kafka connection ends up serialized behind
-whichever single Iggy request is in flight; the Kafka side's own connection limit
-(`IGGY_KAFKA_MAX_CONNECTIONS`) does nothing to relieve this. No connection pooling exists yet - it
-is a known gap to address before `#3535`/`#3536` put this on a hot path, not a design decision to
-rely on.
+- One `IggyClient` serves every Kafka connection, one Iggy request at a time.
+- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A client pool is a TODO in
+  [docs/SCOPE.md](docs/SCOPE.md).
+- Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
+  can land after later ones.
 
 ### Error mapping
 
 `BridgeError::to_kafka_error_code()` maps Iggy failures to Kafka wire error codes:
 
-- Stream/topic/partition not found → `UNKNOWN_TOPIC_OR_PARTITION` (3)
+- Stream, topic or partition not found → `UNKNOWN_TOPIC_OR_PARTITION` (3). This includes the
+  generic `ResourceNotFound` that a partition request returns when the server cannot resolve it
 - A rejected *permission* (`Unauthorized`) → `TOPIC_AUTHORIZATION_FAILED` (29) - a real,
   fixable-by-the-Kafka-operator ACL problem
 - A rejected *login* (the bridge's own `IGGY_KAFKA_IGGY_USERNAME`/`_PASSWORD` are wrong) →
   `UNKNOWN_SERVER_ERROR` (-1), deliberately **not** 29 - the Kafka client can't fix a bridge-side
   credential misconfiguration, and blaming its own ACLs for one is worse than an unexplained
   fatal error
-- Connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6, the same retriable code the
-  foundation's own stubs send, so a client backs off and retries)
+- Connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6). On a send, `Disconnected`,
+  `EmptyResponse`, `TcpError` and `StaleClient` → 7 instead: the write may have landed
 - An Iggy commit whose outcome is genuinely unknown (`TransientNotCommitted`) →
   `REQUEST_TIMED_OUT` (7) - retriable in real Kafka too, chosen because it's what a real broker
   sends for the same shape of failure, not to make a client stop retrying

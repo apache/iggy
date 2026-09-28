@@ -16,6 +16,7 @@ ingests from / egresses to external systems via dlopened plugins.
 - [Apache Iggy Agent Guidelines](#apache-iggy-agent-guidelines)
   - [Contents](#contents)
   - [STOP and ask the user before](#stop-and-ask-the-user-before)
+  - [Helping someone contribute](#helping-someone-contribute)
   - [Quick reference](#quick-reference)
   - [Structure](#structure)
   - [Where to look](#where-to-look)
@@ -41,6 +42,16 @@ ingests from / egresses to external systems via dlopened plugins.
   any other operator-facing identifier.
 - Force-pushing to `master`, amending shipped commits, or skipping
   hooks with `--no-verify` / `--no-gpg-sign`.
+
+## Helping someone contribute
+
+Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance and Close Policy sections of CONTRIBUTING.md before helping open a PR.
+
+- The PR must link an issue the user is assigned to. If it doesn't, stop and tell them.
+- Run `prek run` before the PR is opened. If prek isn't installed, ask the user to install it (`cargo install prek`, then `prek install`). Don't substitute the individual checks.
+- If a check can't run, tell the user which one and why, and treat the PR as not ready. Never write text in a PR asking a maintainer to run something.
+- The user should write the rationale in their own words and be able to explain every change without asking you.
+- New contributors keep one open PR at a time.
 
 ## Quick reference
 
@@ -147,7 +158,7 @@ non-trivial change passes verification, suggest `/team-review <target>`.
 6. **Imports at the top.** No inline `use` inside functions or blocks. Group: std, external crates, then `crate::`.
 7. **Precise names.** No `b`, `p`, `t`, `m`. Match literal API field names as log labels.
 8. **Comments explain WHY, not WHAT.** Default to no comment. Add one only when a hidden constraint or workaround would surprise a future reader. Never reference the current task / PR.
-9. **Never `cargo install`** without authorization. Toolchain pinned in `rust-toolchain.toml`. CI installs additional cargo tools on demand.
+9. **Never `cargo install`** without authorization. Toolchain pinned in `rust-toolchain.toml`. CI installs additional cargo tools on demand. If a required tool such as prek is missing, ask the user to install it rather than skipping the check.
 10. **No `unwrap()` / `expect()` on Results from external I/O** outside tests.
 11. **`tokio::sync::Mutex` (not `std::sync::Mutex`)** wherever a lock is held across `.await`. Hold locks briefly: lock, clone, drop guard, then do I/O.
 12. **Code reads top to bottom.** Public consts and public fns first, helpers below, deeper helpers below those.
