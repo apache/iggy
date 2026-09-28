@@ -23,9 +23,6 @@ use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use server_common::log::LoggingSettings;
 
-pub const INDEX_EXTENSION: &str = "index";
-pub const LOG_EXTENSION: &str = "log";
-
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct RuntimeConfig {
     pub path: String,

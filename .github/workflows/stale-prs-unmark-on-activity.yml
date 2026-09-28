@@ -29,8 +29,11 @@
 # Push-driven unmark stays in stale-prs-unmark.yml because
 # pull_request_target.synchronize gets a write token directly.
 #
-# SECURITY: no actions/checkout, no exec of PR contents. The artifact
-# contents come from the runner-written event_path, not from PR code.
+# SECURITY: no actions/checkout, no exec of PR contents. The artifact is
+# not trusted for identity: on the pull_request_review path collect runs the
+# PR head's own copy, so a fork can forge the payload. Only a numeric id is
+# read from it, the PR number is resolved from the API, and the commit the
+# collect run fired on must belong to that PR.
 
 name: Unmark Stale PRs on Activity
 
@@ -66,13 +69,24 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: payload/
 
-      - name: Extract PR number
+      - name: Resolve PR number from the API
+        id: resolve
+        env:
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # The artifact contains exactly one file: the JSON event payload
-          # uploaded as ${{ github.event_path }}. Its on-disk name is
-          # whatever the runner used; resolve it dynamically.
+          # collect runs the PR head's own copy on the pull_request_review
+          # path, so a fork can upload any payload. Take only a numeric id from
+          # the artifact and resolve the PR number from the API, so a forged
+          # value can neither reach a process env var nor point this at another
+          # PR. UPSTREAM_EVENT is set by GitHub from the collect run, not from
+          # the artifact, and issue_comment workflows only run from the default
+          # branch, so a fork's run always arrives as pull_request_review and
+          # takes the checked path.
           payload=( payload/*.json payload/event.json )
           f=""
           for candidate in "${payload[@]}"; do
@@ -83,17 +97,78 @@ jobs:
             ls -la payload/ >&2 || true
             exit 1
           fi
-          pr=$(jq -r '.pull_request.number // .issue.number // ""' "$f")
-          if [[ -z "$pr" ]]; then
-            echo "no PR number in payload" >&2
-            exit 1
-          fi
-          echo "PR_NUMBER=$pr" >> "$GITHUB_ENV"
+          require_num() {
+            case "$1" in
+              ''|*[!0-9]*) echo "non-numeric ${2}: '${1}'" >&2; exit 1 ;;
+            esac
+          }
+          # Retry 5xx, 429 and network failures, as withRetry does for the
+          # script path. Anything else fails at once with gh's own message;
+          # a 404 returns 44 so a caller can tell it apart.
+          gh_api() {
+            local err out code="" delay
+            err="$(mktemp)"
+            for delay in 0.5 1.5 4 ""; do
+              if out="$(gh api "$@" 2>"$err")"; then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              code="$(grep -oE 'HTTP [0-9]{3}' "$err" | tail -n1 | cut -d' ' -f2 || true)"
+              case "$code" in
+                ''|429|5??) ;;
+                *) break ;;
+              esac
+              [[ -n "$delay" ]] || break
+              echo "gh api $1: transient failure (${code:-network}), retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+            cat "$err" >&2
+            rm -f "$err"
+            if [[ "$code" == 404 ]]; then return 44; fi
+            return 1
+          }
+          case "$UPSTREAM_EVENT" in
+            issue_comment)
+              cid="$(jq -r '.comment.id // ""' "$f")"
+              require_num "$cid" comment_id
+              pr="$(gh_api "repos/${REPO}/issues/comments/${cid}" \
+                --jq '.issue_url' | grep -oE '[0-9]+$' || true)"
+              ;;
+            pull_request_review)
+              rid="$(jq -r '.review.id // ""' "$f")"
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              require_num "$rid" review_id
+              require_num "$cpr" pr_number
+              # A review id that does not belong to the claimed PR 404s here.
+              gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}" >/dev/null
+              # HEAD_SHA is set by GitHub, not the fork. A forged run fires on
+              # the fork's own commit, which is in no other PR's commit list,
+              # so a real review cannot be replayed onto another PR. The
+              # review's commit_id is not compared: GitHub moves it when the
+              # branch is updated.
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
+                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
+                exit 1
+              fi
+              pr="$cpr"
+              ;;
+            *)
+              echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
+              exit 1
+              ;;
+          esac
+          require_num "$pr" resolved_pr
+          # A step output, not $GITHUB_ENV: it is read only through a
+          # steps.*.outputs.* expression and never becomes a process env var in
+          # the next step, so a value cannot smuggle in an env var like BASH_ENV.
+          echo "pr_number=$pr" >> "$GITHUB_OUTPUT"
 
       - name: Remove stale label if present
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
           REPO: ${{ github.repository }}
         # Pre-check via REST so we only invoke the GraphQL edit when the
         # label is actually on the PR. Saves an API write on every drive-by
