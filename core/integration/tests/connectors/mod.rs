@@ -24,7 +24,7 @@ mod fixtures;
 mod http;
 mod http_config_provider;
 mod iceberg;
-mod iggy_source;
+mod iggy;
 mod influxdb;
 mod meilisearch;
 mod mongodb;

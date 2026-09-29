@@ -20,6 +20,7 @@ use iggy::prelude::{
     Client, CompressionAlgorithm, Consumer, Identifier, IggyClient, IggyError, IggyMessage,
     MessageClient, PollingStrategy, StreamClient, TopicClient, TopicCreateOptions,
 };
+use iggy_common::Durability;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     retry::{parse_duration, retry_backoff},
@@ -189,19 +190,17 @@ impl IggySource {
             DEFAULT_MAX_RETRY_INTERVAL,
         );
 
-        let initial_offset = config
-            .initial_offset
-            .as_deref()
-            .map(InitialOffset::from_str)
-            .and_then(Result::ok)
-            .unwrap_or_else(|| {
+        let initial_offset = match config.initial_offset.as_deref() {
+            None => InitialOffset::Earliest,
+            Some(value) => value.parse().unwrap_or_else(|_| {
                 warn!(
                     "Invalid initial offset {:?} for {CONNECTOR_NAME} connector ID: {id}, \
                      defaulting to earliest",
-                    config.initial_offset
+                    value
                 );
                 InitialOffset::Earliest
-            });
+            }),
+        };
 
         let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
         let include_user_headers = config.include_user_headers.unwrap_or(true);
@@ -285,6 +284,8 @@ impl IggySource {
                         &TopicCreateOptions {
                             partitions_count: Some(AUTO_CREATED_PARTITIONS_COUNT),
                             compression_algorithm: Some(CompressionAlgorithm::None),
+                            durability: Durability::Persisted,
+                            messages_required_to_save: Some(1),
                             ..TopicCreateOptions::default()
                         },
                     )
@@ -684,7 +685,7 @@ fn redact_connection_string(connection_string: &str) -> String {
     let Some(rest) = connection_string.get(scheme_end + 3..) else {
         return "***".to_string();
     };
-    let Some(at_offset) = rest.find('@') else {
+    let Some(at_offset) = rest.rfind('@') else {
         return "***".to_string();
     };
     let userinfo_end = scheme_end + 3 + at_offset;
@@ -1191,6 +1192,11 @@ mod tests {
         let token_redacted = redact_connection_string("iggy+tcp://iggypat-abc123@127.0.0.1:8090");
         assert_eq!(token_redacted, "iggy+tcp://***@127.0.0.1:8090");
         assert!(!token_redacted.contains("abc123"));
+
+        let password_with_at =
+            redact_connection_string("iggy+tcp://iggy:secret@fragment@127.0.0.1:8090");
+        assert_eq!(password_with_at, "iggy+tcp://iggy:***@127.0.0.1:8090");
+        assert!(!password_with_at.contains("fragment"));
 
         assert_eq!(redact_connection_string("not-a-url"), "***");
     }

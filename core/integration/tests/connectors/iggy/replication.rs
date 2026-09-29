@@ -22,8 +22,8 @@ use iggy::prelude::{
     Partitioning, TopicCreateOptions,
 };
 use iggy_common::{
-    Consumer, Identifier, MessageClient, PartitionClient, PollingStrategy, StreamClient,
-    TopicClient,
+    Consumer, Durability, Identifier, MessageClient, PartitionClient, PollingStrategy,
+    StreamClient, TopicClient, TopicRuntimeOptions,
 };
 use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use integration::harness::{
@@ -429,7 +429,7 @@ async fn restart_with_upstream_partition_count(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn iggy_source_replicates_messages_with_headers(
@@ -438,6 +438,18 @@ async fn iggy_source_replicates_messages_with_headers(
 ) {
     let upstream_client = fixture.client().await.expect("upstream client");
     fixture.ensure_upstream_topic(&upstream_client).await;
+
+    let topic = upstream_client
+        .get_topic(
+            &Identifier::named(UPSTREAM_STREAM).expect("valid stream name"),
+            &Identifier::named(UPSTREAM_TOPIC).expect("valid topic name"),
+        )
+        .await
+        .expect("upstream topic request")
+        .expect("upstream topic");
+    let options = TopicRuntimeOptions::from_resource_options(&topic.options);
+    assert_eq!(options.durability, Durability::Persisted);
+    assert_eq!(options.messages_required_to_save, Some(1));
 
     let payloads: Vec<String> = (0..TEST_MESSAGE_COUNT)
         .map(|i| format!("upstream-message-{i}"))
@@ -465,7 +477,7 @@ async fn iggy_source_replicates_messages_with_headers(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn block_policy_commits_prefix_and_drop_headers_resumes_partition(
@@ -561,7 +573,7 @@ async fn block_policy_commits_prefix_and_drop_headers_resumes_partition(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn malformed_user_headers_do_not_back_off_healthy_partitions(
@@ -622,7 +634,7 @@ async fn malformed_user_headers_do_not_back_off_healthy_partitions(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn non_recoverable_poll_error_does_not_skip_remaining_partitions(
@@ -665,7 +677,7 @@ async fn non_recoverable_poll_error_does_not_skip_remaining_partitions(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn multiple_upstream_partitions_resume_from_independent_offsets(
@@ -770,7 +782,7 @@ async fn multiple_upstream_partitions_resume_from_independent_offsets(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn downstream_outage_replays_nacked_batch_after_recovery(
@@ -843,7 +855,7 @@ async fn downstream_outage_replays_nacked_batch_after_recovery(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn state_persists_across_connector_restart(
@@ -920,7 +932,7 @@ async fn state_persists_across_connector_restart(
 
 #[iggy_harness(
     cluster_nodes = 1,
-    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/iggy/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn recreated_upstream_topic_replicates_from_initial_offset(

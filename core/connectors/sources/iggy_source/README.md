@@ -114,11 +114,11 @@ messages.
 
 ## Operational Notes
 
-- The connector discovers upstream partitions when it opens. Restart it after
-  adding partitions to the upstream topic.
+- The connector discovers new upstream partitions automatically on each poll cycle.
 - A `batch_size` outside `1..=10,000` prevents the connector from starting.
 - If the upstream stream is missing, the connector creates it. If the topic is
-  missing, it creates the topic with one partition and no compression.
+  missing, it creates the topic with one partition, no compression, persisted
+  durability, and a one-message save threshold.
 - Invalid `initial_offset` values produce a warning and fall back to
   `earliest`.
 - If user headers cannot be decoded, `malformed_message_policy = "block"`
