@@ -1,26 +1,20 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it. Everything else is a stub.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions. With a bridge, CreateTopics, Metadata, Produce, and ListOffsets all do real work against Iggy. Fetch is still a stub.
 
-> **Stub warning:** Produce and Fetch still don't persist or read real data - they return
-> retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. CreateTopics, Metadata, and ListOffsets are wired to the Iggy bridge:
-> with `IGGY_KAFKA_BRIDGE_ENABLED=true`, CreateTopics creates a real Iggy stream/topic, Metadata
-> reports real topics and partition counts (a topic not requested by name and not found is
-> silently absent from a null-topics "list all" response, and `UNKNOWN_TOPIC_OR_PARTITION` when
-> named explicitly), and ListOffsets answers `EARLIEST`/`LATEST` from real partition state; with
-> the bridge off (the default), all three stay stubs - CreateTopics answers `NOT_CONTROLLER` (41),
-> Metadata reports every requested topic unknown, and ListOffsets answers `NOT_LEADER_OR_FOLLOWER`
-> (6). **CreateTopics has no authentication gate yet**: with the bridge on, any client that can
-> reach this port can create topics (up to 1000 partitions each) as the bridge's own Iggy user,
-> until SASL ([#3549](https://github.com/apache/iggy/issues/3549)) lands. See
-> **Stub warning:** When you set `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy and
-> ListOffsets answers `EARLIEST`/`LATEST` from real partition state. No other API stores or reads
-> real data. Produce and ListOffsets without a bridge, and Fetch with or without one, answer
-> retriable `NOT_LEADER_OR_FOLLOWER` (6). Clients then keep their data and do not trust a fake
-> success. CreateTopics answers `NOT_CONTROLLER` (41) and creates nothing. Metadata reports every
-> topic as unknown, so a real client cannot reach Produce or ListOffsets yet. See
-> [docs/SCOPE.md](docs/SCOPE.md).
+> **Stub warning:** Fetch still doesn't read real data - it returns retriable
+> `NOT_LEADER_OR_FOLLOWER` (6) with or without a bridge, so clients keep retrying instead of
+> trusting an empty read. Everything else is wired to the Iggy bridge: with
+> `IGGY_KAFKA_BRIDGE_ENABLED=true`, CreateTopics creates a real Iggy stream/topic, Metadata reports
+> real topics and partition counts (a topic not requested by name and not found is silently absent
+> from a null-topics "list all" response, and `UNKNOWN_TOPIC_OR_PARTITION` when named explicitly),
+> Produce writes decoded records to Iggy and answers with real offsets, and ListOffsets answers
+> `EARLIEST`/`LATEST` from real partition state; with the bridge off (the default), all four stay
+> stubs - CreateTopics answers `NOT_CONTROLLER` (41), Metadata reports every requested topic
+> unknown, Produce and ListOffsets answer `NOT_LEADER_OR_FOLLOWER` (6). **CreateTopics has no
+> authentication gate yet**: with the bridge on, any client that can reach this port can create
+> topics (up to 1000 partitions each) as the bridge's own Iggy user, until SASL
+> ([#3549](https://github.com/apache/iggy/issues/3549)) lands. See [docs/SCOPE.md](docs/SCOPE.md).
 
 ## Run
 
@@ -45,6 +39,82 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Require SASL/PLAIN authentication before serving any other API (`true` or `false`, nothing else) |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
+
+## Quick start (Docker Compose)
+
+The fastest way to see a Kafka client talk to Iggy: two containers, no local Rust toolchain.
+
+```text
+                    Kafka wire (TCP 9093)              Iggy wire (TCP 8090)
+  kcat / librdkafka  ─────────────────────▶  gateway  ─────────────────────▶  iggy-server
+  (your Kafka client)                    iggy-gateway-kafka                  (real broker)
+```
+
+```bash
+cd gateways/kafka
+docker compose up --build
+```
+
+First run compiles two release binaries from scratch under the workspace's `lto = true,
+codegen-units = 1` profile (no build cache mount) - budget several minutes for `--build` alone
+the first time; subsequent runs without a source change reuse Docker's image cache.
+
+This starts `iggy-server` (the real Iggy broker) and `iggy-gateway-kafka` (bridge enabled,
+pointed at that server) on a shared Docker network, with the gateway waiting for the server's
+health check before it starts. From another terminal:
+
+```bash
+# Broker discovery works with just kcat - it has no create-topic mode of its own, though.
+kcat -b 127.0.0.1:9093 -L
+```
+
+A full create-topic-then-produce flow needs a client that can send `CreateTopics` (there is no
+auto-create on Produce). With Python's `kafka-python`:
+
+```python
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka import KafkaProducer
+
+admin = KafkaAdminClient(bootstrap_servers="127.0.0.1:9093")
+admin.create_topics([NewTopic(name="orders", num_partitions=1, replication_factor=1)])
+
+producer = KafkaProducer(bootstrap_servers="127.0.0.1:9093")
+producer.send("orders", b"hello from kafka-python").get(timeout=5)
+```
+
+Fetch is unimplemented (see the stub warning above), so read the record back through Iggy
+directly rather than a Kafka consumer:
+
+```bash
+cargo run -p iggy-cli -- --username iggy --password iggy-gateway-quickstart \
+  message poll kafka orders 0 --offset 0 --message-count 1
+```
+
+**Ports**: gateway `9093` (Kafka wire, the one a client dials), Iggy `8090` (TCP, `iggy` CLI/SDK),
+`3000`/`8080`/`8092` (Iggy HTTP/QUIC/WebSocket, unused by the gateway itself but published for
+direct Iggy inspection).
+
+**Config**: the compose file sets fixed dev-only root credentials (`IGGY_ROOT_PASSWORD`) so the
+gateway's `IGGY_KAFKA_IGGY_PASSWORD` is known ahead of time - never reuse them outside a local
+stack. See `gateways/kafka/docker-compose.yml` and the environment variable tables below for
+every other knob.
+
+**Limitations** (see the stub warning above for the full list): Fetch is unimplemented, so no
+Kafka consumer can read back through the gateway - poll Iggy directly with the `iggy` CLI or SDK
+instead. Single gateway, single Iggy node: no partition rebalancing, no consumer groups, no SASL
+by default. This is a development quick start, not a production deployment shape. Neither this
+quick start nor `phase1_e2e_tests.rs` exercises crash/restart durability (stopping and
+restarting `iggy-server` against its existing volume, then re-reading) - both only prove a
+produced record is readable from the still-live process that wrote it.
+
+**Success criteria** (tracked for [#3539](https://github.com/apache/iggy/issues/3539)): a new
+contributor should reach a successful produce (and an Iggy-side read-back confirming it landed)
+within 15 minutes of `git clone`, and every Phase 1 API key (CreateTopics, Metadata, Produce,
+ListOffsets) has an automated test exercising the real compiled binaries end to end -
+`tests/phase1_e2e_tests.rs` is that test, spawning real `iggy-server` and `iggy-gateway-kafka`
+processes (not `KafkaGateway::run` in-process, as every other suite in this crate does) and
+driving CreateTopics → Metadata → Produce → ListOffsets over real TCP, then reading the produced
+records back through the Iggy SDK.
 
 ## Test
 

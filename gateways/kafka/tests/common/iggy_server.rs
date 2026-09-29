@@ -352,7 +352,7 @@ impl TestServer {
 const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGKILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-fn graceful_kill(child: &mut Child) {
+pub fn graceful_kill(child: &mut Child) {
     // `wait_ready` calls `try_wait()` too (and panics on an early exit, unwinding into this via
     // `Drop`) - if it already reaped the child, `child.id()` is a PID the OS is free to hand to an
     // unrelated process by the time we get here, and a raw `libc::kill` (unlike `std::Child::kill`,

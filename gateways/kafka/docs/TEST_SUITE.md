@@ -36,6 +36,17 @@ in the same target directory; neither harness invokes `cargo build` itself). Ski
 fails with a clear "binary not found" message naming the build command to run, not a hang or a
 silent skip.
 
+### `iggy-gateway-kafka` binary (required for `phase1_e2e_tests`)
+
+Same pattern as `iggy-server` above, and both binaries are needed together - this suite spawns
+the compiled gateway itself, bridged to a spawned `iggy-server`:
+
+```bash
+cargo build --package server --bin iggy-server
+cargo build --package iggy-gateway-kafka --bin iggy-gateway-kafka
+cargo test -p iggy-gateway-kafka
+```
+
 ---
 
 ## Test files
@@ -66,9 +77,10 @@ file under `tests/` anymore.
 | [`sasl_tests.rs`](../tests/sasl_tests.rs) | SASL/PLAIN over a socket — full handshake, every refusal path, and the disabled default. Drives a stub verifier implementing `SaslAuthenticator`, so no Iggy server is needed | No |
 | [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
 | [`produce_real_bridge_tests.rs`](../tests/produce_real_bridge_tests.rs) | Produce (key 0) through the whole handler against a real, spawned `iggy-server` — records go in as Kafka wire bytes and come back through the Iggy SDK, plus one error code per partition | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary bridged to a real spawned `iggy-server` - the only suite that spawns the gateway as a process rather than calling `KafkaGateway::run` in-process | No (needs both binaries - see Prerequisites) |
 
-`tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `scope.rs`, `server.rs`,
-`iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
+`tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `gateway_process.rs`, `scope.rs`,
+`server.rs`, `iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
 is test-only primitive encode/decode scaffolding for hand-building legacy/adversarial wire shapes
 `kafka_protocol`'s spec-correct encoder cannot produce - it is not the gateway's production codec.
 

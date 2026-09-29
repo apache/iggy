@@ -238,7 +238,7 @@ for CreateTopics, and so on).
 
 ### Category G — Real Kafka client (kcat)
 
-Requires `kcat` installed. Gateway does **not** implement SASL or full broker semantics — expect limited success.
+Requires `kcat` installed. Gateway does **not** implement SASL or full broker semantics — expect limited success. This category predates the bridge landing: G2/G3's "fails at metadata" framing assumes an unbridged gateway, and no longer holds with `IGGY_KAFKA_BRIDGE_ENABLED=true` against a topic that was actually created first. See Category I for the bridged, docker-compose flow.
 
 | ID | Test | Command | Expected (foundation) |
 | ---- | ------ | --------- | --------------------- |
@@ -255,6 +255,29 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | H1 | Truncated Produce body | Send valid header + incomplete body | No response. Connection closed. **No panic** |
 | H2 | Random bytes | `dd if=/dev/urandom bs=64 count=1 \| nc 127.0.0.1 9093` | Connection closed or protocol error; gateway stays up |
 | H3 | Empty body after header | ApiVersions with valid header, empty body | `ec=0` (ApiVersions accepts empty body) |
+
+### Category I — Docker Compose quick start ([#3539](https://github.com/apache/iggy/issues/3539))
+
+Exercises the real compiled binaries the way an operator actually runs them - not `cargo run`
+against a locally-built binary, and not `KafkaGateway::run` in-process the way every automated
+suite except `tests/phase1_e2e_tests.rs` does.
+
+| ID | Test | Steps | Expected |
+| ---- | ------ | ------- | ---------- |
+| I1 | Stack comes up | `cd gateways/kafka && docker compose up --build` | Both containers start; gateway does not exit (it would if the bridge connect failed before the server's health check passed) |
+| I2 | Broker discovery | `kcat -b 127.0.0.1:9093 -L` | Broker listed, reachable |
+| I3 | Create + produce | Run the `kafka-python` snippet from README.md's Quick start | `create_topics` and `send(...).get()` both return without raising |
+| I4 | Read-back via Iggy | `cargo run -p iggy-cli -- --username iggy --password iggy-gateway-quickstart message poll kafka orders 0 --offset 0` | The produced record's payload is printed |
+| I5 | Crash/restart durability | `docker compose restart iggy-server`, wait for its health check to go healthy again, re-run I4's poll command | The same record is still readable - proves the write survived a restart against the persisted volume, not just a read from the still-live process that wrote it |
+| I6 | Teardown | `docker compose down -v` | Both containers stop; volume removed |
+
+I5 is the one step here with no automated equivalent yet - `tests/phase1_e2e_tests.rs` and every
+step above it only prove read-your-own-write on a live process (see README.md's Limitations).
+Treat an I5 failure as a real regression, not a flake.
+
+Record wall-clock time from `git clone` to I3 passing - README.md's Quick start states a 15-minute
+target for a new contributor ([#3539](https://github.com/apache/iggy/issues/3539) acceptance
+criteria).
 
 ---
 
@@ -346,6 +369,7 @@ kcat version (if used): ___________
 [ ] F1–F6  TCP / connection behavior
 [ ] G1–G3  kcat client (record errors for G2/G3)
 [ ] H1–H3  Adversarial input
+[ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist

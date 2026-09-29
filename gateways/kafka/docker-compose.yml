@@ -1,0 +1,97 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Quick-start: a real iggy-server plus the Kafka gateway bridged to it, for a Kafka client to
+# talk to end to end. `docker compose up` from this directory. See README.md's "Quick start".
+
+services:
+  iggy-server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: iggy-server
+    restart: unless-stopped
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    environment:
+      - IGGY_NODE_ADVERTISED_ADDRESS=localhost
+      # Fixed, non-default root credentials: this quick-start's gateway needs a password it
+      # knows ahead of time, and iggy-server otherwise generates a random one per start.
+      # Dev-only - never reuse these outside a local compose stack.
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy-gateway-quickstart
+    networks:
+      - iggy-kafka-gateway
+    ports:
+      - 3000:3000
+      - 8080:8080
+      - 8090:8090
+      - 8092:8092
+    volumes:
+      - iggy-server:/local_data
+    # The gateway's own startup does one bridge connect attempt and exits if it fails - this
+    # gates its start on the server actually answering a command, not just accepting a TCP
+    # connect (a bare connect succeeds before the request-processing loop is wired up; `ping`
+    # is unauthenticated - see core/cli/src/commands/binary_system/ping.rs's
+    # `login_required() -> false` - so this still doesn't prove root-user login is ready, only
+    # that the server itself is; the gateway's own bounded bridge-connect retries cover the
+    # remaining gap between "server up" and "root user provisioned").
+    healthcheck:
+      test: ["CMD", "/iggy", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  iggy-gateway-kafka:
+    build:
+      context: ../..
+      dockerfile: gateways/kafka/Dockerfile
+    container_name: iggy-gateway-kafka
+    restart: unless-stopped
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
+      # Binding the wildcard address above means the gateway cannot derive its own advertised
+      # host (server.rs::BrokerAdvertise::from_server_config refuses to start without this) -
+      # same requirement root docker-compose.yml's IGGY_NODE_ADVERTISED_ADDRESS already carries
+      # for iggy-server, for the same reason: the value a Kafka client's Metadata response
+      # points it back at has to be reachable from outside the container.
+      - IGGY_KAFKA_ADVERTISED_HOST=localhost
+      - IGGY_KAFKA_BRIDGE_ENABLED=true
+      - IGGY_KAFKA_IGGY_ADDR=iggy-server:8090
+      - IGGY_KAFKA_IGGY_USERNAME=iggy
+      - IGGY_KAFKA_IGGY_PASSWORD=iggy-gateway-quickstart
+    networks:
+      - iggy-kafka-gateway
+    ports:
+      - 9093:9093
+
+volumes:
+  iggy-server:
+    driver: local
+
+networks:
+  iggy-kafka-gateway:
+    name: iggy-kafka-gateway
