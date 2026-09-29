@@ -57,8 +57,21 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
         return httpClient.executeWithOptionalResponse(request, ConsumerOffsetInfo.class);
     }
 
+    @Override
+    public void deleteConsumerOffset(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
+        var request = httpClient.prepareDeleteRequest(
+                path(streamId, topicId, consumer),
+                new BasicNameValuePair(
+                        "partition_id", partitionId.map(Object::toString).orElse(DEFAULT_PARTITION_ID)));
+        httpClient.execute(request);
+    }
+
     private static String path(StreamId streamId, TopicId topicId) {
         return "/streams/" + streamId + "/topics/" + topicId + "/consumer-offsets";
+    }
+
+    private static String path(StreamId streamId, TopicId topicId, Consumer consumer) {
+        return path(streamId, topicId) + "/" + consumer.id();
     }
 
     private record StoreConsumerOffset(String consumerId, Optional<Long> partitionId, BigInteger offset) {}
