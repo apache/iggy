@@ -118,7 +118,7 @@ impl ConsumerOffsetClient for HttpClient {
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            consumer.id
+            utf8_percent_encode(&consumer.id.as_cow_str(), PATH_SEGMENT)
         );
         self.delete_with_query(
             &path,
