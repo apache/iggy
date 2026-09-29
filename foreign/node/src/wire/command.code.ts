@@ -44,7 +44,6 @@ export const COMMAND_CODE = {
   LoginRegisterWithAccessToken: 45,
   PollMessages: 100,
   SendMessages: 101,
-  FlushUnsavedBuffers: 102,
   GetPollRouting: 103,
   PollMessagesOnPrimary: 104,
   GetOffset: 120,

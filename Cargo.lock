@@ -7018,6 +7018,7 @@ name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "crc32c",
  "flate2",
@@ -7038,6 +7039,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "zstd 0.13.3",
 ]
 

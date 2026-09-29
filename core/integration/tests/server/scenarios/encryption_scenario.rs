@@ -97,9 +97,8 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); the
-    // eager-flush envs in `build_server_config` make every committed batch hit
-    // disk instead.
+    // No flush primitive exists; `eager_flush_options()` makes every committed
+    // batch hit disk instead.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Verify on-disk encryption of headers and payload
@@ -244,9 +243,8 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); the
-    // eager-flush envs in `build_server_config` make every committed batch hit
-    // disk instead.
+    // No flush primitive exists; `eager_flush_options()` makes every committed
+    // batch hit disk instead.
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let polled = client

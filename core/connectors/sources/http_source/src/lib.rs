@@ -26,7 +26,7 @@ mod types;
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
 use axum::http::{HeaderName, header};
-use iggy_common::{HeaderKey, HeaderValue};
+use iggy_common::{HeaderKey, HeaderValue, MAX_PAYLOAD_SIZE};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source,
     source_connector,
@@ -71,7 +71,10 @@ pub const BUFFER_CAPACITY_LIMIT: usize = 1_000_000;
 /// until it hits this many messages. Nothing is allocated up front, so an
 /// oversized value costs a longer drain rather than a large empty buffer.
 pub const MAX_BATCH_SIZE_LIMIT: usize = 100_000;
-pub const MAX_BODY_SIZE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+/// Iggy's own payload cap, because a body becomes the message payload byte
+/// for byte. The runtime cannot send a larger one, and it NACKs the whole
+/// batch around it on every replay.
+pub const MAX_BODY_SIZE_BYTES_LIMIT: usize = MAX_PAYLOAD_SIZE as usize;
 
 pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
@@ -919,9 +922,9 @@ impl HttpSource {
     /// that bounded, visible backpressure for silent loss growing with the
     /// length of the outage, and no downstream can detect it.
     ///
-    /// A batch that can never be delivered still replays. Readiness fails once
-    /// it has been NACKed longer than the liveness window, so operators and
-    /// load balancers can see that the accepted work is stuck.
+    /// Malformed work is rejected before enqueueing, but downstream failures
+    /// can still leave an accepted batch replaying indefinitely. Readiness
+    /// fails once it has been NACKed longer than the liveness window.
     fn on_nack(&self) -> Result<(), Error> {
         let mut staged = self.lock_staged();
         let Some(batch) = staged.as_mut() else {
@@ -1430,7 +1433,7 @@ mod tests {
             ),
             (
                 "max_body_size_bytes",
-                r#"{"listen_addr": "0.0.0.0:9090", "max_body_size_bytes": 67108865}"#,
+                r#"{"listen_addr": "0.0.0.0:9090", "max_body_size_bytes": 64000001}"#,
             ),
         ] {
             assert!(

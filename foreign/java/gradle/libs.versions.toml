@@ -45,7 +45,7 @@ assertj = "3.27.7"
 testcontainers = "2.0.5"
 
 # Netty
-netty = "4.2.17.Final"
+netty = "4.2.18.Final"
 
 # Spotbugs
 spotbugs = "4.10.4"

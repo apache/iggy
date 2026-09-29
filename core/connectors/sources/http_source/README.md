@@ -109,7 +109,7 @@ The stream's `schema` **must be `raw`**. This connector always produces raw bodi
 
 The batch is then replayed on every poll. This source disables the SDK's consecutive-NACK breaker by default because accepted webhooks exist only in its in-memory bridge. Repeated failures back off to a five-second retry delay, and the listener answers 429 once the bridge fills.
 
-Empty bodies are rejected with 400. Bodies beyond Iggy's 64,000,000-byte payload cap are rejected with 413 even if `max_body_size_bytes` allows a larger request. A staged batch that keeps failing for more than 60 seconds makes `/health` and `/admin/health` report unavailable, even while retries continue.
+Empty bodies are rejected with 400. `max_body_size_bytes` cannot exceed Iggy's 64,000,000-byte payload cap; requests above the configured limit are rejected with 413. A staged batch that keeps failing for more than 60 seconds makes `/health` and `/admin/health` report unavailable, even while retries continue.
 
 Set `max_consecutive_nacks` in `[plugin_config]` to a positive integer only if an external replay mechanism makes stopping safe. This does not make a mismatched stream schema valid: `schema` lives under `[[streams]]` and the plugin only receives `[plugin_config]`.
 
@@ -125,7 +125,7 @@ Rebuild the HTTP source plugin with SDK 0.6 to get this behavior and the `iggy_s
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. A misspelled key reads as unset, so it opens the path rather than failing; see the note on unknown keys below. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
-| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. The Iggy payload cap of 64,000,000 bytes still applies. |
+| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 64000000**, Iggy's message payload cap, since a body becomes the payload unchanged; a larger value fails `open()`. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
 | `max_consecutive_nacks` | positive integer | disabled | Optional SDK breaker limit. Omit to keep retrying NACKed batches with capped backoff; set only when accepted events can be replayed after a restart. Zero is invalid. |
@@ -190,8 +190,9 @@ Content-Type: application/json
 | 200 | Accepted into the bridge | `{"status":"queued"}` |
 | 401 | Bearer or HMAC validation failed | `{"error":"unauthorized"}` |
 | 404 | Unknown path, or a revoked or expired endpoint | `{"error":"not found"}` |
-| 400 | Empty body or malformed request body, e.g. the client reset mid-send | `{"error":"empty payload"}` or `{"error":"bad request"}` |
-| 413 | Body over `max_body_size_bytes` or Iggy's 64,000,000-byte payload cap | `{"error":"payload too large"}` |
+| 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
+| 400 | Empty body, which Iggy cannot store as a message | `{"error":"empty body"}` |
+| 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
 | 503 | `GET /health` when an instance has stopped polling or its staged batch has failed for more than 60 seconds; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |

@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, serve};
-use iggy_common::{HeaderKey, HeaderValue, MAX_PAYLOAD_SIZE};
+use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_sdk::Error;
 use rand::RngExt;
 use ring::hmac;
@@ -1093,14 +1093,10 @@ fn enqueue(
     body: Bytes,
     metrics: &Metrics,
 ) -> Response {
-    match validate_payload_len(body.len()) {
-        Ok(()) => {}
-        Err(PayloadLengthError::Empty) => {
-            return error_response(StatusCode::BAD_REQUEST, "empty payload");
-        }
-        Err(PayloadLengthError::TooLarge) => {
-            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
-        }
+    // Iggy refuses an empty payload, and the runtime NACKs the whole batch
+    // around it on every replay. Checked first, because no retry can fix it.
+    if body.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "empty body");
     }
     // Checked before the header map is built and the body copied, since a full
     // bridge throws both away. Both handlers check once more before they read
@@ -1171,22 +1167,6 @@ fn enqueue(
     // would otherwise be counted against messages that never existed.
     metrics.record_headers(&instance.instance_name, clamped, dropped);
     Json(StatusResponse { status: "queued" }).into_response()
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PayloadLengthError {
-    Empty,
-    TooLarge,
-}
-
-fn validate_payload_len(length: usize) -> Result<(), PayloadLengthError> {
-    if length == 0 {
-        Err(PayloadLengthError::Empty)
-    } else if length > MAX_PAYLOAD_SIZE as usize {
-        Err(PayloadLengthError::TooLarge)
-    } else {
-        Ok(())
-    }
 }
 
 fn authorize(
@@ -1409,17 +1389,6 @@ mod tests {
 
     const STATIC_SECRET: &str = "whsec_static";
 
-    #[test]
-    fn given_invalid_payload_length_should_reject_before_enqueue() {
-        assert_eq!(validate_payload_len(0), Err(PayloadLengthError::Empty));
-        assert_eq!(validate_payload_len(1), Ok(()));
-        assert_eq!(validate_payload_len(MAX_PAYLOAD_SIZE as usize), Ok(()));
-        assert_eq!(
-            validate_payload_len(MAX_PAYLOAD_SIZE as usize + 1),
-            Err(PayloadLengthError::TooLarge)
-        );
-    }
-
     fn config(public_port: u16, admin_port: u16, endpoints: &[&str]) -> HttpSourceConfig {
         let mut config = crate::test_support::config(Some("github"), endpoints);
         config.listen_addr = format!("127.0.0.1:{public_port}");
@@ -1618,6 +1587,41 @@ mod tests {
             StatusCode::NOT_FOUND,
             "expired must not be distinguishable from never-existed by an unauthenticated caller"
         );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_empty_body_when_posted_to_secret_path_should_answer_bad_request() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("the refusal must carry this API's json");
+        assert_eq!(body["error"], "empty body");
+        assert_eq!(
+            source.shared.sender.len(),
+            0,
+            "an empty body queued is a batch the runtime NACKs on every replay"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_empty_body_when_posted_to_named_path_should_answer_bad_request() {
+        let mut source = open(1, config(free_port(), free_port(), &[])).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(source.shared.sender.len(), 0);
         close(&mut source).await;
     }
 

@@ -45,7 +45,6 @@ internal static class CommandCodes
     internal const int LOGIN_REGISTER_WITH_PAT_CODE = 45;
     internal const int POLL_MESSAGES_CODE = 100;
     internal const int SEND_MESSAGES_CODE = 101;
-    internal const int FLUSH_UNSAVED_BUFFER_CODE = 102;
     internal const int GET_POLL_ROUTING_CODE = 103;
     internal const int POLL_MESSAGES_ON_PRIMARY_CODE = 104;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;

@@ -17,17 +17,13 @@
 
 use crate::session::ConsensusSession;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::codes::{
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
-};
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
-    RequestHeader, read_size_field, result_code, result_section_len,
+    RequestHeader, operation_for_code, read_size_field, result_code, result_section_len,
 };
-use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
+use iggy_common::{IggyError, eviction_reason_to_error};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
 // A reconnect creates a fresh VSR client and session. A replicated request
 // retried there gets a new (client_id, request_id) tuple, so server-side
@@ -104,55 +100,14 @@ pub(crate) fn encode_request_header(
             }
         }
     };
-    // Metadata dedup compares this stamp with its cached replies. Partition
-    // dedup tracks request ids without retaining replies or comparing stamps;
-    // send batches carry their own checksum. NonReplicated ops bypass dedup.
-    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
-        0
-    } else {
-        u128::from(calculate_checksum(payload))
-    };
-    let total_size = HEADER_SIZE
-        .checked_add(payload.len())
-        .ok_or(IggyError::InvalidConfiguration)?;
-    let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut reserved = [0; 60];
-    if operation == Operation::NonReplicated {
-        reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
-    }
-    let header = RequestHeader {
-        command: Command::Request,
-        operation,
-        size,
-        client: session.client_id(),
-        request: request_id,
-        session: session_id,
-        // Lets the client table tell a genuine retry from a `request` number reused
-        // for different arguments. Zero means unstamped, which is what an SDK
-        // predating this sends. A server that rewrites the body (PAT, password)
-        // carries it through untouched, so it keeps describing what the client sent.
-        request_checksum,
-        // Replicated prepares get a server timestamp. Direct replies may echo
-        // this field, but no RTT consumer needs a client clock read here.
-        timestamp: 0,
-        reserved,
-        ..Default::default()
-    };
-
-    Ok((header, total_size))
-}
-
-/// `COMMAND_TABLE` is a protocol registry, not a per-server capability list, so
-/// an SDK build cannot know which codes a given server implements. The server is
-/// the authority: an unmapped code is forwarded as non-replicated (the code
-/// rides `RequestHeader.reserved`, which that path already stamps) and the
-/// server answers with a proper error if it does not know it.
-pub(crate) fn operation_for_code(code: u32) -> Operation {
-    if code == LOGOUT_USER_CODE {
-        return Operation::Logout;
-    }
-
-    Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
+    // The header rules (checksum stamp, size, reserved code) live in the
+    // protocol crate so every client and the cross-SDK fixtures share them;
+    // only the session identity is decided here.
+    let header =
+        RequestHeader::for_request(code, session.client_id(), request_id, session_id, payload)
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+    debug_assert_eq!(header.operation, operation);
+    Ok((header, header.size as usize))
 }
 
 /// Whether replaying `code` after reconnecting with a new session cannot
@@ -363,12 +318,14 @@ mod tests {
     use super::*;
     use crate::session::ConsensusSession;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE, SEND_MESSAGES_CODE,
+        CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::consensus::NON_REPLICATED_CODE_RANGE;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
     use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName, WireOptions};
+    use iggy_common::calculate_checksum;
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
