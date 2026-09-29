@@ -1,6 +1,8 @@
 {
   "protocol_version": 11264,
   "protocol_version_min": 11264,
+  "no_assigned_partition": 4294967294,
+  "resync_required_partition": 4294967295,
   "xxh3_64": {
     "0": "2d06800538d394c2",
     "1": "4c5cca45d0f4811f",
