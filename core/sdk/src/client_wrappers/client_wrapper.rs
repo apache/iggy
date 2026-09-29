@@ -23,6 +23,7 @@ use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::NonZeroIggyDuration;
 use std::fmt::Debug;
 use std::sync::Arc;
+use tokio::sync::TryLockError;
 
 pub(crate) trait ClientRequestPolicy: Debug + Send + Sync {
     /// Returns the deadline used for supported requests.
@@ -30,7 +31,7 @@ pub(crate) trait ClientRequestPolicy: Debug + Send + Sync {
     /// Whether connect includes sign-in and should share that deadline.
     fn should_budget_connect(&self) -> bool;
     /// Invalidates the connection after the request deadline expires.
-    fn expire(&self);
+    fn expire(&self) -> Result<(), TryLockError>;
 }
 
 #[allow(clippy::large_enum_variant)]

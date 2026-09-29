@@ -583,12 +583,14 @@ impl IggyClient {
         &self,
         future: impl Future<Output = Result<T, IggyError>>,
     ) -> Result<T, IggyError> {
-        let policy = self.request_policy.as_ref();
+        let Some(policy) = self.request_policy.as_ref() else {
+            return future.await;
+        };
         RequestBudget::run(
-            policy.map(|policy| policy.timeout()),
+            Some(policy.timeout()),
             || {
-                if let Some(policy) = policy {
-                    policy.expire();
+                if let Err(error) = policy.expire() {
+                    error!("Failed to expire the client request: {error}");
                 }
             },
             future,
