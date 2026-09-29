@@ -21,13 +21,10 @@ import Testing
 
 @Suite("Error codes")
 struct ErrorCodeTests {
-    /// Pins the table to the server's `IggyError` discriminants: the count,
-    /// both ends, and a code from every band.
+    /// Spot checks a code from every band by name; the golden test below
+    /// covers the whole table.
     @Test func tableMatchesTheServerCodes() {
-        #expect(IggyErrorCode.allCases.count == 240)
         #expect(IggyErrorCode.error.rawValue == 1)
-        #expect(IggyErrorCode.allCases.map(\.rawValue).min() == 1)
-        #expect(IggyErrorCode.allCases.map(\.rawValue).max() == 14003)
         #expect(IggyErrorCode.incompatibleProtocolVersion.rawValue == 14003)
         #expect(IggyErrorCode(rawValue: 57) == .transientNotCommitted)
         #expect(IggyErrorCode(rawValue: 58) == .transientNotAccepted)
@@ -37,6 +34,17 @@ struct ErrorCodeTests {
         #expect(IggyErrorCode(rawValue: 5006) == .consumerGroupMemberNotFound)
         #expect(IggyErrorCode.streamIdNotFound.name == "stream_id_not_found")
         #expect(Set(IggyErrorCode.allCases.map(\.name)).count == IggyErrorCode.allCases.count)
+    }
+
+    /// The full table, against the dump the Rust generator takes from the
+    /// server's error enum.
+    @Test func errorCodesMatchTheServerTable() {
+        let golden = GoldenFixture.shared
+        let known = Dictionary(uniqueKeysWithValues: IggyErrorCode.allCases.map { ($0.rawValue, $0.name) })
+        #expect(known.count == golden.errors.count)
+        for entry in golden.errors {
+            #expect(known[entry.code] == entry.name, "code \(entry.code)")
+        }
     }
 
     @Test func unknownWireCodesKeepTheRawValue() {

@@ -20,15 +20,16 @@ description: Swift pre-merge testing github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, test, build, build-macos)"
+    description: "Task to run (lint, test, build, build-macos, golden)"
     required: true
 
 runs:
   using: "composite"
   steps:
-    # The macOS lane uses the Swift that ships with Xcode on the runner.
+    # The macOS lane uses the Swift that ships with Xcode on the runner, and
+    # the golden lane only runs the Rust generator.
     - name: Setup Swift
-      if: inputs.task != 'build-macos'
+      if: inputs.task != 'build-macos' && inputs.task != 'golden'
       uses: ./.github/actions/utils/setup-swift
 
     # swift-format ships with the toolchain; the configuration lives in
@@ -73,3 +74,31 @@ runs:
         swift --version
         swift build -Xswiftc -warnings-as-errors
         swift test --parallel
+
+    # The generator is a small standalone workspace that needs no system
+    # packages, and the workspace cache never matches its dependency set, so
+    # the lane skips the disk cleanup, the apt install, and the cache restore.
+    - name: Setup Rust for the golden vectors
+      if: inputs.task == 'golden'
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        free-disk-space: "false"
+        read-cache: "false"
+        install-system-dependencies: "false"
+
+    # The generator sits outside the root workspace, so the repo-wide fmt and
+    # clippy runs never see it. The golden fixture is checked in, so this lane
+    # then regenerates it from the Rust crates and fails when the two differ;
+    # otherwise the Swift tests stay green against a stale copy of the protocol.
+    - name: Check the golden vectors match the Rust crates
+      shell: bash
+      if: inputs.task == 'golden'
+      run: |
+        cargo fmt --manifest-path foreign/swift/Tools/golden-vectors/Cargo.toml -- --check
+        cargo clippy --manifest-path foreign/swift/Tools/golden-vectors/Cargo.toml --all-targets -- -D warnings
+        cargo run --manifest-path foreign/swift/Tools/golden-vectors/Cargo.toml -- foreign/swift/Tests/IggyTests/Fixtures/golden.json
+        if ! git diff --exit-code -- foreign/swift/Tests/IggyTests/Fixtures/golden.json; then
+          echo "❌ golden.json is out of date; regenerate it with the command above and commit the result"
+          exit 1
+        fi
+        echo "✅ golden.json matches the Rust crates"

@@ -16,8 +16,8 @@
 // under the License.
 
 // Every discriminant the server can answer with, transcribed from
-// `core/common/src/error/iggy_error.rs`. The golden-vector generator that
-// follows in a later change dumps the same table and the tests compare.
+// `core/common/src/error/iggy_error.rs`. `Tools/golden-vectors` dumps the
+// same table from the crate and `ErrorCodeTests` compares the two.
 
 /// Numeric error code shared with every other Apache Iggy SDK and the server.
 ///
