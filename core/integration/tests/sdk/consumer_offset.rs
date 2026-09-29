@@ -23,11 +23,96 @@ use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
 use integration::iggy_harness;
 use tokio::time::{Duration, timeout};
 
-const STREAM_NAME: &str = "delete-offset-stream";
-const TOPIC_NAME: &str = "delete-offset-topic";
-const CONSUMER_NAME: &str = "delete-offset-consumer";
+const STREAM_NAME: &str = "test-offset-stream";
+const TOPIC_NAME: &str = "test-offset-topic";
+const CONSUMER_NAME: &str = "test-offset-consumer";
+const CONSUMER_GROUP_NAME: &str = "test-offset-group";
+const OFFSET_PARTITION_ID: u32 = 0;
 const ASSIGNED_PARTITION_ID: u32 = 3;
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[iggy_harness(test_client_transport = [Http, Tcp, Quic, WebSocket])]
+async fn all_transports_can_read_stored_consumer_offsets_of_any_consumer_kind(
+    harness: &TestHarness,
+) {
+    // client to run test cases for all transports
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+
+    // Use tcp for seeding, which carries consumer kind in binary protocol correctly
+    let seed_client = harness
+        .tcp_root_client()
+        .await
+        .expect("Failed to get tcp seed client");
+
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(&stream_id, TOPIC_NAME, &TopicCreateOptions::default())
+        .await
+        .unwrap();
+
+    let mut messages = vec![
+        IggyMessage::from_str("message_1").unwrap(),
+        IggyMessage::from_str("message_2").unwrap(),
+        IggyMessage::from_str("message_3").unwrap(),
+        IggyMessage::from_str("message_4").unwrap(),
+        IggyMessage::from_str("message_5").unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(OFFSET_PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    seed_client
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+
+    seed_client
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+
+    let standalone_consumer = Consumer::new(Identifier::named(CONSUMER_NAME).unwrap());
+    let group_consumer = Consumer::group(group_id.clone());
+
+    for (consumer, offset) in [(&standalone_consumer, 2_u64), (&group_consumer, 4_u64)] {
+        seed_client
+            .store_consumer_offset(
+                consumer,
+                &stream_id,
+                &topic_id,
+                Some(OFFSET_PARTITION_ID),
+                offset,
+            )
+            .await
+            .unwrap();
+
+        let stored_offset = client
+            .get_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap()
+            .map(|info| info.stored_offset);
+
+        assert_eq!(
+            stored_offset,
+            Some(offset),
+            "{consumer:?} stored offset should be readable over every transport"
+        );
+    }
+}
 
 #[iggy_harness]
 async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(
