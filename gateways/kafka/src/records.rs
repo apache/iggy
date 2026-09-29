@@ -23,7 +23,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy::prelude::{HeaderKey, HeaderValue, IggyError, IggyMessage, MAX_PAYLOAD_SIZE};
@@ -93,7 +93,7 @@ const MAX_VARINT_BYTES: usize = 5;
 const MAX_VARLONG_BYTES: usize = 10;
 /// Base offset, batch length, leader epoch, magic, CRC, attributes, last offset delta, first and
 /// max timestamp, producer id, producer epoch, base sequence and record count.
-const BATCH_HEADER_BYTES: usize = 61;
+pub const BATCH_HEADER_BYTES: usize = 61;
 /// Widest v2 record framing: five varints at five bytes each, an attributes byte, and the header
 /// count varint, before the key, the value and the header bytes.
 const RECORD_FRAMING_BYTES: usize = 31;
@@ -259,16 +259,27 @@ struct Stamp {
 /// enforces the namespace, so that is a claim the message makes and not one the server keeps: an
 /// Iggy writer can set `kafka.v` to a version this build does not implement, and every read of
 /// that message then fails. Fetch cannot serve a record it cannot decode and a Kafka consumer
-/// cannot step over one, so the handler in #3536 owns the skip-or-quarantine policy for a message
-/// that fails here. `BRIDGE_MAPPING.md` records that as the open end of the provenance design.
+/// cannot step over one, so Fetch answers -1 at that offset and the consumer stops there.
+/// `BRIDGE_MAPPING.md` records that as the open end of the provenance design.
 ///
 /// # Errors
 ///
 /// Returns an error when the stored user headers do not parse, when `kafka.v` names a mapping
 /// version this build does not implement, or when a marker or an envelope is malformed.
 pub fn from_iggy(message: &IggyMessage, offset: i64) -> Result<Record> {
+    // The common record: a value alone, which `plain_message` wrote. Skips the header map.
+    if message.user_headers.as_deref() == Some(version_only()) {
+        let value = Some(message.payload.clone());
+        return Ok(record(
+            None,
+            value,
+            IndexMap::new(),
+            offset,
+            timestamp_out(message),
+        ));
+    }
     let stored = user_headers(message)?;
-    let Some(version) = stored.get(&header_key(VERSION_HEADER)) else {
+    let Some(version) = stored.get(&VERSION_KEY) else {
         let (key, value, headers) = foreign_fields(message, &stored);
         return Ok(record(key, value, headers, offset, timestamp_out(message)));
     };
@@ -277,11 +288,11 @@ pub fn from_iggy(message: &IggyMessage, offset: i64) -> Result<Record> {
         return Err(RecordCodecError::MappingVersion(version));
     }
 
-    let (key, value, headers) = match stored.get(&header_key(ENVELOPE_HEADER)) {
+    let (key, value, headers) = match stored.get(&ENVELOPE_KEY) {
         Some(envelope) => decode_envelope(envelope.as_bytes(), &message.payload)?,
         None => gateway_fields(message, &stored)?,
     };
-    let timestamp = match stored.get(&header_key(TIMESTAMP_HEADER)) {
+    let timestamp = match stored.get(&TIMESTAMP_KEY) {
         None => timestamp_out(message),
         Some(header) => match header.as_int64() {
             Ok(NO_TIMESTAMP) => server_timestamp(message),
@@ -364,17 +375,7 @@ fn plain_value(record: &Record, stamp: Stamp) -> Option<&Bytes> {
 ///
 /// Static bytes: a clone touches no refcount shared across workers.
 fn plain_message(value: Bytes, origin: u64) -> Result<IggyMessage> {
-    static VERSION_ONLY: OnceLock<&'static [u8]> = OnceLock::new();
-    let headers = *VERSION_ONLY.get_or_init(|| {
-        let block = IggyMessage::builder()
-            .payload(Bytes::from_static(PLACEHOLDER))
-            .user_headers(gateway_headers(None))
-            .build()
-            .ok()
-            .and_then(|message| message.user_headers)
-            .unwrap_or_else(|| unreachable!("the kafka.v header always fits"));
-        Box::leak(block.to_vec().into_boxed_slice())
-    });
+    let headers = version_only();
     let mut message = IggyMessage::builder().payload(value).build()?;
     message.header.user_headers_length =
         u32::try_from(headers.len()).unwrap_or_else(|_| unreachable!("the kafka.v header is tiny"));
@@ -540,8 +541,8 @@ fn gateway_fields(
     message: &IggyMessage,
     stored: &BTreeMap<HeaderKey, HeaderValue>,
 ) -> Result<RecordFields> {
-    let key = stored.get(&header_key(KEY_HEADER)).map(HeaderValue::value);
-    let value = match stored.get(&header_key(VALUE_MARKER_HEADER)) {
+    let key = stored.get(&KEY_KEY).map(HeaderValue::value);
+    let value = match stored.get(&VALUE_MARKER_KEY) {
         None => Some(message.payload.clone()),
         Some(marker) => match marker.as_bytes() {
             MARKER_NULL => None,
@@ -657,6 +658,28 @@ fn take_field(buf: &mut Bytes) -> Result<Bytes> {
     let len = u32::from_le_bytes(take(buf, 4)?.as_ref().try_into().unwrap_or_default()) as usize;
     take(buf, len)
 }
+
+/// The encoded header block that holds `kafka.v` alone.
+fn version_only() -> &'static [u8] {
+    static VERSION_ONLY: OnceLock<&'static [u8]> = OnceLock::new();
+    VERSION_ONLY.get_or_init(|| {
+        let block = IggyMessage::builder()
+            .payload(Bytes::from_static(PLACEHOLDER))
+            .user_headers(gateway_headers(None))
+            .build()
+            .ok()
+            .and_then(|message| message.user_headers)
+            .unwrap_or_else(|| unreachable!("the kafka.v header always fits"));
+        Box::leak(block.to_vec().into_boxed_slice())
+    })
+}
+
+/// Lookup keys for the headers `from_iggy` reads, built once.
+static VERSION_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(VERSION_HEADER));
+static ENVELOPE_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(ENVELOPE_HEADER));
+static TIMESTAMP_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(TIMESTAMP_HEADER));
+static KEY_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(KEY_HEADER));
+static VALUE_MARKER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(VALUE_MARKER_HEADER));
 
 /// Both are infallible for the names and values this module builds: every one is non-empty and
 /// within `MAX_FIELD`, which `needs_envelope` guarantees for caller-supplied bytes.
@@ -968,28 +991,28 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
     Ok(buf.freeze())
 }
 
+/// An upper bound on the bytes `record` adds to a batch [`encode_batch`] writes.
+///
+/// Fetch sums these against its byte budget before it encodes.
+#[must_use]
+pub fn record_size_bound(record: &Record) -> usize {
+    let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
+    RECORD_FRAMING_BYTES
+        + field(record.key.as_ref())
+        + field(record.value.as_ref())
+        + record
+            .headers
+            .iter()
+            .map(|(name, value)| HEADER_FRAMING_BYTES + name.as_str().len() + field(value.as_ref()))
+            .sum::<usize>()
+}
+
 /// An upper bound on the encoded batch, so the Fetch path reserves once instead of doubling.
 ///
 /// `kafka_protocol` never reserves: it writes every field with `put_slice` into whatever buffer
 /// it is handed. Every length needed here is already in hand.
 fn batch_size(records: &[Record]) -> usize {
-    let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
-    BATCH_HEADER_BYTES
-        + records
-            .iter()
-            .map(|record| {
-                RECORD_FRAMING_BYTES
-                    + field(record.key.as_ref())
-                    + field(record.value.as_ref())
-                    + record
-                        .headers
-                        .iter()
-                        .map(|(name, value)| {
-                            HEADER_FRAMING_BYTES + name.as_str().len() + field(value.as_ref())
-                        })
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
+    BATCH_HEADER_BYTES + records.iter().map(record_size_bound).sum::<usize>()
 }
 
 /// Decompresses one batch, refusing the write that would pass the budget.
@@ -1265,9 +1288,13 @@ mod tests {
             general.header.user_headers_length
         );
         assert_eq!(plain.header.origin_timestamp, 1_700_000_000_123_000);
-        let back = from_iggy(&plain, 0).unwrap();
+        // Fetch reads this block without a header map. It must match the full read.
+        let back = from_iggy(&plain, 7).unwrap();
         assert_eq!(back.value.as_deref(), Some(&b"v"[..]));
         assert_eq!(back.timestamp, CREATE_TIME);
+        assert_eq!(back.key, None);
+        assert!(back.headers.is_empty());
+        assert_eq!(back.offset, 7);
     }
 
     fn envelope_bytes(count: u32, trailing: &[u8]) -> Bytes {

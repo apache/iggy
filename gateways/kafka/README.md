@@ -1,19 +1,14 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it. Everything else is a stub.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata and CreateTopics use Iggy. InitProducerId and consumer group coordination work with or without one.
 
-> **Stub warning:** Fetch does not read real data yet: with or without a bridge it returns
-> retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally / retry elsewhere instead of
-> trusting a fake success. With `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce writes to Iggy,
-> CreateTopics creates a real Iggy stream/topic, Metadata reports real topics and partition counts
-> (a topic not requested by name and not found is silently absent from a null-topics "list all"
-> response, and `UNKNOWN_TOPIC_OR_PARTITION` when named explicitly), and ListOffsets answers
-> `EARLIEST`/`LATEST` from real partition state. With the bridge off (the default) these stay stubs: Produce and
-> ListOffsets answer `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics answers `NOT_CONTROLLER` (41), and
-> Metadata reports every requested topic unknown. **CreateTopics runs as the bridge's own Iggy
-> user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can
-> reach this port can create topics (up to 1000 partitions each). See
-> [docs/SCOPE.md](docs/SCOPE.md).
+> **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata and
+> CreateTopics use Iggy. With the bridge off (the default), those five are stubs: Produce, Fetch and
+> ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics answers `NOT_CONTROLLER`
+> (41), and Metadata reports every requested topic unknown. **CreateTopics runs as the bridge's own
+> Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that
+> can reach this port can create topics (up to 1000 partitions each). Every client reads and writes
+> as the bridge's Iggy user. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
@@ -21,8 +16,9 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `LeaveGroup` and `SyncGroup` are real, with real membership, rebalances, graceful leave and
 > session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
 > Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
-> With it on, partitions are assigned, but offset commit/fetch is not implemented and Fetch is
-> still a stub, so nothing can be consumed yet.
+> Offset commit and fetch are not implemented yet, so a consumer must use `assign()` with explicit
+> start offsets and `enable.auto.commit=false`. The Java client needs no `group.id`. librdkafka
+> refuses `assign()` without one, so set any value there.
 
 ## Run
 
@@ -156,10 +152,9 @@ Four things to know before switching it on:
   `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
   whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
 - **Authentication and an ACL view, not enforcement.** The gateway verifies the credentials and
-  can describe what Iggy grants the principal, but nothing gates an operation yet. Iggy's
-  permissions decide that once Produce and Fetch are wired to it
-  ([#3535](https://github.com/apache/iggy/issues/3535),
-  [#3536](https://github.com/apache/iggy/issues/3536)).
+  can describe what Iggy grants the principal, but no operation checks those grants. Produce and
+  Fetch act as the bridge's Iggy user for every client, so any client that signs in reads and
+  writes what that user can.
 
 ### ACLs
 
@@ -181,14 +176,13 @@ Full reasoning, including what was rejected and why, is in
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
-streams/topics, provisions them on demand, and looks up high watermarks (one or many partitions of
-a topic per call) for `ListOffsets`.
-ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) and Produce
-([#3535](https://github.com/apache/iggy/issues/3535), see below) call it. Fetch does not call it
-yet ([#3536](https://github.com/apache/iggy/issues/3536)).
-Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs`,
-`tests/list_offsets_real_bridge_tests.rs` and `tests/produce_real_bridge_tests.rs`. The last three
-start a real `iggy-server`.
+streams/topics, provisions them on demand, looks up high watermarks (one or many partitions of
+a topic per call) for `ListOffsets`, and probes and polls partitions for Fetch.
+Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
+([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)) and CreateTopics
+([#3538](https://github.com/apache/iggy/issues/3538)) call it.
+Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
+`tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
 
 ### Produce ([#3535](https://github.com/apache/iggy/issues/3535))
 
@@ -230,6 +224,58 @@ decoded. 4 requests decode at once.
 
 [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 
+### Fetch ([#3536](https://github.com/apache/iggy/issues/3536))
+
+Per request: one probe per topic, shared with other Fetches, then polls of each partition with
+records, in request order. One uncompressed batch per partition.
+
+| Field | Gateway |
+| ----- | ------- |
+| Partition, offset | As sent. Both systems count from 0. |
+| Iggy replica | The one on the node the bridge connects to. |
+| Offset below the oldest kept one | Reads from the oldest kept one. If none is kept, no records until the next write, because a cluster replica that lost records after a crash reads the same. Kafka answers `1` here, so `auto.offset.reset=none` gets no error. |
+| Purge | Iggy restarts the partition at offset 0, and Fetch cannot see it. Seek consumers to 0 after a purge. Otherwise writes past a consumer's old offset make it skip the records below. |
+| `high_watermark` | One past the last committed offset. |
+| `last_stable_offset` | Same as `high_watermark`. No transactions. |
+| `log_start_offset` | Always `-1`. |
+| Sessions | None opened. `session_id` is always `0`, so every request is a full one. |
+| `max_wait_ms` | Honored, max 18 s. |
+| `min_bytes` | Honored, as Kafka does: the request waits until the records read reach it. New bytes are estimated from Iggy's average message size. |
+| `max_bytes` | Honored, max `IGGY_KAFKA_MAX_FRAME_SIZE`. |
+| `partition_max_bytes` | Honored. |
+| First partition with records | At least one record, even past every byte limit (KIP-74). |
+| Records per partition | At most 1000 per request, polled up to 16 at a time. |
+| `isolation_level`, replica id, epochs, rack, forgotten topics | Ignored. |
+
+| Code | When | Java consumer |
+| ---- | ---- | ------------- |
+| `OFFSET_OUT_OF_RANGE` (1) | Offset below 0, or past `high_watermark`. A partition with no offset past 0 answers 6 instead for its first 30 s, because Iggy reports that while it loads or fences one. | Resets its offset (`auto.offset.reset`). |
+| `UNKNOWN_TOPIC_OR_PARTITION` (3) | Topic or partition not in Iggy, or a name Kafka refuses | Refreshes metadata, retries. |
+| `NOT_LEADER_OR_FOLLOWER` (6) | Iggy unreachable, too slow, not signed in, loading the partition, or returning no records where it reports some. Alone, it goes out after `max_wait_ms`. | Refreshes metadata, retries. |
+| `TOPIC_AUTHORIZATION_FAILED` (29) | The bridge's Iggy user lacks permission. Fetch reads as that user, not as the client. | Fails. |
+| `UNKNOWN_SERVER_ERROR` (-1) | Anything else, such as a stored message the gateway cannot map. Alone, it goes out after `max_wait_ms`. The partition is read again at most once per `max_wait_ms`. | Retries the same offset. |
+| `FETCH_SESSION_ID_NOT_FOUND` (70) | Top level. The request continues a session. | Sends a full request. |
+
+The Java consumer throws on any other partition code, so Fetch sends none.
+
+Limits:
+
+- 20 s per request, wait included, so a waiting Fetch fits the 25 s shutdown drain. Partitions
+  not read by then answer `0` with no records.
+- 4 requests read and encode at once. A waiting request, or a response on a slow socket, holds no
+  slot. So response memory grows with connections: `max_bytes` each, or one larger record.
+- A message the gateway cannot map stops the consumer at its offset. Records before it are served.
+  The log shows it once at `warn`.
+- Each slot polls on its own Iggy client, which connects at the slot's first poll. A poll ends at
+  the request deadline, so a partition that Iggy refuses holds up only its own slot.
+- Iggy polls by count, not bytes. One poll can load 16 of the largest messages: about 1 GB, and
+  about 4 GB over the 4 slots. It also costs polls: 1000 small records take 63. A byte cap on Iggy
+  polls would lift both.
+- A request loads at most 100 new topic probes per round, the oldest first. Other topics use an
+  older probe. A waiting request probes 100 topics per round, in turn.
+- A Produce through the gateway wakes a waiting Fetch of that topic at once. A native Iggy write
+  wakes it at the next probe, within about 200 ms.
+
 ### Connection config
 
 | Variable | Default | Description |
@@ -246,10 +292,10 @@ Iggy SDK client's own default of unlimited retries, one dial per second, forever
 attempt - retries included - is capped at `REQUEST_TIMEOUT` (15s) wall-clock, so `IggyBridge::connect`
 fails in bounded time whether the address refuses the connection or silently drops it, instead of
 blocking the calling task indefinitely. Every other bridge call (`ensure_stream_and_topic`,
-`high_watermark(s)`, `close`) carries the same `REQUEST_TIMEOUT` for the same reason: the SDK
-reconnects internally, mid-call, on a transport error, through the same undead-lined dial path - a
-bridge call made well after the initial connect can still hit this if Iggy becomes unreachable
-later.
+`high_watermark(s)`, `probe`, `close`) carries the same `REQUEST_TIMEOUT` for the same
+reason: the SDK reconnects internally, mid-call, on a transport error, through the same
+undead-lined dial path - a bridge call made well after the initial connect can still hit this if
+Iggy becomes unreachable later.
 
 `send_records` uses the Produce deadline instead:
 
@@ -310,11 +356,15 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-- One `IggyClient` serves every Kafka connection, one Iggy request at a time.
-- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A client pool is a TODO in
+- One `IggyClient` serves every Kafka connection, one Iggy request at a time. Fetch polls use 4
+  more, one per read slot.
+- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in
   [docs/SCOPE.md](docs/SCOPE.md).
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
   can land after later ones.
+
+Fetches share topic probes: one `get_topic` per topic at a time, for all consumers together, on
+that same client. A caught-up consumer of a busy topic can start one per Fetch.
 
 ### Error mapping
 
@@ -344,6 +394,8 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 - Too many partitions requested (`TooManyPartitions`) → `INVALID_PARTITIONS` (37), reachable
   through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
+
+Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
 
 ### Server limits the gateway inherits
 

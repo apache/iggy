@@ -61,6 +61,9 @@ pub enum BridgeError {
         partition: u32,
         partitions_count: u32,
     },
+    /// Iggy loads the partition, so its high watermark reads too low. Retriable: 6.
+    #[error("partition {partition} of topic '{topic}' is loading")]
+    PartitionLoading { topic: String, partition: u32 },
     /// `ensure_topic` was asked to ensure a topic that already exists with a different partition
     /// count. `ensure_topic`'s whole contract is "the topic has `partition_count` partitions
     /// afterward" - silently keeping the old count and returning `Ok(())` would let two
@@ -105,6 +108,7 @@ impl BridgeError {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
             Self::Timeout | Self::SendLost(_) => ERROR_REQUEST_TIMED_OUT,
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            Self::PartitionLoading { .. } => ERROR_NOT_LEADER_OR_FOLLOWER,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
             Self::InvalidKafkaTopicName { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
             // Same code the wire-validation layer already uses for this exact condition - this

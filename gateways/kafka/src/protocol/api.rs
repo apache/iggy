@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use kafka_protocol::error::ResponseError;
@@ -41,6 +42,7 @@ use crate::protocol::handlers::{
     init_producer_id, join_group, leave_group, list_offsets, metadata, produce, respond_or_close,
     sync_group,
 };
+use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
     SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
 };
@@ -67,6 +69,8 @@ pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 /// uses it for an `IggyError` with no closer Kafka analogue.
 pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = ResponseError::UnknownServerError.code();
 pub const ERROR_NONE: i16 = 0;
+/// Fetch: the offset is negative or past the high watermark. The client resets its position.
+pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = ResponseError::OffsetOutOfRange.code();
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = ResponseError::UnknownTopicOrPartition.code();
 /// Retriable, nothing written. The Produce stub, and a partition refused because the request
 /// budget ran out.
@@ -163,6 +167,9 @@ pub const ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 /// unknown user the same way, and distinguishing them here would reintroduce a user-enumeration
 /// oracle.
 pub const ERROR_SASL_AUTHENTICATION_FAILED: i16 = ResponseError::SaslAuthenticationFailed.code();
+/// Fetch: the request continues a session. This gateway opens none, so the client starts over
+/// with a full request.
+pub const ERROR_FETCH_SESSION_ID_NOT_FOUND: i16 = ResponseError::FetchSessionIdNotFound.code();
 /// Produce: zstd before v7.
 pub const ERROR_UNSUPPORTED_COMPRESSION_TYPE: i16 =
     ResponseError::UnsupportedCompressionType.code();
@@ -178,6 +185,13 @@ pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// retriable, so a client would resend a batch that can never decode. A client older than Kafka
 /// 2.4 reads 87 as a generic server error, which is still terminal and still better than a loop.
 pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
+
+/// Kafka's -1 for an offset or a timestamp that is not known.
+pub(crate) const UNKNOWN_OFFSET: i64 = -1;
+
+/// Ceiling on the bridge work of one request, wait included. A clock, not a partition cap, so a
+/// wide topic still works. Above one bridge call's 15 s timeout. Fits the 25 s shutdown drain.
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -276,8 +290,8 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// `bridge` is `None` until `IGGY_KAFKA_BRIDGE_ENABLED` turns it on. A handler that finds `None`
 /// answers with its stub, so APIs can be wired one at a time.
 ///
-/// One `IggyBridge` is one `IggyClient` and its TCP transport is lockstep, so Kafka connections
-/// serialize behind whichever Iggy request is in flight. The `Arc` does not change that. See the
+/// Every Iggy call but a Fetch poll goes through one lockstep `IggyClient`, so Kafka connections
+/// serialize behind whichever of those calls is in flight. The `Arc` does not change that. See the
 /// README's "Concurrency ceiling".
 pub struct GatewayState {
     pub broker: BrokerAdvertise,
@@ -294,6 +308,12 @@ pub struct GatewayState {
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
+    /// Partitions that answered -1 to Fetch, per Kafka topic.
+    pub(crate) stuck_offsets: fetch::StuckOffsets,
+    /// Per Kafka topic and partition, how long Fetch finds it not ready.
+    pub(crate) not_ready: Mutex<fetch::Spells>,
+    /// Topic probes that every Fetch shares.
+    pub(crate) probe_board: ProbeBoard,
 }
 
 /// Each holds one decoded partition at a time, so about 160 MB at the default 8 MiB frame. Sends
@@ -318,6 +338,9 @@ impl GatewayState {
             producer_ids: ProducerIdAllocator::new(instance_id),
             produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
             groups,
+            stuck_offsets: fetch::StuckOffsets::default(),
+            not_ready: Mutex::default(),
+            probe_board: ProbeBoard::default(),
         }
     }
 

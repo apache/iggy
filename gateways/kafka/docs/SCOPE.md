@@ -2,9 +2,9 @@
 
 ## Issue #3421 — in scope (this iteration)
 
-Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it.
+A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata and CreateTopics use Iggy.
 
-**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers `NOT_CONTROLLER` (41), so clients do not believe topics were created. Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores real data once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
+**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6 too. CreateTopics validates the request but answers `NOT_CONTROLLER` (41), so clients do not believe topics were created. Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
@@ -46,7 +46,7 @@ it knows the server supports flexible encoding.
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
-| 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
+| 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
 | 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
@@ -132,8 +132,8 @@ untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 12 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the five consumer-group keys, and CreateTopics, Metadata, Produce and ListOffsets with a bridge |
-| **3 — Iggy bridge** | CreateTopics, Metadata, Produce and ListOffsets wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`). CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), Produce ([#3535](https://github.com/apache/iggy/issues/3535)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) call it. Fetch does not call it yet ([#3536](https://github.com/apache/iggy/issues/3536)) |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 12 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the five consumer-group keys, and Produce, Fetch, ListOffsets, Metadata and CreateTopics with a bridge |
+| **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata and CreateTopics wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)) and CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)) call it |
 
 ---
 
@@ -274,8 +274,9 @@ below it are still open for the issues that build on top of it.
     tracks no rolling low-watermark distinct from partition creation, so once a partition is
     old enough for retention to purge its first segment, `0` names a log-start offset that no
     longer exists - a real consumer with `auto.offset.reset=earliest` seeks into a hole. Not
-    fixable client-side; needs the bridge to expose a real start offset. Harmless *today* only
-    because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this returns.
+    fixable client-side; needs the bridge to expose a real start offset. Fetch at an offset in
+    that hole reads from the oldest kept message, so the consumer skips the gap. If none is kept,
+    Fetch serves no records until the next write.
   - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
     still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
     one `high_watermarks` call before any bridge work starts (a name repeated across request
@@ -288,6 +289,13 @@ below it are still open for the issues that build on top of it.
     fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
     batch: a topic already resolved when the deadline arrives keeps its real answer, and only the
     not-yet-started topics answer `REQUEST_TIMED_OUT`.
+- [x] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, shared topic probes, paged polls per partition with
+      records, and a wait of up to `max_wait_ms` (max 18 s) when there are none. Only codes the
+      Java consumer handles go out. See [README.md](../README.md#fetch-3536),
+      `src/protocol/handlers/fetch.rs`, `tests/fetch_real_bridge_tests.rs`.
+- [ ] Fetch: pick skip or quarantine for a stored message the gateway cannot map. Today the
+      consumer stops at it, and Fetch reads it at most once per `max_wait_ms`. See [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md#provenance).
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
