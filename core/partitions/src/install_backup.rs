@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
@@ -73,9 +73,8 @@ pub async fn recover_with_storage<S: DurableStorage>(
 /// # Errors
 /// Returns an error if the rollback state cannot be made durable.
 /// After any failure the caller must stop serving until recovery.
-pub async fn begin(directory: &Path) -> io::Result<()> {
-    begin_with_storage(directory, &DiskStorage)
-        .await
+pub async fn begin(directory: &Path, synced_files: BTreeSet<PathBuf>) -> io::Result<()> {
+    begin_with_synced_files(directory, synced_files, &DiskStorage).await
         .note_descriptor_exhaustion(|| format!("starting an install in {}", directory.display()))
 }
 
@@ -112,7 +111,7 @@ pub async fn begin_with_storage_and_barriers<S: DurableStorage>(
 
 async fn begin_with_synced_files<S: DurableStorage>(
     directory: &Path,
-    synced_files: BTreeSet<std::path::PathBuf>,
+    synced_files: BTreeSet<PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     if storage.exists(&directory.join(BACKUP)).await? {
@@ -157,7 +156,7 @@ async fn link_tree<S: DurableStorage>(
     source: &Path,
     target: &Path,
     skip_scratch: bool,
-    synced_files: &BTreeSet<std::path::PathBuf>,
+    synced_files: &BTreeSet<PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
@@ -248,7 +247,7 @@ mod tests {
         }
         // These std writes are closed before [`begin`], so no original writer
         // remains to synchronize.
-        begin(root).await.unwrap();
+        begin(root, BTreeSet::new()).await.unwrap();
         // Model the install's unlink and atomic replacement operations.
         for name in ["0.log", "offsets/1", "prepares-1/frontier"] {
             std::fs::remove_file(root.join(name)).unwrap();
@@ -276,7 +275,7 @@ mod tests {
         let root = directory.path();
         std::fs::write(root.join("0.log"), b"old").unwrap();
         // The fixture has no live writer outside [`begin`].
-        begin(root).await.unwrap();
+        begin(root, BTreeSet::new()).await.unwrap();
         std::fs::remove_file(root.join("0.log")).unwrap();
         std::fs::write(root.join("0.log"), b"new").unwrap();
         File::open(root.join("0.log"))
@@ -301,7 +300,7 @@ mod tests {
         crate::write_created_revision(partition_dir, CREATED_REVISION)
             .await
             .unwrap();
-        begin(root).await.unwrap();
+        begin(root, BTreeSet::new()).await.unwrap();
         // The delete walk removes the backup's files in no fixed order, the
         // marker last only at the top level.
         for entry in std::fs::read_dir(root.join(BACKUP)).unwrap() {

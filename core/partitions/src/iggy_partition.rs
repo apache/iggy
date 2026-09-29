@@ -89,11 +89,11 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1063,9 +1063,9 @@ where
     ///
     /// Unlike [`IggyPartition::checkpoint_persistence`], this barrier runs even
     /// when the checkpoint frontier cannot advance.
-    pub(crate) async fn barrier_install_files_locked(&self) -> std::io::Result<()> {
+    pub(crate) async fn barrier_install_files_locked(&self) -> std::io::Result<BTreeSet<PathBuf>> {
         let Some(persistence) = &self.persistence else {
-            return Ok(());
+            return Ok(BTreeSet::new());
         };
         let mut barriers = Vec::with_capacity(2);
         if let Some(writer) = self.log.messages_writers().last().and_then(Option::as_ref) {
@@ -1088,9 +1088,10 @@ where
                     .map_err(|error| std::io::Error::other(error.to_string()))
             }));
         }
-        persistence.barrier_files(barriers);
+        let synced_files = persistence.barrier_files(barriers);
         self.start_persistence();
-        persistence.drain_with_timeout().await
+        persistence.drain_with_timeout().await?;
+        Ok(synced_files)
     }
 
     fn persistence_checkpoint_files(
@@ -9377,7 +9378,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[compio::test]
-    async fn given_a_failed_writeback_when_installing_state_transfer_should_refuse_backup_publication()
+    async fn given_an_index_sync_failure_when_installing_state_transfer_should_refuse_backup_publication()
      {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition_at(0, 3);
