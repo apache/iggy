@@ -190,12 +190,12 @@ cat kafka_messages/018_ApiVersions_v3.bin | nc 127.0.0.1 9092 | xxd | head
 | 18 | ApiVersions | v0–v5 | ✅ Critical |
 | 19 | CreateTopics | v2–v7 | ✅ Critical |
 | 20 | DeleteTopics | v1–v6 | 🟡 Important |
-| 21 | DeleteRecords | v0–v2 | 🔵 Phase 2 |
+| 21 | DeleteRecords | v0–v2 | ❌ Unadvertised |
 | 22 | InitProducerId | v0–v6 | 🔵 Phase 2 |
-| 24 | AddPartitionsToTxn | v0–v5 | 🔵 Phase 2 |
-| 25 | AddOffsetsToTxn | v0–v4 | 🔵 Phase 2 |
-| 26 | EndTxn | v0–v5 | 🔵 Phase 2 |
-| 28 | TxnOffsetCommit | v0–v5 | 🔵 Phase 2 |
+| 24 | AddPartitionsToTxn | v0–v5 | ❌ Unadvertised |
+| 25 | AddOffsetsToTxn | v0–v4 | ❌ Unadvertised |
+| 26 | EndTxn | v0–v5 | ❌ Unadvertised |
+| 28 | TxnOffsetCommit | v0–v5 | ❌ Unadvertised |
 | 29–31 | ACL APIs | v1–v3 | 🔵 Phase 2 |
 | 32 | DescribeConfigs | v1–v4 | 🟡 Important |
 | 36 | SaslAuthenticate | v0–v2 | 🟡 Important |

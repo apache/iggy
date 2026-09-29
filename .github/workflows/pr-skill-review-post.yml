@@ -31,6 +31,13 @@ name: PR Skill Review Post
 #   ok, agent produced no findings  -> reply naming the run and its conclusion
 #   ok, findings present            -> one review (event COMMENT) with inline
 #                                      comments, +1 on the trigger comment
+#   review posted, needs the author -> the /author label move, see below
+#
+# State label: the agent sets flip_author_label when its findings need the
+# author before merge, and the poster follows it only when the review shows
+# a critical or warning finding. The label then matches the counts, and nits
+# alone never send a pull request back. The move goes one way: /ready is the
+# way back, and a draft keeps no state label.
 #
 # Anchoring: GitHub accepts an inline comment only on a line that the diff
 # carries, and a single createReview call keeps only the first 30 inline
@@ -157,6 +164,22 @@ jobs:
                 ? names.map((n) => `\`${n}\``).join(', ')
                 : 'none';
             };
+            // Write access comes from the permission endpoint, the one the run
+            // gates on. Read through this token, author_association reports a
+            // private org membership as CONTRIBUTOR, and most committers keep
+            // theirs private. A lookup that fails denies.
+            const hasWriteAccess = async (login) => {
+              try {
+                const { data } = await withRetry(() =>
+                  github.rest.repos.getCollaboratorPermissionLevel({
+                    owner, repo, username: login,
+                  }), 'getCollaboratorPermissionLevel');
+                return data.permission === 'write' || data.permission === 'admin';
+              } catch (e) {
+                core.warning(`write-access check failed for ${login}: ${e.message}`);
+                return false;
+              }
+            };
 
             // Every value this post acts on is read back from the API: the
             // comment that asked, its author and the pull request it sits on.
@@ -181,8 +204,6 @@ jobs:
               core.setFailed(`cannot read a pull request from ${comment.issue_url}`);
               return;
             }
-            const committer = ['MEMBER', 'COLLABORATOR', 'OWNER']
-              .includes(comment.author_association) && !author.endsWith('[bot]');
 
             // The command has to be a line of the comment, the same rule the
             // run workflow applies before it spends a runner. A comment that
@@ -193,7 +214,7 @@ jobs:
               core.info('the trigger comment carries no /skill command');
               return;
             }
-            if (!committer) {
+            if (author.endsWith('[bot]') || !(await hasWriteAccess(author))) {
               await react('confused');
               await reply('`/skill` is limited to repository committers, and ' +
                 `\`${author}\` does not have write access.`);
@@ -454,4 +475,30 @@ jobs:
             }
             core.info(`posted ${inline.length} inline comments and ` +
               `${unanchored.length} body findings`);
+
+            // The move copies replaceStateLabel in pr-triage-apply.yml: one
+            // setLabels call that drops the other S-* label, so a racing /ready
+            // converges on one state instead of leaving both.
+            const LABEL_REVIEW = 'S-waiting-on-review';
+            const LABEL_AUTHOR = 'S-waiting-on-author';
+            if (payload.flip_author_label === true
+                && counts.critical + counts.warning > 0
+                && !pr.data.draft) {
+              try {
+                const live = await withRetry(() => github.paginate(
+                  github.rest.issues.listLabelsOnIssue,
+                  { owner, repo, issue_number: prNumber, per_page: 100 },
+                ), 'listLabelsOnIssue');
+                const labels = live.map((l) => l.name)
+                  .filter((name) => name !== LABEL_REVIEW && name !== LABEL_AUTHOR);
+                labels.push(LABEL_AUTHOR);
+                await withRetry(() => github.rest.issues.setLabels({
+                  owner, repo, issue_number: prNumber, labels,
+                }), `setLabels ${LABEL_AUTHOR}`);
+                core.info(`state label: ${LABEL_AUTHOR}`);
+              } catch (e) {
+                // The review already landed, and /author still works by hand.
+                core.warning(`could not set ${LABEL_AUTHOR}: ${e.message}`);
+              }
+            }
             await react('+1');

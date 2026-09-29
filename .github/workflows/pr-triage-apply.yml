@@ -37,19 +37,22 @@ name: PR Triage Apply
 #   /author                        — flip state to S-waiting-on-author
 #
 # Auth gate:
-#   /request-review, /ready  -> org MEMBER / repo COLLABORATOR/OWNER, or PR author
-#   /author                  -> CONTRIBUTOR / MEMBER / COLLABORATOR / OWNER
+#   /request-review, /ready  -> repo write access, org MEMBER / repo
+#                               COLLABORATOR/OWNER, or PR author
+#   /author                  -> repo write access, or CONTRIBUTOR / MEMBER /
+#                               COLLABORATOR / OWNER
 #                               (anyone with author_association=CONTRIBUTOR has
 #                               at least one merged commit and is trusted to
 #                               flip any PR back to the author queue, matching
 #                               the implicit /author from a changes_requested
 #                               review)
-#   changes_requested review -> CONTRIBUTOR / MEMBER / COLLABORATOR / OWNER
+#   changes_requested review -> repo write access, or CONTRIBUTOR / MEMBER /
+#                               COLLABORATOR / OWNER
 #
 # Review state (pull_request_review.submitted):
-#   A changes_requested review by a prior contributor (CONTRIBUTOR or
-#   above, never a bot) acts as an implicit /author. An explicit command
-#   in the review body overrides it.
+#   A changes_requested review by a committer or a prior contributor
+#   (CONTRIBUTOR or above, never a bot) acts as an implicit /author. An
+#   explicit command in the review body overrides it.
 #
 # Feedback:
 #   On issue_comment commands the workflow reacts on the comment: +1 when
@@ -730,10 +733,15 @@ jobs:
             // commands as committer or PR author — would let bots
             // self-flip review state.
             const isBot = /\[bot\]$/.test(commentAuthor);
-            const isCommitter = COMMITTER_ASSOCS.has(commentAssoc) && !isBot;
+            // The resolve step reads the association through this token,
+            // which cannot see a private org membership, so a committer can
+            // read as CONTRIBUTOR or NONE. Write access admits them.
+            const isCommitter = !isBot && (COMMITTER_ASSOCS.has(commentAssoc)
+              || await hasWriteAccess(commentAuthor));
             // Permitted to drive the implicit changes_requested flip;
             // see REVIEW_AUTHOR_ASSOCS.
-            const isReviewFlipper = REVIEW_AUTHOR_ASSOCS.has(commentAssoc) && !isBot;
+            const isReviewFlipper = isCommitter
+              || (REVIEW_AUTHOR_ASSOCS.has(commentAssoc) && !isBot);
 
             // Live state read. The artifact carries the webhook-frozen
             // payload at delivery time, plus we now have ~30s of

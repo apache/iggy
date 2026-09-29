@@ -29,10 +29,9 @@ use std::rc::Rc;
 
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -265,9 +264,6 @@ where
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_groups,
         ),
-        // No on-demand flush primitive exists, and flush has no HTTP route, so
-        // this arm is the only thing answering `FeatureUnavailable` for it.
-        FLUSH_UNSAVED_BUFFER_CODE => Err(IggyError::FeatureUnavailable),
         // A replicated code smuggled inside a `NonReplicated` header keeps the
         // builder's `FeatureUnavailable`; a table-listed code with no arm above
         // and an unknown code are both refused as `InvalidCommand`. The builder
@@ -446,7 +442,6 @@ mod tests {
         let allow = Verdict::Allow;
         let unauthenticated = Verdict::Deny(IggyError::Unauthenticated.as_code());
         let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
-        let feature_unavailable = Verdict::Deny(IggyError::FeatureUnavailable.as_code());
         vec![
             (PING_CODE, invalid_command, invalid_command),
             (GET_STATS_CODE, unauthenticated, allow),
@@ -482,11 +477,6 @@ mod tests {
                 GET_CONSUMER_OFFSET_ROUTING_CODE,
                 invalid_command,
                 invalid_command,
-            ),
-            (
-                FLUSH_UNSAVED_BUFFER_CODE,
-                feature_unavailable,
-                feature_unavailable,
             ),
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),

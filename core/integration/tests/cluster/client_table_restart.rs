@@ -810,7 +810,10 @@ async fn given_many_recovered_members_when_expiring_should_drain_without_another
 ) {
     // Exceeds the per-pass logout cap, so recovery needs multiple passes.
     const MEMBER_COUNT: u32 = 300;
-    const DRAIN_BUDGET: Duration = Duration::from_secs(4);
+    // Below the 5s heartbeat interval. Every logout is a persisted, replicated
+    // commit, so a slow disk stretches the drain. Only a pass that waits for
+    // the next interval leaves the member count flat this long.
+    const STALL_BUDGET: Duration = Duration::from_secs(4);
     const FIRST_EXPIRY_BUDGET: Duration = Duration::from_secs(45);
     let observer = harness.root_client_for_node(0).await.unwrap();
     create_liveness_group(&observer).await;
@@ -846,15 +849,20 @@ async fn given_many_recovered_members_when_expiring_should_drain_without_another
         );
         sleep(RETRY_PAUSE).await;
     }
-    let deadline = Instant::now() + DRAIN_BUDGET;
+    let mut remaining = MEMBER_COUNT;
+    let mut last_drop = Instant::now();
     loop {
-        let remaining = liveness_group(&observer).await.members_count;
-        if remaining == 0 {
+        let current = liveness_group(&observer).await.members_count;
+        if current == 0 {
             break;
         }
+        if current < remaining {
+            remaining = current;
+            last_drop = Instant::now();
+        }
         assert!(
-            Instant::now() < deadline,
-            "cleanup waited another interval with {remaining} members remaining"
+            last_drop.elapsed() < STALL_BUDGET,
+            "cleanup stalled for {STALL_BUDGET:?} with {remaining} members remaining"
         );
         sleep(RETRY_PAUSE).await;
     }

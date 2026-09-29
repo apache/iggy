@@ -15,10 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde::{Deserialize, Serialize};
+extension UnsafeRawBufferPointer {
+    /// The little-endian word at `offset`, which both hashes read from
+    /// arbitrary positions of the input and the secret.
+    @inline(__always)
+    func loadLittleEndianUInt32(at offset: Int) -> UInt32 {
+        UInt32(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+    }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FlushUnsavedBuffer {
-    pub partition_id: u32,
-    pub fsync: bool,
+    @inline(__always)
+    func loadLittleEndianUInt64(at offset: Int) -> UInt64 {
+        UInt64(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+    }
 }
