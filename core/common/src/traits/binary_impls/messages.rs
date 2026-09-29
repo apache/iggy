@@ -28,11 +28,11 @@ use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
 use bytes::BytesMut;
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::SEND_MESSAGES_CODE;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
-use iggy_binary_protocol::codes::{FLUSH_UNSAVED_BUFFER_CODE, SEND_MESSAGES_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
-    FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 
@@ -398,25 +398,6 @@ impl<B: BinaryClient> MessageClient for B {
             .send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
             .await?;
         Ok(committed_send_confirmations(&response))
-    }
-
-    async fn flush_unsaved_buffer(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        fsync: bool,
-    ) -> Result<(), IggyError> {
-        fail_if_not_authenticated(self).await?;
-        let req = FlushUnsavedBufferRequest {
-            stream_id: identifier_to_wire(stream_id)?,
-            topic_id: identifier_to_wire(topic_id)?,
-            partition_id,
-            fsync,
-        };
-        self.send_raw_with_response(FLUSH_UNSAVED_BUFFER_CODE, req.to_bytes())
-            .await?;
-        Ok(())
     }
 }
 

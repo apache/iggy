@@ -52,7 +52,6 @@ import { deleteOffset } from './offset/delete-offset.command.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
-import { flushUnsavedBuffers } from './message/flush-unsaved-buffers.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
@@ -182,8 +181,7 @@ type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
-  send: sendMessages(c),
-  flushUnsavedBuffers: flushUnsavedBuffers(c)
+  send: sendMessages(c)
 });
 
 type MessageAPI = ReturnType<typeof messageAPI>;

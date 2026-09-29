@@ -26,7 +26,7 @@ mod types;
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
 use axum::http::{HeaderName, header};
-use iggy_common::{HeaderKey, HeaderValue};
+use iggy_common::{HeaderKey, HeaderValue, MAX_PAYLOAD_SIZE};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source,
     source_connector,
@@ -70,7 +70,10 @@ pub const BUFFER_CAPACITY_LIMIT: usize = 1_000_000;
 /// until it hits this many messages. Nothing is allocated up front, so an
 /// oversized value costs a longer drain rather than a large empty buffer.
 pub const MAX_BATCH_SIZE_LIMIT: usize = 100_000;
-pub const MAX_BODY_SIZE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+/// Iggy's own payload cap, because a body becomes the message payload byte
+/// for byte. The runtime cannot send a larger one, and it NACKs the whole
+/// batch around it on every replay.
+pub const MAX_BODY_SIZE_BYTES_LIMIT: usize = MAX_PAYLOAD_SIZE as usize;
 
 pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
@@ -905,7 +908,7 @@ impl HttpSource {
     ///
     /// A batch that can never be delivered would replay forever, but this
     /// connector rejects malformed work at the door rather than mid-stream:
-    /// oversized bodies get 413 before a handler runs, headers are clamped on
+    /// an empty body gets 400 and an oversized one 413, headers are clamped on
     /// accept, and `Schema::Raw` cannot fail to decode.
     fn on_nack(&self) -> Result<(), Error> {
         let mut staged = self.lock_staged();
@@ -1352,7 +1355,7 @@ mod tests {
             ),
             (
                 "max_body_size_bytes",
-                r#"{"listen_addr": "0.0.0.0:9090", "max_body_size_bytes": 67108865}"#,
+                r#"{"listen_addr": "0.0.0.0:9090", "max_body_size_bytes": 64000001}"#,
             ),
         ] {
             assert!(

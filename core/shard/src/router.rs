@@ -125,7 +125,7 @@ where
     /// build excludes the `simulator` feature and this method.
     #[cfg(any(test, feature = "simulator"))]
     pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
-        (self.on_client_request)(client_id, message);
+        self.host.on_client_request(client_id, message);
     }
 
     /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
@@ -810,14 +810,14 @@ where
                     self.id, 0,
                     "MetadataSubmit must only be processed on shard 0"
                 );
-                (self.on_metadata_submit)(submit);
+                self.host.on_metadata_submit(submit);
             }
             LifecycleFrame::ListClients { reply } => {
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
                 // (wired by the server) reads this shard's `SessionManager`
                 // and pushes the list over `reply`.
-                (self.on_list_clients)(reply);
+                self.host.on_list_clients(reply);
             }
             LifecycleFrame::PartitionRead {
                 namespace,

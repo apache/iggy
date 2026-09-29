@@ -382,6 +382,7 @@ mod ffi {
         created_at: u64,
         status: UserStatus,
         username: String,
+        options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -391,6 +392,7 @@ mod ffi {
         username: String,
         has_permissions: bool,
         permissions: Permissions,
+        options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -604,13 +606,6 @@ mod ffi {
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
         ) -> Result<SendMessagesResponse>;
-        fn flush_unsaved_buffer(
-            self: &Client,
-            stream_id: Identifier,
-            topic_id: Identifier,
-            partition_id: u32,
-            fsync: bool,
-        ) -> Result<()>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
         fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
@@ -656,6 +651,7 @@ mod ffi {
             username: String,
             has_status: bool,
             status: UserStatus,
+            options: Vec<HeaderEntry>,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,
