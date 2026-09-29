@@ -17,6 +17,11 @@
 
 codecov:
   require_ci_to_pass: false
+  notify:
+    # Codecov edits its PR comment after every processed upload, and the
+    # pre-merge coverage legs finish minutes apart. Hold the comment and
+    # statuses until codecov-notify.yml sends one trigger per finished run.
+    manual_trigger: true
 
 coverage:
   precision: 2

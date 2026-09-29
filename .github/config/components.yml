@@ -336,6 +336,17 @@ components:
       - "foreign/cpp/**"
     tasks: ["lint", "build", "test"]
 
+  sdk-swift:
+    depends_on:
+      - "rust-sdk" # Swift SDK depends on core SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
+    paths:
+      - "foreign/swift/**"
+      - "bdd/swift/**"
+      - "examples/swift/**"
+    tasks: ["lint", "test", "build", "build-macos", "golden"]
+
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:
     paths:

@@ -388,6 +388,12 @@ pub struct PartitionsConfig {
     pub path_layout: PartitionPathLayout,
 }
 
+/// Directory names under a partition's root; fixed, because existing data
+/// directories were written with them.
+const OFFSETS_DIR: &str = "offsets";
+const CONSUMER_OFFSETS_DIR: &str = "consumers";
+const CONSUMER_GROUP_OFFSETS_DIR: &str = "groups";
+
 impl PartitionsConfig {
     #[must_use]
     pub fn get_partition_path(
@@ -429,6 +435,48 @@ impl PartitionsConfig {
         format!(
             "{}/{start_offset:0>20}.index",
             self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Root of the partition's consumer-offset directories.
+    #[must_use]
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{OFFSETS_DIR}",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Directory holding one offset file per consumer.
+    #[must_use]
+    pub fn get_consumer_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{CONSUMER_OFFSETS_DIR}",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Directory holding one offset file per consumer group.
+    #[must_use]
+    pub fn get_consumer_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{CONSUMER_GROUP_OFFSETS_DIR}",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }
 }

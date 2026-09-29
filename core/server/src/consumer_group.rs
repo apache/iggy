@@ -25,6 +25,9 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
+pub mod lease;
+pub mod liveness;
+
 use crate::namespace::{resolve_offset_group_id, resolve_partition_namespace};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
@@ -85,6 +88,7 @@ where
                 group_id: wire.group_id,
                 client_id,
                 in_flight,
+                session: Some(request.header().session),
             }
             .to_bytes()
         }
@@ -301,8 +305,8 @@ mod tests {
     use shard::metrics::ShardMetrics;
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
-        LifecycleFrame, PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardIdentity,
-        channel, shard_channel,
+        LifecycleFrame, NoopHost, PartitionConsensusConfig, ReplicaTopology, ShardFrame,
+        ShardIdentity, channel, shard_channel,
     };
 
     use super::*;
@@ -783,10 +787,7 @@ mod tests {
             TestShard::new(
                 ShardIdentity::new(0, "consumer-group-test".to_string()),
                 bus.clone(),
-                Rc::new(|_, _| {}),
-                Rc::new(|_, _| {}),
-                Rc::new(|_| {}),
-                Rc::new(|_| {}),
+                Rc::new(NoopHost),
                 metadata,
                 partitions,
                 vec![sender],
@@ -881,6 +882,7 @@ mod tests {
                     group_id: GROUP_ID,
                     client_id: FIRST_CLIENT,
                     in_flight: Vec::new(),
+                    session: None,
                 }
                 .to_bytes(),
             ))

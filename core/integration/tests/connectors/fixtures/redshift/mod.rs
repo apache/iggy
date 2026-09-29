@@ -19,7 +19,7 @@ mod container;
 mod redshift_mock;
 mod sink;
 
-pub use container::{MinioContainer, PostgresContainer, RedshiftContainer};
+pub use container::{PostgresContainer, RedshiftContainer};
 pub use sink::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
     RedshiftSinkVarbyteFixture,

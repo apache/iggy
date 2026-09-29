@@ -15,26 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
-using Apache.Iggy.Exceptions;
-using Apache.Iggy.Tests.Integrations.Fixtures;
-using Shouldly;
+extension UnsafeRawBufferPointer {
+    /// The little-endian word at `offset`, which both hashes read from
+    /// arbitrary positions of the input and the secret.
+    @inline(__always)
+    func loadLittleEndianUInt32(at offset: Int) -> UInt32 {
+        UInt32(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+    }
 
-namespace Apache.Iggy.Tests.Integrations;
-
-public class FlushMessagesTests
-{
-    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
-    public required IggyServerFixture Fixture { get; init; }
-
-    [Test]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task FlushUnsavedBuffer_Should_Throw_FeatureUnavailable(Protocol protocol)
-    {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
-
-        await Should.ThrowAsync<FeatureUnavailableException>(() =>
-            client.FlushUnsavedBufferAsync(Identifier.String("any-stream"),
-                Identifier.String("any-topic"), 1, false));
+    @inline(__always)
+    func loadLittleEndianUInt64(at offset: Int) -> UInt64 {
+        UInt64(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt64.self))
     }
 }

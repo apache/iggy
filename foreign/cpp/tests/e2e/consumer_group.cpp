@@ -1566,7 +1566,6 @@ TEST_F(E2E_ConsumerGroup, StoreConsumerOffsetWithoutPermissionThrowsWithoutChang
     const std::string password    = "secret123";
     auto client                   = GetLoggedInHighLevelClient();
     auto *message_client          = GetLoggedInClient();
-    auto *user_admin_client       = GetLoggedInClient();
     const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
@@ -1583,8 +1582,7 @@ TEST_F(E2E_ConsumerGroup, StoreConsumerOffsetWithoutPermissionThrowsWithoutChang
                                                   partition_id_bytes(0), std::move(messages)));
     ASSERT_NO_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::String(stream_name),
                                                iggy::Identifier::String(topic_name), 0, 1));
-    ASSERT_NO_THROW(CreateUser(user_admin_client, username, password, iggy::ffi::UserStatus::Active, true,
-                               iggy::ffi::Permissions{}));
+    ASSERT_NO_THROW(CreateUser(client, username, password, iggy::UserStatus::Active, iggy::Permissions{}));
     auto restricted_client = GetLoggedInHighLevelClient(username, password);
 
     ASSERT_THROW(restricted_client.StoreConsumerOffset(consumer, iggy::Identifier::String(stream_name),
@@ -1723,7 +1721,6 @@ TEST_F(E2E_ConsumerGroup, GetConsumerOffsetWithoutPermissionThrows) {
     const std::string password    = "secret123";
     auto client                   = GetLoggedInHighLevelClient();
     auto *message_client          = GetLoggedInClient();
-    auto *user_admin_client       = GetLoggedInClient();
     const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
@@ -1737,8 +1734,7 @@ TEST_F(E2E_ConsumerGroup, GetConsumerOffsetWithoutPermissionThrows) {
                                                   partition_id_bytes(0), std::move(messages)));
     ASSERT_NO_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::String(stream_name),
                                                iggy::Identifier::String(topic_name), 0, 0));
-    ASSERT_NO_THROW(CreateUser(user_admin_client, username, password, iggy::ffi::UserStatus::Active, true,
-                               iggy::ffi::Permissions{}));
+    ASSERT_NO_THROW(CreateUser(client, username, password, iggy::UserStatus::Active, iggy::Permissions{}));
     auto restricted_client = GetLoggedInHighLevelClient(username, password);
 
     ASSERT_THROW(restricted_client.GetConsumerOffset(consumer, iggy::Identifier::String(stream_name),
@@ -2000,7 +1996,6 @@ TEST_F(E2E_ConsumerGroup, DeleteConsumerOffsetWithoutPermissionThrowsWithoutRemo
     const std::string password    = "secret123";
     auto client                   = GetLoggedInHighLevelClient();
     auto *message_client          = GetLoggedInClient();
-    auto *user_admin_client       = GetLoggedInClient();
     const auto consumer           = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
@@ -2017,8 +2012,7 @@ TEST_F(E2E_ConsumerGroup, DeleteConsumerOffsetWithoutPermissionThrowsWithoutRemo
                                                   partition_id_bytes(0), std::move(messages)));
     ASSERT_NO_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::String(stream_name),
                                                iggy::Identifier::String(topic_name), 0, 1));
-    ASSERT_NO_THROW(CreateUser(user_admin_client, username, password, iggy::ffi::UserStatus::Active, true,
-                               iggy::ffi::Permissions{}));
+    ASSERT_NO_THROW(CreateUser(client, username, password, iggy::UserStatus::Active, iggy::Permissions{}));
     auto restricted_client = GetLoggedInHighLevelClient(username, password);
 
     ASSERT_THROW(restricted_client.DeleteConsumerOffset(consumer, iggy::Identifier::String(stream_name),

@@ -302,16 +302,6 @@ public class HttpMessageStream : IIggyClient
                ?? throw new InvalidResponseException("Send messages reply carried no confirmation body.");
     }
 
-    /// <summary>
-    ///     This feature is not supported by the server.
-    /// </summary>
-    /// <exception cref="FeatureUnavailableException"></exception>
-    public Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
-        CancellationToken token = default)
-    {
-        throw new FeatureUnavailableException();
-    }
-
     /// <inheritdoc />
     public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
