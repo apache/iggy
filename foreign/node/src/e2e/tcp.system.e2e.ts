@@ -48,6 +48,11 @@ describe('e2e -> system', async () => {
     );
   });
 
+  it('e2e -> system::snapshot', async () => {
+    const data = await c.system.snapshot();
+    assert.ok(data.length > 0);
+  });
+
   it('e2e -> system::logout', async () => {
     assert.ok(await c.session.logout());
   });
