@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::{Instant, timeout_at};
 
-use crate::bridge::TopicProbe;
+use crate::bridge::iggy_bridge::TopicProbe;
 
 /// How long a probe counts as new, and how often a waiting Fetch asks for one.
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(100);

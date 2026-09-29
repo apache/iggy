@@ -36,7 +36,7 @@ mod produce;
 mod topics;
 
 use fetch::FetchPool;
-pub use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
@@ -186,10 +186,12 @@ impl IggyBridge {
     ///
     /// Returns [`BridgeError::Timeout`] if it takes longer than `REQUEST_TIMEOUT`. Returns
     /// [`BridgeError::Iggy`] if the underlying client reports a shutdown failure (e.g. the socket
-    /// was already in a state that rejects a clean shutdown).
+    /// was already in a state that rejects a clean shutdown). Every client is shut down even when
+    /// one fails, and the error is the first one.
     pub async fn close(self) -> Result<(), BridgeError> {
-        self.fetch_pool.close().await?;
-        with_request_timeout(self.client.shutdown()).await
+        let fetch_clients = self.fetch_pool.close().await;
+        let shared_client = with_request_timeout(self.client.shutdown()).await;
+        fetch_clients.and(shared_client)
     }
 }
 

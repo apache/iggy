@@ -93,10 +93,11 @@ const MAX_VARINT_BYTES: usize = 5;
 const MAX_VARLONG_BYTES: usize = 10;
 /// Base offset, batch length, leader epoch, magic, CRC, attributes, last offset delta, first and
 /// max timestamp, producer id, producer epoch, base sequence and record count.
-pub const BATCH_HEADER_BYTES: usize = 61;
-/// Widest v2 record framing: five varints at five bytes each, an attributes byte, and the header
-/// count varint, before the key, the value and the header bytes.
-const RECORD_FRAMING_BYTES: usize = 31;
+pub(crate) const BATCH_HEADER_BYTES: usize = 61;
+/// Widest v2 record framing before the key, the value and the header bytes: the length, offset
+/// delta, key length, value length and header count varints, the timestamp delta varlong, and the
+/// attributes byte.
+const RECORD_FRAMING_BYTES: usize = 5 * MAX_VARINT_BYTES + MAX_VARLONG_BYTES + 1;
 /// Widest per-header framing inside a v2 record: a name length and a value length varint.
 const HEADER_FRAMING_BYTES: usize = 10;
 
@@ -995,7 +996,7 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
 ///
 /// Fetch sums these against its byte budget before it encodes.
 #[must_use]
-pub fn record_size_bound(record: &Record) -> usize {
+pub(crate) fn record_size_bound(record: &Record) -> usize {
     let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
     RECORD_FRAMING_BYTES
         + field(record.key.as_ref())

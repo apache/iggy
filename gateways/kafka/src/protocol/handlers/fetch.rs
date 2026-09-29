@@ -35,8 +35,9 @@ use kafka_protocol::records::Record;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
+use crate::bridge::iggy_bridge::{FetchSlot, PartitionProbe};
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, FetchSlot, IggyBridge, PartitionProbe};
+use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_FETCH, ApiVersionRange, ERROR_FETCH_SESSION_ID_NOT_FOUND,
@@ -748,9 +749,9 @@ impl<'a> Reader<'a> {
                 served(want.partition, polled.high_watermark, batch)
             }
             Err(error) => {
-                let until = hold_until(Instant::now(), self.fetch.max_wait);
                 let stuck = &self.fetch.state.stuck_offsets;
-                let first = hold(stuck, want.topic, index, offset, until);
+                let now = Instant::now();
+                let first = hold(stuck, want.topic, index, offset, now, self.fetch.max_wait);
                 log_stuck(first, want.topic, index, offset, &error);
                 refused(want.partition, ERROR_UNKNOWN_SERVER_ERROR)
             }
@@ -848,13 +849,13 @@ impl<'a> Reader<'a> {
     ) -> PartitionData {
         let code = refusal(want.topic, error);
         if code == ERROR_UNKNOWN_SERVER_ERROR {
-            let until = hold_until(Instant::now(), self.fetch.max_wait);
             hold(
                 &self.fetch.state.stuck_offsets,
                 want.topic,
                 index,
                 offset,
-                until,
+                Instant::now(),
+                self.fetch.max_wait,
             );
         }
         refused(want.partition, code)
@@ -943,19 +944,85 @@ const fn empty_poll(
     }
 }
 
-/// Per Kafka topic and partition, a spell of answers that found it not ready.
-#[derive(Debug, Default)]
-pub(crate) struct Spells {
-    by_partition: HashMap<(String, u32), Spell>,
-    /// The size at which the next new spell sweeps first.
+/// Per Kafka topic, then partition, so a lookup takes a `&str` and allocates nothing.
+///
+/// A new key first sweeps out the entries its caller no longer needs, once the map has doubled
+/// since the last sweep. Sweeps then cost O(1) per new key.
+#[derive(Debug)]
+pub(crate) struct PartitionMap<T> {
+    by_topic: HashMap<String, HashMap<u32, T>>,
+    /// Entries across every topic.
+    len: usize,
+    /// The size at which the next new key sweeps first.
     sweep_at: usize,
 }
 
-/// No sweep below this many spells.
-const MIN_SPELL_SWEEP: usize = 1024;
+/// No sweep below this many entries.
+const MIN_SWEEP: usize = 1024;
+
+impl<T> Default for PartitionMap<T> {
+    fn default() -> Self {
+        Self {
+            by_topic: HashMap::new(),
+            len: 0,
+            sweep_at: MIN_SWEEP,
+        }
+    }
+}
+
+impl<T> PartitionMap<T> {
+    fn get(&self, topic: &str, partition: u32) -> Option<&T> {
+        self.by_topic.get(topic)?.get(&partition)
+    }
+
+    fn get_mut(&mut self, topic: &str, partition: u32) -> Option<&mut T> {
+        self.by_topic.get_mut(topic)?.get_mut(&partition)
+    }
+
+    /// Stores `value` for `partition` of `topic`, and returns the value it replaces. A new key may
+    /// first sweep out every entry that `live` rejects.
+    fn insert(
+        &mut self,
+        topic: &str,
+        partition: u32,
+        value: T,
+        live: impl FnMut(&T) -> bool,
+    ) -> Option<T> {
+        if let Some(entry) = self.get_mut(topic, partition) {
+            return Some(std::mem::replace(entry, value));
+        }
+        if self.len >= self.sweep_at {
+            self.sweep(live);
+        }
+        match self.by_topic.get_mut(topic) {
+            Some(partitions) => {
+                partitions.insert(partition, value);
+            }
+            None => {
+                self.by_topic
+                    .insert(topic.to_owned(), HashMap::from([(partition, value)]));
+            }
+        }
+        self.len += 1;
+        None
+    }
+
+    fn sweep(&mut self, mut live: impl FnMut(&T) -> bool) {
+        self.by_topic.retain(|_, partitions| {
+            partitions.retain(|_, value| live(value));
+            !partitions.is_empty()
+        });
+        self.len = self.by_topic.values().map(HashMap::len).sum();
+        // Twice what is left, so sweeps cost O(1) per new key.
+        self.sweep_at = self.len.saturating_mul(2).max(MIN_SWEEP);
+    }
+}
+
+/// Per Kafka topic and partition, a spell of answers that found it not ready.
+pub(crate) type Spells = PartitionMap<Spell>;
 
 #[derive(Debug, Clone, Copy)]
-struct Spell {
+pub(crate) struct Spell {
     first: Instant,
     last: Instant,
 }
@@ -963,23 +1030,17 @@ struct Spell {
 /// How long `partition` of `topic` reads as not ready, as of `now`. Zero for a new spell. A spell
 /// ends once the partition goes [`RELOAD_GRACE`] without reading so.
 fn spell(spells: &Mutex<Spells>, topic: &str, partition: u32, now: Instant) -> Duration {
-    let key = (topic.to_owned(), partition);
     let mut spells = spells.lock().unwrap_or_else(PoisonError::into_inner);
-    if !spells.by_partition.contains_key(&key) && spells.by_partition.len() >= spells.sweep_at {
-        spells
-            .by_partition
-            .retain(|_, spell| now.saturating_duration_since(spell.last) < RELOAD_GRACE);
-        // Twice what is left, so sweeps cost O(1) per new spell.
-        spells.sweep_at = spells
-            .by_partition
-            .len()
-            .saturating_mul(2)
-            .max(MIN_SPELL_SWEEP);
-    }
-    let spell = spells.by_partition.entry(key).or_insert(Spell {
-        first: now,
-        last: now,
-    });
+    let Some(spell) = spells.get_mut(topic, partition) else {
+        let fresh = Spell {
+            first: now,
+            last: now,
+        };
+        spells.insert(topic, partition, fresh, |spell| {
+            now.saturating_duration_since(spell.last) < RELOAD_GRACE
+        });
+        return Duration::ZERO;
+    };
     if now.saturating_duration_since(spell.last) >= RELOAD_GRACE {
         spell.first = now;
     }
@@ -1010,7 +1071,7 @@ fn log_not_ready(first: bool, topic: &str, partition: u32, offset: u64) {
 }
 
 /// Per Kafka topic, then partition, where a partition last answered -1.
-pub(crate) type StuckOffsets = Mutex<HashMap<String, HashMap<u32, Stuck>>>;
+pub(crate) type StuckOffsets = PartitionMap<Stuck>;
 
 /// A partition answered -1 at `offset`. Until `until`, it answers -1 there without a read.
 #[derive(Debug, Clone, Copy)]
@@ -1019,24 +1080,44 @@ pub(crate) struct Stuck {
     until: Instant,
 }
 
-/// Holds `partition` of `topic` at `offset` until `until`. `true` if it did not stop there before.
-fn hold(stuck: &StuckOffsets, topic: &str, partition: u32, offset: u64, until: Instant) -> bool {
-    let before = stuck
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(topic.to_owned())
-        .or_default()
-        .insert(partition, Stuck { offset, until });
+/// Holds `partition` of `topic` at `offset` for a wait of `max_wait` that starts at `now`. `true`
+/// if it did not stop there before.
+///
+/// A sweep forgets a stop once its hold ended [`MAX_WAIT`] ago. A consumer still stuck there asks
+/// again within its own wait, so it keeps the stop and logs no second `warn!`.
+fn hold(
+    stuck: &Mutex<StuckOffsets>,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+    now: Instant,
+    max_wait: Duration,
+) -> bool {
+    let stop = Stuck {
+        offset,
+        until: hold_until(now, max_wait),
+    };
+    let before = stuck.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        topic,
+        partition,
+        stop,
+        |held| now.saturating_duration_since(held.until) < MAX_WAIT,
+    );
     before.is_none_or(|before| before.offset != offset)
 }
 
 /// Whether `partition` of `topic` answered -1 at `offset` and its hold runs at `now`.
-fn held(stuck: &StuckOffsets, topic: &str, partition: u32, offset: u64, now: Instant) -> bool {
+fn held(
+    stuck: &Mutex<StuckOffsets>,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+    now: Instant,
+) -> bool {
     stuck
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(topic)
-        .and_then(|partitions| partitions.get(&partition))
+        .get(topic, partition)
         .is_some_and(|held| held.offset == offset && now < held.until)
 }
 
@@ -1296,7 +1377,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::bridge::TopicProbe;
+    use crate::bridge::iggy_bridge::TopicProbe;
     use crate::protocol::probe_board::ProbeBoard;
     use crate::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
@@ -1916,19 +1997,74 @@ mod tests {
 
     #[test]
     fn given_a_minus_one_when_asked_again_should_hold_the_partition_until_the_wait_ends() {
-        let stuck = StuckOffsets::default();
+        let stuck = Mutex::default();
         let now = Instant::now();
-        let until = now + Duration::from_millis(500);
-        assert!(hold(&stuck, "a", 0, 7, until), "a new stop");
+        let wait = Duration::from_millis(500);
+        let until = now + wait;
+        assert!(hold(&stuck, "a", 0, 7, now, wait), "a new stop");
         assert!(held(&stuck, "a", 0, 7, now));
         assert!(!held(&stuck, "a", 0, 7, until), "the hold ended");
         assert!(!held(&stuck, "a", 0, 8, now), "another offset");
         assert!(!held(&stuck, "a", 1, 7, now), "another partition");
         assert!(!held(&stuck, "b", 0, 7, now), "another topic");
-        assert!(!hold(&stuck, "a", 0, 7, until), "the same stop");
+        assert!(!hold(&stuck, "a", 0, 7, now, wait), "the same stop");
         assert!(
-            hold(&stuck, "a", 0, 9, until),
+            hold(&stuck, "a", 0, 9, now, wait),
             "moved on, then stopped again"
+        );
+    }
+
+    #[test]
+    fn given_a_full_partition_map_when_a_new_key_comes_should_sweep_out_the_dead_entries() {
+        let mut map = PartitionMap::default();
+        for partition in 0..MIN_SWEEP - 1 {
+            let partition = u32::try_from(partition).unwrap();
+            assert_eq!(map.insert("dead", partition, false, |_| false), None);
+        }
+        assert_eq!(map.len, MIN_SWEEP - 1, "no sweep below MIN_SWEEP");
+        map.insert("live", 0, true, |&live| live);
+
+        assert_eq!(
+            map.insert("live", 0, true, |&live| live),
+            Some(true),
+            "a replaced entry sweeps nothing"
+        );
+        assert_eq!(map.len, MIN_SWEEP);
+
+        map.insert("new", 0, true, |&live| live);
+        assert_eq!(map.get("dead", 0), None, "swept");
+        assert!(
+            !map.by_topic.contains_key("dead"),
+            "an empty topic goes too"
+        );
+        assert_eq!(map.get("live", 0), Some(&true));
+        assert_eq!(map.get("new", 0), Some(&true));
+        assert_eq!(map.len, 2);
+        assert_eq!(map.sweep_at, MIN_SWEEP);
+    }
+
+    #[test]
+    fn given_many_stuck_partitions_when_they_sweep_should_forget_only_stops_past_the_longest_wait()
+    {
+        let stuck = Mutex::default();
+        let start = Instant::now();
+        let wait = Duration::from_millis(500);
+        for partition in 0..MIN_SWEEP - 1 {
+            let partition = u32::try_from(partition).unwrap();
+            hold(&stuck, "gone", partition, 7, start, wait);
+        }
+        hold(&stuck, "retried", 0, 7, start + MAX_WAIT, wait);
+
+        // "gone" ended its hold more than MAX_WAIT ago, "retried" one second ago.
+        let now = start + MAX_WAIT + wait + Duration::from_secs(1);
+        assert!(hold(&stuck, "new", 0, 7, now, wait), "a new stop sweeps");
+        assert!(
+            !hold(&stuck, "retried", 0, 7, now, wait),
+            "a retried stop keeps its first warn"
+        );
+        assert!(
+            hold(&stuck, "gone", 0, 7, now, wait),
+            "a forgotten stop warns again"
         );
     }
 

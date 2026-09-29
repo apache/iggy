@@ -74,14 +74,15 @@ impl FetchPool {
         })
     }
 
-    /// Shuts down each client that connected.
+    /// Shuts down each client that connected, and returns the first error. A client that fails to
+    /// shut down stops none of the others.
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
-        for client in &self.all {
-            if let Some(client) = client.0.get() {
-                with_request_timeout(client.shutdown()).await?;
-            }
+        let mut closed = Ok(());
+        for client in self.all.iter().filter_map(|client| client.0.get()) {
+            let shutdown = with_request_timeout(client.shutdown()).await;
+            closed = closed.and(shutdown);
         }
-        Ok(())
+        closed
     }
 }
 
@@ -183,7 +184,7 @@ impl FromIterator<(u32, PartitionProbe)> for TopicProbe {
 
 impl IggyBridge {
     /// A Fetch read slot, with its own client. `None` if none frees by `deadline`.
-    pub async fn fetch_slot(&self, deadline: Instant) -> Option<FetchSlot> {
+    pub(crate) async fn fetch_slot(&self, deadline: Instant) -> Option<FetchSlot> {
         self.fetch_pool.take(deadline).await
     }
 
@@ -195,7 +196,7 @@ impl IggyBridge {
     /// [`BridgeError::InvalidKafkaTopicName`] if the name fails Kafka's rules.
     /// [`BridgeError::Iggy`] if the stream or topic is missing, or the call fails.
     /// [`BridgeError::Timeout`] past `REQUEST_TIMEOUT`.
-    pub async fn probe(&self, kafka_topic: &str) -> Result<TopicProbe, BridgeError> {
+    pub(crate) async fn probe(&self, kafka_topic: &str) -> Result<TopicProbe, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
         let probe = self.probe_target(&target).await?;
         // A load lasts. A commit that raced the read does not.
@@ -236,7 +237,7 @@ impl IggyBridge {
     /// The errors are those of [`Self::probe`]. A partition the topic lacks is
     /// [`BridgeError::Iggy`] here. The poll stops at `deadline` too, so a result that comes then
     /// is [`BridgeError::Timeout`].
-    pub async fn poll(
+    pub(crate) async fn poll(
         self: &Arc<Self>,
         slot: FetchSlot,
         kafka_topic: &str,

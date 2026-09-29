@@ -23,14 +23,17 @@ use super::IggyBridge;
 use crate::bridge::error::BridgeError;
 
 impl IggyBridge {
-    /// The high watermark of each of `partitions`, in the same order, from one [`Self::probe`].
+    /// The high watermark of each of `partitions`, in the same order, from one `probe` of the
+    /// topic.
     ///
     /// `i64`, as `ListOffsets` sends it. A partition the topic lacks, or one Iggy loads, fails
     /// alone.
     ///
     /// # Errors
     ///
-    /// As [`Self::probe`].
+    /// [`BridgeError::InvalidKafkaTopicName`] if the name fails Kafka's rules.
+    /// [`BridgeError::Iggy`] if the stream or topic is missing, or the call fails.
+    /// [`BridgeError::Timeout`] past `REQUEST_TIMEOUT`.
     pub async fn high_watermarks(
         &self,
         kafka_topic: &str,

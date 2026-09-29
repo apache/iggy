@@ -309,7 +309,7 @@ pub struct GatewayState {
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
     /// Partitions that answered -1 to Fetch, per Kafka topic.
-    pub(crate) stuck_offsets: fetch::StuckOffsets,
+    pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
     /// Per Kafka topic and partition, how long Fetch finds it not ready.
     pub(crate) not_ready: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
@@ -338,7 +338,7 @@ impl GatewayState {
             producer_ids: ProducerIdAllocator::new(instance_id),
             produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
             groups,
-            stuck_offsets: fetch::StuckOffsets::default(),
+            stuck_offsets: Mutex::default(),
             not_ready: Mutex::default(),
             probe_board: ProbeBoard::default(),
         }
