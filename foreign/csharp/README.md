@@ -148,6 +148,50 @@ await client.ConnectAsync();
 TCP applies the connection, heartbeat, TLS, and auto-login settings. HTTP `ConnectAsync` does no
 network work and requires explicit login. For TLS configuration, see the [TcpTls example](../../examples/csharp/README.md#tcptls).
 
+### Connection String
+
+A TCP client can also be created from the connection string format shared with the other SDKs. The
+credentials become the auto-login settings, so the client signs in on `ConnectAsync`:
+
+```c#
+using var client = IggyClientFactory.CreateClient("iggy://iggy:iggy@127.0.0.1:8090");
+await client.ConnectAsync();
+
+// A personal access token instead of a username and password, plus options
+using var tokenClient = IggyClientFactory.CreateClient(
+    "iggy+tcp://iggypat-your-token@127.0.0.1:8090?heartbeat_interval=10s&reconnection_retries=5");
+
+// Parse into a configurator to adjust the remaining settings
+var config = IggyClientConfigurator.FromConnectionString("iggy://iggy:iggy@127.0.0.1:8090");
+config.LoggerFactory = loggerFactory;
+```
+
+| Option                  | Default     | Description                                                                    |
+|-------------------------|-------------|--------------------------------------------------------------------------------|
+| `tls`                   | `false`     | `true` or `false`                                                              |
+| `tls_domain`            | server host | Server name for the TLS handshake, used for every node the client dials        |
+| `tls_ca_file`           | empty       | CA certificate path, read when connecting, required with `tls=true`            |
+| `reconnection_retries`  | `unlimited` | Count or `unlimited`. `0` turns reconnection off, also after a lost connection |
+| `reconnection_interval` | `1s`        | Fixed delay between attempts and before the first redial, at least `1ms`       |
+| `heartbeat_interval`    | `5s`        | Between `1ms` and about 49 days                                                |
+| `reestablish_after`     | -           | Validated, then ignored. `reconnection_interval` paces the first redial        |
+| `nodelay`               | -           | Validated, then ignored. The client always disables Nagle                      |
+
+`reestablish_after` and `nodelay` are accepted so that strings shared with other SDKs keep parsing, but
+they change nothing. The client has no `reestablish_after` window after a lost connection, and it always opens
+sockets with `NoDelay`, so `nodelay=false` does not turn Nagle back on even though the Rust and Node.js SDKs leave
+Nagle on by default.
+
+`reconnection_retries=0` differs from the Rust SDK. After a lost connection, Rust still makes one reconnect
+attempt, but this client fails the request at once.
+
+Reconnection uses no exponential backoff, and after each reconnect the client waits
+`ReconnectionSettings.WaitAfterReconnect` (1 second by default). Credentials are taken literally: they are
+not percent-decoded and must not contain `@` or `:`. Bracketed IPv6 hosts such as
+`iggy://iggy:iggy@[::1]:8090` are accepted. Durations look like `500ms`, `5s` or `1m30s`. Only `iggy://` and
+`iggy+tcp://` are supported. A malformed string throws `FormatException`, whose message never
+contains the connection string.
+
 ## Viewstamped Replication (VSR)
 
 Over TCP every request is wrapped in a 256-byte consensus header, the client registers a consensus session at
