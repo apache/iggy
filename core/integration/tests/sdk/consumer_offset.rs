@@ -135,6 +135,53 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
             stored_offset_after_delete, None,
             "{consumer:?} stored offset should be gone after delete over every transport"
         );
+
+        // HTTP has no persistent connection to fence a group-offset write to,
+        // so store/delete/poll should reject consumer_kind=consumer_group.
+        if consumer.kind == ConsumerKind::ConsumerGroup
+            && harness.transport().expect("harness transport") == TransportProtocol::Http
+        {
+            let store_error = client
+                .store_consumer_offset(
+                    consumer,
+                    &stream_id,
+                    &topic_id,
+                    Some(OFFSET_PARTITION_ID),
+                    offset,
+                )
+                .await
+                .expect_err("HTTP store must reject a consumer-group kind");
+            assert!(
+                matches!(store_error, IggyError::HttpResponseError(400, _)),
+                "expected a 400 rejection for HTTP store with consumer_kind=consumer_group, got {store_error:?}"
+            );
+
+            let delete_error = client
+                .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+                .await
+                .expect_err("HTTP delete must reject a consumer-group kind");
+            assert!(
+                matches!(delete_error, IggyError::HttpResponseError(400, _)),
+                "expected a 400 rejection for HTTP delete with consumer_kind=consumer_group, got {delete_error:?}"
+            );
+
+            let poll_error = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    Some(OFFSET_PARTITION_ID),
+                    consumer,
+                    &PollingStrategy::first(),
+                    1,
+                    false,
+                )
+                .await
+                .expect_err("HTTP poll must reject a consumer-group kind");
+            assert!(
+                matches!(poll_error, IggyError::HttpResponseError(400, _)),
+                "expected a 400 rejection for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
+            );
+        }
     }
 }
 

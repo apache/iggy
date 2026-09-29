@@ -1286,9 +1286,13 @@ pub(in crate::http) async fn poll_messages(
 /// optional `partition_id`).
 ///
 /// A non-replicated read served in band, mirroring [`poll_messages`]. A
-/// missing offset is the legacy 404, which the SDK reads as `None`. An owner
-/// that does not hold the partition yet answers 503 `TransientNotAccepted`,
-/// as TCP does, so it never reads as `None`.
+/// missing offset (never stored, or the partition unknown to its owner) is
+/// the legacy 404: the TCP path replies an empty body the SDK decodes as
+/// `None`, and the legacy HTTP server renders that `None` as
+/// `CustomError::ResourceNotFound`. Unlike poll/store/delete,
+/// `consumer_kind=consumer_group` is allowed, because a group offset read needs
+/// no held connection, so it is not member-fenced
+/// ([`resolve_consumer_offset_request`]).
 pub(in crate::http) async fn get_consumer_offset(
     State(state): State<HttpState>,
     identity: Identity,
