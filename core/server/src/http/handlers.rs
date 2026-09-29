@@ -1324,8 +1324,9 @@ pub(in crate::http) async fn poll_messages(
 
 /// `GET /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: fetch a
 /// consumer's stored offset as the same `ConsumerOffsetInfo` JSON the legacy
-/// server returns. The query is the same flattened `GetConsumerOffset` shape
-/// the legacy server accepts (`consumer_id`, optional `partition_id`).
+/// server returns. The query is the flattened `GetConsumerOffset` shape
+/// (`consumer_id`, optional `consumer_kind` defaulting to `consumer`,
+/// optional `partition_id`).
 ///
 /// A non-replicated read served in band, mirroring [`poll_messages`]. A
 /// missing offset (never stored, or the partition unknown to its owner) is

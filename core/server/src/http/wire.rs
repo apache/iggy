@@ -96,9 +96,6 @@ pub(in crate::http) fn encode_send_messages(
 
 /// Map a validated HTTP poll query onto the wire `PollMessagesRequest` the
 /// shared TCP resolver consumes, so both transports resolve one request shape.
-/// The query's consumer kind is structurally always `Consumer`
-/// (`Consumer::kind` is `#[serde(skip)]` - the flattened `kind` param names
-/// the polling strategy), matching the legacy HTTP server.
 pub(in crate::http) fn poll_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
@@ -143,10 +140,8 @@ pub(in crate::http) fn consumer_offset_wire_request(
 
 /// Map a validated HTTP store-offset body onto the wire request
 /// (`StoreConsumerOffsetRequest`), `ack` pinned to `Quorum` so the route can
-/// await the committed reply. The body's consumer kind is structurally always
-/// `Consumer` (`Consumer::kind` is `#[serde(skip)]`), matching the legacy HTTP
-/// server; `partition_id` passes through as the wire `Option` (flag byte +
-/// u32) for the server-side resolvers to ground.
+/// await the committed reply. `partition_id` passes through as the wire
+/// `Option` (flag byte + u32) for the server-side resolvers to ground.
 pub(in crate::http) fn store_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
@@ -435,6 +430,54 @@ mod tests {
         let wire = consumer_offset_wire_request(&stream_id, &topic_id, &query).expect("maps");
         assert_eq!(wire.partition_id, Some(DEFAULT_PARTITION_ID));
         assert_eq!(wire.consumer.kind, 1);
+    }
+
+    #[test]
+    fn consumer_offset_wire_request_maps_consumer_group_kind() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::numeric(1).expect("valid topic id");
+        let query = GetConsumerOffset {
+            consumer: Consumer::group(Identifier::numeric(7).expect("valid id")),
+            partition_id: Some(2),
+        };
+        let wire = consumer_offset_wire_request(&stream_id, &topic_id, &query).expect("maps");
+        assert_eq!(wire.consumer.kind, 2);
+        assert_eq!(wire.partition_id, Some(2));
+    }
+
+    #[test]
+    fn get_consumer_offset_query_parses_consumer_kind_param() {
+        let uri: Uri = "/streams/1/topics/1/consumer-offsets?consumer_id=my-group&consumer_kind=consumer_group&partition_id=0"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<GetConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::ConsumerGroup);
+        assert_eq!(
+            query.consumer.id,
+            Identifier::named("my-group").expect("valid id")
+        );
+    }
+
+    #[test]
+    fn get_consumer_offset_query_defaults_consumer_kind_when_omitted() {
+        let uri: Uri = "/streams/1/topics/1/consumer-offsets?consumer_id=42"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<GetConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::Consumer);
+    }
+
+    #[test]
+    fn store_consumer_offset_json_body_round_trips_consumer_group_kind() {
+        let json = serde_json::json!({
+            "consumer_id": "my-group",
+            "consumer_kind": "consumer_group",
+            "partition_id": 0,
+            "offset": 42,
+        });
+        let command: StoreConsumerOffset =
+            serde_json::from_value(json).expect("valid StoreConsumerOffset body");
+        assert_eq!(command.consumer.kind, ConsumerKind::ConsumerGroup);
     }
 
     #[test]
