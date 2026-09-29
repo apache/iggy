@@ -63,14 +63,14 @@ async fn given_json_batch_when_consumed_should_write_single_json_lines_object_to
         .await
         .expect("messages should be sent");
 
-    let stored = fixture
-        .wait_for_object(0, 1)
-        .await
-        .expect("OpenDAL batch object should be written");
-    assert_eq!(
-        stored,
-        br#"{"payload":{"id":1}}
+    fixture
+        .wait_for_object(
+            0,
+            1,
+            br#"{"payload":{"id":1}}
 {"payload":{"id":2}}
-"#
-    );
+"#,
+        )
+        .await
+        .expect("OpenDAL batch object should contain the expected payload");
 }

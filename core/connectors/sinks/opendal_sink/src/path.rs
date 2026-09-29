@@ -62,29 +62,28 @@ fn render_template(template: &str, context: &PathContext<'_>) -> Result<String, 
     let timestamp_millis = (context.first_timestamp_micros / 1_000).to_string();
 
     Ok(template
-        .replace("{stream}", &sanitize_path_segment(context.stream))
-        .replace("{topic}", &sanitize_path_segment(context.topic))
+        .replace("{stream}", &encode_path_segment(context.stream))
+        .replace("{topic}", &encode_path_segment(context.topic))
         .replace("{partition}", &context.partition_id.to_string())
         .replace("{date}", &date)
         .replace("{hour}", &hour)
         .replace("{timestamp}", &timestamp_millis))
 }
 
-fn sanitize_path_segment(segment: &str) -> String {
-    segment
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric()
-                || character == '.'
-                || character == '_'
-                || character == '-'
-            {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn encode_path_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    encoded
 }
 
 fn timestamp_to_datetime(micros: u64) -> Result<DateTime<Utc>, Error> {
@@ -122,9 +121,22 @@ mod tests {
 
         assert_eq!(
             path,
-            "archive/event_stream/orders_eu/7/2024-03-16/14/1710597600000/\
+            "archive/event%20stream/orders%2Feu/7/2024-03-16/14/1710597600000/\
              00007-00000000000000000042-00000000000000000084.jsonl"
         );
+    }
+
+    #[test]
+    fn given_distinct_path_segments_when_encoded_should_remain_distinct() {
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+        assert_eq!(encode_path_segment("a_b"), "a_b");
+        assert_ne!(encode_path_segment("a b"), encode_path_segment("a_b"));
+    }
+
+    #[test]
+    fn given_traversal_segment_when_encoded_should_not_form_parent_path() {
+        assert_eq!(encode_path_segment(".."), "%2E%2E");
+        assert_eq!(encode_path_segment("../orders"), "%2E%2E%2Forders");
     }
     #[test]
     fn given_out_of_range_timestamp_when_building_path_should_return_error() {

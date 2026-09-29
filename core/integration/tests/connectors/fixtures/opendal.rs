@@ -43,19 +43,24 @@ impl OpenDalSinkFixture {
         &self,
         offset_start: u64,
         offset_end: u64,
-    ) -> Result<Vec<u8>, TestBinaryError> {
+        expected: &[u8],
+    ) -> Result<(), TestBinaryError> {
         let path = self.object_path(offset_start, offset_end);
 
         for _ in 0..POLL_ATTEMPTS {
             match tokio::fs::read(&path).await {
-                Ok(payload) => return Ok(payload),
+                Ok(payload) if payload == expected => return Ok(()),
+                Ok(_) => sleep(POLL_INTERVAL).await,
                 Err(error) if error.kind() == ErrorKind::NotFound => sleep(POLL_INTERVAL).await,
                 Err(source) => return Err(TestBinaryError::FileSystemError { path, source }),
             }
         }
 
         Err(TestBinaryError::InvalidState {
-            message: format!("OpenDAL object was not written: {}", path.display()),
+            message: format!(
+                "OpenDAL object did not contain the expected payload: {}",
+                path.display()
+            ),
         })
     }
 

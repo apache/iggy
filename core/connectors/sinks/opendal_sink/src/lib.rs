@@ -18,6 +18,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -62,7 +63,7 @@ pub struct OpenDalSinkConfig {
     pub include_metadata: bool,
     #[serde(default)]
     pub include_headers: bool,
-    #[serde(default)]
+    #[serde(default, alias = "max_retries")]
     pub max_attempts: Option<u32>,
     #[serde(default)]
     pub retry_delay: Option<String>,
@@ -96,7 +97,7 @@ pub struct OpenDalSink {
     retry_policy: RetryPolicy,
     verbose: bool,
     operator: Option<Operator>,
-    output_format: Option<OutputFormat>,
+    formatter: Option<formatter::Formatter>,
     messages_processed: AtomicU64,
     write_errors: AtomicU64,
 }
@@ -125,7 +126,7 @@ impl OpenDalSink {
                 max_delay: MAX_BACKOFF,
             },
             verbose,
-            output_format: None,
+            formatter: None,
             operator: None,
             messages_processed: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
@@ -138,7 +139,7 @@ impl OpenDalSink {
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
-        output_format: OutputFormat,
+        formatter: &formatter::Formatter,
     ) -> Result<(), Error> {
         let Some(first_message) = messages.first() else {
             return Ok(());
@@ -158,22 +159,9 @@ impl OpenDalSink {
             &context,
             first_message.offset,
             last_offset,
-            output_format,
+            formatter.output_format(),
         )?;
-        let entries = messages
-            .iter()
-            .map(|message| {
-                formatter::format_message(
-                    message,
-                    topic_metadata,
-                    messages_metadata,
-                    self.config.include_metadata,
-                    self.config.include_headers,
-                    output_format,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let data = formatter::finalize_buffer(entries.iter().map(Vec::as_slice), output_format);
+        let data = formatter.format_batch(messages, topic_metadata, messages_metadata)?;
         let buffer = Buffer::from(data);
         let retry_context = format!("{CONNECTOR_NAME} connector ID {} batch write", self.id);
 
@@ -212,12 +200,13 @@ impl Sink for OpenDalSink {
         }
 
         let output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
+        let formatter = formatter::Formatter::new(
+            output_format,
+            self.config.include_metadata,
+            self.config.include_headers,
+        );
         opendal::install_default();
-        let options = self
-            .config
-            .options
-            .iter()
-            .map(|(key, value)| (key.clone(), value.expose_secret().to_owned()));
+        let options = operator_options(service, &self.config.options);
         let operator = Operator::via_iter(service, options).map_err(|error| {
             Error::InitError(format!(
                 "Failed to create OpenDAL service '{service}': {error}"
@@ -230,18 +219,12 @@ impl Sink for OpenDalSink {
             )));
         }
 
-        operator.check().await.map_err(|error| {
-            Error::InitError(format!(
-                "OpenDAL service '{service}' connectivity check failed: {error}"
-            ))
-        })?;
-
         info!(
             "Opened {CONNECTOR_NAME} connector ID: {}, service: {service}, root: {}",
             self.id,
             operator.info().root()
         );
-        self.output_format = Some(output_format);
+        self.formatter = Some(formatter);
         self.operator = Some(operator);
         Ok(())
     }
@@ -257,9 +240,9 @@ impl Sink for OpenDalSink {
                 "OpenDAL operator is not initialized".to_string(),
             ));
         };
-        let Some(output_format) = self.output_format else {
+        let Some(formatter) = self.formatter.as_ref() else {
             return Err(Error::InitError(
-                "OpenDAL output format is not initialized".to_string(),
+                "OpenDAL formatter is not initialized".to_string(),
             ));
         };
         if messages.is_empty() {
@@ -286,7 +269,7 @@ impl Sink for OpenDalSink {
                 topic_metadata,
                 &messages_metadata,
                 &messages,
-                output_format,
+                formatter,
             )
             .await
         {
@@ -313,9 +296,9 @@ impl Sink for OpenDalSink {
 
     async fn close(&mut self) -> Result<(), Error> {
         self.operator.take();
-        self.output_format.take();
+        self.formatter.take();
         info!(
-            "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, errors: {}",
+            "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, failed_messages: {}",
             self.id,
             self.messages_processed.load(Ordering::Relaxed),
             self.write_errors.load(Ordering::Relaxed)
@@ -334,6 +317,31 @@ fn default_output_format() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn operator_options(
+    service: &str,
+    options: &BTreeMap<String, SecretString>,
+) -> Vec<(String, String)> {
+    let mut ret = Vec::with_capacity(options.len() + 1);
+    ret.extend(
+        options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.expose_secret().to_owned())),
+    );
+
+    if service.eq_ignore_ascii_case("fs")
+        && !options.contains_key("atomic_write_dir")
+        && let Some(root) = options.get("root")
+    {
+        let atomic_write_dir = Path::new(root.expose_secret())
+            .join(".iggy-opendal-tmp")
+            .to_string_lossy()
+            .into_owned();
+        ret.push(("atomic_write_dir".to_string(), atomic_write_dir));
+    }
+
+    ret
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,7 +466,7 @@ mod tests {
             let mut sink = OpenDalSink::new(1, config);
 
             let server = async {
-                for request_index in 0..3 {
+                for request_index in 0..2 {
                     let (mut connection, _) = listener
                         .accept()
                         .await
@@ -469,38 +477,19 @@ mod tests {
                         .await
                         .expect("test server should read the request");
                     let request = String::from_utf8_lossy(&request[..bytes_read]);
+                    assert!(request.starts_with("PUT "));
 
                     let (status, headers, body) = match request_index {
-                        0 => {
-                            assert!(request.starts_with("GET "));
-                            (
-                                "200 OK",
-                                "",
-                                concat!(
-                                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-                                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
-                                    "<Name>test-bucket</Name><Prefix></Prefix><KeyCount>0</KeyCount>",
-                                    "<MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated>",
-                                    "</ListBucketResult>"
-                                ),
-                            )
-                        }
-                        1 => {
-                            assert!(request.starts_with("PUT "));
-                            (
-                                "500 Internal Server Error",
-                                "",
-                                concat!(
-                                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-                                    "<Error><Code>InternalError</Code>",
-                                    "<Message>temporary failure</Message></Error>"
-                                ),
-                            )
-                        }
-                        2 => {
-                            assert!(request.starts_with("PUT "));
-                            ("200 OK", "ETag: \"test-etag\"\r\n", "")
-                        }
+                        0 => (
+                            "500 Internal Server Error",
+                            "",
+                            concat!(
+                                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                                "<Error><Code>InternalError</Code>",
+                                "<Message>temporary failure</Message></Error>"
+                            ),
+                        ),
+                        1 => ("200 OK", "ETag: \"test-etag\"\r\n", ""),
                         _ => unreachable!(),
                     };
                     let response = format!(
@@ -542,7 +531,7 @@ mod tests {
                 timeout(Duration::from_secs(5), server),
                 timeout(Duration::from_secs(5), client)
             );
-            server_result.expect("OpenDAL should complete three requests");
+            server_result.expect("OpenDAL should complete two write requests");
             client_result.expect("OpenDAL operations should finish");
         });
     }
@@ -618,6 +607,10 @@ mod tests {
             let root = temp_dir.path().to_string_lossy();
             let mut sink = OpenDalSink::new(1, test_config(&root));
             sink.open().await.expect("sink should open");
+            assert!(
+                temp_dir.path().join(".iggy-opendal-tmp").is_dir(),
+                "filesystem writes should use the default atomic directory"
+            );
 
             let topic_metadata = TopicMetadata {
                 stream: "events".to_string(),
