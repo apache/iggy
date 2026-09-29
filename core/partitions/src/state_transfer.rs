@@ -58,7 +58,7 @@ use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::mem::size_of;
@@ -2411,6 +2411,7 @@ pub(crate) struct PendingInstall {
     next_offset: u64,
     phase: InstallPhase,
     drain: Option<crate::PersistenceDrain>,
+    synced_files: BTreeSet<PathBuf>,
     directory_handle: Option<compio::fs::File>,
     offset_dirs_changed: [bool; ConsumerKind::COUNT],
     /// Published with the offsets, replacing the local receipt table.
@@ -3334,7 +3335,7 @@ where
                     if install.drain.is_none() {
                         // Checkpoint syncs may be skipped when the frontier is unchanged.
                         // The backup still needs proof from each original writer.
-                        self.barrier_install_files_locked();
+                        install.synced_files = self.barrier_install_files_locked();
                         install.disposition = InstallDisposition::Backup;
                     }
                     self.start_persistence();
@@ -3346,6 +3347,12 @@ where
                             install.phase = InstallPhase::Backup;
                         }
                         Ok(false) => step = crate::PartitionIoStep::Pending,
+                        Err(source)
+                            if source.kind() == std::io::ErrorKind::TimedOut
+                                && persistence.failure().is_none() =>
+                        {
+                            step = crate::PartitionIoStep::Pending;
+                        }
                         Err(source) => self.fail_install(
                             &mut install,
                             PartitionInstallError::SwapIo {
@@ -3620,6 +3627,7 @@ where
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
                     begin: true,
+                    synced_files: install.synced_files.clone(),
                 }),
                 InstallFilePhase::Backup,
             ),
@@ -3767,6 +3775,7 @@ where
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
                     begin: false,
+                    synced_files: BTreeSet::new(),
                 }),
                 InstallFilePhase::FinishBackup,
             ),
@@ -4325,6 +4334,7 @@ where
             next_offset,
             phase: InstallPhase::StageOffsets(0),
             drain: None,
+            synced_files: BTreeSet::new(),
             directory_handle: None,
             offset_dirs_changed: [false; ConsumerKind::COUNT],
             retry_table: Some(retry_table),
@@ -4360,11 +4370,19 @@ where
                 },
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &self.persistence {
-                        if let Err(source) = persistence.drain_with_timeout().await
-                            && let Some(crate::iggy_partition::PendingPartitionTransition::Install(
+                        if let Err(source) = persistence.drain_with_timeout().await {
+                            if source.kind() == std::io::ErrorKind::TimedOut
+                                && persistence.failure().is_none()
+                            {
+                                return Err(PartitionInstallError::SwapIo {
+                                    path: self.partition_dir.clone().unwrap_or_default(),
+                                    source,
+                                });
+                            }
+                            if let Some(crate::iggy_partition::PendingPartitionTransition::Install(
                                 mut install,
                             )) = self.transition.take()
-                        {
+                            {
                             let error = PartitionInstallError::SwapIo {
                                 path: install.partition_dir.clone(),
                                 source,
@@ -4373,6 +4391,7 @@ where
                             self.transition = Some(
                                 crate::iggy_partition::PendingPartitionTransition::Install(install),
                             );
+                            }
                         }
                     } else {
                         return Err(PartitionInstallError::SwapIo {
