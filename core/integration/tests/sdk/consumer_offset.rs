@@ -90,8 +90,14 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
     let standalone_consumer = Consumer::new(Identifier::named(CONSUMER_NAME).unwrap());
     let group_consumer = Consumer::group(group_id.clone());
 
-    for (consumer, offset) in [(&standalone_consumer, 2_u64), (&group_consumer, 4_u64)] {
-        client
+    // The group consumer must commit and delete through `seed_client`, the
+    // connection that actually joined the group: the server fences a
+    // group-offset write to the calling connection's own membership.
+    for (consumer, offset, owner) in [
+        (&standalone_consumer, 2_u64, &client),
+        (&group_consumer, 4_u64, &seed_client),
+    ] {
+        owner
             .store_consumer_offset(
                 consumer,
                 &stream_id,
@@ -114,7 +120,7 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
             "{consumer:?} stored offset should be readable over every transport"
         );
 
-        client
+        owner
             .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
             .await
             .unwrap();
