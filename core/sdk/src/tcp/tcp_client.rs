@@ -40,7 +40,7 @@ use iggy_binary_protocol::codes::{
 #[cfg(test)]
 use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
-use iggy_common::request_budget::{request_budget_deadline, with_request_budget};
+use iggy_common::request_budget::RequestBudget;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     IdKind, Identifier, IggyDuration, IggyError, IggyTimestamp, NonZeroIggyDuration,
@@ -282,8 +282,8 @@ impl BinaryTransport for TcpClient {
         // The configured request timeout currently covers TCP login/register
         // and credentialed connect, including their retries. Other requests
         // keep the response-read limit unless their caller supplies a budget.
-        if is_login_register_code(code) && request_budget_deadline().is_none() {
-            return with_request_budget(
+        if is_login_register_code(code) && RequestBudget::deadline().is_none() {
+            return RequestBudget::run(
                 self.request_timeout(),
                 || self.expire_request(),
                 self.send_raw_with_response_inner(code, payload),
@@ -336,7 +336,7 @@ impl TcpClient {
         }
 
         let error = result.unwrap_err();
-        if request_budget_deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        if RequestBudget::deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
         {
             return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
@@ -387,10 +387,7 @@ impl TcpClient {
         let _routing_guard = if nested_connect {
             None
         } else {
-            Some(
-                with_request_budget(None, || {}, async { Ok(self.routing_lock.lock().await) })
-                    .await?,
-            )
+            Some(self.routing_lock.lock().await)
         };
         if !nested_connect && self.connect_coordinator.is_active() {
             self.connect().await?;
@@ -400,7 +397,7 @@ impl TcpClient {
             drop(_routing_guard);
             return self.send_raw(code, payload).await;
         }
-        with_request_budget(None, || {}, self.disconnect_transport()).await?;
+        self.disconnect_transport().await?;
 
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
@@ -440,12 +437,8 @@ impl TcpClient {
     }
 
     async fn wait_before_login_replay(result: &Result<Bytes, IggyError>) -> Result<(), IggyError> {
-        if result.is_err() && request_budget_deadline().is_some() {
-            with_request_budget(None, || {}, async {
-                sleep(NOT_READY_RETRY_INTERVAL).await;
-                Ok(())
-            })
-            .await?;
+        if result.is_err() && RequestBudget::deadline().is_some() {
+            sleep(NOT_READY_RETRY_INTERVAL).await;
         }
         Ok(())
     }
@@ -711,8 +704,8 @@ impl TcpClient {
     }
 
     async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
-        if request_budget_deadline().is_none() && self.request_policy().has_sign_in_credentials() {
-            return with_request_budget(
+        if RequestBudget::deadline().is_none() && self.request_policy().has_sign_in_credentials() {
+            return RequestBudget::run(
                 self.request_timeout(),
                 || self.expire_request(),
                 Box::pin(self.connect_with_settlement_inner(settle_off_leader)),
@@ -749,18 +742,9 @@ impl TcpClient {
                             }
                             self.connect_inner(context).await
                         };
-                        let result = with_request_budget(None, || {}, operation).await;
+                        let result = operation.await;
                         if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
-                            // A transport task may still hold the stream
-                            // lock. Mark it stale now so its next user
-                            // discards it without extending this deadline.
-                            self.discard_stream_on_next_lock
-                                .store(true, Ordering::SeqCst);
-                            if let Ok(mut stream) = self.stream.try_lock() {
-                                stream.take();
-                                self.discard_stream_on_next_lock
-                                    .store(false, Ordering::SeqCst);
-                            }
+                            self.request_policy().expire();
                             self.reset_vsr_session().await?;
                             self.set_state(ClientState::Disconnected).await;
                         }
@@ -774,7 +758,7 @@ impl TcpClient {
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         loop {
-            if request_budget_deadline()
+            if RequestBudget::deadline()
                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
             {
                 self.fail_connect().await;
@@ -843,24 +827,11 @@ impl TcpClient {
                     && let Some(remaining) = self.reestablish_wait().await
                 {
                     info!("Trying to connect to the server: {server_address} in: {remaining}");
-                    if let Err(error) = with_request_budget(None, || {}, async {
-                        sleep(remaining.get_duration()).await;
-                        Ok(())
-                    })
-                    .await
-                    {
-                        self.fail_connect().await;
-                        return Err(error);
-                    }
+                    sleep(remaining.get_duration()).await;
                 }
 
                 info!("{NAME} client is connecting to server: {server_address}...");
-                let established = with_request_budget(
-                    None,
-                    || {},
-                    self.establish_bounded(&server_address, &candidates),
-                )
-                .await;
+                let established = self.establish_bounded(&server_address, &candidates).await;
                 match established {
                     Ok(connection) => {
                         let dialed = server_address.clone();
@@ -970,15 +941,7 @@ impl TcpClient {
                          {} endpoint(s) in: {interval_str}",
                         candidates.len(),
                     );
-                    if let Err(error) = with_request_budget(None, || {}, async {
-                        sleep(self.config.reconnection.interval.get_duration()).await;
-                        Ok(())
-                    })
-                    .await
-                    {
-                        self.fail_connect().await;
-                        return Err(error);
-                    }
+                    sleep(self.config.reconnection.interval.get_duration()).await;
                     continue;
                 }
 
@@ -1535,7 +1498,7 @@ impl TcpClient {
         // whole budget: the connect flow owns leader redirection for the
         // sign-in handshake, and reconnecting from underneath it would
         // recurse.
-        let request_deadline = request_budget_deadline();
+        let request_deadline = RequestBudget::deadline();
         if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(IggyError::RequestTimeoutOutcomeUnknown);
         }
@@ -1728,7 +1691,7 @@ impl TcpClient {
     ) {
         let stream = self.stream.clone();
         let discard_stream_on_next_lock = Arc::clone(&self.discard_stream_on_next_lock);
-        let request_deadline = request_budget_deadline();
+        let request_deadline = RequestBudget::deadline();
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
@@ -2389,7 +2352,7 @@ mod tests {
         let payload = Bytes::from(vec![0; payload_size]);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            with_request_budget(
+            RequestBudget::run(
                 Some(client.config.request_timeout),
                 || client.expire_request(),
                 async {

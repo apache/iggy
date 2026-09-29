@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::request_budget::with_request_budget;
+use crate::request_budget::RequestBudget;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::personal_access_tokens_from_wire;
 use crate::{
@@ -94,7 +94,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        with_request_budget(self.request_timeout(), || self.expire_request(), async {
+        RequestBudget::run(self.request_timeout(), || self.expire_request(), async {
             super::logout_before_relogin(self).await?;
             // The request stores a `SecretString` rather than a `WireName`, so the
             // `WireName` bounds are enforced here to keep the u8 length prefix

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::request_budget::with_request_budget;
+use crate::request_budget::RequestBudget;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
 use crate::{
@@ -183,7 +183,7 @@ impl<B: BinaryClient> UserClient for B {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        with_request_budget(self.request_timeout(), || self.expire_request(), async {
+        RequestBudget::run(self.request_timeout(), || self.expire_request(), async {
             super::validate_username(username)?;
             super::validate_password(password)?;
             super::logout_before_relogin(self).await?;

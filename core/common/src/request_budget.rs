@@ -22,45 +22,54 @@ use tokio::time::{Instant, timeout_at};
 use crate::{IggyError, NonZeroIggyDuration};
 
 tokio::task_local! {
-    static REQUEST_DEADLINE: Instant;
+    static REQUEST_BUDGET: RequestBudget;
 }
 
-/// Returns the active request deadline, if this task has a budget.
-pub fn request_budget_deadline() -> Option<Instant> {
-    REQUEST_DEADLINE.try_with(|deadline| *deadline).ok()
+#[derive(Clone, Copy)]
+pub struct RequestBudget {
+    deadline: Instant,
 }
 
-/// Runs a request under its existing deadline, or starts one from `timeout`.
-pub async fn with_request_budget<T>(
-    timeout: Option<NonZeroIggyDuration>,
-    on_expire: impl FnOnce(),
-    future: impl Future<Output = Result<T, IggyError>>,
-) -> Result<T, IggyError> {
-    let existing_deadline = request_budget_deadline();
-    let deadline = existing_deadline
-        .or_else(|| timeout.map(|timeout| Instant::now() + timeout.get_duration()));
-    let Some(deadline) = deadline else {
-        return future.await;
-    };
-    // Login reconnects nest budgeted futures; boxing keeps their stack use bounded.
-    let future = Box::pin(future);
-    let run = async {
-        if deadline <= Instant::now() {
-            return Err(IggyError::RequestTimeoutOutcomeUnknown);
-        }
-        timeout_at(deadline, future)
-            .await
-            .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?
-    };
-    let result = if existing_deadline.is_some() {
-        run.await
-    } else {
-        REQUEST_DEADLINE.scope(deadline, run).await
-    };
-    if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
-        on_expire();
+impl RequestBudget {
+    pub fn deadline() -> Option<Instant> {
+        REQUEST_BUDGET.try_with(|budget| budget.deadline).ok()
     }
-    result
+
+    /// Runs the operation under its caller's deadline, or starts a new one.
+    pub async fn run<T>(
+        timeout: Option<NonZeroIggyDuration>,
+        on_expire: impl FnOnce(),
+        future: impl Future<Output = Result<T, IggyError>>,
+    ) -> Result<T, IggyError> {
+        let existing = REQUEST_BUDGET.try_with(|budget| *budget).ok();
+        let budget = existing.or_else(|| {
+            timeout.map(|timeout| Self {
+                deadline: Instant::now() + timeout.get_duration(),
+            })
+        });
+        let Some(budget) = budget else {
+            return future.await;
+        };
+        // Login reconnects nest budgeted futures; boxing keeps their stack use bounded.
+        let future = Box::pin(future);
+        let run = async {
+            if budget.deadline <= Instant::now() {
+                return Err(IggyError::RequestTimeoutOutcomeUnknown);
+            }
+            timeout_at(budget.deadline, future)
+                .await
+                .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?
+        };
+        let result = if existing.is_some() {
+            run.await
+        } else {
+            REQUEST_BUDGET.scope(budget, run).await
+        };
+        if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
+            on_expire();
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -72,10 +81,10 @@ mod tests {
     #[tokio::test]
     async fn nested_operation_inherits_request_deadline() {
         let timeout = NonZeroIggyDuration::new(Duration::from_secs(1)).unwrap();
-        let result = with_request_budget(Some(timeout), || {}, async {
-            let outer_deadline = request_budget_deadline();
-            let inner_deadline = with_request_budget(Some(timeout), || {}, async {
-                Ok(request_budget_deadline())
+        let result = RequestBudget::run(Some(timeout), || {}, async {
+            let outer_deadline = RequestBudget::deadline();
+            let inner_deadline = RequestBudget::run(Some(timeout), || {}, async {
+                Ok(RequestBudget::deadline())
             })
             .await?;
             assert_eq!(inner_deadline, outer_deadline);
@@ -84,6 +93,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert!(request_budget_deadline().is_none());
+        assert!(RequestBudget::deadline().is_none());
     }
 }
