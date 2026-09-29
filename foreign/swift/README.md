@@ -11,9 +11,11 @@
 Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
 The SDK is built up in stages. This stage carries the package scaffold, the error table,
-the byte codec the wire protocol is encoded with, and native XXH3-64 and XXH32 hashes
-pinned to the Rust crates by golden vectors. The protocol layer, the TCP and TLS client,
-the producer and consumer, examples, and BDD scenarios follow in later changes.
+the byte codec the wire protocol is encoded with, native XXH3-64 and XXH32 hashes pinned
+to the Rust crates by golden vectors, and the domain models (streams, topics, messages,
+user headers, options, permissions) with their wire encodings. The protocol layer, the
+TCP and TLS client, the producer and consumer, examples, and BDD scenarios follow in
+later changes.
 
 ## Requirements
 
