@@ -40,8 +40,7 @@ func (c *IggyTcpClient) GetConsumerOffset(ctx context.Context, consumer iggcon.C
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
-	target := command.GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: partitionId}
-	return c.writeOffset(ctx, &target, &command.StoreConsumerOffsetRequest{
+	return c.writeOffset(ctx, consumer, streamId, topicId, partitionId, &command.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
@@ -51,8 +50,7 @@ func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon
 }
 
 func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
-	target := command.GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: partitionId}
-	return c.writeOffset(ctx, &target, &command.DeleteConsumerOffset{
+	return c.writeOffset(ctx, consumer, streamId, topicId, partitionId, &command.DeleteConsumerOffset{
 		Consumer:    consumer,
 		StreamId:    streamId,
 		TopicId:     topicId,
@@ -65,7 +63,7 @@ func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggco
 // would walk the roster and register a new client identity, which is not a
 // member of the group, so a group commit would be refused and the membership
 // lost.
-func (c *IggyTcpClient) writeOffset(ctx context.Context, target *command.GetConsumerOffset, write command.Command) error {
+func (c *IggyTcpClient) writeOffset(ctx context.Context, consumer iggcon.Consumer, streamId, topicId iggcon.Identifier, partitionId *uint32, write command.Command) error {
 	if !c.topologyKnown.Load() {
 		if _, err := c.GetClusterMetadata(ctx); err != nil {
 			return err
@@ -75,6 +73,7 @@ func (c *IggyTcpClient) writeOffset(ctx context.Context, target *command.GetCons
 		_, err := c.do(ctx, write)
 		return err
 	}
+	target := command.GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: partitionId}
 	routing, err := target.MarshalBinary()
 	if err != nil {
 		return err
