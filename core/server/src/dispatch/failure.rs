@@ -695,10 +695,9 @@ mod tests {
         );
     }
 
-    /// The HTTP mirror (`resync_required_polled_messages` in
-    /// `crate::http::wire`) is a JSON DTO, not a wire frame, so the shared
-    /// contract asserted here is the sentinel constant itself; the DTO's own
-    /// test pins its `partition_id` to the same constant.
+    /// TCP is the only transport that still carries this sentinel. HTTP
+    /// rejects `consumer_kind=consumer_group` polls before a poll ever
+    /// reaches this path (`crate::http::wire::poll_wire_request`).
     #[compio::test]
     async fn resync_sentinel_must_ride_a_status_zero_poll_body_led_by_the_sentinel() {
         let (bus, shard) = shard_at_commit();
