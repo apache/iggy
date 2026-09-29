@@ -958,6 +958,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_terminal_offset_errors_when_routed_should_not_recover_or_replay() {
+        for (code, error) in [
+            (STORE_CONSUMER_OFFSET_CODE, IggyError::InvalidOffset(10)),
+            (
+                DELETE_CONSUMER_OFFSET_CODE,
+                IggyError::ConsumerOffsetNotFound(7),
+            ),
+        ] {
+            let expected_code = error.as_code();
+            let (router, coordinator, request) = fixture([
+                (
+                    Channel::Coordinator,
+                    GET_CONSUMER_OFFSET_ROUTING_CODE,
+                    Ok(routing()),
+                ),
+                (
+                    Channel::Data,
+                    ATTACH_CONSUMER_SESSION_CODE,
+                    Ok(Bytes::new()),
+                ),
+                (Channel::Data, code, Err(error)),
+            ]);
+            let error = routed_request(&router, &coordinator, &request, code)
+                .await
+                .expect_err("obsolete offset mutations must be returned to the caller");
+            assert_eq!(error.as_code(), expected_code);
+            assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
+            assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn acknowledged_metadata_changes_refresh_cached_routes_and_attachments() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
