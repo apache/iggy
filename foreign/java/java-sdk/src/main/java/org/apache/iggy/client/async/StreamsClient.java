@@ -149,4 +149,26 @@ public interface StreamsClient {
      * @throws org.apache.iggy.exception.IggyException if the stream does not exist
      */
     CompletableFuture<Void> deleteStream(StreamId streamId);
+
+    /**
+     * Purges a stream, removing all of its messages while keeping the stream, its
+     * topics, and their partitions in place.
+     *
+     * @param streamId the stream identifier (numeric or string-based)
+     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @throws org.apache.iggy.exception.IggyException if the stream does not exist
+     */
+    default CompletableFuture<Void> purgeStream(Long streamId) {
+        return purgeStream(StreamId.of(streamId));
+    }
+
+    /**
+     * Purges a stream, removing all of its messages while keeping the stream, its
+     * topics, and their partitions in place.
+     *
+     * @param streamId the stream identifier (numeric or string-based)
+     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @throws org.apache.iggy.exception.IggyException if the stream does not exist
+     */
+    CompletableFuture<Void> purgeStream(StreamId streamId);
 }

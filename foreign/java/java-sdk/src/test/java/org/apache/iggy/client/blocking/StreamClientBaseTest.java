@@ -87,4 +87,18 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
         // then
         assertThat(stream).isEmpty();
     }
+
+    @Test
+    void shouldPurgeStreamButKeepIt() {
+        // given
+        var streamDetails = streamsClient.createStream("test-stream");
+        trackStream(streamDetails.id());
+
+        // when
+        streamsClient.purgeStream(streamDetails.id());
+
+        // then: the stream still exists after the purge
+        var streamOptional = streamsClient.getStream(streamDetails.id());
+        assertThat(streamOptional).isPresent();
+    }
 }

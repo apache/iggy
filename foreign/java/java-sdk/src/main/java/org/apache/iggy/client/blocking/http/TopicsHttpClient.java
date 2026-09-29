@@ -102,6 +102,13 @@ class TopicsHttpClient implements TopicsClient {
         httpClient.execute(request);
     }
 
+    @Override
+    public void purgeTopic(StreamId streamId, TopicId topicId) {
+        var request =
+                httpClient.prepareDeleteRequest(STREAMS + "/" + streamId + TOPICS + "/" + topicId + "/purge");
+        httpClient.execute(request);
+    }
+
     /**
      * Renders option values as the strings the REST body carries them in.
      *

@@ -49,4 +49,10 @@ public interface StreamsClient {
     }
 
     void deleteStream(StreamId streamId);
+
+    default void purgeStream(Long streamId) {
+        purgeStream(StreamId.of(streamId));
+    }
+
+    void purgeStream(StreamId streamId);
 }

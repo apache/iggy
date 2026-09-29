@@ -131,7 +131,8 @@ public interface CommandCode {
         GET_ALL(201),
         CREATE(202),
         DELETE(203),
-        UPDATE(204);
+        UPDATE(204),
+        PURGE(205);
 
         private final int value;
 
