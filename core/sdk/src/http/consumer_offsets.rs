@@ -21,6 +21,7 @@ use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo};
@@ -91,12 +92,20 @@ impl ConsumerOffsetClient for HttpClient {
         let partition_id = partition_id
             .map(|id| format!("?partition_id={id}"))
             .unwrap_or_default();
+
         let path = format!(
-            "{}/{}{partition_id}",
+            "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             consumer.id
         );
-        self.delete(&path).await?;
+        self.delete_with_query(
+            &path,
+            &DeleteConsumerOffset {
+                consumer_kind: consumer.kind,
+                partition_id,
+            },
+        )
+        .await?;
         Ok(())
     }
 }

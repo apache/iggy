@@ -34,7 +34,7 @@ use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::wire_conversions::{consumer_to_wire, identifier_to_wire, partitioning_to_wire};
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessageView, PollMessages, PolledMessages,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessageView, PollMessages, PolledMessages,
     RESYNC_REQUIRED_PARTITION_SENTINEL, SendMessages,
 };
 use server_common::Message;
@@ -96,11 +96,15 @@ pub(in crate::http) fn encode_send_messages(
 
 /// Map a validated HTTP poll query onto the wire `PollMessagesRequest` the
 /// shared TCP resolver consumes, so both transports resolve one request shape.
+/// Rejects `consumer_kind=consumer_group` since HTTP has no persistent connection.
 pub(in crate::http) fn poll_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     query: &PollMessages,
 ) -> Result<PollMessagesRequest, IggyError> {
+    if query.consumer.kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::InvalidCommand);
+    }
     Ok(PollMessagesRequest {
         consumer: WireConsumer {
             kind: query.consumer.kind.as_code(),
@@ -417,6 +421,18 @@ mod tests {
         assert_eq!(wire.strategy.value, 0);
         assert_eq!(wire.count, 25);
         assert!(wire.auto_commit);
+    }
+
+    #[test]
+    fn poll_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::from_str_value("orders").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("1").expect("valid topic id");
+        let query = PollMessages {
+            consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
+            ..Default::default()
+        };
+        let error = poll_wire_request(&stream_id, &topic_id, &query).expect_err("must reject");
+        assert!(matches!(error, IggyError::InvalidCommand));
     }
 
     #[test]

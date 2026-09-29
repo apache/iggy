@@ -1196,7 +1196,10 @@ pub(in crate::http) async fn delete_segments(
 /// messages as the same `PolledMessages` JSON the legacy server returns. The
 /// query is the same flattened `PollMessages` shape the legacy server accepts
 /// (`consumer_id`, `partition_id`, strategy `kind`+`value`, `count`,
-/// `auto_commit`); stream and topic come from the path.
+/// `auto_commit`); stream and topic come from the path. `consumer_kind`
+/// defaults to `consumer` and `consumer_group` is rejected (see
+/// [`poll_wire_request`]) since HTTP has no persistent connection and cannot observe
+/// group's partition assignment (that can be subject to change).
 ///
 /// A non-replicated read served in band: the same resolution the TCP dispatch
 /// runs ([`resolve_poll_request`]), then a mesh read on the owning shard and a
@@ -1464,12 +1467,13 @@ pub(in crate::http) async fn store_consumer_offset(
 }
 
 /// `DELETE /streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}`:
-/// delete a consumer's stored offset. The consumer comes from the path and the
-/// optional `partition_id` from the query, the same `DeleteConsumerOffset`
-/// shape the legacy server accepts. Returns 204 on commit, matching the legacy
-/// server; a delete of a never-stored offset is denied by the partition
-/// primary (`ReplyHeader.status`) and renders the legacy typed 404. Same
-/// replicated partition write as [`store_consumer_offset`].
+/// delete a consumer's stored offset. The consumer id comes from the path and the
+/// optional `consumer_kind` (defaulting to `consumer`) and `partition_id` come
+/// from the query, the same `DeleteConsumerOffset` shape the legacy server
+/// accepts. Returns 204 on commit, matching the legacy server; a delete of a
+/// never-stored offset is denied by the partition primary
+/// (`ReplyHeader.status`) and renders the legacy typed 404. Same replicated
+/// partition write as [`store_consumer_offset`].
 pub(in crate::http) async fn delete_consumer_offset(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1488,11 +1492,10 @@ pub(in crate::http) async fn delete_consumer_offset(
         Permissioner::delete_consumer_offset,
     )
     .map_err(PartitionWriteError::Rejected)?;
-    // `Consumer::new` fixes the kind to `Consumer`, exactly as the legacy
-    // handler does; HTTP cannot express a group-kind offset op.
-    let consumer = Consumer::new(
-        Identifier::from_str_value(&consumer_id).map_err(PartitionWriteError::Rejected)?,
-    );
+    let consumer = Consumer {
+        kind: query.consumer_kind,
+        id: Identifier::from_str_value(&consumer_id).map_err(PartitionWriteError::Rejected)?,
+    };
     let request = delete_offset_wire_request(&stream_id, &topic_id, &consumer, query.partition_id)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();
