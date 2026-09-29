@@ -106,8 +106,8 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
         var streamDetails = streamsClient.createStream("test-stream");
         trackStream(streamDetails.id());
         var streamId = StreamId.of(streamDetails.id());
-        var topicDetails = client.topics().createTopic(
-                streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
+        var topicDetails = client.topics()
+                .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
         var topicId = TopicId.of(topicDetails.id());
         var messagesClient = client.messages();
         messagesClient.sendMessages(
