@@ -63,12 +63,23 @@ mod stream;
 mod transform;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const CONNECTOR_PREFIX_PATTERN: &str = "IGGY_CONNECTORS";
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(author = "Apache Iggy", version)]
+    /// Print supported configuration environment variables and exit.
+    ///
+    /// Lists all supported IGGY_* environment variable names and templates,
+    /// sorted and deduplicated. Template syntax:
+    /// - <N> represents vector indices
+    /// - <KEY> represents connector keys (uppercased from config)
+    /// - <FIELD> represents plugin configuration field names
+    ///
+    /// Exits immediately before any startup.
+
 struct Args {
     /// Print supported configuration environment variables and exit.
     #[arg(long)]
@@ -157,7 +168,7 @@ fn print_config_env_vars() {
     .flat_map(|(kind, templates)| {
         templates
             .iter()
-            .map(move |template| format!("IGGY_CONNECTORS_{kind}_<KEY>_{}", template.env_name))
+            .map(move |template| format!("{CONNECTOR_PREFIX_PATTERN}_{kind}_<KEY>_{}", template.env_name))
             .chain(std::iter::once(format!(
                 "IGGY_CONNECTORS_{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
             )))
