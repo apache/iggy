@@ -2808,8 +2808,8 @@ class Stats:
         The number of file descriptors the server process holds open.
 
         0 when unknown. Where the kernel cannot count them without a scan
-        (Linux before 6.2, macOS), this is the count from the server's last
-        periodic sysinfo log line.
+        (Linux before 6.2, macOS), the server scans at least every 10 seconds,
+        so the count can be 10 seconds old.
         """
     @property
     def open_files_limit(self) -> builtins.int:

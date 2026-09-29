@@ -33,7 +33,7 @@ use crate::segment_anchor::ANCHOR_EXTENSION;
 use crate::state_transfer::STAGING_SUFFIX;
 use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -495,7 +495,8 @@ impl From<IggyError> for PartitionRecoveryError {
 }
 
 /// A persisted segment recovered from disk: its metadata plus the storage
-/// handles (readers/writers) opened over its `.log` / `.index` files.
+/// handles opened over its `.log` / `.index` files. Only the last segment of
+/// a chain keeps its writers.
 pub struct RecoveredSegment {
     pub segment: Segment,
     pub storage: SegmentStorage,
@@ -771,7 +772,7 @@ pub async fn load_persisted_segments_with_checkpoint(
             truncate_to(&plan.index_path, plan.index_size)?;
         }
 
-        let storage = if checkpoint.is_some() {
+        let mut storage = if checkpoint.is_some() {
             SegmentStorage::with_read_only_messages(
                 &plan.messages_path,
                 &plan.index_path,
@@ -816,6 +817,12 @@ pub async fn load_persisted_segments_with_checkpoint(
                 transient => transient.into(),
             }
         })?;
+        // The open above fsyncs the truncated files. Nothing writes a sealed
+        // segment after that, so its writers close here as a rotation closes
+        // them, and a long chain does not hold 2 descriptors per segment.
+        if plan.segment.sealed {
+            let _ = storage.shutdown();
+        }
 
         stats.increment_segments_count(1);
         stats.increment_size_bytes(messages_size);
@@ -1245,7 +1252,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
-        .exit_on_descriptor_exhaustion(|| format!("opening {path}"))
+        .note_descriptor_exhaustion(|| format!("opening {path}"))
         .map_err(|source| {
             error!(
                 path,
@@ -1293,7 +1300,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Parti
         .create(true)
         .truncate(true)
         .open(&staging_path)
-        .exit_on_descriptor_exhaustion(|| format!("opening {staging_path}"))
+        .note_descriptor_exhaustion(|| format!("opening {staging_path}"))
         .map_err(|source| {
             error!(
                 path = %staging_path,
@@ -1346,7 +1353,7 @@ fn install_rebuilt_index(
 /// other mutation in this module (see [`FileScanner`]).
 fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::open(dir)
-        .exit_on_descriptor_exhaustion(|| format!("opening directory {dir}"))
+        .note_descriptor_exhaustion(|| format!("opening directory {dir}"))
         .and_then(|handle| handle.sync_all())
         .map_err(|source| {
             error!(
@@ -1475,7 +1482,7 @@ fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRe
 
 fn seed_empty_file(path: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::create(path)
-        .exit_on_descriptor_exhaustion(|| format!("creating {path}"))
+        .note_descriptor_exhaustion(|| format!("creating {path}"))
         .and_then(|file| file.sync_all())
         .map_err(|source| {
             error!(
@@ -3385,6 +3392,38 @@ mod tests {
             "a mid-chain torn tail must be truncated too"
         );
         assert_eq!(len_of(&tail_messages_path), tail_log.len() as u64);
+    }
+
+    #[compio::test]
+    async fn given_sealed_segments_when_recovering_should_keep_writers_on_the_tail_only() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        for start_offset in [0, 2, 4] {
+            write_segment(
+                &config,
+                start_offset,
+                &encoded_batch(start_offset, 2),
+                &index_entry(start_offset, 0),
+            );
+        }
+
+        let recovered = recover(&config).await.expect("recover three-segment chain");
+
+        assert_eq!(recovered.len(), 3);
+        for sealed in &recovered[..2] {
+            assert!(sealed.segment.sealed);
+            assert!(
+                sealed.storage.messages_writer.is_none() && sealed.storage.index_writer.is_none(),
+                "a sealed segment must not hold writer descriptors"
+            );
+            assert!(sealed.storage.messages_reader.is_some());
+        }
+        let tail = &recovered[2].storage;
+        assert!(
+            tail.messages_writer.is_some() && tail.index_writer.is_some(),
+            "the tail segment must keep its writers"
+        );
     }
 
     #[compio::test]

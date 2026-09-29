@@ -49,7 +49,7 @@ use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -647,30 +647,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_segment_read_error_when_classifying_should_keep_its_os_error() {
+    fn given_segment_read_error_when_classifying_should_tell_local_faults_from_stale_offers() {
         const EIO: i32 = 5;
-        let read_error = |source| {
-            std::io::Error::from(SegmentReadError {
-                position: 0,
-                to: 1,
-                source,
-            })
-        };
 
         assert!(matches!(
-            SegmentLoadError::classify(read_error(std::io::Error::from_raw_os_error(EIO))),
+            SegmentLoadError::classify(std::io::Error::from_raw_os_error(EIO)),
             SegmentLoadError::LocalFault(_)
         ));
         assert!(matches!(
-            SegmentLoadError::classify(read_error(std::io::Error::from(
-                std::io::ErrorKind::PermissionDenied
-            ))),
+            SegmentLoadError::classify(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
             SegmentLoadError::LocalFault(_)
         ));
         assert!(matches!(
-            SegmentLoadError::classify(read_error(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof
-            ))),
+            SegmentLoadError::classify(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             SegmentLoadError::Stale(_)
         ));
     }
@@ -1624,7 +1613,7 @@ pub async fn mark_materialization_missing(directory: &str, revision: u64) -> std
         .write(true)
         .open(&temporary)
         .await
-        .exit_on_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
+        .note_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
     file.write_all_at(revision.to_le_bytes().to_vec(), 0)
         .await
         .0?;
@@ -1867,7 +1856,7 @@ async fn discard_offset_writes(planned: &[PlannedOffsetWrite]) {
 pub(crate) async fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
     compio::fs::File::open(partition_dir)
         .await
-        .exit_on_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))?
+        .note_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))?
         .sync_all()
         .await
 }
@@ -3029,7 +3018,7 @@ where
         // is an `open`+`close` per segment for no durability gain.
         let dir_handle = compio::fs::File::open(partition_dir)
             .await
-            .exit_on_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))
+            .note_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))
             .map_err(|source| PartitionInstallError::SwapIo {
                 path: partition_dir.to_owned(),
                 source,
@@ -3055,7 +3044,7 @@ where
         // segments with metadata from the validation walk, real storage over
         // the final paths, and writers on the LAST segment only (the
         // hydrate pattern; earlier segments are sealed and never written).
-        for meta in &staged {
+        for (index, meta) in staged.iter().enumerate() {
             let (log_final, index_final) = final_paths(partition_dir, meta.start_offset);
             // Retried once: by this point every rename already landed, so a
             // failed open converges away a chain that is COMPLETE AND DURABLE
@@ -3078,7 +3067,7 @@ where
                         .await
                 }
             };
-            let storage = match open().await {
+            let mut storage = match open().await {
                 Ok(storage) => storage,
                 Err(_) => open()
                     .await
@@ -3087,6 +3076,11 @@ where
                         source,
                     })?,
             };
+            // The open fsyncs the installed files, and then a sealed segment
+            // gives its writer descriptors back.
+            if index + 1 < staged.len() {
+                let _ = storage.shutdown();
+            }
             let mut segment = Segment::new(meta.start_offset, self.effective_segment_size());
             segment.sealed = true;
             segment.start_timestamp = meta.start_timestamp;
@@ -3798,10 +3792,9 @@ async fn hash_segment_range(
         }
         let compio::BufResult(read, returned) = file.read_exact_at(buf, position).await;
         buf = returned;
-        read.map_err(|source| SegmentReadError {
-            position,
-            to,
-            source,
+        // The caller's log line shows the error but not where it happened.
+        read.inspect_err(|error| {
+            tracing::debug!(path, position, to, %error, "reading segment bytes failed");
         })?;
         hasher.update(&buf);
         if let Some(sink) = sink.as_deref_mut() {
@@ -3871,7 +3864,7 @@ impl SegmentLoadError {
         // Everything unrecognised stays STALE: a short read past EOF is what a
         // racing GC unlink-and-recreate legitimately produces.
         const EIO: i32 = 5;
-        if SegmentReadError::os_error(&source) == Some(EIO) {
+        if source.raw_os_error() == Some(EIO) {
             return Self::LocalFault(source);
         }
         match source.kind() {
@@ -3907,53 +3900,6 @@ impl fmt::Display for SegmentLoadError {
 }
 
 impl std::error::Error for SegmentLoadError {}
-
-/// A failed read inside a served segment, with where it failed.
-///
-/// It travels as an `io::Error` of the read's own kind and keeps the OS error
-/// as its source, so [`SegmentLoadError::classify`] still tells a dying disk
-/// from a stale offer. A message-only rewrap hid `EIO` behind `Other`.
-#[derive(Debug)]
-struct SegmentReadError {
-    position: u64,
-    to: u64,
-    source: std::io::Error,
-}
-
-impl SegmentReadError {
-    /// The OS error code of `error`, also when a read error sits inside it.
-    fn os_error(error: &std::io::Error) -> Option<i32> {
-        error.raw_os_error().or_else(|| {
-            error
-                .get_ref()?
-                .downcast_ref::<Self>()?
-                .source
-                .raw_os_error()
-        })
-    }
-}
-
-impl From<SegmentReadError> for std::io::Error {
-    fn from(error: SegmentReadError) -> Self {
-        Self::new(error.source.kind(), error)
-    }
-}
-
-impl fmt::Display for SegmentReadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "reading segment bytes at {} of {} failed: {}",
-            self.position, self.to, self.source
-        )
-    }
-}
-
-impl std::error::Error for SegmentReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
 
 /// [`consensus::verify_state_artifact`] with reactor yields.
 ///
@@ -4062,7 +4008,7 @@ fn segment_manifest_digest(manifest: &[consensus::StateArtifact]) -> u64 {
 async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()> {
     let mut file = compio::fs::File::create(path)
         .await
-        .exit_on_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
+        .note_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
     let (result, _) = file.write_all_at(payload, 0).await.into();
     result?;
     file.sync_data().await?;

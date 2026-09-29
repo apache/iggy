@@ -31,11 +31,12 @@ pub const DESCRIPTOR_EXHAUSTION_BACKOFF: Duration = Duration::from_secs(1);
 /// Wait [`DESCRIPTOR_EXHAUSTION_BACKOFF`] if `error` says no file descriptor
 /// is free, and return at once for any other `accept()` error.
 ///
-/// An accept loop does not stop the process on this, unlike the storage
-/// write paths. `[message_bus] connections_max` keeps clients below the
-/// descriptor limit, so an accept reaches `EMFILE` only when that cap is off
-/// or set too high, or when storage holds the descriptors. A process exit
-/// here would let clients stop the node in the first two cases.
+/// An accept loop only waits. It does not record the exhaustion for the exit
+/// status as the storage write paths do, because no write failed.
+/// `[message_bus] connections_max` keeps clients below the descriptor limit,
+/// so an accept reaches `EMFILE` only when that cap is off or set too high, or
+/// when storage holds the descriptors. A process exit here would let clients
+/// stop the node in the first two cases.
 #[allow(clippy::future_not_send)]
 pub async fn pause_after_accept_error(error: &io::Error) {
     if is_descriptor_exhaustion(error) {

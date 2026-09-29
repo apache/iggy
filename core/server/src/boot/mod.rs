@@ -214,6 +214,11 @@ pub fn bootstrap(
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
+    // Before the shards, so the first count is there when a client connects.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
+    if let Err(error) = crate::sysinfo_probe::start_open_files_scan(sysinfo_print_interval) {
+        warn!(error = %error, "cannot start the open-files scan thread, so open_files_count stays 0");
+    }
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 

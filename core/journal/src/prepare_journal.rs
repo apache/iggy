@@ -19,7 +19,7 @@ use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
@@ -822,7 +822,7 @@ impl Journal for PrepareJournal {
         {
             let mut tmp = compio::fs::File::create(&tmp_path)
                 .await
-                .exit_on_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
+                .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
             let mut write_pos: u64 = 0;
             for (header, old_offset) in &live {
                 let size = header.size as usize;
@@ -844,9 +844,7 @@ impl Journal for PrepareJournal {
         if let Some(parent) = wal_path.parent() {
             let opened = compio::fs::File::open(parent)
                 .await
-                .exit_on_descriptor_exhaustion(|| {
-                    format!("opening directory {}", parent.display())
-                });
+                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()));
             let dir = match opened {
                 Ok(dir) => dir,
                 Err(error) => {
@@ -991,7 +989,7 @@ impl Journal for PrepareJournal {
         {
             let mut tmp = compio::fs::File::create(&tmp_path)
                 .await
-                .exit_on_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
+                .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
             let mut write_pos: u64 = 0;
             for (header, old_offset) in &live {
                 let size = header.size as usize;
@@ -1025,9 +1023,7 @@ impl Journal for PrepareJournal {
         if let Some(parent) = wal_path.parent() {
             let opened = compio::fs::File::open(parent)
                 .await
-                .exit_on_descriptor_exhaustion(|| {
-                    format!("opening directory {}", parent.display())
-                });
+                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()));
             let dir = match opened {
                 Ok(d) => d,
                 Err(e) => {

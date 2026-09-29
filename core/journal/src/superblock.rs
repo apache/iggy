@@ -50,7 +50,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 
 use crate::prepare_journal::TmpFileGuard;
 use twox_hash::XxHash3_64;
@@ -531,7 +531,7 @@ async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Resu
     let guard = TmpFileGuard::new(tmp_path.clone());
     let mut tmp = compio::fs::File::create(&tmp_path)
         .await
-        .exit_on_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
+        .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
     let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
     result?;
     tmp.sync_all().await?;
@@ -541,7 +541,7 @@ async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Resu
 
     let dir_file = compio::fs::File::open(dir)
         .await
-        .exit_on_descriptor_exhaustion(|| format!("opening directory {}", dir.display()))?;
+        .note_descriptor_exhaustion(|| format!("opening directory {}", dir.display()))?;
     dir_file.sync_all().await?;
     Ok(())
 }

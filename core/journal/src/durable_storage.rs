@@ -23,7 +23,7 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use futures::channel::oneshot;
 use futures::lock::Mutex;
 use futures::{Stream, stream};
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use std::ffi::OsString;
 use std::io;
@@ -251,12 +251,12 @@ impl DurableStorage for DiskStorage {
                 .truncate(matches!(mode, OpenMode::Create | OpenMode::CreateWriteOnly));
         }
         let opened = options.open(path).await;
-        // A failed read fails only its own request. See `ExitOnDescriptorExhaustion`.
-        // A caller that opens read-only to sync wraps the result itself.
+        // A failed read fails only its own request. See `NoteDescriptorExhaustion`.
+        // A caller that opens read-only to sync notes the result itself.
         if mode == OpenMode::Read {
             return opened;
         }
-        opened.exit_on_descriptor_exhaustion(|| format!("opening {}", path.display()))
+        opened.note_descriptor_exhaustion(|| format!("opening {}", path.display()))
     }
 
     async fn create_directories(&self, path: &Path) -> io::Result<()> {
@@ -266,7 +266,7 @@ impl DurableStorage for DiskStorage {
     async fn sync_directory(&self, path: &Path) -> io::Result<()> {
         File::open(path)
             .await
-            .exit_on_descriptor_exhaustion(|| format!("opening directory {}", path.display()))?
+            .note_descriptor_exhaustion(|| format!("opening directory {}", path.display()))?
             .sync_all()
             .await
     }
@@ -456,7 +456,7 @@ impl DurableFile for File {
         // disabled. Own the inode until the worker completes, even on cancellation.
         let descriptor = std::os::fd::AsFd::as_fd(self)
             .try_clone_to_owned()
-            .exit_on_descriptor_exhaustion(|| {
+            .note_descriptor_exhaustion(|| {
                 "duplicating a file descriptor to truncate".to_owned()
             })?;
         run_blocking("iggy-file-truncate", move || {

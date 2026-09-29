@@ -83,7 +83,7 @@ pub struct Stats {
     pub total_disk_space: IggyByteSize,
     /// The number of file descriptors the server process holds open, 0 when unknown.
     /// Where the kernel cannot count them without a scan (Linux before 6.2, macOS),
-    /// this is the count from the server's last periodic sysinfo log line.
+    /// the server scans at least every 10 seconds, so the count can be 10 seconds old.
     #[serde(default)]
     pub open_files_count: u64,
     /// The soft limit on open file descriptors (`RLIMIT_NOFILE`) of the server

@@ -62,7 +62,7 @@ use journal::superblock::{
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
@@ -147,7 +147,7 @@ impl IggySnapshot {
         let tmp_path = path.with_extension("bin.tmp");
 
         let mut file = fs::File::create(&tmp_path)
-            .exit_on_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
+            .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Write,
                 source: e,
@@ -181,7 +181,7 @@ impl IggySnapshot {
         // Fsync the parent directory to ensure the rename is durable.
         if let Some(parent) = path.parent() {
             let dir = fs::File::open(parent)
-                .exit_on_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
+                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
                 .map_err(|e| SnapshotError::Persist {
                     stage: PersistStage::DirSync,
                     source: e,
@@ -1014,9 +1014,10 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.client_table.borrow_mut().set_capacity(max_clients);
     }
 
-    /// Cap the node's partitions at `[metadata] partitions_max`, zero for no
-    /// cap. The primary checks it when it admits a `CreateTopic` or
-    /// `CreatePartitions`.
+    /// Cap the partitions of all streams and topics at `[metadata]
+    /// partitions_max`, zero for no cap. Only the primary checks it, with the
+    /// value of its own node, when it admits a `CreateTopic` or
+    /// `CreatePartitions`, so every node needs the same value.
     pub fn set_partitions_max(&self, partitions_max: u32) {
         self.partitions_max.set(partitions_max);
     }
@@ -2236,15 +2237,18 @@ where
         }
     }
 
-    /// Node-wide `[metadata] partitions_max` admission for a `CreateTopic` or
+    /// `[metadata] partitions_max` admission for a `CreateTopic` or
     /// `CreatePartitions`. Other operations pass.
     ///
     /// A soft cap: the apply must not branch on node config, so this counts
-    /// the partitions this primary has committed, and creates in flight
-    /// together can overshoot it. A body that does not decode passes here,
-    /// and `prepare_request` evicts the session for it. A create that the
-    /// gated apply refuses, for a missing target or a missing grant, also
-    /// passes, so it gets that error and not the cap's.
+    /// the partitions this primary has committed. The creates in flight, up to
+    /// a full prepare queue and request queue of them, each pass it on their
+    /// own, so together they can overshoot it by up to 1000 partitions each.
+    ///
+    /// A body that does not decode passes here, and `prepare_request` evicts
+    /// the session for it. A create that the gated apply refuses, for a
+    /// missing target or a missing grant, also passes, so it gets that error
+    /// and not the cap's.
     fn admit_partitions(&self, message: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
         let partitions_max = self.partitions_max.get();
         if partitions_max == 0 {
@@ -2267,9 +2271,11 @@ where
             },
             _ => return Ok(()),
         };
-        let admitted = validate_partitions_limit(partitions_max, requested, || {
-            self.mux_stm.streams().partition_count()
-        });
+        let admitted = validate_partitions_limit(
+            partitions_max,
+            requested,
+            self.mux_stm.streams().partition_count(),
+        );
         if admitted.is_err() {
             let applies =
                 resolve_acting_user_id(header.operation, header.client, &self.client_table)
@@ -4343,19 +4349,19 @@ fn unreplayable_secret_refusal(
     )
 }
 
-/// `requested` more partitions on top of the `committed` count against the
-/// `partitions_max` cap. Zero is no cap, and `committed` is read only when a
-/// cap is set. A create of zero partitions adds nothing, so it passes also
-/// on a node already past the cap, for example after the cap was lowered.
+/// `requested` more partitions on top of the `committed` count against a
+/// nonzero `partitions_max` cap. A create of zero partitions adds nothing, so
+/// it passes also on a node already past the cap, for example after the cap
+/// was lowered.
 fn validate_partitions_limit(
     partitions_max: u32,
     requested: u32,
-    committed: impl FnOnce() -> usize,
+    committed: usize,
 ) -> Result<(), IggyError> {
-    if partitions_max == 0 || requested == 0 {
+    if requested == 0 {
         return Ok(());
     }
-    let total = u64::try_from(committed())
+    let total = u64::try_from(committed)
         .unwrap_or(u64::MAX)
         .saturating_add(u64::from(requested));
     if total > u64::from(partitions_max) {
@@ -5041,6 +5047,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_no_partitions_cap_when_admitting_create_topic_should_admit() {
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+
+        assert!(
+            metadata
+                .admit_partitions(&create_topic_request(1, TOPIC_MANAGER))
+                .is_ok(),
+            "a zero partitions_max must admit a create on a node with partitions"
+        );
+    }
+
     /// The gated apply answers a create from a user without the grant, or for
     /// a stream that does not exist, with `Unauthorized` or `NotFound`. The
     /// cap must not answer first, or that user could probe the cap state.
@@ -5187,32 +5209,23 @@ mod tests {
     }
 
     #[test]
-    fn given_no_partitions_cap_when_validating_should_admit_without_counting() {
-        let admitted = validate_partitions_limit(0, u32::MAX, || {
-            panic!("the committed count must not be read without a cap")
-        });
-
-        assert!(admitted.is_ok());
-    }
-
-    #[test]
     fn given_zero_partitions_create_past_partitions_cap_when_validating_should_admit() {
-        assert!(validate_partitions_limit(10, 0, || 12).is_ok());
+        assert!(validate_partitions_limit(10, 0, 12).is_ok());
     }
 
     #[test]
     fn given_create_reaching_partitions_cap_when_validating_should_admit() {
-        assert!(validate_partitions_limit(10, 4, || 6).is_ok());
+        assert!(validate_partitions_limit(10, 4, 6).is_ok());
     }
 
     #[test]
     fn given_create_past_partitions_cap_when_validating_should_deny() {
         assert!(matches!(
-            validate_partitions_limit(10, 5, || 6),
+            validate_partitions_limit(10, 5, 6),
             Err(IggyError::PartitionsLimitReached)
         ));
         assert!(matches!(
-            validate_partitions_limit(10, 1, || 10),
+            validate_partitions_limit(10, 1, 10),
             Err(IggyError::PartitionsLimitReached)
         ));
     }

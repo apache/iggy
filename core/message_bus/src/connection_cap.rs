@@ -57,11 +57,6 @@ impl ConnectionCap {
         }
     }
 
-    #[must_use]
-    pub const fn max(&self) -> Option<usize> {
-        self.max
-    }
-
     /// Sockets of this process that hold a permit now.
     #[must_use]
     pub fn live(&self) -> usize {

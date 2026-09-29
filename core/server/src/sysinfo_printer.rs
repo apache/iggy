@@ -23,7 +23,7 @@
 
 use crate::responses::{StatsTotals, stats_totals};
 use crate::shell::ServerShard;
-use crate::sysinfo_probe::{SystemStats, publish_open_files_count, stats_disk_space};
+use crate::sysinfo_probe::{SystemStats, stats_disk_space};
 use iggy_common::IggyByteSize;
 use shard::Receiver;
 use std::fmt;
@@ -52,9 +52,6 @@ pub async fn run_sysinfo_printer(shard: Rc<ServerShard>, stop: Receiver<()>, int
 }
 
 async fn print_sysinfo(shard: &Rc<ServerShard>, system: &mut SysinfoSystem) {
-    // `GetStats` reads this count where the kernel keeps none, so it is
-    // published also while the line itself is filtered out.
-    publish_open_files_count();
     // The global max level, not `tracing::enabled!`: the logger's idle
     // OpenTelemetry layers veto every `enabled` query, so that is always false.
     if LevelFilter::current() < LevelFilter::INFO {

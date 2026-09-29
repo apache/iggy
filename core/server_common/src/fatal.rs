@@ -20,6 +20,7 @@
 use nix::errno::Errno;
 use nix::sys::resource::{Resource, getrlimit};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Why the process is stopping. The discriminant is the exit status, one per
 /// condition; `1` stays the binary's generic startup failure.
@@ -34,10 +35,10 @@ pub enum FatalReason {
     /// The replica was already fenced quorum-invisible, so exiting hands the
     /// wedge to a supervisor instead of a log reader.
     SuperblockWedged = 3,
-    /// A storage open for a write or a sync failed because the process
-    /// (`EMFILE`) or the host (`ENFILE`) has no free file descriptor. The shard
-    /// cannot persist that write, and serving on only fails each later write in
-    /// turn.
+    /// The server stopped on an error after a storage open for a write or a
+    /// sync failed because the process (`EMFILE`) or the host (`ENFILE`) had no
+    /// free file descriptor. The exit comes after the ordinary shutdown, so the
+    /// shards flushed what they could. See [`NoteDescriptorExhaustion`].
     DescriptorsExhausted = 4,
 }
 
@@ -47,6 +48,10 @@ impl FatalReason {
         self as u8
     }
 }
+
+/// The target that 0.9.0 shipped for the fatal log line, so existing log
+/// filters keep matching.
+const FATAL_LOG_TARGET: &str = "iggy.consensus.diag";
 
 /// Log `message` and terminate the process.
 ///
@@ -65,7 +70,7 @@ impl FatalReason {
 /// write result is ignored because `eprintln!` would panic on a broken stderr.
 pub fn fatal(reason: FatalReason, message: &str) -> ! {
     tracing::error!(
-        target: "iggy.fatal.diag",
+        target: FATAL_LOG_TARGET,
         reason = ?reason,
         exit_status = reason.exit_status(),
         "{message}"
@@ -78,32 +83,54 @@ pub fn fatal(reason: FatalReason, message: &str) -> ! {
     std::process::exit(i32::from(reason.exit_status()));
 }
 
-/// Storage results that stop the process when no file descriptor is free.
+/// Storage results that record a missing file descriptor for the exit status.
 ///
 /// Only for opens that write, create, truncate or sync, and for read-only
 /// opens that are one step of such a write: the existence probes of segment
-/// setup, or an open that exists only to sync. A failure there leaves the
-/// write half done. Other reads keep their own error path: a failed read fails
-/// only its request, and the descriptors that fill the table can be client
-/// sockets or other reads that close again soon.
-/// Accept loops never stop here, see `message_bus::accept`.
-pub trait ExitOnDescriptorExhaustion: Sized {
-    /// Pass the result through, unless it failed with `EMFILE` or `ENFILE`: then
-    /// stop the process with [`FatalReason::DescriptorsExhausted`]. `operation`
-    /// names what was being opened, for the fatal message.
+/// setup, or an open that exists only to sync. The error still goes to the
+/// caller, whose own handling decides what happens. A failed partition write
+/// fences the partition and stops the server through the shutdown flush, and a
+/// failed partition build retries. Stopping at the open instead would skip that
+/// flush and lose committed messages that are not yet in a segment.
+///
+/// If the server then stops on an error, it exits with
+/// [`FatalReason::DescriptorsExhausted`] instead of 1. The record lasts for the
+/// life of the process. A failed read fails only its own request, so reads do
+/// not record it, and accept loops do not either, see `message_bus::accept`.
+pub trait NoteDescriptorExhaustion: Sized {
+    /// Pass the result through. If it failed with `EMFILE` or `ENFILE`, record
+    /// that for [`descriptors_exhausted`], and log the first one with the
+    /// limits. `operation` names what was being opened, for that log line.
     #[must_use]
-    fn exit_on_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self;
+    fn note_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self;
 }
 
-impl<T> ExitOnDescriptorExhaustion for io::Result<T> {
-    fn exit_on_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self {
+static DESCRIPTORS_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+
+impl<T> NoteDescriptorExhaustion for io::Result<T> {
+    fn note_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self {
         if let Err(error) = &self
             && is_descriptor_exhaustion(error)
+            && !DESCRIPTORS_EXHAUSTED.swap(true, Ordering::Relaxed)
         {
-            exit_descriptors_exhausted(error, &operation());
+            tracing::error!(
+                target: FATAL_LOG_TARGET,
+                "no free file descriptor while {}: {error} ({}); if the server stops \
+                 on an error, it exits with status {}",
+                operation(),
+                open_file_limits(),
+                FatalReason::DescriptorsExhausted.exit_status()
+            );
         }
         self
     }
+}
+
+/// Whether a storage write open of this process failed with `EMFILE` or
+/// `ENFILE`. See [`NoteDescriptorExhaustion`].
+#[must_use]
+pub fn descriptors_exhausted() -> bool {
+    DESCRIPTORS_EXHAUSTED.load(Ordering::Relaxed)
 }
 
 /// `EMFILE` (this process is at its `RLIMIT_NOFILE`) or `ENFILE` (the host is
@@ -115,14 +142,10 @@ pub fn is_descriptor_exhaustion(error: &io::Error) -> bool {
         .is_some_and(|code| code == Errno::EMFILE as i32 || code == Errno::ENFILE as i32)
 }
 
-fn exit_descriptors_exhausted(error: &io::Error, operation: &str) -> ! {
-    let limits = getrlimit(Resource::RLIMIT_NOFILE).map_or_else(
+fn open_file_limits() -> String {
+    getrlimit(Resource::RLIMIT_NOFILE).map_or_else(
         |errno| format!("RLIMIT_NOFILE unreadable: {errno}"),
         |(soft, hard)| format!("RLIMIT_NOFILE soft={soft} hard={hard}"),
-    );
-    fatal(
-        FatalReason::DescriptorsExhausted,
-        &format!("no free file descriptor while {operation}: {error} ({limits})"),
     )
 }
 
@@ -150,14 +173,21 @@ mod tests {
     }
 
     #[test]
-    fn given_non_exhaustion_error_when_checking_result_should_pass_it_through() {
-        let result: io::Result<()> = Err(io::Error::from_raw_os_error(Errno::ENOENT as i32));
-
-        let checked = result.exit_on_descriptor_exhaustion(|| "opening a test file".to_owned());
-
+    fn given_exhaustion_error_when_noting_result_should_record_it_and_pass_it_through() {
+        let other: io::Result<()> = Err(io::Error::from_raw_os_error(Errno::ENOENT as i32));
+        let noted = other.note_descriptor_exhaustion(|| "opening a test file".to_owned());
         assert_eq!(
-            checked.map_err(|error| error.kind()),
+            noted.map_err(|error| error.kind()),
             Err(io::ErrorKind::NotFound)
         );
+        assert!(!descriptors_exhausted());
+
+        let exhausted: io::Result<()> = Err(io::Error::from_raw_os_error(Errno::EMFILE as i32));
+        let noted = exhausted.note_descriptor_exhaustion(|| "opening a test file".to_owned());
+        assert_eq!(
+            noted.map_err(|error| error.raw_os_error()),
+            Err(Some(Errno::EMFILE as i32))
+        );
+        assert!(descriptors_exhausted());
     }
 }

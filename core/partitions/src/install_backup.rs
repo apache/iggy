@@ -17,7 +17,7 @@
 
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
-use server_common::fatal::ExitOnDescriptorExhaustion;
+use server_common::fatal::NoteDescriptorExhaustion;
 use std::io;
 use std::path::Path;
 
@@ -30,7 +30,11 @@ const RETIRED: &str = ".install-retired";
 /// # Errors
 /// Returns an error if the previous materialization cannot be restored durably.
 pub async fn recover(directory: &Path) -> io::Result<()> {
-    recover_with_storage(directory, &DiskStorage).await
+    // Every step of an install is part of one durable write, reads and
+    // directory listings included, so each entry point notes its error once.
+    recover_with_storage(directory, &DiskStorage)
+        .await
+        .note_descriptor_exhaustion(|| format!("recovering an install in {}", directory.display()))
 }
 
 /// # Errors
@@ -62,7 +66,9 @@ pub async fn recover_with_storage<S: DurableStorage>(
 /// Returns an error if the rollback state cannot be made durable.
 /// After any failure the caller must stop serving until recovery.
 pub async fn begin(directory: &Path) -> io::Result<()> {
-    begin_with_storage(directory, &DiskStorage).await
+    begin_with_storage(directory, &DiskStorage)
+        .await
+        .note_descriptor_exhaustion(|| format!("starting an install in {}", directory.display()))
 }
 
 /// # Errors
@@ -88,7 +94,9 @@ pub async fn begin_with_storage<S: DurableStorage>(
 /// # Errors
 /// Returns an error if the installation cannot be published durably.
 pub async fn finish(directory: &Path) -> io::Result<()> {
-    finish_with_storage(directory, &DiskStorage).await
+    finish_with_storage(directory, &DiskStorage)
+        .await
+        .note_descriptor_exhaustion(|| format!("finishing an install in {}", directory.display()))
 }
 
 /// # Errors
@@ -136,11 +144,9 @@ async fn link_tree<S: DurableStorage>(
                 // Transfer unlinks or atomically replaces these frozen files.
                 // Hard links retain the old bytes without copying segment data.
                 storage.hard_link(&source.join(&name), &destination).await?;
-                // Read-only, but only to sync, so it stops like a write open.
                 storage
                     .open(&destination, OpenMode::Read)
-                    .await
-                    .exit_on_descriptor_exhaustion(|| format!("opening {}", destination.display()))?
+                    .await?
                     .sync()
                     .await?;
             }

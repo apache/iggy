@@ -252,8 +252,7 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
             stats.free_disk_space.as_bytes_u64() <= stats.total_disk_space.as_bytes_u64(),
             "free_disk_space should be <= total_disk_space"
         );
-        // The count can be 0 (unknown) before the first sysinfo line on
-        // kernels without their own count, but the limit is always readable.
+        assert!(stats.open_files_count > 0, "open_files_count should be > 0");
         assert!(stats.open_files_limit > 0, "open_files_limit should be > 0");
         assert!(
             stats.open_files_count <= stats.open_files_limit,

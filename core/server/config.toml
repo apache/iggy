@@ -409,7 +409,7 @@ retention = "7 days"
 
 # Interval for printing process and host usage (CPU, memory, disk, clients,
 # messages, open file descriptors) to the log from shard 0. "0 s" disables the
-# line.
+# line. Any other value must be at least 1 s.
 sysinfo_print_interval = "10 s"
 
 # Encryption configuration
@@ -860,10 +860,13 @@ journal_slots = 1024
 # it lifts both. Must be between 2 and 65536.
 clients_table_max = 8192
 
-# Cap on partitions across all streams and topics of the node. A request to
-# create a topic or partitions that would exceed it fails with
-# PartitionsLimitReached. The check counts committed partitions only, so
-# concurrent creates can go slightly over it. 0 means no cap.
+# Cap on the partitions of all streams and topics. A request to create a
+# topic or partitions that would exceed it fails with PartitionsLimitReached.
+# The metadata primary checks it with its own value, so give every node the
+# same value. The check counts committed partitions only and does not add up
+# the creates in flight. Up to 3 x prepare_queue_depth creates (96 at the
+# default) can be in flight, with up to 1000 partitions each, so the count
+# can exceed the cap by that much. 0 means no cap.
 partitions_max = 0
 
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0

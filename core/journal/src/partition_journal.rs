@@ -26,7 +26,7 @@ use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, ConsensusHeader, Operation, PrepareHeader};
 use server_common::{
     Message,
-    fatal::ExitOnDescriptorExhaustion,
+    fatal::NoteDescriptorExhaustion,
     iobuf::{Frozen, Owned},
     send_messages::decode_prepare_slice,
 };
@@ -570,12 +570,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     ) -> io::Result<()> {
         futures::stream::iter(files.iter().map(Ok::<_, io::Error>))
             .try_for_each_concurrent(16, |path| async {
-                // Read-only, but part of the sync barrier, so it stops like a write open.
+                // Read-only, but part of the sync barrier, so it counts like a write open.
                 let file = self
                     .storage
                     .open(path, OpenMode::Read)
                     .await
-                    .exit_on_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
+                    .note_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
                 if synced_files.contains(path) {
                     Ok(())
                 } else {

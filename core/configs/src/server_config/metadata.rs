@@ -30,8 +30,8 @@
 //! - `clients_table_max` -> `consensus::CLIENTS_TABLE_MAX` (the VSR
 //!   client-table slot count; independent of the two above). The
 //!   HTTP session cap tracks it at half.
-//! - `partitions_max` (the node-wide partition count, checked when a
-//!   create is admitted; zero is no cap)
+//! - `partitions_max` (the partitions of all streams and topics, checked
+//!   by the metadata primary when it admits a create; zero is no cap)
 //!
 //! The first two interlock through the forced-checkpoint margin
 //! (`max(64, prepare_queue_depth)` at bootstrap): while a checkpoint
@@ -115,12 +115,14 @@ pub struct MetadataConfig {
     /// both.
     pub clients_table_max: usize,
 
-    /// Node-wide cap on partitions across all streams and topics. A
-    /// CreateTopic or CreatePartitions that would exceed it is rejected with
+    /// Cap on the partitions of all streams and topics. A CreateTopic or
+    /// CreatePartitions that would exceed it is rejected with
     /// `PartitionsLimitReached` before it enters consensus. Zero is no cap.
     ///
-    /// A soft cap: it counts committed partitions only, so creates in flight
-    /// at the same time can overshoot it.
+    /// The metadata primary checks it with its own value, so every node needs
+    /// the same value. A soft cap: the check counts committed partitions only.
+    /// Up to 3 x `prepare_queue_depth` creates can be in flight, with up to
+    /// 1000 partitions each, and each one passes the check on its own.
     #[serde(default)]
     pub partitions_max: u32,
 }

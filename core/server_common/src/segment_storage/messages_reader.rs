@@ -20,7 +20,7 @@ use err_trail::ErrContext;
 use iggy_common::IggyError;
 use tracing::trace;
 
-use crate::fatal::ExitOnDescriptorExhaustion;
+use crate::fatal::NoteDescriptorExhaustion;
 
 /// Path handle for a segment's messages file, validated openable at segment
 /// build. Reads go through the partition's own sealed-segment handles; this
@@ -35,13 +35,12 @@ impl MessagesReader {
     /// Opens the messages file read-only to prove it exists, then drops the
     /// descriptor: nothing reads through this type.
     pub async fn new(file_path: &str) -> Result<Self, IggyError> {
-        // Read-only, but one step of segment setup: a failure here leaves the
-        // segment half set up, so it stops like a write open.
+        // Read-only, but one step of segment setup, so it counts like a write open.
         OpenOptions::new()
             .read(true)
             .open(file_path)
             .await
-            .exit_on_descriptor_exhaustion(|| format!("opening {file_path}"))
+            .note_descriptor_exhaustion(|| format!("opening {file_path}"))
             .error(|e: &std::io::Error| format!("Failed to open messages file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 

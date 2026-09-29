@@ -21,9 +21,12 @@
 
 use nix::sys::resource::{Resource, getrlimit};
 use std::cell::RefCell;
+use std::io;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use sysinfo::System as SysinfoSystem;
 use system_stats::{SystemProbe, count_open_files, count_open_files_without_scan};
 
@@ -44,7 +47,7 @@ pub struct SystemStats {
     pub read_bytes: u64,
     pub written_bytes: u64,
     pub threads_count: u32,
-    /// 0 when unknown. See [`publish_open_files_count`] for where the count
+    /// 0 when unknown. See [`start_open_files_scan`] for where the count
     /// comes from without a kernel count.
     pub open_files_count: u64,
     /// Soft `RLIMIT_NOFILE`, the ceiling `open()` fails at. 0 when unknown.
@@ -95,10 +98,14 @@ static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 /// bootstrap.
 static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Last open-descriptor count from [`publish_open_files_count`], 0 before
-/// the first. Process-global because the printer runs on shard 0 and any
+/// Last open-descriptor count from [`start_open_files_scan`], 0 before the
+/// first. Process-global because the scan has a thread of its own and any
 /// shard can serve `GetStats`.
 static PUBLISHED_OPEN_FILES_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The longest period of the scan thread, and so the oldest the published
+/// count gets.
+const OPEN_FILES_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Capture the configured data directory for `GetStats` disk reporting.
 /// Idempotent: only the first call (process bootstrap) takes effect.
@@ -117,15 +124,44 @@ pub fn stats_disk_space() -> (u64, u64) {
     })
 }
 
-/// Count open descriptors, scanning where the kernel keeps no count, and
-/// publish the result for [`probe_system_stats`].
+/// Start the thread that counts open descriptors for `GetStats` and the
+/// sysinfo line where the kernel keeps no count. Where the kernel keeps one,
+/// start nothing.
 ///
-/// Only the sysinfo printer calls this, once per interval. The scan cost
-/// grows with the count, so `GetStats` reads the published value instead of
-/// scanning on the request path. The value is as old as the printer interval,
-/// and stays 0 while the printer is disabled.
-pub fn publish_open_files_count() {
-    PUBLISHED_OPEN_FILES_COUNT.store(count_open_files().unwrap_or(0), Ordering::Relaxed);
+/// The thread scans every [`OPEN_FILES_SCAN_INTERVAL`], or every
+/// `sysinfo_print_interval` when that is shorter and not zero, so each line
+/// shows a count from its own interval. The scan blocks for a time that grows
+/// with the count, and a shard must not block. `spawn_blocking` is not
+/// available, because shards run without the blocking pool of the runtime.
+/// The thread runs until the process exits, also while the printer is
+/// disabled.
+pub fn start_open_files_scan(sysinfo_print_interval: Duration) -> io::Result<()> {
+    if count_open_files_without_scan().is_some() {
+        return Ok(());
+    }
+    let interval = if sysinfo_print_interval.is_zero() {
+        OPEN_FILES_SCAN_INTERVAL
+    } else {
+        sysinfo_print_interval.min(OPEN_FILES_SCAN_INTERVAL)
+    };
+    thread::Builder::new()
+        .name("iggy-open-files".to_owned())
+        .spawn(move || {
+            loop {
+                publish_open_files_count(count_open_files());
+                thread::sleep(interval);
+            }
+        })
+        .map(drop)
+}
+
+/// A failed scan keeps the previous count. Before Linux 6.2, the scan needs a
+/// free descriptor, so it fails when the table is full, and 0 would then read
+/// as unknown.
+fn publish_open_files_count(count: Option<u64>) {
+    if let Some(count) = count {
+        PUBLISHED_OPEN_FILES_COUNT.store(count, Ordering::Relaxed);
+    }
 }
 
 /// Probe through this thread's [`SYSINFO`], the `GetStats` path.
@@ -179,5 +215,13 @@ mod tests {
         assert_eq!(stats.process_id, std::process::id());
         assert!(stats.total_memory > 0);
         assert!(!stats.hostname.is_empty());
+    }
+
+    #[test]
+    fn given_failed_scan_when_publishing_should_keep_previous_count() {
+        publish_open_files_count(Some(42));
+        publish_open_files_count(None);
+
+        assert_eq!(PUBLISHED_OPEN_FILES_COUNT.load(Ordering::Relaxed), 42);
     }
 }

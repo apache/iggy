@@ -79,6 +79,8 @@ mod concurrent_addition;
 // The node-wide cap on client sockets closes a socket past it at accept.
 mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
+// A write that runs out of file descriptors flushes, then exits with status 4.
+mod descriptor_exhaustion_vsr;
 mod general;
 mod partitions_limit_vsr;
 // The per-shard segment cleaner deletes expired / oversize segments from disk.

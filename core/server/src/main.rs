@@ -28,6 +28,7 @@ use server::boot::{
     raise_open_file_limit,
 };
 use server::server_error::ServerError;
+use server_common::fatal::{FatalReason, descriptors_exhausted, fatal};
 use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
 use tracing::{error, info, warn};
@@ -114,6 +115,13 @@ fn main() -> Result<(), ServerError> {
     #[cfg(feature = "systemd")]
     if let Err(error) = &joined {
         server::boot::systemd::notify_shutdown_failure(error);
+    }
+    if let Err(error) = &joined
+        && descriptors_exhausted()
+    {
+        // `fatal` skips destructors, and the log appenders flush on drop.
+        drop(logging);
+        fatal(FatalReason::DescriptorsExhausted, &error.to_string());
     }
     joined?;
     info!("server shutdown complete");

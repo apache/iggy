@@ -119,9 +119,22 @@ pub fn count_open_files() -> Option<u64> {
 
 /// The open-descriptor count where the kernel keeps it, or `None` where only
 /// the scan in [`count_open_files`] can find it. Cheap enough for a request
-/// path: Linux 6.2 and later count the descriptor bitmap for one `stat`.
+/// path: Linux 6.2 and later report the count as the size of `/proc/self/fd`,
+/// counted from the descriptor bitmap for one `stat`. Older kernels report 0,
+/// and a server always holds descriptors, so 0 means the kernel lacks the
+/// feature.
+#[cfg(target_os = "linux")]
 pub fn count_open_files_without_scan() -> Option<u64> {
-    kernel_open_files_count()
+    std::fs::metadata("/proc/self/fd")
+        .ok()
+        .map(|metadata| metadata.len())
+        .filter(|&count| count > 0)
+}
+
+/// Always `None`, because only Linux keeps the open-descriptor count.
+#[cfg(not(target_os = "linux"))]
+pub const fn count_open_files_without_scan() -> Option<u64> {
+    None
 }
 
 static ALLOWED_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
@@ -134,23 +147,6 @@ static ALLOWED_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
 /// core as the whole process's set.
 pub fn capture_allowed_cpus() {
     ALLOWED_CPUS.get_or_init(allowed_cpus);
-}
-
-/// Linux 6.2 and later report the open-descriptor count as the size of
-/// `/proc/self/fd`, counted from the descriptor bitmap without a scan.
-/// Older kernels report 0. A server always holds descriptors, so 0 means
-/// the kernel lacks the feature.
-#[cfg(target_os = "linux")]
-fn kernel_open_files_count() -> Option<u64> {
-    std::fs::metadata("/proc/self/fd")
-        .ok()
-        .map(|metadata| metadata.len())
-        .filter(|&count| count > 0)
-}
-
-#[cfg(not(target_os = "linux"))]
-const fn kernel_open_files_count() -> Option<u64> {
-    None
 }
 
 fn scan_open_files() -> Option<u64> {
@@ -278,7 +274,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn given_fd_dir_size_when_kernel_reports_it_should_match_the_scan() {
-        let Some(from_size) = kernel_open_files_count() else {
+        let Some(from_size) = count_open_files_without_scan() else {
             return;
         };
         let scanned = scan_open_files().expect("/proc/self/fd listable");
