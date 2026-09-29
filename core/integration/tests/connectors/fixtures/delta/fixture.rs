@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::Path, path::PathBuf};
 
 use async_trait::async_trait;
 use deltalake::kernel::{DataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
 use integration::harness::{TestBinaryError, TestFixture};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use tracing::info;
 
@@ -372,19 +370,18 @@ pub struct DeltaS3NoTableFixture {
 #[async_trait]
 impl TestFixture for DeltaS3NoTableFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let id = Uuid::new_v4();
-        let network = format!("iggy-delta-s3-{id}");
-        let minio_name = fixtures::unique_container_name("minio-delta-no-table");
+        let floci_name = fixtures::unique_container_name("floci-delta-no-table");
 
-        let (minio, minio_endpoint) = DeltaS3Fixture::start_minio(&network, &minio_name).await?;
-        DeltaS3Fixture::create_bucket(&minio_endpoint).await?;
+        let floci = FlociContainer::start(None, &floci_name).await?;
+        let floci_endpoint = floci.endpoint.clone();
+        floci::create_bucket(&floci_endpoint, TEST_BUCKET).await?;
 
-        info!("Delta S3 'no table' fixture ready with MinIO at {minio_endpoint}");
+        info!("Delta S3 'no table' fixture ready with Floci at {floci_endpoint}");
 
         Ok(Self {
             inner: DeltaS3Fixture {
-                minio,
-                minio_endpoint,
+                floci,
+                floci_endpoint,
             },
         })
     }
@@ -401,18 +398,17 @@ pub struct DeltaS3NoBucketFixture {
 #[async_trait]
 impl TestFixture for DeltaS3NoBucketFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let id = Uuid::new_v4();
-        let network = format!("iggy-delta-s3-{id}");
-        let minio_name = fixtures::unique_container_name("minio-delta-no-bucket");
+        let floci_name = fixtures::unique_container_name("floci-delta-no-bucket");
 
-        let (minio, minio_endpoint) = DeltaS3Fixture::start_minio(&network, &minio_name).await?;
+        let floci = FlociContainer::start(None, &floci_name).await?;
+        let floci_endpoint = floci.endpoint.clone();
 
-        info!("Delta S3 'no bucket' fixture ready with MinIO at {minio_endpoint}");
+        info!("Delta S3 'no bucket' fixture ready with Floci at {floci_endpoint}");
 
         Ok(Self {
             inner: DeltaS3Fixture {
-                minio,
-                minio_endpoint,
+                floci,
+                floci_endpoint,
             },
         })
     }
