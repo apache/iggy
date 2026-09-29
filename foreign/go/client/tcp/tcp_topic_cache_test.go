@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
@@ -89,4 +90,40 @@ func TestDeleteStream_DropsTheCachedTopicsOfTheStream(t *testing.T) {
 	}
 	assert.Equal(t, 2, metadataReads,
 		"a send after the stream delete rereads the topic instead of trusting the dead cache")
+}
+
+func TestTopicMutations_ClearTheCachedPartitionCountAfterAnErrorReply(t *testing.T) {
+	streamId := numericIdentifier(t, 1)
+	topicId := numericIdentifier(t, 2)
+	tests := []struct {
+		name   string
+		mutate func(context.Context, *IggyTcpClient) error
+	}{
+		{name: "create partitions", mutate: func(ctx context.Context, client *IggyTcpClient) error {
+			return client.CreatePartitions(ctx, streamId, topicId, 2)
+		}},
+		{name: "delete partitions", mutate: func(ctx context.Context, client *IggyTcpClient) error {
+			return client.DeletePartitions(ctx, streamId, topicId, 2)
+		}},
+		{name: "delete topic", mutate: func(ctx context.Context, client *IggyTcpClient) error {
+			return client.DeleteTopic(ctx, streamId, topicId)
+		}},
+		{name: "delete stream", mutate: func(ctx context.Context, client *IggyTcpClient) error {
+			return client.DeleteStream(ctx, streamId)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			serve(serverConn, func(_ int, read request) []byte {
+				return statusReplyFrame(read.operation(), uint32(ierror.UnauthorizedCode), nil)
+			})
+			key := newTopicKey(streamId, topicId)
+			client.topics.setPartitionsCount(key, 3)
+
+			require.ErrorIs(t, test.mutate(context.Background(), client), ierror.ErrUnauthorized)
+			_, cached := client.topics.partitionsCount(key)
+			assert.False(t, cached, "a request that returned an error can still commit")
+		})
+	}
 }

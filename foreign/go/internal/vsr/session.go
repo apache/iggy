@@ -46,8 +46,7 @@ var (
 // assigns once Register commits, and the request watermark.
 //
 // Not safe for concurrent use. The transport owns one per connection and
-// serializes access through its exchange lock, which the lockstep request
-// model already requires.
+// serializes access through its state lock.
 type Session struct {
 	client           ClientID
 	session          uint64

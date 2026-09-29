@@ -85,6 +85,9 @@ type InvalidVersion struct {
 }
 
 func (e InvalidVersion) Error() string {
+	if e == (InvalidVersion{}) {
+		return "invalid version: ?"
+	}
 	return fmt.Sprintf("invalid version: %s", e.Version)
 }
 func (e InvalidVersion) Code() Code { return 7 }
@@ -116,6 +119,9 @@ type CannotCreateBaseDirectory struct {
 }
 
 func (e CannotCreateBaseDirectory) Error() string {
+	if e == (CannotCreateBaseDirectory{}) {
+		return "cannot create base directory, path: ?"
+	}
 	return fmt.Sprintf("cannot create base directory, path: %s", e.Path)
 }
 func (e CannotCreateBaseDirectory) Code() Code { return 10 }
@@ -129,6 +135,9 @@ type CannotCreateRuntimeDirectory struct {
 }
 
 func (e CannotCreateRuntimeDirectory) Error() string {
+	if e == (CannotCreateRuntimeDirectory{}) {
+		return "cannot create runtime directory, path: ?"
+	}
 	return fmt.Sprintf("cannot create runtime directory, path: %s", e.Path)
 }
 func (e CannotCreateRuntimeDirectory) Code() Code { return 11 }
@@ -142,6 +151,9 @@ type CannotRemoveRuntimeDirectory struct {
 }
 
 func (e CannotRemoveRuntimeDirectory) Error() string {
+	if e == (CannotRemoveRuntimeDirectory{}) {
+		return "cannot remove runtime directory, path: ?"
+	}
 	return fmt.Sprintf("cannot remove runtime directory, path: %s", e.Path)
 }
 func (e CannotRemoveRuntimeDirectory) Code() Code { return 12 }
@@ -155,6 +167,9 @@ type CannotCreateStateDirectory struct {
 }
 
 func (e CannotCreateStateDirectory) Error() string {
+	if e == (CannotCreateStateDirectory{}) {
+		return "cannot create state directory, path: ?"
+	}
 	return fmt.Sprintf("cannot create state directory, path: %s", e.Path)
 }
 func (e CannotCreateStateDirectory) Code() Code { return 13 }
@@ -188,6 +203,9 @@ type InvalidStateEntryChecksum struct {
 }
 
 func (e InvalidStateEntryChecksum) Error() string {
+	if e == (InvalidStateEntryChecksum{}) {
+		return "invalid state entry checksum: ?, expected: ?, for index: ?"
+	}
 	return fmt.Sprintf("invalid state entry checksum: %d, expected: %d, for index: %d", e.Actual, e.Expected, e.Index)
 }
 func (e InvalidStateEntryChecksum) Code() Code { return 16 }
@@ -201,6 +219,9 @@ type CannotOpenDatabase struct {
 }
 
 func (e CannotOpenDatabase) Error() string {
+	if e == (CannotOpenDatabase{}) {
+		return "cannot open database, path: ?"
+	}
 	return fmt.Sprintf("cannot open database, path: %s", e.Path)
 }
 func (e CannotOpenDatabase) Code() Code { return 19 }
@@ -214,6 +235,9 @@ type ResourceNotFound struct {
 }
 
 func (e ResourceNotFound) Error() string {
+	if e == (ResourceNotFound{}) {
+		return "resource with key: ? was not found."
+	}
 	return fmt.Sprintf("resource with key: %s was not found.", e.Key)
 }
 func (e ResourceNotFound) Code() Code { return 20 }
@@ -282,6 +306,9 @@ type InvalidIpAddress struct {
 }
 
 func (e InvalidIpAddress) Error() string {
+	if e == (InvalidIpAddress{}) {
+		return "invalid ip address: ?:?"
+	}
 	return fmt.Sprintf("invalid ip address: %s:%s", e.IP, e.Port)
 }
 func (e InvalidIpAddress) Code() Code { return 35 }
@@ -295,6 +322,9 @@ type HttpError struct {
 }
 
 func (e HttpError) Error() string {
+	if e == (HttpError{}) {
+		return "http error ?"
+	}
 	return fmt.Sprintf("http error %s", e.Message)
 }
 func (e HttpError) Code() Code { return 36 }
@@ -308,6 +338,9 @@ type InvalidApiUrl struct {
 }
 
 func (e InvalidApiUrl) Error() string {
+	if e == (InvalidApiUrl{}) {
+		return "invalid api url: ?"
+	}
 	return fmt.Sprintf("invalid api url: %s", e.Url)
 }
 func (e InvalidApiUrl) Code() Code { return 37 }
@@ -393,6 +426,9 @@ type CannotDeleteUser struct {
 }
 
 func (e CannotDeleteUser) Error() string {
+	if e == (CannotDeleteUser{}) {
+		return "cannot delete user with id: ?"
+	}
 	return fmt.Sprintf("cannot delete user with id: %d", e.ID)
 }
 func (e CannotDeleteUser) Code() Code { return 48 }
@@ -406,6 +442,9 @@ type CannotChangePermissions struct {
 }
 
 func (e CannotChangePermissions) Error() string {
+	if e == (CannotChangePermissions{}) {
+		return "cannot change permissions for user with id: ?"
+	}
 	return fmt.Sprintf("cannot change permissions for user with id: %d", e.ID)
 }
 func (e CannotChangePermissions) Code() Code { return 49 }
@@ -429,6 +468,9 @@ type PersonalAccessTokenAlreadyExists struct {
 }
 
 func (e PersonalAccessTokenAlreadyExists) Error() string {
+	if e == (PersonalAccessTokenAlreadyExists{}) {
+		return "personal access token: ? for user with id: ? already exists"
+	}
 	return fmt.Sprintf("personal access token: %s for user with id: %d already exists", e.Token, e.ID)
 }
 func (e PersonalAccessTokenAlreadyExists) Code() Code { return 51 }
@@ -443,6 +485,9 @@ type PersonalAccessTokensLimitReached struct {
 }
 
 func (e PersonalAccessTokensLimitReached) Error() string {
+	if e == (PersonalAccessTokensLimitReached{}) {
+		return "user with id: ? has reached the maximum number of personal access tokens: ?"
+	}
 	return fmt.Sprintf("user with id: %d has reached the maximum number of personal access tokens: %d", e.ID, e.Limit)
 }
 func (e PersonalAccessTokensLimitReached) Code() Code { return 52 }
@@ -466,6 +511,9 @@ type PersonalAccessTokenExpired struct {
 }
 
 func (e PersonalAccessTokenExpired) Error() string {
+	if e == (PersonalAccessTokenExpired{}) {
+		return "personal access token: ? for user with id: ? has expired."
+	}
 	return fmt.Sprintf("personal access token: %s for user with id: %d has expired.", e.Token, e.ID)
 }
 func (e PersonalAccessTokenExpired) Code() Code { return 54 }
@@ -611,6 +659,9 @@ type InvalidJwtAlgorithm struct {
 }
 
 func (e InvalidJwtAlgorithm) Error() string {
+	if e == (InvalidJwtAlgorithm{}) {
+		return "invalid jwt algorithm: ?"
+	}
 	return fmt.Sprintf("invalid jwt algorithm: %s", e.Algorithm)
 }
 func (e InvalidJwtAlgorithm) Code() Code { return 73 }
@@ -669,6 +720,9 @@ type CannotFetchJwks struct {
 }
 
 func (e CannotFetchJwks) Error() string {
+	if e == (CannotFetchJwks{}) {
+		return "cannot fetch jwks from url: ?"
+	}
 	return fmt.Sprintf("cannot fetch jwks from url: %s", e.Url)
 }
 func (e CannotFetchJwks) Code() Code { return 79 }
@@ -727,6 +781,9 @@ type ClientNotFound struct {
 }
 
 func (e ClientNotFound) Error() string {
+	if e == (ClientNotFound{}) {
+		return "client with id: ? was not found."
+	}
 	return fmt.Sprintf("client with id: %d was not found.", e.ID)
 }
 func (e ClientNotFound) Code() Code { return 100 }
@@ -758,6 +815,9 @@ type CannotParseHeaderKind struct {
 }
 
 func (e CannotParseHeaderKind) Error() string {
+	if e == (CannotParseHeaderKind{}) {
+		return "cannot parse header kind from ?"
+	}
 	return fmt.Sprintf("cannot parse header kind from %s", e.Str)
 }
 func (e CannotParseHeaderKind) Code() Code { return 209 }
@@ -772,6 +832,9 @@ type HttpResponseError struct {
 }
 
 func (e HttpResponseError) Error() string {
+	if e == (HttpResponseError{}) {
+		return "http response error, status: ?, body: ?"
+	}
 	return fmt.Sprintf("http response error, status: %d, body: %s", e.Status, e.Reason)
 }
 func (e HttpResponseError) Code() Code { return 300 }
@@ -884,6 +947,9 @@ type CannotCreateStreamsDirectory struct {
 }
 
 func (e CannotCreateStreamsDirectory) Error() string {
+	if e == (CannotCreateStreamsDirectory{}) {
+		return "cannot create streams directory, path: ?"
+	}
 	return fmt.Sprintf("cannot create streams directory, path: %s", e.Path)
 }
 func (e CannotCreateStreamsDirectory) Code() Code { return 1000 }
@@ -898,6 +964,9 @@ type CannotCreateStreamDirectory struct {
 }
 
 func (e CannotCreateStreamDirectory) Error() string {
+	if e == (CannotCreateStreamDirectory{}) {
+		return "cannot create stream with id: ? directory, path: ?"
+	}
 	return fmt.Sprintf("cannot create stream with id: %d directory, path: %s", e.ID, e.Path)
 }
 func (e CannotCreateStreamDirectory) Code() Code { return 1001 }
@@ -911,6 +980,9 @@ type CannotCreateStreamInfo struct {
 }
 
 func (e CannotCreateStreamInfo) Error() string {
+	if e == (CannotCreateStreamInfo{}) {
+		return "failed to create stream info file for stream with id: ?"
+	}
 	return fmt.Sprintf("failed to create stream info file for stream with id: %d", e.ID)
 }
 func (e CannotCreateStreamInfo) Code() Code { return 1002 }
@@ -924,6 +996,9 @@ type CannotUpdateStreamInfo struct {
 }
 
 func (e CannotUpdateStreamInfo) Error() string {
+	if e == (CannotUpdateStreamInfo{}) {
+		return "failed to update stream info for stream with id: ?"
+	}
 	return fmt.Sprintf("failed to update stream info for stream with id: %d", e.ID)
 }
 func (e CannotUpdateStreamInfo) Code() Code { return 1003 }
@@ -937,6 +1012,9 @@ type CannotOpenStreamInfo struct {
 }
 
 func (e CannotOpenStreamInfo) Error() string {
+	if e == (CannotOpenStreamInfo{}) {
+		return "failed to open stream info file for stream with id: ?"
+	}
 	return fmt.Sprintf("failed to open stream info file for stream with id: %d", e.ID)
 }
 func (e CannotOpenStreamInfo) Code() Code { return 1004 }
@@ -950,6 +1028,9 @@ type CannotReadStreamInfo struct {
 }
 
 func (e CannotReadStreamInfo) Error() string {
+	if e == (CannotReadStreamInfo{}) {
+		return "failed to read stream info file for stream with id: ?"
+	}
 	return fmt.Sprintf("failed to read stream info file for stream with id: %d", e.ID)
 }
 func (e CannotReadStreamInfo) Code() Code { return 1005 }
@@ -963,6 +1044,9 @@ type CannotCreateStream struct {
 }
 
 func (e CannotCreateStream) Error() string {
+	if e == (CannotCreateStream{}) {
+		return "failed to create stream with id: ?"
+	}
 	return fmt.Sprintf("failed to create stream with id: %d", e.ID)
 }
 func (e CannotCreateStream) Code() Code { return 1006 }
@@ -976,6 +1060,9 @@ type CannotDeleteStream struct {
 }
 
 func (e CannotDeleteStream) Error() string {
+	if e == (CannotDeleteStream{}) {
+		return "failed to delete stream with id: ?"
+	}
 	return fmt.Sprintf("failed to delete stream with id: %d", e.ID)
 }
 func (e CannotDeleteStream) Code() Code { return 1007 }
@@ -989,6 +1076,9 @@ type CannotDeleteStreamDirectory struct {
 }
 
 func (e CannotDeleteStreamDirectory) Error() string {
+	if e == (CannotDeleteStreamDirectory{}) {
+		return "failed to delete stream directory with id: ?"
+	}
 	return fmt.Sprintf("failed to delete stream directory with id: %d", e.ID)
 }
 func (e CannotDeleteStreamDirectory) Code() Code { return 1008 }
@@ -1002,6 +1092,9 @@ type StreamIdNotFound struct {
 }
 
 func (e StreamIdNotFound) Error() string {
+	if e == (StreamIdNotFound{}) {
+		return "stream with id: ? was not found."
+	}
 	return fmt.Sprintf("stream with id: %d was not found.", e.ID)
 }
 func (e StreamIdNotFound) Code() Code { return 1009 }
@@ -1015,6 +1108,9 @@ type StreamNameNotFound struct {
 }
 
 func (e StreamNameNotFound) Error() string {
+	if e == (StreamNameNotFound{}) {
+		return "stream with name: ? was not found."
+	}
 	return fmt.Sprintf("stream with name: %s was not found.", e.Name)
 }
 func (e StreamNameNotFound) Code() Code { return 1010 }
@@ -1028,6 +1124,9 @@ type StreamDirectoryNotFound struct {
 }
 
 func (e StreamDirectoryNotFound) Error() string {
+	if e == (StreamDirectoryNotFound{}) {
+		return "stream with directory ? was not found."
+	}
 	return fmt.Sprintf("stream with directory %s was not found.", e.Path)
 }
 func (e StreamDirectoryNotFound) Code() Code { return 1011 }
@@ -1041,6 +1140,9 @@ type StreamNameAlreadyExists struct {
 }
 
 func (e StreamNameAlreadyExists) Error() string {
+	if e == (StreamNameAlreadyExists{}) {
+		return "stream with name: ? already exists."
+	}
 	return fmt.Sprintf("stream with name: %s already exists.", e.Name)
 }
 func (e StreamNameAlreadyExists) Code() Code { return 1012 }
@@ -1082,6 +1184,9 @@ type InvalidTopicSize struct {
 }
 
 func (e InvalidTopicSize) Error() string {
+	if e == (InvalidTopicSize{}) {
+		return "max topic size cannot be lower than segment size. max topic size: ? < segment size: ?."
+	}
 	return fmt.Sprintf("max topic size cannot be lower than segment size. max topic size: %v < segment size: %v.", e.MaxTopicSize, e.SegmentSize)
 }
 func (e InvalidTopicSize) Code() Code { return 1019 }
@@ -1105,6 +1210,9 @@ type CannotCreateTopicsDirectory struct {
 }
 
 func (e CannotCreateTopicsDirectory) Error() string {
+	if e == (CannotCreateTopicsDirectory{}) {
+		return "cannot create topics directory for stream with id: ?, path: ?"
+	}
 	return fmt.Sprintf("cannot create topics directory for stream with id: %d, path: %s", e.ID, e.Path)
 }
 func (e CannotCreateTopicsDirectory) Code() Code { return 2000 }
@@ -1120,6 +1228,9 @@ type CannotCreateTopicDirectory struct {
 }
 
 func (e CannotCreateTopicDirectory) Error() string {
+	if e == (CannotCreateTopicDirectory{}) {
+		return "failed to create directory for topic with id: ? for stream with id: ?, path: ?"
+	}
 	return fmt.Sprintf("failed to create directory for topic with id: %d for stream with id: %d, path: %s", e.TopicId, e.StreamId, e.Path)
 }
 func (e CannotCreateTopicDirectory) Code() Code { return 2001 }
@@ -1134,6 +1245,9 @@ type CannotCreateTopicInfo struct {
 }
 
 func (e CannotCreateTopicInfo) Error() string {
+	if e == (CannotCreateTopicInfo{}) {
+		return "failed to create topic info file for topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to create topic info file for topic with id: %d for stream with id: %d.", e.TopicId, e.StreamId)
 }
 func (e CannotCreateTopicInfo) Code() Code { return 2002 }
@@ -1148,6 +1262,9 @@ type CannotUpdateTopicInfo struct {
 }
 
 func (e CannotUpdateTopicInfo) Error() string {
+	if e == (CannotUpdateTopicInfo{}) {
+		return "failed to update topic info for topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to update topic info for topic with id: %d for stream with id: %d.", e.TopicId, e.StreamId)
 }
 func (e CannotUpdateTopicInfo) Code() Code { return 2003 }
@@ -1162,6 +1279,9 @@ type CannotOpenTopicInfo struct {
 }
 
 func (e CannotOpenTopicInfo) Error() string {
+	if e == (CannotOpenTopicInfo{}) {
+		return "failed to open topic info file for topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to open topic info file for topic with id: %d for stream with id: %d.", e.TopicId, e.StreamId)
 }
 func (e CannotOpenTopicInfo) Code() Code { return 2004 }
@@ -1176,6 +1296,9 @@ type CannotReadTopicInfo struct {
 }
 
 func (e CannotReadTopicInfo) Error() string {
+	if e == (CannotReadTopicInfo{}) {
+		return "failed to read topic info file for topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to read topic info file for topic with id: %d for stream with id: %d.", e.TopicId, e.StreamId)
 }
 func (e CannotReadTopicInfo) Code() Code { return 2005 }
@@ -1190,6 +1313,9 @@ type CannotCreateTopic struct {
 }
 
 func (e CannotCreateTopic) Error() string {
+	if e == (CannotCreateTopic{}) {
+		return "failed to create topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to create topic with id: %d for stream with id: %d.", e.TopicId, e.StreamId)
 }
 func (e CannotCreateTopic) Code() Code { return 2006 }
@@ -1204,6 +1330,9 @@ type CannotDeleteTopic struct {
 }
 
 func (e CannotDeleteTopic) Error() string {
+	if e == (CannotDeleteTopic{}) {
+		return "failed to delete topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to delete topic with id: %d for stream with id: %d.", e.TopicId, e.StreamId)
 }
 func (e CannotDeleteTopic) Code() Code { return 2007 }
@@ -1219,6 +1348,9 @@ type CannotDeleteTopicDirectory struct {
 }
 
 func (e CannotDeleteTopicDirectory) Error() string {
+	if e == (CannotDeleteTopicDirectory{}) {
+		return "failed to delete topic directory with id: ? for stream with id: ?, path: ?"
+	}
 	return fmt.Sprintf("failed to delete topic directory with id: %d for stream with id: %d, path: %s", e.TopicId, e.StreamId, e.Path)
 }
 func (e CannotDeleteTopicDirectory) Code() Code { return 2008 }
@@ -1242,6 +1374,9 @@ type TopicIdNotFound struct {
 }
 
 func (e TopicIdNotFound) Error() string {
+	if e == (TopicIdNotFound{}) {
+		return "topic with id: ? for stream with id: ? was not found."
+	}
 	return fmt.Sprintf("topic with id: %d for stream with id: %d was not found.", e.TopicId, e.StreamId)
 }
 func (e TopicIdNotFound) Code() Code { return 2010 }
@@ -1256,6 +1391,9 @@ type TopicNameNotFound struct {
 }
 
 func (e TopicNameNotFound) Error() string {
+	if e == (TopicNameNotFound{}) {
+		return "topic with name: ? for stream with id: ? was not found."
+	}
 	return fmt.Sprintf("topic with name: %s for stream with id: %s was not found.", e.TopicName, e.StreamId)
 }
 func (e TopicNameNotFound) Code() Code { return 2011 }
@@ -1270,6 +1408,9 @@ type TopicNameAlreadyExists struct {
 }
 
 func (e TopicNameAlreadyExists) Error() string {
+	if e == (TopicNameAlreadyExists{}) {
+		return "topic with name: ? for stream with id: ? already exists."
+	}
 	return fmt.Sprintf("topic with name: %s for stream with id: %d already exists.", e.TopicName, e.StreamId)
 }
 func (e TopicNameAlreadyExists) Code() Code { return 2013 }
@@ -1310,6 +1451,9 @@ type CannotReadTopics struct {
 }
 
 func (e CannotReadTopics) Error() string {
+	if e == (CannotReadTopics{}) {
+		return "cannot read topics for stream with id: ?"
+	}
 	return fmt.Sprintf("cannot read topics for stream with id: %d", e.ID)
 }
 func (e CannotReadTopics) Code() Code { return 2017 }
@@ -1341,6 +1485,9 @@ type TopicDirectoryNotFound struct {
 }
 
 func (e TopicDirectoryNotFound) Error() string {
+	if e == (TopicDirectoryNotFound{}) {
+		return "topic directory: ? not found"
+	}
 	return fmt.Sprintf("topic directory: %s not found", e.Path)
 }
 func (e TopicDirectoryNotFound) Code() Code { return 2020 }
@@ -1365,6 +1512,9 @@ type CannotCreatePartition struct {
 }
 
 func (e CannotCreatePartition) Error() string {
+	if e == (CannotCreatePartition{}) {
+		return "cannot create partition with id: ? for stream with id: ? and topic with id: ?"
+	}
 	return fmt.Sprintf("cannot create partition with id: %d for stream with id: %d and topic with id: %d", e.PartitionId, e.StreamId, e.TopicId)
 }
 func (e CannotCreatePartition) Code() Code { return 3000 }
@@ -1379,6 +1529,9 @@ type CannotCreatePartitionsDirectory struct {
 }
 
 func (e CannotCreatePartitionsDirectory) Error() string {
+	if e == (CannotCreatePartitionsDirectory{}) {
+		return "failed to create directory for partitions for stream with id: ? and topic with id: ?"
+	}
 	return fmt.Sprintf("failed to create directory for partitions for stream with id: %d and topic with id: %d", e.StreamId, e.TopicId)
 }
 func (e CannotCreatePartitionsDirectory) Code() Code { return 3001 }
@@ -1394,6 +1547,9 @@ type CannotCreatePartitionDirectory struct {
 }
 
 func (e CannotCreatePartitionDirectory) Error() string {
+	if e == (CannotCreatePartitionDirectory{}) {
+		return "failed to create directory for partition with id: ? for stream with id: ? and topic with id: ?"
+	}
 	return fmt.Sprintf("failed to create directory for partition with id: %d for stream with id: %d and topic with id: %d", e.PartitionId, e.StreamId, e.TopicId)
 }
 func (e CannotCreatePartitionDirectory) Code() Code { return 3002 }
@@ -1427,6 +1583,9 @@ type CannotDeletePartition struct {
 }
 
 func (e CannotDeletePartition) Error() string {
+	if e == (CannotDeletePartition{}) {
+		return "failed to delete partition with id: ? for stream with id: ? and topic with id: ?"
+	}
 	return fmt.Sprintf("failed to delete partition with id: %d for stream with id: %d and topic with id: %d", e.PartitionId, e.StreamId, e.TopicId)
 }
 func (e CannotDeletePartition) Code() Code { return 3005 }
@@ -1442,6 +1601,9 @@ type CannotDeletePartitionDirectory struct {
 }
 
 func (e CannotDeletePartitionDirectory) Error() string {
+	if e == (CannotDeletePartitionDirectory{}) {
+		return "failed to delete partition directory with id: ? for stream with id: ? and topic with id: ?"
+	}
 	return fmt.Sprintf("failed to delete partition directory with id: %d for stream with id: %d and topic with id: %d", e.PartitionId, e.StreamId, e.TopicId)
 }
 func (e CannotDeletePartitionDirectory) Code() Code { return 3006 }
@@ -1457,6 +1619,9 @@ type PartitionNotFound struct {
 }
 
 func (e PartitionNotFound) Error() string {
+	if e == (PartitionNotFound{}) {
+		return "partition with id: ? for topic with id: ? for stream with id: ? was not found."
+	}
 	return fmt.Sprintf("partition with id: %d for topic with id: %d for stream with id: %d was not found.", e.PartitionId, e.TopicId, e.StreamId)
 }
 func (e PartitionNotFound) Code() Code { return 3007 }
@@ -1471,6 +1636,9 @@ type NoPartitions struct {
 }
 
 func (e NoPartitions) Error() string {
+	if e == (NoPartitions{}) {
+		return "topic with id: ? for stream with id: ? has no partitions."
+	}
 	return fmt.Sprintf("topic with id: %d for stream with id: %d has no partitions.", e.TopicId, e.StreamId)
 }
 func (e NoPartitions) Code() Code { return 3008 }
@@ -1485,6 +1653,9 @@ type TopicFull struct {
 }
 
 func (e TopicFull) Error() string {
+	if e == (TopicFull{}) {
+		return "cannot read partitions for topic with id: ? for stream with id: ?"
+	}
 	return fmt.Sprintf("cannot read partitions for topic with id: %d for stream with id: %d", e.TopicId, e.StreamId)
 }
 func (e TopicFull) Code() Code { return 3009 }
@@ -1498,6 +1669,9 @@ type CannotDeleteConsumerOffsetsDirectory struct {
 }
 
 func (e CannotDeleteConsumerOffsetsDirectory) Error() string {
+	if e == (CannotDeleteConsumerOffsetsDirectory{}) {
+		return "failed to delete consumer offsets directory for path: ?"
+	}
 	return fmt.Sprintf("failed to delete consumer offsets directory for path: %s", e.Path)
 }
 func (e CannotDeleteConsumerOffsetsDirectory) Code() Code { return 3010 }
@@ -1511,6 +1685,9 @@ type CannotDeleteConsumerOffsetFile struct {
 }
 
 func (e CannotDeleteConsumerOffsetFile) Error() string {
+	if e == (CannotDeleteConsumerOffsetFile{}) {
+		return "failed to delete consumer offset file for path: ?"
+	}
 	return fmt.Sprintf("failed to delete consumer offset file for path: %s", e.Path)
 }
 func (e CannotDeleteConsumerOffsetFile) Code() Code { return 3011 }
@@ -1524,6 +1701,9 @@ type CannotCreateConsumerOffsetsDirectory struct {
 }
 
 func (e CannotCreateConsumerOffsetsDirectory) Error() string {
+	if e == (CannotCreateConsumerOffsetsDirectory{}) {
+		return "failed to create consumer offsets directory for path: ?"
+	}
 	return fmt.Sprintf("failed to create consumer offsets directory for path: %s", e.Path)
 }
 func (e CannotCreateConsumerOffsetsDirectory) Code() Code { return 3012 }
@@ -1537,6 +1717,9 @@ type CannotReadConsumerOffsets struct {
 }
 
 func (e CannotReadConsumerOffsets) Error() string {
+	if e == (CannotReadConsumerOffsets{}) {
+		return "failed to read consumers offsets from path: ?"
+	}
 	return fmt.Sprintf("failed to read consumers offsets from path: %s", e.Path)
 }
 func (e CannotReadConsumerOffsets) Code() Code { return 3020 }
@@ -1550,6 +1733,9 @@ type ConsumerOffsetNotFound struct {
 }
 
 func (e ConsumerOffsetNotFound) Error() string {
+	if e == (ConsumerOffsetNotFound{}) {
+		return "consumer offset for consumer with id: ? was not found."
+	}
 	return fmt.Sprintf("consumer offset for consumer with id: %d was not found.", e.ID)
 }
 func (e ConsumerOffsetNotFound) Code() Code { return 3021 }
@@ -1563,6 +1749,9 @@ type NotResolvedConsumer struct {
 }
 
 func (e NotResolvedConsumer) Error() string {
+	if e == (NotResolvedConsumer{}) {
+		return "failed to resolve consumer with id: ?"
+	}
 	return fmt.Sprintf("failed to resolve consumer with id: %d", e.ID)
 }
 func (e NotResolvedConsumer) Code() Code { return 3022 }
@@ -1576,6 +1765,9 @@ type CannotOpenConsumerOffsetsFile struct {
 }
 
 func (e CannotOpenConsumerOffsetsFile) Error() string {
+	if e == (CannotOpenConsumerOffsetsFile{}) {
+		return "cannot open consumer offsets file for path: ?"
+	}
 	return fmt.Sprintf("cannot open consumer offsets file for path: %s", e.Path)
 }
 func (e CannotOpenConsumerOffsetsFile) Code() Code { return 3023 }
@@ -1621,6 +1813,9 @@ type SegmentClosed struct {
 }
 
 func (e SegmentClosed) Error() string {
+	if e == (SegmentClosed{}) {
+		return "segment with start offset: ? and partition with id: ? is closed"
+	}
 	return fmt.Sprintf("segment with start offset: %d and partition with id: %d is closed", e.StartOffset, e.PartitionId)
 }
 func (e SegmentClosed) Code() Code { return 4001 }
@@ -1643,6 +1838,9 @@ type CannotCreateSegmentLogFile struct {
 }
 
 func (e CannotCreateSegmentLogFile) Error() string {
+	if e == (CannotCreateSegmentLogFile{}) {
+		return "failed to create segment log file for path: ?."
+	}
 	return fmt.Sprintf("failed to create segment log file for path: %s.", e.Path)
 }
 func (e CannotCreateSegmentLogFile) Code() Code { return 4003 }
@@ -1656,6 +1854,9 @@ type CannotCreateSegmentIndexFile struct {
 }
 
 func (e CannotCreateSegmentIndexFile) Error() string {
+	if e == (CannotCreateSegmentIndexFile{}) {
+		return "failed to create segment index file for path: ?."
+	}
 	return fmt.Sprintf("failed to create segment index file for path: %s.", e.Path)
 }
 func (e CannotCreateSegmentIndexFile) Code() Code { return 4004 }
@@ -1669,6 +1870,9 @@ type CannotCreateSegmentTimeIndexFile struct {
 }
 
 func (e CannotCreateSegmentTimeIndexFile) Error() string {
+	if e == (CannotCreateSegmentTimeIndexFile{}) {
+		return "failed to create segment time index file for path: ?."
+	}
 	return fmt.Sprintf("failed to create segment time index file for path: %s.", e.Path)
 }
 func (e CannotCreateSegmentTimeIndexFile) Code() Code { return 4005 }
@@ -1873,6 +2077,9 @@ type InvalidMessageChecksum struct {
 }
 
 func (e InvalidMessageChecksum) Error() string {
+	if e == (InvalidMessageChecksum{}) {
+		return "invalid message checksum: ?, expected: ?, for offset: ?"
+	}
 	return fmt.Sprintf("invalid message checksum: %d, expected: %d, for offset: %d", e.Actual, e.Expected, e.Offset)
 }
 func (e InvalidMessageChecksum) Code() Code { return 4027 }
@@ -1895,6 +2102,9 @@ type CommandLengthError struct {
 }
 
 func (e CommandLengthError) Error() string {
+	if e == (CommandLengthError{}) {
+		return "command length error: ?"
+	}
 	return fmt.Sprintf("command length error: %s", e.Detail)
 }
 func (e CommandLengthError) Code() Code { return 4029 }
@@ -1908,6 +2118,9 @@ type InvalidSegmentsCount struct {
 }
 
 func (e InvalidSegmentsCount) Error() string {
+	if e == (InvalidSegmentsCount{}) {
+		return "incorrect segments count size: ?"
+	}
 	return fmt.Sprintf("incorrect segments count size: %d", e.Count)
 }
 func (e InvalidSegmentsCount) Code() Code { return 4030 }
@@ -1922,6 +2135,9 @@ type NonZeroOffset struct {
 }
 
 func (e NonZeroOffset) Error() string {
+	if e == (NonZeroOffset{}) {
+		return "non-zero offset: ? at index: ?"
+	}
 	return fmt.Sprintf("non-zero offset: %d at index: %d", e.Offset, e.Index)
 }
 func (e NonZeroOffset) Code() Code { return 4031 }
@@ -1936,6 +2152,9 @@ type NonZeroTimestamp struct {
 }
 
 func (e NonZeroTimestamp) Error() string {
+	if e == (NonZeroTimestamp{}) {
+		return "non-zero timestamp: ? at index: ?"
+	}
 	return fmt.Sprintf("non-zero timestamp: %d at index: %d", e.Timestamp, e.Index)
 }
 func (e NonZeroTimestamp) Code() Code { return 4032 }
@@ -1949,6 +2168,9 @@ type MissingIndex struct {
 }
 
 func (e MissingIndex) Error() string {
+	if e == (MissingIndex{}) {
+		return "missing index: ?"
+	}
 	return fmt.Sprintf("missing index: %d", e.Index)
 }
 func (e MissingIndex) Code() Code { return 4033 }
@@ -1962,6 +2184,9 @@ type InvalidIndexesByteSize struct {
 }
 
 func (e InvalidIndexesByteSize) Error() string {
+	if e == (InvalidIndexesByteSize{}) {
+		return "invalid indexes byte size: ?B, should be divisible by 16"
+	}
 	return fmt.Sprintf("invalid indexes byte size: %dB, should be divisible by 16", e.Size)
 }
 func (e InvalidIndexesByteSize) Code() Code { return 4034 }
@@ -1976,6 +2201,9 @@ type InvalidIndexesCount struct {
 }
 
 func (e InvalidIndexesCount) Error() string {
+	if e == (InvalidIndexesCount{}) {
+		return "invalid indexes count: ?, expected: ?"
+	}
 	return fmt.Sprintf("invalid indexes count: %d, expected: %d", e.Count, e.Expected)
 }
 func (e InvalidIndexesCount) Code() Code { return 4035 }
@@ -1990,6 +2218,9 @@ type InvalidMessagesSize struct {
 }
 
 func (e InvalidMessagesSize) Error() string {
+	if e == (InvalidMessagesSize{}) {
+		return "invalid messages byte size: ?B, expected: ?B"
+	}
 	return fmt.Sprintf("invalid messages byte size: %dB, expected: %dB", e.Actual, e.Expected)
 }
 func (e InvalidMessagesSize) Code() Code { return 4036 }
@@ -2004,6 +2235,9 @@ type TooSmallMessage struct {
 }
 
 func (e TooSmallMessage) Error() string {
+	if e == (TooSmallMessage{}) {
+		return "too small message: ?B, expected: ?B"
+	}
 	return fmt.Sprintf("too small message: %dB, expected: %dB", e.Actual, e.Expected)
 }
 func (e TooSmallMessage) Code() Code { return 4037 }
@@ -2017,6 +2251,9 @@ type InvalidMessageTimestampDelta struct {
 }
 
 func (e InvalidMessageTimestampDelta) Error() string {
+	if e == (InvalidMessageTimestampDelta{}) {
+		return "invalid message timestamp delta: ? microseconds exceeds the per-batch limit"
+	}
 	return fmt.Sprintf("invalid message timestamp delta: %d microseconds exceeds the per-batch limit", e.Delta)
 }
 func (e InvalidMessageTimestampDelta) Code() Code { return 4038 }
@@ -2032,6 +2269,9 @@ type InvalidBatchChecksum struct {
 }
 
 func (e InvalidBatchChecksum) Error() string {
+	if e == (InvalidBatchChecksum{}) {
+		return "invalid batch checksum: ?, expected: ?, for base offset: ?"
+	}
 	return fmt.Sprintf("invalid batch checksum: %d, expected: %d, for base offset: %d", e.Stored, e.Computed, e.BaseOffset)
 }
 func (e InvalidBatchChecksum) Code() Code { return 4039 }
@@ -2045,6 +2285,9 @@ type InvalidHeaderKind struct {
 }
 
 func (e InvalidHeaderKind) Error() string {
+	if e == (InvalidHeaderKind{}) {
+		return "invalid header kind code: ?"
+	}
 	return fmt.Sprintf("invalid header kind code: %d", e.Kind)
 }
 func (e InvalidHeaderKind) Code() Code { return 4040 }
@@ -2058,6 +2301,9 @@ type UnsupportedOptionKey struct {
 }
 
 func (e UnsupportedOptionKey) Error() string {
+	if e == (UnsupportedOptionKey{}) {
+		return "unsupported option key: ?"
+	}
 	return fmt.Sprintf("unsupported option key: %s", e.Key)
 }
 func (e UnsupportedOptionKey) Code() Code { return 4041 }
@@ -2071,6 +2317,9 @@ type InvalidOptionValue struct {
 }
 
 func (e InvalidOptionValue) Error() string {
+	if e == (InvalidOptionValue{}) {
+		return "invalid option value for key: ?"
+	}
 	return fmt.Sprintf("invalid option value for key: %s", e.Key)
 }
 func (e InvalidOptionValue) Code() Code { return 4042 }
@@ -2084,6 +2333,9 @@ type OptionsBlockTooLarge struct {
 }
 
 func (e OptionsBlockTooLarge) Error() string {
+	if e == (OptionsBlockTooLarge{}) {
+		return "options block exceeds its limits: ?"
+	}
 	return fmt.Sprintf("options block exceeds its limits: %s", e.Details)
 }
 func (e OptionsBlockTooLarge) Code() Code { return 4043 }
@@ -2162,6 +2414,9 @@ type InvalidOffset struct {
 }
 
 func (e InvalidOffset) Error() string {
+	if e == (InvalidOffset{}) {
+		return "invalid offset: ?"
+	}
 	return fmt.Sprintf("invalid offset: %d", e.Offset)
 }
 func (e InvalidOffset) Code() Code { return 4100 }
@@ -2175,6 +2430,9 @@ type InvalidReservedField struct {
 }
 
 func (e InvalidReservedField) Error() string {
+	if e == (InvalidReservedField{}) {
+		return "invalid reserved field value: ?, expected: 0"
+	}
 	return fmt.Sprintf("invalid reserved field value: %d, expected: 0", e.Value)
 }
 func (e InvalidReservedField) Code() Code { return 4101 }
@@ -2189,6 +2447,9 @@ type SegmentSizeMismatchAtOpen struct {
 }
 
 func (e SegmentSizeMismatchAtOpen) Error() string {
+	if e == (SegmentSizeMismatchAtOpen{}) {
+		return "segment file size on disk: ? does not match expected size: ?"
+	}
 	return fmt.Sprintf("segment file size on disk: %d does not match expected size: %d", e.OnDisk, e.Expected)
 }
 func (e SegmentSizeMismatchAtOpen) Code() Code { return 4102 }
@@ -2203,6 +2464,9 @@ type ConsumerGroupIdNotFound struct {
 }
 
 func (e ConsumerGroupIdNotFound) Error() string {
+	if e == (ConsumerGroupIdNotFound{}) {
+		return "consumer group with id: ? for topic with id: ? was not found."
+	}
 	return fmt.Sprintf("consumer group with id: %d for topic with id: %d was not found.", e.GroupId, e.TopicId)
 }
 func (e ConsumerGroupIdNotFound) Code() Code { return 5000 }
@@ -2226,6 +2490,9 @@ type ConsumerGroupNameNotFound struct {
 }
 
 func (e ConsumerGroupNameNotFound) Error() string {
+	if e == (ConsumerGroupNameNotFound{}) {
+		return "consumer group with name: ? for topic with id: ? was not found."
+	}
 	return fmt.Sprintf("consumer group with name: %s for topic with id: %s was not found.", e.Name, e.TopicId)
 }
 func (e ConsumerGroupNameNotFound) Code() Code { return 5003 }
@@ -2240,6 +2507,9 @@ type ConsumerGroupNameAlreadyExists struct {
 }
 
 func (e ConsumerGroupNameAlreadyExists) Error() string {
+	if e == (ConsumerGroupNameAlreadyExists{}) {
+		return "consumer group with name: ? for topic with id: ? already exists."
+	}
 	return fmt.Sprintf("consumer group with name: %s for topic with id: %d already exists.", e.Name, e.TopicId)
 }
 func (e ConsumerGroupNameAlreadyExists) Code() Code { return 5004 }
@@ -2264,6 +2534,9 @@ type ConsumerGroupMemberNotFound struct {
 }
 
 func (e ConsumerGroupMemberNotFound) Error() string {
+	if e == (ConsumerGroupMemberNotFound{}) {
+		return "consumer group member with id: ? for group with id: ? for topic with id: ? was not found."
+	}
 	return fmt.Sprintf("consumer group member with id: %d for group with id: %d for topic with id: %d was not found.", e.MemberId, e.GroupId, e.TopicId)
 }
 func (e ConsumerGroupMemberNotFound) Code() Code { return 5006 }
@@ -2279,6 +2552,9 @@ type CannotCreateConsumerGroupInfo struct {
 }
 
 func (e CannotCreateConsumerGroupInfo) Error() string {
+	if e == (CannotCreateConsumerGroupInfo{}) {
+		return "failed to create consumer group info file for id: ? for topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to create consumer group info file for id: %d for topic with id: %d for stream with id: %d.", e.GroupId, e.TopicId, e.StreamId)
 }
 func (e CannotCreateConsumerGroupInfo) Code() Code { return 5007 }
@@ -2294,6 +2570,9 @@ type CannotDeleteConsumerGroupInfo struct {
 }
 
 func (e CannotDeleteConsumerGroupInfo) Error() string {
+	if e == (CannotDeleteConsumerGroupInfo{}) {
+		return "failed to delete consumer group info file for id: ? for topic with id: ? for stream with id: ?."
+	}
 	return fmt.Sprintf("failed to delete consumer group info file for id: %d for topic with id: %d for stream with id: %d.", e.GroupId, e.TopicId, e.StreamId)
 }
 func (e CannotDeleteConsumerGroupInfo) Code() Code { return 5008 }
@@ -2308,6 +2587,9 @@ type ConsumerGroupPartitionNotOwned struct {
 }
 
 func (e ConsumerGroupPartitionNotOwned) Error() string {
+	if e == (ConsumerGroupPartitionNotOwned{}) {
+		return "consumer group member with client id: ? does not own partition: ? at the current generation (rebalance in progress)."
+	}
 	return fmt.Sprintf("consumer group member with client id: %d does not own partition: %d at the current generation (rebalance in progress).", e.ClientId, e.PartitionId)
 }
 func (e ConsumerGroupPartitionNotOwned) Code() Code { return 5009 }
@@ -2548,6 +2830,9 @@ type TimestampOutOfRange struct {
 }
 
 func (e TimestampOutOfRange) Error() string {
+	if e == (TimestampOutOfRange{}) {
+		return "timestamp out of range: ?"
+	}
 	return fmt.Sprintf("timestamp out of range: %d", e.Timestamp)
 }
 func (e TimestampOutOfRange) Code() Code { return 10013 }
@@ -2563,6 +2848,9 @@ type ShardNotFound struct {
 }
 
 func (e ShardNotFound) Error() string {
+	if e == (ShardNotFound{}) {
+		return "shard not found for stream id: ?, topic id: ?, partition id: ?"
+	}
 	return fmt.Sprintf("shard not found for stream id: %d, topic id: %d, partition id: %d", e.StreamId, e.TopicId, e.PartitionId)
 }
 func (e ShardNotFound) Code() Code { return 11000 }
@@ -2585,6 +2873,9 @@ type CannotBindToSocket struct {
 }
 
 func (e CannotBindToSocket) Error() string {
+	if e == (CannotBindToSocket{}) {
+		return "cannot bind to socket with addr: ?"
+	}
 	return fmt.Sprintf("cannot bind to socket with addr: %s", e.Addr)
 }
 func (e CannotBindToSocket) Code() Code { return 12000 }
@@ -2607,6 +2898,9 @@ type IoError struct {
 }
 
 func (e IoError) Error() string {
+	if e == (IoError{}) {
+		return "io error: ?"
+	}
 	return fmt.Sprintf("io error: %s", e.Message)
 }
 func (e IoError) Code() Code { return 13000 }
@@ -2631,6 +2925,9 @@ type InvalidSession struct {
 }
 
 func (e InvalidSession) Error() string {
+	if e == (InvalidSession{}) {
+		return "vsr session value ? is invalid (must be non-zero)"
+	}
 	return fmt.Sprintf("vsr session value %d is invalid (must be non-zero)", e.Session)
 }
 func (e InvalidSession) Code() Code { return 14001 }
@@ -2646,6 +2943,9 @@ type IncompatibleProtocolVersion struct {
 }
 
 func (e IncompatibleProtocolVersion) Error() string {
+	if e == (IncompatibleProtocolVersion{}) {
+		return "incompatible binary protocol version: client ?, server accepts [?, ?]"
+	}
 	return fmt.Sprintf("incompatible binary protocol version: client %d, server accepts [%d, %d]", e.ClientVersion, e.ServerVersionMin, e.ServerVersionMax)
 }
 func (e IncompatibleProtocolVersion) Code() Code { return 14003 }

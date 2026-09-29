@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -41,6 +42,10 @@ type ErrorDef struct {
 }
 
 const OutputFile = "errors_gen.go"
+
+const unknownField = "?"
+
+var formatVerb = regexp.MustCompile(`%[vsd]`)
 
 func main() {
 	data, err := os.ReadFile("./errors.yaml")
@@ -115,10 +120,7 @@ type IggyError interface {
 	}
 
 	for _, e := range errors {
-		if len(e.Fields) != 0 &&
-			(strings.Contains(e.Format, "%v") ||
-				strings.Contains(e.Format, "%s") ||
-				strings.Contains(e.Format, "%d")) {
+		if len(e.Fields) != 0 && formatVerb.MatchString(e.Format) {
 			// error with fields and need to use fmt.Sprintf.
 			_, _ = fmt.Fprintf(f, "type %s struct {\n", e.Name)
 			for _, field := range e.Fields {
@@ -130,10 +132,15 @@ type IggyError interface {
 			for i, field := range e.Fields {
 				args[i] = "e." + field.Name
 			}
+			// FromCode returns the zero value, because the wire carries only
+			// the code. Its zero fields are values the server never sent.
 			_, _ = fmt.Fprintf(f, `func (e %s) Error() string {
+    if e == (%s{}) {
+        return "%s"
+    }
     return fmt.Sprintf("%s", %s)
 }
-`, e.Name, e.Format, strings.Join(args, ", "))
+`, e.Name, e.Name, formatVerb.ReplaceAllString(e.Format, unknownField), e.Format, strings.Join(args, ", "))
 		} else {
 			_, err = fmt.Fprintf(f, "type %s struct{}\n", e.Name)
 			if err != nil {
