@@ -67,7 +67,9 @@ fn config_env_listing_includes_vector_index_templates() {
 
     // Cluster nodes should have indexed templates
     assert!(
-        names.iter().any(|name| name.contains("IGGY_CLUSTER_NODES_<N>_")),
+        names
+            .iter()
+            .any(|name| name.contains("IGGY_CLUSTER_NODES_<N>_")),
         "server should list cluster node index templates"
     );
 
@@ -94,17 +96,23 @@ fn config_env_listing_includes_connector_templates() {
 
     // Both SINK and SOURCE templates should be present
     assert!(
-        names.iter().any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_")),
+        names
+            .iter()
+            .any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_")),
         "connectors should list SINK templates with <KEY> placeholder"
     );
     assert!(
-        names.iter().any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_")),
+        names
+            .iter()
+            .any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_")),
         "connectors should list SOURCE templates with <KEY> placeholder"
     );
 
     // Plugin config templates should be present
     assert!(
-        names.iter().any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_<FIELD>")),
+        names
+            .iter()
+            .any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_<FIELD>")),
         "connectors should list SINK plugin config templates"
     );
     assert!(
