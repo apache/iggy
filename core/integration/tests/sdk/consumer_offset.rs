@@ -32,16 +32,16 @@ const ASSIGNED_PARTITION_ID: u32 = 3;
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[iggy_harness(test_client_transport = [Http, Tcp, Quic, WebSocket])]
-async fn all_transports_can_read_stored_consumer_offsets_of_any_consumer_kind(
+async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should_store_read_and_delete(
     harness: &TestHarness,
 ) {
-    // client to run test cases for all transports
     let client = harness
         .root_client()
         .await
         .expect("Failed to get root client");
 
-    // Use tcp for seeding, which carries consumer kind in binary protocol correctly
+    // A consumer-group member needs a persistent connection. Required
+    // for offset test cases using a consumer group.
     let seed_client = harness
         .tcp_root_client()
         .await
@@ -75,6 +75,8 @@ async fn all_transports_can_read_stored_consumer_offsets_of_any_consumer_kind(
         .await
         .unwrap();
 
+    // Setup a consumer that joins a group in order to store, read and delete
+    // offsets from a group member.
     seed_client
         .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
         .await
@@ -89,7 +91,7 @@ async fn all_transports_can_read_stored_consumer_offsets_of_any_consumer_kind(
     let group_consumer = Consumer::group(group_id.clone());
 
     for (consumer, offset) in [(&standalone_consumer, 2_u64), (&group_consumer, 4_u64)] {
-        seed_client
+        client
             .store_consumer_offset(
                 consumer,
                 &stream_id,
@@ -110,6 +112,22 @@ async fn all_transports_can_read_stored_consumer_offsets_of_any_consumer_kind(
             stored_offset,
             Some(offset),
             "{consumer:?} stored offset should be readable over every transport"
+        );
+
+        client
+            .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap();
+
+        let stored_offset_after_delete = client
+            .get_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap()
+            .map(|info| info.stored_offset);
+
+        assert_eq!(
+            stored_offset_after_delete, None,
+            "{consumer:?} stored offset should be gone after delete over every transport"
         );
     }
 }
