@@ -450,7 +450,7 @@ impl IggyClient {
     /// [`TcpClient`]: crate::prelude::TcpClient
     /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn new(client: ClientWrapper) -> Self {
-        // Only TCP supplies a policy. It bounds login, PAT login, and connect
+        // Only TCP currently supplies a request policy. It bounds login, PAT login, and connect
         // when sign-in credentials are available, including their lock waits.
         let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
@@ -566,7 +566,7 @@ impl IggyClient {
             info!("Client-side encryption is enabled.");
         }
 
-        // Only TCP supplies a policy. It bounds login, PAT login, and connect
+        // Only TCP currently supplies a request policy. It bounds login, PAT login, and connect
         // when sign-in credentials are available, including their lock waits.
         let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
@@ -583,7 +583,11 @@ impl IggyClient {
         &self,
         future: impl Future<Output = Result<T, IggyError>>,
     ) -> Result<T, IggyError> {
-        let Some(policy) = self.request_policy.as_ref() else {
+        let Some(policy) = self
+            .request_policy
+            .as_ref()
+            .filter(|policy| policy.is_active())
+        else {
             return future.await;
         };
         RequestBudget::run(

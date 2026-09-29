@@ -51,13 +51,13 @@ use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use secrecy::{ExposeSecret, SecretString};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 #[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, TryLockError};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_rustls::{TlsConnector, TlsStream};
 use tracing::{error, info, trace, warn};
@@ -96,10 +96,7 @@ const FAILOVER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub struct TcpClient {
     poll_router: PollRouter<Self>,
     pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
-    /// A deadline may expire while another task holds the stream lock. Its
-    /// next user must discard that old connection before sending a request.
-    discard_stream_on_next_lock: Arc<AtomicBool>,
-    has_sign_in_credentials: Arc<AtomicBool>,
+    timeout_control: Arc<TcpTimeoutControl>,
     pub(crate) config: Arc<TcpClientConfig>,
     pub(crate) state: Arc<Mutex<ClientState>>,
     client_address: Mutex<Option<SocketAddr>>,
@@ -139,51 +136,56 @@ pub struct TcpClient {
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct TcpRequestPolicy {
-    timeout: NonZeroIggyDuration,
-    has_sign_in_credentials: Arc<AtomicBool>,
-    discard_stream_on_next_lock: Arc<AtomicBool>,
+#[derive(Debug)]
+struct TcpTimeoutControl {
     stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     state: Arc<Mutex<ClientState>>,
+    /// A timed-out send may hold the stream lock; keep this set until the next
+    /// connect discards the old connection and session.
+    invalidated: Arc<AtomicBool>,
+    has_sign_in_credentials: AtomicBool,
 }
 
-impl TcpRequestPolicy {
-    pub(crate) fn timeout(&self) -> NonZeroIggyDuration {
+impl TcpTimeoutControl {
+    fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::SeqCst);
+        if let Ok(mut stream) = self.stream.try_lock() {
+            stream.take();
+        }
+        if let Ok(mut state) = self.state.try_lock()
+            && *state != ClientState::Shutdown
+        {
+            *state = ClientState::Disconnected;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TcpTimeoutHandle {
+    timeout: NonZeroIggyDuration,
+    control: Weak<TcpTimeoutControl>,
+}
+
+impl ClientRequestPolicy for TcpTimeoutHandle {
+    fn timeout(&self) -> NonZeroIggyDuration {
         self.timeout
     }
 
-    pub(crate) fn has_sign_in_credentials(&self) -> bool {
-        self.has_sign_in_credentials.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn expire(&self) -> Result<(), TryLockError> {
-        self.discard_stream_on_next_lock
-            .store(true, Ordering::SeqCst);
-        let stream_result = self.stream.try_lock().map(|mut stream| {
-            stream.take();
-            self.discard_stream_on_next_lock
-                .store(false, Ordering::SeqCst);
-        });
-        let state_result = self.state.try_lock().map(|mut state| {
-            *state = ClientState::Disconnected;
-        });
-        stream_result?;
-        state_result
-    }
-}
-
-impl ClientRequestPolicy for TcpRequestPolicy {
-    fn timeout(&self) -> NonZeroIggyDuration {
-        TcpRequestPolicy::timeout(self)
-    }
-
     fn should_budget_connect(&self) -> bool {
-        TcpRequestPolicy::has_sign_in_credentials(self)
+        self.control
+            .upgrade()
+            .is_some_and(|control| control.has_sign_in_credentials.load(Ordering::SeqCst))
     }
 
-    fn expire(&self) -> Result<(), TryLockError> {
-        TcpRequestPolicy::expire(self)
+    fn is_active(&self) -> bool {
+        self.control.strong_count() > 0
+    }
+
+    fn expire(&self) -> Result<(), IggyError> {
+        if let Some(control) = self.control.upgrade() {
+            control.invalidate();
+        }
+        Ok(())
     }
 }
 
@@ -249,9 +251,7 @@ impl BinaryTransport for TcpClient {
     }
 
     fn expire_request(&self) {
-        if let Err(error) = self.request_policy().expire() {
-            error!("Failed to expire the TCP request: {error}");
-        }
+        self.timeout_control.invalidate();
     }
 
     async fn send_offset_write_with_response(
@@ -269,7 +269,13 @@ impl BinaryTransport for TcpClient {
         self.poll_router.poll(self, request).await
     }
     async fn get_state(&self) -> ClientState {
-        *self.state.lock().await
+        let state = *self.state.lock().await;
+        if state != ClientState::Shutdown && self.timeout_control.invalidated.load(Ordering::SeqCst)
+        {
+            ClientState::Disconnected
+        } else {
+            state
+        }
     }
 
     async fn set_state(&self, state: ClientState) {
@@ -308,25 +314,6 @@ impl BinaryTransport for TcpClient {
 
 impl TcpClient {
     async fn send_raw_with_response_inner(
-        &self,
-        code: u32,
-        payload: Bytes,
-    ) -> Result<Bytes, IggyError> {
-        loop {
-            let result = self
-                .send_raw_with_response_once(code, payload.clone())
-                .await;
-            if !is_login_register_code(code)
-                || !self.config.reconnection.enabled
-                || !matches!(&result, Err(error) if is_reconnectable_request_error(error))
-            {
-                return result;
-            }
-            Self::wait_before_login_replay(&result).await?;
-        }
-    }
-
-    async fn send_raw_with_response_once(
         &self,
         code: u32,
         payload: Bytes,
@@ -439,13 +426,6 @@ impl TcpClient {
         drop(_routing_guard);
         self.send_raw(code, payload).await
     }
-
-    async fn wait_before_login_replay(result: &Result<Bytes, IggyError>) -> Result<(), IggyError> {
-        if result.is_err() && RequestBudget::deadline().is_some() {
-            sleep(NOT_READY_RETRY_INTERVAL).await;
-        }
-        Ok(())
-    }
 }
 
 impl iggy_common::VsrSessionSealed for TcpClient {}
@@ -494,13 +474,16 @@ impl iggy_common::VsrSessionControl for TcpClient {
                 credentials,
                 user_id,
             });
-        self.has_sign_in_credentials.store(true, Ordering::SeqCst);
+        self.timeout_control
+            .has_sign_in_credentials
+            .store(true, Ordering::SeqCst);
         self.learn_roster_once().await;
     }
 
     async fn forget_session_credentials(&self) {
         self.session_credentials.lock().await.take();
-        self.has_sign_in_credentials
+        self.timeout_control
+            .has_sign_in_credentials
             .store(self.auto_login_configured(), Ordering::SeqCst);
     }
 
@@ -674,14 +657,21 @@ impl TcpClient {
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         let server_address = config.server_address.clone();
         let has_sign_in_credentials = matches!(config.auto_login, AutoLogin::Enabled(_));
+        let stream = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(ClientState::Disconnected));
+        let timeout_control = Arc::new(TcpTimeoutControl {
+            stream: Arc::clone(&stream),
+            state: Arc::clone(&state),
+            invalidated: Arc::new(AtomicBool::new(false)),
+            has_sign_in_credentials: AtomicBool::new(has_sign_in_credentials),
+        });
         Ok(Self {
             poll_router: PollRouter::default(),
             config,
             client_address: Mutex::new(None),
-            stream: Arc::new(Mutex::new(None)),
-            discard_stream_on_next_lock: Arc::new(AtomicBool::new(false)),
-            has_sign_in_credentials: Arc::new(AtomicBool::new(has_sign_in_credentials)),
-            state: Arc::new(Mutex::new(ClientState::Disconnected)),
+            stream,
+            timeout_control,
+            state,
             events: broadcast(1000),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
@@ -708,7 +698,12 @@ impl TcpClient {
     }
 
     async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
-        if RequestBudget::deadline().is_none() && self.request_policy().has_sign_in_credentials() {
+        if RequestBudget::deadline().is_none()
+            && self
+                .timeout_control
+                .has_sign_in_credentials
+                .load(Ordering::SeqCst)
+        {
             return RequestBudget::run(
                 self.request_timeout(),
                 || self.expire_request(),
@@ -719,14 +714,27 @@ impl TcpClient {
         self.connect_with_settlement_inner(settle_off_leader).await
     }
 
-    pub(crate) fn request_policy(&self) -> TcpRequestPolicy {
-        TcpRequestPolicy {
+    pub(crate) fn timeout_handle(&self) -> TcpTimeoutHandle {
+        TcpTimeoutHandle {
             timeout: self.config.request_timeout,
-            has_sign_in_credentials: Arc::clone(&self.has_sign_in_credentials),
-            discard_stream_on_next_lock: Arc::clone(&self.discard_stream_on_next_lock),
-            stream: Arc::clone(&self.stream),
-            state: Arc::clone(&self.state),
+            control: Arc::downgrade(&self.timeout_control),
         }
+    }
+
+    async fn reconcile_expired_connection(&self) -> Result<(), IggyError> {
+        if !self.timeout_control.invalidated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.stream.lock().await.take();
+        self.reset_vsr_session().await?;
+        let mut state = self.state.lock().await;
+        if *state != ClientState::Shutdown {
+            *state = ClientState::Disconnected;
+        }
+        self.timeout_control
+            .invalidated
+            .store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn connect_with_settlement_inner(
@@ -762,6 +770,7 @@ impl TcpClient {
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         loop {
+            self.reconcile_expired_connection().await?;
             if RequestBudget::deadline()
                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
             {
@@ -856,8 +865,6 @@ impl TcpClient {
                         {
                             let mut stream = self.stream.lock().await;
                             stream.replace(connection.stream);
-                            self.discard_stream_on_next_lock
-                                .store(false, Ordering::SeqCst);
                         }
                         self.set_state(ClientState::Connected).await;
                         self.connected_at.lock().await.replace(now);
@@ -1688,7 +1695,7 @@ impl TcpClient {
         Result<Bytes, IggyError>,
     ) {
         let stream = self.stream.clone();
-        let discard_stream_on_next_lock = Arc::clone(&self.discard_stream_on_next_lock);
+        let invalidated = Arc::clone(&self.timeout_control.invalidated);
         let request_deadline = RequestBudget::deadline();
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
@@ -1705,7 +1712,7 @@ impl TcpClient {
             } else {
                 stream.lock().await
             };
-            if discard_stream_on_next_lock.swap(false, Ordering::SeqCst) {
+            if invalidated.load(Ordering::SeqCst) {
                 stream_guard.take();
                 return (None, Err(IggyError::NotConnected));
             }
@@ -2147,7 +2154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_reconnect_attempts_share_one_budget() {
+    async fn login_returns_after_one_failed_reconnect() {
         let (address, dials) = counted_endpoint_that_hangs_up().await;
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: address,
@@ -2170,17 +2177,13 @@ mod tests {
         .await;
         assert!(
             result.is_ok(),
-            "reconnects must finish within the login budget; dials={}, state={:?}",
+            "login must finish within its request budget; dials={}, state={:?}",
             dials.load(Ordering::SeqCst),
             client.get_state().await
         );
         let result = result.unwrap();
-        assert!(
-            matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)),
-            "{result:?}"
-        );
-        assert!(dials.load(Ordering::SeqCst) >= 2);
-        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(matches!(result, Err(IggyError::Disconnected)), "{result:?}");
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -2210,30 +2213,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_policy_expire_reports_incomplete_cleanup() {
-        let client = TcpClient::create(Arc::new(TcpClientConfig::default())).unwrap();
-        let policy = client.request_policy();
-        let stream_lock = client.stream.lock().await;
+    async fn timeout_invalidation_recovers_when_state_lock_is_held() {
+        let (listener, address) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: address,
+            reconnection: TcpClientReconnectionConfig {
+                reestablish_after: IggyDuration::new(std::time::Duration::ZERO),
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        Client::connect(&client).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
         let mut state_lock = client.state.lock().await;
         *state_lock = ClientState::Authenticated;
 
-        assert!(policy.expire().is_err());
-        assert!(client.discard_stream_on_next_lock.load(Ordering::SeqCst));
-
-        drop(state_lock);
-        assert!(policy.expire().is_err());
-        assert_eq!(client.get_state().await, ClientState::Disconnected);
-
-        drop(stream_lock);
-        let mut state_lock = client.state.lock().await;
-        *state_lock = ClientState::Authenticated;
-        assert!(policy.expire().is_err());
-        assert!(!client.discard_stream_on_next_lock.load(Ordering::SeqCst));
+        client.timeout_handle().expire().unwrap();
+        assert!(client.stream.lock().await.is_none());
         assert_eq!(*state_lock, ClientState::Authenticated);
-
+        assert!(client.timeout_control.invalidated.load(Ordering::SeqCst));
         drop(state_lock);
-        assert!(policy.expire().is_ok());
         assert_eq!(client.get_state().await, ClientState::Disconnected);
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), Client::connect(&client))
+                .await
+                .expect("connect must recover after timeout invalidation");
+        assert!(result.is_ok(), "{result:?}");
+        let (_peer, _) = listener.accept().await.unwrap();
+        assert_eq!(client.get_state().await, ClientState::Connected);
+        client.bind_vsr_session(2).await.unwrap();
+        assert!(!client.timeout_control.invalidated.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

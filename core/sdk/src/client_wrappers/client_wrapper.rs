@@ -20,18 +20,19 @@ use crate::http::http_client::HttpClient;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
-use iggy_common::NonZeroIggyDuration;
+use iggy_common::{IggyError, NonZeroIggyDuration};
 use std::fmt::Debug;
 use std::sync::Arc;
-use tokio::sync::TryLockError;
 
 pub(crate) trait ClientRequestPolicy: Debug + Send + Sync {
     /// Returns the deadline used for supported requests.
     fn timeout(&self) -> NonZeroIggyDuration;
     /// Whether connect includes sign-in and should share that deadline.
     fn should_budget_connect(&self) -> bool;
-    /// Invalidates the connection after the request deadline expires.
-    fn expire(&self) -> Result<(), TryLockError>;
+    /// Whether the transport that supplied this policy is still present.
+    fn is_active(&self) -> bool;
+    /// Invalidates transport state after the request deadline expires.
+    fn expire(&self) -> Result<(), IggyError>;
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -45,11 +46,11 @@ pub enum ClientWrapper {
 }
 
 impl ClientWrapper {
-    /// Returns the TCP policy for login, PAT login, and credentialed connect.
+    /// Returns the request policy for login, PAT login, and credentialed connect.
     /// HTTP, QUIC, and WebSocket currently have no request policy.
     pub(crate) fn request_policy(&self) -> Option<Arc<dyn ClientRequestPolicy>> {
         match self {
-            Self::Tcp(client) => Some(Arc::new(client.request_policy())),
+            Self::Tcp(client) => Some(Arc::new(client.timeout_handle())),
             Self::Iggy(client) => client.request_policy.clone(),
             _ => None,
         }

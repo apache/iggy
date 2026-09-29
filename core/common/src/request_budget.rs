@@ -16,6 +16,8 @@
 // under the License.
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::time::{Instant, timeout_at};
 
@@ -25,9 +27,10 @@ tokio::task_local! {
     static REQUEST_BUDGET: RequestBudget;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RequestBudget {
     deadline: Instant,
+    cleanup_started: Arc<AtomicBool>,
 }
 
 impl RequestBudget {
@@ -41,10 +44,11 @@ impl RequestBudget {
         on_expire: impl FnOnce(),
         future: impl Future<Output = Result<T, IggyError>>,
     ) -> Result<T, IggyError> {
-        let existing = REQUEST_BUDGET.try_with(|budget| *budget).ok();
-        let budget = existing.or_else(|| {
+        let existing = REQUEST_BUDGET.try_with(Clone::clone).ok();
+        let budget = existing.clone().or_else(|| {
             timeout.map(|timeout| Self {
                 deadline: Instant::now() + timeout.get_duration(),
+                cleanup_started: Arc::new(AtomicBool::new(false)),
             })
         });
         let Some(budget) = budget else {
@@ -52,11 +56,13 @@ impl RequestBudget {
         };
         // Login reconnects nest budgeted futures; boxing keeps their stack use bounded.
         let future = Box::pin(future);
-        let run = async {
-            if budget.deadline <= Instant::now() {
+        let cleanup_started = Arc::clone(&budget.cleanup_started);
+        let deadline = budget.deadline;
+        let run = async move {
+            if deadline <= Instant::now() {
                 return Err(IggyError::RequestTimeoutOutcomeUnknown);
             }
-            timeout_at(budget.deadline, future)
+            timeout_at(deadline, future)
                 .await
                 .map_err(|_| IggyError::RequestTimeoutOutcomeUnknown)?
         };
@@ -65,7 +71,10 @@ impl RequestBudget {
         } else {
             REQUEST_BUDGET.scope(budget, run).await
         };
-        if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
+        // Nested scopes share one deadline, so the first observer owns cleanup.
+        if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown))
+            && !cleanup_started.swap(true, Ordering::SeqCst)
+        {
             on_expire();
         }
         result
@@ -74,6 +83,7 @@ impl RequestBudget {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -94,5 +104,71 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(RequestBudget::deadline().is_none());
+    }
+
+    #[tokio::test]
+    async fn nested_timeout_runs_cleanup_once() {
+        let timeout = NonZeroIggyDuration::new(Duration::from_secs(1)).unwrap();
+        let outer_cleanup = AtomicUsize::new(0);
+        let inner_cleanup = AtomicUsize::new(0);
+
+        let result: Result<(), IggyError> = RequestBudget::run(
+            Some(timeout),
+            || {
+                outer_cleanup.fetch_add(1, Ordering::SeqCst);
+            },
+            async {
+                RequestBudget::run(
+                    Some(timeout),
+                    || {
+                        inner_cleanup.fetch_add(1, Ordering::SeqCst);
+                    },
+                    async { Err(IggyError::RequestTimeoutOutcomeUnknown) },
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
+        assert_eq!(outer_cleanup.load(Ordering::SeqCst), 0);
+        assert_eq!(inner_cleanup.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_deadline_runs_cleanup_once_for_pending_operation() {
+        let timeout = NonZeroIggyDuration::new(Duration::from_millis(10)).unwrap();
+        let outer_cleanup = AtomicUsize::new(0);
+        let inner_cleanup = AtomicUsize::new(0);
+
+        let result: Result<(), IggyError> = RequestBudget::run(
+            Some(timeout),
+            || {
+                outer_cleanup.fetch_add(1, Ordering::SeqCst);
+            },
+            async {
+                RequestBudget::run(
+                    Some(timeout),
+                    || {
+                        inner_cleanup.fetch_add(1, Ordering::SeqCst);
+                    },
+                    std::future::pending(),
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
+        assert_eq!(
+            outer_cleanup.load(Ordering::SeqCst) + inner_cleanup.load(Ordering::SeqCst),
+            1
+        );
     }
 }
