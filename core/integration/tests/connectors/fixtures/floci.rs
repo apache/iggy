@@ -59,6 +59,7 @@ impl FlociContainer {
                     .with_port(PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
+            .with_env_var("FLOCI_SERVICES_S3_ENFORCE_AUTH", "true")
             .with_container_name(container_name)
             .with_mapped_port(0, PORT.tcp());
         let request = if let Some(network) = network {
