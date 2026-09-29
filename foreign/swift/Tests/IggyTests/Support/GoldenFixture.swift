@@ -35,9 +35,15 @@ struct GoldenFixture: Decodable {
         let name: String
     }
 
+    /// `NO_ASSIGNED_PARTITION` and `RESYNC_REQUIRED_PARTITION_SENTINEL` from
+    /// `core/common`.
+    let noAssignedPartition: UInt32
+    let resyncRequiredPartition: UInt32
     private let xxh3_64Table: [String: String]
     private let xxh32Table: [String: String]
     private let errorTable: [String: String]
+    /// Encoded values and request and reply bodies by name, as hex.
+    let vectors: [String: String]
 
     /// The XXH3-64 vectors, by input length.
     var xxh3_64: [HashVector] { Self.hashVectors(xxh3_64Table) }
@@ -55,9 +61,12 @@ struct GoldenFixture: Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case noAssignedPartition = "no_assigned_partition"
+        case resyncRequiredPartition = "resync_required_partition"
         case xxh3_64Table = "xxh3_64"
         case xxh32Table = "xxh32"
         case errorTable = "errors"
+        case vectors
     }
 
     static let shared: GoldenFixture = {
@@ -69,5 +78,28 @@ struct GoldenFixture: Decodable {
     /// The deterministic input the hash vectors were computed over.
     static func pattern(_ length: Int) -> [UInt8] {
         (0..<length).map { UInt8(truncatingIfNeeded: $0) &* 31 &+ 7 }
+    }
+
+    /// Bytes of a named vector; fails the test when the name is unknown.
+    func bytes(_ name: String) -> [UInt8] {
+        guard let hex = vectors[name] else {
+            Issue.record("missing golden vector \(name)")
+            return []
+        }
+        return [UInt8](hex: hex)
+    }
+}
+
+extension [UInt8] {
+    init(hex: String) {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            bytes.append(UInt8(hex[index..<next], radix: 16)!)
+            index = next
+        }
+        self = bytes
     }
 }
