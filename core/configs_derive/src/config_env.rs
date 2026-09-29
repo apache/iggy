@@ -180,7 +180,7 @@ fn generate_enum_impl(
         })
         .collect();
 
-    let tag_mapping = tag.map(|tag_name| {
+    let tag_mapping = tag.clone().map(|tag_name| {
         let env_segment = tag_name.to_uppercase();
         quote! {
             all_mappings.push(configs::EnvVarMapping {
@@ -197,6 +197,10 @@ fn generate_enum_impl(
                 fn env_mappings() -> &'static [configs::EnvVarMapping] {
                     &[]
                 }
+
+                fn env_templates() -> &'static [configs::EnvVarTemplate] {
+                    &[]
+                }
             }
         };
     }
@@ -211,6 +215,22 @@ fn generate_enum_impl(
         })
         .collect();
 
+    let template_extends: Vec<TokenStream2> = variant_types
+        .iter()
+        .map(|ty| quote! {
+            all_templates.extend_from_slice(<#ty as configs::ConfigEnvMappings>::env_templates());
+        })
+        .collect();
+    let tag_template = tag.map(|tag_name| {
+        let env_segment = tag_name.to_uppercase();
+        quote! {
+            all_templates.push(configs::EnvVarTemplate {
+                env_name: #env_segment,
+                max_elements: &[],
+            });
+        }
+    });
+
     quote! {
         impl #impl_generics configs::ConfigEnvMappings for #enum_name #ty_generics #where_clause {
             fn env_mappings() -> &'static [configs::EnvVarMapping] {
@@ -220,6 +240,16 @@ fn generate_enum_impl(
                     #tag_mapping
                     #(#extends)*
                     all_mappings
+                })
+            }
+
+            fn env_templates() -> &'static [configs::EnvVarTemplate] {
+                static TEMPLATES: std::sync::OnceLock<Vec<configs::EnvVarTemplate>> = std::sync::OnceLock::new();
+                TEMPLATES.get_or_init(|| {
+                    let mut all_templates = Vec::new();
+                    #tag_template
+                    #(#template_extends)*
+                    all_templates
                 })
             }
         }
@@ -359,6 +389,49 @@ fn generate_struct_impl(
         }
     };
 
+    let own_template_entries = mappings.iter().map(|mapping| {
+        let env_suffix = &mapping.env_suffix;
+        quote! {
+            configs::EnvVarTemplate { env_name: #env_suffix, max_elements: &[] }
+        }
+    });
+    let nested_template_extends = nested_fields.iter().map(|info| {
+        let ty = &info.element_type;
+        let segment = &info.field_env_segment;
+        if info.is_vec {
+            let max_elements = info.max_elements;
+            quote! {
+                for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
+                    let env_name = Box::leak(format!("{}_<N>_{}", #segment, template.env_name).into_boxed_str());
+                    let limits = Box::leak(std::iter::once(#max_elements)
+                        .chain(template.max_elements.iter().copied())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice());
+                    all_templates.push(configs::EnvVarTemplate { env_name, max_elements: limits });
+                }
+            }
+        } else {
+            quote! {
+                for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
+                    let env_name = Box::leak(format!("{}_{}", #segment, template.env_name).into_boxed_str());
+                    all_templates.push(configs::EnvVarTemplate {
+                        env_name,
+                        max_elements: template.max_elements,
+                    });
+                }
+            }
+        }
+    });
+    let template_prefix_application = if has_prefix {
+        quote! {
+            for template in &mut all_templates {
+                template.env_name = Box::leak(format!("{}{}", #prefix_str, template.env_name).into_boxed_str());
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         impl #impl_generics #struct_name #ty_generics #where_clause {
             /// Environment variable prefix for this config type.
@@ -372,6 +445,16 @@ fn generate_struct_impl(
 
         impl #impl_generics configs::ConfigEnvMappings for #struct_name #ty_generics #where_clause {
             #env_mappings_impl
+
+            fn env_templates() -> &'static [configs::EnvVarTemplate] {
+                static TEMPLATES: std::sync::OnceLock<Vec<configs::EnvVarTemplate>> = std::sync::OnceLock::new();
+                TEMPLATES.get_or_init(|| {
+                    let mut all_templates = vec![#(#own_template_entries),*];
+                    #(#nested_template_extends)*
+                    #template_prefix_application
+                    all_templates
+                })
+            }
         }
 
         /// Type-safe builder for constructing environment variable maps for tests.

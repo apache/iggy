@@ -31,7 +31,7 @@ mod parsing;
 mod traits;
 mod typed_env_provider;
 
-pub use env_mapping::{ConfigEnvMappings, EnvVarMapping};
+pub use env_mapping::{ConfigEnvMappings, EnvVarMapping, EnvVarTemplate};
 pub use error::ConfigurationError;
 pub use file_provider::{FileConfigProvider, RelocatedKey, RelocatedTarget};
 pub use parsing::parse_env_value_to_json;

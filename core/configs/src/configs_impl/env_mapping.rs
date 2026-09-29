@@ -29,11 +29,26 @@ pub struct EnvVarMapping {
     pub is_secret: bool,
 }
 
+/// Compact representation of a configuration environment variable.
+///
+/// Array indices are represented by `<N>` in `env_name`. `max_elements`
+/// contains the expansion limit for each placeholder, from left to right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvVarTemplate {
+    /// Environment variable name, with `<N>` for each array index.
+    pub env_name: &'static str,
+    /// Maximum element count for each `<N>` placeholder, from left to right.
+    pub max_elements: &'static [usize],
+}
+
 /// Trait for configuration types that provide environment variable mappings.
 /// Implemented automatically by the `#[derive(ConfigEnv)]` macro.
 pub trait ConfigEnvMappings {
     /// Returns all environment variable mappings for this config type.
     fn env_mappings() -> &'static [EnvVarMapping];
+
+    /// Returns the compact environment variable templates for this config type.
+    fn env_templates() -> &'static [EnvVarTemplate];
 
     /// Finds a mapping by environment variable name.
     fn find_by_env_name(env_name: &str) -> Option<&'static EnvVarMapping> {

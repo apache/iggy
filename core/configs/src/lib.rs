@@ -24,7 +24,8 @@ pub use common::{COMPONENT, defaults, displays, http, system, validators};
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
-    FileConfigProvider, RelocatedKey, RelocatedTarget, TypedEnvProvider, parse_env_value_to_json,
+    EnvVarTemplate, FileConfigProvider, RelocatedKey, RelocatedTarget, TypedEnvProvider,
+    parse_env_value_to_json,
 };
 pub use server_config::{
     cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,
