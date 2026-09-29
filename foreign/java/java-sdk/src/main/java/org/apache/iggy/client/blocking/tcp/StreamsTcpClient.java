@@ -59,4 +59,9 @@ final class StreamsTcpClient implements StreamsClient {
     public void deleteStream(StreamId streamId) {
         FutureUtil.resolve(delegate.deleteStream(streamId));
     }
+
+    @Override
+    public void purgeStream(StreamId streamId) {
+        FutureUtil.resolve(delegate.purgeStream(streamId));
+    }
 }

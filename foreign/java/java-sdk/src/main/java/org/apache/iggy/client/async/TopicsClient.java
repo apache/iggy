@@ -186,4 +186,32 @@ public interface TopicsClient {
      * @throws org.apache.iggy.exception.IggyException if the topic does not exist
      */
     CompletableFuture<Void> deleteTopic(StreamId streamId, TopicId topicId);
+
+    /**
+     * Purges a topic, deleting all messages in all of its partitions, by numeric IDs.
+     *
+     * <p>This is a convenience overload that wraps the numeric IDs into a {@link StreamId} and
+     * a {@link TopicId}.
+     *
+     * <p>Unlike {@link #deleteTopic(StreamId, TopicId)}, the topic itself is kept.
+     *
+     * @param streamId the numeric stream identifier
+     * @param topicId  the numeric topic identifier
+     * @return a {@link CompletableFuture} that completes when the purge is done
+     */
+    default CompletableFuture<Void> purgeTopic(Long streamId, Long topicId) {
+        return purgeTopic(StreamId.of(streamId), TopicId.of(topicId));
+    }
+
+    /**
+     * Purges a topic, deleting all messages in all of its partitions.
+     *
+     * <p>Unlike {@link #deleteTopic(StreamId, TopicId)}, the topic itself is kept.
+     *
+     * @param streamId the stream identifier containing the topic
+     * @param topicId  the topic identifier to purge
+     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @throws org.apache.iggy.exception.IggyException if the topic does not exist
+     */
+    CompletableFuture<Void> purgeTopic(StreamId streamId, TopicId topicId);
 }

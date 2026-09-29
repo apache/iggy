@@ -19,9 +19,21 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollingKind;
+import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
+import java.util.List;
+
+import static java.util.Optional.empty;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class StreamClientBaseTest extends IntegrationTest {
@@ -86,5 +98,36 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(stream).isEmpty();
+    }
+
+    @Test
+    void shouldPurgeStream() {
+        // given
+        var streamDetails = streamsClient.createStream("test-stream");
+        trackStream(streamDetails.id());
+        var streamId = StreamId.of(streamDetails.id());
+        var topicDetails = client.topics().createTopic(
+                streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
+        var topicId = TopicId.of(topicDetails.id());
+        var messagesClient = client.messages();
+        messagesClient.sendMessages(
+                streamId, topicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
+
+        // when
+        streamsClient.purgeStream(streamDetails.id());
+
+        // then
+        var streamOptional = streamsClient.getStream(streamDetails.id());
+        assertThat(streamOptional).isPresent();
+
+        var polledMessages = messagesClient.pollMessages(
+                streamId,
+                topicId,
+                empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
+        assertThat(polledMessages.messages()).isEmpty();
     }
 }

@@ -80,4 +80,9 @@ final class TopicsTcpClient implements TopicsClient {
     public void deleteTopic(StreamId streamId, TopicId topicId) {
         FutureUtil.resolve(delegate.deleteTopic(streamId, topicId));
     }
+
+    @Override
+    public void purgeTopic(StreamId streamId, TopicId topicId) {
+        FutureUtil.resolve(delegate.purgeTopic(streamId, topicId));
+    }
 }

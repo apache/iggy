@@ -70,6 +70,12 @@ class StreamsHttpClient implements StreamsClient {
         httpClient.execute(request);
     }
 
+    @Override
+    public void purgeStream(StreamId streamId) {
+        var request = httpClient.prepareDeleteRequest(STREAMS + "/" + streamId + "/purge");
+        httpClient.execute(request);
+    }
+
     record CreateStream(String name) {}
 
     record UpdateStream(String name) {}
