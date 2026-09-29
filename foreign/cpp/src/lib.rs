@@ -604,13 +604,6 @@ mod ffi {
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
         ) -> Result<SendMessagesResponse>;
-        fn flush_unsaved_buffer(
-            self: &Client,
-            stream_id: Identifier,
-            topic_id: Identifier,
-            partition_id: u32,
-            fsync: bool,
-        ) -> Result<()>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
         fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
