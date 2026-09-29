@@ -75,6 +75,14 @@ class ConsumerGroupDetails;
 class ConsumerGroupMember;
 class IggyMessagePolled;
 class IggyMessageToSend;
+class ClusterMetadata;
+class ClusterNode;
+class TransportEndpoints;
+class OptionSpec;
+class Partitioning;
+class PolledMessages;
+class SendMessagesConfirmation;
+class SendMessagesResponse;
 
 namespace detail {
 /** @brief Internal base for string-backed option types. */
@@ -834,6 +842,10 @@ class HeaderField final {
         return HeaderField(kind, std::move(value));
     }
 
+    static HeaderField Create(HeaderKind kind, std::string_view value) {
+        return HeaderField(kind, std::vector<std::uint8_t>(value.begin(), value.end()));
+    }
+
     /**
      * @brief Returns the wire type of Value().
      * @return Header type tag.
@@ -921,10 +933,11 @@ class IggyMessageToSend final {
      * @note Payload and header constraints are validated when the message is
      *       sent, not by this function.
      */
-    static IggyMessageToSend Create(std::vector<std::uint8_t> payload,
+    static IggyMessageToSend Create(std::string_view payload,
                                     std::vector<HeaderEntry> user_headers = {},
                                     absl::uint128 id                      = 0) {
-        return IggyMessageToSend(id, std::move(payload), std::move(user_headers));
+        return IggyMessageToSend(id, std::vector<std::uint8_t>(payload.begin(), payload.end()),
+                                 std::move(user_headers));
     }
 
     /**
@@ -1057,6 +1070,7 @@ class IggyMessagePolled final {
     static IggyMessagePolled FromFfi(ffi::IggyMessagePolled message);
 
     friend class IggyBlockingClient;
+    friend class PolledMessages;
 
     std::uint64_t checksum_;
     absl::uint128 id_;
@@ -3224,6 +3238,184 @@ class PollingStrategy final {
     std::uint64_t polling_strategy_value_;
 };
 
+class Partitioning final {
+  public:
+    static Partitioning Balanced() { return Partitioning("balanced", {}); }
+    static Partitioning PartitionId(std::uint32_t partition_id) {
+        constexpr std::size_t kPartitionIdBytes = 4;
+        constexpr std::uint32_t kBitsPerByte    = 8;
+        std::vector<std::uint8_t> partitioning_value(kPartitionIdBytes);
+        for (std::size_t index = 0; index < partitioning_value.size(); ++index) {
+            partitioning_value[index] = static_cast<std::uint8_t>(partition_id >> (index * kBitsPerByte));
+        }
+        return Partitioning("partition_id", std::move(partitioning_value));
+    }
+    static Partitioning MessagesKey(std::vector<std::uint8_t> key) {
+        return Partitioning("messages_key", std::move(key));
+    }
+    [[nodiscard]] std::string_view Kind() const { return partitioning_kind_; }
+    [[nodiscard]] const std::vector<std::uint8_t> &Value() const noexcept { return partitioning_value_; }
+
+  private:
+    explicit Partitioning(std::string kind, std::vector<std::uint8_t> value)
+        : partitioning_kind_(std::move(kind)), partitioning_value_(std::move(value)) {}
+
+    std::string partitioning_kind_;
+    std::vector<std::uint8_t> partitioning_value_;
+};
+
+class SendMessagesConfirmation final {
+  public:
+    [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+    [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+    [[nodiscard]] std::uint64_t BaseOffset() const noexcept { return base_offset_; }
+
+  private:
+    SendMessagesConfirmation(std::uint32_t stream_id,
+                             std::uint32_t topic_id,
+                             std::uint32_t partition_id,
+                             std::uint64_t base_offset)
+        : stream_id_(stream_id), topic_id_(topic_id), partition_id_(partition_id), base_offset_(base_offset) {}
+
+    static SendMessagesConfirmation FromFfi(ffi::SendMessagesConfirmation confirmation);
+
+    friend class SendMessagesResponse;
+
+    std::uint32_t stream_id_;
+    std::uint32_t topic_id_;
+    std::uint32_t partition_id_;
+    std::uint64_t base_offset_;
+};
+
+class SendMessagesResponse final {
+  public:
+    [[nodiscard]] const std::vector<SendMessagesConfirmation> &Confirmations() const noexcept { return confirmations_; }
+
+  private:
+    explicit SendMessagesResponse(std::vector<SendMessagesConfirmation> confirmations)
+        : confirmations_(std::move(confirmations)) {}
+
+    static SendMessagesResponse FromFfi(ffi::SendMessagesResponse response);
+
+    friend class IggyBlockingClient;
+
+    std::vector<SendMessagesConfirmation> confirmations_;
+};
+
+class PolledMessages final {
+  public:
+    [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+    [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+    [[nodiscard]] std::uint32_t Count() const noexcept { return count_; }
+    [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
+
+  private:
+    PolledMessages(std::uint32_t partition_id,
+                   std::uint64_t current_offset,
+                   std::uint32_t count,
+                   std::vector<IggyMessagePolled> messages)
+        : partition_id_(partition_id), current_offset_(current_offset), count_(count), messages_(std::move(messages)) {}
+
+    static PolledMessages FromFfi(ffi::PolledMessages polled);
+
+    friend class IggyBlockingClient;
+
+    std::uint32_t partition_id_;
+    std::uint64_t current_offset_;
+    std::uint32_t count_;
+    std::vector<IggyMessagePolled> messages_;
+};
+
+class OptionSpec final {
+  public:
+    [[nodiscard]] const std::string &Key() const noexcept { return key_; }
+    [[nodiscard]] std::uint8_t Kind() const noexcept { return kind_; }
+    [[nodiscard]] const std::vector<std::uint8_t> &DefaultValue() const noexcept { return default_value_; }
+    [[nodiscard]] const std::string &Description() const noexcept { return description_; }
+
+  private:
+    OptionSpec(std::string key, std::uint8_t kind, std::vector<std::uint8_t> default_value, std::string description)
+        : key_(std::move(key)),
+          kind_(kind),
+          default_value_(std::move(default_value)),
+          description_(std::move(description)) {}
+
+    static OptionSpec FromFfi(ffi::OptionSpec spec);
+
+    friend class IggyBlockingClient;
+
+    std::string key_;
+    std::uint8_t kind_;
+    std::vector<std::uint8_t> default_value_;
+    std::string description_;
+};
+
+class TransportEndpoints final {
+  public:
+    [[nodiscard]] std::uint16_t Tcp() const noexcept { return tcp_; }
+    [[nodiscard]] std::uint16_t Quic() const noexcept { return quic_; }
+    [[nodiscard]] std::uint16_t Http() const noexcept { return http_; }
+    [[nodiscard]] std::uint16_t Websocket() const noexcept { return websocket_; }
+
+  private:
+    TransportEndpoints(std::uint16_t tcp, std::uint16_t quic, std::uint16_t http, std::uint16_t websocket)
+        : tcp_(tcp), quic_(quic), http_(http), websocket_(websocket) {}
+
+    static TransportEndpoints FromFfi(ffi::TransportEndpoints endpoints);
+
+    friend class ClusterNode;
+
+    std::uint16_t tcp_;
+    std::uint16_t quic_;
+    std::uint16_t http_;
+    std::uint16_t websocket_;
+};
+
+class ClusterNode final {
+  public:
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] const std::string &Ip() const noexcept { return ip_; }
+    [[nodiscard]] const TransportEndpoints &Endpoints() const noexcept { return endpoints_; }
+    [[nodiscard]] const std::string &Role() const noexcept { return role_; }
+    [[nodiscard]] const std::string &Status() const noexcept { return status_; }
+
+  private:
+    ClusterNode(std::string name, std::string ip, TransportEndpoints endpoints, std::string role, std::string status)
+        : name_(std::move(name)),
+          ip_(std::move(ip)),
+          endpoints_(std::move(endpoints)),
+          role_(std::move(role)),
+          status_(std::move(status)) {}
+
+    static ClusterNode FromFfi(ffi::ClusterNode node);
+
+    friend class ClusterMetadata;
+
+    std::string name_;
+    std::string ip_;
+    TransportEndpoints endpoints_;
+    std::string role_;
+    std::string status_;
+};
+
+class ClusterMetadata final {
+  public:
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+    [[nodiscard]] const std::vector<ClusterNode> &Nodes() const noexcept { return nodes_; }
+
+  private:
+    ClusterMetadata(std::string name, std::vector<ClusterNode> nodes)
+        : name_(std::move(name)), nodes_(std::move(nodes)) {}
+
+    static ClusterMetadata FromFfi(ffi::ClusterMetadata metadata);
+
+    friend class IggyBlockingClient;
+
+    std::string name_;
+    std::vector<ClusterNode> nodes_;
+};
+
 /**
  * @brief Owning client connection to an Apache Iggy server.
  *
@@ -4049,6 +4241,26 @@ class IggyBlockingClient final {
      *         the request fails.
      */
     Stats GetStats();
+    SendMessagesResponse SendMessages(const Identifier &stream,
+                                      const Identifier &topic,
+                                      const Partitioning &partitioning,
+                                      const std::vector<IggyMessageToSend> &messages);
+    PolledMessages PollMessages(const Identifier &stream,
+                                const Identifier &topic,
+                                std::optional<std::uint32_t> partition_id,
+                                const Consumer &consumer,
+                                const PollingStrategy &strategy,
+                                std::uint32_t count,
+                                bool auto_commit);
+    std::vector<OptionSpec> DescribeOptions(std::string scope);
+    void Ping();
+    std::chrono::microseconds HeartbeatInterval();
+    std::vector<std::uint8_t> Snapshot(const SnapshotCompression &compression,
+                                       const std::vector<SystemSnapshotType> &types);
+    std::vector<std::uint8_t> SendBinaryRequest(std::uint32_t code, const std::vector<std::uint8_t> &payload);
+    void UpdatePermissions(const Identifier &user, const std::optional<Permissions> &permissions);
+    void ChangePassword(const Identifier &user, std::string current_password, std::string new_password);
+    ClusterMetadata GetClusterMetadata();
 
   private:
     explicit IggyBlockingClient(ffi::Client *client);

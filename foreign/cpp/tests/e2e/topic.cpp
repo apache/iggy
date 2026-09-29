@@ -339,15 +339,15 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
                    "Serves the topic option catalog with each key's kind, default and description, returns an empty "
                    "catalog for the stream scope, and rejects an unknown scope name.");
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    rust::Vec<iggy::ffi::OptionSpec> topic_options;
-    ASSERT_NO_THROW({ topic_options = client->describe_options("topic"); });
+    std::vector<iggy::OptionSpec> topic_options;
+    ASSERT_NO_THROW({ topic_options = client.DescribeOptions("topic"); });
 
-    const iggy::ffi::OptionSpec *segment_size = nullptr;
-    bool found_durability                     = false;
+    const iggy::OptionSpec *segment_size = nullptr;
+    bool found_durability                = false;
     for (const auto &option : topic_options) {
-        const std::string key = static_cast<std::string>(option.key);
+        const std::string key = option.Key();
         if (key == "segment_size") {
             segment_size = &option;
         } else if (key == "durability") {
@@ -357,17 +357,17 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
 
     ASSERT_NE(segment_size, nullptr) << "Topic catalog is missing segment_size";
     EXPECT_TRUE(found_durability) << "Topic catalog is missing durability";
-    EXPECT_EQ(segment_size->kind, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::Uint64));
-    EXPECT_FALSE(segment_size->default_value.empty());
-    EXPECT_FALSE(segment_size->description.empty());
+    EXPECT_EQ(segment_size->Kind(), static_cast<std::uint8_t>(iggy::HeaderKind::Uint64));
+    EXPECT_FALSE(segment_size->DefaultValue().empty());
+    EXPECT_FALSE(segment_size->Description().empty());
 
     // Streams take no option keys yet, which is an empty catalog rather than a failure.
     ASSERT_NO_THROW({
-        const auto stream_options = client->describe_options("stream");
+        const auto stream_options = client.DescribeOptions("stream");
         EXPECT_TRUE(stream_options.empty());
     });
 
-    ASSERT_THROW(client->describe_options("not_a_scope"), std::exception);
+    ASSERT_THROW(client.DescribeOptions("not_a_scope"), std::exception);
 }
 
 TEST_F(E2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
@@ -983,8 +983,6 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
     const std::string original_topic     = GetRandomName();
     const std::string updated_topic_name = GetRandomName();
 
-    iggy::ffi::Client *message_client = GetLoggedInClient();
-
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
@@ -995,12 +993,11 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
     ASSERT_EQ(created_stream.Topics().size(), 1u);
     const auto topic_id = created_stream.Topics().front().Id();
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(
-        iggy::ffi::make_message(to_payload("message-before-topic-update"), rust::Vec<iggy::ffi::HeaderEntry>()));
-    ASSERT_NO_THROW(message_client->send_messages(make_numeric_identifier(created_stream.Id()),
-                                                  make_numeric_identifier(topic_id), "partition_id",
-                                                  partition_id_bytes(0), std::move(messages)));
+    std::vector<iggy::IggyMessageToSend> messages;
+    messages.push_back(iggy::IggyMessageToSend::Create("message-before-topic-update", {}));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::Numeric(created_stream.Id()),
+                                        iggy::Identifier::Numeric(topic_id), iggy::Partitioning::PartitionId(0),
+                                        messages));
 
     ASSERT_NO_THROW(client.UpdateTopic(
         iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
@@ -1010,12 +1007,12 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
             .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
-        const auto polled = message_client->poll_messages(make_numeric_identifier(created_stream.Id()),
-                                                          make_string_identifier(updated_topic_name), 0, "consumer",
-                                                          make_numeric_identifier(1), "offset", 0, 10, false);
-        ASSERT_EQ(polled.count, 1u);
-        ASSERT_EQ(polled.messages.size(), 1u);
-        const std::string actual(polled.messages[0].payload.begin(), polled.messages[0].payload.end());
+        const auto polled = client.PollMessages(
+            iggy::Identifier::Numeric(created_stream.Id()), iggy::Identifier::String(updated_topic_name), 0,
+            iggy::Consumer::Single(iggy::Identifier::Numeric(1)), iggy::PollingStrategy::Offset(0), 10, false);
+        ASSERT_EQ(polled.Count(), 1u);
+        ASSERT_EQ(polled.Messages().size(), 1u);
+        const std::string actual(polled.Messages()[0].Payload().begin(), polled.Messages()[0].Payload().end());
         EXPECT_EQ(actual, "message-before-topic-update");
     });
 }
@@ -1364,8 +1361,6 @@ TEST_F(E2E_Topic, PurgeTopicPreservesTopicMetadata) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *message_client = GetLoggedInClient();
-
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
@@ -1380,12 +1375,10 @@ TEST_F(E2E_Topic, PurgeTopicPreservesTopicMetadata) {
     auto stream_before_purge = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(stream_before_purge.Topics().size(), 1u);
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(
-        iggy::ffi::make_message(to_payload("preserve-topic-metadata"), rust::Vec<iggy::ffi::HeaderEntry>()));
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(topic_name), "partition_id",
-                                                  partition_id_bytes(1), std::move(messages)));
+    std::vector<iggy::IggyMessageToSend> messages;
+    messages.push_back(iggy::IggyMessageToSend::Create("preserve-topic-metadata", {}));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                        iggy::Partitioning::PartitionId(1), messages));
 
     stream_before_purge = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(stream_before_purge.Topics().size(), 1u);
@@ -1414,8 +1407,6 @@ TEST_F(E2E_Topic, PurgeTopicRemovesOnlyTargetTopicMessages) {
     const std::string first_topic_name  = GetRandomName();
     const std::string second_topic_name = GetRandomName();
 
-    iggy::ffi::Client *message_client = GetLoggedInClient();
-
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
@@ -1424,23 +1415,21 @@ TEST_F(E2E_Topic, PurgeTopicRemovesOnlyTargetTopicMessages) {
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
                                        iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
+    std::vector<iggy::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        first_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-first-" + std::to_string(i)),
-                                                               rust::Vec<iggy::ffi::HeaderEntry>()));
+        first_topic_messages.push_back(iggy::IggyMessageToSend::Create("purge-topic-first-" + std::to_string(i), {}));
     }
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(first_topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(first_topic_messages)));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name),
+                                        iggy::Identifier::String(first_topic_name), iggy::Partitioning::PartitionId(0),
+                                        first_topic_messages));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
+    std::vector<iggy::IggyMessageToSend> second_topic_messages;
     for (std::uint32_t i = 0; i < 2; ++i) {
-        second_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-second-" + std::to_string(i)),
-                                                                rust::Vec<iggy::ffi::HeaderEntry>()));
+        second_topic_messages.push_back(iggy::IggyMessageToSend::Create("purge-topic-second-" + std::to_string(i), {}));
     }
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(second_topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(second_topic_messages)));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name),
+                                        iggy::Identifier::String(second_topic_name), iggy::Partitioning::PartitionId(0),
+                                        second_topic_messages));
 
     const auto stream_before_purge = client.GetStream(iggy::Identifier::String(stream_name));
     EXPECT_EQ(stream_before_purge.MessagesCount(), 5u);
@@ -1479,8 +1468,6 @@ TEST_F(E2E_Topic, PurgeTopicAcrossMultiplePartitionsClearsAllPartitions) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *message_client = GetLoggedInClient();
-
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
@@ -1488,15 +1475,13 @@ TEST_F(E2E_Topic, PurgeTopicAcrossMultiplePartitionsClearsAllPartitions) {
                                        iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
     for (std::uint32_t partition_id = 0; partition_id < 3; ++partition_id) {
-        rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+        std::vector<iggy::IggyMessageToSend> messages;
         for (std::uint32_t i = 0; i < 2; ++i) {
-            messages.push_back(iggy::ffi::make_message(
-                to_payload("purge-topic-partition-" + std::to_string(partition_id) + "-" + std::to_string(i)),
-                rust::Vec<iggy::ffi::HeaderEntry>()));
+            messages.push_back(iggy::IggyMessageToSend::Create(
+                "purge-topic-partition-" + std::to_string(partition_id) + "-" + std::to_string(i), {}));
         }
-        ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                      make_string_identifier(topic_name), "partition_id",
-                                                      partition_id_bytes(partition_id), std::move(messages)));
+        ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                            iggy::Partitioning::PartitionId(partition_id), messages));
     }
 
     const auto stream_before_purge = client.GetStream(iggy::Identifier::String(stream_name));
@@ -1520,31 +1505,24 @@ TEST_F(E2E_Topic, PurgeTopicThenSendMessagesAgainSucceeds) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *message_client = GetLoggedInClient();
-
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
                                        iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> first_batch;
-    first_batch.push_back(
-        iggy::ffi::make_message(to_payload("before-topic-purge"), rust::Vec<iggy::ffi::HeaderEntry>()));
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(first_batch)));
+    std::vector<iggy::IggyMessageToSend> first_batch;
+    first_batch.push_back(iggy::IggyMessageToSend::Create("before-topic-purge", {}));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                        iggy::Partitioning::PartitionId(0), first_batch));
 
     ASSERT_NO_THROW(client.PurgeTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> second_batch;
-    second_batch.push_back(
-        iggy::ffi::make_message(to_payload("after-topic-purge-0"), rust::Vec<iggy::ffi::HeaderEntry>()));
-    second_batch.push_back(
-        iggy::ffi::make_message(to_payload("after-topic-purge-1"), rust::Vec<iggy::ffi::HeaderEntry>()));
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(second_batch)));
+    std::vector<iggy::IggyMessageToSend> second_batch;
+    second_batch.push_back(iggy::IggyMessageToSend::Create("after-topic-purge-0", {}));
+    second_batch.push_back(iggy::IggyMessageToSend::Create("after-topic-purge-1", {}));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                        iggy::Partitioning::PartitionId(0), second_batch));
 
     const auto stream_after_resend = client.GetStream(iggy::Identifier::String(stream_name));
     EXPECT_EQ(stream_after_resend.MessagesCount(), 2u);
@@ -1560,8 +1538,6 @@ TEST_F(E2E_Topic, PurgeTopicTwiceKeepsTargetTopicEmptyAndOtherTopicsUntouched) {
     const std::string first_topic_name  = GetRandomName();
     const std::string second_topic_name = GetRandomName();
 
-    iggy::ffi::Client *message_client = GetLoggedInClient();
-
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
@@ -1570,23 +1546,23 @@ TEST_F(E2E_Topic, PurgeTopicTwiceKeepsTargetTopicEmptyAndOtherTopicsUntouched) {
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
                                        iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
+    std::vector<iggy::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        first_topic_messages.push_back(iggy::ffi::make_message(
-            to_payload("purge-topic-twice-first-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+        first_topic_messages.push_back(
+            iggy::IggyMessageToSend::Create("purge-topic-twice-first-" + std::to_string(i), {}));
     }
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(first_topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(first_topic_messages)));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name),
+                                        iggy::Identifier::String(first_topic_name), iggy::Partitioning::PartitionId(0),
+                                        first_topic_messages));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
+    std::vector<iggy::IggyMessageToSend> second_topic_messages;
     for (std::uint32_t i = 0; i < 2; ++i) {
-        second_topic_messages.push_back(iggy::ffi::make_message(
-            to_payload("purge-topic-twice-second-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
+        second_topic_messages.push_back(
+            iggy::IggyMessageToSend::Create("purge-topic-twice-second-" + std::to_string(i), {}));
     }
-    ASSERT_NO_THROW(message_client->send_messages(make_string_identifier(stream_name),
-                                                  make_string_identifier(second_topic_name), "partition_id",
-                                                  partition_id_bytes(0), std::move(second_topic_messages)));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::String(stream_name),
+                                        iggy::Identifier::String(second_topic_name), iggy::Partitioning::PartitionId(0),
+                                        second_topic_messages));
 
     ASSERT_NO_THROW(
         client.PurgeTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(first_topic_name)));
