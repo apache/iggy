@@ -37,7 +37,9 @@ The source receives only ACK or NACK, not the runtime's failure cause. It cannot
 
 The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it.
 
-SDK 0.6 adds `Source::batch_policy()` with a default implementation, so existing source implementations need no code change when rebuilt. Sources that opt out of the NACK breaker must retain and replay their rejected batch; otherwise disabling the stop only turns a visible failure into a silent drop. Rebuild source plugins to export `iggy_source_register_stop_callback`; the runtime warns when an older plugin lacks it. The callback reports why polling stopped so the runtime can mark the source `Error` and update its running gauge.
+SDK 0.6 adds `Source::batch_policy()` with a default implementation, so existing source implementations need no code change when rebuilt. Sources that opt out of the NACK breaker must retain and replay their rejected batch; otherwise disabling the stop only turns a visible failure into a silent drop.
+
+Rebuild source plugins to export `iggy_source_register_stop_callback`; the runtime warns when an older plugin lacks it. The callback reports why polling stopped so the runtime can mark the source `Error` and update its running gauge.
 
 The original batch-acknowledgment contract introduced a breaking FFI change. Source plugins built before it must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK. SDK 0.6 also adds the optional stop-callback export; older plugins cannot report an unexpected poll-task exit.
 

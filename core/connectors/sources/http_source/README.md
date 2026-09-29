@@ -205,7 +205,9 @@ A 404 there would tell a conventional client the resource is gone, and it would 
 
 The named path's 503 covers two conditions and says `route unavailable` for both: the path was withdrawn, or another instance on the same listener took it over. The caller retries either way, and the body deliberately does not say which, since that would describe the listener's topology to a sender that has no use for it.
 
-`GET /health` on the public listener answers 200 only while every instance on it is serving and its poll path is healthy, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped or whose staged batch is stuck would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
+`GET /health` on the public listener answers 200 only while every instance on it is serving and its poll path is healthy, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped or whose staged batch is stuck would otherwise keep receiving traffic into a bridge nothing drains.
+
+Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
 
 An instance that has not polled yet is not counted, which is a different condition from one that has stopped. Between `open()` and its first `poll()` the runtime finishes the sources it has not reached yet and then every sink, in series, and only then starts the poll tasks; counting that window meant restarting one instance took every healthy sibling out of rotation for the length of it, and on boot the length of it depends on connectors that have nothing to do with this one.
 
