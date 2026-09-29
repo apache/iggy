@@ -40,18 +40,25 @@ root = "/var/lib/iggy-objects"
 
 ### Plugin options
 
-| Option                  | Type     | Default                          | Description                                   |
-| ----------------------- | -------- | -------------------------------- | --------------------------------------------- |
-| `service`               | String   | **required**                     | OpenDAL service name                          |
-| `path_prefix`           | String   | empty                            | Prefix before the rendered object path        |
-| `path_template`         | String   | `{stream}/{topic}/{date}/{hour}` | Object directory template                     |
-| `options`               | Map      | empty                            | Secret OpenDAL service options                |
-| `output_format`         | String   | `json_lines`                     | `json_lines`, `json_array`, or `raw`           |
-| `include_metadata`      | Boolean  | `true`                           | Add message metadata to JSON output            |
-| `include_headers`       | Boolean  | `false`                          | Add message headers to JSON output             |
-| `max_attempts`          | Integer  | `3`                              | Total write attempts                           |
-| `retry_delay`           | Duration | `1s`                             | Delay before the first retry                   |
-| `verbose_logging`       | Boolean  | `false`                          | Log each consumed batch at info level          |
+| Option             | Type     | Default                          | Description                                                                            |
+| ------------------ | -------- | -------------------------------- | -------------------------------------------------------------------------------------- |
+| `service`          | String   | **required**                     | OpenDAL service name                                                                   |
+| `path_prefix`      | String   | empty                            | Prefix before the rendered object path                                                 |
+| `path_template`    | String   | `{stream}/{topic}/{date}/{hour}` | Object directory template                                                              |
+| `options`          | Map      | empty                            | Secret OpenDAL options as quoted TOML strings; values of other types will fail to load |
+| `output_format`    | String   | `json_lines`                     | `json_lines` (also accepts `jsonl` or `jsonlines`), `json_array`, or `raw`             |
+| `include_metadata` | Boolean  | `true`                           | Add message metadata to JSON output                                                    |
+| `include_headers`  | Boolean  | `false`                          | Add message headers to JSON output                                                     |
+| `max_attempts`     | Integer  | `3`                              | Total write attempts (`max_retries` alias)                                             |
+| `retry_delay`      | Duration | `1s`                             | Delay before the first retry                                                           |
+| `verbose_logging`  | Boolean  | `false`                          | Log each consumed batch at info level                                                  |
+
+### Filesystem atomic writes
+
+For `service = "fs"`, the sink enables atomic writes by default. If
+`plugin_config.options.atomic_write_dir` is not set, the sink uses
+`<root>/.iggy-opendal-tmp`. Set `atomic_write_dir = ""` to disable atomic
+writes, or set it to another directory on the same filesystem as `root`.
 
 ### Default services
 
@@ -68,7 +75,9 @@ Use `--no-default-features` when building to disable the four default services.
 
 ### Additional services
 
-When building the sink directly, enable another OpenDAL service through Cargo's feature syntax. For example, this command builds the sink with CompFS and without the default services:
+When building the sink directly, enable another OpenDAL service through Cargo's
+feature syntax. For example, this command builds the sink with CompFS and
+without the default services:
 
 ```bash
 cargo build --release -p iggy_connector_opendal_sink \
@@ -76,14 +85,10 @@ cargo build --release -p iggy_connector_opendal_sink \
     --features opendal/services-compfs
 ```
 
-When using the sink as a dependency, add `opendal` as a direct dependency and enable additional features:
+See the [complete list of OpenDAL service features][opendal-service-features]
+for other values accepted by `--features`.
 
-```toml
-iggy_connector_opendal_sink = { version = "0.5.0-edge.4", default-features = false }
-opendal = { version = "0.59.1", default-features = false, features = ["services-compfs"] }
-```
-
-The direct OpenDAL dependency must use a version compatible with the sink. See the [complete list of OpenDAL service features](https://github.com/apache/opendal/blob/main/core/Cargo.toml).
+[opendal-service-features]: https://github.com/apache/opendal/blob/main/core/Cargo.toml
 
 ### S3 example
 
@@ -118,10 +123,9 @@ archive/events/orders/2024-03-16/14/00007-00000000000000000042-00000000000000000
 
 A custom `path_template` replaces the default template part. The `{partition}`
 variable can appear in that template, but the partition ID and offset range are
-always present in the filename.
+always present in the filename. Stream and topic template values use percent encoding.
 
-The sink writes one object for each non-empty batch passed to `consume()`. Its
-output formats match the S3 sink:
+Output formats match the S3 sink:
 
 - `json_lines` writes one JSON object per line and uses `.jsonl`.
 - `json_array` writes one JSON array and uses `.json`.

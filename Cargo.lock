@@ -7396,7 +7396,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_opendal_sink"
-version = "0.5.0-edge.4"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
