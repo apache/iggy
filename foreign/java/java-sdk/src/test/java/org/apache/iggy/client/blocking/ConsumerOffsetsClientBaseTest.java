@@ -63,4 +63,24 @@ public abstract class ConsumerOffsetsClientBaseTest extends IntegrationTest {
         // then
         assertThat(consumerOffset).isPresent();
     }
+
+    @Test
+    void shouldDeleteConsumerOffset() {
+        // given. Send message to ensure partition is not empty so we can store offset 0
+        client.messages()
+                .sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("test")));
+
+        var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(1223L));
+        // The VSR client routes the store to its partition consensus group, so
+        // the partition id must be explicit.
+        consumerOffsetsClient.storeConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer, BigInteger.ZERO);
+
+        // when
+        consumerOffsetsClient.deleteConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer);
+        var consumerOffset =
+                consumerOffsetsClient.getConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer);
+
+        // then
+        assertThat(consumerOffset).isEmpty();
+    }
 }

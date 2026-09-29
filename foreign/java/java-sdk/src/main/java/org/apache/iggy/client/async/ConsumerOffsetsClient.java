@@ -87,4 +87,7 @@ public interface ConsumerOffsetsClient {
      */
     CompletableFuture<Optional<ConsumerOffsetInfo>> getConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
+
+    CompletableFuture<Void> deleteConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
 }

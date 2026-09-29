@@ -107,4 +107,27 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                     }
                 });
     }
+
+    @Override
+    public CompletableFuture<Void> deleteConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
+        var payload = BytesSerializer.toBytes(consumer);
+        payload.writeBytes(BytesSerializer.toBytes(streamId));
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
+        payload.writeBytes(BytesSerializer.toBytes(partitionId));
+        payload.writeByte(ACK_QUORUM);
+
+        log.debug(
+                "Deleting consumer offset - Stream: {}, Topic: {}, Partition: {}, Consumer: {}",
+                streamId,
+                topicId,
+                partitionId,
+                consumer);
+
+        return connection()
+                .send(CommandCode.ConsumerOffset.DELETE.getValue(), payload)
+                .thenAccept(response -> {
+                    response.release();
+                });
+    }
 }
