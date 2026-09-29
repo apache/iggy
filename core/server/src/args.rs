@@ -88,7 +88,20 @@ For more information, visit: https://iggy.apache.org/docs/introduction/getting-s
 #[allow(clippy::doc_markdown)]
 pub struct Args {
     /// Print supported configuration environment variables and exit.
-    #[arg(long)]
+    ///
+    /// Lists all supported IGGY_* environment variable names and templates,
+    /// sorted and deduplicated. Template syntax:
+    /// - `<N>` represents vector indices (0-255 for most fields)
+    /// - `<KEY>` represents connector keys (uppercased)
+    /// - `<FIELD>` represents plugin configuration field names
+    ///
+    /// Exits immediately before any startup (before dotenv, config loading,
+    /// logging, runtimes, credentials, plugins, filesystem or network activity).
+    /// Works even with missing or invalid configuration files.
+    ///
+    /// Example:
+    ///   iggy-server --list-config-env-vars
+    #[arg(long, verbatim_doc_comment)]
     pub list_config_env_vars: bool,
 
     /// Remove the system path before starting (WARNING: THIS WILL DELETE ALL DATA!)

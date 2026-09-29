@@ -137,31 +137,43 @@ fn main() -> Result<(), RuntimeError> {
 }
 
 fn print_config_env_vars() {
-    let mut names: Vec<String> = ConnectorsRuntimeConfig::env_templates()
+    // Collect static template names from ConfigEnv derived configs
+    let mut names: Vec<&'static str> = ConnectorsRuntimeConfig::env_templates()
         .iter()
-        .map(|template| template.env_name.to_owned())
+        .map(|template| template.env_name)
         .chain([
-            "IGGY_CONNECTORS_CONFIG_PATH".to_owned(),
-            "IGGY_CONNECTORS_ENV_PATH".to_owned(),
-            "IGGY_DISPLAY_CONFIG".to_owned(),
+            "IGGY_CONNECTORS_CONFIG_PATH",
+            "IGGY_CONNECTORS_ENV_PATH",
+            "IGGY_DISPLAY_CONFIG",
         ])
         .collect();
-    for (kind, templates) in [
+
+    // Collect sink and source connector templates (reusable across all connectors)
+    let sink_source_templates: Vec<String> = [
         ("SINK", SinkConfig::env_templates()),
         ("SOURCE", SourceConfig::env_templates()),
-    ] {
-        names.extend(
-            templates
-                .iter()
-                .map(|template| format!("IGGY_CONNECTORS_{kind}_<KEY>_{}", template.env_name)),
-        );
-        names.push(format!(
-            "IGGY_CONNECTORS_{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
-        ));
-    }
-    names.sort_unstable();
-    names.dedup();
-    for name in names {
+    ]
+    .iter()
+    .flat_map(|(kind, templates)| {
+        templates
+            .iter()
+            .map(move |template| format!("IGGY_CONNECTORS_{kind}_<KEY>_{}", template.env_name))
+            .chain(std::iter::once(format!(
+                "IGGY_CONNECTORS_{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
+            )))
+    })
+    .collect();
+
+    // Combine static and dynamic templates, sort, deduplicate
+    let mut all_names: Vec<String> = names
+        .into_iter()
+        .map(|s| s.to_string())
+        .chain(sink_source_templates)
+        .collect();
+    all_names.sort_unstable();
+    all_names.dedup();
+
+    for name in all_names {
         println!("{name}");
     }
 }
