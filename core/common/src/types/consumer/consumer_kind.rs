@@ -30,8 +30,8 @@ use std::str::FromStr;
 /// - `id`: the unique identifier of the consumer.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct Consumer {
-    /// The type of consumer.
-    #[serde(skip)]
+    /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`.
+    #[serde(rename = "consumer_kind", default)]
     pub kind: ConsumerKind,
     /// The unique identifier of the consumer.
     #[serde(rename = "consumer_id")]
