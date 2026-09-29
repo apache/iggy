@@ -34,8 +34,7 @@ use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::wire_conversions::{consumer_to_wire, identifier_to_wire, partitioning_to_wire};
 use iggy_common::{
-    Consumer, ConsumerKind, Identifier, IggyError, IggyMessageView, PollMessages, PolledMessages,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, SendMessages,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessageView, PollMessages, SendMessages,
 };
 use server_common::Message;
 
@@ -188,18 +187,6 @@ pub(in crate::http) fn delete_offset_wire_request(
     })
 }
 
-/// The empty `PolledMessages` a fenced consumer-group poll answers, carrying
-/// the re-sync sentinel in `partition_id` exactly as the TCP dispatch replies
-/// it, so an SDK re-syncs its assignment instead of reading end-of-partition.
-pub(in crate::http) const fn resync_required_polled_messages() -> PolledMessages {
-    PolledMessages {
-        partition_id: RESYNC_REQUIRED_PARTITION_SENTINEL,
-        current_offset: 0,
-        count: 0,
-        messages: Vec::new(),
-    }
-}
-
 /// Build a `Message<RoutedRequestHeader>` for a control-plane write by filling a zeroed
 /// `#[repr(C)]` header, mirroring `wire::rewrite_request_body` and the partition
 /// reconciler's prepare builder. `body` is the already-encoded wire request,
@@ -237,8 +224,8 @@ mod tests {
     use iggy_binary_protocol::WireEncode;
     use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
     use iggy_common::{
-        IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind, PollingKind,
-        PollingStrategy, Validatable,
+        IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind, PolledMessages,
+        PollingKind, PollingStrategy, Validatable,
     };
     use partitions::{Fragment, PollFragments};
     use server_common::MESSAGE_ALIGN;

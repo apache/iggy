@@ -140,7 +140,7 @@ use crate::http::submit::{
 };
 use crate::http::wire::{
     consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
-    poll_wire_request, resync_required_polled_messages, store_offset_wire_request,
+    poll_wire_request, store_offset_wire_request,
 };
 use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
 use crate::responses::connected_client_to_response;
@@ -155,11 +155,11 @@ const PONG: &str = "pong";
 
 /// VSR client id stamped on HTTP data-plane reads (poll / consumer-offset).
 /// HTTP reads never Register a VSR client, and shard-0 client ids are minted
-/// from 1, so 0 can never name a live consumer-group member: a group-kind
-/// poll fences closed with `ConsumerGroupPartitionNotOwned` and answers the
-/// re-sync sentinel empty poll - the same failure a stale TCP member sees.
-/// Legacy HTTP polls with client id 0 for the same reason (no persistent
-/// sessions, so no group membership).
+/// from 1, so 0 can never collide with a live client. `resolve_poll_request`
+/// takes a client id only for its consumer-group fencing branch, and HTTP
+/// never reaches it: `poll_wire_request` rejects `consumer_kind=consumer_group`
+/// up front. Legacy HTTP polls with client id 0 for the same reason (no
+/// persistent sessions, so no group membership).
 const HTTP_READ_CLIENT_ID: u128 = 0;
 
 /// Response header attesting what durability a produce response proves:
@@ -1233,11 +1233,6 @@ pub(in crate::http) async fn poll_messages(
     let (namespace, partition_id, consumer, args) =
         match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
             Ok(decoded) => decoded,
-            // TCP parity: a fenced group poll answers 200 with the re-sync
-            // sentinel partition, not an error (see [`HTTP_READ_CLIENT_ID`]).
-            Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
-                return Ok(Json(resync_required_polled_messages()));
-            }
             // A partition id the topic does not have is a client addressing
             // error with its own code; collapsing it into the generic 404 body
             // told an SDK "no such stream/topic" for a request whose stream and
