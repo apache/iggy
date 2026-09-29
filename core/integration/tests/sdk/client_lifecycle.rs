@@ -44,7 +44,9 @@ const SDK_SIDE_FAILURE: Duration = Duration::from_millis(500);
 #[ignore = "fails until #4287 is fixed: WebSocket connects after shutdown"]
 async fn given_a_shut_down_websocket_client_when_connecting_should_fail(harness: &TestHarness) {
     // TODO: in `WebSocketClient::connect_inner`, return `ClientShutdown` in the
-    // `Shutdown` state, as `TcpClient` and `QuicClient` already do.
+    // `Shutdown` state before any dial, as `TcpClient` and `QuicClient` already
+    // do. The `set_state` guard of the next test only stops the state change,
+    // not the dial.
     let client = harness.websocket_new_client().await.unwrap();
     client.shutdown().await.unwrap();
 
@@ -57,9 +59,11 @@ async fn given_a_shut_down_websocket_client_when_connecting_should_fail(harness:
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
 #[ignore = "fails until #4287 is fixed: disconnect after shutdown makes the client reusable"]
 async fn given_a_shut_down_client_when_disconnected_should_stay_shut_down(harness: &TestHarness) {
-    // TODO: in `TcpClient::disconnect_transport`, `QuicClient::disconnect` and
-    // `WebSocketClient::disconnect`, return early in the `Shutdown` state, as
-    // `shutdown()` already does, so the state stays `Shutdown`.
+    // TODO: add one guard in `set_state` of each transport, so that no write
+    // moves a client out of `Shutdown`. A guard in each `disconnect()` is not
+    // enough: other paths also write `Disconnected`, for example a timeout.
+    // With the guard, `connect_inner` returns `ClientShutdown` as it does for a
+    // client that was never disconnected.
     let client = harness.new_client().await.unwrap();
     client.shutdown().await.unwrap();
     client.disconnect().await.unwrap();
@@ -78,9 +82,9 @@ async fn given_an_auto_login_client_when_explicitly_disconnected_should_stay_dis
     // TODO: stop the heartbeat task in `IggyClient::disconnect`, and let
     // `connect` start it again. That alone is not enough: the heartbeat ping
     // reconnects through the same path as a direct `ping()`, so this test also
-    // needs the fix of the ping and get_stats tests below. The `IggyClient`,
-    // Python and C++ docs describe the current behavior, so they must change
-    // with the fix.
+    // needs the caller-intent flag of the ping and get_stats tests below. The
+    // `IggyClient`, Python and C++ docs describe the current behavior, so they
+    // must change with the fix.
     let config = TcpClientConfig {
         server_address: harness.server().raw_tcp_addr().unwrap(),
         heartbeat_interval: NonZeroIggyDuration::from_str(HEARTBEAT_INTERVAL).unwrap(),
@@ -116,9 +120,12 @@ async fn given_an_auto_login_client_when_explicitly_disconnected_should_stay_dis
 async fn given_a_disconnected_auto_login_client_when_pinging_should_fail_without_reconnecting(
     harness: &TestHarness,
 ) {
-    // TODO: after an explicit `disconnect()`, `send_raw_with_response` must fail
-    // on the SDK side until the next `connect()`, instead of reconnecting with
-    // the configured credentials.
+    // TODO: `Client::disconnect` sets a caller-intent flag, and `connect()`
+    // clears it. While the flag is set, `send_raw_with_response` fails on the
+    // SDK side instead of reconnecting with the configured credentials. Do not
+    // read the intent from `get_state() == Disconnected`: a socket error or a
+    // timeout also leaves the client `Disconnected`, and that loss must still
+    // heal on its own.
     let client = disconnected_auto_login_client(harness).await;
 
     let ping = timeout(SDK_SIDE_FAILURE, client.ping()).await;
@@ -138,9 +145,9 @@ async fn given_a_disconnected_auto_login_client_when_pinging_should_fail_without
 async fn given_a_disconnected_auto_login_client_when_getting_stats_should_fail_without_reconnecting(
     harness: &TestHarness,
 ) {
-    // TODO: same fix as for ping: after an explicit `disconnect()`,
-    // `send_raw_with_response` must fail on the SDK side until the next
-    // `connect()`.
+    // TODO: same fix as for ping: while the caller-intent flag that
+    // `Client::disconnect` sets is on, `send_raw_with_response` fails on the
+    // SDK side until the next `connect()`.
     let client = disconnected_auto_login_client(harness).await;
 
     let stats = timeout(SDK_SIDE_FAILURE, client.get_stats()).await;
