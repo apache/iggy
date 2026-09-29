@@ -7,7 +7,7 @@ partition so replication can resume after a restart.
 
 ## Features
 
-- Polls every partition of one upstream topic.
+- Polls every partition of one upstream topic over successive cycles.
 - Preserves payload bytes and non-zero message IDs.
 - Preserves user headers by default, with an option to omit them.
 - Stores per-partition offsets in the connector runtime's state storage.
@@ -49,8 +49,9 @@ verbose_logging = false
 
 Use `schema = "raw"` on the downstream stream to replicate payload bytes
 without decoding or re-encoding them. The runtime-level `batch_length` controls
-downstream producer batching, while `plugin_config.batch_size` controls how many
-messages are requested from each upstream partition in one poll cycle.
+downstream producer batching, while `plugin_config.batch_size` limits each
+upstream partition poll. A poll cycle forwards at most 10,000 messages across
+all partitions and resumes with another partition on the next cycle.
 
 ### Plugin Fields
 
@@ -60,7 +61,7 @@ messages are requested from each upstream partition in one poll cycle.
 | `upstream_stream` | yes | none | Name of the stream to replicate from. |
 | `upstream_topic` | yes | none | Name of the topic to replicate from. |
 | `poll_interval` | no | `2s` | Delay before each upstream poll cycle. |
-| `batch_size` | no | `100` | Maximum messages requested from each upstream partition per poll cycle. Must be between `1` and `10,000`. |
+| `batch_size` | no | `100` | Maximum messages requested from each upstream partition per poll. Must be between `1` and `10,000`. |
 | `initial_offset` | no | `earliest` | Starting position for a partition without a saved offset, including after the upstream topic is recreated with the same name. Accepts `earliest`, `latest`, or an absolute numeric offset. |
 | `include_user_headers` | no | `true` | Copy user headers to downstream messages. |
 | `malformed_message_policy` | no | `block` | Handling for messages with unparsable user headers: `block` retries from the failed offset; `drop_headers` forwards the payload without those headers. |
@@ -116,6 +117,8 @@ messages.
 
 - The connector discovers new upstream partitions automatically on each poll cycle.
 - A `batch_size` outside `1..=10,000` prevents the connector from starting.
+- The 10,000-message cycle cap bounds message count, not payload bytes. Large
+  messages can still use substantial memory while the batch crosses the runtime.
 - If the upstream stream is missing, the connector creates it. If the topic is
   missing, it creates the topic with one partition, no compression, persisted
   durability, and a one-message save threshold.

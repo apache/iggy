@@ -47,6 +47,8 @@ const DEFAULT_RETRY_INTERVAL: &str = "1s";
 const DEFAULT_MAX_RETRY_INTERVAL: &str = "60s";
 const DEFAULT_BATCH_SIZE: u32 = 100;
 const MAX_BATCH_SIZE: u32 = 10_000;
+// A cycle must not accumulate more messages than one legal partition poll.
+const MAX_POLL_CYCLE_MESSAGES: u32 = MAX_BATCH_SIZE;
 const AUTO_CREATED_PARTITIONS_COUNT: u32 = 1;
 
 /// Configuration for the Iggy source connector, replicating a topic from an
@@ -162,6 +164,7 @@ pub struct IggySource {
     retry_interval: Duration,
     max_retry_interval: Duration,
     consecutive_failed_poll_cycles: AtomicU64,
+    next_partition: AtomicU64,
     initial_offset: InitialOffset,
     batch_size: u32,
     include_user_headers: bool,
@@ -224,6 +227,7 @@ impl IggySource {
             retry_interval,
             max_retry_interval,
             consecutive_failed_poll_cycles: AtomicU64::new(0),
+            next_partition: AtomicU64::new(0),
             initial_offset,
             batch_size,
             include_user_headers,
@@ -438,7 +442,18 @@ impl Source for IggySource {
         let mut messages = Vec::with_capacity(self.batch_size as usize);
         let mut cycle_counts = PollCycleCounts::default();
 
-        for &partition_id in partitions {
+        let first_partition = next_partition_index(
+            self.next_partition.load(Ordering::Relaxed) as usize,
+            0,
+            partitions.len(),
+        );
+        for &partition_id in partitions[first_partition..]
+            .iter()
+            .chain(&partitions[..first_partition])
+        {
+            let Some(poll_count) = next_poll_count(self.batch_size, messages.len()) else {
+                break;
+            };
             let strategy = next_strategy(
                 self.initial_offset,
                 candidate_state.offsets.get(&partition_id).copied(),
@@ -450,7 +465,7 @@ impl Source for IggySource {
                     Some(partition_id),
                     &consumer,
                     &strategy,
-                    self.batch_size,
+                    poll_count,
                     false,
                 )
                 .await;
@@ -502,6 +517,13 @@ impl Source for IggySource {
             }
         }
 
+        let attempted_partitions =
+            (cycle_counts.successful_upstream_polls + cycle_counts.upstream_poll_errors) as usize;
+        self.next_partition.store(
+            next_partition_index(first_partition, attempted_partitions, partitions.len()) as u64,
+            Ordering::Relaxed,
+        );
+
         candidate_state.messages_synced += messages.len() as u64;
         candidate_state.errors_count += cycle_counts.total_errors();
         let total_synced = candidate_state.messages_synced;
@@ -530,7 +552,7 @@ impl Source for IggySource {
                  Total synced: {}, poll errors in cycle: {}, conversion errors in cycle: {}",
                 self.id,
                 messages.len(),
-                partitions.len(),
+                attempted_partitions,
                 total_synced,
                 cycle_counts.upstream_poll_errors,
                 cycle_counts.conversion_errors
@@ -541,7 +563,7 @@ impl Source for IggySource {
                  Total synced: {}, poll errors in cycle: {}, conversion errors in cycle: {}",
                 self.id,
                 messages.len(),
-                partitions.len(),
+                attempted_partitions,
                 total_synced,
                 cycle_counts.upstream_poll_errors,
                 cycle_counts.conversion_errors
@@ -592,6 +614,23 @@ fn validate_batch_size(batch_size: u32) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+fn next_poll_count(batch_size: u32, produced_count: usize) -> Option<u32> {
+    let remaining = MAX_POLL_CYCLE_MESSAGES.saturating_sub(produced_count as u32);
+    (remaining > 0).then_some(batch_size.min(remaining))
+}
+
+fn next_partition_index(
+    first_partition: usize,
+    attempted_partitions: usize,
+    partitions_count: usize,
+) -> usize {
+    if partitions_count == 0 {
+        0
+    } else {
+        (first_partition + attempted_partitions) % partitions_count
+    }
 }
 
 fn next_strategy(initial: InitialOffset, saved_offset: Option<u64>) -> PollingStrategy {
@@ -1072,6 +1111,23 @@ mod tests {
     fn batch_size_at_supported_boundaries_should_be_valid() {
         assert!(validate_batch_size(1).is_ok());
         assert!(validate_batch_size(MAX_BATCH_SIZE).is_ok());
+    }
+
+    #[test]
+    fn given_cycle_capacity_when_polling_should_preserve_partition_limit() {
+        assert_eq!(next_poll_count(100, 0), Some(100));
+        assert_eq!(next_poll_count(MAX_BATCH_SIZE, 0), Some(MAX_BATCH_SIZE));
+        assert_eq!(next_poll_count(100, 9_950), Some(50));
+        assert_eq!(next_poll_count(100, 10_000), None);
+    }
+
+    #[test]
+    fn given_cycle_cap_when_advancing_partition_should_resume_after_attempted_partitions() {
+        assert_eq!(next_partition_index(0, 100, 1_000), 100);
+        assert_eq!(next_partition_index(100, 100, 1_000), 200);
+        assert_eq!(next_partition_index(900, 100, 1_000), 0);
+        assert_eq!(next_partition_index(4, 5, 5), 4);
+        assert_eq!(next_partition_index(0, 0, 0), 0);
     }
 
     #[test]
