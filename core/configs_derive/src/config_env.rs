@@ -416,7 +416,6 @@ fn generate_struct_impl(
                     let env_name = Box::leak(format!("{}_{}", #segment, template.env_name).into_boxed_str());
                     all_templates.push(configs::EnvVarTemplate {
                         env_name,
-                        max_elements: template.max_elements,
                     });
                 }
             }
