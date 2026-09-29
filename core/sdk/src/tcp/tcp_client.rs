@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, TryLockError};
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, trace, warn};
@@ -155,17 +155,19 @@ impl TcpRequestPolicy {
         self.has_sign_in_credentials.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn expire(&self) {
+    pub(crate) fn expire(&self) -> Result<(), TryLockError> {
         self.discard_stream_on_next_lock
             .store(true, Ordering::SeqCst);
-        if let Ok(mut stream) = self.link.try_lock() {
+        let stream_result = self.link.try_lock().map(|mut stream| {
             stream.take();
             self.discard_stream_on_next_lock
                 .store(false, Ordering::SeqCst);
-        }
-        if let Ok(mut state) = self.state.try_lock() {
+        });
+        let state_result = self.state.try_lock().map(|mut state| {
             *state = ClientState::Disconnected;
-        }
+        });
+        stream_result?;
+        state_result
     }
 }
 
@@ -178,8 +180,8 @@ impl ClientRequestPolicy for TcpRequestPolicy {
         TcpRequestPolicy::has_sign_in_credentials(self)
     }
 
-    fn expire(&self) {
-        TcpRequestPolicy::expire(self);
+    fn expire(&self) -> Result<(), TryLockError> {
+        TcpRequestPolicy::expire(self)
     }
 }
 
@@ -246,7 +248,9 @@ impl BinaryTransport for TcpClient {
     }
 
     fn expire_request(&self) {
-        self.request_policy().expire();
+        if let Err(error) = self.request_policy().expire() {
+            error!("Failed to expire the TCP request: {error}");
+        }
     }
 
     async fn send_offset_write_with_response(
@@ -730,7 +734,7 @@ impl TcpClient {
                         };
                         let result = operation.await;
                         if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown)) {
-                            self.request_policy().expire();
+                            self.expire_request();
                             self.reset_vsr_session().await?;
                             self.set_state(ClientState::Disconnected).await;
                         }
@@ -1573,10 +1577,7 @@ impl TcpClient {
             if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 && result.is_err()
             {
-                if let Ok(mut stream) = self.link.try_lock() {
-                    stream.take();
-                }
-                self.set_state(ClientState::Disconnected).await;
+                self.expire_request();
                 return Err(IggyError::RequestTimeoutOutcomeUnknown);
             }
             match result {
@@ -1693,10 +1694,7 @@ impl TcpClient {
                     return Err(IggyError::Disconnected);
                 }
                 Err(IggyError::RequestTimeoutOutcomeUnknown) => {
-                    if let Ok(mut stream) = self.link.try_lock() {
-                        stream.take();
-                    }
-                    self.set_state(ClientState::Disconnected).await;
+                    self.expire_request();
                     return Err(IggyError::RequestTimeoutOutcomeUnknown);
                 }
                 other => return other,
@@ -2977,6 +2975,33 @@ mod tests {
             Err(IggyError::RequestTimeoutOutcomeUnknown)
         ));
         drop(lock);
+    }
+
+    #[tokio::test]
+    async fn request_policy_expire_reports_incomplete_cleanup() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig::default())).unwrap();
+        let policy = client.request_policy();
+        let stream_lock = client.link.lock().await;
+        let mut state_lock = client.state.lock().await;
+        *state_lock = ClientState::Authenticated;
+
+        assert!(policy.expire().is_err());
+        assert!(client.discard_stream_on_next_lock.load(Ordering::SeqCst));
+
+        drop(state_lock);
+        assert!(policy.expire().is_err());
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+
+        drop(stream_lock);
+        let mut state_lock = client.state.lock().await;
+        *state_lock = ClientState::Authenticated;
+        assert!(policy.expire().is_err());
+        assert!(!client.discard_stream_on_next_lock.load(Ordering::SeqCst));
+        assert_eq!(*state_lock, ClientState::Authenticated);
+
+        drop(state_lock);
+        assert!(policy.expire().is_ok());
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
     }
 
     #[tokio::test]
