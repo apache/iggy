@@ -1425,9 +1425,11 @@ pub(in crate::http) async fn send_messages(
 
 /// `PUT /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: store a
 /// consumer's offset. The JSON body is the same `StoreConsumerOffset` shape the
-/// legacy server accepts (flattened `consumer_id`, optional `partition_id`,
-/// `offset`); stream and topic come from the path. Returns 204 on commit,
-/// matching the legacy server.
+/// legacy server accepts (flattened `consumer_id`, optional `consumer_kind`,
+/// `partition_id`, `offset`); stream and topic come from the path. Returns
+/// 204 on commit, matching the legacy server. `consumer_kind=consumer_group`
+/// is rejected ([`store_offset_wire_request`]) since HTTP has no persistent
+/// connection and group memberships can change.
 ///
 /// Data plane like a produce: the offset write is a replicated op on the
 /// partition group's own consensus, awaited through the session's in-process
@@ -1473,7 +1475,8 @@ pub(in crate::http) async fn store_consumer_offset(
 /// accepts. Returns 204 on commit, matching the legacy server; a delete of a
 /// never-stored offset is denied by the partition primary
 /// (`ReplyHeader.status`) and renders the legacy typed 404. Same replicated
-/// partition write as [`store_consumer_offset`].
+/// partition write as [`store_consumer_offset`]. `consumer_kind=consumer_group`
+/// is rejected because HTTP does not persist a connection and group memberships can change.
 pub(in crate::http) async fn delete_consumer_offset(
     State(state): State<HttpState>,
     identity: Authenticated,

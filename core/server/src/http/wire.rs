@@ -146,11 +146,16 @@ pub(in crate::http) fn consumer_offset_wire_request(
 /// (`StoreConsumerOffsetRequest`), `ack` pinned to `Quorum` so the route can
 /// await the committed reply. `partition_id` passes through as the wire
 /// `Option` (flag byte + u32) for the server-side resolvers to ground.
+/// Rejects `consumer_kind=consumer_group` since HTTP has no persistent
+/// connection to hold group membership, so the write would always be fenced.
 pub(in crate::http) fn store_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     command: &StoreConsumerOffset,
 ) -> Result<StoreConsumerOffsetRequest, IggyError> {
+    if command.consumer.kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::InvalidCommand);
+    }
     Ok(StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(&command.consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
@@ -163,13 +168,17 @@ pub(in crate::http) fn store_offset_wire_request(
 
 /// Map a validated HTTP delete-offset request onto the wire request
 /// (`DeleteConsumerOffsetRequest`), `ack` pinned to `Quorum` like
-/// [`store_offset_wire_request`].
+/// [`store_offset_wire_request`]. Rejects `consumer_kind=consumer_group` for
+/// the same reason [`store_offset_wire_request`] does.
 pub(in crate::http) fn delete_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     consumer: &Consumer,
     partition_id: Option<u32>,
 ) -> Result<DeleteConsumerOffsetRequest, IggyError> {
+    if consumer.kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::InvalidCommand);
+    }
     Ok(DeleteConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
@@ -228,8 +237,8 @@ mod tests {
     use iggy_binary_protocol::WireEncode;
     use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
     use iggy_common::{
-        Consumer, ConsumerKind, IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind,
-        PollingKind, PollingStrategy, Validatable,
+        IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind, PollingKind,
+        PollingStrategy, Validatable,
     };
     use partitions::{Fragment, PollFragments};
     use server_common::MESSAGE_ALIGN;
@@ -569,6 +578,46 @@ mod tests {
         let bare: Uri = "/x".parse().expect("valid uri");
         let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&bare).expect("parses");
         assert_eq!(query.partition_id, None);
+    }
+
+    #[test]
+    fn delete_offset_query_parses_consumer_kind_param() {
+        let uri: Uri = "/x?consumer_kind=consumer_group&partition_id=3"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer_kind, ConsumerKind::ConsumerGroup);
+        let bare: Uri = "/x".parse().expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&bare).expect("parses");
+        assert_eq!(query.consumer_kind, ConsumerKind::Consumer);
+    }
+
+    #[test]
+    fn store_offset_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::named("orders").expect("valid topic id");
+        let command = StoreConsumerOffset {
+            consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
+            partition_id: Some(1),
+            offset: 42,
+        };
+        let error =
+            store_offset_wire_request(&stream_id, &topic_id, &command).expect_err("must reject");
+        assert!(matches!(error, IggyError::InvalidCommand));
+    }
+
+    #[test]
+    fn delete_offset_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::named("stream-1").expect("valid stream id");
+        let topic_id = Identifier::numeric(2).expect("valid topic id");
+        let error = delete_offset_wire_request(
+            &stream_id,
+            &topic_id,
+            &Consumer::group(Identifier::numeric(9).expect("valid id")),
+            Some(1),
+        )
+        .expect_err("must reject");
+        assert!(matches!(error, IggyError::InvalidCommand));
     }
 
     /// Wrap one stored `SendMessages` batch (`[256B header][blob]`) as the
