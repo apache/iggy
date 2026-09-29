@@ -22,7 +22,7 @@ mod banner;
 
 use args::Args;
 use clap::Parser;
-use configs::server::ServerConfig;
+use configs::{ConfigEnvMappings, server::ServerConfig};
 use server::boot::{apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs};
 use server::server_error::ServerError;
 use server_common::log::Logging;
@@ -38,6 +38,10 @@ fn main() -> Result<(), ServerError> {
     // visible. `create_shard_executor` also reads its capacity knob from the
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars();
+        return Ok(());
+    }
     banner::print(server::VERSION);
     // `logging` owns the tracing appender worker guards; it must outlive the
     // shard threads or every log line after bootstrap is silently dropped.
@@ -102,4 +106,25 @@ fn main() -> Result<(), ServerError> {
     joined?;
     info!("server shutdown complete");
     Ok(())
+}
+
+fn print_config_env_vars() {
+    let mut names: Vec<_> = ServerConfig::env_templates()
+        .iter()
+        .map(|template| template.env_name)
+        .chain([
+            "IGGY_CONFIG_PATH",
+            "IGGY_DISPLAY_CONFIG",
+            "IGGY_ENV_PATH",
+            "IGGY_ROOT_PASSWORD",
+            "IGGY_ROOT_USERNAME",
+            "IGGY_SHARD_EVENT_INTERVAL",
+            "IGGY_SHARD_RUNTIME_CAPACITY",
+        ])
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        println!("{name}");
+    }
 }

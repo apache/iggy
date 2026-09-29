@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::configs::connectors::{
-    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, create_connectors_config_provider,
+    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, SinkConfig, SourceConfig,
+    create_connectors_config_provider,
 };
 use crate::metrics::ConnectorType;
-use ::configs::ConfigProvider;
+use ::configs::{ConfigEnvMappings, ConfigProvider};
 use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
@@ -43,6 +44,7 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
+use tokio::runtime::Builder;
 use tracing::{error, info, warn};
 
 mod api;
@@ -67,7 +69,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(author = "Apache Iggy", version)]
-struct Args {}
+struct Args {
+    /// Print supported configuration environment variables and exit.
+    #[arg(long)]
+    list_config_env_vars: bool,
+}
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
@@ -117,10 +123,50 @@ fn print_ascii_art(text: &str) {
     println!("{}", figure.unwrap());
 }
 
-#[tokio::main]
-async fn main() -> Result<(), RuntimeError> {
+fn main() -> Result<(), RuntimeError> {
+    let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars();
+        return Ok(());
+    }
     capture_allowed_cpus();
-    Args::parse();
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+fn print_config_env_vars() {
+    let mut names: Vec<String> = ConnectorsRuntimeConfig::env_templates()
+        .iter()
+        .map(|template| template.env_name.to_owned())
+        .chain([
+            "IGGY_CONNECTORS_CONFIG_PATH".to_owned(),
+            "IGGY_CONNECTORS_ENV_PATH".to_owned(),
+            "IGGY_DISPLAY_CONFIG".to_owned(),
+        ])
+        .collect();
+    for (kind, templates) in [
+        ("SINK", SinkConfig::env_templates()),
+        ("SOURCE", SourceConfig::env_templates()),
+    ] {
+        names.extend(
+            templates
+                .iter()
+                .map(|template| format!("IGGY_CONNECTORS_{kind}_<KEY>_{}", template.env_name)),
+        );
+        names.push(format!(
+            "IGGY_CONNECTORS_{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
+        ));
+    }
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        println!("{name}");
+    }
+}
+
+async fn run() -> Result<(), RuntimeError> {
     print_ascii_art("Iggy Connectors");
 
     if let Ok(env_path) = std::env::var("IGGY_CONNECTORS_ENV_PATH") {

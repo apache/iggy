@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use ::configs::ConfigEnvMappings;
 use ::configs::ConfigProvider;
+use clap::Parser;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
@@ -42,7 +44,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_CONFIG_PATH: &str = "core/ai/mcp/config.toml";
 
+#[derive(Debug, Parser)]
+#[command(author = "Apache Iggy", version)]
+struct Args {
+    /// Print supported configuration environment variables and exit.
+    #[arg(long)]
+    list_config_env_vars: bool,
+}
+
 fn main() -> Result<(), McpRuntimeError> {
+    let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars();
+        return Ok(());
+    }
     let runtime = Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -51,6 +66,23 @@ fn main() -> Result<(), McpRuntimeError> {
     // Tokio cannot cancel its blocking stdin read when a signal ends a live session.
     runtime.shutdown_background();
     result
+}
+
+fn print_config_env_vars() {
+    let mut names: Vec<_> = McpServerConfig::env_templates()
+        .iter()
+        .map(|template| template.env_name)
+        .chain([
+            "IGGY_DISPLAY_CONFIG",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_ENV_PATH",
+        ])
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        println!("{name}");
+    }
 }
 
 async fn run() -> Result<(), McpRuntimeError> {

@@ -7049,6 +7049,7 @@ version = "0.5.0"
 dependencies = [
  "axum",
  "axum-server",
+ "clap",
  "configs",
  "configs_derive",
  "dirs 7.0.0",
