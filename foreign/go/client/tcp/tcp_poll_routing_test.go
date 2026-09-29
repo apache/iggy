@@ -528,11 +528,13 @@ func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
 					return pollRoutingReply(t, read, route.endpoint, 0)
 				})
 				polls := 0
+				var pollTimes []time.Time
 				serve(primaryConn, func(_ int, read request) []byte {
 					if read.code() == uint32(command.AttachConsumerSessionCode) {
 						return replyFrame(vsr.OperationNonReplicated, nil)
 					}
 					polls++
+					pollTimes = append(pollTimes, time.Now())
 					if outcome == "refused" {
 						return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrTransientNotAccepted.Code()), nil)
 					}
@@ -546,6 +548,12 @@ func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
 				if outcome == "refused" {
 					require.ErrorIs(t, err, ierror.ErrTransientNotAccepted)
 					assert.Greater(t, polls, 1)
+					interval := replayInterval
+					for index := 1; index < len(pollTimes); index++ {
+						assert.Equal(t, interval, pollTimes[index].Sub(pollTimes[index-1]),
+							"refused routes must back off between attempts")
+						interval = min(interval*2, time.Second)
+					}
 				} else {
 					require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
 					if outcome == "lost-reply" {
@@ -775,6 +783,39 @@ func TestPrimaryOffsetWrite_SplitPrimariesKeepCoordinatorSessionAndShareRoutes(t
 		assert.Equal(t, 1, requestCount(primary.recorded(), command.AttachConsumerSessionCode))
 		assert.Equal(t, 1, operationCount(primary.recorded(), vsr.OperationStoreConsumerOffset))
 		assert.Equal(t, 1, operationCount(primary.recorded(), vsr.OperationDeleteConsumerOffset))
+	}
+}
+
+func TestPrimaryOffsetWrite_UnknownOutcomeDoesNotRecoverOrReplay(t *testing.T) {
+	for _, operation := range []vsr.Operation{vsr.OperationStoreConsumerOffset, vsr.OperationDeleteConsumerOffset} {
+		for _, lostReply := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/lost_reply=%t", operation, lostReply), func(t *testing.T) {
+				fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+					if read.operation() == operation {
+						if lostReply {
+							return nil, true
+						}
+						return statusReplyFrame(operation, uint32(ierror.TransientNotCommittedCode), nil), true
+					}
+					return nil, false
+				}, nil)
+				stream, topic, consumer := groupConsumer(t)
+				partition := uint32(0)
+				var err error
+				if operation == vsr.OperationStoreConsumerOffset {
+					err = fixture.client.StoreConsumerOffset(context.Background(), consumer, stream, topic, 10, &partition)
+				} else {
+					err = fixture.client.DeleteConsumerOffset(context.Background(), consumer, stream, topic, &partition)
+				}
+				require.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+				assert.Equal(t, 1, operationCount(fixture.primaries[0].recorded(), operation),
+					"an admitted offset write with an unknown outcome must not replay")
+				assert.Equal(t, 1, fixture.primaries[0].connections())
+				assert.Zero(t, fixture.primaries[1].connections())
+				assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetOffsetRoutingCode))
+				assert.Equal(t, 1, fixture.coordinator.connections())
+			})
+		}
 	}
 }
 

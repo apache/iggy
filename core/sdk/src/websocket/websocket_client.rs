@@ -349,7 +349,7 @@ impl BinaryTransport for WebSocketClient {
             return Err(error);
         }
 
-        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
+        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &payload, &error);
         let skip_auto_login = is_login_register_code(code);
         let owner_context = skip_auto_login
             .then(|| self.connect_coordinator.current_owner_context())

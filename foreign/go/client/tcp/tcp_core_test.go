@@ -19,8 +19,13 @@ package tcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"testing"
@@ -77,8 +82,8 @@ type cancelOnDeadlineConn struct {
 	cancel context.CancelFunc
 }
 
-func (c cancelOnDeadlineConn) SetDeadline(deadline time.Time) error {
-	err := c.Conn.SetDeadline(deadline)
+func (c cancelOnDeadlineConn) SetReadDeadline(deadline time.Time) error {
+	err := c.Conn.SetReadDeadline(deadline)
 	if !deadline.IsZero() {
 		c.cancel()
 	}
@@ -448,17 +453,88 @@ func TestExchange_KeepsTheConnectionWhenTheCallerGivesUpMidRead(t *testing.T) {
 
 type observedReadConn struct {
 	net.Conn
-	maxRead int
-	cancel  context.CancelFunc
+	maxRead     int
+	readBytes   int
+	cancelAfter int
+	cancel      context.CancelFunc
 }
 
 func (c *observedReadConn) Read(buffer []byte) (int, error) {
 	c.maxRead = max(c.maxRead, len(buffer))
 	count, err := c.Conn.Read(buffer)
-	if count > 0 && c.cancel != nil {
+	c.readBytes += count
+	if count > 0 && c.cancel != nil && c.readBytes >= c.cancelAfter {
 		c.cancel()
 	}
 	return count, err
+}
+
+func TestExchange_ResumesPartialRepliesAfterCancellation(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		transport := "TCP"
+		if encrypted {
+			transport = "TLS"
+		}
+		for _, phase := range []string{"header", "body"} {
+			t.Run(transport+"/"+phase, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					client, serverConn := newPipeClient(t)
+					if encrypted {
+						certificate, _ := selfSignedCert(t)
+						leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+						require.NoError(t, err)
+						roots := x509.NewCertPool()
+						roots.AddCert(leaf)
+						serverTLS := tls.Server(serverConn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+						clientTLS := tls.Client(client.conn, &tls.Config{RootCAs: roots, ServerName: "localhost"})
+						handshake := make(chan error, 1)
+						go func() { handshake <- serverTLS.Handshake() }()
+						require.NoError(t, clientTLS.Handshake())
+						require.NoError(t, <-handshake)
+						client.conn = clientTLS
+						serverConn = serverTLS
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					const bodyPrefix = 3
+					split := vsr.HeaderSize / 2
+					if phase == "body" {
+						split = vsr.HeaderSize + bodyPrefix
+					}
+					observed := &observedReadConn{Conn: client.conn, cancelAfter: split, cancel: cancel}
+					client.conn = observed
+					client.reader = bufio.NewReaderSize(observed, connectionReadBufferSize)
+					identity := client.session.ClientID()
+					release := make(chan struct{})
+					server := serve(serverConn, func(index int, read request) []byte {
+						if index != 0 {
+							return replyFrame(vsr.OperationNonReplicated, []byte("next"))
+						}
+						answer := replyFrame(vsr.OperationNonReplicated, []byte("late reply"))
+						echoReplyRequest(answer, read)
+						if phase == "body" {
+							_, _ = serverConn.Write(answer[:vsr.HeaderSize])
+							_, _ = serverConn.Write(answer[vsr.HeaderSize:split])
+						} else {
+							_, _ = serverConn.Write(answer[:split])
+						}
+						<-release
+						_, _ = serverConn.Write(answer[split:])
+						return nil
+					})
+
+					_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
+					require.ErrorIs(t, err, context.Canceled)
+					close(release)
+					response, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
+					require.NoError(t, err)
+					assert.Equal(t, []byte("next"), response)
+					assert.Equal(t, identity, client.session.ClientID())
+					assert.Len(t, server.recorded(), 2)
+				})
+			})
+		}
+	}
 }
 
 func TestExchange_DrainsAbandonedRepliesWithoutAllocatingTheBody(t *testing.T) {
@@ -468,6 +544,8 @@ func TestExchange_DrainsAbandonedRepliesWithoutAllocatingTheBody(t *testing.T) {
 		t.Run(outcome, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				client, serverConn := newPipeClient(t)
+				var logs bytes.Buffer
+				client.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 				transport := &observedReadConn{Conn: client.conn}
 				client.conn = transport
 				client.reader = bufio.NewReaderSize(transport, connectionReadBufferSize)
@@ -505,6 +583,7 @@ func TestExchange_DrainsAbandonedRepliesWithoutAllocatingTheBody(t *testing.T) {
 				close(release)
 				require.NoError(t, client.acquireExchange(context.Background()))
 				client.releaseExchange()
+				assert.Contains(t, logs.String(), fmt.Sprintf("msg=\"Abandoned TCP reply drain finished\" code=%d", command.CreateStreamCode))
 				if outcome != "complete" {
 					assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
 					assert.False(t, client.session.Bound())
@@ -516,6 +595,7 @@ func TestExchange_DrainsAbandonedRepliesWithoutAllocatingTheBody(t *testing.T) {
 				assert.LessOrEqual(t, transport.maxRead, connectionReadBufferSize,
 					"draining must not allocate a read buffer for the entire reply body")
 				assert.Equal(t, watermark, client.metadataWatermark.Load())
+				assert.Contains(t, logs.String(), "reply_complete=true drain_error=<nil> reply_header_status=0")
 				response, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
 				require.NoError(t, err)
 				assert.Equal(t, []byte("next"), response)
@@ -591,7 +671,7 @@ func TestExchange_DoesNotResendAfterTheCallerGaveUp(t *testing.T) {
 	}
 }
 
-func TestExchange_KeepsTheFrameOfAWriteItsCallerGaveUpOn(t *testing.T) {
+func TestExchange_FinishesTheWriteBeforeReturningCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client, serverConn := newPipeClient(t)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -604,14 +684,27 @@ func TestExchange_KeepsTheFrameOfAWriteItsCallerGaveUpOn(t *testing.T) {
 
 		gaveUp := make(chan error, 1)
 		go func() {
-			_, err := client.exchange(ctx, uint32(command.CreateStreamCode), bp)
+			_, _, err := client.exchange(ctx, uint32(command.CreateStreamCode), bp)
 			gaveUp <- err
 		}()
 		// A pipe write blocks until the other end reads, and nothing reads yet.
 		synctest.Wait()
 		cancel()
+		synctest.Wait()
+		select {
+		case err := <-gaveUp:
+			t.Fatalf("cancellation interrupted the write: %v", err)
+		default:
+		}
+		release := make(chan struct{})
+		server := serve(serverConn, func(index int, _ request) []byte {
+			if index == 0 {
+				<-release
+			}
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		})
 		require.ErrorIs(t, <-gaveUp, context.Canceled)
-		assert.Nil(t, *bp, "the caller kept a frame that the exchange still writes")
+		assert.NotNil(t, *bp, "the completed write no longer needs the pooled frame")
 		releaseRequestBuf(bp)
 
 		payments := make(chan error, 1)
@@ -620,15 +713,84 @@ func TestExchange_KeepsTheFrameOfAWriteItsCallerGaveUpOn(t *testing.T) {
 			payments <- err
 		}()
 		synctest.Wait()
-		server := serve(serverConn, func(_ int, _ request) []byte {
-			return replyFrame(vsr.OperationCreateStream, resultSection())
-		})
+		close(release)
 		require.NoError(t, <-payments)
 
 		recorded := server.recorded()
 		require.Len(t, recorded, 2)
 		assert.Equal(t, orders, recorded[0].payload, "the pool handed out a frame in flight")
 	})
+}
+
+func TestExchange_CancelledWriteCannotOutliveTheRequestBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client, _ := newPipeClient(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			time.Sleep(time.Second)
+			cancel()
+		}()
+		started := time.Now()
+		_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, responseReadTimeout, time.Since(started))
+		assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	})
+}
+
+func BenchmarkSendMessagesSmallBatch(b *testing.B) {
+	for _, cancellable := range []bool{false, true} {
+		name := "background"
+		if cancellable {
+			name = "cancellable"
+		}
+		b.Run(name, func(b *testing.B) {
+			serverConn, clientConn := net.Pipe()
+			client := newTestClient(b, clientConn)
+			client.session.BeginRegister()
+			require.NoError(b, client.session.Bind(100))
+			client.sessionState = iggcon.SessionStateAuthenticated
+			done := make(chan struct{})
+			b.Cleanup(func() {
+				_ = clientConn.Close()
+				_ = serverConn.Close()
+				<-done
+			})
+			go func() {
+				defer close(done)
+				answer := replyFrame(vsr.OperationSendMessages, zeroConfirmations())
+				for {
+					read, err := readRequest(serverConn)
+					if err != nil {
+						return
+					}
+					echoReplyRequest(answer, read)
+					if _, err := serverConn.Write(answer); err != nil {
+						return
+					}
+				}
+			}()
+			ctx := context.Background()
+			if cancellable {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+			}
+			identifier, err := iggcon.NewIdentifier(uint32(1))
+			require.NoError(b, err)
+			message, err := iggcon.NewIggyMessage([]byte("payload"))
+			require.NoError(b, err)
+			messages := []iggcon.IggyMessage{message}
+			b.ReportAllocs()
+			for b.Loop() {
+				_, err := client.SendMessages(ctx, identifier, identifier, iggcon.PartitionId(0), messages)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestClose_DoesNotWaitForAnExchangeItsCallerGaveUpOn(t *testing.T) {
@@ -1029,8 +1191,35 @@ func TestCanReplay_RefusesOnlyReplicatedRequestsWithAnUnknownOutcome(t *testing.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			assert.Equal(t, test.want, canReplay(test.code, test.err))
+			assert.Equal(t, test.want, canReplay(test.code, nil, test.err))
 		})
+	}
+}
+
+func TestCanReplay_ReadsThePollFlagBeforeTrailingBytes(t *testing.T) {
+	stream, err := iggcon.NewIdentifier("orders")
+	require.NoError(t, err)
+	for _, autoCommit := range []bool{false, true} {
+		poll := command.PollMessages{
+			StreamId: stream, TopicId: numericIdentifier(t, 2), Consumer: iggcon.DefaultConsumer(),
+			Strategy: iggcon.NextPollingStrategy(), Count: 10, AutoCommit: autoCommit,
+		}
+		payload, err := poll.MarshalBinary()
+		require.NoError(t, err)
+		code := uint32(command.PollMessagesCode)
+		assert.Equal(t, !autoCommit, canReplay(code, payload, ierror.ErrDisconnected))
+		for _, err := range []error{ierror.ErrNotConnected, ierror.ErrCannotEstablishConnection, ierror.ErrUnauthenticated, ierror.ErrStaleClient} {
+			assert.True(t, canReplay(code, payload, err), "a poll that was never applied can reconnect: %v", err)
+		}
+		for size := range len(payload) {
+			assert.False(t, canReplay(code, payload[:size], ierror.ErrDisconnected),
+				"truncated poll of length %d must not replay", size)
+		}
+		trailing := byte(0)
+		if !autoCommit {
+			trailing = 1
+		}
+		assert.Equal(t, !autoCommit, canReplay(code, append(payload, trailing), ierror.ErrDisconnected))
 	}
 }
 

@@ -275,7 +275,7 @@ impl BinaryTransport for TcpClient {
         // Login and register are the exception: the server stays deliberately
         // silent on a transient register failure and relies on the client
         // replaying, so that replay is the protocol rather than a retry.
-        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
+        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &payload, &error);
 
         let skip_auto_login = is_login_register_code(code);
         let owner_context = skip_auto_login
@@ -323,7 +323,7 @@ impl BinaryTransport for TcpClient {
 
         if !replay_after_reconnect {
             warn!(
-                "Reconnected, but command: {code} is replicated and its outcome is unknown: \
+                "Reconnected, but command: {code} has an unknown outcome: \
                  replaying it under the new session could apply it twice, so the original \
                  error is returned instead."
             );
@@ -2240,10 +2240,12 @@ mod tests {
         // Never written, or refused before execution.
         assert!(replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
+            &[],
             &IggyError::NotConnected
         ));
         assert!(replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
+            &[],
             &IggyError::CannotEstablishConnection
         ));
         // Written, and its outcome unknown: a replicated write must not be
@@ -2252,30 +2254,36 @@ mod tests {
         // whether the write committed.
         assert!(!replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
+            &[],
             &IggyError::StaleClient
         ));
         assert!(!replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
+            &[],
             &IggyError::Disconnected
         ));
         assert!(!replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
+            &[],
             &IggyError::EmptyResponse
         ));
         // A read never enters the log, and a logout ends a session the
         // reconnect already replaced -- `logout_before_relogin` depends on it.
         assert!(replay_after_session_reset_is_safe(
             GET_ME_CODE,
+            &[],
             &IggyError::Disconnected
         ));
         assert!(replay_after_session_reset_is_safe(
             LOGOUT_USER_CODE,
+            &[],
             &IggyError::Disconnected
         ));
         // The register replay is the protocol: the server stays silent on a
         // transient failure and waits for the resend.
         assert!(replay_after_session_reset_is_safe(
             LOGIN_REGISTER_CODE,
+            &[],
             &IggyError::Disconnected
         ));
     }

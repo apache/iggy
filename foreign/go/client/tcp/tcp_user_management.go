@@ -64,6 +64,9 @@ func (c *IggyTcpClient) CreateUser(ctx context.Context, username string, passwor
 	return userInfo, nil
 }
 
+// UpdateUser refreshes remembered credentials only after an acknowledged update.
+// Cancellation can leave a committed username change with stale credentials;
+// explicitly sign in with the new username before relying on automatic reconnect.
 func (c *IggyTcpClient) UpdateUser(ctx context.Context, userID iggcon.Identifier, username *string, status *iggcon.UserStatus) error {
 	_, err := c.do(ctx, &command.UpdateUser{
 		UserID:   userID,
@@ -91,6 +94,9 @@ func (c *IggyTcpClient) UpdatePermissions(ctx context.Context, userID iggcon.Ide
 	return err
 }
 
+// ChangePassword refreshes remembered credentials only after an acknowledged change.
+// Cancellation can leave a committed password change with stale credentials;
+// explicitly sign in with the new password before relying on automatic reconnect.
 func (c *IggyTcpClient) ChangePassword(ctx context.Context, userID iggcon.Identifier, currentPassword string, newPassword string) error {
 	_, err := c.do(ctx, &command.ChangePassword{
 		UserID:          userID,

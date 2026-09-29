@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"testing"
 	"time"
 
@@ -189,78 +190,112 @@ func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 		"the first poll joins on the caller's behalf")
 }
 
-func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
-	for _, outcome := range []string{"acknowledged", "cancelled"} {
+func TestPollMessages_GroupPollDoesNotRejoinAfterLeavingOrDeleting(t *testing.T) {
+	for _, operation := range []vsr.Operation{vsr.OperationLeaveConsumerGroup, vsr.OperationDeleteConsumerGroup} {
+		for _, outcome := range []string{"acknowledged", "cancelled"} {
+			t.Run(fmt.Sprintf("%d/%s", operation, outcome), func(t *testing.T) {
+				client, serverConn := newPipeClient(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				release := make(chan struct{})
+				server := serve(serverConn, func(_ int, read request) []byte {
+					switch {
+					case read.code() == uint32(command.SyncGroupCode):
+						return replyFrame(vsr.OperationNonReplicated, nil)
+					case read.operation() == operation:
+						if outcome == "cancelled" {
+							cancel()
+							<-release
+						}
+						return replyFrame(operation, resultSection())
+					default:
+						return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+					}
+				})
+
+				streamId, topicId, consumer := groupConsumer(t)
+				var err error
+				if operation == vsr.OperationDeleteConsumerGroup {
+					err = client.DeleteConsumerGroup(ctx, streamId, topicId, consumer.Id)
+				} else {
+					err = client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id)
+				}
+				close(release)
+				if outcome == "cancelled" {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					require.NoError(t, err)
+				}
+
+				_, err = pollOnce(t, client)
+				assert.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound,
+					"an explicit leave stays left until an explicit join")
+
+				for _, read := range server.recorded() {
+					assert.NotEqual(t, vsr.OperationJoinConsumerGroup, read.operation(),
+						"the poll must not undo the leave")
+				}
+			})
+		}
+	}
+}
+
+func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
+	for _, outcome := range []string{"acknowledged", "cancelled before commit", "cancelled after commit"} {
 		t.Run(outcome, func(t *testing.T) {
 			client, serverConn := newPipeClient(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			release := make(chan struct{})
+			member := false
+			joins := 0
 			server := serve(serverConn, func(_ int, read request) []byte {
 				switch {
+				case read.code() == uint32(command.SyncGroupCode) && member:
+					return replyFrame(vsr.OperationNonReplicated, assignmentBody(2, 4))
 				case read.code() == uint32(command.SyncGroupCode):
 					return replyFrame(vsr.OperationNonReplicated, nil)
 				case read.operation() == vsr.OperationLeaveConsumerGroup:
-					if outcome == "cancelled" {
+					member = false
+					return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
+				case read.operation() == vsr.OperationJoinConsumerGroup:
+					joins++
+					if joins == 1 && outcome != "acknowledged" {
 						cancel()
 						<-release
+						if outcome == "cancelled before commit" {
+							return statusReplyFrame(vsr.OperationJoinConsumerGroup, uint32(ierror.TransientNotCommittedCode), nil)
+						}
 					}
-					return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
-				default:
+					member = true
 					return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+				default:
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 				}
 			})
 
 			streamId, topicId, consumer := groupConsumer(t)
-			err := client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id)
+			require.NoError(t, client.LeaveConsumerGroup(
+				context.Background(), streamId, topicId, consumer.Id))
+			err := client.JoinConsumerGroup(ctx, streamId, topicId, consumer.Id)
 			close(release)
-			if outcome == "cancelled" {
-				require.ErrorIs(t, err, context.Canceled)
-			} else {
+			if outcome == "acknowledged" {
 				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, context.Canceled)
 			}
 
-			_, err = pollOnce(t, client)
-			assert.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound,
-				"an explicit leave stays left until an explicit join")
-
-			for _, read := range server.recorded() {
-				assert.NotEqual(t, vsr.OperationJoinConsumerGroup, read.operation(),
-					"the poll must not undo the leave")
+			polled, err := pollOnce(t, client)
+			require.NoError(t, err)
+			assert.Equal(t, uint32(4), polled.PartitionId)
+			assert.False(t, client.groups.hasLeft(newGroupKey(streamId, topicId, consumer.Id)))
+			wantJoins := 1
+			if outcome == "cancelled before commit" {
+				wantJoins++
 			}
+			assert.Equal(t, wantJoins, operationCount(server.recorded(), vsr.OperationJoinConsumerGroup))
 		})
 	}
-}
-
-func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
-	client, serverConn := newPipeClient(t)
-	member := false
-	serve(serverConn, func(_ int, read request) []byte {
-		switch {
-		case read.code() == uint32(command.SyncGroupCode) && member:
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(2, 4))
-		case read.code() == uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		case read.operation() == vsr.OperationLeaveConsumerGroup:
-			member = false
-			return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
-		case read.operation() == vsr.OperationJoinConsumerGroup:
-			member = true
-			return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
-		default:
-			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
-		}
-	})
-
-	streamId, topicId, consumer := groupConsumer(t)
-	require.NoError(t, client.LeaveConsumerGroup(
-		context.Background(), streamId, topicId, consumer.Id))
-	require.NoError(t, client.JoinConsumerGroup(
-		context.Background(), streamId, topicId, consumer.Id))
-
-	polled, err := pollOnce(t, client)
-	require.NoError(t, err)
-	assert.Equal(t, uint32(4), polled.PartitionId)
 }
 
 func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheMemberOwnsNothing(t *testing.T) {

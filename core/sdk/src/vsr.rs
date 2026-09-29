@@ -17,13 +17,16 @@
 
 use crate::session::ConsensusSession;
 use bytes::{BufMut, Bytes, BytesMut};
+use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::codes::{
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE, POLL_MESSAGES_CODE,
+    POLL_MESSAGES_ON_PRIMARY_CODE,
 };
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
     RequestHeader, read_size_field, result_code, result_section_len,
 };
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -157,14 +160,28 @@ pub(crate) fn operation_for_code(code: u32) -> Operation {
 
 /// Whether replaying `code` after reconnecting with a new session cannot
 /// apply it twice.
-pub(crate) fn replay_after_session_reset_is_safe(code: u32, error: &IggyError) -> bool {
+pub(crate) fn replay_after_session_reset_is_safe(
+    code: u32,
+    payload: &[u8],
+    error: &IggyError,
+) -> bool {
+    if code == POLL_MESSAGES_ON_PRIMARY_CODE {
+        return false;
+    }
+    if matches!(
+        error,
+        IggyError::NotConnected | IggyError::CannotEstablishConnection | IggyError::Unauthenticated
+    ) {
+        return true;
+    }
+    // Polls can advance offsets despite being non-replicated. Decode the flag
+    // because the server permits trailing bytes after the poll payload.
+    if code == POLL_MESSAGES_CODE
+        && PollMessagesRequest::decode_from(payload).map_or(true, |poll| poll.auto_commit)
+    {
+        return false;
+    }
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
-        || matches!(
-            error,
-            IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::Unauthenticated
-        )
         || matches!(
             operation_for_code(code),
             Operation::NonReplicated | Operation::Logout
@@ -365,14 +382,66 @@ mod tests {
     use iggy_binary_protocol::codes::{
         CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE, SEND_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::primitives::consumer::WireConsumer;
+    use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
-    use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName, WireOptions};
+    use iggy_binary_protocol::{
+        ClientVersionInfo, WireEncode, WireIdentifier, WireName, WireOptions,
+    };
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
         *bytemuck::checked::try_from_bytes::<RequestHeader>(&bytes[..HEADER_SIZE]).unwrap()
+    }
+
+    #[test]
+    fn lost_poll_replies_only_replay_without_auto_commit() {
+        for auto_commit in [false, true] {
+            let request = PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(1),
+                topic_id: WireIdentifier::numeric(2),
+                partition_id: Some(0),
+                strategy: WirePollingStrategy::next(),
+                count: 10,
+                auto_commit,
+            };
+            let mut payload = request.to_bytes().to_vec();
+            payload.push(u8::from(!auto_commit));
+            for error in [
+                IggyError::NotConnected,
+                IggyError::CannotEstablishConnection,
+                IggyError::Unauthenticated,
+            ] {
+                assert!(
+                    replay_after_session_reset_is_safe(POLL_MESSAGES_CODE, &payload, &error),
+                    "a poll that was never applied can reconnect: auto_commit={auto_commit}, error={error}"
+                );
+            }
+            for error in [
+                IggyError::Disconnected,
+                IggyError::EmptyResponse,
+                IggyError::TcpError,
+            ] {
+                assert_eq!(
+                    replay_after_session_reset_is_safe(POLL_MESSAGES_CODE, &payload, &error),
+                    !auto_commit,
+                    "auto_commit={auto_commit}, error={error}"
+                );
+                assert!(!replay_after_session_reset_is_safe(
+                    POLL_MESSAGES_ON_PRIMARY_CODE,
+                    &payload,
+                    &error
+                ));
+            }
+        }
+        assert!(!replay_after_session_reset_is_safe(
+            POLL_MESSAGES_CODE,
+            &[],
+            &IggyError::Disconnected
+        ));
     }
 
     #[test]

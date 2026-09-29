@@ -87,28 +87,31 @@ another node, it can return the previous offset for a short time.
 `Next` polls with auto-commit disabled also read the coordinator replica. After
 a routed offset store or delete, they can temporarily use the previous offset,
 repeating messages or skipping the intended restart after a delete.
+Storing an earlier offset can likewise leave the intended rewind temporarily
+unobserved by a `Next` poll.
 
-Standalone auto-commit polls can be replayed after a lost reply while the
-caller's context is active. With `Next`, the first poll may already have
-advanced the offset, so the replay can skip messages from its unread batch.
+Standalone auto-commit polls are not replayed after a lost reply. With `Next`,
+the offset may already have advanced, so the caller must handle the unknown
+outcome without assuming that retrying will return the same batch.
 
-When a caller cancels a request on a signed-in connection, or its deadline
-passes, the call returns the context error at once. The client finishes that
-exchange in the background, so the request can still reach the server and
-commit. The client does not resend it after the caller gives up. The connection,
-the session and the consumer group membership stay. Until that request gets its
-reply or its 30 s budget ends, later requests on the same client wait for the
-connection. Each one waits only as long as its own context allows.
+On a signed-in coordinator connection, cancellation during a socket write
+waits for that write to finish within the request's 30 s budget. Interrupting a
+TLS write would make the connection unusable. Once the frame has been written,
+cancellation returns the context error promptly and the client drains the reply
+in the background. The request can still commit, but the client does not resend
+it after the caller gives up. The connection, session and consumer group
+membership stay. Later requests wait for that reply or the remainder of its
+budget. Waiting for the exchange gate honors each request's own context.
 
 If the server never answers, the client drops the connection when the 30 s
 budget ends, and the next request reconnects with a new session. Consumers must
 rejoin their groups after that reconnect. As in the Rust SDK, the heartbeat
 does not drop it sooner. So failover from a hung node can take up to about 35 s
-with the default 5 s heartbeat interval. `Close` does not wait for a request in
+with the fixed 5 s heartbeat interval. `Close` does not wait for a request in
 flight. That request fails at once.
 
 For sign-in, logout and requests on a connection without a session, a cancel
-in flight drops the connection. On a primary data connection, a cancel
+in flight drops the connection. On a primary data connection, a cancel in flight
 drops only that data connection, and the next request opens a new one. The
 coordinator session and the membership stay.
 

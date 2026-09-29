@@ -21,18 +21,20 @@ import "context"
 
 // Client provides access to Iggy over the configured transport.
 //
-// On a signed-in TCP coordinator connection, cancellation returns the context
-// error while the exchange finishes in the background. The request can still
-// commit, but the client does not resend it after the caller gives up. The
-// session and consumer group membership remain while the reply is drained.
-// Later requests wait for that reply or the remainder of its 30 s request
-// budget. Each one waits only as long as its own context allows. Close interrupts
+// On a signed-in TCP coordinator connection, cancellation during a socket write
+// waits for the write to finish within the 30 s request budget. Once written,
+// cancellation returns the context error promptly while the reply is drained
+// in the background. The request can still commit, but is not resent after the
+// caller gives up. The session and consumer group membership remain. Later
+// requests wait for the reply or the remainder of its budget; waiting for the
+// exchange gate honors each request's own context. Close interrupts
 // the exchange. If the budget expires, the connection is dropped; reconnecting
 // creates a new session and consumers must rejoin their groups.
 //
-// Cancelling sign-in, logout or an exchange without a bound session drops that
-// connection. Cancelling an exchange on a primary data connection drops only
-// that connection, preserving the coordinator session and group membership.
+// A cancel in flight during sign-in, logout or an exchange without a bound
+// session drops that connection. A cancel in flight on a primary data connection
+// drops only that connection, preserving the coordinator session and group
+// membership.
 type Client interface {
 	// Connect establishes the connection to the server.
 	Connect(ctx context.Context) error
@@ -144,13 +146,13 @@ type Client interface {
 	// These polls are never replayed automatically after an unknown outcome.
 	// Servers must support primary routing and consumer-session attachment.
 	//
-	// Standalone auto-commit polls can be replayed after a lost reply while the
-	// caller's context is active. With Next, this can skip an unread batch if
-	// the first poll already advanced the offset.
+	// Standalone auto-commit polls are not replayed after a lost reply. With
+	// Next, the offset may already have advanced, so retrying can skip the
+	// unread batch.
 	//
 	// In a cluster, polls without auto-commit read the coordinator replica.
 	// Next polls may temporarily use the previous offset after a routed store
-	// or delete, repeating messages or skipping the intended restart after a delete.
+	// or delete, repeating messages or skipping the intended rewind or restart.
 	//
 	// A group poll that names no partition is orchestrated client-side and
 	// has three outcomes:
@@ -340,6 +342,9 @@ type Client interface {
 
 	// UpdateUser update a user by unique ID or username.
 	// Authentication is required, and the permission to manage the users.
+	// A canceled username update can still commit while the TCP client's
+	// remembered credentials remain unchanged. Explicitly sign in with the new
+	// username before relying on automatic reconnect after such a change.
 	UpdateUser(
 		ctx context.Context,
 		userID Identifier,
@@ -353,6 +358,9 @@ type Client interface {
 
 	// ChangePassword change the password of a user by unique ID or username.
 	// Authentication is required, and the permission to manage the users, unless the provided user ID is the same as the authenticated user.
+	// A canceled change can still commit while the TCP client's remembered
+	// password remains unchanged. Explicitly sign in with the new password
+	// before relying on automatic reconnect after such a change.
 	ChangePassword(
 		ctx context.Context,
 		userID Identifier,

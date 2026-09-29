@@ -371,12 +371,7 @@ func acquireRequestBuf() *[]byte {
 	return requestBufPool.Get().(*[]byte)
 }
 
-// releaseRequestBuf returns a buffer to the pool. A nil slice means an
-// exchange that outlived its caller took the buffer over (see attempt).
 func releaseRequestBuf(bp *[]byte) {
-	if *bp == nil {
-		return
-	}
 	// Producer batches routinely grow to megabytes and reusing them is the
 	// point of the pool; the ceiling only stops a pathological frame from
 	// pinning memory for the process lifetime.
@@ -411,7 +406,8 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 		return nil, err
 	}
 
-	return c.exchange(ctx, uint32(cmd.Code()), bp)
+	response, _, err := c.exchange(ctx, uint32(cmd.Code()), bp)
+	return response, err
 }
 
 // SendBinaryRequest sends a command code and payload and returns the raw response body.
@@ -426,7 +422,8 @@ func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payl
 
 	*bp = append(reserveHeader(*bp), payload...)
 
-	return c.exchange(ctx, code, bp)
+	response, _, err := c.exchange(ctx, code, bp)
+	return response, err
 }
 
 // reserveHeader returns buf truncated to exactly the header prologue, growing
@@ -510,13 +507,11 @@ func (e *localPreconditionError) Error() string { return e.err.Error() }
 func (e *localPreconditionError) Unwrap() error { return e.err }
 
 // exchange runs one request to completion, reconnecting and replaying it when
-// the failure is one a fresh connection recovers from. frame is the caller's
-// pooled buffer, which an exchange that outlives its caller takes over (see
-// attempt).
-func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte) ([]byte, error) {
+// the failure is one a fresh connection recovers from.
+func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte) ([]byte, uint64, error) {
 	response, generation, err := c.sendFrame(ctx, code, frame)
 	if err == nil || !isReconnectable(err) {
-		return response, err
+		return response, generation, err
 	}
 
 	// A stale-client eviction is not caller intent: the heartbeat verifier
@@ -525,14 +520,14 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte
 	// explicit sign-out ends it. Same rule in every SDK.
 	var precondition *localPreconditionError
 	if errors.As(err, &precondition) {
-		return nil, err
+		return nil, generation, err
 	}
 	if ctx.Value(connectScoped{}) != nil {
-		return nil, err
+		return nil, generation, err
 	}
 	if !c.config.reconnection.enabled {
 		c.logger.Warn("Automatic reconnection is disabled.")
-		return nil, err
+		return nil, generation, err
 	}
 
 	// With no credentials -- neither configured nor remembered from a
@@ -542,7 +537,7 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte
 	// register failure and expects the client to replay it.
 	login := isRegisterCode(code)
 	if _, ok := c.signInCredentials(); !ok && !login {
-		return nil, err
+		return nil, generation, err
 	}
 	c.mtx.Lock()
 	loggedOut := c.loggedOut
@@ -550,16 +545,16 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte
 	if loggedOut && !login {
 		// An explicit sign-out stays signed out: the reconnect's automatic
 		// sign-in would silently reverse it.
-		return nil, err
+		return nil, generation, err
 	}
-	if !canReplay(code, err) {
-		c.logger.Warn("Not replaying a replicated request with an unknown outcome.",
+	if !canReplay(code, (*frame)[vsr.HeaderSize:], err) {
+		c.logger.Warn("Not replaying a request with an unknown outcome.",
 			slog.Int("code", int(code)), slog.Any("error", err))
-		return nil, err
+		return nil, generation, err
 	}
 
 	if _, disconnectErr := c.disconnectGeneration(ctx, generation); disconnectErr != nil {
-		return nil, disconnectErr
+		return nil, generation, disconnectErr
 	}
 	reconnectCtx := ctx
 	if login {
@@ -574,21 +569,15 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte
 		slog.String("server_address", serverAddress),
 		slog.Any("error", err))
 
-	if reconnectErr := c.Connect(reconnectCtx); reconnectErr != nil {
-		return nil, reconnectErr
+	reconnected, reconnectErr := c.connect(reconnectCtx)
+	if reconnectErr != nil {
+		return nil, generation, reconnectErr
 	}
-	var loginConn net.Conn
-	if login {
-		// This reconnect skipped auto-login, so the replay owns its cleanup.
-		c.mtx.Lock()
-		loginConn = c.conn
-		c.mtx.Unlock()
-	}
-	response, _, err = c.sendFrame(ctx, code, frame)
+	response, generation, err = c.sendFrame(ctx, code, frame)
 	if login && err != nil {
-		_ = c.dropConn(loginConn)
+		_ = c.dropConn(reconnected)
 	}
-	return response, err
+	return response, generation, err
 }
 
 // canReplay reports whether re-issuing the request over a fresh connection
@@ -600,15 +589,9 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame *[]byte
 // written, and a session refusal the server answered instead of applying.
 // What remains is a replicated request whose reply was lost in transit, and
 // its unknown outcome makes the replay unsafe.
-func canReplay(code uint32, err error) bool {
+func canReplay(code uint32, payload []byte, err error) bool {
 	if code == uint32(command.PollMessagesOnPrimaryCode) {
 		return false
-	}
-	if isRegisterCode(code) {
-		return true
-	}
-	if _, replicated := vsr.ReplicatedOperation(code); !replicated {
-		return true
 	}
 	neverApplied := []error{
 		ierror.ErrNotConnected,
@@ -620,6 +603,33 @@ func canReplay(code uint32, err error) bool {
 		if errors.Is(err, target) {
 			return true
 		}
+	}
+	if code == uint32(command.PollMessagesCode) {
+		// The server ignores trailing bytes, so locate AutoCommit after the
+		// variable-length target instead of inspecting the end of the frame.
+		const (
+			consumerKindSize     = 1
+			identifierCount      = 3
+			identifierHeaderSize = 2
+			partitionFieldSize   = 1 + 4
+		)
+		offset := consumerKindSize
+		for range identifierCount {
+			if len(payload) < offset+identifierHeaderSize {
+				return false
+			}
+			offset += identifierHeaderSize + int(payload[offset+identifierHeaderSize-1])
+		}
+		offset += partitionFieldSize + pollParametersSize - 1
+		if len(payload) <= offset || payload[offset] != 0 {
+			return false
+		}
+	}
+	if isRegisterCode(code) {
+		return true
+	}
+	if _, replicated := vsr.ReplicatedOperation(code); !replicated {
+		return true
 	}
 	return false
 }
@@ -750,10 +760,6 @@ func (c *IggyTcpClient) sendFrame(
 // attempt stamps the frame if it is not stamped yet and exchanges it once,
 // replaying in place while the server answers transiently. It reports the
 // connection generation it ran on alongside the outcome.
-//
-// frame is the caller's pooled buffer. An exchange that outlives a caller who
-// gave up (see exchangeDetachable) keeps the buffer and sets *frame to nil, so
-// the caller does not pool a frame that may still be written.
 func (c *IggyTcpClient) attempt(
 	ctx context.Context,
 	code uint32,
@@ -784,44 +790,60 @@ func (c *IggyTcpClient) attempt(
 	if err != nil {
 		return nil, stamped, generation, err
 	}
-	if detachable {
-		handedOff = true
-		response, err := c.exchangeDetachable(ctx, s, code, frame, transientDeadline, readDeadline)
-		return response, stamped, generation, err
+	var deadlineState struct {
+		sync.Mutex
+		cleared bool
 	}
-
-	var deadlineMu sync.Mutex
-	cleared := false
 	if ctx.Done() != nil {
 		stop := context.AfterFunc(ctx, func() {
-			deadlineMu.Lock()
-			defer deadlineMu.Unlock()
-			if !cleared {
+			deadlineState.Lock()
+			defer deadlineState.Unlock()
+			if !deadlineState.cleared {
 				// A deadline in the past unblocks any read or write in
 				// progress. This uses the captured stream, not c.conn, so a
 				// reconnect cannot receive the deadline of a cancelled call.
-				_ = s.conn.SetDeadline(time.Now())
+				if detachable {
+					_ = s.conn.SetReadDeadline(time.Now())
+				} else {
+					_ = s.conn.SetDeadline(time.Now())
+				}
 			}
 		})
 		defer stop()
 	}
 
-	if deadline, ok := ctx.Deadline(); ok && deadline.Before(readDeadline) {
-		readDeadline = deadline
+	callerDeadline := readDeadline
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(callerDeadline) {
+		callerDeadline = deadline
 	}
-	deadlineMu.Lock()
+	deadlineState.Lock()
 	if ctx.Err() != nil {
-		readDeadline = time.Now()
+		callerDeadline = time.Now()
 	}
-	_ = s.conn.SetDeadline(readDeadline)
-	deadlineMu.Unlock()
+	if detachable {
+		// A TLS write timeout corrupts the connection, so cancellation only
+		// interrupts reads. An in-flight write keeps the request's budget.
+		_ = s.conn.SetWriteDeadline(readDeadline)
+		_ = s.conn.SetReadDeadline(callerDeadline)
+	} else {
+		_ = s.conn.SetDeadline(callerDeadline)
+	}
+	deadlineState.Unlock()
 
-	response, err := c.exchangeOn(ctx, s, code, *frame, transientDeadline, readDeadline, false)
+	progress := replyProgress{}
+	response, err := c.exchangeOn(ctx, s, code, *frame, transientDeadline, readDeadline, detachable, &progress)
 
-	deadlineMu.Lock()
-	cleared = true
+	deadlineState.Lock()
+	deadlineState.cleared = true
+	if detachable && progress.pending {
+		_ = s.conn.SetDeadline(readDeadline)
+		deadlineState.Unlock()
+		handedOff = true
+		go c.drainReply(s, code, vsr.StampedRequestID(*frame), progress)
+		return nil, stamped, generation, err
+	}
 	_ = s.conn.SetDeadline(time.Time{})
-	deadlineMu.Unlock()
+	deadlineState.Unlock()
 
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -895,64 +917,34 @@ func (c *IggyTcpClient) beginExchangeLocked(
 	return connIO{conn: c.conn, reader: c.reader}, generation, nil
 }
 
-// exchangeDetachable runs the exchange on a goroutine that takes the exchange
-// gate over from the caller and holds it until the reply arrives or the
-// request budget runs out. A caller that stops waiting returns its context's
-// error at once and leaves the connection up: tearing it down would end the
-// session on the server, and every group membership with it. Once the caller
-// is gone, the goroutine does not resend the request.
-func (c *IggyTcpClient) exchangeDetachable(
-	ctx context.Context,
-	s connIO,
-	code uint32,
-	frame *[]byte,
-	transientDeadline, readDeadline time.Time,
-) ([]byte, error) {
-	// The request budget, not the caller's deadline, which would cut the drain
-	// short and tear the connection down after all.
-	_ = s.conn.SetDeadline(readDeadline)
+// The header stays under the exchange gate; only the byte counts transfer to
+// the drain, so an interrupted body does not keep its allocation alive.
+type replyProgress struct {
+	headerRead int
+	bodyRead   int
+	pending    bool
+}
 
-	// The goroutine shares the caller's context, so a replay wait ends once
-	// the caller gives up: a resend after that could commit a request whose
-	// caller already saw an error. A private poll state avoids racing the
-	// caller's state read after cancellation. Coordinator callers discard it.
-	exchangeCtx := ctx
-	if ctx.Value(singlePollExchange{}) != nil {
-		exchangeCtx = context.WithValue(ctx, singlePollExchange{}, &pollExchangeState{})
+// drainReply owns the exchange gate until the unread reply is consumed or the
+// request budget expires. It never retains or resends the request frame.
+func (c *IggyTcpClient) drainReply(s connIO, code uint32, requestID uint64, progress replyProgress) {
+	defer c.releaseExchange()
+	_, err := c.readReply(context.Background(), s, code, requestID, &progress, false, true)
+	if progress.pending {
+		_ = c.dropConn(s.conn)
+	} else {
+		c.dropOnEviction(s, err)
 	}
-
-	type outcome struct {
-		response []byte
-		err      error
+	_ = s.conn.SetDeadline(time.Time{})
+	attrs := []slog.Attr{
+		slog.Int("code", int(code)),
+		slog.Bool("reply_complete", !progress.pending),
+		slog.Any("drain_error", err),
 	}
-	done := make(chan outcome, 1)
-	go func(frame []byte) {
-		response, err := c.exchangeOn(exchangeCtx, s, code, frame, transientDeadline, readDeadline, true)
-		_ = s.conn.SetDeadline(time.Time{})
-		c.releaseExchange()
-		done <- outcome{response, err}
-	}(*frame)
-
-	var result outcome
-	select {
-	case result = <-done:
-	case <-ctx.Done():
-		// A finished exchange wins a tie with the cancellation.
-		select {
-		case result = <-done:
-		default:
-			// The goroutine may still be writing the frame, so the buffer is
-			// no longer the caller's to pool.
-			*frame = nil
-			return nil, ctx.Err()
-		}
+	if progress.headerRead == vsr.HeaderSize && vsr.PeekCommand(&c.respHeader) == vsr.FrameReply {
+		attrs = append(attrs, slog.Uint64("reply_header_status", uint64(vsr.ReadStatus(&c.respHeader))))
 	}
-	// As on the inline path, a caller whose context ended hears about that
-	// rather than about a failure it would answer with a reconnect.
-	if result.err != nil && ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	return result.response, result.err
+	c.logger.LogAttrs(context.Background(), slog.LevelDebug, "Abandoned TCP reply drain finished", attrs...)
 }
 
 // exchangeOn writes the frame and reads its reply on s, resending the
@@ -965,7 +957,8 @@ func (c *IggyTcpClient) exchangeOn(
 	code uint32,
 	frame []byte,
 	transientDeadline, readDeadline time.Time,
-	discardOnCancel bool,
+	detachable bool,
+	progress *replyProgress,
 ) ([]byte, error) {
 	pollState, _ := ctx.Value(singlePollExchange{}).(*pollExchangeState)
 	for {
@@ -985,43 +978,27 @@ func (c *IggyTcpClient) exchangeOn(
 			return nil, c.dropConn(s.conn)
 		}
 
-		bodyLength, err := c.readReplyHeader(s, code)
-		if err != nil {
-			return nil, err
+		*progress = replyProgress{pending: true}
+		response, err := c.readReply(ctx, s, code, vsr.StampedRequestID(frame), progress, detachable, false)
+		if progress.pending {
+			ctxErr := ctx.Err()
+			if ctxErr == nil {
+				if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+					ctxErr = context.DeadlineExceeded
+				}
+			}
+			if detachable && ctxErr != nil && (errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, ctxErr)) {
+				return nil, ctxErr
+			}
+			progress.pending = false
+			c.logger.Error("Failed to read the reply", slog.Int("code", int(code)), slog.Any("error", err))
+			disconnectErr := c.dropConn(s.conn)
+			if errors.Is(err, ierror.ErrInvalidCommand) {
+				return nil, err
+			}
+			return nil, disconnectErr
 		}
 		isReply := vsr.PeekCommand(&c.respHeader) == vsr.FrameReply
-		if isReply {
-			// A reply must answer the request in flight. An unexpected echo
-			// means the stream is delivering some other request's answer, and
-			// every later reply would pair off by one.
-			expected := vsr.StampedRequestID(frame)
-			if echoed := vsr.ReadReplyRequestID(&c.respHeader); echoed != expected {
-				c.logger.Error("The reply answers a different request",
-					slog.Uint64("expected_request", expected),
-					slog.Uint64("echoed_request", echoed))
-				return nil, c.dropConn(s.conn)
-			}
-		}
-
-		if commit := vsr.MetadataCommit(&c.respHeader); commit > c.metadataWatermark.Load() {
-			c.metadataWatermark.Store(commit)
-		}
-		var body []byte
-		if bodyLength > 0 {
-			if discardOnCancel && ctx.Err() != nil && isReply {
-				if _, err := s.reader.Discard(bodyLength); err != nil {
-					return nil, c.dropConn(s.conn)
-				}
-				return nil, ctx.Err()
-			}
-			body = make([]byte, bodyLength)
-			if _, err := io.ReadFull(s.reader, body); err != nil {
-				c.logger.Error("Failed to read the reply body",
-					slog.Int("code", int(code)), slog.Any("error", err))
-				return nil, c.dropConn(s.conn)
-			}
-		}
-		response, err := vsr.DecodeReply(&c.respHeader, body)
 		if pollState != nil {
 			c.dropOnEviction(s, err)
 			pollState.reusable = isReply &&
@@ -1034,11 +1011,11 @@ func (c *IggyTcpClient) exchangeOn(
 			// on this session is safe. On the metadata plane the client table
 			// answers a committed request from its reply cache; partition
 			// requests use the group's bounded request-id deduplication window.
-			if waitErr := c.waitBeforeReplay(ctx, readDeadline); waitErr != nil {
+			if waitErr := c.waitBeforeReplay(ctx, readDeadline, replayInterval); waitErr != nil {
 				return nil, waitErr
 			}
 		case errors.Is(err, ierror.ErrTransientNotAccepted) && time.Now().Before(transientDeadline):
-			if waitErr := c.waitBeforeReplay(ctx, transientDeadline); waitErr != nil {
+			if waitErr := c.waitBeforeReplay(ctx, transientDeadline, replayInterval); waitErr != nil {
 				return nil, waitErr
 			}
 		default:
@@ -1051,23 +1028,53 @@ func (c *IggyTcpClient) exchangeOn(
 	}
 }
 
-// readReplyHeader validates the frame size before reading or discarding its
-// body. An incomplete header leaves the connection at an unknown frame boundary.
-func (c *IggyTcpClient) readReplyHeader(s connIO, code uint32) (int, error) {
-	if _, err := io.ReadFull(s.reader, c.respHeader[:]); err != nil {
-		c.logger.Error("Failed to read the reply header",
-			slog.Int("code", int(code)), slog.Any("error", err))
-		return 0, c.dropConn(s.conn)
+func (c *IggyTcpClient) readReply(ctx context.Context, s connIO, code uint32, requestID uint64,
+	progress *replyProgress, detachable, discard bool,
+) ([]byte, error) {
+	count, err := io.ReadFull(s.reader, c.respHeader[progress.headerRead:])
+	progress.headerRead += count
+	if err != nil {
+		return nil, err
 	}
 
 	size := vsr.ReadSize(&c.respHeader)
 	if size < vsr.HeaderSize || size > vsr.MaxFrameSize {
 		c.logger.Error("The reply declares an invalid frame size",
 			slog.Int("code", int(code)), slog.Int("size", int(size)))
-		_ = c.dropConn(s.conn)
-		return 0, ierror.ErrInvalidCommand
+		return nil, ierror.ErrInvalidCommand
 	}
-	return int(size) - vsr.HeaderSize, nil
+	isReply := vsr.PeekCommand(&c.respHeader) == vsr.FrameReply
+	if isReply && vsr.ReadReplyRequestID(&c.respHeader) != requestID {
+		c.logger.Error("The reply answers a different request",
+			slog.Uint64("expected_request", requestID),
+			slog.Uint64("echoed_request", vsr.ReadReplyRequestID(&c.respHeader)))
+		return nil, ierror.ErrDisconnected
+	}
+	if commit := vsr.MetadataCommit(&c.respHeader); commit > c.metadataWatermark.Load() {
+		c.metadataWatermark.Store(commit)
+	}
+	bodyLength := int(size) - vsr.HeaderSize
+	var body []byte
+	if discard {
+		if _, err := s.reader.Discard(bodyLength - progress.bodyRead); err != nil {
+			return nil, err
+		}
+	} else if bodyLength > 0 {
+		if detachable && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		body = make([]byte, bodyLength)
+		count, err := io.ReadFull(s.reader, body)
+		progress.bodyRead += count
+		if err != nil {
+			return nil, err
+		}
+	}
+	progress.pending = false
+	if discard && isReply {
+		return nil, nil
+	}
+	return vsr.DecodeReply(&c.respHeader, body)
 }
 
 // An eviction ends the session, so the next sign-in registers a fresh identity.
@@ -1101,8 +1108,7 @@ func (c *IggyTcpClient) dropConn(conn net.Conn) error {
 // never past the deadline, the caller's cancellation, or a client shutdown.
 // The shutdown channel matters because Close only closes the socket, and
 // this wait does no I/O that the close could fail.
-func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time) error {
-	interval := replayInterval
+func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time, interval time.Duration) error {
 	if remaining := time.Until(deadline); remaining < interval {
 		interval = remaining
 	}
@@ -1159,24 +1165,31 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 // runs waits for it and shares its outcome. Reporting success to those callers
 // instead would hand them a client with no connection yet, and their next
 // request would fail ErrNotConnected for no reason of its own.
-func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
+func (c *IggyTcpClient) Connect(ctx context.Context) error {
+	_, err := c.connect(ctx)
+	return err
+}
+
+// connect returns only the connection this call installed. Observing or waiting
+// for another attempt does not give the caller ownership of its cleanup.
+func (c *IggyTcpClient) connect(ctx context.Context) (installed net.Conn, err error) {
 	suppressesLogin := ctx.Value(skipAutoLogin{}) != nil
 	c.mtx.Lock()
 	switch c.transportState {
 	case iggcon.TransportStateShutdown:
 		c.mtx.Unlock()
 		c.logger.Debug("Cannot connect. Client is shutdown.")
-		return ierror.ErrClientShutdown
+		return nil, ierror.ErrClientShutdown
 	case iggcon.TransportStateConnected:
 		clientAddress := c.clientAddress
 		c.mtx.Unlock()
 		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
-		return nil
+		return nil, nil
 	case iggcon.TransportStateConnecting:
 		attempt := c.connectAttempt
 		c.mtx.Unlock()
 		if attempt == nil {
-			return nil
+			return nil, nil
 		}
 		if suppressesLogin && !attempt.suppressesLogin {
 			// Only the sign-in transaction suppresses the automatic sign-in,
@@ -1185,17 +1198,17 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 			// would close a cycle: the owner blocked on registerMtx, this
 			// goroutine blocked on the owner, and neither context cancelled.
 			c.logger.Debug("Another connect is signing in; not waiting for it.")
-			return ierror.ErrCannotEstablishConnection
+			return nil, ierror.ErrCannotEstablishConnection
 		}
 		c.logger.Debug("Client is already connecting; waiting for that attempt.")
 		select {
 		case <-attempt.done:
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-c.closed:
-			return ierror.ErrClientShutdown
+			return nil, ierror.ErrClientShutdown
 		}
-		return attempt.err
+		return nil, attempt.err
 	}
 	attempt := &connectAttempt{
 		done:            make(chan struct{}),
@@ -1227,7 +1240,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 		c.transportState = iggcon.TransportStateDisconnected
 		c.mtx.Unlock()
 		c.logger.Error("No server address to connect to.")
-		return ierror.ErrCannotEstablishConnection
+		return nil, ierror.ErrCannotEstablishConnection
 	}
 
 	// reestablishAfter paces reconnects to the endpoint this client was last
@@ -1302,7 +1315,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 			c.logger.Warn("Automatic reconnection is disabled.")
 		}
 		// TODO publish event disconnected
-		return err
+		return nil, err
 	}
 
 	c.mtx.Lock()
@@ -1317,11 +1330,11 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 			slog.Any("transport_state", state))
 		switch state {
 		case iggcon.TransportStateShutdown:
-			return ierror.ErrClientShutdown
+			return nil, ierror.ErrClientShutdown
 		case iggcon.TransportStateConnected:
-			return nil
+			return nil, nil
 		default:
-			return ierror.ErrNotConnected
+			return nil, ierror.ErrNotConnected
 		}
 	}
 	c.conn = conn
@@ -1342,9 +1355,9 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 
 	if err := c.establishSession(ctx, ctx.Value(skipAutoLogin{}) != nil); err != nil {
 		_ = c.dropConn(conn)
-		return err
+		return nil, err
 	}
-	return nil
+	return conn, nil
 }
 
 // isTLSConfigFault reports whether a dial failed for a reason that says the

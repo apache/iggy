@@ -206,6 +206,74 @@ func TestConnect_SignsInAndThenSettlesLeadership(t *testing.T) {
 	assert.Equal(t, iggcon.SessionStateAuthenticated, client.sessionState)
 }
 
+func TestLoginUser_FailedInitialSettlementDropsTheBoundSession(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+	client := newDialingClient(t, server.address())
+	require.NoError(t, client.Connect(context.Background()))
+	_, err := client.LoginUser(context.Background(), "alice", "a")
+	require.NoError(t, err)
+	require.NoError(t, client.disconnect(context.Background()))
+	require.NoError(t, client.Connect(suppressAutoLogin(context.Background())))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client.logger = slog.New(connectStageHandler{
+		Handler: slog.NewTextHandler(io.Discard, nil),
+		message: "Iggy client has signed in successfully.",
+		hook:    cancel,
+	})
+	_, err = client.LoginUser(ctx, "bob", "b")
+	require.ErrorIs(t, err, context.Canceled)
+
+	client.mtx.Lock()
+	defer client.mtx.Unlock()
+	assert.False(t, client.session.Bound(), "a failed sign-in must not leave a bound session")
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	assert.Equal(t, "alice", client.rememberedLogin.credentials.username)
+}
+
+func TestExchange_StandalonePollWithALostReplyReplaysOnlyWithoutAutoCommit(t *testing.T) {
+	for _, autoCommit := range []bool{false, true} {
+		name := "manual commit"
+		if autoCommit {
+			name = "auto commit"
+		}
+		t.Run(name, func(t *testing.T) {
+			var server *testListener
+			server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				if read.code() == uint32(command.PollMessagesCode) {
+					if connection == 0 {
+						return nil
+					}
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(0))
+				}
+				return singleNodeHandler(t, server.address)(connection, index, read)
+			})
+			client := newDialingClient(t, server.address(),
+				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			require.NoError(t, client.Connect(context.Background()))
+			partition := uint32(0)
+			_, err := client.PollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+				iggcon.DefaultConsumer(), iggcon.NextPollingStrategy(), 10, autoCommit, &partition)
+			if autoCommit {
+				require.ErrorIs(t, err, ierror.ErrDisconnected)
+				assert.Equal(t, 1, requestCount(server.recorded(), command.PollMessagesCode),
+					"a lost reply must not cause another auto-commit")
+				assert.Equal(t, 1, server.connections())
+				_, err = client.PollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+					iggcon.DefaultConsumer(), iggcon.NextPollingStrategy(), 10, true, &partition)
+				require.NoError(t, err, "the next poll has not been sent and must be allowed to reconnect")
+				assert.Equal(t, 2, requestCount(server.recorded(), command.PollMessagesCode))
+				assert.Equal(t, 2, server.connections())
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, 2, requestCount(server.recorded(), command.PollMessagesCode))
+			}
+		})
+	}
+}
+
 func TestConnect_SignsInWithAPersonalAccessToken(t *testing.T) {
 	var server *testListener
 	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
@@ -633,6 +701,98 @@ func TestConnect_CancelledLoginReplayDropsItsConnection(t *testing.T) {
 			assert.NotNil(t, client.pollSession.Load())
 		})
 	}
+}
+
+func TestLoginUser_FailedReplayPreservesAReplacementConnection(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		redirect   bool
+		message    string
+		generation uint64
+	}{
+		{name: "lost login reply", message: "Skipping the automatic sign-in for a replayed login.", generation: 2},
+		{name: "leader settlement", redirect: true, message: "Skipping the automatic sign-in for a replayed login.", generation: 2},
+		{name: "replacement before reconnect", message: "Reconnecting to the server...", generation: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var leader *testListener
+			leader = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				if !test.redirect && connection == 0 && read.operation() == vsr.OperationRegister {
+					return nil
+				}
+				return singleNodeHandler(t, leader.address)(connection, index, read)
+			})
+			address := leader.address()
+			if test.redirect {
+				var follower *testListener
+				follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
+					if read.code() == uint32(command.GetClusterMetadataCode) {
+						return clusterMetadataFrame(t, 1, follower.address(), leader.address())
+					}
+					return registerReplyFrame(7, 100)
+				})
+				address = follower.address()
+			}
+			client := newDialingClient(t, address,
+				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var replacement net.Conn
+			client.logger = slog.New(connectStageHandler{
+				Handler: slog.NewTextHandler(io.Discard, nil),
+				message: test.message,
+				hook: func() {
+					client.mtx.Lock()
+					replaying := client.connGeneration == test.generation
+					client.mtx.Unlock()
+					if replaying {
+						require.NoError(t, client.disconnect(context.Background()))
+						require.NoError(t, client.Connect(suppressAutoLogin(context.Background())))
+						replacement = client.conn
+						cancel()
+					}
+				},
+			})
+			require.ErrorIs(t, client.Connect(ctx), context.Canceled)
+			require.NotNil(t, replacement)
+			assert.Same(t, replacement, client.conn, "failed sign-in cleanup must own the connection it drops")
+			assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
+			assert.False(t, client.session.Bound())
+		})
+	}
+}
+
+type deadlineClearedConn struct {
+	net.Conn
+	cleared func()
+}
+
+func (c *deadlineClearedConn) SetDeadline(deadline time.Time) error {
+	if deadline.IsZero() {
+		c.cleared()
+	}
+	return c.Conn.SetDeadline(deadline)
+}
+
+func TestLoginUser_DoesNotBindAReplyToAReplacementConnection(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+	client := newDialingClient(t, server.address())
+	require.NoError(t, client.Connect(context.Background()))
+	var replacement net.Conn
+	client.conn = &deadlineClearedConn{Conn: client.conn, cleared: func() {
+		_ = client.dropConn(client.conn)
+		require.NoError(t, client.Connect(suppressAutoLogin(context.Background())))
+		replacement = client.conn
+	}}
+
+	_, err := client.LoginUser(context.Background(), "iggy", "iggy")
+	require.Error(t, err, "a reply from the previous connection cannot bind the new session")
+	require.NotNil(t, replacement)
+	assert.Same(t, replacement, client.conn)
+	assert.False(t, client.session.Bound())
+	assert.False(t, client.rememberedLogin.enabled)
+	require.NoError(t, client.Ping(context.Background()))
 }
 
 func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {

@@ -34,11 +34,12 @@ import (
 )
 
 const (
-	maxPollRoutes         = 4096
-	maxPollConnections    = 256
-	consumerSessionSize   = 32
-	pollParametersSize    = 1 + 8 + 4 + 1
-	pollHeartbeatInterval = 5 * time.Second
+	maxPollRoutes           = 4096
+	maxPollConnections      = 256
+	consumerSessionSize     = 32
+	pollParametersSize      = 1 + 8 + 4 + 1
+	pollHeartbeatInterval   = 5 * time.Second
+	routingRetryMaxInterval = time.Second
 )
 
 // Primary polls have no deduplication key, including within one VSR session.
@@ -207,6 +208,7 @@ func (c *IggyTcpClient) sendRouted(caller context.Context, code uint32, key rout
 		}
 	}
 
+	interval := replayInterval
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -221,15 +223,16 @@ func (c *IggyTcpClient) sendRouted(caller context.Context, code uint32, key rout
 		}
 		c.polls.dropRoute(key)
 		deadline, _ := ctx.Deadline()
-		if time.Until(deadline) <= replayInterval {
+		if time.Until(deadline) <= interval {
 			return nil, err
 		}
-		if waitErr := c.waitBeforeReplay(ctx, deadline); waitErr != nil {
+		if waitErr := c.waitBeforeReplay(ctx, deadline, interval); waitErr != nil {
 			if caller.Err() == nil && ctx.Err() != nil {
 				return nil, err
 			}
 			return nil, waitErr
 		}
+		interval = min(interval*2, routingRetryMaxInterval)
 	}
 }
 
