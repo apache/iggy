@@ -504,10 +504,17 @@ async fn incremental_mode_advances_offset_across_polls() {
         .expect("Failed to insert initial rows");
 
     let query = "SELECT id, name FROM inc_test WHERE id > {last_offset} ORDER BY id";
-    let (_runtime, client) =
-        setup_jdbc_postgres_source(&jdbc_url, &postgres_jar, query, "incremental")
-            .await
-            .expect("Failed to setup runtime");
+    let iggy_setup = IggySetup::default();
+    let mut envs = build_jdbc_env(&jdbc_url, &postgres_jar, query, "incremental", &iggy_setup);
+    envs.insert(
+        "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_BATCH_SIZE".to_owned(),
+        "2".to_owned(),
+    );
+    let mut runtime = setup_runtime();
+    runtime
+        .init("jdbc/config_postgres.toml", Some(envs), iggy_setup)
+        .await;
+    let client = runtime.create_client().await;
 
     // First batch: ids 1..3.
     let (first_ids, first_received) = poll_until_ids_seen(&client, &[1, 2, 3], POLL_TIMEOUT).await;
@@ -719,6 +726,80 @@ async fn bulk_result_larger_than_batch_size_fails_closed() {
     assert!(
         polled.messages.is_empty(),
         "bulk truncation must fail closed and deliver nothing, got {} messages",
+        polled.messages.len()
+    );
+}
+
+/// Test: incremental mode must not advance past rows tied at a batch boundary.
+/// The source probes one row beyond batch_size and fails the complete poll when
+/// that row shares the last in-batch tracking value, so no partial page is sent.
+#[tokio::test]
+#[serial]
+async fn incremental_tie_at_batch_boundary_fails_closed() {
+    let (_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
+        Ok(result) => result,
+        Err(error) => panic!("Failed to set up Postgres container: {error}"),
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&pg_sqlx_url(&jdbc_url))
+        .await
+        .expect("Failed to connect to Postgres for seeding");
+    sqlx::query("CREATE TABLE tie_test (id INT PRIMARY KEY, position INT NOT NULL)")
+        .execute(&pool)
+        .await
+        .expect("Failed to create table");
+    sqlx::query("INSERT INTO tie_test (id, position) VALUES (1, 1), (2, 2), (3, 2), (4, 3)")
+        .execute(&pool)
+        .await
+        .expect("Failed to insert rows");
+
+    let iggy_setup = IggySetup::default();
+    let query =
+        "SELECT id, position FROM tie_test WHERE position > {last_offset} ORDER BY position, id";
+    let mut envs = build_jdbc_env(&jdbc_url, &postgres_jar, query, "incremental", &iggy_setup);
+    envs.insert(
+        "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_BATCH_SIZE".to_owned(),
+        "2".to_owned(),
+    );
+    envs.insert(
+        "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_TRACKING_COLUMN".to_owned(),
+        "position".to_owned(),
+    );
+
+    let mut runtime = setup_runtime();
+    runtime
+        .init("jdbc/config_postgres.toml", Some(envs), iggy_setup)
+        .await;
+    let client = runtime.create_client().await;
+
+    let api_url = runtime
+        .harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let sources: serde_json::Value = reqwest::get(format!("{api_url}/sources"))
+        .await
+        .expect("Failed to query source status")
+        .error_for_status()
+        .expect("Source status endpoint returned an error")
+        .json()
+        .await
+        .expect("Failed to deserialize source status");
+    assert_eq!(
+        sources[0]["status"], "running",
+        "JDBC source must be running before exercising incremental fail-closed behavior: {sources}"
+    );
+
+    sleep(Duration::from_secs(4)).await;
+    let polled = client
+        .get_messages(POLL_BATCH)
+        .await
+        .expect("Failed to poll messages");
+    assert!(
+        polled.messages.is_empty(),
+        "a tied incremental page must fail before delivering a partial batch, got {} messages",
         polled.messages.len()
     );
 }

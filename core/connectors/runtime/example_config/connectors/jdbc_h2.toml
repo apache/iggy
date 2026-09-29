@@ -27,8 +27,9 @@ path = "target/release/libiggy_connector_jdbc_source"
 plugin_config_format = "toml"
 
 [plugin_config]
-# H2 connection URL (in-memory database)
-jdbc_url = "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1"
+# H2 connection URL (in-memory database). INIT creates and seeds the table used
+# by the query so this example runs without a separate setup step.
+jdbc_url = "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;INIT=CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(100), email VARCHAR(100), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)\\;INSERT INTO users (name, email) SELECT 'User ' || x, 'user' || x || '@test.com' FROM SYSTEM_RANGE(1, 100) WHERE NOT EXISTS (SELECT 1 FROM users)"
 
 # H2 JDBC driver
 driver_class = "org.h2.Driver"

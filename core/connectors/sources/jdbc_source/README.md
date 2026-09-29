@@ -90,10 +90,10 @@ password = "secret_password"
 query = "SELECT * FROM orders WHERE updated_at > {last_offset} ORDER BY updated_at ASC"
 poll_interval = "30s"
 batch_size = 1000
-# updated_at is a timestamp and may not be unique. A run of rows sharing one
-# timestamp that is split across a batch boundary would skip the remainder (see
-# "Unique / strictly increasing" below). Prefer a unique auto-increment key, or
-# keep batch_size larger than any same-timestamp group.
+# updated_at is a timestamp and may not be unique. If equal timestamps cross a
+# batch boundary, the poll fails closed (see "Unique / strictly increasing"
+# below). Prefer a unique auto-increment key, or keep batch_size larger than any
+# same-timestamp group.
 tracking_column = "updated_at"
 initial_offset = "2024-01-01 00:00:00"
 mode = "incremental"
@@ -193,8 +193,8 @@ topic = "orders"
 | `driver_jar_path` | string | Yes | - | Path to the JDBC driver JAR (checked to exist at startup; passed to the embedded JVM as `-Djava.class.path`) |
 | `username` | string | No | - | Database username (optional if in jdbc_url) |
 | `password` | string | No | - | Database password (optional if in jdbc_url) |
-| `query` | string | Yes | - | SQL query to execute (supports `{last_offset}` and `{tracking_column}` placeholders) |
-| `poll_interval` | string (duration) | No | 5s | How often to poll, as a humantime string (e.g., "30s", "5m", "1h") |
+| `query` | string | Yes | - | SQL query to execute. Incremental mode requires `{last_offset}`; `{tracking_column}` is also supported |
+| `poll_interval` | string (duration) | No | 5s | Positive polling interval as a humantime string (e.g., "30s", "5m", "1h"); zero is rejected |
 | `batch_size` | u32 | No | 1000 | Maximum rows to fetch per poll |
 | `tracking_column` | string | Incremental | - | Column to track for incremental reads (required in incremental mode; the query must also `ORDER BY` it) |
 | `initial_offset` | string | No | - | Starting offset value for first poll |
@@ -217,6 +217,12 @@ connector refuses to start otherwise):
 
 - **`tracking_column` is required.** Without it the offset can never advance and
   every poll re-reads the same rows.
+- **The query must contain `{last_offset}`.** Without it each poll would execute
+  the same query and re-read the first batch while the stored cursor had no
+  effect.
+- **Exactly one result column must match `tracking_column`.** The connector
+  rejects a missing match and duplicate matching labels. Use explicit, unique
+  aliases when a query joins tables that expose the same column name.
 - **The query must order by the tracking column, ascending, as the first
   `ORDER BY` term.** Row limiting uses `setMaxRows`, so an unordered (or
   otherwise-ordered) query returns an arbitrary subset; advancing the offset to
@@ -242,13 +248,13 @@ as the next cursor, so the cursor always matches the database's own `ORDER BY`.
 The tracking column must also be:
 
 - **Unique / strictly increasing.** The next poll resumes with a strict
-  `> {last_offset}`, and each batch is capped by `setMaxRows`. If a batch ends in
-  the middle of a run of rows that share the same tracking value (common for a
-  non-unique column like a timestamp), the remaining same-value rows are skipped
-  on the next poll. Use a unique, strictly-increasing key (an auto-increment ID
-  is ideal). If you must track a non-unique column, ensure `batch_size` exceeds
-  the largest group of equal values so a tie never spans a batch boundary.
-  (Keyset pagination with a tie-break is a planned follow-up.)
+  `> {last_offset}`. The connector probes one row past `batch_size`; if that row
+  has the same tracking value as the last row in the batch, the entire poll
+  fails before emitting messages or advancing the checkpoint. This prevents
+  silent skips, but the source cannot progress until `batch_size` exceeds that
+  equal-value group or the query uses a unique, strictly-increasing key. An
+  auto-increment ID is ideal. Keyset pagination with a tie-break is a planned
+  follow-up.
 - **Monotonic under the database's own ordering.** Because the cursor is the last
   ordered row and is fed back as `WHERE {tracking_column} > '<value>'`, the column
   must increase monotonically under the same ordering the database applies to that
@@ -270,8 +276,9 @@ The tracking column must also be:
 -- Configuration
 tracking_column = "id"
 query = "SELECT * FROM users WHERE id > {last_offset} ORDER BY id"
+initial_offset = "0"
 
--- First poll (no offset yet)
+-- First poll (initial_offset configured as 0)
 SELECT * FROM users WHERE id > '0' ORDER BY id
 
 -- After processing rows up to id=100
@@ -333,9 +340,11 @@ JDBC SQL types are automatically mapped to JSON:
 
 - **Embedded JVM, one per process.** JNI permits a single `JavaVM` per OS
   process. All JDBC *source* instances in the connectors runtime share one JVM
-  (the first instance's `jvm_options`/classpath win). A JDBC source and a JDBC
-  sink are separate shared libraries and **cannot both create a JVM in the same
-  runtime process** — run them in separate connectors-runtime processes.
+  and must configure the same `driver_jar_path` and `jvm_options`; a later source
+  with different values is rejected instead of silently using the first
+  source's classpath. A JDBC source and a JDBC sink are separate shared libraries
+  and **cannot both create a JVM in the same runtime process**. Run them in
+  separate connectors-runtime processes.
 - **Blocking I/O.** JDBC calls go through JNI and are synchronous. The fetch in
   `poll()` (and the close in `close()`) runs under `tokio::task::block_in_place`
   so it does not monopolize a shared async-runtime worker, but the work is still
@@ -347,6 +356,10 @@ JDBC SQL types are automatically mapped to JSON:
   than a batch, raise `batch_size` to cover the full result, or use incremental
   mode with an ordered `tracking_column`. (Full cross-database OFFSET pagination
   is a planned follow-up.)
+- **Incremental boundaries fail closed on tied tracking values.** The connector
+  fetches one probe row beyond `batch_size`. If the probe and last in-batch row
+  share a tracking value, no messages are emitted and no cursor is staged. Raise
+  `batch_size` above the tie group or use a unique tracking column.
 - **Fetched-batch delivery is at-least-once.** The offset advanced by a poll is
   only *staged*; it is committed after the runtime reports that the batch was
   both sent and its checkpoint durably persisted (`SourceBatchResult::Ack`). If
@@ -540,6 +553,7 @@ jdbc_url = "jdbc:h2:file:/data/mydb;USER=sa;PASSWORD=sa"
 mode = "incremental"
 tracking_column = "updated_at"  # or "id", "created_at", etc.
 query = "SELECT * FROM table WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
+initial_offset = "2024-01-01 00:00:00"  # value appropriate for the column type
 ```
 
 **Benefits:**
@@ -547,15 +561,16 @@ query = "SELECT * FROM table WHERE {tracking_column} > {last_offset} ORDER BY {t
 - Avoids re-reading rows below the tracked offset (at-least-once, not exactly-once)
 - Tracks offset automatically
 - Efficient for large tables
-- Works with timestamps, IDs, or any orderable column
+- Works with timestamps, IDs, or other orderable, non-null columns; a unique
+  strictly increasing value avoids fail-closed tie boundaries
 
 **Database Examples** (the query must order by the tracking column; a unique,
 strictly-increasing key like an auto-increment ID is safest, see the tracking
 column requirements above):
 
-- MySQL: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; ensure `batch_size` exceeds any same-timestamp group, or track a unique id)
+- MySQL: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; if `batch_size` splits a same-timestamp group, the poll fails closed until the batch is enlarged or a unique id is tracked)
 - Oracle: `WHERE id > {last_offset} ORDER BY id` (use a monotonic key; `ROWNUM` is not a valid tracking column)
-- SQL Server: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; same caveat as MySQL)
+- SQL Server: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; same fail-closed boundary behavior as MySQL)
 - PostgreSQL: `WHERE id > {last_offset} ORDER BY id`
 
 ### Bulk Mode (Universal)

@@ -91,14 +91,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             let result = runtime.block_on(sink.open());
             self.id = id;
             self.sink = Some(sink);
-            // Only a status code crosses the FFI boundary, so log the cause here
-            // or it is lost: the runtime can then report no more than "plugin
-            // initialization failed", leaving an operator with a skipped
-            // connector and nothing to explain why.
             match result {
                 Ok(()) => 0,
-                Err(error) => {
-                    error!("Failed to open sink connector with ID: {id}. {error}");
+                Err(_) => {
+                    // Connector errors may contain secrets from external clients.
+                    // Only the status is safe to log at this generic boundary.
+                    error!("Failed to open sink connector with ID: {id}");
                     1
                 }
             }

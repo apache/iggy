@@ -39,7 +39,7 @@ mod s3;
 mod stdout;
 mod surrealdb;
 
-use iggy::prelude::{IggyClient, IggyMessage, Partitioning};
+use iggy::prelude::IggyClient;
 use iggy_common::Client;
 use iggy_common::{
     CompressionAlgorithm, Durability, IggyExpiry, IggyTimestamp, MaxTopicSize, MessageClient,
@@ -120,23 +120,6 @@ struct ConnectorsIggyClient {
 }
 
 impl ConnectorsIggyClient {
-    /// Send messages to the configured stream/topic (used by sink connector tests).
-    #[allow(dead_code)]
-    async fn send_messages(
-        &self,
-        messages: &mut [IggyMessage],
-    ) -> Result<(), iggy_common::IggyError> {
-        self.client
-            .send_messages(
-                &self.stream.clone().try_into().unwrap(),
-                &self.topic.clone().try_into().unwrap(),
-                &Partitioning::balanced(),
-                messages,
-            )
-            .await
-            .map(|_| ())
-    }
-
     /// Poll up to `count` messages from the configured stream/topic.
     ///
     /// `count` is the caller's, because it bounds how much a collect-until-N loop

@@ -26,9 +26,10 @@ use jni::{JNIEnv, JavaVM};
 use regex::Regex;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Clear any pending Java exception on the current thread. The JNI spec forbids
@@ -141,11 +142,11 @@ fn lock_mutex<'a, T>(mutex: &'a Mutex<T>, what: &str) -> Result<MutexGuard<'a, T
 
 /// Cached compiled regex patterns for password sanitization
 static RE_USER_PASS_AT: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"://([^:]+):([^@?;/]+)@").unwrap());
+    std::sync::LazyLock::new(|| Regex::new(r"://([^:/?#]+):([^/?#]*)@").unwrap());
 static RE_PASSWORD_PARAM: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"(?i)(password|pwd|pass)=([^;&\s]+)").unwrap());
 static RE_ORACLE_PASS: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"thin:([^/]+)/([^@]+)@").unwrap());
+    std::sync::LazyLock::new(|| Regex::new(r"thin:([^/]+)/([^?#]*)@").unwrap());
 
 /// Regexes that remove the incremental offset predicate `{tracking_column} >
 /// {last_offset}` on the first (no-offset) poll while preserving any other
@@ -322,26 +323,20 @@ impl std::fmt::Debug for JdbcSourceConfig {
 }
 
 /// Internal state tracking for the JDBC source
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct State {
     /// Last tracked offset value (for incremental mode)
     last_offset: Option<String>,
 
     /// Total rows processed
     processed_rows: u64,
-
-    /// Last poll timestamp
-    last_poll_time: DateTime<Utc>,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            last_offset: None,
-            processed_rows: 0,
-            last_poll_time: Utc::now(),
-        }
-    }
+#[derive(Debug)]
+struct ColumnMetadata {
+    output_name: String,
+    sql_type: i32,
+    is_tracking: bool,
 }
 
 /// Database record structure for output messages
@@ -364,7 +359,7 @@ pub struct JdbcSource {
     connection: Mutex<Option<GlobalRef>>,
     // The committed cursor: only ever advanced from `pending_state` once the
     // runtime confirms the batch was both sent and its checkpoint persisted.
-    state: Arc<Mutex<State>>,
+    state: Mutex<State>,
     // The cursor this in-flight batch would advance to, staged by `poll` and
     // resolved by `on_batch_result`. The SDK keeps at most one batch in flight,
     // so a single slot is sufficient.
@@ -390,6 +385,16 @@ fn sanitize_jdbc_url(url: &str) -> String {
     url.to_string()
 }
 
+fn sanitize_jdbc_error(error: Error, jdbc_url: &str) -> Error {
+    let sanitized_url = sanitize_jdbc_url(jdbc_url);
+    let sanitize = |message: String| message.replace(jdbc_url, &sanitized_url);
+    match error {
+        Error::InitError(message) => Error::InitError(sanitize(message)),
+        Error::Connection(message) => Error::Connection(sanitize(message)),
+        error => error,
+    }
+}
+
 impl JdbcSource {
     /// Create a new JDBC source connector
     pub fn new(id: u32, config: JdbcSourceConfig, connector_state: Option<ConnectorState>) -> Self {
@@ -411,7 +416,7 @@ impl JdbcSource {
             config,
             jvm: None,
             connection: Mutex::new(None),
-            state: Arc::new(Mutex::new(state)),
+            state: Mutex::new(state),
             pending_state: Mutex::new(None),
             poll_interval,
             next_poll_at: Mutex::new(None),
@@ -459,7 +464,9 @@ impl JdbcSource {
             env.push_local_frame(24),
             "Failed to push connection local frame"
         );
-        let result = self.create_direct_connection_inner(env);
+        let result = self
+            .create_direct_connection_inner(env)
+            .map_err(|error| sanitize_jdbc_error(error, self.config.jdbc_url.expose_secret()));
         finish_local_frame(
             env,
             result,
@@ -755,7 +762,6 @@ impl JdbcSource {
             State {
                 last_offset: max_offset.or_else(|| state.last_offset.clone()),
                 processed_rows: state.processed_rows.saturating_add(row_count),
-                last_poll_time: Utc::now(),
             }
         };
         info!(
@@ -788,15 +794,11 @@ impl JdbcSource {
             Err(_) => return Err(classify_query_failure(env, "prepare statement")),
         };
 
-        // Use setMaxRows for database-agnostic row limiting instead of SQL LIMIT clause.
-        // This works across all JDBC drivers (MySQL, Oracle, SQL Server, H2, etc.).
-        // In bulk mode fetch one extra row so the caller can detect an oversized
-        // (truncated) result set and fail closed rather than sync an arbitrary
-        // subset; incremental mode pages via the offset, so batch_size is the cap.
-        let max_rows = match self.config.mode {
-            Mode::Bulk => self.config.batch_size.saturating_add(1),
-            Mode::Incremental => self.config.batch_size,
-        };
+        // Use setMaxRows for database-agnostic row limiting instead of SQL LIMIT.
+        // Both modes fetch one probe row beyond the batch. Bulk mode uses it to
+        // detect unsupported pagination; incremental mode uses it to detect an
+        // equal tracking value split across the boundary before any row is emitted.
+        let max_rows = self.config.batch_size.saturating_add(1);
         if let Err(err) = env.call_method(
             &statement,
             "setMaxRows",
@@ -850,7 +852,7 @@ impl JdbcSource {
         &self,
         env: &mut JNIEnv,
         result_set: &JObject,
-    ) -> Result<Vec<(String, i32)>, Error> {
+    ) -> Result<Vec<ColumnMetadata>, Error> {
         // Read all column metadata inside its own JNI local frame so the
         // metadata object and per-column name references are reclaimed; a very
         // wide table would otherwise accumulate one local ref per column on the
@@ -873,7 +875,7 @@ impl JdbcSource {
         &self,
         env: &mut JNIEnv,
         result_set: &JObject,
-    ) -> Result<Vec<(String, i32)>, Error> {
+    ) -> Result<Vec<ColumnMetadata>, Error> {
         let metadata = jni!(
             env,
             env.call_method(
@@ -897,11 +899,66 @@ impl JdbcSource {
 
         // Clamp a driver-supplied count before using it as an allocation size: a
         // negative i32 would sign-extend to an enormous usize and abort on alloc.
-        let mut columns = Vec::with_capacity((column_count.max(0) as usize).min(8192));
+        let mut raw_columns = Vec::with_capacity((column_count.max(0) as usize).min(8192));
         for i in 1..=column_count {
-            let col_name = self.get_column_label(env, &metadata, i)?;
-            let col_type = self.get_column_type(env, &metadata, i)?;
-            columns.push((col_name, col_type));
+            let source_name = self.get_column_label(env, &metadata, i)?;
+            let sql_type = self.get_column_type(env, &metadata, i)?;
+            raw_columns.push((source_name, sql_type));
+        }
+
+        self.prepare_column_metadata(raw_columns)
+    }
+
+    fn prepare_column_metadata(
+        &self,
+        raw_columns: Vec<(String, i32)>,
+    ) -> Result<Vec<ColumnMetadata>, Error> {
+        let mut columns = Vec::with_capacity(raw_columns.len());
+        let mut output_names = std::collections::HashSet::new();
+        let mut tracking_matches = 0usize;
+        for (source_name, sql_type) in raw_columns {
+            let output_name = if self.config.snake_case_columns {
+                to_snake_case(&source_name)
+            } else {
+                source_name.clone()
+            };
+            if !output_names.insert(output_name.clone()) {
+                warn!(
+                    "Column '{source_name}' maps to output key '{output_name}', which is already in the result; later values overwrite earlier ones"
+                );
+            }
+            let is_tracking = self
+                .config
+                .tracking_column
+                .as_deref()
+                .is_some_and(|tracking| {
+                    tracking_column_matches(tracking, &source_name, &output_name)
+                });
+            if is_tracking {
+                tracking_matches += 1;
+            }
+            columns.push(ColumnMetadata {
+                output_name,
+                sql_type,
+                is_tracking,
+            });
+        }
+
+        if self.config.mode == Mode::Incremental {
+            let tracking_column = self.config.tracking_column.as_deref().unwrap_or("");
+            match tracking_matches {
+                1 => {}
+                0 => {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "tracking column '{tracking_column}' is not present in the query result; include it exactly once in the SELECT list"
+                    )));
+                }
+                count => {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "tracking column '{tracking_column}' matches {count} columns in the query result; use unique column aliases so it matches exactly once"
+                    )));
+                }
+            }
         }
 
         Ok(columns)
@@ -912,11 +969,11 @@ impl JdbcSource {
         &self,
         env: &mut JNIEnv,
         result_set: &JObject,
-        columns: &[(String, i32)],
+        columns: &[ColumnMetadata],
     ) -> Result<(Vec<ProducedMessage>, u64, Option<String>), Error> {
-        // setMaxRows caps the result set at batch_size, so that is the known
-        // upper bound; clamp the pre-allocation so an extreme batch_size cannot
-        // request an absurd allocation up front.
+        // The emitted batch is capped at batch_size; the possible extra row is a
+        // probe and is never retained. Clamp the pre-allocation so an extreme
+        // batch_size cannot request an absurd allocation up front.
         let mut messages = Vec::with_capacity((self.config.batch_size as usize).min(8192));
         let mut row_count: u64 = 0;
         let mut last_offset: Option<String> = None;
@@ -950,20 +1007,26 @@ impl JdbcSource {
                 Error::Connection,
             )?;
 
+            // The extra row is a boundary probe, never part of the emitted batch.
+            // If it shares the last in-batch tracking value, advancing with strict
+            // `>` would skip it and any following ties. Fail the complete poll so
+            // no messages or checkpoint can escape from an unsafe page.
+            if self.config.mode == Mode::Incremental && row_count == self.config.batch_size as u64 {
+                if offset == last_offset {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "incremental batch boundary splits rows with tracking value '{}'; increase batch_size or use a unique, strictly increasing tracking_column",
+                        offset.as_deref().unwrap_or("")
+                    )));
+                }
+                break;
+            }
+
             // Take the tracking value of the LAST row as the next offset. Rows
             // arrive in ascending tracking order (validate_config enforces
             // ORDER BY the tracking column ascending), so the last row is the
             // high-water mark. Using the last row rather than a Rust-side max
             // keeps the cursor consistent with the database's own ordering.
             //
-            // The next poll resumes with a strict `> last_offset`, so if this
-            // setMaxRows-capped batch ends in the middle of a run of rows sharing
-            // one tracking value (a non-unique column such as a timestamp), the
-            // remaining tied rows are skipped. The tracking column must therefore
-            // be unique / strictly increasing, or batch_size must exceed the
-            // largest group of equal values. See the README tracking-column
-            // requirements; keyset pagination with a tie-break is a planned
-            // follow-up.
             if let Some(offset) = offset {
                 last_offset = Some(offset);
             }
@@ -971,19 +1034,6 @@ impl JdbcSource {
             let message = self.build_message(row_data)?;
             messages.push(message);
             row_count += 1;
-        }
-
-        // In incremental mode a non-empty batch that never yielded a tracking
-        // value means the tracking column is absent from the result set: the
-        // offset could never advance, so the same batch would be re-read forever.
-        // Fail loudly instead of stalling silently. (A NULL tracking value in a
-        // present column is already rejected per-row by tracking_offset_or_error.)
-        if self.config.mode == Mode::Incremental && row_count > 0 && last_offset.is_none() {
-            return Err(Error::InvalidConfigValue(format!(
-                "tracking column '{}' is not present in the query result; incremental mode cannot \
-                 advance its offset. Include it in the SELECT list.",
-                self.config.tracking_column.as_deref().unwrap_or("")
-            )));
         }
 
         Ok((messages, row_count, last_offset))
@@ -994,42 +1044,21 @@ impl JdbcSource {
         &self,
         env: &mut JNIEnv,
         result_set: &JObject,
-        columns: &[(String, i32)],
+        columns: &[ColumnMetadata],
     ) -> Result<(serde_json::Map<String, serde_json::Value>, Option<String>), Error> {
         let mut row_data = serde_json::Map::new();
         let mut offset = None;
 
-        for (idx, (col_name, col_type)) in columns.iter().enumerate() {
+        for (idx, column) in columns.iter().enumerate() {
             let col_idx = (idx + 1) as i32;
-            let value = self.extract_column_value(env, result_set, col_idx, col_type)?;
+            let value = self.extract_column_value(env, result_set, col_idx, &column.sql_type)?;
+            row_data.insert(column.output_name.clone(), value);
 
-            let final_col_name = if self.config.snake_case_columns {
-                to_snake_case(col_name)
-            } else {
-                col_name.clone()
-            };
-
-            // A snake_case conversion (or a query with duplicate labels) can map
-            // two source columns onto the same key; the later value silently wins.
-            // Warn so the loss is diagnosable rather than invisible.
-            if row_data.contains_key(&final_col_name) {
-                warn!(
-                    "Column '{col_name}' maps to key '{final_col_name}', which already exists in the row; the earlier value is overwritten"
-                );
-            }
-
-            row_data.insert(final_col_name.clone(), value);
-
-            // Track offset from the first column matching the tracking column
-            // (by driver label or normalized key, case-insensitively). Only the
-            // first match counts: a collapsed/duplicate label must not let a later
-            // column silently overwrite the offset with an unrelated value.
-            if offset.is_none()
-                && let Some(ref tracking_col) = self.config.tracking_column
-                && tracking_column_matches(tracking_col, col_name, &final_col_name)
+            if column.is_tracking
+                && let Some(ref tracking_column) = self.config.tracking_column
             {
-                let value = self.extract_offset_value(&row_data, &final_col_name);
-                offset = self.tracking_offset_or_error(value, tracking_col)?;
+                let value = self.extract_offset_value(&row_data, &column.output_name);
+                offset = self.tracking_offset_or_error(value, tracking_column)?;
             }
         }
 
@@ -1037,8 +1066,8 @@ impl JdbcSource {
     }
 
     /// Resolve a tracking-column value into an offset. In incremental mode a NULL
-    /// or empty value is a hard error: the row is emitted but the offset cannot
-    /// advance past NULL, so it would be re-read (and re-emitted) every poll.
+    /// or empty value is a hard error: the batch cannot be safely emitted because
+    /// its checkpoint could not advance past that row.
     fn tracking_offset_or_error(
         &self,
         value: Option<String>,
@@ -1403,15 +1432,25 @@ impl JdbcSource {
             )));
         }
 
-        // A set poll_interval must be a valid humantime string; an unparsable
-        // value would otherwise silently fall back to the default.
-        if let Some(value) = self.config.poll_interval.as_deref()
-            && !value.trim().is_empty()
-            && humantime::parse_duration(value.trim()).is_err()
+        // A set poll_interval must be valid and positive. Zero would make every
+        // successful poll immediately eligible to run again and hammer the DB.
+        if let Some(value) = self
+            .config
+            .poll_interval
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
         {
-            return Err(Error::InvalidConfigValue(format!(
-                "poll_interval '{value}' is not a valid duration (e.g. \"30s\", \"5m\", \"1h\")"
-            )));
+            let duration = humantime::parse_duration(value).map_err(|_| {
+                Error::InvalidConfigValue(format!(
+                    "poll_interval '{value}' is not a valid duration (e.g. \"30s\", \"5m\", \"1h\")"
+                ))
+            })?;
+            if duration.is_zero() {
+                return Err(Error::InvalidConfigValue(
+                    "poll_interval must be greater than zero".to_string(),
+                ));
+            }
         }
 
         // The query must be non-empty; an empty query only fails later at
@@ -1460,6 +1499,12 @@ impl JdbcSource {
                         .to_string(),
                 ));
             };
+            if !self.config.query.contains("{last_offset}") {
+                return Err(Error::InvalidConfigValue(
+                    "incremental mode requires the query to contain {last_offset}; without it each poll would re-read the same first batch"
+                        .to_string(),
+                ));
+            }
             if !query_orders_by_tracking_column(
                 &self.config.query,
                 tracking_column,
@@ -1471,19 +1516,6 @@ impl JdbcSource {
                      `ORDER BY {{tracking_column}}`) to the query"
                 )));
             }
-
-            // The cursor advances with a strict `> last_offset` per batch, so a
-            // group of rows sharing one tracking value that is split across a
-            // batch_size boundary loses its remainder. This cannot be detected
-            // without inspecting the data, so warn: the column should be unique /
-            // strictly increasing, or batch_size must exceed the largest tie group.
-            warn!(
-                "JDBC source [{}] incremental tracking_column '{tracking_column}': ensure it is \
-                 unique / strictly increasing, or that batch_size ({}) exceeds the largest group \
-                 of rows sharing one value. A tie split across a batch boundary skips the \
-                 remaining rows (common for non-unique timestamp columns).",
-                self.id, self.config.batch_size
-            );
         }
 
         // Dry-run the query build so an unresolved placeholder or an invalid
@@ -1505,18 +1537,29 @@ impl Source for JdbcSource {
             self.config.mode
         );
 
-        // Fail fast on bad config before starting the JVM or opening a connection.
-        self.validate_config()?;
+        let result = (|| -> Result<(), Error> {
+            // Fail fast on bad config before starting the JVM or opening a connection.
+            self.validate_config()?;
 
-        // JVM boot and DriverManager.getConnection are blocking JNI work. Run
-        // them via block_in_place (like poll()/close()) so they do not monopolize
-        // a shared async-runtime worker; the login timeout set in the connection
-        // path bounds how long a stuck connect can block.
-        tokio::task::block_in_place(|| -> Result<(), Error> {
-            self.initialize_jvm()?;
-            self.create_connection()?;
-            Ok(())
-        })?;
+            // JVM boot and DriverManager.getConnection are blocking JNI work. Run
+            // them via block_in_place (like poll()/close()) so they do not monopolize
+            // a shared async-runtime worker; the login timeout set in the connection
+            // path bounds how long a stuck connect can block.
+            tokio::task::block_in_place(|| -> Result<(), Error> {
+                self.initialize_jvm()?;
+                self.create_connection()?;
+                Ok(())
+            })
+        })();
+
+        if let Err(open_error) = result {
+            let open_error = sanitize_jdbc_error(open_error, self.config.jdbc_url.expose_secret());
+            error!(
+                "Failed to open JDBC source connector [{}]: {open_error}",
+                self.id
+            );
+            return Err(open_error);
+        }
 
         info!("JDBC source connector [{}] opened successfully", self.id);
         Ok(())
@@ -1684,27 +1727,64 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
+struct SharedJvm {
+    vm: Arc<JavaVM>,
+    configuration: JvmConfiguration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JvmConfiguration {
+    driver_jar_path: PathBuf,
+    options: Vec<String>,
+}
+
+impl JvmConfiguration {
+    fn new(driver_jar_path: &str, options: &[String]) -> Result<Self, Error> {
+        let driver_jar_path = Path::new(driver_jar_path).canonicalize().map_err(|error| {
+            Error::InitError(format!(
+                "Failed to canonicalize driver_jar_path '{driver_jar_path}': {error}"
+            ))
+        })?;
+        Ok(Self {
+            driver_jar_path,
+            options: options.to_vec(),
+        })
+    }
+
+    fn ensure_compatible_with(&self, requested: &Self) -> Result<(), Error> {
+        if self == requested {
+            return Ok(());
+        }
+        Err(Error::InvalidConfigValue(
+            "all JDBC source instances in one runtime process must use the same driver_jar_path and jvm_options because they share one JVM"
+                .to_string(),
+        ))
+    }
+}
+
 /// Process-wide JVM. JNI allows only one `JavaVM` per OS process, so every JDBC
 /// connector instance in this dynamic library shares this one.
-static GLOBAL_JVM: Mutex<Option<Arc<JavaVM>>> = Mutex::new(None);
+static GLOBAL_JVM: Mutex<Option<SharedJvm>> = Mutex::new(None);
 
 /// Return the process JVM, creating it on first use within this dynamic
-/// library. The first caller's `jvm_options`/classpath win; later callers (e.g.
-/// a second JDBC connector of the same type) reuse the existing VM instead of
-/// failing with `JNI_EEXIST`.
+/// library. Later callers reuse it only when their classpath and options match;
+/// otherwise startup fails instead of silently running with the wrong driver.
 ///
 /// Limitation: a JDBC *source* and a JDBC *sink* are separate dynamic libraries
 /// and do not share this static, so configuring both in the *same* connectors
 /// runtime process is not supported (the second to start cannot create a second
 /// JVM). Run them in separate runtime processes.
 fn get_or_create_jvm(driver_jar_path: &str, jvm_options: &[String]) -> Result<Arc<JavaVM>, Error> {
+    let requested = JvmConfiguration::new(driver_jar_path, jvm_options)?;
     let mut guard = lock_mutex(&GLOBAL_JVM, "jvm")?;
-    if let Some(jvm) = guard.as_ref() {
+    if let Some(shared) = guard.as_ref() {
+        shared.configuration.ensure_compatible_with(&requested)?;
         info!("Reusing existing process JVM");
-        return Ok(jvm.clone());
+        return Ok(shared.vm.clone());
     }
 
-    let classpath_option = format!("-Djava.class.path={driver_jar_path}");
+    let canonical_jar_path = requested.driver_jar_path.to_string_lossy();
+    let classpath_option = format!("-Djava.class.path={canonical_jar_path}");
     let mut args_builder = jni::InitArgsBuilder::new()
         .version(jni::JNIVersion::V8)
         .option(&classpath_option);
@@ -1717,9 +1797,12 @@ fn get_or_create_jvm(driver_jar_path: &str, jvm_options: &[String]) -> Result<Ar
     let jvm = JavaVM::new(jvm_args)
         .map_err(|e| Error::InitError(format!("Failed to create JVM: {e:?}")))?;
 
-    info!("JVM initialized successfully (classpath: {driver_jar_path})");
+    info!("JVM initialized successfully (classpath: {canonical_jar_path})");
     let arc = Arc::new(jvm);
-    *guard = Some(arc.clone());
+    *guard = Some(SharedJvm {
+        vm: arc.clone(),
+        configuration: requested,
+    });
     Ok(arc)
 }
 
@@ -2026,10 +2109,8 @@ fn throwable_string_method(
 /// JDBC SQL Types constants
 mod java {
     pub mod sql {
-        #[allow(dead_code)]
         pub struct Types;
 
-        #[allow(dead_code)]
         impl Types {
             pub const BIT: i32 = -7;
             pub const TINYINT: i32 = -6;
@@ -2041,16 +2122,12 @@ mod java {
             pub const DOUBLE: i32 = 8;
             pub const NUMERIC: i32 = 2;
             pub const DECIMAL: i32 = 3;
-            pub const CHAR: i32 = 1;
-            pub const VARCHAR: i32 = 12;
-            pub const LONGVARCHAR: i32 = -1;
             pub const DATE: i32 = 91;
             pub const TIME: i32 = 92;
             pub const TIMESTAMP: i32 = 93;
             pub const BINARY: i32 = -2;
             pub const VARBINARY: i32 = -3;
             pub const LONGVARBINARY: i32 = -4;
-            pub const NULL: i32 = 0;
             pub const BOOLEAN: i32 = 16;
         }
     }
@@ -2117,6 +2194,19 @@ mod tests {
             .validate_config()
             .expect_err("must reject bad poll_interval");
         assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("poll_interval")));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_zero_poll_interval() {
+        let jar = write_temp_jar("jdbc_validate_zero_poll_interval.jar");
+        let mut config = base_config();
+        config.driver_jar_path = jar;
+        config.poll_interval = Some("0s".to_string());
+        let source = JdbcSource::new(1, config, None);
+        let err = source
+            .validate_config()
+            .expect_err("must reject a zero poll interval");
+        assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("greater than zero")));
     }
 
     #[test]
@@ -2256,6 +2346,45 @@ mod tests {
                 .to_string();
         let source = JdbcSource::new(1, config, None);
         assert!(source.validate_config().is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_incremental_requires_last_offset_placeholder() {
+        let jar = write_temp_jar("jdbc_validate_last_offset.jar");
+        let mut config = base_config();
+        config.driver_jar_path = jar;
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("id".to_string());
+        config.query = "SELECT id FROM t ORDER BY id".to_string();
+        let source = JdbcSource::new(1, config, None);
+        let err = source
+            .validate_config()
+            .expect_err("must require {last_offset}");
+        assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("{last_offset}")));
+    }
+
+    #[test]
+    fn test_incremental_metadata_rejects_duplicate_tracking_labels() {
+        let mut config = base_config();
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("id".to_string());
+        let source = JdbcSource::new(1, config, None);
+        let err = source
+            .prepare_column_metadata(vec![("id".to_string(), 4), ("ID".to_string(), 4)])
+            .expect_err("duplicate tracking labels must be rejected");
+        assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("matches 2 columns")));
+    }
+
+    #[test]
+    fn test_incremental_metadata_requires_tracking_column_in_result() {
+        let mut config = base_config();
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("id".to_string());
+        let source = JdbcSource::new(1, config, None);
+        let err = source
+            .prepare_column_metadata(vec![("name".to_string(), 12)])
+            .expect_err("missing tracking label must be rejected");
+        assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("not present")));
     }
 
     #[test]
@@ -2567,6 +2696,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_jdbc_url_masks_password_through_last_at_sign() {
+        let url = "jdbc:mysql://root:p@ss@localhost:3306/mydb";
+        let sanitized = sanitize_jdbc_url(url);
+        assert_eq!(sanitized, "jdbc:mysql://root:***@localhost:3306/mydb");
+        assert!(!sanitized.contains("p@ss"));
+    }
+
+    #[test]
+    fn test_sanitize_jdbc_error_masks_echoed_url() {
+        let url = "jdbc:mysql://root:p@ss@localhost:3306/mydb";
+        let error = Error::InitError(format!("No suitable driver found for {url}"));
+        let sanitized = sanitize_jdbc_error(error, url).to_string();
+        assert_eq!(
+            sanitized,
+            "Init error: No suitable driver found for jdbc:mysql://root:***@localhost:3306/mydb"
+        );
+        assert!(!sanitized.contains("p@ss"));
+    }
+
+    #[test]
     fn test_sanitize_jdbc_url_postgresql_query_params() {
         let url = "jdbc:postgresql://localhost:5432/mydb?user=admin&password=P@ssw0rd&ssl=true";
         let sanitized = sanitize_jdbc_url(url);
@@ -2638,6 +2787,24 @@ mod tests {
     }
 
     #[test]
+    fn test_jvm_configuration_rejects_different_jar_or_options() {
+        let first_jar = write_temp_jar("jdbc_jvm_first.jar");
+        let second_jar = write_temp_jar("jdbc_jvm_second.jar");
+        let first = JvmConfiguration::new(&first_jar, &["-Xmx128m".to_string()])
+            .expect("first JVM configuration");
+        let same = JvmConfiguration::new(&first_jar, &["-Xmx128m".to_string()])
+            .expect("same JVM configuration");
+        let different_jar = JvmConfiguration::new(&second_jar, &["-Xmx128m".to_string()])
+            .expect("different jar configuration");
+        let different_options = JvmConfiguration::new(&first_jar, &["-Xmx256m".to_string()])
+            .expect("different options configuration");
+
+        assert!(first.ensure_compatible_with(&same).is_ok());
+        assert!(first.ensure_compatible_with(&different_jar).is_err());
+        assert!(first.ensure_compatible_with(&different_options).is_err());
+    }
+
+    #[test]
     fn test_build_query_incremental_with_offset() {
         let config = JdbcSourceConfig {
             jdbc_url: SecretString::from("jdbc:h2:mem:test"),
@@ -2663,7 +2830,6 @@ mod tests {
         let state = State {
             last_offset: None,
             processed_rows: 0,
-            last_poll_time: Utc::now(),
         };
         let query = source.build_query(&state).expect("build query");
         assert_eq!(query, "SELECT * FROM users WHERE id > '0' ORDER BY id");
@@ -2672,7 +2838,6 @@ mod tests {
         let state = State {
             last_offset: Some("42".to_string()),
             processed_rows: 42,
-            last_poll_time: Utc::now(),
         };
         let query = source.build_query(&state).expect("build query");
         assert_eq!(query, "SELECT * FROM users WHERE id > '42' ORDER BY id");
@@ -2704,7 +2869,6 @@ mod tests {
         let state = State {
             last_offset: Some("2024-06-15".to_string()),
             processed_rows: 0,
-            last_poll_time: Utc::now(),
         };
         let query = source.build_query(&state).expect("build query");
         assert_eq!(
@@ -2742,7 +2906,6 @@ mod tests {
             .build_query(&State {
                 last_offset: None,
                 processed_rows: 0,
-                last_poll_time: Utc::now(),
             })
             .expect("build query");
         assert!(!query.contains("{tracking_column}"), "got: {query}");
@@ -2807,7 +2970,6 @@ mod tests {
         let original_state = State {
             last_offset: Some("2024-06-15 12:00:00".to_string()),
             processed_rows: 1500,
-            last_poll_time: Utc::now(),
         };
         let connector_state = ConnectorState::serialize(&original_state, CONNECTOR_NAME, 1)
             .expect("Failed to serialize state");
@@ -3287,7 +3449,6 @@ mod tests {
         let state = State {
             last_offset: None,
             processed_rows: 0,
-            last_poll_time: Utc::now(),
         };
         let query = source.build_query(&state).expect("build query");
         // The WHERE clause placeholder should be removed
@@ -3349,7 +3510,6 @@ mod tests {
         let state = State {
             last_offset: Some("42".to_string()),
             processed_rows: 42,
-            last_poll_time: Utc::now(),
         };
         // In bulk mode the query is used verbatim; the tracked offset is ignored.
         let query = source.build_query(&state).expect("build query");
@@ -3452,7 +3612,6 @@ mod tests {
         *source.pending_state.lock().expect("pending lock") = Some(State {
             last_offset: Some(offset.to_string()),
             processed_rows,
-            last_poll_time: Utc::now(),
         });
     }
 
