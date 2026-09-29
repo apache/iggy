@@ -17,7 +17,7 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
-use crate::stm::authz::gated_apply;
+use crate::stm::authz::{admits_partitions_create, gated_apply};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
@@ -2242,7 +2242,9 @@ where
     /// A soft cap: the apply must not branch on node config, so this counts
     /// the partitions this primary has committed, and creates in flight
     /// together can overshoot it. A body that does not decode passes here,
-    /// and `prepare_request` evicts the session for it.
+    /// and `prepare_request` evicts the session for it. A create that the
+    /// gated apply refuses, for a missing target or a missing grant, also
+    /// passes, so it gets that error and not the cap's.
     fn admit_partitions(&self, message: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
         let partitions_max = self.partitions_max.get();
         if partitions_max == 0 {
@@ -2250,21 +2252,43 @@ where
         }
         let header = message.header();
         let body = &message.as_slice()[size_of::<RoutedRequestHeader>()..header.size as usize];
-        let requested = match header.operation {
-            Operation::CreateTopic => WireCreateTopicRequest::decode_from(body)
-                .map(|request| request.partitions_count)
-                .ok(),
-            Operation::CreatePartitions => WireCreatePartitionsRequest::decode_from(body)
-                .map(|request| request.partitions_count)
-                .ok(),
-            _ => None,
+        let (requested, stream_id, topic_id) = match header.operation {
+            Operation::CreateTopic => match WireCreateTopicRequest::decode_from(body) {
+                Ok(request) => (request.partitions_count, request.stream_id, None),
+                Err(_) => return Ok(()),
+            },
+            Operation::CreatePartitions => match WireCreatePartitionsRequest::decode_from(body) {
+                Ok(request) => (
+                    request.partitions_count,
+                    request.stream_id,
+                    Some(request.topic_id),
+                ),
+                Err(_) => return Ok(()),
+            },
+            _ => return Ok(()),
         };
-        let Some(requested) = requested else {
-            return Ok(());
-        };
-        validate_partitions_limit(partitions_max, requested, || {
+        let admitted = validate_partitions_limit(partitions_max, requested, || {
             self.mux_stm.streams().partition_count()
-        })
+        });
+        if admitted.is_err() {
+            let applies =
+                resolve_acting_user_id(header.operation, header.client, &self.client_table)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|user_id| {
+                        admits_partitions_create(
+                            self.mux_stm.users(),
+                            self.mux_stm.streams(),
+                            user_id,
+                            &stream_id,
+                            topic_id.as_ref(),
+                        )
+                    });
+            if !applies {
+                return Ok(());
+            }
+        }
+        admitted
     }
 
     /// Submit `Logout` from in-process, await commit.
@@ -4346,13 +4370,17 @@ mod tests {
     use crate::stm::StateHandler;
     use crate::stm::consumer_group::JoinConsumerGroupRequest;
     use crate::stm::stream::{Streams, StreamsInner};
-    use crate::stm::user::Users;
+    use crate::stm::user::{Users, UsersInner};
     use consensus::LocalPipeline;
     use iggy_binary_protocol::WireOptions;
+    use iggy_binary_protocol::primitives::permissions::{
+        WireGlobalPermissions, WirePermissions, WireStreamPermissions,
+    };
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_common::{IggyTimestamp, variadic};
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::{
         BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
@@ -4737,7 +4765,7 @@ mod tests {
 
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
-            stream_id: WireIdentifier::numeric(1),
+            stream_id: WireIdentifier::numeric(0),
             partitions_count: 1,
             name: WireName::new("t").unwrap(),
             options: WireOptions::empty(),
@@ -4969,37 +4997,12 @@ mod tests {
     async fn given_committed_create_topic_at_partitions_cap_when_replayed_should_serve_cached_reply()
      {
         const CLIENT: u128 = 1;
-        const USER: u32 = 7;
-        let mut inner = StreamsInner::new();
-        let timestamp = IggyTimestamp::now();
-        let _ = StateHandler::apply(
-            &CreateStreamRequest {
-                name: WireName::new("stream").unwrap(),
-                options: WireOptions::empty(),
-            },
-            &mut inner,
-            timestamp,
-        );
-        let _ = StateHandler::apply(
-            &PersistedCreateTopicRequest {
-                request: CreateTopicRequest {
-                    stream_id: WireIdentifier::numeric(0),
-                    partitions_count: 1,
-                    name: WireName::new("t").unwrap(),
-                    options: WireOptions::empty(),
-                },
-                created_view: 0,
-                derived_options: WireOptions::empty(),
-                partitions: vec![CreatedPartitionAssignment {
-                    partition_id: 0,
-                    consensus_group_id: 1,
-                }],
-            },
-            &mut inner,
-            timestamp,
-        );
+        const USER: u32 = TOPIC_MANAGER;
         let mut metadata = metadata_plane();
-        metadata.mux_stm = Rc::new(TestMux::new((Users::default(), (inner.into(), ()))));
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
         metadata.set_partitions_max(1);
         metadata
             .client_table
@@ -5036,6 +5039,151 @@ mod tests {
             Some(IggyError::PartitionsLimitReached.as_code()),
             "a new create past the cap must be denied"
         );
+    }
+
+    /// The gated apply answers a create from a user without the grant, or for
+    /// a stream that does not exist, with `Unauthorized` or `NotFound`. The
+    /// cap must not answer first, or that user could probe the cap state.
+    #[test]
+    fn given_create_topic_past_partitions_cap_when_apply_would_refuse_should_leave_it_to_apply() {
+        const UNGRANTED_CLIENT: u128 = 1;
+        const MANAGER_CLIENT: u128 = 2;
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_partitions_max(1);
+
+        metadata.client_table.borrow_mut().commit_register(
+            UNGRANTED_CLIENT,
+            UNGRANTED,
+            register_reply(UNGRANTED_CLIENT, 1),
+        );
+        assert!(
+            metadata
+                .admit_partitions(&create_topic_request(UNGRANTED_CLIENT, UNGRANTED))
+                .is_ok(),
+            "a user without create_topic must get Unauthorized from apply"
+        );
+
+        metadata.client_table.borrow_mut().commit_register(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            register_reply(MANAGER_CLIENT, 1),
+        );
+        let mut missing_stream = create_topic_request(MANAGER_CLIENT, TOPIC_MANAGER);
+        let header_size = size_of::<RoutedRequestHeader>();
+        let body = CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(9),
+            partitions_count: 1,
+            name: WireName::new("t").unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        missing_stream.as_mut_slice()[header_size..].copy_from_slice(&body);
+        assert!(
+            metadata.admit_partitions(&missing_stream).is_ok(),
+            "a create for a missing stream must get NotFound from apply"
+        );
+
+        assert!(
+            matches!(
+                metadata.admit_partitions(&create_topic_request(MANAGER_CLIENT, TOPIC_MANAGER)),
+                Err(IggyError::PartitionsLimitReached)
+            ),
+            "a create that apply would carry out is denied at the cap"
+        );
+    }
+
+    /// Slab ids of `users_with_topic_manager`: root takes 0.
+    const TOPIC_MANAGER: u32 = 1;
+    const UNGRANTED: u32 = 2;
+
+    /// Root, then `TOPIC_MANAGER` with `manage_topics` on stream 0, then
+    /// `UNGRANTED` with no permissions.
+    fn users_with_topic_manager() -> Users {
+        let mut inner = UsersInner::new();
+        let timestamp = IggyTimestamp::now();
+        let no_grants = WireGlobalPermissions {
+            manage_servers: false,
+            read_servers: false,
+            manage_users: false,
+            read_users: false,
+            manage_streams: false,
+            read_streams: false,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: false,
+            send_messages: false,
+        };
+        for (username, streams) in [
+            ("iggy", Vec::new()),
+            (
+                "manager",
+                vec![WireStreamPermissions {
+                    stream_id: 0,
+                    manage_stream: false,
+                    read_stream: false,
+                    manage_topics: true,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                    topics: Vec::new(),
+                }],
+            ),
+            ("ungranted", Vec::new()),
+        ] {
+            let reply = StateHandler::apply(
+                &CreateUserRequest {
+                    username: WireName::new(username).unwrap(),
+                    password: "hash".to_string(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: Some(WirePermissions {
+                        global: no_grants.clone(),
+                        streams,
+                    }),
+                    options: WireOptions::empty(),
+                },
+                &mut inner,
+                timestamp,
+            );
+            assert_eq!(reply.code, 0, "fixture user {username} must be created");
+        }
+        inner.into()
+    }
+
+    /// Stream 0 holding one topic with one partition.
+    fn stream_with_one_partition() -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        let timestamp = IggyTimestamp::now();
+        let _ = StateHandler::apply(
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &PersistedCreateTopicRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("existing").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                created_view: 0,
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                }],
+            },
+            &mut inner,
+            timestamp,
+        );
+        inner
     }
 
     #[test]

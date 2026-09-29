@@ -345,6 +345,38 @@ pub(crate) fn authorize(
     }
 }
 
+/// Whether `authorize` lets a `CreateTopic`, or a `CreatePartitions` when
+/// `topic_id` is set, reach its apply: the ids resolve and `user_id` holds the
+/// grant. The primary asks before it denies a create for `[metadata]
+/// partitions_max`, so apply answers `NotFound` or `Unauthorized` first and a
+/// user who cannot create learns nothing about the cap.
+pub(crate) fn admits_partitions_create(
+    users: &Users,
+    streams: &Streams,
+    user_id: u32,
+    stream_id: &WireIdentifier,
+    topic_id: Option<&WireIdentifier>,
+) -> bool {
+    let Some(topic_id) = topic_id else {
+        return streams
+            .resolve_stream_id(stream_id)
+            .is_some_and(|stream_id| {
+                user_id == ROOT_USER_ID
+                    || users
+                        .authorize(|perm| perm.create_topic(user_id, stream_id))
+                        .is_ok()
+            });
+    };
+    streams
+        .resolve_topic_ids(stream_id, topic_id)
+        .is_some_and(|(stream_id, topic_id)| {
+            user_id == ROOT_USER_ID
+                || users
+                    .authorize(|perm| perm.create_partitions(user_id, stream_id, topic_id))
+                    .is_ok()
+        })
+}
+
 /// Maps a permissioner rule outcome to a gate decision: any `Err` (always
 /// `Unauthorized`) denies with a committed `Unauthorized` reply.
 fn check(
