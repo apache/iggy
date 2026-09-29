@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, serve};
-use iggy_common::{HeaderKey, HeaderValue};
+use iggy_common::{HeaderKey, HeaderValue, MAX_PAYLOAD_SIZE};
 use iggy_connector_sdk::Error;
 use rand::RngExt;
 use ring::hmac;
@@ -991,12 +991,10 @@ async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> Response
 
 /// Readiness for a load balancer: unavailable until an instance is serving.
 ///
-/// A joined instance is not the same as a polling one. The SDK stops the poll
-/// task after five consecutive NACKs without calling `close()`, so the instance
-/// stays joined and this kept answering 200 to the load balancer while handlers
-/// accepted into a bridge nobody drained, until it filled and 429d forever.
-/// Readiness needs all three: an instance, a route it can reach, and a poll
-/// task still running behind it.
+/// A joined instance is not the same as a polling one. A configured NACK
+/// limit or result-hook failure can stop polling without calling `close()`;
+/// repeated NACKs can also leave a staged batch stuck while polling continues.
+/// Readiness needs an instance, a reachable route, and a healthy poll path.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     let now = unix_now_seconds();
     // One guard, so readiness cannot be computed from a route table and an
@@ -1095,6 +1093,15 @@ fn enqueue(
     body: Bytes,
     metrics: &Metrics,
 ) -> Response {
+    match validate_payload_len(body.len()) {
+        Ok(()) => {}
+        Err(PayloadLengthError::Empty) => {
+            return error_response(StatusCode::BAD_REQUEST, "empty payload");
+        }
+        Err(PayloadLengthError::TooLarge) => {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
+        }
+    }
     // Checked before the header map is built and the body copied, since a full
     // bridge throws both away. Both handlers check once more before they read
     // the body at all; this one catches a bridge that filled during the read.
@@ -1164,6 +1171,22 @@ fn enqueue(
     // would otherwise be counted against messages that never existed.
     metrics.record_headers(&instance.instance_name, clamped, dropped);
     Json(StatusResponse { status: "queued" }).into_response()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadLengthError {
+    Empty,
+    TooLarge,
+}
+
+fn validate_payload_len(length: usize) -> Result<(), PayloadLengthError> {
+    if length == 0 {
+        Err(PayloadLengthError::Empty)
+    } else if length > MAX_PAYLOAD_SIZE as usize {
+        Err(PayloadLengthError::TooLarge)
+    } else {
+        Ok(())
+    }
 }
 
 fn authorize(
@@ -1355,10 +1378,9 @@ struct InstanceHealth {
     /// Whether a poll has run recently enough to believe one still will.
     ///
     /// `state_submitted` says a change was handed over; this says whether
-    /// anything is still there to hand the next one to. The SDK stops the poll
-    /// task after five consecutive NACKs without calling `close()`, so the
-    /// instance stays registered and keeps accepting mutations that will never
-    /// be persisted. See #3941.
+    /// anything is still there to hand the next one to. A configured NACK
+    /// limit or result-hook failure can stop polling without calling `close()`,
+    /// leaving registered routes that cannot drain or persist mutations.
     ///
     /// Read it with `has_polled`, which separates the two ways this can be
     /// false. `has_polled` false alongside it is an instance still starting
@@ -1386,6 +1408,17 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const STATIC_SECRET: &str = "whsec_static";
+
+    #[test]
+    fn given_invalid_payload_length_should_reject_before_enqueue() {
+        assert_eq!(validate_payload_len(0), Err(PayloadLengthError::Empty));
+        assert_eq!(validate_payload_len(1), Ok(()));
+        assert_eq!(validate_payload_len(MAX_PAYLOAD_SIZE as usize), Ok(()));
+        assert_eq!(
+            validate_payload_len(MAX_PAYLOAD_SIZE as usize + 1),
+            Err(PayloadLengthError::TooLarge)
+        );
+    }
 
     fn config(public_port: u16, admin_port: u16, endpoints: &[&str]) -> HttpSourceConfig {
         let mut config = crate::test_support::config(Some("github"), endpoints);
@@ -1470,6 +1503,17 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(source.shared.sender.len(), 1);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_empty_body_when_posted_should_not_enter_bridge() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(source.shared.sender.len(), 0);
         close(&mut source).await;
     }
 

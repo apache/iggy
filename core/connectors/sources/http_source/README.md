@@ -13,7 +13,7 @@ Loss windows, explicitly:
 1. **Process crash** between HTTP 200 and the producer send. Buffered messages are volatile.
 2. **Producer failure.** Narrowed by #3855, which gave sources a delivery result. The runtime NACKs a batch it could not send, or whose state it could not persist, and neither is abandoned here: a message batch is held and replayed on the next `poll()`, and a state-only batch re-arms the flush so the mutation is handed out again. Answering 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 handlers return once the bridge fills.
 3. **Shutdown.** Narrowed by #3321, which closes the plugin before tearing down the forwarding channel so in-flight batches drain. Messages still in the bridge when the poll task stops are lost; the connector logs the count and increments `http_source_dropped_on_close_total`.
-4. **Poll task stopped by the SDK.** A source is stopped after five consecutive NACKs, roughly 1.5s of backoff plus five send rounds, so a broker outage longer than that ends the poll task while the listener keeps accepting. Whatever the bridge holds is then lost on the next restart, and the stop is unobservable: the runtime's forwarding loop stays parked, so the source keeps being counted as running while nothing polls. Tracked in #3941.
+4. **Poll task stopped by the SDK.** The HTTP source now retries NACKed batches without a fixed stop limit by default, with capped backoff. A configured `max_consecutive_nacks` can still stop it; the runtime reports the stop as `Error` and removes it from the running gauge. Rebuild the plugin with the current SDK to enable stop reporting. A stopped source cannot drain its in-memory bridge, so accepted messages remain at risk until the connector is restarted.
 
 What mitigates this in practice is the caller: webhook senders such as GitHub, Stripe, and Twilio retry on timeout and 5xx, so the sender side is at-least-once up to the moment this connector returns 200. The connector's job is to make the post-200 window as small and as observable as possible.
 
@@ -109,9 +109,11 @@ The stream's `schema` **must be `raw`**. This connector always produces raw bodi
 
 The batch is then replayed on every poll. This source disables the SDK's consecutive-NACK breaker by default because accepted webhooks exist only in its in-memory bridge. Repeated failures back off to a five-second retry delay, and the listener answers 429 once the bridge fills.
 
+Empty bodies are rejected with 400. Bodies beyond Iggy's 64,000,000-byte payload cap are rejected with 413 even if `max_body_size_bytes` allows a larger request. A staged batch that keeps failing for more than 60 seconds makes `/health` and `/admin/health` report unavailable, even while retries continue.
+
 Set `max_consecutive_nacks` in `[plugin_config]` to a positive integer only if an external replay mechanism makes stopping safe. This does not make a mismatched stream schema valid: `schema` lives under `[[streams]]` and the plugin only receives `[plugin_config]`.
 
-Rebuild the HTTP source plugin with SDK 0.6 to get this behavior. An older plugin binary still uses the five-NACK limit.
+Rebuild the HTTP source plugin with SDK 0.6 to get this behavior and the `iggy_source_register_stop_callback` export. An older plugin binary still uses the five-NACK limit and cannot notify the runtime when its poll task stops; the runtime warns when the export is absent.
 
 ### Options
 
@@ -123,7 +125,7 @@ Rebuild the HTTP source plugin with SDK 0.6 to get this behavior. An older plugi
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. A misspelled key reads as unset, so it opens the path rather than failing; see the note on unknown keys below. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
-| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. |
+| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 67108864**; a larger value fails `open()`. The Iggy payload cap of 64,000,000 bytes still applies. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
 | `max_consecutive_nacks` | positive integer | disabled | Optional SDK breaker limit. Omit to keep retrying NACKed batches with capped backoff; set only when accepted events can be replayed after a restart. Zero is invalid. |
@@ -188,11 +190,11 @@ Content-Type: application/json
 | 200 | Accepted into the bridge | `{"status":"queued"}` |
 | 401 | Bearer or HMAC validation failed | `{"error":"unauthorized"}` |
 | 404 | Unknown path, or a revoked or expired endpoint | `{"error":"not found"}` |
-| 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
-| 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
+| 400 | Empty body or malformed request body, e.g. the client reset mid-send | `{"error":"empty payload"}` or `{"error":"bad request"}` |
+| 413 | Body over `max_body_size_bytes` or Iggy's 64,000,000-byte payload cap | `{"error":"payload too large"}` |
 | 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
-| 503 | `GET /health` when an instance on the listener has stopped polling, having previously polled; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
+| 503 | `GET /health` when an instance has stopped polling or its staged batch has failed for more than 60 seconds; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
 
@@ -202,7 +204,7 @@ A 404 there would tell a conventional client the resource is gone, and it would 
 
 The named path's 503 covers two conditions and says `route unavailable` for both: the path was withdrawn, or another instance on the same listener took it over. The caller retries either way, and the body deliberately does not say which, since that would describe the listener's topology to a sender that has no use for it.
 
-`GET /health` on the public listener answers 200 only while every instance on it is serving, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
+`GET /health` on the public listener answers 200 only while every instance on it is serving and its poll path is healthy, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped or whose staged batch is stuck would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
 
 An instance that has not polled yet is not counted, which is a different condition from one that has stopped. Between `open()` and its first `poll()` the runtime finishes the sources it has not reached yet and then every sink, in series, and only then starts the poll tasks; counting that window meant restarting one instance took every healthy sibling out of rotation for the length of it, and on boot the length of it depends on connectors that have nothing to do with this one.
 

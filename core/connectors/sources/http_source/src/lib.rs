@@ -251,6 +251,8 @@ pub struct SharedState {
     /// When the last `poll()` returned. Covers the gap between polls, where
     /// the SDK is awaiting a batch result and nothing is in flight.
     last_poll_at: AtomicU64,
+    /// First NACK of the currently staged webhook batch, or zero if none.
+    staged_nack_since: AtomicU64,
     /// Serializes registry writers, which are all control-plane. The request
     /// path only ever loads the `ArcSwap` and never touches this.
     registry_writer: StdMutex<()>,
@@ -385,10 +387,15 @@ impl SharedState {
     /// bridge for hours, which is the normal state of a quiet gateway. The
     /// timestamp covers the other case, where the SDK is between polls waiting
     /// for a batch result. Neither advances once the poll task has stopped.
+    /// A staged batch that keeps receiving NACKs eventually fails readiness
+    /// even though replay keeps updating the poll timestamp.
     pub fn poll_is_live(&self, now_seconds: u64) -> bool {
-        self.poll_active.load(Ordering::Acquire)
-            || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
-                <= POLL_LIVENESS_SECONDS
+        let staged_nack_since = self.staged_nack_since.load(Ordering::Acquire);
+        (staged_nack_since == 0
+            || now_seconds.saturating_sub(staged_nack_since) <= POLL_LIVENESS_SECONDS)
+            && (self.poll_active.load(Ordering::Acquire)
+                || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
+                    <= POLL_LIVENESS_SECONDS)
     }
 
     /// Marks the instance as having left the route table, before anything
@@ -436,10 +443,9 @@ impl SharedState {
         }
         // Re-posting immediately turns a latched state store into a tight
         // loop: `poll()` produces another state-only batch, the runtime
-        // refuses it for the same reason, and the SDK stops the source after
-        // five of those without calling `close()`. Backing off keeps the
-        // mutation deliverable without spending that budget on a store that
-        // is not going to answer yet. Dropping the permit instead would leave
+        // refuses it for the same reason. Backing off keeps the mutation
+        // deliverable without hammering a store that is not going to answer
+        // yet. Dropping the permit instead would leave
         // an idle gateway, one with no traffic and no further mutations, with
         // no wakeup at all.
         let state_flush = Arc::clone(&self.state_flush);
@@ -539,7 +545,7 @@ pub struct HttpSourceConfig {
     pub max_batch_size: usize,
     /// Omitted to keep retrying NACKed batches; a nonzero value enables the SDK breaker.
     #[serde(default)]
-    pub max_consecutive_nacks: Option<NonZeroU32>,
+    pub max_consecutive_nacks: Option<u32>,
     /// Path segment exposed as `POST /topics/{topic_path}`. Unset disables
     /// the named path, leaving only secret-path endpoints.
     #[serde(default)]
@@ -609,6 +615,11 @@ impl EndpointAuthType {
 
 impl HttpSourceConfig {
     fn validate(&self) -> Result<(), Error> {
+        if self.max_consecutive_nacks == Some(0) {
+            return Err(Error::InvalidConfigValue(
+                "max_consecutive_nacks must be greater than zero".to_string(),
+            ));
+        }
         self.listen_addr.parse::<SocketAddr>().map_err(|error| {
             Error::InvalidConfigValue(format!("listen_addr '{}': {error}", self.listen_addr))
         })?;
@@ -828,6 +839,7 @@ impl HttpSource {
             has_polled: AtomicBool::new(false),
             departed: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
+            staged_nack_since: AtomicU64::new(0),
             registry_writer: StdMutex::new(()),
             state_flush: Arc::new(Notify::new()),
             state_flush_nacks: AtomicU32::new(0),
@@ -907,10 +919,9 @@ impl HttpSource {
     /// that bounded, visible backpressure for silent loss growing with the
     /// length of the outage, and no downstream can detect it.
     ///
-    /// A batch that can never be delivered would replay forever, but this
-    /// connector rejects malformed work at the door rather than mid-stream:
-    /// oversized bodies get 413 before a handler runs, headers are clamped on
-    /// accept, and `Schema::Raw` cannot fail to decode.
+    /// A batch that can never be delivered still replays. Readiness fails once
+    /// it has been NACKed longer than the liveness window, so operators and
+    /// load balancers can see that the accepted work is stuck.
     fn on_nack(&self) -> Result<(), Error> {
         let mut staged = self.lock_staged();
         let Some(batch) = staged.as_mut() else {
@@ -942,6 +953,12 @@ impl HttpSource {
         let nacks = batch.nacks;
         let count = batch.messages.len();
         drop(staged);
+        let _ = self.shared.staged_nack_since.compare_exchange(
+            0,
+            unix_now_seconds(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         warn!(
             "Runtime NACKed {count} messages ({nacks} so far) for {CONNECTOR_NAME} connector ID: {}",
             self.shared.id
@@ -970,8 +987,12 @@ impl Source for HttpSource {
     }
 
     fn batch_policy(&self) -> source::BatchPolicy {
-        source::BatchPolicy::default()
-            .with_max_consecutive_nacks(self.shared.config.max_consecutive_nacks)
+        source::BatchPolicy::default().with_max_consecutive_nacks(
+            self.shared
+                .config
+                .max_consecutive_nacks
+                .and_then(NonZeroU32::new),
+        )
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
@@ -1094,6 +1115,7 @@ impl Source for HttpSource {
         match result {
             source::SourceBatchResult::Ack => {
                 self.lock_staged().take();
+                self.shared.staged_nack_since.store(0, Ordering::Release);
                 // Only the batch that carried the flush clears its backoff,
                 // the same rule `on_nack` already applies. Clearing on every
                 // Ack let traffic zero a counter that traffic knows nothing
@@ -1161,13 +1183,8 @@ impl Source for HttpSource {
 /// that it doubles to an eight second ceiling, which is inside the SDK's
 /// result timeout, so a store that recovers is picked up promptly.
 ///
-/// What a store that never recovers costs depends on whether the gateway is
-/// busy, and only the idle case ends. Idle, every batch is the flush, so its
-/// refusals are consecutive and the SDK stops the source after five. Under
-/// traffic they are not consecutive: each traffic batch Acks and resets the
-/// SDK's counter, so the source runs on indefinitely, retrying at the ceiling.
-/// #3941 is the subject there, not something this connector can fix from the
-/// inside.
+/// A store that never recovers is retried at the ceiling. The HTTP source has
+/// no default NACK stop limit because its accepted webhooks exist only here.
 fn state_flush_retry_delay(attempt: u32) -> Duration {
     match attempt {
         0 => Duration::ZERO,
@@ -1349,13 +1366,37 @@ mod tests {
     }
 
     #[test]
-    fn given_zero_nack_limit_when_deserialized_should_reject() {
-        assert!(
-            serde_json::from_str::<HttpSourceConfig>(
-                r#"{"listen_addr": "127.0.0.1:9090", "max_consecutive_nacks": 0}"#
-            )
-            .is_err()
-        );
+    fn given_zero_nack_limit_when_validated_should_name_field() {
+        let config = parse(r#"{"listen_addr": "127.0.0.1:9090", "max_consecutive_nacks": 0}"#);
+        assert!(matches!(
+            config.validate(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("max_consecutive_nacks")
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_staged_batch_failing_past_liveness_window_should_not_be_ready() {
+        let source = HttpSource::new(1, parse(minimal_config_json()), None);
+        source.shared.poll_active.store(true, Ordering::Release);
+        source.stage(vec![queued("event")]);
+        source
+            .on_nack()
+            .expect("NACK should retain the staged batch");
+        assert_ne!(source.shared.staged_nack_since.load(Ordering::Acquire), 0);
+        source
+            .shared
+            .staged_nack_since
+            .store(100, Ordering::Release);
+
+        assert!(source.shared.poll_is_live(100 + POLL_LIVENESS_SECONDS));
+        assert!(!source.shared.poll_is_live(101 + POLL_LIVENESS_SECONDS));
+
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ACK should clear the staged batch");
+        assert_eq!(source.shared.staged_nack_since.load(Ordering::Acquire), 0);
+        assert!(source.shared.poll_is_live(101 + POLL_LIVENESS_SECONDS));
     }
 
     #[test]
@@ -2471,7 +2512,7 @@ mod tests {
             !source
                 .shared
                 .poll_is_live(returned_at + POLL_LIVENESS_SECONDS + 1),
-            "but a poll task the SDK stopped after five NACKs eventually goes stale, which is what stops readiness reporting ok"
+            "a stopped poll task eventually goes stale and fails readiness"
         );
     }
 

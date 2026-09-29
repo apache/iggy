@@ -61,8 +61,10 @@ let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
 
 `on_batch_result` (added by #3855) is how a source learns what happened to the batch it just
 returned. The SDK keeps exactly one batch in flight: it will not call `poll()` again until this
-returns, and it stops the source after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs, roughly 1.5s
-of backoff, without calling `close()`.
+returns. By default it stops after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs; a source can
+override `batch_policy()` to disable the limit when its accepted input cannot be replayed after
+restart. A stop is reported to the runtime only when the plugin exports the current SDK's stop
+callback, so rebuild older source plugins.
 
 - `Ack` means the runtime sent the batch **and** persisted its state. `Nack` means it could not
   confirm both, which is **not** the same as neither happening: a batch that reached the topic but
@@ -100,8 +102,9 @@ of backoff, without calling `close()`.
   state needed to resume them safely.
 - Keep `State` small - rewritten every batch. No unbounded vecs.
 
-The SDK allows one in-flight batch. Five consecutive NACKs stop the source and
-require a manual restart. Returning `Err` from `on_batch_result` is fatal, so
+The SDK allows one in-flight batch. Five consecutive NACKs stop a source using
+the default policy and require a manual restart. Returning `Err` from
+`on_batch_result` is fatal regardless of the NACK limit, so
 retry transient backend failures inside the callback before returning an error.
 The runtime must report ACK or NACK within the SDK's 30-second batch-result
 window. Once the result is received, the SDK waits for `on_batch_result` to

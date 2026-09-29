@@ -454,11 +454,10 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
 
 /// Warns when a mutation landed on an instance whose poll task looks stopped.
 ///
-/// [`still_joined`] proves only that the instance is registered. The SDK stops
-/// the poll task after five consecutive NACKs without calling `close()`, so an
-/// instance can stay registered and keep answering 201 and 202 for changes
-/// nothing will ever carry to the runtime. `/admin/health` reports the same
-/// pair, as `poll_is_live` and `has_polled`. See #3941.
+/// [`still_joined`] proves only that the instance is registered. A configured
+/// NACK limit or a result-hook failure can stop polling without calling
+/// `close()`, so an instance can stay registered while changes cannot reach
+/// the runtime. `/admin/health` reports `poll_is_live` and `has_polled`.
 fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
     if instance.poll_is_live(unix_now_seconds()) {
         return;

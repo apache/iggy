@@ -334,6 +334,23 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
     fixture.store.conflict_mode.store(true, Ordering::SeqCst);
     wait_for_status(harness, ConnectorStatus::Error).await;
 
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    loop {
+        let source = fetch_source(harness).await;
+        if source
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("NackLimit"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source did not report a restart-required NACK-limit stop"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
     let api_url = harness
         .connectors_runtime()
         .expect("connector runtime should be available")

@@ -35,6 +35,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReport {
+    Ignored,
+    AlreadyError,
+    NewError,
+}
+
 #[derive(Debug)]
 pub struct SourceManager {
     sources: DashMap<String, Arc<Mutex<SourceDetails>>>,
@@ -88,18 +95,7 @@ impl SourceManager {
 
     pub async fn set_error(&self, key: &str, error_message: &str, metrics: Option<&Arc<Metrics>>) {
         if let Some(source) = self.sources.get(key) {
-            let mut source = source.lock().await;
-            // Through the shared transition, so leaving `Running` moves the
-            // gauge. Skipping it left an errored instance counted as running,
-            // and the loop's later `Stopped` could not correct that either,
-            // because by then the old status was `Error` and neither branch
-            // fires.
-            //
-            // The message is assigned after the transition, and that ordering is
-            // what preserves it. `Error` being outside the set that clears
-            // `last_error` is belt and braces here, not the mechanism.
-            source.apply_status(ConnectorStatus::Error, metrics);
-            source.info.last_error = Some(ConnectorError::new(error_message));
+            source.lock().await.record_error(error_message, metrics);
         }
     }
 
@@ -108,20 +104,24 @@ impl SourceManager {
         key: &str,
         error_message: &str,
         metrics: &Arc<Metrics>,
-    ) -> bool {
+    ) -> StopReport {
         let Some(source) = self.sources.get(key).map(|entry| entry.value().clone()) else {
-            return false;
+            return StopReport::Ignored;
         };
         let mut source = source.lock().await;
         if matches!(
             source.info.status,
             ConnectorStatus::Stopping | ConnectorStatus::Stopped
         ) {
-            return false;
+            return StopReport::Ignored;
         }
-        source.apply_status(ConnectorStatus::Error, Some(metrics));
-        source.info.last_error = Some(ConnectorError::new(error_message));
-        true
+        let already_error = source.info.status == ConnectorStatus::Error;
+        source.record_error(error_message, Some(metrics));
+        if already_error {
+            StopReport::AlreadyError
+        } else {
+            StopReport::NewError
+        }
     }
 
     pub async fn recover_from_error(&self, key: &str, metrics: Option<&Arc<Metrics>>) {
@@ -385,6 +385,13 @@ pub struct SourceDetails {
 }
 
 impl SourceDetails {
+    fn record_error(&mut self, message: &str, metrics: Option<&Arc<Metrics>>) {
+        // Update the gauge before storing the error; `apply_status` clears old
+        // error text only when entering Running or Stopped.
+        self.apply_status(ConnectorStatus::Error, metrics);
+        self.info.last_error = Some(ConnectorError::new(message));
+    }
+
     /// Applies a status transition and the gauge move that belongs with it.
     ///
     /// On `&mut self` rather than behind a key, so it can run inside a lock the
@@ -559,15 +566,42 @@ mod tests {
             .update_status("pg", ConnectorStatus::Running, Some(&metrics))
             .await;
 
-        assert!(
+        assert_eq!(
             manager
                 .report_unexpected_stop("pg", "polling stopped", &metrics)
-                .await
+                .await,
+            StopReport::NewError
         );
         let source = manager.get("pg").await.expect("source exists");
         let source = source.lock().await;
         assert_eq!(source.info.status, ConnectorStatus::Error);
         assert_eq!(metrics.get_sources_running(), 0);
+        assert!(source.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn given_batch_error_before_stop_should_not_count_a_second_error() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+        manager
+            .set_error("pg", "batch rejected", Some(&metrics))
+            .await;
+
+        assert_eq!(
+            manager
+                .report_unexpected_stop("pg", "NACK limit reached", &metrics)
+                .await,
+            StopReport::AlreadyError
+        );
+        assert_eq!(metrics.get_sources_running(), 0);
+        let source = manager.get("pg").await.expect("source exists");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
         assert!(source.info.last_error.is_some());
     }
 
@@ -584,10 +618,11 @@ mod tests {
             .update_status("pg", ConnectorStatus::Stopping, Some(&metrics))
             .await;
 
-        assert!(
-            !manager
+        assert_eq!(
+            manager
                 .report_unexpected_stop("pg", "polling stopped", &metrics)
-                .await
+                .await,
+            StopReport::Ignored
         );
         let source = manager.get("pg").await.expect("source exists");
         let source = source.lock().await;

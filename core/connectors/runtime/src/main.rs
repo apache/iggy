@@ -36,6 +36,7 @@ use iggy_connector_sdk::{
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
+use source::RegisterStopCallback;
 use state::StateStorage;
 use std::{
     collections::HashMap,
@@ -510,7 +511,7 @@ struct SourceConnectorProducer {
 
 struct SourceConnectorWrapper {
     handle_callback: HandleCallback,
-    register_stop_callback: Option<extern "C" fn(u32, SourceStoppedCallback) -> i32>,
+    register_stop_callback: Option<RegisterStopCallback>,
     batch_result_callback: BatchResultCallback,
     plugins: Vec<SourceConnectorPlugin>,
 }
