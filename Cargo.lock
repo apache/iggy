@@ -6844,6 +6844,7 @@ dependencies = [
  "iggy_binary_protocol",
  "iggy_common",
  "mockall",
+ "percent-encoding",
  "quinn",
  "rand 0.10.2",
  "rcgen",

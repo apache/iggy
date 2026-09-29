@@ -102,7 +102,7 @@ pub(in crate::http) fn poll_wire_request(
     query: &PollMessages,
 ) -> Result<PollMessagesRequest, IggyError> {
     if query.consumer.kind == ConsumerKind::ConsumerGroup {
-        return Err(IggyError::InvalidCommand);
+        return Err(IggyError::FeatureUnavailable);
     }
     Ok(PollMessagesRequest {
         consumer: WireConsumer {
@@ -153,7 +153,7 @@ pub(in crate::http) fn store_offset_wire_request(
     command: &StoreConsumerOffset,
 ) -> Result<StoreConsumerOffsetRequest, IggyError> {
     if command.consumer.kind == ConsumerKind::ConsumerGroup {
-        return Err(IggyError::InvalidCommand);
+        return Err(IggyError::FeatureUnavailable);
     }
     Ok(StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(&command.consumer)?,
@@ -176,7 +176,7 @@ pub(in crate::http) fn delete_offset_wire_request(
     partition_id: Option<u32>,
 ) -> Result<DeleteConsumerOffsetRequest, IggyError> {
     if consumer.kind == ConsumerKind::ConsumerGroup {
-        return Err(IggyError::InvalidCommand);
+        return Err(IggyError::FeatureUnavailable);
     }
     Ok(DeleteConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer)?,
@@ -428,7 +428,7 @@ mod tests {
             ..Default::default()
         };
         let error = poll_wire_request(&stream_id, &topic_id, &query).expect_err("must reject");
-        assert!(matches!(error, IggyError::InvalidCommand));
+        assert!(matches!(error, IggyError::FeatureUnavailable));
     }
 
     #[test]
@@ -590,7 +590,7 @@ mod tests {
         };
         let error =
             store_offset_wire_request(&stream_id, &topic_id, &command).expect_err("must reject");
-        assert!(matches!(error, IggyError::InvalidCommand));
+        assert!(matches!(error, IggyError::FeatureUnavailable));
     }
 
     #[test]
@@ -604,7 +604,7 @@ mod tests {
             Some(1),
         )
         .expect_err("must reject");
-        assert!(matches!(error, IggyError::InvalidCommand));
+        assert!(matches!(error, IggyError::FeatureUnavailable));
     }
 
     /// Wrap one stored `SendMessages` batch (`[256B header][blob]`) as the

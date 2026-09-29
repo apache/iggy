@@ -24,7 +24,15 @@ use iggy_common::ConsumerOffsetClient;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo};
+use iggy_common::{Consumer, ConsumerOffsetInfo};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// RFC 3986 unreserved characters (`-`, `.`, `_`, `~`).
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
@@ -96,7 +104,7 @@ impl ConsumerOffsetClient for HttpClient {
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            consumer.id
+            utf8_percent_encode(&consumer.id.as_cow_str(), PATH_SEGMENT)
         );
         self.delete_with_query(
             &path,
