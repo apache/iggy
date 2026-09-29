@@ -517,6 +517,52 @@ impl IggyClient {
         })
     }
 
+    /// Closes the current connection. Repeated calls are safe. Call `connect`
+    /// to use the client again. Over TCP and QUIC, that `connect` first waits
+    /// for the rest of `reestablish_after` (5 s by default). The sign-in made
+    /// with `login_user` is dropped, so it must be repeated after reconnecting.
+    /// A client configured with auto-login credentials signs in again on
+    /// `connect`. Over HTTP there is no connection to close and this call does
+    /// nothing.
+    ///
+    /// Known issue: unless reconnection is disabled, the heartbeat of a client
+    /// with auto-login credentials connects it again and signs in within one
+    /// heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the connection cannot be closed.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn disconnect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.disconnect().await.map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
+    /// Closes the connection. Shut down background producers with
+    /// `IggyProducer.shutdown()` and stop iterating consumers before this call,
+    /// because they share the connection. Otherwise background producers drop
+    /// queued messages and consumer iterators hang. Later requests fail with
+    /// `RuntimeError`. Repeated calls are safe. Over HTTP there is no
+    /// connection to close, but the heartbeat that `connect` started keeps
+    /// sending pings until the client is dropped.
+    ///
+    /// Known issue: `disconnect` then `connect` makes the client usable again
+    /// on TCP, QUIC and WebSocket, and WebSocket also accepts `connect` alone.
+    /// See https://github.com/apache/iggy/issues/4287.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client cannot be shut down.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.shutdown().await.map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
     /// Creates a new stream with the provided ID and name.
     /// Raises `RuntimeError` if the stream cannot be created.
     #[pyo3(signature = (name))]

@@ -276,16 +276,14 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
     ASSERT_NO_THROW(ffi_client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0),
                                               "partition_id", partition_id_bytes(0), std::move(messages)));
 
-    auto stream_before_update = client.GetStream(iggy::Identifier::Numeric(stream_id));
-    iggy::ffi::Stats stats_before_update{};
-    ASSERT_NO_THROW({ stats_before_update = ffi_client->get_stats(); });
+    auto stream_before_update      = client.GetStream(iggy::Identifier::Numeric(stream_id));
+    const auto stats_before_update = client.GetStats();
 
     ASSERT_NO_THROW(client.UpdateStream(iggy::Identifier::Numeric(stream_id), updated_stream_name));
 
     ASSERT_THROW(client.GetStream(iggy::Identifier::String(stream_name)), iggy::IggyException);
-    auto stream_after_update = client.GetStream(iggy::Identifier::Numeric(stream_id));
-    iggy::ffi::Stats stats_after_update{};
-    ASSERT_NO_THROW({ stats_after_update = ffi_client->get_stats(); });
+    auto stream_after_update      = client.GetStream(iggy::Identifier::Numeric(stream_id));
+    const auto stats_after_update = client.GetStats();
 
     EXPECT_EQ(stream_after_update.Id(), stream_before_update.Id());
     EXPECT_EQ(stream_after_update.CreatedAt(), stream_before_update.CreatedAt());
@@ -308,11 +306,11 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
     EXPECT_EQ(after_topic.MessagesCount(), before_topic.MessagesCount());
     EXPECT_EQ(after_topic.PartitionsCount(), before_topic.PartitionsCount());
 
-    EXPECT_EQ(stats_after_update.streams_count, stats_before_update.streams_count);
-    EXPECT_EQ(stats_after_update.topics_count, stats_before_update.topics_count);
-    EXPECT_EQ(stats_after_update.partitions_count, stats_before_update.partitions_count);
-    EXPECT_EQ(stats_after_update.segments_count, stats_before_update.segments_count);
-    EXPECT_EQ(stats_after_update.messages_count, stats_before_update.messages_count);
+    EXPECT_EQ(stats_after_update.StreamsCount(), stats_before_update.StreamsCount());
+    EXPECT_EQ(stats_after_update.TopicsCount(), stats_before_update.TopicsCount());
+    EXPECT_EQ(stats_after_update.PartitionsCount(), stats_before_update.PartitionsCount());
+    EXPECT_EQ(stats_after_update.SegmentsCount(), stats_before_update.SegmentsCount());
+    EXPECT_EQ(stats_after_update.MessagesCount(), stats_before_update.MessagesCount());
 }
 
 TEST_F(E2E_Stream, UpdateStreamValidatesNameBounds) {

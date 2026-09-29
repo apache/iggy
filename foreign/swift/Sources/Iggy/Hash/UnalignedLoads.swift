@@ -1,4 +1,3 @@
-// swift-tools-version: 6.0
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -16,27 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import PackageDescription
+extension UnsafeRawBufferPointer {
+    /// The little-endian word at `offset`, which both hashes read from
+    /// arbitrary positions of the input and the secret.
+    @inline(__always)
+    func loadLittleEndianUInt32(at offset: Int) -> UInt32 {
+        UInt32(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt32.self))
+    }
 
-let package = Package(
-    name: "apache-iggy",
-    platforms: [
-        .macOS(.v13),
-        .iOS(.v16),
-        .tvOS(.v16),
-        .watchOS(.v9),
-        .visionOS(.v1),
-    ],
-    products: [
-        .library(name: "Iggy", targets: ["Iggy"])
-    ],
-    targets: [
-        .target(name: "Iggy"),
-        .testTarget(
-            name: "IggyTests",
-            dependencies: ["Iggy"],
-            resources: [.copy("Fixtures")]
-        ),
-    ],
-    swiftLanguageModes: [.v6]
-)
+    @inline(__always)
+    func loadLittleEndianUInt64(at offset: Int) -> UInt64 {
+        UInt64(littleEndian: loadUnaligned(fromByteOffset: offset, as: UInt64.self))
+    }
+}
