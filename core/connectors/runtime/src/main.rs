@@ -138,7 +138,7 @@ fn main() -> Result<(), RuntimeError> {
 
 fn print_config_env_vars() {
     // Collect static template names from ConfigEnv derived configs
-    let mut names: Vec<&'static str> = ConnectorsRuntimeConfig::env_templates()
+    let names: Vec<&'static str> = ConnectorsRuntimeConfig::env_templates()
         .iter()
         .map(|template| template.env_name)
         .chain([
