@@ -24,11 +24,13 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggySegment
 {
     /// <summary>
-    ///     Deletes the last N segments from a partition.
+    ///     Deletes the oldest N sealed segments from a partition.
     /// </summary>
     /// <remarks>
     ///     For example, given a partition with 5 segments, if you delete 2 segments,
-    ///     the partition will have 3 segments left (from 1 to 3).
+    ///     the partition will have 3 segments left (from 3 to 5). The active segment is never deleted,
+    ///     and deletion stops at the lowest offset any consumer or consumer group has committed,
+    ///     so fewer than N segments may be removed.
     ///     Authentication is required, and the permission to manage the segments.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
