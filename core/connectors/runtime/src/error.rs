@@ -43,16 +43,20 @@ pub enum RuntimeError {
         connector_key: String,
         source: iggy_connector_sdk::Error,
     },
-    #[error(transparent)]
-    IggyClient(#[from] iggy::prelude::ClientError),
+    /// Passed through as-is. An `IggyError` that originated on the server
+    /// loses its fields on the wire (apache/iggy#3735): the client reads
+    /// only the status code and fills the rest with defaults, so ids in the
+    /// message can be zero placeholders and not real ids. This is not
+    /// specific to this variant. It applies wherever a server-originated
+    /// `IggyError` is wrapped or stringified, such as
+    /// `iggy::prelude::ClientError::SdkError` or a message built by a
+    /// connector plugin.
     #[error(transparent)]
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
     #[error("Missing TLS certificate file")]
     MissingTlsCertificateFile,
-    #[error(transparent)]
-    JsonError(#[from] serde_json::Error),
     #[error("Sink not found with key: {0}")]
     SinkNotFound(String),
     #[error("Sink config not found with key: {0}, version: {1}")]
@@ -98,7 +102,7 @@ impl RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::{ClientError, IggyError};
+    use iggy::prelude::IggyError;
 
     #[test]
     fn given_iggy_error_when_displayed_should_include_inner_message() {
@@ -115,20 +119,6 @@ mod tests {
     }
 
     #[test]
-    fn given_client_error_when_displayed_should_include_inner_message() {
-        let inner = ClientError::InvalidTransport("carrier-pigeon".to_owned());
-        let expected = inner.to_string();
-
-        let error = RuntimeError::from(inner);
-
-        assert_eq!(
-            error.to_string(),
-            expected,
-            "RuntimeError should carry the ClientError message"
-        );
-    }
-
-    #[test]
     fn given_connector_sdk_error_when_displayed_should_include_inner_message() {
         let inner = iggy_connector_sdk::Error::InitError("bad credentials".to_owned());
         let expected = inner.to_string();
@@ -139,20 +129,6 @@ mod tests {
             error.to_string(),
             expected,
             "RuntimeError should carry the SDK error message"
-        );
-    }
-
-    #[test]
-    fn given_json_error_when_displayed_should_include_inner_message() {
-        let inner = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
-        let expected = inner.to_string();
-
-        let error = RuntimeError::from(inner);
-
-        assert_eq!(
-            error.to_string(),
-            expected,
-            "RuntimeError should carry the JSON error message"
         );
     }
 }

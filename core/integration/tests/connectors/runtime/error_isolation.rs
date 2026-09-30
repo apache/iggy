@@ -430,7 +430,7 @@ async fn given_sink_with_missing_stream_when_runtime_starts_should_expose_iggy_e
     assert!(
         last_error.message.contains("no_such_stream")
             && last_error.message.contains("was not found"),
-        "last_error should carry the Iggy server's reason, got: {}",
+        "last_error should carry the SDK's StreamNameNotFound message, got: {}",
         last_error.message
     );
 
