@@ -180,7 +180,7 @@ fn generate_enum_impl(
         })
         .collect();
 
-    let tag_mapping = tag.clone().map(|tag_name| {
+    let tag_mapping = tag.as_deref().map(|tag_name: &str| {
         let env_segment = tag_name.to_uppercase();
         quote! {
             all_mappings.push(configs::EnvVarMapping {
@@ -416,6 +416,7 @@ fn generate_struct_impl(
                     let env_name = Box::leak(format!("{}_{}", #segment, template.env_name).into_boxed_str());
                     all_templates.push(configs::EnvVarTemplate {
                         env_name,
+                        max_elements: template.max_elements,
                     });
                 }
             }
