@@ -19,13 +19,10 @@
 
 package org.apache.iggy.client.blocking;
 
-import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.message.PollingKind;
-import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -34,7 +31,6 @@ import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 
-import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -81,21 +77,17 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
         messagesClient.sendMessages(
                 STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
 
+        // The send is acknowledged before this runs, so the message must already be visible.
+        assertThat(pollMessages(messagesClient, STREAM_NAME, topicId).messages()).hasSize(1);
+
         // when
         topicsClient.purgeTopic(STREAM_NAME, topicId);
 
         // then
         assertThat(topicsClient.getTopic(STREAM_NAME, topicId)).isPresent();
-
-        var polledMessages = messagesClient.pollMessages(
-                STREAM_NAME,
-                topicId,
-                empty(),
-                Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
-                10L,
-                false);
-        assertThat(polledMessages.messages()).isEmpty();
+        assertThat(pollUntilEmpty(messagesClient, STREAM_NAME, topicId))
+                .as("messages are purged from the topic")
+                .isTrue();
     }
 
     @Test

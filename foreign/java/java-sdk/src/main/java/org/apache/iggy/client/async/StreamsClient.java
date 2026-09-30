@@ -158,7 +158,7 @@ public interface StreamsClient {
      * <p>Unlike {@link #deleteStream(StreamId)}, the stream itself and its topics are kept.
      *
      * @param streamId the numeric stream identifier
-     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @return a {@link CompletableFuture} that completes when the server accepts the purge
      */
     default CompletableFuture<Void> purgeStream(Long streamId) {
         return purgeStream(StreamId.of(streamId));
@@ -170,7 +170,7 @@ public interface StreamsClient {
      * <p>Unlike {@link #deleteStream(StreamId)}, the stream itself and its topics are kept.
      *
      * @param streamId the stream identifier (numeric or string-based)
-     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @return a {@link CompletableFuture} that completes when the server accepts the purge
      * @throws org.apache.iggy.exception.IggyException if the stream does not exist
      */
     CompletableFuture<Void> purgeStream(StreamId streamId);

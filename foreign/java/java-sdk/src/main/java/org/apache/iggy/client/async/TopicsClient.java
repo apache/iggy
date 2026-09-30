@@ -197,7 +197,7 @@ public interface TopicsClient {
      *
      * @param streamId the numeric stream identifier
      * @param topicId  the numeric topic identifier
-     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @return a {@link CompletableFuture} that completes when the server accepts the purge
      */
     default CompletableFuture<Void> purgeTopic(Long streamId, Long topicId) {
         return purgeTopic(StreamId.of(streamId), TopicId.of(topicId));
@@ -210,7 +210,7 @@ public interface TopicsClient {
      *
      * @param streamId the stream identifier containing the topic
      * @param topicId  the topic identifier to purge
-     * @return a {@link CompletableFuture} that completes when the purge is done
+     * @return a {@link CompletableFuture} that completes when the server accepts the purge
      * @throws org.apache.iggy.exception.IggyException if the topic does not exist
      */
     CompletableFuture<Void> purgeTopic(StreamId streamId, TopicId topicId);
