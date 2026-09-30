@@ -97,7 +97,7 @@ fn main() -> Result<(), ServerError> {
         let config = load_config().await?;
         prepare_runtime_dirs(&config, &mut logging, args.fresh).await?;
         let memory_pool_settings = server_common::MemoryPoolSettings::from(&config.memory_pool);
-        server_common::MemoryPool::init_pool(&memo
+        server_common::MemoryPool::init_pool(&memory_pool_settings);
 
         Ok(config)
     });
@@ -105,11 +105,11 @@ fn main() -> Result<(), ServerError> {
     drop(bootstrap_runtime);
 
     let shards = bootstrap(config, args.replica_id)?;
-    if let Err(error) = shards.install_ctrlc_handl
+    if let Err(error) = shards.install_ctrlc_handler() {
         // Without a working SIGINT handler the server has no way to
-        // observe an operator Ctrl-C and the shut
+        // observe an operator Ctrl-C and the shutdown flag would never
         // flip, leaving shard threads parked indefinitely. Fail fast
-        // rather than boot into an un-killable st
+        // rather than boot into an un-killable state.
         error!(error = %error, "failed to install Ctrl-C handler; aborting boot");
         std::process::exit(1);
     }
@@ -123,7 +123,7 @@ fn main() -> Result<(), ServerError> {
     if let Err(error) = &joined
         && descriptors_exhausted()
     {
-        // `fatal` skips destructors, and the log
+        // `fatal` skips destructors, and the log flush must run
         fatal_with_log_flush(
             FatalReason::DescriptorsExhausted,
             &error.to_string(),
