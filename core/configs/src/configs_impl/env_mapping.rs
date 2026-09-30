@@ -38,6 +38,7 @@ pub struct EnvVarTemplate {
     /// Environment variable name, with `<N>` for each array index.
     pub env_name: &'static str,
     /// Maximum element count for each `<N>` placeholder, from left to right.
+    pub max_elements: &'static [usize],
 }
 
 /// Trait for configuration types that provide environment variable mappings.
