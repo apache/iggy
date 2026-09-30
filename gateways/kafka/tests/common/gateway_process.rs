@@ -28,28 +28,16 @@ use std::time::Duration;
 
 use crate::iggy_server::{PortGuard, TestServer, graceful_kill};
 
-/// Locates the already-built `iggy-gateway-kafka` binary. Mirrors `iggy_server.rs`'s
-/// `iggy_server_binary()` exactly - see its doc comment for why an ancestor walk from
-/// `env::current_exe()` beats `assert_cmd::cargo_bin` here.
+/// Locates the already-built `iggy-gateway-kafka` binary.
 ///
-/// # Panics
-///
-/// Panics if `iggy-gateway-kafka` cannot be found alongside this test binary's own target
-/// directory.
+/// Unlike `iggy_server.rs`'s `iggy_server_binary()`, this does not need an ancestor walk from
+/// `env::current_exe()`: that workaround exists because `iggy-server` lives in a *different*
+/// package, where `CARGO_BIN_EXE_*` never resolves. `iggy-gateway-kafka` is this package's own
+/// `[[bin]]` (`Cargo.toml`), so `CARGO_BIN_EXE_iggy-gateway-kafka` is set at compile time and
+/// Cargo builds the binary itself before running this test - same pattern already used in
+/// `gateways/kafka/tools/kafka-tool/tests/generate_cli_tests.rs`.
 fn iggy_gateway_binary() -> PathBuf {
-    let current_exe = std::env::current_exe().expect("resolve this test binary's own path");
-    let binary_name = format!("iggy-gateway-kafka{}", std::env::consts::EXE_SUFFIX);
-    current_exe
-        .ancestors()
-        .map(|dir| dir.join(&binary_name))
-        .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "iggy-gateway-kafka binary not found near {} - build it first with \
-                 `cargo build --package iggy-gateway-kafka --bin iggy-gateway-kafka`",
-                current_exe.display()
-            )
-        })
+    PathBuf::from(env!("CARGO_BIN_EXE_iggy-gateway-kafka"))
 }
 
 pub struct TestGateway {
@@ -103,6 +91,22 @@ impl TestGateway {
                 .await
                 .is_ok()
             {
+                // `PortGuard` only excludes other `PortGuard`-based processes (it never binds
+                // the port itself - see its own doc comment for why not). A prior test's
+                // gateway, orphaned by a hard kill that skipped `Drop`, can still hold this
+                // port: the connect above would then succeed against that stale process, not
+                // ours. Re-checking here catches the common case - our own child already exited
+                // (bind failed, `EADDRINUSE`) by the time a stale listener answers - turning a
+                // confusing pass-then-fail-on-the-wrong-server into the same clear panic as
+                // above, not a silent false pass.
+                if let Some(status) = self.child.try_wait().expect("poll child status") {
+                    panic!(
+                        "iggy-gateway-kafka at {} exited during startup with {status} - the \
+                         successful connect above answered from a stale listener on this port, \
+                         not this process",
+                        self.address
+                    );
+                }
                 return;
             }
             assert!(

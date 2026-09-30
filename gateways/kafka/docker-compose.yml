@@ -43,23 +43,26 @@ services:
     networks:
       - iggy-kafka-gateway
     ports:
-      - 3000:3000
-      - 8080:8080
-      - 8090:8090
-      - 8092:8092
+      - 127.0.0.1:3000:3000
+      - 127.0.0.1:8080:8080
+      - 127.0.0.1:8090:8090
+      - 127.0.0.1:8092:8092
     volumes:
       - iggy-server:/local_data
-    # The gateway's own startup does one bridge connect attempt and exits if it fails - this
-    # gates its start on the server actually answering a command, not just accepting a TCP
-    # connect (a bare connect succeeds before the request-processing loop is wired up; `ping`
-    # is unauthenticated - see core/cli/src/commands/binary_system/ping.rs's
+    # This gates the gateway's start on the server actually answering a command, not just
+    # accepting a TCP connect (a bare connect succeeds before the request-processing loop is
+    # wired up; `ping` is unauthenticated - see core/cli/src/commands/binary_system/ping.rs's
     # `login_required() -> false` - so this still doesn't prove root-user login is ready, only
-    # that the server itself is; the gateway's own bounded bridge-connect retries cover the
-    # remaining gap between "server up" and "root user provisioned").
+    # that the server itself is). Root is seeded during metadata recovery, before the TCP
+    # listeners bind (core/server/src/boot/mod.rs), so there is no "server up, root not ready"
+    # window for the gateway to race against - RECONNECTION_RETRIES in bridge/iggy_bridge/mod.rs
+    # (3 retries after the first attempt, 4 attempts total) exists for transient connect
+    # failures, not for waiting out root provisioning.
     healthcheck:
       test: ["CMD", "/iggy", "ping"]
       interval: 2s
-      timeout: 2s
+      timeout: 5s
+      start_period: 10s
       retries: 30
 
   iggy-gateway-kafka:
@@ -86,7 +89,7 @@ services:
     networks:
       - iggy-kafka-gateway
     ports:
-      - 9093:9093
+      - 127.0.0.1:9093:9093
 
 volumes:
   iggy-server:

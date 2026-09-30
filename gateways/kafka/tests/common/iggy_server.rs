@@ -318,6 +318,22 @@ impl TestServer {
                 .await
                 .is_ok()
             {
+                // `PortGuard` only excludes other `PortGuard`-based processes (it never binds
+                // the port itself - see its own doc comment for why not). A prior test's
+                // server, orphaned by a hard kill that skipped `Drop`, can still hold this
+                // port: the connect above would then succeed against that stale process, not
+                // ours. Re-checking here catches the common case - our own child already exited
+                // (bind failed, `EADDRINUSE`) by the time a stale listener answers - turning a
+                // confusing pass-then-fail-on-the-wrong-server into the same clear panic as
+                // above, not a silent false pass.
+                if let Some(status) = self.child.try_wait().expect("poll child status") {
+                    panic!(
+                        "iggy-server at {} exited during startup with {status} - the successful \
+                         connect above answered from a stale listener on this port, not this \
+                         process",
+                        self.address
+                    );
+                }
                 return;
             }
             assert!(

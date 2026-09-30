@@ -38,12 +38,13 @@ silent skip.
 
 ### `iggy-gateway-kafka` binary (required for `phase1_e2e_tests`)
 
-Same pattern as `iggy-server` above, and both binaries are needed together - this suite spawns
-the compiled gateway itself, bridged to a spawned `iggy-server`:
+`phase1_e2e_tests` spawns the compiled gateway itself, bridged to a spawned `iggy-server`, so
+`iggy-server` still needs the manual build step above. `iggy-gateway-kafka` does not: it is this
+package's own `[[bin]]`, so `CARGO_BIN_EXE_iggy-gateway-kafka` resolves at compile time and Cargo
+builds it automatically as part of `cargo test -p iggy-gateway-kafka`.
 
 ```bash
 cargo build --package server --bin iggy-server
-cargo build --package iggy-gateway-kafka --bin iggy-gateway-kafka
 cargo test -p iggy-gateway-kafka
 ```
 

@@ -78,16 +78,16 @@ fn build_create_topics_request(topic: &str, num_partitions: i32) -> Bytes {
     enc.freeze()
 }
 
-/// `(error_code, num_partitions)` from the first (only) topic result.
-fn decode_create_topics_response(body: Bytes) -> (i16, i32) {
+/// `(error_code, error_message, num_partitions)` from the first (only) topic result.
+fn decode_create_topics_response(body: Bytes) -> (i16, Option<String>, i32) {
     let mut d = Decoder::new(body);
     let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
     let _topics_plus_one = d.read_varint().expect("topics array count");
     let _name = d.read_compact_nullable_string().expect("topic name");
     let error_code = d.read_i16().expect("error_code");
-    let _error_message = d.read_compact_nullable_string().expect("error_message");
+    let error_message = d.read_compact_nullable_string().expect("error_message");
     let num_partitions = d.read_i32().expect("num_partitions");
-    (error_code, num_partitions)
+    (error_code, error_message, num_partitions)
 }
 
 fn build_metadata_request(topic: &str) -> Bytes {
@@ -102,18 +102,26 @@ fn build_metadata_request(topic: &str) -> Bytes {
     enc.freeze()
 }
 
-/// `(topic error_code, leader_id of partition 0)` for the single requested topic.
-fn decode_metadata_response(body: Bytes) -> (i16, i32) {
+/// `(topic error_code, leader_id of partition 0, first broker's host, first broker's port)` for
+/// the single requested topic.
+fn decode_metadata_response(body: Bytes) -> (i16, i32, Option<String>, i32) {
     let mut d = Decoder::new(body);
     let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
 
     let brokers_plus_one = d.read_varint().expect("brokers array count");
-    for _ in 1..brokers_plus_one {
+    assert!(brokers_plus_one >= 2, "at least one broker in the list");
+    let mut broker_host = None;
+    let mut broker_port = 0;
+    for i in 1..brokers_plus_one {
         d.read_i32().expect("node_id");
-        d.read_compact_nullable_string().expect("host");
-        d.read_i32().expect("port");
+        let host = d.read_compact_nullable_string().expect("host");
+        let port = d.read_i32().expect("port");
         d.read_compact_nullable_string().expect("rack");
         d.read_tagged_fields().expect("broker tagged fields");
+        if i == 1 {
+            broker_host = host;
+            broker_port = port;
+        }
     }
     d.read_compact_nullable_string().expect("cluster_id");
     d.read_i32().expect("controller_id");
@@ -129,7 +137,7 @@ fn decode_metadata_response(body: Bytes) -> (i16, i32) {
     d.read_i16().expect("partition error_code");
     d.read_i32().expect("partition_index");
     let leader_id = d.read_i32().expect("leader_id");
-    (error_code, leader_id)
+    (error_code, leader_id, broker_host, broker_port)
 }
 
 fn record(offset: i64, value: &[u8]) -> Record {
@@ -225,7 +233,7 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
     let gateway = TestGateway::spawn(&server).await;
     let addr: SocketAddr = gateway.address.parse().expect("gateway address");
 
-    let (_corr, body) = round_trip(
+    let (corr, body) = round_trip(
         addr,
         API_KEY_CREATE_TOPICS,
         CREATE_TOPICS_VERSION,
@@ -233,11 +241,16 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         &build_create_topics_request(TOPIC, 1),
     )
     .await;
-    let (error_code, num_partitions) = decode_create_topics_response(body);
+    assert_eq!(corr, 1, "correlation id must echo the request");
+    let (error_code, error_message, num_partitions) = decode_create_topics_response(body);
     assert_eq!(error_code, ERROR_NONE, "CreateTopics must succeed");
+    assert_eq!(
+        error_message, None,
+        "no error_message on a successful result"
+    );
     assert_eq!(num_partitions, 1);
 
-    let (_corr, body) = round_trip(
+    let (corr, body) = round_trip(
         addr,
         API_KEY_METADATA,
         METADATA_VERSION,
@@ -245,12 +258,23 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         &build_metadata_request(TOPIC),
     )
     .await;
-    let (error_code, leader_id) = decode_metadata_response(body);
+    assert_eq!(corr, 2, "correlation id must echo the request");
+    let (error_code, leader_id, broker_host, broker_port) = decode_metadata_response(body);
     assert_eq!(error_code, ERROR_NONE, "Metadata must report the new topic");
     assert_eq!(leader_id, 1, "this gateway is the sole broker");
+    assert_eq!(
+        broker_host.as_deref(),
+        Some(addr.ip().to_string().as_str()),
+        "Metadata must advertise the address a client can actually reach this gateway on"
+    );
+    assert_eq!(
+        broker_port,
+        i32::from(addr.port()),
+        "Metadata must advertise the port this gateway is actually listening on"
+    );
 
     let records = [record(0, b"phase1-hello"), record(1, b"phase1-world")];
-    let (_corr, body) = round_trip(
+    let (corr, body) = round_trip(
         addr,
         API_KEY_PRODUCE,
         PRODUCE_VERSION,
@@ -258,11 +282,12 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         &build_produce_request(TOPIC, &records),
     )
     .await;
+    assert_eq!(corr, 3, "correlation id must echo the request");
     let (error_code, base_offset) = decode_produce_response(body);
     assert_eq!(error_code, ERROR_NONE, "Produce must succeed");
     assert_eq!(base_offset, 0, "first batch into an empty partition");
 
-    let (_corr, body) = round_trip(
+    let (corr, body) = round_trip(
         addr,
         API_KEY_LIST_OFFSETS,
         LIST_OFFSETS_VERSION,
@@ -270,6 +295,7 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         &build_list_offsets_request(TOPIC),
     )
     .await;
+    assert_eq!(corr, 4, "correlation id must echo the request");
     let (error_code, offset) = decode_list_offsets_response(body);
     assert_eq!(error_code, ERROR_NONE, "ListOffsets must succeed");
     assert_eq!(offset, 2, "high watermark after two produced records");

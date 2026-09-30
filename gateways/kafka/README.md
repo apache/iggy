@@ -51,7 +51,8 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 
 ## Quick start (Docker Compose)
 
-The fastest way to see a Kafka client talk to Iggy: two containers, no local Rust toolchain.
+The fastest way to see a Kafka client talk to Iggy: two containers, no local Rust toolchain to
+build them. (Reading the record back below uses `docker compose exec`, not a local build either.)
 
 ```text
                     Kafka wire (TCP 9093)              Iggy wire (TCP 8090)
@@ -64,9 +65,10 @@ cd gateways/kafka
 docker compose up --build
 ```
 
-First run compiles two release binaries from scratch under the workspace's `lto = true,
-codegen-units = 1` profile (no build cache mount) - budget several minutes for `--build` alone
-the first time; subsequent runs without a source change reuse Docker's image cache.
+First run compiles three release binaries (`iggy`, `iggy-server`, `iggy-gateway-kafka`) plus the
+web UI's static assets from scratch under the workspace's `lto = true, codegen-units = 1` profile
+(no build cache mount) - budget several minutes for `--build` alone the first time; subsequent
+runs without a source change reuse Docker's image cache.
 
 This starts `iggy-server` (the real Iggy broker) and `iggy-gateway-kafka` (bridge enabled,
 pointed at that server) on a shared Docker network, with the gateway waiting for the server's
@@ -78,7 +80,8 @@ kcat -b 127.0.0.1:9093 -L
 ```
 
 A full create-topic-then-produce flow needs a client that can send `CreateTopics` (there is no
-auto-create on Produce). With Python's `kafka-python`:
+auto-create on Produce). With Python's `kafka-python` (illustrative - not exercised by an
+automated test, so adjust if the library's API has moved since this was written):
 
 ```python
 from kafka.admin import KafkaAdminClient, NewTopic
@@ -95,7 +98,7 @@ Fetch is unimplemented (see the stub warning above), so read the record back thr
 directly rather than a Kafka consumer:
 
 ```bash
-cargo run -p iggy-cli -- --username iggy --password iggy-gateway-quickstart \
+docker compose exec iggy-server /iggy --username iggy --password iggy-gateway-quickstart \
   message poll kafka orders 0 --offset 0 --message-count 1
 ```
 
@@ -108,10 +111,11 @@ gateway's `IGGY_KAFKA_IGGY_PASSWORD` is known ahead of time - never reuse them o
 stack. See `gateways/kafka/docker-compose.yml` and the environment variable tables below for
 every other knob.
 
-**Limitations** (see the stub warning above for the full list): Fetch is unimplemented, so no
-Kafka consumer can read back through the gateway - poll Iggy directly with the `iggy` CLI or SDK
-instead. Single gateway, single Iggy node: no partition rebalancing, no consumer groups, no SASL
-by default. This is a development quick start, not a production deployment shape. Neither this
+**Limitations** (see the stub warning above for the full list): Fetch is unimplemented, so a
+Kafka consumer group can form and get assigned partitions, but cannot actually read anything back
+through the gateway yet - poll Iggy directly with the `iggy` CLI or SDK instead. Single gateway,
+single Iggy node, SASL off by default. This is a development quick start, not a production
+deployment shape. Neither this
 quick start nor `phase1_e2e_tests.rs` exercises crash/restart durability (stopping and
 restarting `iggy-server` against its existing volume, then re-reading) - both only prove a
 produced record is readable from the still-live process that wrote it.

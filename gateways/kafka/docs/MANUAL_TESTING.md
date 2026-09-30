@@ -297,7 +297,7 @@ for CreateTopics, and so on).
 | F5 | Oversized frame | Send 4-byte length > 8 MiB | Connection rejected/closed, no OOM |
 | F6 | Graceful shutdown | Ctrl+C on gateway | Log "shutdown requested", in-flight requests drain |
 
-### Category G — Real Kafka client (kcat)
+### Category G — Real Kafka client (kcat, Java console consumer)
 
 Requires `kcat` installed. Gateway does **not** implement SASL or full broker semantics — expect limited success. This category predates the bridge landing: G2/G3's "fails at metadata" framing assumes an unbridged gateway, and no longer holds with `IGGY_KAFKA_BRIDGE_ENABLED=true` against a topic that was actually created first. See Category I for the bridged, docker-compose flow.
 
@@ -437,8 +437,8 @@ kcat version (if used): ___________
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
 [ ] F1–F6  TCP / connection behavior
-[ ] G1–G3  kcat client (record errors for G2/G3)
-[ ] H1–H3  Adversarial input
+[ ] G1–G8  kcat / Java client (record errors for G2/G3)
+[ ] H1–H6  Adversarial input
 [ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 
 Automated regression:
