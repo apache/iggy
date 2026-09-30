@@ -72,7 +72,7 @@ async fn given_capped_sockets_when_they_close_or_fail_the_upgrade_should_free_th
     bus.install_client_fd(
         fd,
         test_client_meta(1, ClientTransportKind::Tcp),
-        cap.try_acquire(),
+        cap.try_acquire().expect("a free slot"),
         on_request.clone(),
     );
 
@@ -82,7 +82,7 @@ async fn given_capped_sockets_when_they_close_or_fail_the_upgrade_should_free_th
     bus.install_client_ws_fd(
         fd,
         test_client_meta(2, ClientTransportKind::Ws),
-        cap.try_acquire(),
+        cap.try_acquire().expect("a free slot"),
         on_request,
     );
 

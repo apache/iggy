@@ -55,9 +55,12 @@ impl CacheMetricEntry {
 /// [threads_count:4]
 /// [free_disk_space:8]
 /// [total_disk_space:8]
-/// [open_files_count:8]
-/// [open_files_limit:8]
+/// [open_files_count:8][open_files_limit:8]
 /// ```
+///
+/// The last two fields are an optional tail. A server older than them ends
+/// the reply at `total_disk_space`, and both decode as 0. A tail shorter than
+/// 16 bytes fails the decode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsResponse {
     pub process_id: u32,
@@ -94,7 +97,7 @@ pub struct StatsResponse {
 
 // Fixed-size numeric header before the variable-length string section.
 const NUMERIC_HEADER_SIZE: usize =
-    4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 4 + 4; // 104
+    4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 4 + 4; // 108
 
 fn encode_len_prefixed_str(buf: &mut BytesMut, s: &str) {
     #[allow(clippy::cast_possible_truncation)]

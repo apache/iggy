@@ -359,7 +359,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: client install is unreachable");
@@ -369,7 +369,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: ws client install is unreachable");
@@ -380,7 +380,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: tcp tls client install is unreachable");
@@ -391,7 +391,7 @@ impl ConnectionInstaller for SharedSimOutbox {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
         panic!("simulator has no fd transfer: wss client install is unreachable");

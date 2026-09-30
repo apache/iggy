@@ -149,7 +149,7 @@ impl ConnectionInstaller for SpyBus {
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -157,7 +157,7 @@ impl ConnectionInstaller for SpyBus {
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -166,7 +166,7 @@ impl ConnectionInstaller for SpyBus {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -175,7 +175,7 @@ impl ConnectionInstaller for SpyBus {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
-        _permit: Option<ConnectionPermit>,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }

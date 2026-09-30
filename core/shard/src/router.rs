@@ -735,7 +735,7 @@ where
                     "installing delegated client fd"
                 );
                 self.bus
-                    .install_client_fd(fd, meta, Some(permit), self.on_client_request.clone());
+                    .install_client_fd(fd, meta, permit, self.on_client_request.clone());
             }
             LifecycleFrame::ClientWsConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
@@ -744,12 +744,8 @@ where
                     raw_fd = fd.as_raw_fd(),
                     "installing delegated WS client fd (pre-upgrade)"
                 );
-                self.bus.install_client_ws_fd(
-                    fd,
-                    meta,
-                    Some(permit),
-                    self.on_client_request.clone(),
-                );
+                self.bus
+                    .install_client_ws_fd(fd, meta, permit, self.on_client_request.clone());
             }
             LifecycleFrame::ClientTcpTlsConnectionSetup {
                 fd,
@@ -767,7 +763,7 @@ where
                     fd,
                     meta,
                     config,
-                    Some(permit),
+                    permit,
                     self.on_client_request.clone(),
                 );
             }
@@ -787,7 +783,7 @@ where
                     fd,
                     meta,
                     config,
-                    Some(permit),
+                    permit,
                     self.on_client_request.clone(),
                 );
             }

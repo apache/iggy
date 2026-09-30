@@ -122,22 +122,27 @@ async fn load_offsets<S: DurableStorage, T>(
     construct: impl Fn(ConsumerOffset) -> T,
 ) -> Result<RecoveredOffsets<T>, IggyError> {
     trace!(?kind, path, "loading consumer offsets");
+    // Read-only, but a failed listing fails the partition load, which stops
+    // the server at boot, so it counts like a write open. The directory opens
+    // on the scan worker, so that failure can also arrive as the first entry.
     let mut dir_entries = storage
         .regular_files(Path::new(path))
         .await
+        .note_descriptor_exhaustion(|| format!("listing directory {path}"))
         .map_err(|error| {
             warn!(?kind, path, %error, "failed to enumerate offset directory");
             IggyError::CannotReadConsumerOffsets(path.to_owned())
         })?;
     let mut recovered = RecoveredOffsets::default();
     while let Some(entry) = dir_entries.next().await {
-        let entry_path = match entry {
-            Ok(path) => path,
-            Err(error) => {
-                warn!(?kind, path, %error, "failed to enumerate offset directory");
-                return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
-            }
-        };
+        let entry_path =
+            match entry.note_descriptor_exhaustion(|| format!("listing directory {path}")) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(?kind, path, %error, "failed to enumerate offset directory");
+                    return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
+                }
+            };
         let name = entry_path
             .file_name()
             .unwrap_or_default()

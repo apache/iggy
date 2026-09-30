@@ -1117,7 +1117,11 @@ async fn ensure_contiguous_chain(
 fn sweep_scratch_files_and_collect_offsets(
     partition_path: &str,
 ) -> Result<Vec<u64>, PartitionRecoveryError> {
-    let entries = match fs::read_dir(partition_path) {
+    // The recovery opens are read-only, but a failed one fails the partition
+    // load, which stops the server at boot, so they count like write opens.
+    let entries = match fs::read_dir(partition_path)
+        .note_descriptor_exhaustion(|| format!("listing directory {partition_path}"))
+    {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
@@ -1511,17 +1515,22 @@ async fn load_index_anchors(
     if file_len(index_path)? == 0 {
         return Ok((0, None, None));
     }
-    let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %index_path,
-            error = %source,
-            "failed to open sparse index during recovery"
-        );
-        source
-    })?;
+    // Opened here, not by `IggyIndexReader::new`, which drops the `io::Error`.
+    let file = compio::fs::File::open(index_path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {index_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to open sparse index during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
+    let reader = IggyIndexReader::from_file(index_path, file);
     let entry_count = reader.entry_count().await.map_err(|source| {
         error!(
             stream_id = identity.stream_id,
@@ -2252,17 +2261,19 @@ async fn find_provable_index_anchor(
             searched_entries: 0,
         });
     };
-    let file = fs::File::open(index_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %index_path,
-            error = %source,
-            "failed to open sparse index for anchor search during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })?;
+    let file = fs::File::open(index_path)
+        .note_descriptor_exhaustion(|| format!("opening {index_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to open sparse index for anchor search during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
     let mut raw = [0u8; IGGY_INDEX_SIZE];
     // Lowest log byte a probed entry has already paid for; the next probed
     // entry is budgeted by the span from its own position up to here.
@@ -2377,28 +2388,32 @@ async fn index_is_consistent(
     messages_size: u64,
     scratch: &mut ScanScratch,
 ) -> Result<IndexValidation, PartitionRecoveryError> {
-    let index_file = fs::File::open(index_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %index_path,
-            error = %source,
-            "failed to open sparse index for validation during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })?;
-    let messages_file = fs::File::open(messages_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %messages_path,
-            error = %source,
-            "failed to open segment log for sparse index validation"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })?;
+    let index_file = fs::File::open(index_path)
+        .note_descriptor_exhaustion(|| format!("opening {index_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to open sparse index for validation during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
+    let messages_file = fs::File::open(messages_path)
+        .note_descriptor_exhaustion(|| format!("opening {messages_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %messages_path,
+                error = %source,
+                "failed to open segment log for sparse index validation"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
     let ScanScratch {
         window: index_window,
         spill: log_window,
@@ -2513,17 +2528,19 @@ fn open_messages_file(
     identity: PartitionIdentity<'_>,
     messages_path: &str,
 ) -> Result<fs::File, PartitionRecoveryError> {
-    fs::File::open(messages_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %messages_path,
-            error = %source,
-            "failed to open a segment messages file during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })
+    fs::File::open(messages_path)
+        .note_descriptor_exhaustion(|| format!("opening {messages_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %messages_path,
+                error = %source,
+                "failed to open a segment messages file during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })
 }
 
 /// The batch header at `position`, or `None` when the walk must stop there

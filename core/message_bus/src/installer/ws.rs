@@ -44,7 +44,7 @@ pub fn install_client_ws(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: compio_ws::WebSocketStream<TcpStream>,
-    permit: Option<ConnectionPermit>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -52,7 +52,7 @@ pub fn install_client_ws(
         bus,
         meta,
         WsTransportConn::new_server(stream).with_close_grace(cfg.close_grace),
-        permit,
+        Some(permit),
         on_request,
     );
 }

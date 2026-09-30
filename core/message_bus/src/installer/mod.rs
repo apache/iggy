@@ -107,7 +107,7 @@ pub trait ConnectionInstaller {
         &self,
         fd: DupedFd,
         meta: ClientConnMeta,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     );
 
@@ -124,7 +124,7 @@ pub trait ConnectionInstaller {
         &self,
         fd: DupedFd,
         meta: ClientConnMeta,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     );
 
@@ -135,7 +135,7 @@ pub trait ConnectionInstaller {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     );
 
@@ -146,7 +146,7 @@ pub trait ConnectionInstaller {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     );
 
@@ -194,7 +194,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         &self,
         fd: DupedFd,
         meta: ClientConnMeta,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
@@ -205,7 +205,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         &self,
         fd: DupedFd,
         meta: ClientConnMeta,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
@@ -243,7 +243,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
@@ -255,7 +255,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
-        permit: Option<ConnectionPermit>,
+        permit: ConnectionPermit,
         on_request: RequestHandler,
     ) {
         let stream = fd_transfer::wrap_duped_fd(fd);

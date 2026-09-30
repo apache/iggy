@@ -21,7 +21,7 @@ use iggy_common::IggyTimestamp;
 use nix::errno::Errno;
 use nix::sys::resource::{Resource, getrlimit};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Why the process is stopping. The discriminant is the exit status, one per
 /// condition; `1` stays the binary's generic startup failure.
@@ -36,10 +36,11 @@ pub enum FatalReason {
     /// The replica was already fenced quorum-invisible, so exiting hands the
     /// wedge to a supervisor instead of a log reader.
     SuperblockWedged = 3,
-    /// The server stopped on an error after a storage open for a write or a
-    /// sync failed because the process (`EMFILE`) or the host (`ENFILE`) had no
-    /// free file descriptor. The exit comes after the ordinary shutdown, so the
-    /// shards flushed what they could. See [`NoteDescriptorExhaustion`].
+    /// The server stopped on an error after a storage open for a write, a sync
+    /// or a partition load failed because the process (`EMFILE`) or the host
+    /// (`ENFILE`) had no free file descriptor. The exit comes after the
+    /// ordinary shutdown, so the shards flushed what they could. See
+    /// [`NoteDescriptorExhaustion`].
     ///
     /// The other reasons keep their own status after such a failure, for
     /// example a superblock that stays unwritable for lack of a descriptor
@@ -104,18 +105,20 @@ pub fn fatal_with_log_flush(reason: FatalReason, message: &str, flush_logs: impl
 /// Storage results that record a missing file descriptor for the exit status.
 ///
 /// Only for opens that write, create, truncate or sync, and for read-only
-/// opens that are one step of such a write: the existence probes of segment
-/// setup, or an open that exists only to sync. The error still goes to the
-/// caller, whose own handling decides what happens. A failed partition write
-/// fences the partition and stops the server through the shutdown flush, and a
-/// failed partition build retries. Stopping at the open instead would skip that
-/// flush and lose committed messages that are not yet in a segment.
+/// opens that are one step of such a write or of a partition load: the
+/// existence probes of segment setup, an open that exists only to sync, and
+/// the reads of partition recovery. The error still goes to the caller, whose
+/// own handling decides what happens. A failed partition write fences the
+/// partition and stops the server through the shutdown flush. Stopping at the
+/// open instead would skip that flush and lose committed messages that are not
+/// yet in a segment. A failed partition load stops the server at boot, and at
+/// run time the reconciler retries it on a later pass.
 ///
 /// If the server then stops on an error, it exits with
 /// [`FatalReason::DescriptorsExhausted`] instead of 1. A stop through
-/// [`fatal`] keeps the status of its own reason. A failed read fails only its
-/// own request, so reads do not record it, and accept loops do not either, see
-/// `message_bus::accept`.
+/// [`fatal`] keeps the status of its own reason. Any other failed read fails
+/// only its own request, so it does not record, and accept loops do not
+/// either, see `message_bus::accept`.
 ///
 /// The record lasts for the life of the process. An exhaustion that the server
 /// recovers from, such as a superblock write that succeeds on a retry, therefore
@@ -129,21 +132,15 @@ pub trait NoteDescriptorExhaustion: Sized {
     fn note_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self;
 }
 
-/// Microseconds since the Unix epoch of the first noted exhaustion, or 0 for
-/// none.
-static FIRST_DESCRIPTOR_EXHAUSTION: AtomicU64 = AtomicU64::new(0);
+/// The time of the first noted exhaustion.
+static FIRST_DESCRIPTOR_EXHAUSTION: OnceLock<IggyTimestamp> = OnceLock::new();
 
 impl<T> NoteDescriptorExhaustion for io::Result<T> {
     fn note_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self {
         if let Err(error) = &self
             && is_descriptor_exhaustion(error)
             && FIRST_DESCRIPTOR_EXHAUSTION
-                .compare_exchange(
-                    0,
-                    IggyTimestamp::now().as_micros().max(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .set(IggyTimestamp::now())
                 .is_ok()
         {
             tracing::error!(
@@ -160,7 +157,7 @@ impl<T> NoteDescriptorExhaustion for io::Result<T> {
     }
 }
 
-/// Whether a storage write open of this process failed with `EMFILE` or
+/// Whether a recorded storage open of this process failed with `EMFILE` or
 /// `ENFILE`. See [`NoteDescriptorExhaustion`].
 #[must_use]
 pub fn descriptors_exhausted() -> bool {
@@ -168,10 +165,7 @@ pub fn descriptors_exhausted() -> bool {
 }
 
 fn first_descriptor_exhaustion() -> Option<IggyTimestamp> {
-    match FIRST_DESCRIPTOR_EXHAUSTION.load(Ordering::Relaxed) {
-        0 => None,
-        micros => Some(IggyTimestamp::from(micros)),
-    }
+    FIRST_DESCRIPTOR_EXHAUSTION.get().copied()
 }
 
 /// `EMFILE` (this process is at its `RLIMIT_NOFILE`) or `ENFILE` (the host is

@@ -51,7 +51,7 @@ pub fn install_client_wss(
     meta: ClientConnMeta,
     stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
-    permit: Option<ConnectionPermit>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -69,7 +69,7 @@ pub fn install_client_wss(
             .with_close_grace(cfg.close_grace)
             .with_handshake_grace(cfg.handshake_grace)
             .with_ws_config(cfg.ws_config),
-        permit,
+        Some(permit),
         on_request,
     );
 }

@@ -46,7 +46,7 @@ pub fn install_client_tcp(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: TcpStream,
-    permit: Option<ConnectionPermit>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let client_id = meta.client_id;
@@ -56,7 +56,13 @@ pub fn install_client_tcp(
             "nodelay failed on delegated client fd: {e}"
         );
     }
-    install_client_conn(bus, meta, TcpTransportConn::new(stream), permit, on_request);
+    install_client_conn(
+        bus,
+        meta,
+        TcpTransportConn::new(stream),
+        Some(permit),
+        on_request,
+    );
 }
 
 /// Install a pre-wrapped client connection on the bus. Generic over

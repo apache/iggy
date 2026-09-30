@@ -665,6 +665,28 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_segment_read_error_when_loading_artifact_should_classify_the_os_error() {
+        // The open succeeds on a directory, and the read then fails with EISDIR.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let entry = consensus::StateArtifact {
+            kind: artifact_kind::SEGMENT_LOG,
+            frontier: 0,
+            len: 1,
+            checksum: 0,
+        };
+
+        let error =
+            load_verified_segment_artifact(directory.path().to_str().expect("UTF-8 path"), &entry)
+                .await
+                .expect_err("a directory holds no segment bytes");
+
+        assert!(
+            matches!(&error, SegmentLoadError::Stale(source) if source.raw_os_error().is_some()),
+            "the read error must reach the classification with its OS code, got {error:?}"
+        );
+    }
+
+    #[compio::test]
     async fn given_transient_offset_io_failure_when_retried_should_succeed_without_exhausting_budget()
      {
         let attempts = std::cell::Cell::new(0);

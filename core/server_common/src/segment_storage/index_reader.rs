@@ -15,12 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use compio::fs::OpenOptions;
-use err_trail::ErrContext;
-use iggy_common::IggyError;
 use tracing::trace;
-
-use crate::fatal::NoteDescriptorExhaustion;
 
 /// Path handle for a segment's index file, validated openable at segment
 /// build. Reads go through the partition's own index reader; this exists so
@@ -31,25 +26,14 @@ pub struct IndexReader {
 }
 
 impl IndexReader {
-    /// Opens the index file read-only to prove it exists, then drops the
-    /// descriptor: nothing reads through this type.
-    pub async fn new(file_path: &str) -> Result<Self, IggyError> {
-        // Read-only, but one step of segment setup, so it counts like a write open.
-        OpenOptions::new()
-            .read(true)
-            .open(file_path)
-            .await
-            .note_descriptor_exhaustion(|| format!("opening {file_path}"))
-            .error(|e: &std::io::Error| format!("Failed to open index file: {file_path}. {e}"))
-            .map_err(|_| IggyError::CannotReadFile)?;
-
-        trace!("Validated index file for reading: {file_path}");
-        Ok(Self {
-            file_path: file_path.to_string(),
-        })
-    }
-
     pub fn path(&self) -> String {
         self.file_path.clone()
+    }
+
+    pub(super) fn from_validated_path(file_path: &str) -> Self {
+        trace!("Validated index file for reading: {file_path}");
+        Self {
+            file_path: file_path.to_owned(),
+        }
     }
 }

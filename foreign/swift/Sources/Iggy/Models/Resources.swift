@@ -484,7 +484,7 @@ public struct Stats: Sendable, Hashable {
         startTime: IggyTimestamp, readBytes: UInt64, writtenBytes: UInt64, messagesSizeBytes: UInt64, streamsCount: UInt32, topicsCount: UInt32,
         partitionsCount: UInt32, segmentsCount: UInt32, messagesCount: UInt64, clientsCount: UInt32, consumerGroupsCount: UInt32, hostname: String,
         osName: String, osVersion: String, kernelVersion: String, iggyServerVersion: String, iggyServerSemver: UInt32?, cacheMetrics: [CacheMetrics],
-        threadsCount: UInt32, freeDiskSpace: UInt64, totalDiskSpace: UInt64, openFilesCount: UInt64 = 0, openFilesLimit: UInt64 = 0
+        threadsCount: UInt32, freeDiskSpace: UInt64, totalDiskSpace: UInt64, openFilesCount: UInt64, openFilesLimit: UInt64
     ) {
         self.processID = processID
         self.cpuUsage = cpuUsage

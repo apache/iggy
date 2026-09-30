@@ -95,7 +95,7 @@ impl SegmentStorage {
             messages_size: None,
             messages_reader: Some(Rc::new(messages_reader)),
             index_size: Some(Rc::new(AtomicU64::new(indexes_size))),
-            index_reader: Some(Rc::new(IndexReader::new(index_path).await?)),
+            index_reader: Some(Rc::new(IndexReader::from_validated_path(index_path))),
         })
     }
 
@@ -108,8 +108,8 @@ impl SegmentStorage {
     ) -> Result<Self, IggyError> {
         prepare_for_writes(messages_path, "messages", messages_size, file_exists).await?;
         prepare_for_writes(index_path, "index", indexes_size, file_exists).await?;
-        let messages_reader = Rc::new(MessagesReader::new(messages_path).await?);
-        let index_reader = Rc::new(IndexReader::new(index_path).await?);
+        let messages_reader = Rc::new(MessagesReader::from_validated_path(messages_path));
+        let index_reader = Rc::new(IndexReader::from_validated_path(index_path));
         Ok(Self {
             messages_size: Some(Rc::new(AtomicU64::new(messages_size))),
             messages_reader: Some(messages_reader),
@@ -131,9 +131,10 @@ impl SegmentStorage {
     }
 }
 
-/// Open a segment file for writes as its appending writer will, then close
-/// it. A new file is created empty. An existing file must be `expected_size`
-/// bytes long, and it is synced, so the truncation of recovery is durable.
+/// Open a segment file for reads and writes, then close it. The open proves
+/// that the readers and the appending writer can open the file. A new file is
+/// created empty. An existing file must be `expected_size` bytes long, and it
+/// is synced, so the truncation of recovery is durable.
 ///
 /// The appending writer opens its own descriptor, so keeping this one open
 /// would cost a descriptor per segment and serve nothing.
@@ -144,7 +145,7 @@ async fn prepare_for_writes(
     file_exists: bool,
 ) -> Result<(), IggyError> {
     let mut options = OpenOptions::new();
-    options.create(true).write(true);
+    options.create(true).read(true).write(true);
     // `file_exists = false` asserts a fresh start; truncate so a
     // stale file from a partial prior attempt doesn't survive.
     if !file_exists {
