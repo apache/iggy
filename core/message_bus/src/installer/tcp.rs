@@ -21,12 +21,12 @@
 
 use super::common::drain_rejected_registration;
 use super::conn_info::ClientConnMeta;
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::lifecycle::{FusedShutdown, InstanceToken, Shutdown, ShutdownToken};
 use crate::socket_opts::apply_nodelay_for_connection;
 use crate::transports::tcp::TcpTransportConn;
 use crate::transports::{ActorContext, TransportConn};
+use crate::{ConnectionPermit, IggyMessageBus};
 use async_channel::Receiver;
 use compio::net::TcpStream;
 use futures::FutureExt;
@@ -46,6 +46,7 @@ pub fn install_client_tcp(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: TcpStream,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let client_id = meta.client_id;
@@ -55,7 +56,13 @@ pub fn install_client_tcp(
             "nodelay failed on delegated client fd: {e}"
         );
     }
-    install_client_conn(bus, meta, TcpTransportConn::new(stream), on_request);
+    install_client_conn(
+        bus,
+        meta,
+        TcpTransportConn::new(stream),
+        Some(permit),
+        on_request,
+    );
 }
 
 /// Install a pre-wrapped client connection on the bus. Generic over
@@ -63,11 +70,16 @@ pub fn install_client_tcp(
 /// [`super::replica::install_replica_conn`].
 ///
 /// Connections arriving after shutdown starts are dropped before registration.
+///
+/// `permit` is the connection's slot in the node's connection cap, or `None`
+/// for a connection that does not count (QUIC). The transport task holds it,
+/// so the slot frees on every exit path once the socket is closed.
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub fn install_client_conn<C: TransportConn>(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     conn: C,
+    permit: Option<ConnectionPermit>,
     on_request: RequestHandler,
 ) {
     if bus.is_shutting_down() {
@@ -114,6 +126,8 @@ pub fn install_client_conn<C: TransportConn>(
     let aborted_transport = Rc::clone(&install_aborted);
     let token_for_transport = Rc::clone(&install_token);
     let transport_handle = compio::runtime::spawn(async move {
+        // Bound first so it drops last, after `conn` has closed the socket.
+        let _permit = permit;
         // Scopeguard so the registry slot is evicted on PANIC as well as
         // clean exit. compio's `spawn` wraps the future with
         // `AssertUnwindSafe(future).catch_unwind()` which silently swallows

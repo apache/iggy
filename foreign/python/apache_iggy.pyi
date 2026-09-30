@@ -2802,6 +2802,22 @@ class Stats:
         0 when the server does not know its data directory or the disk probe
         fails.
         """
+    @property
+    def open_files_count(self) -> builtins.int:
+        r"""
+        The number of file descriptors the server process holds open.
+
+        0 when unknown. Where the kernel cannot count them without a scan
+        (Linux before 6.2, macOS), the server scans at least every 10 seconds,
+        so the count can be 10 seconds old.
+        """
+    @property
+    def open_files_limit(self) -> builtins.int:
+        r"""
+        The soft limit on open file descriptors of the server process.
+
+        0 when unknown.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final

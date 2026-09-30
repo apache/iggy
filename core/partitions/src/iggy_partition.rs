@@ -1646,7 +1646,7 @@ where
         if !committed_restored && !append_restored {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             namespace_raw = self.consensus().group(),
             offset_frontier = frontier,
             offset_reserved = reserved,
@@ -4143,7 +4143,7 @@ where
         }
         let file_backed =
             self.log.storages().iter().any(|storage| {
-                storage.messages_reader.is_some() || storage.messages_writer.is_some()
+                storage.messages_reader.is_some() || storage.messages_size.is_some()
             });
         if file_backed {
             PartitionDirResolution::Unresolvable
@@ -7162,8 +7162,7 @@ where
         self.install_empty_segment(config, start_offset).await?;
         self.stats.increment_segments_count(1);
 
-        let sealed_storage = &mut self.log.storages_mut()[sealed_index];
-        let _ = sealed_storage.shutdown();
+        self.log.storages_mut()[sealed_index].seal();
         self.log.messages_writers_mut()[sealed_index] = None;
         self.log.index_writers_mut()[sealed_index] = None;
         // Drop the sealed segment's in-memory index cache: only the ACTIVE
@@ -7310,13 +7309,11 @@ where
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
             // victim is the front once the previous one is gone.
-            let Some((segment, mut storage)) = self.log.retire_front() else {
+            let Some((segment, storage)) = self.log.retire_front() else {
                 break;
             };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
 
             for path in messages_path
                 .into_iter()
@@ -7431,10 +7428,9 @@ where
             None
         } else {
             let messages_size_bytes = storage
-                .messages_writer
-                .as_ref()
-                .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
-                .size_counter();
+                .messages_size
+                .clone()
+                .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
             Some(Rc::new(
                 MessagesWriter::new(
                     &messages_path,
@@ -7448,10 +7444,9 @@ where
             ))
         };
         let index_size_bytes = storage
-            .index_writer
-            .as_ref()
-            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
-            .size_counter();
+            .index_size
+            .clone()
+            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?;
         let index_writer = Rc::new(
             IggyIndexWriter::new(&index_path, index_size_bytes, persisted, false)
                 .await
@@ -7502,12 +7497,10 @@ where
             if segment.size.as_bytes_u64() > 0 || segment.start_offset >= frontier {
                 break;
             }
-            let Some((segment, mut storage)) = self.log.retire_back() else {
+            let Some((segment, storage)) = self.log.retire_back() else {
                 break;
             };
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
             for path in messages_path
                 .into_iter()
                 .chain(index_path)
@@ -7775,13 +7768,11 @@ where
         // Drain every segment (including the active one) and unlink its files.
         let segment_count = self.log.segments().len();
         for _ in 0..segment_count {
-            let Some((segment, mut storage)) = self.log.retire_front() else {
+            let Some((segment, storage)) = self.log.retire_front() else {
                 break;
             };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
 
             for path in messages_path
                 .into_iter()
@@ -9184,13 +9175,82 @@ mod tests {
                         .log
                         .storages()
                         .iter()
-                        .all(|storage| storage.messages_writer.is_none())
+                        .all(|storage| storage.messages_size.is_none())
                 );
                 assert!(partition.log.messages_writers().iter().all(Option::is_none));
                 assert!(partition.log.index_writers().last().unwrap().is_some());
                 assert_eq!(partition.consensus().commit_min(), 1);
             }
         }
+    }
+
+    #[compio::test]
+    async fn given_multi_segment_transfer_when_installing_should_keep_writers_on_the_tail_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        partition.set_partition_dir(partition_dir.clone());
+        for kind in ["consumers", "groups"] {
+            std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
+        }
+        partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
+        partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
+        let mut prepares = Vec::new();
+        let mut parent = 0;
+        for offset in 0..3u64 {
+            let prepare = checksummed_segment_prepare(offset + 1, parent, offset, b"transferred");
+            parent = prepare.header().checksum;
+            prepares.push(prepare);
+        }
+        let mut staged = Vec::new();
+        for (offset, prepare) in (0u64..).zip(&prepares) {
+            let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+            let artifact = consensus::StateArtifact::for_bytes(
+                consensus::state_manifest::artifact_kind::SEGMENT_LOG,
+                offset,
+                &body,
+            );
+            staged.push(
+                partition
+                    .spill_transfer_segment(&artifact, body)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let last = prepares.last().unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            prepare_checksum: Some(last.header().checksum),
+            checkpoint_prepare: last.as_slice().to_vec(),
+            purge_generation: 0,
+            next_offset: 3,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            dedup: Vec::new(),
+        };
+        partition
+            .install_state_transfer(&repair_config(), 3, staged, &offsets.encode(), 0)
+            .await
+            .unwrap();
+
+        let tail = partition.log.segments().len() - 1;
+        assert_eq!(
+            tail, 2,
+            "each staged segment must install as its own segment"
+        );
+        for index in 0..tail {
+            let storage = &partition.log.storages()[index];
+            assert!(
+                storage.messages_size.is_none() && storage.index_size.is_none(),
+                "sealed segment {index} must not keep write cursors"
+            );
+            assert!(
+                partition.log.messages_writers()[index].is_none()
+                    && partition.log.index_writers()[index].is_none(),
+                "sealed segment {index} must not keep a writer open"
+            );
+        }
+        assert!(partition.log.storages()[tail].index_size.is_some());
+        assert!(partition.log.index_writers()[tail].is_some());
     }
 
     #[compio::test]

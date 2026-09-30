@@ -96,8 +96,7 @@ pub(in crate::http) async fn read_local(
 ) -> Result<Bytes, ReadError> {
     gate_local_read(state, identity, consistency, code, rule).await?;
     let clients_count = if code == GET_STATS_CODE {
-        u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
-            .unwrap_or(u32::MAX)
+        u32::try_from(SendWrapper::new(state.shard.count_all_clients()).await).unwrap_or(u32::MAX)
     } else {
         0
     };

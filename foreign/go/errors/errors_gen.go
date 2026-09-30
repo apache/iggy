@@ -1358,6 +1358,17 @@ func (e TooManyTopics) Is(target error) bool {
 	return ok
 }
 
+type PartitionsLimitReached struct{}
+
+func (e PartitionsLimitReached) Error() string {
+	return "partitions limit reached, raise [metadata] partitions_max"
+}
+func (e PartitionsLimitReached) Code() Code { return 2022 }
+func (e PartitionsLimitReached) Is(target error) bool {
+	_, ok := target.(PartitionsLimitReached)
+	return ok
+}
+
 type CannotCreatePartition struct {
 	PartitionId uint32
 	StreamId    uint32
@@ -2778,6 +2789,7 @@ var (
 	ErrInvalidPartitionsCount                     = InvalidPartitionsCount{}
 	ErrTopicDirectoryNotFound                     = TopicDirectoryNotFound{}
 	ErrTooManyTopics                              = TooManyTopics{}
+	ErrPartitionsLimitReached                     = PartitionsLimitReached{}
 	ErrCannotCreatePartition                      = CannotCreatePartition{}
 	ErrCannotCreatePartitionsDirectory            = CannotCreatePartitionsDirectory{}
 	ErrCannotCreatePartitionDirectory             = CannotCreatePartitionDirectory{}
@@ -3022,6 +3034,7 @@ const (
 	InvalidPartitionsCountCode                     Code = 2019
 	TopicDirectoryNotFoundCode                     Code = 2020
 	TooManyTopicsCode                              Code = 2021
+	PartitionsLimitReachedCode                     Code = 2022
 	CannotCreatePartitionCode                      Code = 3000
 	CannotCreatePartitionsDirectoryCode            Code = 3001
 	CannotCreatePartitionDirectoryCode             Code = 3002
@@ -3388,6 +3401,8 @@ func (c Code) String() string {
 		return "TopicDirectoryNotFound"
 	case TooManyTopicsCode:
 		return "TooManyTopics"
+	case PartitionsLimitReachedCode:
+		return "PartitionsLimitReached"
 	case CannotCreatePartitionCode:
 		return "CannotCreatePartition"
 	case CannotCreatePartitionsDirectoryCode:
@@ -3873,6 +3888,8 @@ func FromCode(code Code) IggyError {
 		return ErrTopicDirectoryNotFound
 	case TooManyTopicsCode:
 		return ErrTooManyTopics
+	case PartitionsLimitReachedCode:
+		return ErrPartitionsLimitReached
 	case CannotCreatePartitionCode:
 		return ErrCannotCreatePartition
 	case CannotCreatePartitionsDirectoryCode:

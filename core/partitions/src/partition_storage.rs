@@ -370,16 +370,8 @@ pub async fn ensure_initial_segment<B: MessageBus>(
     // Share the storage's size counters: they are the write cursors. A private
     // counter would let the append position diverge from the segment
     // bookkeeping that index entries and poll bounds rely on.
-    let messages_size_counter = storage
-        .messages_writer
-        .as_ref()
-        .map(|writer| writer.size_counter())
-        .unwrap_or_default();
-    let index_size_counter = storage
-        .index_writer
-        .as_ref()
-        .map(|writer| writer.size_counter())
-        .unwrap_or_default();
+    let messages_size_counter = storage.messages_size.clone().unwrap_or_default();
+    let index_size_counter = storage.index_size.clone().unwrap_or_default();
     let messages_writer = if wal_owned_messages {
         None
     } else {
@@ -523,39 +515,34 @@ pub async fn hydrate_partition_log<B: MessageBus>(
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
         let storage = &partition.log.storages()[active_index];
-        if storage.messages_writer.is_none()
-            && let (Some(index_reader), Some(index_writer)) =
-                (&storage.index_reader, &storage.index_writer)
+        if storage.messages_size.is_none()
+            && let (Some(index_reader), Some(index_size)) =
+                (&storage.index_reader, &storage.index_size)
         {
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
-                IggyIndexWriter::new(
-                    &index_reader.path(),
-                    index_writer.size_counter(),
-                    persisted,
-                    true,
-                )
-                .await?,
+                IggyIndexWriter::new(&index_reader.path(), Rc::clone(index_size), persisted, true)
+                    .await?,
             ));
             return Ok(());
         }
         if let (
             Some(messages_reader),
             Some(index_reader),
-            Some(storage_messages_writer),
-            Some(storage_index_writer),
+            Some(storage_messages_size),
+            Some(storage_index_size),
         ) = (
             storage.messages_reader.as_ref(),
             storage.index_reader.as_ref(),
-            storage.messages_writer.as_ref(),
-            storage.index_writer.as_ref(),
+            storage.messages_size.as_ref(),
+            storage.index_size.as_ref(),
         ) {
             let index_path = index_reader.path();
             let start_offset = partition.log.segments()[active_index].start_offset;
             // Share the storage's size counters: they are the write cursors.
             // A private counter would let the append position diverge from the
             // segment bookkeeping that index entries and poll bounds rely on.
-            let messages_size_counter = storage_messages_writer.size_counter();
-            let index_size_counter = storage_index_writer.size_counter();
+            let messages_size_counter = Rc::clone(storage_messages_size);
+            let index_size_counter = Rc::clone(storage_index_size);
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
                 MessagesWriter::new(
                     &messages_reader.path(),

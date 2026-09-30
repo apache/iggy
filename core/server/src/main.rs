@@ -23,11 +23,15 @@ mod banner;
 use args::Args;
 use clap::Parser;
 use configs::{ConfigEnvMappings, print_env_var_names, server::ServerConfig};
-use server::boot::{apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs};
+use server::boot::{
+    apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
+    raise_open_file_limit,
+};
 use server::server_error::ServerError;
+use server_common::fatal::{FatalReason, descriptors_exhausted, fatal_with_log_flush};
 use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn main() -> Result<(), ServerError> {
     // This prelude must stay ahead of the first thread the process ever
@@ -51,7 +55,7 @@ fn main() -> Result<(), ServerError> {
     #[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
     info!("Using mimalloc allocator");
     #[cfg(not(all(feature = "mimalloc", not(feature = "disable-mimalloc"))))]
-    tracing::warn!("Using the default system allocator");
+    warn!("Using the default system allocator");
     if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
         let _ = dotenvy::from_path(&env_path);
     } else {
@@ -62,6 +66,19 @@ fn main() -> Result<(), ServerError> {
 
     // Before shard threads pin themselves: a pinned capture sees one core.
     capture_allowed_cpus();
+
+    // Before bootstrap: partition persistence sizes its offset-file budget
+    // from the soft limit it reads first, and nothing else raises it except a
+    // side effect of sysinfo's first process refresh on Linux.
+    match raise_open_file_limit() {
+        Ok(limit) => info!(
+            soft_before = limit.soft_before,
+            soft = limit.soft,
+            hard = limit.hard,
+            "open-file limit (RLIMIT_NOFILE) set"
+        ),
+        Err(error) => warn!(error = %error, "open-file limit (RLIMIT_NOFILE) left unchanged"),
+    }
 
     let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
@@ -80,7 +97,7 @@ fn main() -> Result<(), ServerError> {
         let config = load_config().await?;
         prepare_runtime_dirs(&config, &mut logging, args.fresh).await?;
         let memory_pool_settings = server_common::MemoryPoolSettings::from(&config.memory_pool);
-        server_common::MemoryPool::init_pool(&memory_pool_settings);
+        server_common::MemoryPool::init_pool(&memo
 
         Ok(config)
     });
@@ -88,11 +105,11 @@ fn main() -> Result<(), ServerError> {
     drop(bootstrap_runtime);
 
     let shards = bootstrap(config, args.replica_id)?;
-    if let Err(error) = shards.install_ctrlc_handler() {
+    if let Err(error) = shards.install_ctrlc_handl
         // Without a working SIGINT handler the server has no way to
-        // observe an operator Ctrl-C and the shutdown flag would never
+        // observe an operator Ctrl-C and the shut
         // flip, leaving shard threads parked indefinitely. Fail fast
-        // rather than boot into an un-killable state.
+        // rather than boot into an un-killable st
         error!(error = %error, "failed to install Ctrl-C handler; aborting boot");
         std::process::exit(1);
     }
@@ -103,12 +120,24 @@ fn main() -> Result<(), ServerError> {
     if let Err(error) = &joined {
         server::boot::systemd::notify_shutdown_failure(error);
     }
+    if let Err(error) = &joined
+        && descriptors_exhausted()
+    {
+        // `fatal` skips destructors, and the log
+        fatal_with_log_flush(
+            FatalReason::DescriptorsExhausted,
+            &error.to_string(),
+            || {
+                drop(logging);
+            },
+        );
+    }
     joined?;
     info!("server shutdown complete");
     Ok(())
 }
 
-fn print_config_env_vars() -> std::io::Result<()> {
+fn print_config_env_vars() -> std::io::Result<()>
     print_env_var_names(
         ServerConfig::env_templates()
             .iter()

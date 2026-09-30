@@ -188,8 +188,7 @@ pub use state_transfer::{
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver, Sender, channel as oneshot_channel};
 
-mod fatal;
-pub use fatal::{FatalReason, fatal};
+pub use server_common::fatal::{FatalReason, fatal};
 
 mod impls;
 pub use impls::*;

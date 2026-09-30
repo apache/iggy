@@ -31,8 +31,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
@@ -82,6 +83,7 @@ pub struct ServerHandle {
     test_transport: Option<iggy_common::TransportProtocol>,
     mcp: Option<McpHandle>,
     connectors_runtime: Option<ConnectorsRuntimeHandle>,
+    open_files_limit: Option<u64>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -706,6 +708,7 @@ impl ServerHandle {
             test_transport: None,
             mcp: None,
             connectors_runtime: None,
+            open_files_limit: None,
         }
     }
 
@@ -733,6 +736,13 @@ impl ServerHandle {
     /// `impl Into<String>`.
     pub fn set_executable_path(&mut self, path: Option<String>) {
         self.config.executable_path = path;
+    }
+
+    /// Set the soft and hard `RLIMIT_NOFILE` of the next `start()`, or `None`
+    /// to inherit the limits of the test process. The server raises its soft
+    /// limit to the hard one at boot, so only a lowered hard limit holds.
+    pub fn set_open_files_limit(&mut self, limit: Option<u64>) {
+        self.open_files_limit = limit;
     }
 
     /// Configure MCP server for this iggy server.
@@ -877,6 +887,7 @@ impl TestBinary for ServerHandle {
             test_transport: None,
             mcp: None,
             connectors_runtime: None,
+            open_files_limit: None,
         }
     }
 
@@ -968,6 +979,25 @@ impl TestBinary for ServerHandle {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
+
+        if let Some(limit) = self.open_files_limit {
+            let rlimit = libc::rlimit {
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: limit as libc::rlim_t,
+            };
+            // SAFETY: the hook runs in the forked child before `exec`, where
+            // only async-signal-safe calls are sound. `setrlimit` is one, and
+            // the hook touches nothing but its own copy of `rlimit`.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
 
         // `--replica-id` is the single identity input expected by the
         // server when cluster mode is enabled; all other cluster config is
@@ -1130,6 +1160,38 @@ impl ServerHandle {
             let _ = child.wait();
         }
         Ok(())
+    }
+
+    /// Disarm the watchdog ahead of an exit the test causes on purpose. The
+    /// watchdog panics on any exit, and its reap would take the exit status
+    /// that [`Self::wait_for_exit`] reports.
+    pub fn expect_exit(&mut self) {
+        self.stop_watchdog();
+    }
+
+    /// Wait up to `timeout` for the server to exit by itself, after
+    /// [`Self::expect_exit`], and return its exit status. Restart it
+    /// afterwards with [`TestBinary::start`].
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, TestBinaryError> {
+        let child = self
+            .child_handle
+            .as_mut()
+            .ok_or(TestBinaryError::NotStarted)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child_handle = None;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(TestBinaryError::InvalidState {
+                    message: format!(
+                        "the server was still running {timeout:?} after the test expected it to exit"
+                    ),
+                });
+            }
+            sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
+        }
     }
 
     /// Names this node in the log dumps. A cluster failure prints every
