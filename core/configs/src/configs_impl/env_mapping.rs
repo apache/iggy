@@ -74,3 +74,120 @@ pub trait ConfigEnvMappings {
             .collect()
     }
 }
+
+impl EnvVarTemplate {
+    /// Expands this template into every concrete env-var name it represents,
+    /// substituting each `<N>` placeholder left-to-right with `0..limit`.
+    /// A leaf template (`max_elements: &[]`) expands to itself.
+    pub fn expand_names(&self) -> Vec<String> {
+        if self.max_elements.is_empty() {
+            return vec![self.env_name.to_string()];
+        }
+
+        let mut results = vec![self.env_name.to_string()];
+
+        for &limit in self.max_elements {
+            let mut next = Vec::new();
+            for name in results {
+                for i in 0..limit {
+                    next.push(name.replacen("<N>", &i.to_string(), 1));
+                }
+            }
+            results = next;
+        }
+
+        results
+    }
+}
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use crate::server::ServerConfig;
+    use crate::cluster::ClusterConfig;
+    use crate::McpServerConfig;
+    use configs::runtime::ConnectorsRuntimeConfig;
+    use configs::connectors::{SinkConfig, SourceConfig};
+
+    #[test]
+    fn server_config_templates_and_mappings_align() {
+        let expanded: HashSet<String> = ServerConfig::env_templates()
+            .iter()
+            .flat_map(|t| t.expand_names())
+            .collect();
+        let mapped: HashSet<String> = ServerConfig::env_mappings()
+            .iter()
+            .map(|m| m.env_name.to_string())
+            .collect();
+        assert_eq!(expanded, mapped, "ServerConfig env_templates and env_mappings must align");
+    }
+
+    #[test]
+    fn cluster_config_templates_and_mappings_align() {
+        let expanded: HashSet<String> = ClusterConfig::env_templates()
+            .iter()
+            .flat_map(|t| t.expand_names())
+            .collect();
+        let mapped: HashSet<String> = ClusterConfig::env_mappings()
+            .iter()
+            .map(|m| m.env_name.to_string())
+            .collect();
+        assert_eq!(expanded, mapped, "ClusterConfig env_templates and env_mappings must align");
+    }
+
+    #[test]
+    fn mcp_server_config_templates_and_mappings_align() {
+        let expanded: HashSet<String> = McpServerConfig::env_templates()
+            .iter()
+            .flat_map(|t| t.expand_names())
+            .collect();
+        let mapped: HashSet<String> = McpServerConfig::env_mappings()
+            .iter()
+            .map(|m| m.env_name.to_string())
+            .collect();
+        assert_eq!(expanded, mapped, "McpServerConfig env_templates and env_mappings must align");
+    }
+
+    #[test]
+    fn connectors_runtime_config_templates_and_mappings_align() {
+        let expanded: HashSet<String> = ConnectorsRuntimeConfig::env_templates()
+            .iter()
+            .flat_map(|t| t.expand_names())
+            .collect();
+        let mapped: HashSet<String> = ConnectorsRuntimeConfig::env_mappings()
+            .iter()
+            .map(|m| m.env_name.to_string())
+            .collect();
+        assert_eq!(
+            expanded, mapped,
+            "ConnectorsRuntimeConfig env_templates and env_mappings must align"
+        );
+    }
+
+    #[test]
+    fn sink_config_templates_and_mappings_align() {
+        let expanded: HashSet<String> = SinkConfig::env_templates()
+            .iter()
+            .flat_map(|t| t.expand_names())
+            .collect();
+        let mapped: HashSet<String> = SinkConfig::env_mappings()
+            .iter()
+            .map(|m| m.env_name.to_string())
+            .collect();
+        assert_eq!(expanded, mapped, "SinkConfig env_templates and env_mappings must align");
+    }
+
+    #[test]
+    fn source_config_templates_and_mappings_align() {
+        let expanded: HashSet<String> = SourceConfig::env_templates()
+            .iter()
+            .flat_map(|t| t.expand_names())
+            .collect();
+        let mapped: HashSet<String> = SourceConfig::env_mappings()
+            .iter()
+            .map(|m| m.env_name.to_string())
+            .collect();
+        assert_eq!(expanded, mapped, "SourceConfig env_templates and env_mappings must align");
+    }
+}
