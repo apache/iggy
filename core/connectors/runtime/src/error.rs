@@ -32,7 +32,7 @@ pub enum RuntimeError {
     FailedToSerializeMessagesMetadata,
     #[error("Failed to serialize raw messages")]
     FailedToSerializeRawMessages,
-    #[error("Connector SDK error")]
+    #[error(transparent)]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
     /// A classified state-store failure while loading an enabled source's
     /// state. Process-level: treating it as "no state" would silently rewind
@@ -43,16 +43,20 @@ pub enum RuntimeError {
         connector_key: String,
         source: iggy_connector_sdk::Error,
     },
-    #[error("Iggy client error")]
-    IggyClient(#[from] iggy::prelude::ClientError),
-    #[error("Iggy error")]
+    /// Passed through as-is. An `IggyError` that originated on the server
+    /// loses its fields on the wire (apache/iggy#3735): the client reads
+    /// only the status code and fills the rest with defaults, so ids in the
+    /// message can be zero placeholders and not real ids. This is not
+    /// specific to this variant. It applies wherever a server-originated
+    /// `IggyError` is wrapped or stringified, such as
+    /// `iggy::prelude::ClientError::SdkError` or a message built by a
+    /// connector plugin.
+    #[error(transparent)]
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
     #[error("Missing TLS certificate file")]
     MissingTlsCertificateFile,
-    #[error("JSON error")]
-    JsonError(#[from] serde_json::Error),
     #[error("Sink not found with key: {0}")]
     SinkNotFound(String),
     #[error("Sink config not found with key: {0}, version: {1}")]
@@ -92,5 +96,39 @@ impl RuntimeError {
             RuntimeError::TokenFileEmpty(_) => "invalid_configuration",
             _ => "error",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::IggyError;
+
+    #[test]
+    fn given_iggy_error_when_displayed_should_include_inner_message() {
+        let inner = IggyError::StreamNameNotFound("orders".to_owned());
+        let expected = inner.to_string();
+
+        let error = RuntimeError::from(inner);
+
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "RuntimeError should carry the IggyError message"
+        );
+    }
+
+    #[test]
+    fn given_connector_sdk_error_when_displayed_should_include_inner_message() {
+        let inner = iggy_connector_sdk::Error::InitError("bad credentials".to_owned());
+        let expected = inner.to_string();
+
+        let error = RuntimeError::from(inner);
+
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "RuntimeError should carry the SDK error message"
+        );
     }
 }
