@@ -4548,9 +4548,11 @@ where
                 // request room -> buffer; both full -> drop+warn (client retries
                 // via read-timeout).
                 if consensus.pipeline_is_full() {
-                    let push_result = consensus.push_queued_request(
-                        consensus::RequestEntry::with_sender(message, reply.take()),
-                    );
+                    let entry = consensus::RequestEntry::with_sender(message, reply.take())
+                        .with_consumer_offset_history(
+                            consumer_offset.is_some().then_some(self.poll_history),
+                        );
+                    let push_result = consensus.push_queued_request(entry);
                     if let Err(mut refused) = push_result {
                         emit_partition_diag(
                             tracing::Level::WARN,
@@ -4655,13 +4657,6 @@ where
         while promoted < slots_freed {
             let req = self.consensus().pop_queued_request();
             let Some(mut req) = req else { break };
-            let parsed_store = (req.message.header().operation == Operation::StoreConsumerOffset)
-                .then(|| {
-                    Self::parse_consumer_offset_request(
-                        Operation::StoreConsumerOffset,
-                        &req.message,
-                    )
-                });
             let context = req.take_auto_commit();
             // History and capacity ownership can change while the request
             // waits for a prepare slot, so admission alone is not sufficient.
@@ -4671,8 +4666,7 @@ where
                         .consumer_offset_capacity_for(context.reservation.kind())
                         .owns(&context.reservation)
             }) {
-                consecutive_denials += 1;
-                if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                if Self::record_promotion_denial(&mut consecutive_denials) {
                     break;
                 }
                 continue;
@@ -4681,6 +4675,40 @@ where
             // Taken before the preflight so a refusal answers the parked waiter
             // instead of waking it with `Canceled`.
             let mut reply_sender = req.take_reply_sender();
+            if req
+                .consumer_offset_history()
+                .is_some_and(|history| history != self.poll_history)
+            {
+                // An old offset can fit the replacement history, and an old
+                // delete can erase a replacement checkpoint. Refuse before
+                // projection with a terminal error so clients do not replay it.
+                let error = Self::parse_consumer_offset_request(
+                    req.message.header().operation,
+                    &req.message,
+                )
+                .map_or(
+                    IggyError::InvalidCommand,
+                    |(_, consumer_id, offset, _)| {
+                        offset.map_or_else(
+                            || IggyError::ConsumerOffsetNotFound(consumer_id as usize),
+                            IggyError::InvalidOffset,
+                        )
+                    },
+                );
+                if self
+                    .deny_queued_request(
+                        req.message.header(),
+                        error.as_code(),
+                        "queued offset history deny reply send failed",
+                        reply_sender.take(),
+                        &mut consecutive_denials,
+                    )
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
             if !self
                 .admit_reserved_send(&req.message, &mut reply_sender)
                 .await
@@ -4688,33 +4716,40 @@ where
                 break;
             }
 
+            let parsed_store = (req.message.header().operation == Operation::StoreConsumerOffset)
+                .then(|| {
+                    Self::parse_consumer_offset_request(
+                        Operation::StoreConsumerOffset,
+                        &req.message,
+                    )
+                });
             if let Some(parsed) = parsed_store {
                 let Ok((kind, consumer_id, Some(offset), _)) = parsed else {
-                    Self::send_partition_deny_or_log(
-                        self.consensus(),
-                        req.message.header(),
-                        IggyError::InvalidCommand.as_code(),
-                        "queued consumer offset parse deny reply send failed",
-                        reply_sender.take(),
-                    )
-                    .await;
-                    consecutive_denials += 1;
-                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    if self
+                        .deny_queued_request(
+                            req.message.header(),
+                            IggyError::InvalidCommand.as_code(),
+                            "queued consumer offset parse deny reply send failed",
+                            reply_sender.take(),
+                            &mut consecutive_denials,
+                        )
+                        .await
+                    {
                         break;
                     }
                     continue;
                 };
                 if let Some(error) = self.store_offset_range_error(offset) {
-                    Self::send_partition_deny_or_log(
-                        self.consensus(),
-                        req.message.header(),
-                        error.as_code(),
-                        "queued offset range deny reply send failed",
-                        reply_sender.take(),
-                    )
-                    .await;
-                    consecutive_denials += 1;
-                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    if self
+                        .deny_queued_request(
+                            req.message.header(),
+                            error.as_code(),
+                            "queued offset range deny reply send failed",
+                            reply_sender.take(),
+                            &mut consecutive_denials,
+                        )
+                        .await
+                    {
                         break;
                     }
                     continue;
@@ -4728,8 +4763,7 @@ where
                     )
                     .await
                 {
-                    consecutive_denials += 1;
-                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    if Self::record_promotion_denial(&mut consecutive_denials) {
                         break;
                     }
                     continue;
@@ -4786,6 +4820,24 @@ where
         if self.queued_requests_ready() {
             self.drain_request_queue_into_prepares(1).await;
         }
+    }
+
+    async fn deny_queued_request(
+        &self,
+        header: &RoutedRequestHeader,
+        status: u32,
+        send_fail_label: &'static str,
+        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
+        consecutive_denials: &mut usize,
+    ) -> bool {
+        Self::send_partition_deny_or_log(self.consensus(), header, status, send_fail_label, waiter)
+            .await;
+        Self::record_promotion_denial(consecutive_denials)
+    }
+
+    const fn record_promotion_denial(consecutive_denials: &mut usize) -> bool {
+        *consecutive_denials += 1;
+        *consecutive_denials >= PROMOTION_DENIALS_MAX
     }
 
     /// # Panics
