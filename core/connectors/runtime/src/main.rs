@@ -156,9 +156,13 @@ fn print_config_env_vars() -> std::io::Result<()> {
         templates
             .iter()
             .map(move |template| format!("{prefix}{kind}_<KEY>_{}", template.env_name))
-            .chain(std::iter::once(format!(
-                "{prefix}{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
-            )))
+            .chain(
+                [
+                    format!("{prefix}{kind}_<KEY>_ENABLED"),
+                    format!("{prefix}{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"),
+                ]
+                .into_iter(),
+            )
     })
     .collect();
 

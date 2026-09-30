@@ -137,7 +137,7 @@ fn main() -> Result<(), ServerError> {
     Ok(())
 }
 
-fn print_config_env_vars() -> std::io::Result<()>
+fn print_config_env_vars() -> std::io::Result<()> {
     print_env_var_names(
         ServerConfig::env_templates()
             .iter()
