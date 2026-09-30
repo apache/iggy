@@ -1098,6 +1098,52 @@ impl IggyClient {
         })
     }
 
+    /// Delete the oldest sealed segments of a partition, including all messages
+    /// stored in them. The active segment is never deleted, and deletion stops at
+    /// the lowest offset any consumer or consumer group has committed on the
+    /// partition, so fewer than `segments_count` segments may be removed.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     partition_id: Partition ID as `int`.
+    ///     segments_count: Maximum number of segments to delete as `int`, starting
+    ///         from the oldest; `0` deletes nothing.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when deletion is accepted; segment
+    ///     files are removed asynchronously.
+    ///
+    /// Raises:
+    ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `partition_id` or `segments_count` is outside the
+    ///         unsigned 32-bit range.
+    ///     RuntimeError: If the client is not authenticated, lacks global
+    ///         `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+    ///         `manage_topics`, or per-topic `manage_topic` permission, the
+    ///         stream, topic, or partition does not exist, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_segments<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        partition_id: u32,
+        segments_count: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| py.None()))
+        })
+    }
+
     /// Create a consumer group for a stream and topic.
     ///
     /// Args:

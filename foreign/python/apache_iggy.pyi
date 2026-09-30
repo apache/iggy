@@ -1675,6 +1675,39 @@ class IggyClient:
                 `manage_topics`, or per-topic `manage_topic` permission, or the
                 request fails.
         """
+    def delete_segments(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partition_id: builtins.int,
+        segments_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete the oldest sealed segments of a partition, including all messages
+        stored in them. The active segment is never deleted, and deletion stops at
+        the lowest offset any consumer or consumer group has committed on the
+        partition, so fewer than `segments_count` segments may be removed.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partition_id: Partition ID as `int`.
+            segments_count: Maximum number of segments to delete as `int`, starting
+                from the oldest; `0` deletes nothing.
+
+        Returns:
+            An awaitable that resolves to `None` when deletion is accepted; segment
+            files are removed asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `partition_id` or `segments_count` is outside the
+                unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, the
+                stream, topic, or partition does not exist, or the request fails.
+        """
     def create_consumer_group(
         self,
         stream_id: builtins.str | builtins.int,
