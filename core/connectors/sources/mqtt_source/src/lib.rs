@@ -18,6 +18,7 @@
 mod driver;
 
 use async_trait::async_trait;
+use base64::Engine;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
@@ -36,6 +37,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use driver::{AckToken, MqttDriver};
+use driver::{Mqtt5EnvelopeProperties, MqttMessage};
 
 source_connector!(MqttSource);
 
@@ -95,6 +97,9 @@ pub struct MqttSourceConfig {
     /// MQTT protocol version used for the connection.
     #[serde(default)]
     pub protocol: MqttProtocol,
+    /// Preserves MQTT 5 extended properties in a JSON payload envelope.
+    #[serde(default)]
+    pub include_metadata: bool,
     /// Default subscription QoS when no per-filter override exists.
     #[serde(default = "default_qos")]
     pub qos: u8,
@@ -216,6 +221,11 @@ impl MqttSource {
         if self.config.broker_url.trim().is_empty() {
             return Err(Error::InvalidConfigValue(
                 "broker_url must not be empty".to_string(),
+            ));
+        }
+        if self.config.include_metadata && self.config.protocol == MqttProtocol::Mqtt311 {
+            return Err(Error::InvalidConfigValue(
+                "include_metadata is only supported with protocol = \"mqtt5\"".to_string(),
             ));
         }
         if self.config.subscriptions.is_empty()
@@ -474,13 +484,18 @@ impl Source for MqttSource {
             if let Some(ack_token) = received.ack_token {
                 ack_tokens.push(ack_token);
             }
+            let payload = if self.config.include_metadata {
+                serialize_mqtt5_envelope(&received.message)?
+            } else {
+                received.message.payload
+            };
             messages.push(ProducedMessage {
                 id: None,
                 checksum: None,
                 timestamp: None,
                 origin_timestamp: None,
                 headers: Some(received.message.headers),
-                payload: received.message.payload,
+                payload,
             });
         }
         *self.pending_batch.lock().await = Some(PendingBatch {
@@ -489,7 +504,11 @@ impl Source for MqttSource {
         });
 
         Ok(ProducedMessages {
-            schema: Schema::Raw,
+            schema: if self.config.include_metadata {
+                Schema::Json
+            } else {
+                Schema::Raw
+            },
             messages,
             state: Some(persisted_state),
         })
@@ -554,6 +573,26 @@ fn default_qos() -> u8 {
     1
 }
 
+#[derive(Debug, Serialize)]
+struct MqttEnvelope<'a> {
+    version: u8,
+    topic: &'a str,
+    properties: Option<&'a Mqtt5EnvelopeProperties>,
+    payload_base64: String,
+}
+
+fn serialize_mqtt5_envelope(message: &MqttMessage) -> Result<Vec<u8>, Error> {
+    let envelope = MqttEnvelope {
+        version: 1,
+        topic: &message.topic,
+        properties: message.mqtt5_properties.as_ref(),
+        payload_base64: base64::engine::general_purpose::STANDARD.encode(&message.payload),
+    };
+    serde_json::to_vec(&envelope).map_err(|error| {
+        Error::Serialization(format!("failed to serialize MQTT envelope: {error}"))
+    })
+}
+
 fn empty_messages() -> ProducedMessages {
     ProducedMessages {
         schema: Schema::Raw,
@@ -614,6 +653,7 @@ mod tests {
             subscriptions: vec!["devices/+/telemetry".to_string()],
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
+            include_metadata: false,
             qos: 1,
             tls: None,
             client_id: Some("test-source".to_string()),
@@ -743,6 +783,75 @@ mod tests {
 
             assert!(source.validate_config().is_ok());
         }
+    }
+
+    #[test]
+    fn given_mqtt311_metadata_enabled_should_reject_configuration() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.include_metadata = true;
+        let source = MqttSource::new(7, config, None);
+
+        let result = source.validate_config();
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidConfigValue(message))
+                if message == "include_metadata is only supported with protocol = \"mqtt5\""
+        ));
+    }
+
+    #[test]
+    fn given_mqtt5_metadata_enabled_should_serialize_payload_and_properties() {
+        let properties = rumqttc::v5::mqttbytes::v5::PublishProperties {
+            correlation_data: Some(vec![0, 255].into()),
+            ..Default::default()
+        };
+        let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+            "devices/test",
+            rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            vec![0, 255],
+            Some(properties),
+        );
+        let message = driver::normalize_mqtt5(publish)
+            .expect("MQTT 5 publish should normalize")
+            .message;
+
+        let serialized = serialize_mqtt5_envelope(&message).expect("envelope should serialize");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&serialized).expect("envelope should be valid JSON");
+
+        assert_eq!(envelope["version"], 1);
+        assert_eq!(envelope["topic"], "devices/test");
+        assert_eq!(envelope["payload_base64"], "AP8=");
+        assert_eq!(envelope["properties"]["correlation_data_base64"], "AP8=");
+        assert_eq!(message.headers.len(), 5);
+    }
+
+    #[test]
+    fn given_oversized_topic_should_be_preserved_by_mqtt5_envelope() {
+        let topic = format!("devices/{}/telemetry", "x".repeat(280));
+        let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
+            topic.clone(),
+            rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            b"payload".to_vec(),
+            None,
+        );
+        let message = driver::normalize_mqtt5(publish)
+            .expect("MQTT 5 publish should normalize")
+            .message;
+
+        let serialized = serialize_mqtt5_envelope(&message).expect("envelope should serialize");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&serialized).expect("envelope should be valid JSON");
+
+        assert_eq!(envelope["topic"], topic);
+        assert_eq!(envelope["payload_base64"], "cGF5bG9hZA==");
+        assert!(
+            !message
+                .headers
+                .contains_key(&"mqtt.topic".try_into().unwrap())
+        );
     }
 
     #[test]

@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::connectors::fixtures::{
-    Mqtt5InvalidCredentialsFixture, Mqtt5PendingBatchFixture, Mqtt5Qos0Fixture, Mqtt5Qos1Fixture,
-    Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture, Mqtt311Qos0Fixture, Mqtt311Qos1Fixture,
-    Mqtt311Qos2Fixture,
+    Mqtt5InvalidCredentialsFixture, Mqtt5MetadataQos1Fixture, Mqtt5PendingBatchFixture,
+    Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture,
+    Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
 };
+use base64::Engine;
 use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
 use integration::harness::{TestBinary, TestHarness, seeds};
 use integration::iggy_harness;
@@ -118,8 +119,7 @@ async fn mqtt311_qos1_messages_are_persisted_to_iggy(
     harness: &TestHarness,
     fixture: Mqtt311Qos1Fixture,
 ) {
-    // This test checks both persistence and the metadata needed to prove that
-    // the source received a QoS 1 publish with a packet identifier.
+    // This test checks persistence and the stable metadata used for routing.
     let message = assert_message_is_persisted(
         harness,
         fixture.publish(b"mqtt311-qos1-integration"),
@@ -145,11 +145,7 @@ async fn mqtt311_qos1_messages_are_persisted_to_iggy(
         headers[&"mqtt.qos".try_into().unwrap()].as_uint8().unwrap(),
         1
     );
-    assert!(
-        headers[&"mqtt.packet_id".try_into().unwrap()]
-            .as_uint16()
-            .is_ok()
-    );
+    assert!(!headers.contains_key(&"mqtt.packet_id".try_into().unwrap()));
     assert!(!headers[&"mqtt.dup".try_into().unwrap()].as_bool().unwrap());
     assert!(
         !headers[&"mqtt.retain".try_into().unwrap()]
@@ -443,7 +439,7 @@ async fn mqtt5_qos2_messages_are_persisted_to_iggy(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt5_publish_properties_are_persisted_as_iggy_headers(
+async fn mqtt5_publish_properties_are_not_persisted_as_iggy_headers(
     harness: &TestHarness,
     fixture: Mqtt5Qos1Fixture,
 ) {
@@ -482,48 +478,96 @@ async fn mqtt5_publish_properties_are_persisted_as_iggy_headers(
         headers[&"mqtt.qos".try_into().unwrap()].as_uint8().unwrap(),
         1
     );
+    assert_eq!(headers.len(), 5);
+    assert!(!headers.contains_key(&"mqtt.response_topic".try_into().unwrap()));
+    assert!(!headers.contains_key(&"mqtt.correlation_data".try_into().unwrap()));
+    assert!(!headers.contains_key(&"mqtt.user_property.0.key".try_into().unwrap()));
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mqtt5_metadata_envelope_persists_properties_and_payload(
+    harness: &TestHarness,
+    fixture: Mqtt5MetadataQos1Fixture,
+) {
+    let payload = b"mqtt5-metadata-envelope-integration";
+    let properties = PublishProperties {
+        payload_format_indicator: Some(1),
+        message_expiry_interval: Some(30),
+        topic_alias: None,
+        response_topic: Some("devices/response".to_string()),
+        correlation_data: Some(b"correlation".as_slice().into()),
+        user_properties: vec![("device_id".to_string(), "device-1".to_string())],
+        subscription_identifiers: Vec::new(),
+        content_type: Some("application/json".to_string()),
+    };
+
+    wait_for_source_running(harness).await;
+    fixture
+        .publish_with_properties(payload, properties)
+        .await
+        .expect("MQTT 5 publish with properties should complete");
+
+    let message = poll_first_message(harness, "mqtt5_metadata_envelope_consumer").await;
+    let headers = message
+        .user_headers_map()
+        .expect("Iggy headers should deserialize")
+        .expect("MQTT headers should be present");
+
+    assert_eq!(headers.len(), 5);
     assert_eq!(
-        headers[&"mqtt.payload_format_indicator".try_into().unwrap()]
-            .as_uint8()
+        headers[&"mqtt.protocol".try_into().unwrap()]
+            .as_str()
             .unwrap(),
+        "mqtt5"
+    );
+    assert_eq!(
+        headers[&"mqtt.topic".try_into().unwrap()].as_str().unwrap(),
+        "devices/test/telemetry"
+    );
+    assert_eq!(
+        headers[&"mqtt.qos".try_into().unwrap()].as_uint8().unwrap(),
         1
     );
+    assert!(
+        !headers[&"mqtt.retain".try_into().unwrap()]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(!headers[&"mqtt.dup".try_into().unwrap()].as_bool().unwrap());
+    assert!(!headers.contains_key(&"mqtt.packet_id".try_into().unwrap()));
+
+    let envelope: Value = serde_json::from_slice(&message.payload)
+        .expect("metadata-enabled source payload should be a JSON envelope");
+    assert_eq!(envelope["version"], 1);
+    assert_eq!(envelope["topic"], "devices/test/telemetry");
+    assert_eq!(envelope["properties"]["payload_format_indicator"], 1);
+    assert_eq!(envelope["properties"]["message_expiry_interval"], 30);
+    assert_eq!(envelope["properties"]["response_topic"], "devices/response");
     assert_eq!(
-        headers[&"mqtt.message_expiry_interval".try_into().unwrap()]
-            .as_uint32()
-            .unwrap(),
-        30
+        envelope["properties"]["correlation_data_base64"],
+        "Y29ycmVsYXRpb24="
     );
     assert_eq!(
-        headers[&"mqtt.response_topic".try_into().unwrap()]
-            .as_str()
-            .unwrap(),
-        "devices/response"
-    );
-    assert_eq!(
-        headers[&"mqtt.correlation_data".try_into().unwrap()]
-            .as_raw()
-            .unwrap(),
-        b"correlation"
-    );
-    assert_eq!(
-        headers[&"mqtt.user_property.0.key".try_into().unwrap()]
-            .as_str()
-            .unwrap(),
+        envelope["properties"]["user_properties"][0]["key"],
         "device_id"
     );
     assert_eq!(
-        headers[&"mqtt.user_property.0.value".try_into().unwrap()]
-            .as_str()
-            .unwrap(),
+        envelope["properties"]["user_properties"][0]["value"],
         "device-1"
     );
-    assert_eq!(
-        headers[&"mqtt.content_type".try_into().unwrap()]
-            .as_str()
-            .unwrap(),
-        "application/json"
-    );
+    assert_eq!(envelope["properties"]["content_type"], "application/json");
+
+    let decoded_payload = base64::engine::general_purpose::STANDARD
+        .decode(
+            envelope["payload_base64"]
+                .as_str()
+                .expect("envelope should contain a Base64 payload"),
+        )
+        .expect("envelope payload should be valid Base64");
+    assert_eq!(decoded_payload, payload);
 }
 
 async fn assert_message_is_persisted<F>(
@@ -573,6 +617,39 @@ where
 
     assert_eq!(received.payload.as_ref(), payload);
     received
+}
+
+async fn poll_first_message(
+    harness: &TestHarness,
+    consumer_name: &str,
+) -> iggy_common::IggyMessage {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = consumer_name.try_into().unwrap();
+
+    timeout(POLL_TIMEOUT, async {
+        loop {
+            if let Ok(polled) = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    None,
+                    &Consumer::new(consumer_id.clone()),
+                    &PollingStrategy::next(),
+                    10,
+                    true,
+                )
+                .await
+                && let Some(message) = polled.messages.into_iter().next()
+            {
+                return message;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("MQTT metadata envelope should be persisted to Iggy")
 }
 
 async fn assert_message_is_not_persisted(harness: &TestHarness, payload: &[u8]) {

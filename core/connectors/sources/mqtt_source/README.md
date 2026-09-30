@@ -59,7 +59,8 @@ The **MQTT Source Connector** is a dynamically loaded shared library plugin (`.s
 * **Per-Subscription QoS Overrides**: Configure a global fallback QoS alongside per-subscription overrides for specific topic filters.
 * **TLS & Mutual TLS (mTLS)**: Supports secure broker URLs (`mqtts://` / `ssl://`) with system trust roots or custom CA bundles (`ca_file`), client certificates (`client_cert_file`), and client keys (`client_key_file`) via Rustls.
 * **Source-Side Micro-Batching**: Micro-batches incoming messages up to `batch_size` or until `batch_timeout` fires, minimizing FFI serialization and network overhead.
-* **Rich Header Mapping**: Preserves MQTT metadata (topic, protocol, QoS, retain, dup, packet ID) and MQTT 5 properties (content type, response topic, correlation data, user properties) as Iggy message headers.
+* **Stable MQTT Headers**: Preserves protocol, topic, QoS, retain, and dup metadata as Iggy message headers. MQTT 5 extended properties are ignored by default and are available through the optional metadata envelope.
+* **MQTT 5 Metadata Envelope**: Optionally stores MQTT 5 properties and the exact application payload in a versioned JSON envelope.
 * **Route Isolation**: Run multiple connector instances in parallel to route distinct MQTT topic filters into separate Iggy streams and topics.
 * **Process Isolation**: Operates inside the `iggy-connectors` process memory space via C-ABI FFI, keeping the core `iggy-server` decoupled and untouched.
 
@@ -81,6 +82,7 @@ Configuration operates in **two distinct layers**:
 | `broker_url` | String | **Yes** | — | Broker URL scheme (`mqtt://`, `mqtts://`, or `ssl://`) and host/port. |
 | `subscriptions` | Array[String] | **Yes** | — | Non-empty list of unique MQTT topic filters (wildcards `+` and `#` supported). |
 | `protocol` | String | No | `"mqtt5"` | MQTT protocol version: `"mqtt5"` or `"mqtt311"`. |
+| `include_metadata` | Boolean | No | `false` | Enables the MQTT 5 metadata envelope. Requires `protocol = "mqtt5"` and a stream schema of `"json"`. |
 | `qos` | Integer | No | `1` | Default global subscription QoS (`0`, `1`, or `2`). |
 | `subscription_qos` | Table | No | `{}` | Map of topic-filter strings to explicit QoS overrides (`0`, `1`, or `2`). |
 | `client_id` | String | No | `iggy-mqtt-source-{id}` | MQTT client identifier. |
@@ -136,7 +138,55 @@ batch_size = 100
 batch_timeout = "10ms"
 ```
 
-### 2. Per-Subscription QoS Overrides
+### 2. MQTT 5 Metadata Envelope
+
+Use envelope mode when MQTT 5 publish properties must be preserved. This mode
+has three required rules:
+
+1. `protocol` must be `"mqtt5"`.
+2. `include_metadata` must be `true`.
+3. Every destination stream used by this connector must use `schema = "json"`.
+
+MQTT 3.1.1 cannot use envelope mode because it has no MQTT 5 extended
+PUBLISH properties. The connector rejects `include_metadata = true` with
+`protocol = "mqtt311"` during initialization.
+
+```toml
+type = "source"
+key = "mqtt5_metadata"
+enabled = true
+version = 1
+name = "MQTT 5 source with metadata"
+path = "target/release/libiggy_connector_mqtt_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "iot"
+topic = "telemetry"
+schema = "json"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+broker_url = "mqtt://127.0.0.1:1883"
+subscriptions = ["devices/+/telemetry"]
+protocol = "mqtt5"
+include_metadata = true
+qos = 1
+client_id = "iggy-mqtt-source-metadata"
+clean_start = false
+session_expiry_interval = 3600
+keep_alive = "30s"
+batch_size = 100
+batch_timeout = "10ms"
+```
+
+The message payload becomes a JSON envelope containing `version`, `topic`,
+`properties`, and `payload_base64`. The original MQTT payload is recovered by
+Base64-decoding `payload_base64`. The stable routing headers remain present:
+`mqtt.protocol`, `mqtt.topic`, `mqtt.qos`, `mqtt.retain`, and `mqtt.dup`.
+
+### 3. Per-Subscription QoS Overrides
 
 ```toml
 [plugin_config]
@@ -153,7 +203,7 @@ qos = 1 # Fallback for devices/+/alerts
 "devices/+/diagnostics" = 0 # Disposable diagnostic metrics via QoS 0
 ```
 
-### 3. Secure TLS & Mutual TLS (mTLS) Setup
+### 4. Secure TLS & Mutual TLS (mTLS) Setup
 
 ```toml
 [plugin_config]
@@ -169,7 +219,7 @@ client_key_file = "/etc/iggy/certs/client-key.pem"
 server_name = "emqx.example.com"
 ```
 
-### 4. Multi-Instance Route Isolation
+### 5. Multi-Instance Route Isolation
 
 To route distinct MQTT topic filters to different Iggy streams or topics, run
 one source connector instance per route. The runtime loads every connector TOML
@@ -269,6 +319,25 @@ export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_SUBSCRIPTIONS='["devices/+/tele
 
 The connector attaches MQTT metadata directly to `ProducedMessage.headers`:
 
+The connector always writes the stable MQTT headers (`mqtt.protocol`,
+`mqtt.topic`, `mqtt.qos`, `mqtt.dup`, and `mqtt.retain`). MQTT 5 extended
+properties are not written as Iggy headers. They are ignored when
+`include_metadata = false` and stored in the metadata envelope when
+`include_metadata = true` with MQTT 5. MQTT 3.1.1 has no extended PUBLISH
+properties and remains in raw-payload mode.
+
+When metadata envelope mode is enabled, the stream schema must be `"json"`.
+The envelope contains the complete MQTT topic, all supported MQTT 5
+properties, and the original payload as Base64. The topic is intentionally
+available both in the envelope and as `mqtt.topic` for consumers that route by
+headers. Envelope mode is not available for MQTT 3.1.1.
+
+Iggy header values are limited to 255 bytes and cannot be empty. When a stable
+header value is empty or exceeds 255 bytes, the connector omits only that
+header, logs the omission with its name, reason, and byte length, and continues
+persisting the MQTT payload and other valid headers. This also applies to
+`mqtt.topic`; it is omitted when it cannot be represented by an Iggy header.
+
 | Header Key | Type | Description |
 | :--- | :--- | :--- |
 | `mqtt.protocol` | String | `"mqtt311"` or `"mqtt5"`. |
@@ -276,13 +345,6 @@ The connector attaches MQTT metadata directly to `ProducedMessage.headers`:
 | `mqtt.qos` | Integer | Delivered MQTT QoS (`0`, `1`, or `2`). |
 | `mqtt.dup` | Boolean | Duplicate delivery flag from broker. |
 | `mqtt.retain` | Boolean | Retained message flag. |
-| `mqtt.packet_id` | Integer | MQTT Packet ID for QoS 1/2 (absent for QoS 0). |
-| `mqtt.content_type` | String | *(MQTT 5)* Content type descriptor. |
-| `mqtt.response_topic` | String | *(MQTT 5)* Response topic for request/reply flows. |
-| `mqtt.correlation_data` | Bytes | *(MQTT 5)* Correlation binary data. |
-| `mqtt.message_expiry_interval` | Integer | *(MQTT 5)* Message expiry interval in seconds. |
-| `mqtt.user_property.<N>.key` | String | *(MQTT 5)* User property key at index `N`. |
-| `mqtt.user_property.<N>.value` | String | *(MQTT 5)* User property value at index `N`. |
 
 ---
 
@@ -348,7 +410,7 @@ The connector guarantees **At-Least-Once Delivery** for QoS 1 and QoS 2 messages
    * Dynamic per-message destination routing based on MQTT topics is not supported within a single instance; use separate connector files for distinct target streams/topics.
 
 3. **Packet ID Scope**:
-   * MQTT `packet_id` values (e.g., `42`) are ephemeral session tokens generated by the client/broker for connection handshakes. They are reused across connections and **must never be used as durable deduplication keys or offset identifiers** in Iggy.
+   * MQTT `packet_id` values (e.g., `42`) remain internal to the connector's acknowledgement token. They are ephemeral session tokens, reused across connections, and **must never be used as durable deduplication keys, offset identifiers, or Iggy headers**.
 
 4. **Single In-Flight Batch Constraint**:
    * The Iggy Connector SDK enforces that only **one batch may be in flight** at a time. Calling `poll()` while a previous batch is awaiting `Ack`/`Nack` returns `Err(Error::InvalidState)`.
