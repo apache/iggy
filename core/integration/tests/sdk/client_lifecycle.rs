@@ -38,9 +38,11 @@ const FIRST_HEARTBEAT_SETTLE: Duration = Duration::from_millis(500);
 /// A request on a disconnected client must fail on the SDK side,
 /// with no dial and no implicit wait, so it has to fail well within this bound.
 const SDK_SIDE_FAILURE: Duration = Duration::from_millis(500);
-/// A disconnect closes local resources only. A QUIC `disconnect()` that a
-/// heartbeat redial blocks in `endpoint.wait_idle()` never returns, so the tests
-/// bound it to fail instead of hang.
+/// A disconnect closes local resources only, so it must return well within
+/// this bound. On QUIC, a heartbeat redial that lands inside the drain of the old
+/// connection blocks `disconnect()` in `endpoint.wait_idle()` for good, so the
+/// tests bound the call to fail instead of hang. That redial depends on timing,
+/// so it does not block every run.
 const DISCONNECT_BOUND: Duration = Duration::from_secs(5);
 
 #[iggy_harness]
@@ -49,13 +51,19 @@ async fn given_a_shut_down_websocket_client_when_connecting_should_fail(harness:
     // TODO: in `WebSocketClient::connect_inner`, return `ClientShutdown` in the
     // `Shutdown` state before any dial, as `TcpClient` and `QuicClient` already
     // do. The `set_state` guard of the next test only stops the state change,
-    // not the dial.
+    // not the dial. The fix turns the strict `xfail` of
+    // `test_shutdown_client_cannot_connect_again` in
+    // `foreign/python/tests/test_connectivity.py` into an XPASS, so remove that
+    // mark with it, and update the known-issue note of `shutdown()` in
+    // `foreign/python/src/client.rs`.
     let client = harness.websocket_new_client().await.unwrap();
     client.shutdown().await.unwrap();
 
+    let connect = client.connect().await;
+
     assert!(
-        matches!(client.connect().await, Err(IggyError::ClientShutdown)),
-        "a client that is shut down must not open a new connection"
+        matches!(connect, Err(IggyError::ClientShutdown)),
+        "a client that is shut down must not open a new connection, got {connect:?}"
     );
 }
 
@@ -65,15 +73,19 @@ async fn given_a_shut_down_client_when_disconnected_should_stay_shut_down(harnes
     // TODO: add one guard in `set_state` of each transport, so that no write
     // moves a client out of `Shutdown`. A guard in each `disconnect()` is not
     // enough: other paths also write `Disconnected`, for example a timeout.
-    // With the guard, `connect_inner` returns `ClientShutdown` as it does for a
-    // client that was never disconnected.
+    // With the guard, `connect_inner` returns `ClientShutdown` on TCP and QUIC.
+    // WebSocket also needs the `connect_inner` fix of the test above, because it
+    // dials in any state. Drop the known-issue note of `shutdown()` in
+    // `foreign/python/src/client.rs` with this fix.
     let client = harness.new_client().await.unwrap();
     client.shutdown().await.unwrap();
     client.disconnect().await.unwrap();
 
+    let connect = client.connect().await;
+
     assert!(
-        matches!(client.connect().await, Err(IggyError::ClientShutdown)),
-        "disconnect after shutdown must not make the client reusable"
+        matches!(connect, Err(IggyError::ClientShutdown)),
+        "disconnect after shutdown must not make the client reusable, got {connect:?}"
     );
 }
 
@@ -85,12 +97,12 @@ async fn given_an_auto_login_client_when_explicitly_disconnected_should_stay_dis
     // TODO: stop the heartbeat task in `IggyClient::disconnect`, and let
     // `connect` start it again. That alone is not enough: the heartbeat ping
     // reconnects through the same path as a direct `ping()`, so this test also
-    // needs the caller-intent flag of the ping and get_stats tests below. The
-    // `IggyClient`, Python and C++ docs describe the current behavior, so they
-    // must change with the fix. On QUIC, the heartbeat redial also blocks
-    // `disconnect()` in `endpoint.wait_idle()`: stopping the heartbeat first
-    // removes that redial here, but `QuicClient::disconnect` must not wait on a
-    // connection that a redial opens.
+    // needs the caller-intent flag of the next test. The `IggyClient`, Python
+    // and C++ docs describe the current behavior, so they must change with the
+    // fix. On QUIC, the heartbeat redial also blocks `disconnect()` in
+    // `endpoint.wait_idle()`: stopping the heartbeat first removes that redial
+    // here, but `QuicClient::disconnect` must not wait on a connection that a
+    // redial opens.
     let client = auto_login_client(harness, FAST_HEARTBEAT);
     client.connect().await.unwrap();
     client
@@ -104,82 +116,69 @@ async fn given_an_auto_login_client_when_explicitly_disconnected_should_stay_dis
         .unwrap();
     sleep(HEARTBEATS_WINDOW).await;
 
+    let me = client.get_me().await.map(|_| ());
     assert!(
-        matches!(client.get_me().await, Err(IggyError::Disconnected)),
+        matches!(me, Err(IggyError::Disconnected)),
         "a heartbeat after an explicit disconnect must not reconnect the client \
-         and replay its auto-login"
+         and replay its auto-login, got {me:?}"
     );
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
-#[ignore = "fails until #4287 is fixed (ping after disconnect reconnects an auto-login client); run this test explicitly with --ignored"]
-async fn given_a_disconnected_auto_login_client_when_pinging_should_fail_without_reconnecting(
+#[ignore = "fails until #4287 is fixed (a request after disconnect reconnects an auto-login client); run this test explicitly with --ignored"]
+async fn given_a_disconnected_auto_login_client_when_sending_requests_should_fail_without_reconnecting(
     harness: &TestHarness,
 ) {
-    // TODO: `Client::disconnect` sets a caller-intent flag, and `connect()`
-    // clears it. While the flag is set, `send_raw_with_response` fails on the
-    // SDK side instead of reconnecting with the configured credentials. Do not
-    // read the intent from `get_state() == Disconnected`: a socket error or a
-    // timeout also leaves the client `Disconnected`, and that loss must still
-    // heal on its own.
+    // TODO: set a caller-intent flag in the `Client` trait impl of `disconnect()`
+    // on each transport, and clear it in `connect()`. Only in the trait impl: on
+    // WebSocket and QUIC, `handle_leader_redirection` and the reconnect path call
+    // the inherent `disconnect()`, and a flag set there would block every later
+    // heal. While the flag is set, `send_raw_with_response` fails with
+    // `NotConnected` on the SDK side instead of reconnecting with the configured
+    // credentials. Do not read the intent from `get_state() == Disconnected`: a
+    // socket error or a timeout also leaves the client `Disconnected`, and that
+    // loss must still heal on its own.
     let client = disconnected_auto_login_client(harness).await;
 
     let ping = timeout(SDK_SIDE_FAILURE, client.ping()).await;
-
     assert!(
-        matches!(ping, Ok(Err(_))),
-        "ping after an explicit disconnect must fail at once, without a reconnect"
+        matches!(ping, Ok(Err(IggyError::NotConnected))),
+        "ping after an explicit disconnect must fail at once, without a reconnect, got {ping:?}"
     );
+
+    let stats = timeout(SDK_SIDE_FAILURE, client.get_stats())
+        .await
+        .map(|result| result.map(|_| ()));
     assert!(
-        client.get_me().await.is_err(),
-        "the failed ping must not reconnect the client"
+        matches!(stats, Ok(Err(IggyError::NotConnected))),
+        "get_stats after a failed ping must fail at once too, without a reconnect, got {stats:?}"
     );
-}
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
-#[ignore = "fails until #4287 is fixed (get_stats after disconnect reconnects an auto-login client); run this test explicitly with --ignored"]
-async fn given_a_disconnected_auto_login_client_when_getting_stats_should_fail_without_reconnecting(
-    harness: &TestHarness,
-) {
-    // TODO: same fix as for ping: while the caller-intent flag that
-    // `Client::disconnect` sets is on, `send_raw_with_response` fails on the
-    // SDK side until the next `connect()`.
-    let client = disconnected_auto_login_client(harness).await;
-
-    let stats = timeout(SDK_SIDE_FAILURE, client.get_stats()).await;
-
+    let me = client.get_me().await.map(|_| ());
     assert!(
-        matches!(stats, Ok(Err(_))),
-        "get_stats after an explicit disconnect must fail at once, without a reconnect"
-    );
-    assert!(
-        client.get_me().await.is_err(),
-        "the failed get_stats must not reconnect the client"
+        matches!(me, Err(IggyError::Disconnected)),
+        "the failed requests must not reconnect the client, got {me:?}"
     );
 }
 
 /// Builds a client whose auto-login credentials live in its configuration.
-/// `disconnect()` forgets a `login_user()` sign-in, but not these credentials,
-/// so the client still has them to reconnect with. The reconnect cooldown is
-/// zero, so a reconnect is never hidden behind a pause.
+/// After `disconnect()`, every transport reconnects only with these configured
+/// credentials, and TCP also drops a manual `login_user()` sign-in. The
+/// reconnect cooldown is zero, so a reconnect never hides behind a pause.
 fn auto_login_client(harness: &TestHarness, heartbeat_interval: &str) -> IggyClient {
     let server = harness.server();
-    let credentials = format!("{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}");
-    let connection_string = match harness.transport().unwrap() {
-        TransportProtocol::Tcp => format!(
-            "iggy+tcp://{credentials}@{}?heartbeat_interval={heartbeat_interval}&reestablish_after=0s",
-            server.tcp_addr().unwrap()
-        ),
-        TransportProtocol::WebSocket => format!(
-            "iggy+ws://{credentials}@{}?heartbeat_interval={heartbeat_interval}&reestablish_after=0s",
-            server.websocket_addr().unwrap()
-        ),
-        TransportProtocol::Quic => format!(
-            "iggy+quic://{credentials}@{}?heartbeat_interval={heartbeat_interval}&reconnection_reestablish_after=0s",
-            server.quic_addr().unwrap()
-        ),
-        other => panic!("no auto-login client for the {other} transport"),
+    let transport = harness.transport().unwrap();
+    let (address, cooldown_key) = match transport {
+        TransportProtocol::Tcp => (server.tcp_addr(), "reestablish_after"),
+        TransportProtocol::WebSocket => (server.websocket_addr(), "reestablish_after"),
+        TransportProtocol::Quic => (server.quic_addr(), "reconnection_reestablish_after"),
+        TransportProtocol::Http => panic!("HTTP has no connection to disconnect"),
     };
+    let connection_string = format!(
+        "iggy+{transport}://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{}\
+         ?heartbeat_interval={heartbeat_interval}&{cooldown_key}=0s",
+        address.unwrap()
+    );
     IggyClient::from_connection_string(&connection_string).unwrap()
 }
 
