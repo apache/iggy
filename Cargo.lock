@@ -12900,6 +12900,7 @@ dependencies = [
  "partitions",
  "prometheus-client",
  "server_common",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]

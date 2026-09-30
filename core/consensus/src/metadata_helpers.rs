@@ -433,11 +433,24 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
+    is_settled_primary(consensus) && consensus.commit_min() == consensus.commit_max()
+}
+
+/// [`is_caught_up_primary`] without commit-equality.
+///
+/// The primary of a Normal view that it has not ceded, not syncing, with its
+/// recovered suffix re-committed, however far it still is from applying
+/// `commit_max`. Enough only for a caller whose reads stop at `commit_min` by
+/// construction.
+pub fn is_settled_primary<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
     consensus.is_primary()
         && !consensus.has_ceded_primaryship()
         && consensus.is_normal()
         && !consensus.is_transferring()
-        && consensus.commit_min() == consensus.commit_max()
         // Recovery re-pipelines the WAL's prepared-but-uncommitted suffix;
         // those ops were acked to clients before the restart, so admitting
         // new requests (a login is a Register write) before the suffix
@@ -870,16 +883,22 @@ mod tests {
         primary.set_state_transfer_stage(crate::StateTransferStage::Idle);
         assert!(is_caught_up_primary(&primary));
 
-        // commit_min < commit_max -> false.
+        // commit_min < commit_max -> false, yet still the settled primary.
         primary.advance_commit_max(5);
         assert_ne!(primary.commit_min(), primary.commit_max());
         assert!(!is_caught_up_primary(&primary));
+        assert!(is_settled_primary(&primary));
+
+        // Mid-transfer -> not settled either.
+        primary.begin_state_transfer_await();
+        assert!(!is_settled_primary(&primary));
 
         // Backup -> false.
         let backup = VsrConsensus::new(1, 1, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         backup.init();
         assert!(!backup.is_primary());
         assert!(!is_caught_up_primary(&backup));
+        assert!(!is_settled_primary(&backup));
     }
 
     #[test]

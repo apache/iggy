@@ -321,6 +321,7 @@ impl ConsumerOffsetCapacity {
     }
 
     /// See [`Self::set_pending_count`] for the serialization contract.
+    #[cfg(test)]
     pub(crate) fn release_reservation(&self, id: u32) {
         let mut pending = self.pending.borrow_mut();
         let Some(count) = pending.get_mut(&id) else {
@@ -378,6 +379,10 @@ impl ConsumerOffsetCapacity {
     /// zero. Exported as a gauge so that refusal has a signal.
     pub(crate) fn stranded_count(&self) -> usize {
         self.stranded.borrow().len()
+    }
+
+    pub(crate) fn extend_stranded_ids(&self, ids: &mut HashSet<u32>) {
+        ids.extend(self.stranded.borrow().iter().copied());
     }
 
     pub(crate) fn rearm_if_below_limit(&self, durable: &DurableConsumerOffsets) {

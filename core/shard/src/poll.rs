@@ -48,7 +48,7 @@ mod completion_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-mod timeout_tests;
+pub mod timeout_tests;
 
 /// Parent session and metadata identity checked by the partition owner before
 /// accepting consumer progress, including after detached poll I/O.
@@ -141,7 +141,7 @@ where
         let partitions = self.plane.partitions();
         let rejected = partitions
             .with_partition(&namespace, |partition| {
-                if partition.requires_state_transfer() {
+                if partition.requires_state_transfer() || partition.read_history_is_changing() {
                     return true;
                 }
                 if let PartitionRead::PollOnPrimary { attachment, .. } = &read {
