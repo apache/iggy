@@ -28,8 +28,8 @@ repositories {
 
 dependencies {
     implementation("org.apache.iggy:iggy:local-dev")
-    implementation("org.slf4j:slf4j-simple:2.0.19")
-    implementation("tools.jackson.core:jackson-databind:3.2.2")
+    implementation("org.slf4j:slf4j-simple:2.0.20")
+    implementation("tools.jackson.core:jackson-databind:3.2.3")
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
 }
