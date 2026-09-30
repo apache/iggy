@@ -474,13 +474,17 @@ public struct Stats: Sendable, Hashable {
     public var threadsCount: UInt32
     public var freeDiskSpace: UInt64
     public var totalDiskSpace: UInt64
+    /// The number of file descriptors the server process holds open, 0 when unknown.
+    public var openFilesCount: UInt64
+    /// The soft limit on open file descriptors (`RLIMIT_NOFILE`) of the server process, 0 when unknown.
+    public var openFilesLimit: UInt64
 
     public init(
         processID: UInt32, cpuUsage: Float, totalCPUUsage: Float, memoryUsage: UInt64, totalMemory: UInt64, availableMemory: UInt64, runTime: Duration,
         startTime: IggyTimestamp, readBytes: UInt64, writtenBytes: UInt64, messagesSizeBytes: UInt64, streamsCount: UInt32, topicsCount: UInt32,
         partitionsCount: UInt32, segmentsCount: UInt32, messagesCount: UInt64, clientsCount: UInt32, consumerGroupsCount: UInt32, hostname: String,
         osName: String, osVersion: String, kernelVersion: String, iggyServerVersion: String, iggyServerSemver: UInt32?, cacheMetrics: [CacheMetrics],
-        threadsCount: UInt32, freeDiskSpace: UInt64, totalDiskSpace: UInt64
+        threadsCount: UInt32, freeDiskSpace: UInt64, totalDiskSpace: UInt64, openFilesCount: UInt64 = 0, openFilesLimit: UInt64 = 0
     ) {
         self.processID = processID
         self.cpuUsage = cpuUsage
@@ -510,6 +514,8 @@ public struct Stats: Sendable, Hashable {
         self.threadsCount = threadsCount
         self.freeDiskSpace = freeDiskSpace
         self.totalDiskSpace = totalDiskSpace
+        self.openFilesCount = openFilesCount
+        self.openFilesLimit = openFilesLimit
     }
 }
 

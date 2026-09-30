@@ -53,6 +53,8 @@ describe('e2e -> parallel', async () => {
         'messagesSizeBytes', 'streamsCount', 'topicsCount', 'partitionsCount',
         'segmentsCount', 'messagesCount', 'clientsCount', 'consumersGroupsCount',
         'hostname', 'osName', 'osVersion', 'kernelVersion',
+        'iggyServerVersion', 'iggyServerSemver', 'cacheMetrics',
+        'threadsCount', 'freeDiskSpace', 'totalDiskSpace',
         'openFilesCount', 'openFilesLimit'
       ]
     );

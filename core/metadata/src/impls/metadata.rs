@@ -17,7 +17,7 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
-use crate::stm::authz::{admits_partitions_create, gated_apply};
+use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
@@ -2247,8 +2247,8 @@ where
     ///
     /// A body that does not decode passes here, and `prepare_request` evicts
     /// the session for it. A create that the gated apply refuses, for a
-    /// missing target or a missing grant, also passes, so it gets that error
-    /// and not the cap's.
+    /// missing target, a missing grant or a topic name already in use, also
+    /// passes, so it gets that error and not the cap's.
     fn admit_partitions(&self, message: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
         let partitions_max = self.partitions_max.get();
         if partitions_max == 0 {
@@ -2256,26 +2256,29 @@ where
         }
         let header = message.header();
         let body = &message.as_slice()[size_of::<RoutedRequestHeader>()..header.size as usize];
-        let (requested, stream_id, topic_id) = match header.operation {
+        let (requested, stream_id, create) = match header.operation {
             Operation::CreateTopic => match WireCreateTopicRequest::decode_from(body) {
-                Ok(request) => (request.partitions_count, request.stream_id, None),
+                Ok(request) => (
+                    request.partitions_count,
+                    request.stream_id,
+                    PartitionsCreate::Topic { name: request.name },
+                ),
                 Err(_) => return Ok(()),
             },
             Operation::CreatePartitions => match WireCreatePartitionsRequest::decode_from(body) {
                 Ok(request) => (
                     request.partitions_count,
                     request.stream_id,
-                    Some(request.topic_id),
+                    PartitionsCreate::Partitions {
+                        topic_id: request.topic_id,
+                    },
                 ),
                 Err(_) => return Ok(()),
             },
             _ => return Ok(()),
         };
-        let admitted = validate_partitions_limit(
-            partitions_max,
-            requested,
-            self.mux_stm.streams().partition_count(),
-        );
+        let committed = self.mux_stm.streams().partition_count();
+        let admitted = validate_partitions_limit(partitions_max, requested, committed);
         if admitted.is_err() {
             let applies =
                 resolve_acting_user_id(header.operation, header.client, &self.client_table)
@@ -2287,12 +2290,19 @@ where
                             self.mux_stm.streams(),
                             user_id,
                             &stream_id,
-                            topic_id.as_ref(),
+                            &create,
                         )
                     });
             if !applies {
                 return Ok(());
             }
+            warn!(
+                operation = ?header.operation,
+                partitions_max,
+                committed,
+                requested,
+                "refused a create that would take the node past metadata.partitions_max"
+            );
         }
         admitted
     }
@@ -4770,10 +4780,19 @@ mod tests {
     }
 
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {
+        create_named_topic_request(client, wire_user_id, WireIdentifier::numeric(0), "t")
+    }
+
+    fn create_named_topic_request(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+    ) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
-            stream_id: WireIdentifier::numeric(0),
+            stream_id,
             partitions_count: 1,
-            name: WireName::new("t").unwrap(),
+            name: WireName::new(name).unwrap(),
             options: WireOptions::empty(),
         }
         .to_bytes();
@@ -5063,9 +5082,11 @@ mod tests {
         );
     }
 
-    /// The gated apply answers a create from a user without the grant, or for
-    /// a stream that does not exist, with `Unauthorized` or `NotFound`. The
-    /// cap must not answer first, or that user could probe the cap state.
+    /// The gated apply answers a create from a user without the grant, for a
+    /// stream that does not exist, or of a topic name in use, with
+    /// `Unauthorized`, `NotFound` or `TopicNameAlreadyExists`. The cap must not
+    /// answer first, or that user could probe the cap state, and a client that
+    /// creates a topic only when it is missing would get the wrong error.
     #[test]
     fn given_create_topic_past_partitions_cap_when_apply_would_refuse_should_leave_it_to_apply() {
         const UNGRANTED_CLIENT: u128 = 1;
@@ -5094,19 +5115,26 @@ mod tests {
             TOPIC_MANAGER,
             register_reply(MANAGER_CLIENT, 1),
         );
-        let mut missing_stream = create_topic_request(MANAGER_CLIENT, TOPIC_MANAGER);
-        let header_size = size_of::<RoutedRequestHeader>();
-        let body = CreateTopicRequest {
-            stream_id: WireIdentifier::numeric(9),
-            partitions_count: 1,
-            name: WireName::new("t").unwrap(),
-            options: WireOptions::empty(),
-        }
-        .to_bytes();
-        missing_stream.as_mut_slice()[header_size..].copy_from_slice(&body);
+        let missing_stream = create_named_topic_request(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            WireIdentifier::numeric(9),
+            "t",
+        );
         assert!(
             metadata.admit_partitions(&missing_stream).is_ok(),
             "a create for a missing stream must get NotFound from apply"
+        );
+
+        let taken_name = create_named_topic_request(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            WireIdentifier::numeric(0),
+            "existing",
+        );
+        assert!(
+            metadata.admit_partitions(&taken_name).is_ok(),
+            "a create of a topic name in use must get TopicNameAlreadyExists from apply"
         );
 
         assert!(

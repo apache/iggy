@@ -53,7 +53,7 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
-use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier};
+use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, WireName};
 use iggy_common::{IggyError, variadic};
 use server_common::Message;
 
@@ -345,36 +345,54 @@ pub(crate) fn authorize(
     }
 }
 
-/// Whether `authorize` lets a `CreateTopic`, or a `CreatePartitions` when
-/// `topic_id` is set, reach its apply: the ids resolve and `user_id` holds the
-/// grant. The primary asks before it denies a create for `[metadata]
-/// partitions_max`, so apply answers `NotFound` or `Unauthorized` first and a
-/// user who cannot create learns nothing about the cap.
+/// What a create that `[metadata] partitions_max` counts adds partitions to.
+pub(crate) enum PartitionsCreate {
+    /// A `CreateTopic` of a topic with this name.
+    Topic { name: WireName },
+    /// A `CreatePartitions` for this existing topic.
+    Partitions { topic_id: WireIdentifier },
+}
+
+/// Whether a `CreateTopic` or a `CreatePartitions` gets past `authorize` and
+/// the first checks of its apply: the ids resolve, a new topic name is free in
+/// its stream, and `user_id` holds the grant. The primary asks before it denies
+/// a create for `[metadata] partitions_max`, so apply answers `NotFound`,
+/// `Unauthorized` or `TopicNameAlreadyExists` first. A user who cannot create
+/// learns nothing about the cap, and a client that creates a topic only when it
+/// is missing gets the name error it expects.
 pub(crate) fn admits_partitions_create(
     users: &Users,
     streams: &Streams,
     user_id: u32,
     stream_id: &WireIdentifier,
-    topic_id: Option<&WireIdentifier>,
+    create: &PartitionsCreate,
 ) -> bool {
-    let Some(topic_id) = topic_id else {
-        return streams
-            .resolve_stream_id(stream_id)
+    match create {
+        PartitionsCreate::Topic { name } => streams
+            .read(|inner| {
+                let stream_id = inner.resolve_stream_id(stream_id)?;
+                let name_taken = inner
+                    .items
+                    .get(stream_id)?
+                    .topic_index
+                    .contains_key(name.as_str());
+                (!name_taken).then_some(stream_id)
+            })
             .is_some_and(|stream_id| {
                 user_id == ROOT_USER_ID
                     || users
                         .authorize(|perm| perm.create_topic(user_id, stream_id))
                         .is_ok()
-            });
-    };
-    streams
-        .resolve_topic_ids(stream_id, topic_id)
-        .is_some_and(|(stream_id, topic_id)| {
-            user_id == ROOT_USER_ID
-                || users
-                    .authorize(|perm| perm.create_partitions(user_id, stream_id, topic_id))
-                    .is_ok()
-        })
+            }),
+        PartitionsCreate::Partitions { topic_id } => streams
+            .resolve_topic_ids(stream_id, topic_id)
+            .is_some_and(|(stream_id, topic_id)| {
+                user_id == ROOT_USER_ID
+                    || users
+                        .authorize(|perm| perm.create_partitions(user_id, stream_id, topic_id))
+                        .is_ok()
+            }),
+    }
 }
 
 /// Maps a permissioner rule outcome to a gate decision: any `Err` (always

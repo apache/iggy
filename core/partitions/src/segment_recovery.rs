@@ -496,7 +496,7 @@ impl From<IggyError> for PartitionRecoveryError {
 
 /// A persisted segment recovered from disk: its metadata plus the storage
 /// handles opened over its `.log` / `.index` files. Only the last segment of
-/// a chain keeps its writers.
+/// a chain keeps its write cursors.
 pub struct RecoveredSegment {
     pub segment: Segment,
     pub storage: SegmentStorage,
@@ -817,11 +817,9 @@ pub async fn load_persisted_segments_with_checkpoint(
                 transient => transient.into(),
             }
         })?;
-        // The open above fsyncs the truncated files. Nothing writes a sealed
-        // segment after that, so its writers close here as a rotation closes
-        // them, and a long chain does not hold 2 descriptors per segment.
+        // Only the tail takes writes, as after a rotation.
         if plan.segment.sealed {
-            let _ = storage.shutdown();
+            storage.seal();
         }
 
         stats.increment_segments_count(1);
@@ -3395,7 +3393,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_sealed_segments_when_recovering_should_keep_writers_on_the_tail_only() {
+    async fn given_sealed_segments_when_recovering_should_keep_write_cursors_on_the_tail_only() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
@@ -3414,15 +3412,15 @@ mod tests {
         for sealed in &recovered[..2] {
             assert!(sealed.segment.sealed);
             assert!(
-                sealed.storage.messages_writer.is_none() && sealed.storage.index_writer.is_none(),
-                "a sealed segment must not hold writer descriptors"
+                sealed.storage.messages_size.is_none() && sealed.storage.index_size.is_none(),
+                "a sealed segment must not keep write cursors"
             );
             assert!(sealed.storage.messages_reader.is_some());
         }
         let tail = &recovered[2].storage;
         assert!(
-            tail.messages_writer.is_some() && tail.index_writer.is_some(),
-            "the tail segment must keep its writers"
+            tail.messages_size.is_some() && tail.index_size.is_some(),
+            "the tail segment must keep its write cursors"
         );
     }
 
@@ -3847,7 +3845,7 @@ mod tests {
                 let recovered = result.unwrap();
                 assert_eq!(recovered.len(), 2);
                 assert_eq!(recovered[0].segment.end_offset, 1);
-                assert!(recovered[0].storage.messages_writer.is_none());
+                assert!(recovered[0].storage.messages_size.is_none());
             }
             assert_eq!(bytes_of(&messages_path), sealed);
             assert_eq!(bytes_of(&index_path), index);

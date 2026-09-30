@@ -304,11 +304,7 @@ pub struct ClientAddr {
 
 impl Connected<cyper_axum::IncomingStream<'_, CappedListener>> for ClientAddr {
     fn connect_info(stream: cyper_axum::IncomingStream<'_, CappedListener>) -> Self {
-        let peer = stream.remote_addr();
-        Self {
-            addr: peer.addr,
-            _permit: peer.permit.clone(),
-        }
+        stream.remote_addr().clone()
     }
 }
 
@@ -319,17 +315,10 @@ pub struct CappedListener {
     connections: Rc<ConnectionCap>,
 }
 
-/// The peer of an accepted plain HTTP socket and its slot in the connection
-/// cap. `permit` is `None` only for the listener's own local address.
-#[derive(Debug, Clone)]
-pub struct CappedPeer {
-    addr: SocketAddr,
-    permit: Option<Arc<ConnectionPermit>>,
-}
-
 impl cyper_axum::Listener for CappedListener {
     type Io = TcpStream;
-    type Addr = CappedPeer;
+    /// The permit is `None` only for the listener's own local address.
+    type Addr = ClientAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
@@ -338,14 +327,23 @@ impl cyper_axum::Listener for CappedListener {
             let (stream, addr) = cyper_axum::Listener::accept(&mut self.listener).await;
             if let Some(permit) = self.connections.try_acquire() {
                 let permit = Some(Arc::new(permit));
-                return (stream, CappedPeer { addr, permit });
+                return (
+                    stream,
+                    ClientAddr {
+                        addr,
+                        _permit: permit,
+                    },
+                );
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
         let addr = self.listener.local_addr()?;
-        Ok(CappedPeer { addr, permit: None })
+        Ok(ClientAddr {
+            addr,
+            _permit: None,
+        })
     }
 }
 

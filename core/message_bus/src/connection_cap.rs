@@ -26,6 +26,7 @@
 //! frames, and every slot of every shard inbox pays for the largest frame.
 
 use std::cell::Cell;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -41,7 +42,7 @@ static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 /// Owned by shard 0, where every client accept runs.
 #[derive(Debug)]
 pub struct ConnectionCap {
-    max: Option<usize>,
+    max: Option<NonZeroUsize>,
     last_refusal_log: Cell<Option<Instant>>,
     refused_since_log: Cell<u64>,
 }
@@ -49,7 +50,7 @@ pub struct ConnectionCap {
 impl ConnectionCap {
     /// A cap of `max` open sockets. `None` counts sockets and refuses none.
     #[must_use]
-    pub const fn new(max: Option<usize>) -> Self {
+    pub const fn new(max: Option<NonZeroUsize>) -> Self {
         Self {
             max,
             last_refusal_log: Cell::new(None),
@@ -66,7 +67,7 @@ impl ConnectionCap {
     /// Take a slot for a socket that was just accepted, or `None` at the
     /// cap. The caller closes a refused socket by dropping it.
     pub fn try_acquire(&self) -> Option<ConnectionPermit> {
-        if let Some(max) = self.max {
+        if let Some(max) = self.max.map(NonZeroUsize::get) {
             let admitted =
                 LIVE_CONNECTIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
                     (live < max).then_some(live + 1)
@@ -96,7 +97,9 @@ impl ConnectionCap {
         self.refused_since_log.set(0);
         warn!(
             live,
-            max, refused, "client connection cap reached, closing new client connections"
+            connections_max = max,
+            refused,
+            "message_bus.connections_max reached, closing new client connections"
         );
     }
 }
@@ -125,7 +128,7 @@ mod tests {
     // harness runs tests in parallel.
     #[test]
     fn given_cap_when_sockets_open_and_close_should_count_every_permit() {
-        let cap = ConnectionCap::new(Some(2));
+        let cap = ConnectionCap::new(NonZeroUsize::new(2));
         let first = cap.try_acquire().expect("the first slot is free");
         let second = cap.try_acquire().expect("the second slot is free");
         assert!(
@@ -154,8 +157,6 @@ mod tests {
         assert_eq!(uncapped.live(), 1000, "no cap still counts");
         drop(permits);
         assert_eq!(uncapped.live(), 0);
-
-        assert!(ConnectionCap::new(Some(0)).try_acquire().is_none());
         assert_eq!(cap.live(), 0);
     }
 }

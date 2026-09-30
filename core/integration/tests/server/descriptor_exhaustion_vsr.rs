@@ -16,9 +16,9 @@
 // under the License.
 
 //! A partition write that finds no free file descriptor stops the server with
-//! exit status 4, after the shutdown flush. The test runs the server under a
-//! small `RLIMIT_NOFILE`, keeps a few messages in memory only, fills the
-//! descriptor table with idle HTTP sockets, and stores consumer offsets until
+//! exit status 4, after the shutdown flush. The tests run the server under a
+//! small `RLIMIT_NOFILE`, keep a few messages in memory only, fill the
+//! descriptor table with idle HTTP sockets, and write consumer offsets until
 //! an offset file cannot be opened. A restart under the normal limit then
 //! serves the messages that only the flush could have written.
 
@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::harness::{ServerHandle, TestBinary};
+use integration::harness::{ServerHandle, TestBinary, TestHarness};
 use integration::iggy_harness;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -44,12 +44,22 @@ const OPEN_FILES_LIMIT: u64 = 128;
 const PAYLOADS: [&str; 3] = ["first", "second", "third"];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Each attempt uses a new consumer, so each one opens a new offset file.
-const STORE_ATTEMPTS: u32 = 20;
-const STORE_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_ATTEMPTS: u32 = 20;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The HTTP accept loop retries a second after `EMFILE`, so a descriptor
-/// that frees up goes to a waiting socket between two stores.
-const STORE_PAUSE: Duration = Duration::from_millis(500);
+/// that frees up goes to a waiting socket between two writes.
+const WRITE_PAUSE: Duration = Duration::from_millis(500);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How a test writes the offset of a new consumer.
+#[derive(Clone, Copy)]
+enum OffsetWrite {
+    /// A client store, which opens the offset file for a write.
+    Store,
+    /// A poll with auto-commit. The commit of a consumer that has no offset in
+    /// memory reads its offset file first.
+    AutoCommitPoll,
+}
 
 #[iggy_harness(
     cluster_nodes = 1,
@@ -61,6 +71,23 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 async fn given_no_free_descriptor_when_a_partition_write_fails_should_flush_and_exit_4(
     harness: &mut TestHarness,
 ) {
+    stop_on_offset_write_without_descriptor(harness, OffsetWrite::Store).await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(
+        message_bus.connections_max = "0",
+        sharding.cpu_allocation = "0..2"
+    )
+)]
+async fn given_no_free_descriptor_when_an_auto_commit_reads_its_offset_file_should_flush_and_exit_4(
+    harness: &mut TestHarness,
+) {
+    stop_on_offset_write_without_descriptor(harness, OffsetWrite::AutoCommitPoll).await;
+}
+
+async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, write: OffsetWrite) {
     harness
         .server_mut()
         .set_open_files_limit(Some(OPEN_FILES_LIMIT));
@@ -114,18 +141,41 @@ async fn given_no_free_descriptor_when_a_partition_write_fails_should_flush_and_
 
     let held = fill_descriptor_table(harness.server().http_addr().expect("HTTP listener")).await;
     harness.server_mut().expect_exit();
-    for consumer_id in 1..=STORE_ATTEMPTS {
+    for consumer_id in 1..=WRITE_ATTEMPTS {
         let consumer =
             Consumer::new(Identifier::numeric(consumer_id).expect("consumer identifier"));
-        let stored = timeout(
-            STORE_TIMEOUT,
-            client.store_consumer_offset(&consumer, &stream_id, &topic_id, Some(PARTITION_ID), 0),
-        )
-        .await;
-        if !matches!(stored, Ok(Ok(()))) {
+        let written = match write {
+            OffsetWrite::Store => timeout(
+                WRITE_TIMEOUT,
+                client.store_consumer_offset(
+                    &consumer,
+                    &stream_id,
+                    &topic_id,
+                    Some(PARTITION_ID),
+                    0,
+                ),
+            )
+            .await
+            .is_ok_and(|stored| stored.is_ok()),
+            OffsetWrite::AutoCommitPoll => timeout(
+                WRITE_TIMEOUT,
+                client.poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    Some(PARTITION_ID),
+                    &consumer,
+                    &PollingStrategy::offset(0),
+                    1,
+                    true,
+                ),
+            )
+            .await
+            .is_ok_and(|polled| polled.is_ok()),
+        };
+        if !written {
             break;
         }
-        sleep(STORE_PAUSE).await;
+        sleep(WRITE_PAUSE).await;
     }
     let status = harness
         .server_mut()
@@ -140,6 +190,7 @@ async fn given_no_free_descriptor_when_a_partition_write_fails_should_flush_and_
         file_len(&segment) > 0,
         "the shutdown flush must write the messages to their segment before the exit"
     );
+    assert_first_exhaustion_opened_an_offset_file(harness.server());
 
     drop(held);
     drop(client);
@@ -188,6 +239,23 @@ async fn fill_descriptor_table(http: SocketAddr) -> Vec<TcpStream> {
         }
     }
     held
+}
+
+/// Any open that finds no free descriptor sets the exit status, such as the
+/// superblock persist on the way down, so the status alone cannot tell that
+/// the offset write set it. The server logs only the first such open.
+fn assert_first_exhaustion_opened_an_offset_file(server: &ServerHandle) {
+    let path = server.data_path().join("logs/iggy-server.log");
+    let log = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let first = log
+        .lines()
+        .find(|line| line.contains("no free file descriptor while"))
+        .expect("the server logs the first open that found no free descriptor");
+    assert!(
+        first.contains("/offsets/consumers/"),
+        "the offset file must be the first open without a free descriptor, got: {first}"
+    );
 }
 
 fn segment_log(server: &ServerHandle, stream_id: u32, topic_id: u32) -> PathBuf {

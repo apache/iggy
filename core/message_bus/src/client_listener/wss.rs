@@ -117,7 +117,7 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!("Client listener (WSS) accept failed: {e}");
-                        pause_after_accept_error(&e).await;
+                        pause_after_accept_error(&e, &token).await;
                     }
                 }
             }

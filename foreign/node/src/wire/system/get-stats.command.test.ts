@@ -77,6 +77,26 @@ describe('GetStats Command', () => {
     assert.equal(stats.openFilesLimit, 1_048_576n);
   });
 
+  it('deserializes server version, cache metrics, threads and disk space', () => {
+    const stats = deserialize(buildStatsPayload());
+
+    assert.equal(stats.iggyServerVersion, '0.6.0');
+    assert.equal(stats.iggyServerSemver, 600);
+    assert.deepEqual(stats.cacheMetrics, [
+      {
+        streamId: 1, topicId: 1, partitionId: 0,
+        hits: 1000n, misses: 50n, hitRatio: Math.fround(0.95)
+      },
+      {
+        streamId: 2, topicId: 3, partitionId: 1,
+        hits: 1000n, misses: 50n, hitRatio: Math.fround(0.95)
+      }
+    ]);
+    assert.equal(stats.threadsCount, 16);
+    assert.equal(stats.freeDiskSpace, 107_374_182_400n);
+    assert.equal(stats.totalDiskSpace, 512_110_190_592n);
+  });
+
   it('reads open files fields as 0 when the reply ends at total_disk_space', () => {
     const stats = deserialize(buildStatsPayload());
 
@@ -94,12 +114,14 @@ describe('GetStats Command', () => {
       );
   });
 
-  it('throws on reply truncated before total_disk_space ends', () => {
+  it('throws on a reply truncated before total_disk_space ends', () => {
     const payload = buildStatsPayload();
-    assert.throws(
-      () => deserialize(payload.subarray(0, payload.length - 4)),
-      DeserializeError
-    );
+    for (let length = 0; length < payload.length; length += 1)
+      assert.throws(
+        () => deserialize(payload.subarray(0, length)),
+        DeserializeError,
+        `a reply cut to ${length} bytes must not decode`
+      );
   });
 
 });

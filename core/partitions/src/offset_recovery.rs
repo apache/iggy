@@ -36,6 +36,7 @@ use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
 #[cfg(test)]
 use journal::durable_storage::DiskStorage;
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
+use server_common::fatal::{NoteDescriptorExhaustion, is_descriptor_exhaustion};
 use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
@@ -78,7 +79,8 @@ pub async fn load_consumer_offsets(
 ///
 /// # Errors
 /// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
-/// enumerated, including when it is missing.
+/// enumerated, including when it is missing, or if no file descriptor is free
+/// to read a record.
 pub async fn load_consumer_offsets_with_storage<S: DurableStorage>(
     storage: &S,
     path: &str,
@@ -101,7 +103,8 @@ pub async fn load_consumer_group_offsets(
 ///
 /// # Errors
 /// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
-/// enumerated, including when it is missing.
+/// enumerated, including when it is missing, or if no file descriptor is free
+/// to read a record.
 pub async fn load_consumer_group_offsets_with_storage<S: DurableStorage>(
     storage: &S,
     path: &str,
@@ -155,7 +158,7 @@ async fn load_offsets<S: DurableStorage, T>(
             error!(?kind, name, "invalid consumer offset path");
             continue;
         };
-        let offset = match read_offset_file(storage, &path, offset_kind_label(kind)).await {
+        let offset = match read_offset_file(storage, &path, offset_kind_label(kind)).await? {
             OffsetFileLoad::Loaded(offset) => offset,
             OffsetFileLoad::Removed => continue,
             OffsetFileLoad::Stranded => {
@@ -193,28 +196,46 @@ const fn offset_kind_label(kind: ConsumerKind) -> &'static str {
     }
 }
 
+/// # Errors
+/// Returns [`IggyError::CannotReadConsumerOffsets`] if no file descriptor is
+/// free to read the record.
 async fn read_offset_file<S: DurableStorage>(
     storage: &S,
     path: &str,
     offset_kind: &'static str,
-) -> OffsetFileLoad {
+) -> Result<OffsetFileLoad, IggyError> {
     let bytes = match async {
-        let file = storage.open(Path::new(path), OpenMode::Read).await?;
+        // Read-only, but a skipped record rewinds its consumer, so it counts
+        // like a write open.
+        let file = storage
+            .open(Path::new(path), OpenMode::Read)
+            .await
+            .note_descriptor_exhaustion(|| format!("opening {path}"))?;
         let length = usize::try_from(file.length().await?).map_err(std::io::Error::other)?;
         file.read(0, length).await
     }
     .await
     {
         Ok(bytes) => bytes,
+        // A skipped record leaves its consumer without an offset, so the
+        // consumer polls from the start. No free descriptor says nothing about
+        // the record, so the load fails and runs again.
+        Err(e) if is_descriptor_exhaustion(&e) => {
+            error!(
+                "{COMPONENT} (error: {e}) - no free file descriptor to read {offset_kind} \
+                 file, path: {path}, failing the load."
+            );
+            return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
+        }
         Err(e) => {
             warn!(
                 "{COMPONENT} (error: {e}) - failed to read offset file, \
                  path: {path}, skipping."
             );
-            return OffsetFileLoad::Stranded;
+            return Ok(OffsetFileLoad::Stranded);
         }
     };
-    match decode_offset_record(&bytes) {
+    Ok(match decode_offset_record(&bytes) {
         OffsetRecord::Value { offset, .. } => OffsetFileLoad::Loaded(AtomicU64::new(offset)),
         OffsetRecord::Torn => {
             warn!(
@@ -241,7 +262,7 @@ async fn read_offset_file<S: DurableStorage>(
             );
             remove_invalid_offset_file(storage, path, offset_kind).await
         }
-    }
+    })
 }
 
 async fn remove_invalid_offset_file<S: DurableStorage>(
@@ -274,6 +295,78 @@ async fn remove_invalid_offset_file<S: DurableStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use journal::durable_storage::{RegularFiles, StorageEntry};
+    use nix::errno::Errno;
+    use std::io;
+
+    /// [`DiskStorage`] with no free descriptor for a read-only open.
+    struct NoReadDescriptorStorage;
+
+    impl DurableStorage for NoReadDescriptorStorage {
+        type File = <DiskStorage as DurableStorage>::File;
+
+        async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Self::File> {
+            if mode == OpenMode::Read {
+                return Err(io::Error::from_raw_os_error(Errno::EMFILE as i32));
+            }
+            DiskStorage.open(path, mode).await
+        }
+
+        async fn create_directories(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.create_directories(path).await
+        }
+
+        async fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.sync_directory(path).await
+        }
+
+        async fn rename(&self, source: &Path, target: &Path) -> io::Result<()> {
+            DiskStorage.rename(source, target).await
+        }
+
+        async fn remove_file(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.remove_file(path).await
+        }
+
+        async fn hard_link(&self, source: &Path, target: &Path) -> io::Result<()> {
+            DiskStorage.hard_link(source, target).await
+        }
+
+        async fn exists(&self, path: &Path) -> io::Result<bool> {
+            DiskStorage.exists(path).await
+        }
+
+        async fn entries(&self, path: &Path) -> io::Result<Vec<StorageEntry>> {
+            DiskStorage.entries(path).await
+        }
+
+        async fn regular_files(&self, path: &Path) -> io::Result<RegularFiles> {
+            DiskStorage.regular_files(path).await
+        }
+
+        async fn remove_tree(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.remove_tree(path).await
+        }
+    }
+
+    #[compio::test]
+    async fn given_no_free_descriptor_when_loading_should_fail_instead_of_skipping_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("9"), 12_u64.to_le_bytes()).unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert!(matches!(
+            load_consumer_offsets_with_storage(&NoReadDescriptorStorage, path).await,
+            Err(IggyError::CannotReadConsumerOffsets(_))
+        ));
+        assert!(matches!(
+            load_consumer_group_offsets_with_storage(&NoReadDescriptorStorage, path).await,
+            Err(IggyError::CannotReadConsumerOffsets(_))
+        ));
+        assert!(
+            dir.path().join("9").exists(),
+            "a failed load must keep the record"
+        );
+    }
 
     #[compio::test]
     async fn given_missing_directory_when_loading_should_report_error_instead_of_empty_state() {

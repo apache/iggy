@@ -17,10 +17,11 @@
 
 //! Stopping the process on an environmental failure that has no in-process answer.
 
+use iggy_common::IggyTimestamp;
 use nix::errno::Errno;
 use nix::sys::resource::{Resource, getrlimit};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Why the process is stopping. The discriminant is the exit status, one per
 /// condition; `1` stays the binary's generic startup failure.
@@ -39,6 +40,10 @@ pub enum FatalReason {
     /// sync failed because the process (`EMFILE`) or the host (`ENFILE`) had no
     /// free file descriptor. The exit comes after the ordinary shutdown, so the
     /// shards flushed what they could. See [`NoteDescriptorExhaustion`].
+    ///
+    /// The other reasons keep their own status after such a failure, for
+    /// example a superblock that stays unwritable for lack of a descriptor
+    /// exits 3. Their exit line then gives the time of the first one.
     DescriptorsExhausted = 4,
 }
 
@@ -68,16 +73,29 @@ const FATAL_LOG_TARGET: &str = "iggy.consensus.diag";
 /// non-blocking workers, and `exit` stops them before they flush, so without
 /// this write a supervisor's journal never learns why the process stopped. The
 /// write result is ignored because `eprintln!` would panic on a broken stderr.
+///
+/// If a storage open found no free file descriptor earlier, the line gives the
+/// time of the first one, whatever the reason. See [`NoteDescriptorExhaustion`].
 pub fn fatal(reason: FatalReason, message: &str) -> ! {
+    fatal_with_log_flush(reason, message, || {});
+}
+
+/// [`fatal`] for the owner of the log appenders. `flush_logs` runs after the
+/// log event and before the exit, so the event reaches the log files too.
+pub fn fatal_with_log_flush(reason: FatalReason, message: &str, flush_logs: impl FnOnce()) -> ! {
+    let exhaustion = first_descriptor_exhaustion()
+        .map(|at| format!("; a storage open first found no free file descriptor at {at} UTC"))
+        .unwrap_or_default();
     tracing::error!(
         target: FATAL_LOG_TARGET,
         reason = ?reason,
         exit_status = reason.exit_status(),
-        "{message}"
+        "{message}{exhaustion}"
     );
+    flush_logs();
     let _ = writeln!(
         std::io::stderr().lock(),
-        "iggy fatal: reason={reason:?} exit_status={}: {message}",
+        "iggy fatal: reason={reason:?} exit_status={}: {message}{exhaustion}",
         reason.exit_status()
     );
     std::process::exit(i32::from(reason.exit_status()));
@@ -94,9 +112,15 @@ pub fn fatal(reason: FatalReason, message: &str) -> ! {
 /// flush and lose committed messages that are not yet in a segment.
 ///
 /// If the server then stops on an error, it exits with
-/// [`FatalReason::DescriptorsExhausted`] instead of 1. The record lasts for the
-/// life of the process. A failed read fails only its own request, so reads do
-/// not record it, and accept loops do not either, see `message_bus::accept`.
+/// [`FatalReason::DescriptorsExhausted`] instead of 1. A stop through
+/// [`fatal`] keeps the status of its own reason. A failed read fails only its
+/// own request, so reads do not record it, and accept loops do not either, see
+/// `message_bus::accept`.
+///
+/// The record lasts for the life of the process. An exhaustion that the server
+/// recovers from, such as a superblock write that succeeds on a retry, therefore
+/// also sets the status of a later stop on an unrelated error. The exit line
+/// gives the time of the first exhaustion, so the two can be told apart.
 pub trait NoteDescriptorExhaustion: Sized {
     /// Pass the result through. If it failed with `EMFILE` or `ENFILE`, record
     /// that for [`descriptors_exhausted`], and log the first one with the
@@ -105,18 +129,28 @@ pub trait NoteDescriptorExhaustion: Sized {
     fn note_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self;
 }
 
-static DESCRIPTORS_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+/// Microseconds since the Unix epoch of the first noted exhaustion, or 0 for
+/// none.
+static FIRST_DESCRIPTOR_EXHAUSTION: AtomicU64 = AtomicU64::new(0);
 
 impl<T> NoteDescriptorExhaustion for io::Result<T> {
     fn note_descriptor_exhaustion(self, operation: impl FnOnce() -> String) -> Self {
         if let Err(error) = &self
             && is_descriptor_exhaustion(error)
-            && !DESCRIPTORS_EXHAUSTED.swap(true, Ordering::Relaxed)
+            && FIRST_DESCRIPTOR_EXHAUSTION
+                .compare_exchange(
+                    0,
+                    IggyTimestamp::now().as_micros().max(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
         {
             tracing::error!(
                 target: FATAL_LOG_TARGET,
                 "no free file descriptor while {}: {error} ({}); if the server stops \
-                 on an error, it exits with status {}",
+                 on an error, it exits with status {}, and a fail-stop with its own \
+                 status keeps that status",
                 operation(),
                 open_file_limits(),
                 FatalReason::DescriptorsExhausted.exit_status()
@@ -130,7 +164,14 @@ impl<T> NoteDescriptorExhaustion for io::Result<T> {
 /// `ENFILE`. See [`NoteDescriptorExhaustion`].
 #[must_use]
 pub fn descriptors_exhausted() -> bool {
-    DESCRIPTORS_EXHAUSTED.load(Ordering::Relaxed)
+    first_descriptor_exhaustion().is_some()
+}
+
+fn first_descriptor_exhaustion() -> Option<IggyTimestamp> {
+    match FIRST_DESCRIPTOR_EXHAUSTION.load(Ordering::Relaxed) {
+        0 => None,
+        micros => Some(IggyTimestamp::from(micros)),
+    }
 }
 
 /// `EMFILE` (this process is at its `RLIMIT_NOFILE`) or `ENFILE` (the host is
@@ -189,5 +230,14 @@ mod tests {
             Err(Some(Errno::EMFILE as i32))
         );
         assert!(descriptors_exhausted());
+        let first = first_descriptor_exhaustion().expect("the first exhaustion has a time");
+
+        let again: io::Result<()> = Err(io::Error::from_raw_os_error(Errno::ENFILE as i32));
+        let _ = again.note_descriptor_exhaustion(|| "opening a test file".to_owned());
+        assert_eq!(
+            first_descriptor_exhaustion(),
+            Some(first),
+            "a later exhaustion must keep the time of the first one"
+        );
     }
 }

@@ -92,7 +92,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                     }
                     Err(e) => {
                         error!("Client listener (WS) accept failed: {e}");
-                        pause_after_accept_error(&e).await;
+                        pause_after_accept_error(&e, &token).await;
                     }
                 }
             }

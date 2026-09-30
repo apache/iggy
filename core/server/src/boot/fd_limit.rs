@@ -21,6 +21,7 @@
 use message_bus::ConnectionCap;
 use nix::errno::Errno;
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
+use std::num::NonZeroUsize;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -56,6 +57,9 @@ pub enum OpenFileLimitError {
 
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit (clamped on macOS).
 /// A soft limit already at or above the target is left as it is.
+///
+/// No setting turns the raise off. An operator who wants a lower limit lowers
+/// the hard limit, which the raise never passes.
 ///
 /// # Errors
 ///
@@ -133,15 +137,15 @@ pub fn client_connection_cap(connections_max: Option<u32>) -> ConnectionCap {
 /// The cap for `[message_bus] connections_max`, or `None` for no cap. Unset
 /// is half of `soft_limit`, so clients cannot take the descriptors that
 /// storage writes need, and no cap when the limit is unknown. Zero is no cap.
-fn resolve_connections_max(connections_max: Option<u32>, soft_limit: Option<u64>) -> Option<usize> {
-    match connections_max {
-        Some(0) => None,
-        Some(max) => Some(usize::try_from(max).unwrap_or(usize::MAX)),
-        None => soft_limit
-            .map(|soft| soft / 2)
-            .filter(|&max| max > 0)
-            .map(|max| usize::try_from(max).unwrap_or(usize::MAX)),
-    }
+fn resolve_connections_max(
+    connections_max: Option<u32>,
+    soft_limit: Option<u64>,
+) -> Option<NonZeroUsize> {
+    let max = match connections_max {
+        Some(max) => usize::try_from(max).unwrap_or(usize::MAX),
+        None => usize::try_from(soft_limit? / 2).unwrap_or(usize::MAX),
+    };
+    NonZeroUsize::new(max)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -176,16 +180,25 @@ mod tests {
 
     #[test]
     fn given_connections_max_when_resolving_should_apply_the_default_and_zero_rules() {
-        assert_eq!(resolve_connections_max(None, Some(10_240)), Some(5_120));
+        assert_eq!(
+            resolve_connections_max(None, Some(10_240)),
+            NonZeroUsize::new(5_120)
+        );
         assert_eq!(resolve_connections_max(None, Some(1)), None);
         assert_eq!(resolve_connections_max(None, None), None);
         assert_eq!(resolve_connections_max(Some(0), Some(10_240)), None);
         assert_eq!(resolve_connections_max(Some(0), None), None);
-        assert_eq!(resolve_connections_max(Some(64), Some(10_240)), Some(64));
-        assert_eq!(resolve_connections_max(Some(64), None), Some(64));
+        assert_eq!(
+            resolve_connections_max(Some(64), Some(10_240)),
+            NonZeroUsize::new(64)
+        );
+        assert_eq!(
+            resolve_connections_max(Some(64), None),
+            NonZeroUsize::new(64)
+        );
         assert_eq!(
             resolve_connections_max(Some(20_000), Some(10_240)),
-            Some(20_000)
+            NonZeroUsize::new(20_000)
         );
     }
 }

@@ -21,17 +21,18 @@
 //! line per node is enough, and the client count is already a cross-shard
 //! gather.
 
-use crate::responses::{StatsTotals, stats_totals};
 use crate::shell::ServerShard;
 use crate::sysinfo_probe::{SystemStats, stats_disk_space};
+use consensus::MetadataHandle;
 use iggy_common::IggyByteSize;
+use metadata::impls::metadata::StreamsFrontend;
 use shard::Receiver;
 use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 use sysinfo::System as SysinfoSystem;
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info, trace};
+use tracing::{info, trace};
 
 /// Run the printer until `stop` fires, logging one line every `interval`.
 pub async fn run_sysinfo_printer(shard: Rc<ServerShard>, stop: Receiver<()>, interval: Duration) {
@@ -58,17 +59,12 @@ async fn print_sysinfo(shard: &Rc<ServerShard>, system: &mut SysinfoSystem) {
         return;
     }
     let clients_count = shard.list_all_clients().await.len();
-    let totals = match stats_totals(shard) {
-        Ok(totals) => totals,
-        Err(error) => {
-            error!(error = %error, "Failed to get system information");
-            return;
-        }
-    };
+    let (messages_size_bytes, messages_count) = messages_totals(shard);
     let (free_disk_space, total_disk_space) = stats_disk_space();
     let line = SysinfoLine {
         system: SystemStats::capture(system),
-        totals,
+        messages_size_bytes,
+        messages_count,
         clients_count,
         free_disk_space,
         total_disk_space,
@@ -76,10 +72,27 @@ async fn print_sysinfo(shard: &Rc<ServerShard>, system: &mut SysinfoSystem) {
     info!("{line}");
 }
 
+/// Message bytes and count of the node, summed over the per-stream counters,
+/// so a tick costs one step per stream and not per partition.
+fn messages_totals(shard: &ServerShard) -> (u64, u64) {
+    shard.plane.metadata().mux_stm.streams().read(|inner| {
+        inner
+            .items
+            .iter()
+            .fold((0u64, 0u64), |(size_bytes, count), (_, stream)| {
+                (
+                    size_bytes.saturating_add(stream.stats.size_bytes_inconsistent()),
+                    count.saturating_add(stream.stats.messages_count_inconsistent()),
+                )
+            })
+    })
+}
+
 /// One sample, rendered in the 0.8.2 server's layout plus open descriptors.
 struct SysinfoLine {
     system: SystemStats,
-    totals: StatsTotals,
+    messages_size_bytes: u64,
+    messages_count: u64,
     clients_count: usize,
     free_disk_space: u64,
     total_disk_space: u64,
@@ -110,9 +123,9 @@ impl fmt::Display for SysinfoLine {
             IggyByteSize::from(system.total_memory),
             IggyByteSize::from(self.free_disk_space),
             IggyByteSize::from(self.total_disk_space),
-            IggyByteSize::from(self.totals.messages_size_bytes),
+            IggyByteSize::from(self.messages_size_bytes),
             self.clients_count,
-            self.totals.messages_count,
+            self.messages_count,
             IggyByteSize::from(system.read_bytes),
             IggyByteSize::from(system.written_bytes),
         )?;
@@ -153,15 +166,8 @@ mod tests {
                 os_version: String::new(),
                 kernel_version: String::new(),
             },
-            totals: StatsTotals {
-                streams_count: 1,
-                topics_count: 1,
-                partitions_count: 1,
-                segments_count: 1,
-                messages_size_bytes: 0,
-                messages_count: 42,
-                consumer_groups_count: 0,
-            },
+            messages_size_bytes: 0,
+            messages_count: 42,
             clients_count: 3,
             free_disk_space: 0,
             total_disk_space: 0,

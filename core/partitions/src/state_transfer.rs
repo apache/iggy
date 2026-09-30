@@ -2924,10 +2924,8 @@ where
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
         let namespace_raw = self.consensus().group();
-        while let Some((segment, mut storage)) = self.log.retire_front() {
+        while let Some((segment, storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
             // Anchors go with the chain they describe, as everywhere else.
             // Unreachable for an install today, since anchors are planted only
             // by the solo boot re-anchor, but a record outliving its segment is
@@ -3076,10 +3074,9 @@ where
                         source,
                     })?,
             };
-            // The open fsyncs the installed files, and then a sealed segment
-            // gives its writer descriptors back.
+            // Only the tail takes writes, as after a rotation.
             if index + 1 < staged.len() {
-                let _ = storage.shutdown();
+                storage.seal();
             }
             let mut segment = Segment::new(meta.start_offset, self.effective_segment_size());
             segment.sealed = true;
@@ -3121,13 +3118,13 @@ where
             let preallocate_segments = self.effective_preallocate_segments(config);
             let last = self.log.segments().len() - 1;
             let storage = self.log.storages()[last].clone();
-            if let (Some(messages_reader), Some(messages_w)) = (
+            if let (Some(messages_reader), Some(messages_size)) = (
                 storage.messages_reader.as_ref(),
-                storage.messages_writer.as_ref(),
+                storage.messages_size.as_ref(),
             ) {
                 let messages_writer = MessagesWriter::new(
                     &messages_reader.path(),
-                    messages_w.size_counter(),
+                    Rc::clone(messages_size),
                     persisted,
                     true,
                     preallocate_segments.then_some(segment_size),
@@ -3139,12 +3136,12 @@ where
                 })?;
                 self.log.messages_writers_mut()[last] = Some(Rc::new(messages_writer));
             }
-            if let (Some(index_reader), Some(index_w)) =
-                (storage.index_reader.as_ref(), storage.index_writer.as_ref())
+            if let (Some(index_reader), Some(index_size)) =
+                (storage.index_reader.as_ref(), storage.index_size.as_ref())
             {
                 let index_writer = IggyIndexWriter::new(
                     &index_reader.path(),
-                    index_w.size_counter(),
+                    Rc::clone(index_size),
                     persisted,
                     true,
                 )
@@ -3537,9 +3534,7 @@ where
         // inodes as live data. Same hazard and same fix as `purge`.
         self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
-        while let Some((_, mut storage)) = self.log.retire_front() {
-            let _ = storage.shutdown();
-        }
+        while self.log.retire_front().is_some() {}
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
         self.consumer_offsets.pin().clear();

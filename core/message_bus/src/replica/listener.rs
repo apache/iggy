@@ -89,9 +89,10 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
 /// Every accepted connection fires `on_accepted` immediately; no byte is
 /// read here. The callback owns the accepted stream and is responsible
 /// for the in-flight cap check and the fd delegation (see the module
-/// doc). The loop awaits only `accept()` and, after `EMFILE` or `ENFILE`, the
-/// pause of [`pause_after_accept_error`]. Neither waits on what a peer sends,
-/// so a hostile or slow peer cannot stall admission of subsequent peers.
+/// doc). The loop awaits only `accept()` and, after an error that says a
+/// resource is used up, the pause of [`pause_after_accept_error`]. Neither
+/// waits on what a peer sends, so a hostile or slow peer cannot stall
+/// admission of subsequent peers.
 #[allow(clippy::future_not_send)]
 pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: AcceptedReplicaFn) {
     info!(
@@ -111,7 +112,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                     }
                     Err(e) => {
                         error!("Replica listener accept failed: {e}");
-                        pause_after_accept_error(&e).await;
+                        pause_after_accept_error(&e, &token).await;
                     }
                 }
             }

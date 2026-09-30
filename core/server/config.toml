@@ -1136,6 +1136,11 @@ handshake_grace = "10 s"
 # not count, because its connections share one UDP socket. When unset, the cap
 # is half the soft RLIMIT_NOFILE that the server has after it raises the limit
 # at boot. 0 means no cap.
+#
+# The server always raises the soft RLIMIT_NOFILE to the hard limit at boot
+# (on macOS, to at most 10240), and no setting turns this off. To keep a lower
+# limit, lower the hard limit, for example with LimitNOFILE in a systemd unit
+# or with ulimit -Hn.
 #connections_max = 10000
 
 # This node's own client-facing identity, used when 'cluster.enabled' is false.

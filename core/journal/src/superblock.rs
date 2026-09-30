@@ -492,7 +492,12 @@ const fn has_unreadable_sequence(slot: &SlotClass) -> bool {
 }
 
 async fn read_slot(path: &Path) -> io::Result<SlotClass> {
-    let file = match compio::fs::File::open(path).await {
+    // Read-only, but the load gates every later write of the group, so it
+    // counts like a write open.
+    let file = match compio::fs::File::open(path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {}", path.display()))
+    {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SlotClass::Absent),
         Err(e) => return Err(e),

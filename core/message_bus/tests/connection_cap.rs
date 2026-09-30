@@ -31,6 +31,7 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::{
     ClientTransportKind, ConnectionCap, ConnectionInstaller, IggyMessageBus, fd_transfer,
 };
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -63,7 +64,7 @@ async fn wait_for_live(cap: &ConnectionCap, live: usize, context: &str) {
 async fn given_capped_sockets_when_they_close_or_fail_the_upgrade_should_free_their_slots() {
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let cap = ConnectionCap::new(Some(2));
+    let cap = ConnectionCap::new(NonZeroUsize::new(2));
 
     let (tcp_server, tcp_peer) = tcp_pair().await;
     let fd = fd_transfer::dup_fd(&tcp_server).expect("dup TCP fd");

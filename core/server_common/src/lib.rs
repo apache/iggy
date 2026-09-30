@@ -45,7 +45,5 @@ pub use consensus_message::{
 pub use executor::create_shard_executor;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
 pub use reactor_yield::yield_to_reactor;
-pub use segment_storage::{
-    IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
-};
+pub use segment_storage::{IndexReader, MessagesReader, SegmentStorage};
 pub use storage::Storage;

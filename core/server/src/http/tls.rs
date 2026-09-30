@@ -247,7 +247,7 @@ async fn accept_pump(
                 }
                 Err(error) => {
                     error!(%error, "server HTTPS accept failed");
-                    pause_after_accept_error(&error).await;
+                    pause_after_accept_error(&error, &shutdown).await;
                 }
             },
         }

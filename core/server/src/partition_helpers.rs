@@ -342,8 +342,10 @@ pub async fn load_partition_or_fence(
             .map(Some)
         }
         // No free file descriptor says nothing about the record, so the load
-        // fails like any other: the reconciler retries it with backoff, and a
-        // tombstone would keep the group dark after descriptors free up.
+        // fails like any other, and a tombstone would keep the group dark after
+        // descriptors free up. At boot the error stops the server with exit
+        // status 4, because the superblock read notes it. Later, the reconciler
+        // retries the load with backoff.
         Err(error)
             if matches!(&error, ServerError::PartitionSuperblockIo { source, .. }
                 if is_descriptor_exhaustion(source)) =>

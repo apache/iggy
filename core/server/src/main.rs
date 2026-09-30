@@ -28,7 +28,7 @@ use server::boot::{
     raise_open_file_limit,
 };
 use server::server_error::ServerError;
-use server_common::fatal::{FatalReason, descriptors_exhausted, fatal};
+use server_common::fatal::{FatalReason, descriptors_exhausted, fatal_with_log_flush};
 use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
 use tracing::{error, info, warn};
@@ -120,8 +120,13 @@ fn main() -> Result<(), ServerError> {
         && descriptors_exhausted()
     {
         // `fatal` skips destructors, and the log appenders flush on drop.
-        drop(logging);
-        fatal(FatalReason::DescriptorsExhausted, &error.to_string());
+        fatal_with_log_flush(
+            FatalReason::DescriptorsExhausted,
+            &error.to_string(),
+            || {
+                drop(logging);
+            },
+        );
     }
     joined?;
     info!("server shutdown complete");
