@@ -25,9 +25,10 @@ mod publisher;
 
 use container::{
     DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_BATCH_TIMEOUT,
-    ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID, ENV_SOURCE_PASSWORD, ENV_SOURCE_PATH,
-    ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM, ENV_SOURCE_TOPIC,
-    ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD, MQTT_USERNAME, MqttBrokerContainer,
+    ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID, ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PASSWORD,
+    ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM,
+    ENV_SOURCE_TOPIC, ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD, MQTT_USERNAME,
+    MqttBrokerContainer,
 };
 
 struct MqttFixture {
@@ -40,6 +41,7 @@ struct MqttFixture {
     source_password: &'static str,
     batch_size: &'static str,
     batch_timeout: &'static str,
+    include_metadata: bool,
 }
 
 impl MqttFixture {
@@ -78,7 +80,19 @@ impl MqttFixture {
             source_password,
             batch_size,
             batch_timeout,
+            include_metadata: false,
         })
+    }
+
+    async fn start_with_metadata(
+        protocol: publisher::Protocol,
+        qos: u8,
+        source_username: &'static str,
+        source_password: &'static str,
+    ) -> Result<Self, TestBinaryError> {
+        let mut fixture = Self::start(protocol, qos, source_username, source_password).await?;
+        fixture.include_metadata = true;
+        Ok(fixture)
     }
 
     async fn restart_broker(&self) -> Result<(), String> {
@@ -190,7 +204,14 @@ impl MqttFixture {
                 DEFAULT_TEST_STREAM.to_string(),
             ),
             (ENV_SOURCE_TOPIC.to_string(), DEFAULT_IGGY_TOPIC.to_string()),
-            (ENV_SOURCE_SCHEMA.to_string(), "raw".to_string()),
+            (
+                ENV_SOURCE_SCHEMA.to_string(),
+                if self.include_metadata { "json" } else { "raw" }.to_string(),
+            ),
+            (
+                ENV_SOURCE_INCLUDE_METADATA.to_string(),
+                self.include_metadata.to_string(),
+            ),
             (
                 ENV_SOURCE_PATH.to_string(),
                 "../../target/debug/libiggy_connector_mqtt_source".to_string(),
@@ -294,6 +315,37 @@ define_mqtt_fixture!(
     MQTT_USERNAME,
     MQTT_PASSWORD
 );
+
+pub struct Mqtt5MetadataQos1Fixture(MqttFixture);
+
+impl Mqtt5MetadataQos1Fixture {
+    pub async fn publish_with_properties(
+        &self,
+        payload: &[u8],
+        properties: PublishProperties,
+    ) -> Result<(), String> {
+        self.0.publish_with_properties(payload, properties).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for Mqtt5MetadataQos1Fixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self(
+            MqttFixture::start_with_metadata(
+                publisher::Protocol::Mqtt5,
+                1,
+                MQTT_USERNAME,
+                MQTT_PASSWORD,
+            )
+            .await?,
+        ))
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.runtime_envs()
+    }
+}
 
 impl Mqtt5Qos1Fixture {
     pub async fn publish_with_properties(

@@ -36,6 +36,9 @@ linger_time = "5ms"
 broker_url = "mqtt://127.0.0.1:1883"
 subscriptions = ["devices/+/telemetry"]
 protocol = "mqtt5"
+# Set to true to preserve MQTT 5 properties in a JSON envelope. Use
+# schema = "json" when enabling metadata mode.
+include_metadata = false
 qos = 1
 client_id = "iggy-mqtt-source"
 clean_start = false

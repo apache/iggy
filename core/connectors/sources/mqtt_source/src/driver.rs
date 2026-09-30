@@ -16,6 +16,7 @@
 // under the License.
 
 use super::{MqttProtocol, MqttSourceConfig, Qos, qos_for_subscription};
+use base64::Engine;
 use iggy_common::{HeaderKey, HeaderValue};
 use rumqttc::tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 use rumqttc::v5::{
@@ -31,6 +32,7 @@ use rumqttc::{
 use rustls_native_certs::load_native_certs;
 use rustls_pemfile::{certs, private_key};
 use secrecy::ExposeSecret;
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{BufReader, Cursor},
@@ -38,10 +40,12 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
+use tracing::warn;
 use url::Url;
 
 const ACK_RETRY_ATTEMPTS: usize = 5;
 const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const MAX_HEADER_VALUE_LENGTH: usize = 255;
 
 // Metadata is kept separate from the payload so protocol details can be
 // preserved in Iggy headers without changing the application bytes.
@@ -60,6 +64,25 @@ pub(crate) struct MqttMessage {
     pub(crate) topic: String,
     pub(crate) headers: BTreeMap<HeaderKey, HeaderValue>,
     pub(crate) metadata: MqttMessageMetadata,
+    pub(crate) mqtt5_properties: Option<Mqtt5EnvelopeProperties>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Mqtt5EnvelopeProperties {
+    pub(crate) payload_format_indicator: Option<u8>,
+    pub(crate) message_expiry_interval: Option<u32>,
+    pub(crate) topic_alias: Option<u16>,
+    pub(crate) response_topic: Option<String>,
+    pub(crate) correlation_data_base64: Option<String>,
+    pub(crate) user_properties: Vec<Mqtt5UserProperty>,
+    pub(crate) subscription_identifiers: Vec<usize>,
+    pub(crate) content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Mqtt5UserProperty {
+    pub(crate) key: String,
+    pub(crate) value: String,
 }
 
 /// A normalized MQTT message and its optional deferred acknowledgement token.
@@ -623,6 +646,7 @@ fn normalize_mqtt311(
         topic: publish.topic.clone(),
         headers,
         metadata,
+        mqtt5_properties: None,
     };
     let ack_token = (metadata.qos != Qos::Zero).then_some(AckToken(AckTokenKind::Mqtt311(publish)));
     Ok(ReceivedMessage { message, ack_token })
@@ -641,18 +665,45 @@ pub(crate) fn normalize_mqtt5(
         retain: publish.retain,
     };
     let topic = topic_string(&publish.topic)?;
-    let mut headers = metadata_headers("mqtt5", &topic, metadata)?;
-    if let Some(properties) = publish.properties.as_ref() {
-        insert_mqtt5_properties(&mut headers, properties)?;
-    }
+    let headers = metadata_headers("mqtt5", &topic, metadata)?;
+    let mqtt5_properties = publish
+        .properties
+        .as_ref()
+        .map(Mqtt5EnvelopeProperties::from);
     let message = MqttMessage {
         payload: publish.payload.to_vec(),
         topic,
         headers,
         metadata,
+        mqtt5_properties,
     };
     let ack_token = (metadata.qos != Qos::Zero).then_some(AckToken(AckTokenKind::Mqtt5(publish)));
     Ok(ReceivedMessage { message, ack_token })
+}
+
+impl From<&rumqttc::v5::mqttbytes::v5::PublishProperties> for Mqtt5EnvelopeProperties {
+    fn from(properties: &rumqttc::v5::mqttbytes::v5::PublishProperties) -> Self {
+        Self {
+            payload_format_indicator: properties.payload_format_indicator,
+            message_expiry_interval: properties.message_expiry_interval,
+            topic_alias: properties.topic_alias,
+            response_topic: properties.response_topic.clone(),
+            correlation_data_base64: properties
+                .correlation_data
+                .as_ref()
+                .map(|value| base64::engine::general_purpose::STANDARD.encode(value)),
+            user_properties: properties
+                .user_properties
+                .iter()
+                .map(|(key, value)| Mqtt5UserProperty {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            subscription_identifiers: properties.subscription_identifiers.clone(),
+            content_type: properties.content_type.clone(),
+        }
+    }
 }
 
 fn metadata_headers(
@@ -668,47 +719,7 @@ fn metadata_headers(
     headers.insert(header_key("mqtt.qos")?, qos_value(metadata.qos).into());
     headers.insert(header_key("mqtt.dup")?, metadata.dup.into());
     headers.insert(header_key("mqtt.retain")?, metadata.retain.into());
-    if let Some(packet_id) = metadata.packet_id {
-        headers.insert(header_key("mqtt.packet_id")?, packet_id.into());
-    }
     Ok(headers)
-}
-
-fn insert_mqtt5_properties(
-    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
-    properties: &rumqttc::v5::mqttbytes::v5::PublishProperties,
-) -> Result<(), iggy_connector_sdk::Error> {
-    // MQTT 5 properties are copied into headers because the payload remains the
-    // original application bytes. Repeated user properties use distinct keys.
-    if let Some(value) = properties.payload_format_indicator {
-        headers.insert(header_key("mqtt.payload_format_indicator")?, value.into());
-    }
-    if let Some(value) = properties.message_expiry_interval {
-        headers.insert(header_key("mqtt.message_expiry_interval")?, value.into());
-    }
-    if let Some(value) = properties.topic_alias {
-        headers.insert(header_key("mqtt.topic_alias")?, value.into());
-    }
-    if let Some(value) = properties.response_topic.as_deref() {
-        insert_string_header(headers, "mqtt.response_topic", value)?;
-    }
-    if let Some(value) = properties.correlation_data.as_ref() {
-        insert_raw_header(headers, "mqtt.correlation_data", value)?;
-    }
-    for (index, (key, value)) in properties.user_properties.iter().enumerate() {
-        insert_string_header(headers, &format!("mqtt.user_property.{index}.key"), key)?;
-        insert_string_header(headers, &format!("mqtt.user_property.{index}.value"), value)?;
-    }
-    for (index, value) in properties.subscription_identifiers.iter().enumerate() {
-        headers.insert(
-            header_key(&format!("mqtt.subscription_identifier.{index}"))?,
-            (*value as u64).into(),
-        );
-    }
-    if let Some(value) = properties.content_type.as_deref() {
-        insert_string_header(headers, "mqtt.content_type", value)?;
-    }
-    Ok(())
 }
 
 fn insert_string_header(
@@ -716,6 +727,15 @@ fn insert_string_header(
     name: &str,
     value: &str,
 ) -> Result<(), iggy_connector_sdk::Error> {
+    if value.is_empty() {
+        warn_omitted_header(name, "empty_value", value.len());
+        return Ok(());
+    }
+    if value.len() > MAX_HEADER_VALUE_LENGTH {
+        warn_omitted_header(name, "value_too_long", value.len());
+        return Ok(());
+    }
+
     let header_value = HeaderValue::try_from(value).map_err(|error| {
         iggy_connector_sdk::Error::Serialization(format!(
             "invalid MQTT header value for {name}: {error}"
@@ -725,18 +745,15 @@ fn insert_string_header(
     Ok(())
 }
 
-fn insert_raw_header(
-    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
-    name: &str,
-    value: &[u8],
-) -> Result<(), iggy_connector_sdk::Error> {
-    let header_value = HeaderValue::try_from(value.to_vec()).map_err(|error| {
-        iggy_connector_sdk::Error::Serialization(format!(
-            "invalid MQTT header value for {name}: {error}"
-        ))
-    })?;
-    headers.insert(header_key(name)?, header_value);
-    Ok(())
+fn warn_omitted_header(name: &str, reason: &str, value_length: usize) {
+    warn!(
+        connector = "mqtt",
+        header = name,
+        reason,
+        value_length,
+        max_length = MAX_HEADER_VALUE_LENGTH,
+        "MQTT metadata header omitted"
+    );
 }
 
 fn header_key(name: &str) -> Result<HeaderKey, iggy_connector_sdk::Error> {
@@ -853,17 +870,64 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(
-            headers[&header_key("mqtt.packet_id").unwrap()]
-                .as_uint16()
-                .unwrap(),
-            0
-        );
+        assert!(!headers.contains_key(&header_key("mqtt.packet_id").unwrap()));
         assert!(headers[&header_key("mqtt.dup").unwrap()].as_bool().unwrap());
         assert!(
             headers[&header_key("mqtt.retain").unwrap()]
                 .as_bool()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn given_oversized_topic_should_preserve_message_and_omit_topic_header() {
+        let topic = "t".repeat(MAX_HEADER_VALUE_LENGTH + 1);
+        let publish = Mqtt311Publish::new(&topic, Mqtt311Qos::AtMostOnce, b"payload");
+
+        let received = normalize_mqtt311(publish).expect("oversized topic should be tolerated");
+
+        assert_eq!(received.message.payload, b"payload");
+        assert!(
+            !received
+                .message
+                .headers
+                .contains_key(&header_key("mqtt.topic").unwrap())
+        );
+        assert!(
+            received
+                .message
+                .headers
+                .contains_key(&header_key("mqtt.protocol").unwrap())
+        );
+    }
+
+    #[test]
+    fn given_empty_mqtt5_property_should_omit_only_that_header() {
+        let properties = PublishProperties {
+            response_topic: Some(String::new()),
+            ..Default::default()
+        };
+        let publish = Mqtt5Publish::new(
+            "devices/test",
+            Mqtt5Qos::AtMostOnce,
+            b"payload".as_slice(),
+            Some(properties),
+        );
+
+        let received = normalize_mqtt5(publish).expect("empty property should be tolerated");
+
+        assert_eq!(received.message.payload, b"payload");
+        assert!(
+            !received
+                .message
+                .headers
+                .contains_key(&header_key("mqtt.response_topic").unwrap())
+        );
+        assert!(
+            received
+                .message
+                .headers
+                .contains_key(&header_key("mqtt.topic").unwrap())
         );
     }
 
@@ -933,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn given_mqtt5_publish_properties_should_map_to_headers() {
+    fn given_mqtt5_publish_properties_should_be_retained_for_envelope() {
         let properties = PublishProperties {
             payload_format_indicator: Some(1),
             message_expiry_interval: Some(30),
@@ -952,74 +1016,26 @@ mod tests {
         );
 
         let received = normalize_mqtt5(publish).expect("MQTT 5 publish should normalize");
-        let headers = &received.message.headers;
-
+        let properties = received
+            .message
+            .mqtt5_properties
+            .expect("MQTT 5 properties should be retained");
+        assert_eq!(properties.payload_format_indicator, Some(1));
+        assert_eq!(properties.message_expiry_interval, Some(30));
+        assert_eq!(properties.topic_alias, Some(4));
         assert_eq!(
-            headers[&header_key("mqtt.protocol").unwrap()]
-                .as_str()
-                .unwrap(),
-            "mqtt5"
+            properties.response_topic.as_deref(),
+            Some("devices/response")
         );
         assert_eq!(
-            headers[&header_key("mqtt.payload_format_indicator").unwrap()]
-                .as_uint8()
-                .unwrap(),
-            1
+            properties.correlation_data_base64.as_deref(),
+            Some("Y29ycmVsYXRpb24=")
         );
-        assert_eq!(
-            headers[&header_key("mqtt.message_expiry_interval").unwrap()]
-                .as_uint32()
-                .unwrap(),
-            30
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.topic_alias").unwrap()]
-                .as_uint16()
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.response_topic").unwrap()]
-                .as_str()
-                .unwrap(),
-            "devices/response"
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.correlation_data").unwrap()]
-                .as_raw()
-                .unwrap(),
-            b"correlation"
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.user_property.0.key").unwrap()]
-                .as_str()
-                .unwrap(),
-            "device_id"
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.user_property.0.value").unwrap()]
-                .as_str()
-                .unwrap(),
-            "device-1"
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.subscription_identifier.0").unwrap()]
-                .as_uint64()
-                .unwrap(),
-            7
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.subscription_identifier.1").unwrap()]
-                .as_uint64()
-                .unwrap(),
-            9
-        );
-        assert_eq!(
-            headers[&header_key("mqtt.content_type").unwrap()]
-                .as_str()
-                .unwrap(),
-            "application/json"
-        );
+        assert_eq!(properties.user_properties[0].key, "device_id");
+        assert_eq!(properties.user_properties[0].value, "device-1");
+        assert_eq!(properties.subscription_identifiers, vec![7, 9]);
+        assert_eq!(properties.content_type.as_deref(), Some("application/json"));
+        assert_eq!(received.message.headers.len(), 5);
     }
 
     #[test]
@@ -1049,6 +1065,7 @@ mod tests {
             subscriptions: vec!["devices/test".to_string()],
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
+            include_metadata: false,
             qos: 1,
             tls: None,
             client_id: Some("test-source".to_string()),
@@ -1088,6 +1105,7 @@ mod tests {
             subscriptions: vec!["devices/test".to_string()],
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
+            include_metadata: false,
             qos: 1,
             tls: Some(super::super::MqttTlsConfig {
                 ca_file: Some("/path/that/does/not/exist.pem".to_string()),
@@ -1132,6 +1150,7 @@ mod tests {
             subscriptions: vec!["devices/test".to_string()],
             subscription_qos: BTreeMap::new(),
             protocol: MqttProtocol::Mqtt5,
+            include_metadata: false,
             qos: 1,
             tls: None,
             client_id: Some("configured-client".to_string()),

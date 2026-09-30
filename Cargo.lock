@@ -7380,6 +7380,7 @@ name = "iggy_connector_mqtt_source"
 version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "dashmap",
  "humantime",
  "iggy_common",
@@ -7389,6 +7390,7 @@ dependencies = [
  "rustls-pemfile",
  "secrecy",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "url",

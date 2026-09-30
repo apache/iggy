@@ -82,9 +82,9 @@ pub use mongodb::{
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
 pub use mqtt::{
-    Mqtt5InvalidCredentialsFixture, Mqtt5PendingBatchFixture, Mqtt5Qos0Fixture, Mqtt5Qos1Fixture,
-    Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture, Mqtt311Qos0Fixture, Mqtt311Qos1Fixture,
-    Mqtt311Qos2Fixture,
+    Mqtt5InvalidCredentialsFixture, Mqtt5MetadataQos1Fixture, Mqtt5PendingBatchFixture,
+    Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture,
+    Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
 };
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
