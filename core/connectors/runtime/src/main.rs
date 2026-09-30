@@ -41,6 +41,7 @@ use state::StateStorage;
 use std::{
     collections::HashMap,
     env,
+    io::Write,
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
@@ -185,7 +186,7 @@ fn print_config_env_vars() {
     all_names.dedup();
 
     for name in all_names {
-        println!("{name}");
+        let _ = writeln!(std::io::stdout(), "{name}");
     }
 }
 
