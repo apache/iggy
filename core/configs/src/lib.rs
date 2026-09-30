@@ -25,7 +25,7 @@ pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
     EnvVarTemplate, FileConfigProvider, RelocatedKey, RelocatedTarget, TypedEnvProvider,
-    parse_env_value_to_json,
+    parse_env_value_to_json, print_env_var_names, CONNECTORS_RUNTIME_ENV_VARS, MCP_RUNTIME_ENV_VARS,
 };
 pub use server_config::{
     cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,

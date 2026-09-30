@@ -25,6 +25,7 @@
 //! - Automatic type conversion and validation
 
 mod env_mapping;
+mod env_listing;
 mod error;
 mod file_provider;
 mod parsing;
@@ -32,6 +33,7 @@ mod traits;
 mod typed_env_provider;
 
 pub use env_mapping::{ConfigEnvMappings, EnvVarMapping, EnvVarTemplate};
+pub use env_listing::{print_env_var_names, CONNECTORS_RUNTIME_ENV_VARS, MCP_RUNTIME_ENV_VARS};
 pub use error::ConfigurationError;
 pub use file_provider::{FileConfigProvider, RelocatedKey, RelocatedTarget};
 pub use parsing::parse_env_value_to_json;

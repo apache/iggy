@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ::configs::ConfigEnvMappings;
-use ::configs::ConfigProvider;
+use ::configs::{ConfigEnvMappings, ConfigProvider, print_env_var_names, MCP_RUNTIME_ENV_VARS};
 use clap::Parser;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
@@ -55,7 +54,7 @@ struct Args {
 fn main() -> Result<(), McpRuntimeError> {
     let args = Args::parse();
     if args.list_config_env_vars {
-        print_config_env_vars();
+        print_config_env_vars()?;
         return Ok(());
     }
     let runtime = Builder::new_multi_thread()
@@ -68,21 +67,13 @@ fn main() -> Result<(), McpRuntimeError> {
     result
 }
 
-fn print_config_env_vars() {
-    let mut names: Vec<_> = McpServerConfig::env_templates()
-        .iter()
-        .map(|template| template.env_name)
-        .chain([
-            "IGGY_DISPLAY_CONFIG",
-            "IGGY_MCP_CONFIG_PATH",
-            "IGGY_MCP_ENV_PATH",
-        ])
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    for name in names {
-        println!("{name}");
-    }
+fn print_config_env_vars() -> std::io::Result<()> {
+    print_env_var_names(
+        McpServerConfig::env_templates()
+            .iter()
+            .map(|t| t.env_name)
+            .chain(MCP_RUNTIME_ENV_VARS.iter().copied()),
+    )
 }
 
 async fn run() -> Result<(), McpRuntimeError> {

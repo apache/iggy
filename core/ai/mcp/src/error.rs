@@ -45,4 +45,6 @@ pub enum McpRuntimeError {
     TokenFileReadError(String, String),
     #[error("Token file is empty: {0}")]
     TokenFileEmpty(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }

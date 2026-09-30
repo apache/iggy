@@ -47,6 +47,34 @@ pub use crate::common::server::{
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
+/// Vars safe to advertise to end users via `--list-config-env-vars`.
+pub const SERVER_RUNTIME_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_DISPLAY_CONFIG",
+    "IGGY_ENV_PATH",
+    "IGGY_ROOT_PASSWORD",
+    "IGGY_ROOT_USERNAME",
+    "IGGY_SHARD_EVENT_INTERVAL",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+];
+
+/// Test/CI-only vars: never advertised, but still non-config (suppress
+/// "unknown env var" warnings the same as `SERVER_RUNTIME_ENV_VARS` does).
+pub const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
+    "IGGY_TEST_VERBOSE",
+    "IGGY_TEST_CLUSTER_NODES",
+    "IGGY_TEST_CLEANUP_DISABLED",
+    "IGGY_CI_BUILD",
+    "IGGY_HOME",
+    "IGGY_USERNAME",
+    "IGGY_PASSWORD",
+];
+
+/// All non-config env vars the server process reads directly — the union of
+/// `SERVER_RUNTIME_ENV_VARS` and `SERVER_SCAN_ONLY_ENV_VARS`. Kept as one
+/// list (rather than requiring every call site to chain both) so existing
+/// consumers are unaffected; a test below pins its contents to the split so
+/// the two views can't silently diverge.
 pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_CONFIG_PATH",
     "IGGY_ENV_PATH",
@@ -63,6 +91,26 @@ pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
 ];
+
+#[cfg(test)]
+mod server_process_env_vars_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn runtime_and_scan_only_lists_cover_process_env_vars_exactly() {
+        let split: HashSet<&str> = SERVER_RUNTIME_ENV_VARS
+            .iter()
+            .chain(SERVER_SCAN_ONLY_ENV_VARS.iter())
+            .copied()
+            .collect();
+        let whole: HashSet<&str> = SERVER_PROCESS_ENV_VARS.iter().copied().collect();
+        assert_eq!(
+            split, whole,
+            "SERVER_RUNTIME_ENV_VARS + SERVER_SCAN_ONLY_ENV_VARS must equal SERVER_PROCESS_ENV_VARS"
+        );
+    }
+}
 
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
     &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];

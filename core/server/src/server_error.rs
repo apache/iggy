@@ -313,6 +313,8 @@ pub enum ServerError {
     /// as clean.
     #[error("server shut down after a panic: {description}")]
     Panicked { description: String },
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

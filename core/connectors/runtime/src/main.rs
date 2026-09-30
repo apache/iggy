@@ -20,7 +20,7 @@ use crate::configs::connectors::{
     create_connectors_config_provider,
 };
 use crate::metrics::ConnectorType;
-use ::configs::{ConfigEnvMappings, ConfigProvider};
+use ::configs::{ConfigEnvMappings, ConfigProvider, print_env_var_names, CONNECTORS_RUNTIME_ENV_VARS};
 use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
@@ -41,7 +41,6 @@ use state::StateStorage;
 use std::{
     collections::HashMap,
     env,
-    io::Write,
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
@@ -64,26 +63,24 @@ mod stream;
 mod transform;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const CONNECTOR_PREFIX_PATTERN: &str = "IGGY_CONNECTORS";
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(author = "Apache Iggy", version)]
-    /// Print supported configuration environment variables and exit.
-    ///
-    /// Lists all supported IGGY_* environment variable names and templates,
-    /// sorted and deduplicated. Template syntax:
-    /// - <N> represents vector indices
-    /// - <KEY> represents connector keys (uppercased from config)
-    /// - <FIELD> represents plugin configuration field names
-    ///
-    /// Exits immediately before any startup.
-
 struct Args {
-    /// Print supported configuration environment variables and exit.
-    #[arg(long)]
+    #[arg(long, long_help = r#"Print supported configuration environment variables and exit.
+
+Lists all supported IGGY_* environment variable names and templates,
+sorted and deduplicated. Template syntax:
+- <N> represents vector indices
+- <KEY> represents connector keys (uppercased from config).
+  Overrides via <KEY> require the local connectors provider.
+- <FIELD> represents plugin configuration field names, excluding
+  FORMAT (handled separately as a strongly-typed field)
+
+Exits immediately before any startup."#)]
     list_config_env_vars: bool,
 }
 
@@ -138,7 +135,7 @@ fn print_ascii_art(text: &str) {
 fn main() -> Result<(), RuntimeError> {
     let args = Args::parse();
     if args.list_config_env_vars {
-        print_config_env_vars();
+        print_config_env_vars()?;
         return Ok(());
     }
     capture_allowed_cpus();
@@ -148,19 +145,8 @@ fn main() -> Result<(), RuntimeError> {
         .block_on(run())
 }
 
-fn print_config_env_vars() {
-    // Collect static template names from ConfigEnv derived configs
-    let names: Vec<&'static str> = ConnectorsRuntimeConfig::env_templates()
-        .iter()
-        .map(|template| template.env_name)
-        .chain([
-            "IGGY_CONNECTORS_CONFIG_PATH",
-            "IGGY_CONNECTORS_ENV_PATH",
-            "IGGY_DISPLAY_CONFIG",
-        ])
-        .collect();
-
-    // Collect sink and source connector templates (reusable across all connectors)
+fn print_config_env_vars() -> std::io::Result<()> {
+    let prefix = ConnectorsRuntimeConfig::ENV_PREFIX;
     let sink_source_templates: Vec<String> = [
         ("SINK", SinkConfig::env_templates()),
         ("SOURCE", SourceConfig::env_templates()),
@@ -169,25 +155,20 @@ fn print_config_env_vars() {
     .flat_map(|(kind, templates)| {
         templates
             .iter()
-            .map(move |template| format!("{CONNECTOR_PREFIX_PATTERN}_{kind}_<KEY>_{}", template.env_name))
+            .map(move |template| format!("{prefix}{kind}_<KEY>_{}", template.env_name))
             .chain(std::iter::once(format!(
-                "IGGY_CONNECTORS_{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
+                "{prefix}{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"
             )))
     })
     .collect();
 
-    // Combine static and dynamic templates, sort, deduplicate
-    let mut all_names: Vec<String> = names
-        .into_iter()
-        .map(|s| s.to_string())
-        .chain(sink_source_templates)
-        .collect();
-    all_names.sort_unstable();
-    all_names.dedup();
+    let names = ConnectorsRuntimeConfig::env_templates()
+        .iter()
+        .map(|t| t.env_name.to_string())
+        .chain(CONNECTORS_RUNTIME_ENV_VARS.iter().map(|s| s.to_string()))
+        .chain(sink_source_templates.into_iter());
 
-    for name in all_names {
-        let _ = writeln!(std::io::stdout(), "{name}");
-    }
+    print_env_var_names(names)
 }
 
 async fn run() -> Result<(), RuntimeError> {

@@ -22,7 +22,7 @@ mod banner;
 
 use args::Args;
 use clap::Parser;
-use configs::{ConfigEnvMappings, server::ServerConfig};
+use configs::{ConfigEnvMappings, print_env_var_names, server::ServerConfig};
 use server::boot::{apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs};
 use server::server_error::ServerError;
 use server_common::log::Logging;
@@ -39,7 +39,7 @@ fn main() -> Result<(), ServerError> {
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
     if args.list_config_env_vars {
-        print_config_env_vars();
+        print_config_env_vars()?;
         return Ok(());
     }
     banner::print(server::VERSION);
@@ -108,23 +108,11 @@ fn main() -> Result<(), ServerError> {
     Ok(())
 }
 
-fn print_config_env_vars() {
-    let mut names: Vec<_> = ServerConfig::env_templates()
-        .iter()
-        .map(|template| template.env_name)
-        .chain([
-            "IGGY_CONFIG_PATH",
-            "IGGY_DISPLAY_CONFIG",
-            "IGGY_ENV_PATH",
-            "IGGY_ROOT_PASSWORD",
-            "IGGY_ROOT_USERNAME",
-            "IGGY_SHARD_EVENT_INTERVAL",
-            "IGGY_SHARD_RUNTIME_CAPACITY",
-        ])
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    for name in names {
-        println!("{name}");
-    }
+fn print_config_env_vars() -> std::io::Result<()> {
+    print_env_var_names(
+        ServerConfig::env_templates()
+            .iter()
+            .map(|t| t.env_name)
+            .chain(configs::server::SERVER_RUNTIME_ENV_VARS.iter().copied()),
+    )
 }
