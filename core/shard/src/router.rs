@@ -836,7 +836,7 @@ where
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
                 // (wired by the server) reads this shard's `SessionManager`
-                // and pushes the list over `reply`.
+                // and pushes the answer over `reply`.
                 self.host.on_list_clients(reply);
             }
             LifecycleFrame::PartitionRead {

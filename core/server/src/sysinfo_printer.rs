@@ -58,7 +58,7 @@ async fn print_sysinfo(shard: &Rc<ServerShard>, system: &mut SysinfoSystem) {
     if LevelFilter::current() < LevelFilter::INFO {
         return;
     }
-    let clients_count = shard.list_all_clients().await.len();
+    let clients_count = shard.count_all_clients().await;
     let (messages_size_bytes, messages_count) = messages_totals(shard);
     let (free_disk_space, total_disk_space) = stats_disk_space();
     let line = SysinfoLine {
