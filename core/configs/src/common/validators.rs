@@ -23,6 +23,7 @@ use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
 use iggy_common::Validatable;
+use server_common::log::LogFilter;
 use std::thread::available_parallelism;
 
 /// 1 GiB max segment size.
@@ -93,14 +94,17 @@ impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
 
 impl Validatable<ConfigurationError> for LoggingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.level.is_empty() {
-            eprintln!("logging.level is supposed be configured");
+        if let Err(error) = self.level.parse::<LogFilter>() {
+            eprintln!(
+                "Configured logging.level {:?} is invalid: {error}",
+                self.level
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if self.retention.as_secs() < 1 {
+        if !self.retention.is_zero() && self.retention.as_secs() < 1 {
             eprintln!(
-                "Configured logging.retention {} is less than minimum 1 second",
+                "Configured logging.retention {} is less than minimum 1 second, use 0 to turn off deletion by age",
                 self.retention
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -302,7 +306,7 @@ mod cpu_allocation_tests {
 #[cfg(test)]
 mod logging_tests {
     use super::*;
-    use iggy_common::IggyDuration;
+    use iggy_common::{IggyByteSize, IggyDuration};
     use std::time::Duration;
 
     fn with_sysinfo_print_interval(interval: Duration) -> LoggingConfig {
@@ -328,5 +332,53 @@ mod logging_tests {
     fn disabled_sysinfo_print_interval_is_accepted() {
         let config = with_sysinfo_print_interval(Duration::ZERO);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn level_that_is_not_a_level_is_rejected() {
+        let config = LoggingConfig {
+            level: "inof".to_owned(),
+            ..LoggingConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_retention_is_accepted() {
+        let config = LoggingConfig {
+            retention: IggyDuration::new(Duration::ZERO),
+            ..LoggingConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sub_second_retention_and_check_interval_are_rejected() {
+        let half_second = IggyDuration::new(Duration::from_millis(500));
+        let retention = LoggingConfig {
+            retention: half_second,
+            ..LoggingConfig::default()
+        };
+        let check_interval = LoggingConfig {
+            rotation_check_interval: half_second,
+            ..LoggingConfig::default()
+        };
+        assert!(retention.validate().is_err());
+        assert!(check_interval.validate().is_err());
+    }
+
+    #[test]
+    fn max_total_size_below_max_file_size_is_rejected_unless_unlimited() {
+        let below = LoggingConfig {
+            max_file_size: IggyByteSize::from(100),
+            max_total_size: IggyByteSize::from(50),
+            ..LoggingConfig::default()
+        };
+        let unlimited = LoggingConfig {
+            max_total_size: IggyByteSize::from(0),
+            ..below.clone()
+        };
+        assert!(below.validate().is_err());
+        assert!(unlimited.validate().is_ok());
     }
 }

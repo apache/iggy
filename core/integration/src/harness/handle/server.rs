@@ -979,6 +979,9 @@ impl TestBinary for ServerHandle {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
+        if let Some(current_dir) = &self.config.current_dir {
+            command.current_dir(current_dir);
+        }
 
         if let Some(limit) = self.open_files_limit {
             let rlimit = libc::rlimit {
