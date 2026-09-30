@@ -502,6 +502,34 @@ public sealed class BinaryMapper
         Assert.Equal(stats.OsName, response.OsName);
         Assert.Equal(stats.OsVersion, stats.OsVersion);
         Assert.Equal(stats.KernelVersion, response.KernelVersion);
+        Assert.Equal(stats.IggyServerVersion, response.IggyServerVersion);
+        Assert.Equal(stats.ThreadsCount, response.ThreadsCount);
+        Assert.Equal(stats.FreeDiskSpace, response.FreeDiskSpace);
+        Assert.Equal(stats.TotalDiskSpace, response.TotalDiskSpace);
+        Assert.Equal(stats.OpenFilesCount, response.OpenFilesCount);
+        Assert.Equal(stats.OpenFilesLimit, response.OpenFilesLimit);
+    }
+
+    [Fact]
+    public void MapStats_WithoutOpenFilesFields_ReadsThemAsZero()
+    {
+        var stats = StatsFactory.CreateFakeStatsObject();
+        var payload = BinaryFactory.CreateStatsPayload(stats, withOpenFiles: false);
+
+        var response = Mappers.BinaryMapper.MapStats(payload);
+
+        Assert.Equal(stats.TotalDiskSpace, response.TotalDiskSpace);
+        Assert.Equal(0ul, response.OpenFilesCount);
+        Assert.Equal(0ul, response.OpenFilesLimit);
+    }
+
+    [Fact]
+    public void MapStats_TruncatedOpenFilesFields_Throws()
+    {
+        var payload = BinaryFactory.CreateStatsPayload(StatsFactory.CreateFakeStatsObject());
+        var truncated = payload[..^8];
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapStats(truncated));
     }
 
     [Fact]

@@ -40,7 +40,8 @@ use message_bus::transports::tls::{
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedQuicConn, AcceptedReplicaFn,
     AcceptedTlsClientFn, AcceptedWsClientFn, AcceptedWssClientFn, ClientConnMeta,
-    ClientTransportKind, DialedReplicaFn, IggyMessageBus, fd_transfer, installer,
+    ClientTransportKind, ConnectionCap, ConnectionPermit, DialedReplicaFn, IggyMessageBus,
+    fd_transfer, installer,
 };
 use rustls::pki_types::ServerName;
 use server_common::Message;
@@ -203,6 +204,13 @@ pub fn install_dialed_replicas_locally(
     })
 }
 
+/// A slot in an uncapped connection cap, for installs that do not test the cap.
+pub fn test_permit() -> ConnectionPermit {
+    ConnectionCap::new(None)
+        .try_acquire()
+        .expect("an uncapped cap admits every socket")
+}
+
 /// Build an [`AcceptedClientFn`] that mints a local client id (top 16 bits =
 /// `shard_id`, bottom 112 bits = per-call counter) and installs the client
 /// stream directly on the given bus. Tests use this to bypass the shard-0
@@ -220,7 +228,7 @@ pub fn install_clients_locally(
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
         let meta = test_client_meta(client_id, ClientTransportKind::Tcp);
-        installer::install_client_tcp(&bus, meta, stream, on_request.clone());
+        installer::install_client_tcp(&bus, meta, stream, test_permit(), on_request.clone());
     })
 }
 
@@ -264,7 +272,7 @@ pub fn install_ws_clients_locally(
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
         let meta = test_client_meta(client_id, ClientTransportKind::Ws);
-        bus.install_client_ws_fd(fd, meta, on_request.clone());
+        bus.install_client_ws_fd(fd, meta, test_permit(), on_request.clone());
     })
 }
 
@@ -286,7 +294,7 @@ pub fn install_tls_clients_locally(
         let meta = test_client_meta(client_id, ClientTransportKind::TcpTls);
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
-        bus.install_client_tcp_tls_fd(fd, meta, config, on_request.clone());
+        bus.install_client_tcp_tls_fd(fd, meta, config, test_permit(), on_request.clone());
     })
 }
 
@@ -308,7 +316,7 @@ pub fn install_wss_clients_locally(
         let meta = test_client_meta(client_id, ClientTransportKind::Wss);
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
-        bus.install_client_wss_fd(fd, meta, config, on_request.clone());
+        bus.install_client_wss_fd(fd, meta, config, test_permit(), on_request.clone());
     })
 }
 

@@ -26,6 +26,7 @@
 //! directory sync makes creation, replacement, or deletion durable. Offset callers
 //! own that directory sync, while purge marker writes include it before returning.
 
+use server_common::fatal::NoteDescriptorExhaustion;
 use std::{io, path::Path};
 
 use compio::{
@@ -184,6 +185,7 @@ pub async fn persist_offset_retained(
             .truncate(true)
             .open(path)
             .await
+            .note_descriptor_exhaustion(|| format!("opening {path}"))
             .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
     };
     let result = file.write_all_at(encode_offset_record(offset), 0).await.0;
@@ -499,7 +501,14 @@ pub async fn read_purge_generation<S: DurableStorage>(
 async fn read_offset_record(path: &str) -> Result<Option<OffsetRecord>, IggyError> {
     // Absence answered by the open, not a `Path::exists()` probe: that is a BLOCKING
     // stat on the pump before every cold-key commit (see `persist_offset`).
-    let file = match OpenOptions::new().read(true).open(path).await {
+    //
+    // Read-only, but one step of a commit write, so it counts like a write open.
+    let file = match OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {path}"))
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(IggyError::CannotOpenConsumerOffsetsFile(path.to_owned())),

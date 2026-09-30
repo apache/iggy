@@ -103,7 +103,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains("Consumer Groups Count    | 0"))
                     .stdout(contains("Threads Count"))
                     .stdout(contains("Free Disk Space"))
-                    .stdout(contains("Total Disk Space"));
+                    .stdout(contains("Total Disk Space"))
+                    .stdout(contains("Open Files Count"))
+                    .stdout(contains("Open Files Limit"));
             }
             TestStatsCmdOutput::Set(GetStatsOutput::List) => {
                 command_state
@@ -116,7 +118,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains("Consumer Groups Count|0"))
                     .stdout(contains("Threads Count|"))
                     .stdout(contains("Free Disk Space|"))
-                    .stdout(contains("Total Disk Space|"));
+                    .stdout(contains("Total Disk Space|"))
+                    .stdout(contains("Open Files Count|"))
+                    .stdout(contains("Open Files Limit|"));
             }
             TestStatsCmdOutput::Set(GetStatsOutput::Json) => {
                 command_state
@@ -129,7 +133,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains(r#""consumer_groups_count": 0"#))
                     .stdout(contains(r#""threads_count":"#))
                     .stdout(contains(r#""free_disk_space":"#))
-                    .stdout(contains(r#""total_disk_space":"#));
+                    .stdout(contains(r#""total_disk_space":"#))
+                    .stdout(contains(r#""open_files_count":"#))
+                    .stdout(contains(r#""open_files_limit":"#));
             }
             TestStatsCmdOutput::Set(GetStatsOutput::Toml) => {
                 command_state
@@ -142,7 +148,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains("consumer_groups_count = 0"))
                     .stdout(contains("threads_count ="))
                     .stdout(contains("free_disk_space ="))
-                    .stdout(contains("total_disk_space ="));
+                    .stdout(contains("total_disk_space ="))
+                    .stdout(contains("open_files_count ="))
+                    .stdout(contains("open_files_limit ="));
             }
         }
     }
@@ -243,6 +251,12 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
         assert!(
             stats.free_disk_space.as_bytes_u64() <= stats.total_disk_space.as_bytes_u64(),
             "free_disk_space should be <= total_disk_space"
+        );
+        assert!(stats.open_files_count > 0, "open_files_count should be > 0");
+        assert!(stats.open_files_limit > 0, "open_files_limit should be > 0");
+        assert!(
+            stats.open_files_count <= stats.open_files_limit,
+            "open_files_count should be <= open_files_limit"
         );
     }
 

@@ -1660,6 +1660,20 @@ impl Streams {
         })
     }
 
+    /// Total committed partition count across all topics (for the node-wide
+    /// `[metadata] partitions_max` admission check).
+    #[must_use]
+    pub fn partition_count(&self) -> usize {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .map(|(_, topic)| topic.partitions.len())
+                .sum()
+        })
+    }
+
     #[must_use]
     pub fn partition_count_context(
         &self,

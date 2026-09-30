@@ -114,6 +114,15 @@ impl Validatable<ConfigurationError> for LoggingConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        if !self.sysinfo_print_interval.is_zero() && self.sysinfo_print_interval.as_secs() < 1 {
+            eprintln!(
+                "Configured logging.sysinfo_print_interval {} is less than minimum 1 second, \
+                 use \"0 s\" to disable it",
+                self.sysinfo_print_interval
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         let max_total_size_unlimited = self.max_total_size.as_bytes_u64() == 0;
         if !max_total_size_unlimited
             && self.max_file_size.as_bytes_u64() > self.max_total_size.as_bytes_u64()
@@ -287,5 +296,37 @@ mod cpu_allocation_tests {
 
         let available = available_parallelism().unwrap().get();
         assert!(validate_cpu_allocation(&CpuAllocation::Range(0, available + 1), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use iggy_common::IggyDuration;
+    use std::time::Duration;
+
+    fn with_sysinfo_print_interval(interval: Duration) -> LoggingConfig {
+        LoggingConfig {
+            sysinfo_print_interval: IggyDuration::new(interval),
+            ..LoggingConfig::default()
+        }
+    }
+
+    #[test]
+    fn sub_second_sysinfo_print_interval_is_rejected() {
+        let config = with_sysinfo_print_interval(Duration::from_millis(999));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn one_second_sysinfo_print_interval_is_accepted() {
+        let config = with_sysinfo_print_interval(Duration::from_secs(1));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_sysinfo_print_interval_is_accepted() {
+        let config = with_sysinfo_print_interval(Duration::ZERO);
+        assert!(config.validate().is_ok());
     }
 }

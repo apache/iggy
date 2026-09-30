@@ -147,6 +147,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidPartitionsCount = 2019
     case topicDirectoryNotFound = 2020
     case tooManyTopics = 2021
+    case partitionsLimitReached = 2022
     case cannotCreatePartition = 3000
     case cannotCreatePartitionsDirectory = 3001
     case cannotCreatePartitionDirectory = 3002
@@ -393,6 +394,7 @@ extension IggyErrorCode {
         case .invalidPartitionsCount: "invalid_partitions_count"
         case .topicDirectoryNotFound: "topic_directory_not_found"
         case .tooManyTopics: "too_many_topics"
+        case .partitionsLimitReached: "partitions_limit_reached"
         case .cannotCreatePartition: "cannot_create_partition"
         case .cannotCreatePartitionsDirectory: "cannot_create_partitions_directory"
         case .cannotCreatePartitionDirectory: "cannot_create_partition_directory"

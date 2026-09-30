@@ -407,6 +407,11 @@ rotation_check_interval = "1 h"
 # Time to retain log files before deletion. Avoid less than 1s, too.
 retention = "7 days"
 
+# Interval for printing process and host usage (CPU, memory, disk, clients,
+# messages, open file descriptors) to the log from shard 0. "0 s" disables the
+# line. Any other value must be at least 1 s.
+sysinfo_print_interval = "10 s"
+
 # Encryption configuration
 [encryption]
 # Encrypt message payloads and user headers. Metadata and structural headers remain unencrypted.
@@ -855,6 +860,15 @@ journal_slots = 1024
 # it lifts both. Must be between 2 and 65536.
 clients_table_max = 8192
 
+# Cap on the partitions of all streams and topics. A request to create a
+# topic or partitions that would exceed it fails with PartitionsLimitReached.
+# The metadata primary checks it with its own value, so give every node the
+# same value. The check counts committed partitions only and does not add up
+# the creates in flight. Up to 3 x prepare_queue_depth creates (96 at the
+# default) can be in flight, with up to 1000 partitions each, so the count
+# can exceed the cap by that much. 0 means no cap.
+partitions_max = 0
+
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
 # plane), a pipeline exists per partition, so raising this multiplies pinned
 # request-buffer memory by the partition count. Keep it modest.
@@ -1115,6 +1129,19 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
+
+# Cap on open client sockets of the node: TCP, TCP-TLS, WebSocket, WSS, HTTP
+# and HTTPS together. Shard 0 closes a connection past the cap at accept, so
+# clients cannot take the file descriptors that storage writes need. QUIC does
+# not count, because its connections share one UDP socket. When unset, the cap
+# is half the soft RLIMIT_NOFILE that the server has after it raises the limit
+# at boot. 0 means no cap.
+#
+# The server always raises the soft RLIMIT_NOFILE to the hard limit at boot
+# (on macOS, to at most 10240), and no setting turns this off. To keep a lower
+# limit, lower the hard limit, for example with LimitNOFILE in a systemd unit
+# or with ulimit -Hn.
+#connections_max = 10000
 
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]

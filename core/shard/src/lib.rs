@@ -61,7 +61,7 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
-use message_bus::{BusMessage, MessageBus, SharedTlsServerConfig};
+use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfig};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
@@ -320,6 +320,9 @@ pub struct ConnectedClientInfo {
 pub enum ListClientsReply {
     Clients(Sender<Vec<ConnectedClientInfo>>),
     Sessions(Sender<Vec<ConsumerSession>>),
+    /// The number of connected clients only, for the readers that need no
+    /// client details.
+    Count(Sender<usize>),
 }
 
 /// Best-effort client list plus whether every shard answered.
@@ -709,10 +712,13 @@ pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
-    /// 16 bits of `meta.client_id`.
+    /// 16 bits of `meta.client_id`. `permit` is the socket's slot in the
+    /// node's connection cap. It travels with the fd, so a frame dropped
+    /// unprocessed frees the slot with the socket.
     ClientConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+        permit: ConnectionPermit,
     },
     /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
     /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
@@ -735,6 +741,7 @@ pub enum LifecycleFrame {
     ClientWsConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+        permit: ConnectionPermit,
     },
     /// Delegate TCP-TLS before reading TLS bytes. The destination wraps the
     /// fd on its runtime and owns the handshake and connection tasks.
@@ -742,6 +749,7 @@ pub enum LifecycleFrame {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     },
     /// Delegate WSS before either handshake. The listener's configuration
     /// travels with the socket; all TLS and WebSocket state stays local to
@@ -750,6 +758,7 @@ pub enum LifecycleFrame {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
@@ -769,7 +778,8 @@ pub enum LifecycleFrame {
     /// shard 0; processing it on a peer is a routing bug.
     MetadataSubmit(MetadataSubmit),
     /// Broadcast query for `get_clients`: every shard replies with the
-    /// clients whose connections it homes, over `reply`. Unlike
+    /// clients whose connections it homes, or only their number, over
+    /// `reply`. Unlike
     /// [`MetadataSubmit`] this is sent to ALL shards (shared-nothing: each
     /// shard knows only its own connections). See
     /// [`IggyShard::list_all_clients`].
@@ -1965,6 +1975,19 @@ where
         self.gather_clients().await.clients
     }
 
+    /// Count every shard's connected clients, bounded like
+    /// [`Self::list_all_clients`]. Each shard replies with one number, so the
+    /// periodic readers build no client records.
+    #[allow(clippy::future_not_send)]
+    pub async fn count_all_clients(&self) -> usize {
+        let (count, _complete) = self
+            .gather_replies(ListClientsReply::Count, 0usize, |count, shard_clients| {
+                *count = count.saturating_add(shard_clients);
+            })
+            .await;
+        count
+    }
+
     /// Gather administrative client details with completeness information.
     #[allow(clippy::future_not_send)]
     pub async fn gather_clients(&self) -> GatheredClients {
@@ -1982,8 +2005,21 @@ where
         &self,
         reply: fn(Sender<Vec<ClientInfo>>) -> ListClientsReply,
     ) -> GatheredClients<ClientInfo> {
+        let (clients, complete) = self.gather_replies(reply, Vec::new(), Extend::extend).await;
+        GatheredClients { clients, complete }
+    }
+
+    /// Broadcast one [`LifecycleFrame::ListClients`] and fold each shard's
+    /// reply into `gathered`. The flag is false if a shard did not answer.
+    #[allow(clippy::future_not_send)]
+    async fn gather_replies<Reply: Send + 'static, Gathered>(
+        &self,
+        reply: fn(Sender<Reply>) -> ListClientsReply,
+        mut gathered: Gathered,
+        mut fold: impl FnMut(&mut Gathered, Reply),
+    ) -> (Gathered, bool) {
         let shard_count = self.shard_count as usize;
-        let (reply_tx, reply_rx) = channel::<Vec<ClientInfo>>(shard_count.max(1));
+        let (reply_tx, reply_rx) = channel::<Reply>(shard_count.max(1));
         let mut expected = 0usize;
         for sender in &self.senders {
             let frame = ShardFrame::lifecycle(LifecycleFrame::ListClients {
@@ -2003,7 +2039,6 @@ where
         // reply sender is dropped (defensive; we also bound by count).
         drop(reply_tx);
 
-        let mut clients = Vec::new();
         let mut received = 0usize;
         // One deadline across the whole gather, timed on the injected clock
         // (virtual under the simulator, wall-clock in production) via a single
@@ -2016,8 +2051,8 @@ where
         let gather = async {
             while received < expected {
                 match reply_rx.recv().await {
-                    Ok(batch) => {
-                        clients.extend(batch);
+                    Ok(shard_reply) => {
+                        fold(&mut gathered, shard_reply);
                         received += 1;
                     }
                     Err(_) => break, // all reply senders dropped
@@ -2035,10 +2070,7 @@ where
                 "list_all_clients: gather timed out; returning partial result"
             );
         }
-        GatheredClients {
-            clients,
-            complete: received == shard_count,
-        }
+        (gathered, received == shard_count)
     }
 
     /// Run a partition read on the shard owning `namespace` and await the reply.
