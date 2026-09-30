@@ -46,7 +46,7 @@ use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
     API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
+    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState,
     ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
     is_supported_version, supported_max_version,
 };
@@ -74,13 +74,14 @@ pub(crate) fn off_worker<T>(heavy: bool, work: impl FnOnce() -> T) -> T {
 /// back is misparsed against the schema the client expected.
 pub async fn dispatch(
     state: &GatewayState,
+    connection: &ConnectionState,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
     match api_key {
         API_KEY_PRODUCE => produce::handle(state, api_version, body).await,
-        API_KEY_FETCH => fetch::handle(state, api_version, body).await,
+        API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(state, api_version, body).await,

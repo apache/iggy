@@ -46,6 +46,15 @@ pub fn recent(now: Instant) -> Instant {
 pub struct Snapshot {
     pub started: Instant,
     pub probe: TopicProbed,
+    /// When `probe` failed, the newest probe of the topic that did not.
+    pub last_good: Option<Arc<TopicProbe>>,
+}
+
+impl Snapshot {
+    /// The newest probe of the topic that succeeded: this one, or the one before it failed.
+    pub fn good(&self) -> Option<&Arc<TopicProbe>> {
+        self.probe.as_ref().ok().or(self.last_good.as_ref())
+    }
 }
 
 /// The newest probe of each Kafka topic, shared by every Fetch.
@@ -65,12 +74,19 @@ struct Topics {
 }
 
 impl Topics {
-    /// Forgets each topic that no Fetch and no refresh holds, and whose probe is too old to share.
-    /// Any client can name topics, so the board must not keep them all.
+    /// Forgets each topic that no Fetch and no refresh holds, that no waiting Fetch watches for
+    /// writes, and whose probe is too old to share. Any client can name topics, so the board must
+    /// not keep them all.
+    ///
+    /// A waiting Fetch holds only its write receiver. Dropping its topic would drop the sender under
+    /// it, and the next write would wake nothing.
     fn sweep(&mut self, now: Instant) {
         let since = recent(now);
-        self.by_name
-            .retain(|_, topic| Arc::strong_count(topic) > 1 || topic.newer_than(since));
+        self.by_name.retain(|_, topic| {
+            Arc::strong_count(topic) > 1
+                || topic.written.receiver_count() > 0
+                || topic.newer_than(since)
+        });
         // Twice what is left, so sweeps cost O(1) per insert.
         self.sweep_at = self.by_name.len().saturating_mul(2).max(MIN_SWEEP);
     }
@@ -136,9 +152,19 @@ impl ProbeBoard {
                     // Unlock first. A waiter that this wakes and that wants a newer probe must
                     // find the lock free, or it waits out its deadline.
                     drop(running);
-                    topic
-                        .newest
-                        .send_replace(Some(Arc::new(Snapshot { started, probe })));
+                    let last_good = match &probe {
+                        Ok(_) => None,
+                        Err(_) => topic
+                            .newest
+                            .borrow()
+                            .as_ref()
+                            .and_then(|newest| newest.good().cloned()),
+                    };
+                    topic.newest.send_replace(Some(Arc::new(Snapshot {
+                        started,
+                        probe,
+                        last_good,
+                    })));
                 });
             }
             timeout_at(deadline, newest.changed()).await.ok()?.ok()?;
@@ -293,6 +319,60 @@ mod tests {
             .sweep(later(PROBE_INTERVAL * 2));
         assert_eq!(names(&board), vec!["b"]);
         drop(in_use);
+    }
+
+    #[tokio::test]
+    async fn given_a_waiting_fetch_when_the_board_sweeps_should_keep_its_topic_so_a_write_wakes_it()
+    {
+        let board = ProbeBoard::default();
+        let deadline = later(Duration::from_secs(5));
+        board
+            .probe("a", Instant::now(), deadline, done)
+            .await
+            .unwrap();
+        let mut writes = board.writes("a");
+        board
+            .topics
+            .lock()
+            .unwrap()
+            .sweep(later(PROBE_INTERVAL * 2));
+        assert_eq!(names(&board), vec!["a"], "a watched topic stays");
+
+        board.wrote("a");
+        tokio::time::timeout(Duration::from_secs(1), writes.changed())
+            .await
+            .expect("the write wakes the wait")
+            .expect("the sender is still on the board");
+    }
+
+    #[tokio::test]
+    async fn given_a_refresh_that_fails_when_a_good_probe_came_before_should_keep_it() {
+        let board = ProbeBoard::default();
+        let deadline = later(Duration::from_secs(5));
+        let fails = || std::future::ready::<TopicProbed>(Err(6));
+        let first = board
+            .probe("a", Instant::now(), deadline, done)
+            .await
+            .unwrap();
+        let good = Arc::clone(first.good().expect("the first probe succeeded"));
+
+        for _ in 0..2 {
+            sleep(Duration::from_millis(1)).await;
+            let failed = board
+                .probe("a", Instant::now(), deadline, fails)
+                .await
+                .unwrap();
+            assert_eq!(failed.probe, Err(6));
+            let kept = failed.good().expect("the last good probe");
+            assert!(Arc::ptr_eq(kept, &good), "kept through each failure");
+        }
+
+        sleep(Duration::from_millis(1)).await;
+        let recovered = board
+            .probe("a", Instant::now(), deadline, done)
+            .await
+            .unwrap();
+        assert!(recovered.last_good.is_none(), "a success needs no fallback");
     }
 
     #[tokio::test]

@@ -253,7 +253,7 @@ records, in request order. One uncompressed batch per partition.
 | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Topic or partition not in Iggy, or a name Kafka refuses | Refreshes metadata, retries. |
 | `NOT_LEADER_OR_FOLLOWER` (6) | Iggy unreachable, too slow, not signed in, loading the partition, or returning no records where it reports some. Alone, it goes out after `max_wait_ms`. | Refreshes metadata, retries. |
 | `TOPIC_AUTHORIZATION_FAILED` (29) | The bridge's Iggy user lacks permission. Fetch reads as that user, not as the client. | Fails. |
-| `UNKNOWN_SERVER_ERROR` (-1) | Anything else, such as a stored message the gateway cannot map. Alone, it goes out after `max_wait_ms`. The partition is read again at most once per `max_wait_ms`. | Retries the same offset. |
+| `UNKNOWN_SERVER_ERROR` (-1) | Anything else, such as a stored message the gateway cannot map. Alone, it goes out after `max_wait_ms`. Each connection reads the partition again at most once per `max_wait_ms`. | Retries the same offset. |
 | `FETCH_SESSION_ID_NOT_FOUND` (70) | Top level. The request continues a session. | Sends a full request. |
 
 The Java consumer throws on any other partition code, so Fetch sends none.
@@ -262,10 +262,11 @@ Limits:
 
 - 20 s per request, wait included, so a waiting Fetch fits the 25 s shutdown drain. Partitions
   not read by then answer `0` with no records.
-- 4 requests read and encode at once. A waiting request, or a response on a slow socket, holds no
-  slot. So response memory grows with connections: `max_bytes` each, or one larger record.
+- 4 requests read and encode at once. A waiting request, a probe that confirms an empty poll, or a
+  response on a slow socket holds no slot. So response memory grows with connections: `max_bytes`
+  each, or one larger record.
 - A message the gateway cannot map stops the consumer at its offset. Records before it are served.
-  The log shows it once at `warn`.
+  The log shows it once per connection at `warn`.
 - Each slot polls on its own Iggy client, which connects at the slot's first poll. A poll ends at
   the request deadline, so a partition that Iggy refuses holds up only its own slot.
 - Iggy polls by count, not bytes. One poll can load 16 of the largest messages: about 1 GB, and
@@ -273,8 +274,10 @@ Limits:
   polls would lift both.
 - A request loads at most 100 new topic probes per round, the oldest first. Other topics use an
   older probe. A waiting request probes 100 topics per round, in turn.
-- A Produce through the gateway wakes a waiting Fetch of that topic at once. A native Iggy write
-  wakes it at the next probe, within about 200 ms.
+- A probe that fails with 6 or -1 leaves the last good probe in use, and the polls decide.
+- A Produce through the gateway wakes a waiting Fetch of that topic at once. That includes a
+  Produce that ends during the Fetch's first read. A native Iggy write wakes it at the next probe,
+  within about 200 ms.
 
 ### Connection config
 

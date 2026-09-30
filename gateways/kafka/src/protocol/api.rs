@@ -308,8 +308,6 @@ pub struct GatewayState {
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
-    /// Partitions that answered -1 to Fetch, per Kafka topic.
-    pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
     /// Per Kafka topic and partition, how long Fetch finds it not ready.
     pub(crate) not_ready: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
@@ -338,7 +336,6 @@ impl GatewayState {
             producer_ids: ProducerIdAllocator::new(instance_id),
             produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
             groups,
-            stuck_offsets: Mutex::default(),
             not_ready: Mutex::default(),
             probe_board: ProbeBoard::default(),
         }
@@ -358,6 +355,16 @@ impl GatewayState {
             GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
         )
     }
+}
+
+/// What a handler keeps for one Kafka connection, across its requests.
+///
+/// Fetch keeps its -1 holds here. One consumer's stuck offset then neither skips another
+/// consumer's read of it nor replaces the hold of a consumer stuck elsewhere in the partition.
+#[derive(Default)]
+pub struct ConnectionState {
+    /// Partitions that answered -1 to this connection's Fetches, per Kafka topic.
+    pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
 }
 
 /// Default `max_frame_size` used by [`handle_request`] - the direct call sites across this
@@ -384,13 +391,28 @@ pub async fn handle_request(
 /// docs for the CPU/memory amplification this closes (a request within the old element budget
 /// alone could still produce a multi-megabyte response from a single synchronous, non-yielding
 /// call).
+///
+/// Each call is a new connection's first request, so nothing carries over to the next call.
+/// [`handle_connection_request`] keeps a connection's state.
 pub async fn handle_request_bounded(
     state: &GatewayState,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
-    dispatch(state, api_key, api_version, body).await
+    let connection = ConnectionState::default();
+    handle_connection_request(state, &connection, api_key, api_version, body).await
+}
+
+/// [`handle_request_bounded`] for one request of `connection`.
+pub async fn handle_connection_request(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
+    dispatch(state, connection, api_key, api_version, body).await
 }
 
 #[must_use]

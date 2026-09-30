@@ -40,7 +40,7 @@ use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_FETCH, ApiVersionRange, ERROR_FETCH_SESSION_ID_NOT_FOUND,
+    API_KEY_FETCH, ApiVersionRange, ConnectionState, ERROR_FETCH_SESSION_ID_NOT_FOUND,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
     ERROR_OFFSET_OUT_OF_RANGE, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
@@ -93,7 +93,15 @@ const INITIAL_EPOCH: i32 = 0;
 const FINAL_EPOCH: i32 = -1;
 
 /// Without a bridge, the stub. With one, records from Iggy.
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+///
+/// `connection` keeps the partitions that answered its Fetches -1, so its retries skip Iggy for a
+/// while.
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let decoded = decode_request(
         API_KEY_FETCH,
         api_version,
@@ -122,7 +130,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         );
     }
 
-    let (responses, slot) = fetch(bridge, state, &request).await;
+    let (responses, slot) = fetch(bridge, state, &connection.stuck_offsets, &request).await;
     let record_bytes: usize = responses
         .iter()
         .flat_map(|topic| &topic.partitions)
@@ -198,13 +206,15 @@ const fn is_full(version: i16, request: &FetchRequest) -> bool {
 async fn fetch(
     bridge: &Arc<IggyBridge>,
     state: &GatewayState,
+    stuck_offsets: &Mutex<StuckOffsets>,
     request: &FetchRequest,
 ) -> (Vec<FetchableTopicResponse>, Option<FetchSlot>) {
     let started = Instant::now();
     let give_up_at = started + REQUEST_DEADLINE;
-    let fetch = Fetch::new(bridge, state, request, give_up_at);
+    let fetch = Fetch::new(bridge, state, stuck_offsets, request, give_up_at);
     // A shared probe will do: an offset past it goes to a poll, not straight to a 1.
-    let mut probes = fetch.probe_all(recent(started)).await;
+    let since = recent(started);
+    let mut probes = fetch.probe_all(since).await;
     let (mut answers, mut slot) = fetch.read(&probes).await;
     if waits(request, &answers) {
         // No slot while it waits.
@@ -215,7 +225,7 @@ async fn fetch(
             .collect();
         let wait_until = started + fetch.max_wait;
         probes = fetch
-            .wait(probes, &held, request.min_bytes, wait_until)
+            .wait(probes, &held, request.min_bytes, since, wait_until)
             .await;
         // Kafka reads again when the wait ends, too.
         (answers, slot) = fetch.read(&probes).await;
@@ -295,7 +305,7 @@ async fn next_writes(writes: &mut [watch::Receiver<Option<Instant>>]) -> Vec<(us
                 match change.as_mut().poll(context) {
                     // `changed` marks this write seen.
                     Poll::Ready(Ok(())) => return Poll::Ready(topic),
-                    // The topic left the board, so no write wakes this one.
+                    // Only a dropped board ends the channel. The board keeps a watched topic.
                     Poll::Ready(Err(_)) => *slot = None,
                     Poll::Pending => {}
                 }
@@ -322,10 +332,29 @@ fn written_at(write: &mut watch::Receiver<Option<Instant>>) -> Instant {
     seen.unwrap_or_else(Instant::now)
 }
 
+/// The topics behind `writes` whose last gateway write ended at `since` or later, each with the
+/// time of that write, at most [`MAX_ROUND_TOPICS`].
+fn writes_since(
+    writes: &[watch::Receiver<Option<Instant>>],
+    since: Instant,
+) -> Vec<(usize, Instant)> {
+    writes
+        .iter()
+        .enumerate()
+        .filter_map(|(topic, write)| {
+            let written = (*write.borrow())?;
+            (written >= since).then_some((topic, written))
+        })
+        .take(MAX_ROUND_TOPICS)
+        .collect()
+}
+
 /// One request: what it asks for, and what bounds it.
 struct Fetch<'a> {
     bridge: &'a Arc<IggyBridge>,
     state: &'a GatewayState,
+    /// The connection's, not the gateway's. See [`ConnectionState`].
+    stuck_offsets: &'a Mutex<StuckOffsets>,
     wanted: Vec<Wanted<'a>>,
     /// Each topic to probe once, in request order.
     topics: Vec<&'a str>,
@@ -339,6 +368,7 @@ impl<'a> Fetch<'a> {
     fn new(
         bridge: &'a Arc<IggyBridge>,
         state: &'a GatewayState,
+        stuck_offsets: &'a Mutex<StuckOffsets>,
         request: &'a FetchRequest,
         give_up_at: Instant,
     ) -> Self {
@@ -346,6 +376,7 @@ impl<'a> Fetch<'a> {
         Self {
             bridge,
             state,
+            stuck_offsets,
             wanted,
             topics,
             response_bytes: response_bytes(request.max_bytes, state.max_frame_size),
@@ -366,15 +397,16 @@ impl<'a> Fetch<'a> {
             .map(|&topic| board.newest(topic))
             .collect();
         for topic in stale_topics(&snapshots, since) {
-            snapshots[topic] = self
-                .probe_topic(self.topics[topic], since, self.give_up_at)
-                .await;
+            let probe = self.probe_topic(self.topics[topic], since, self.give_up_at);
+            if let Some(snapshot) = probe.await {
+                snapshots[topic] = Some(snapshot);
+            }
         }
         snapshots
             .into_iter()
             .map(|snapshot| {
                 snapshot.map_or(Err(ERROR_NOT_LEADER_OR_FOLLOWER), |snapshot| {
-                    snapshot.probe.clone()
+                    readable(&snapshot)
                 })
             })
             .collect()
@@ -402,6 +434,9 @@ impl<'a> Fetch<'a> {
     }
 
     /// The probe of partition `index` of `topic`, started at `since` or later.
+    ///
+    /// Never the last good probe of a failed refresh: [`empty_poll`] proves nothing from a probe
+    /// taken before the poll, and a stale one would answer an in-range offset 1.
     async fn probe_partition(
         &self,
         topic: &str,
@@ -419,11 +454,16 @@ impl<'a> Fetch<'a> {
     /// write to a topic probes it at once. A topic not probed keeps its last probe.
     ///
     /// `held` marks partitions that answered 6 or -1. They wait it out and end no wait.
+    ///
+    /// `probed_since` is the oldest start of a fresh probe in hand. A write that ended after it may
+    /// not show in the probes, and subscribing marks it seen, so those topics probe at once. An
+    /// older probe, kept when a refresh failed, is stale by the first round.
     async fn wait(
         &self,
         mut probes: Probes,
         held: &[bool],
         min_bytes: i32,
+        probed_since: Instant,
         wait_until: Instant,
     ) -> Probes {
         if held.iter().all(|&held| held) {
@@ -437,13 +477,18 @@ impl<'a> Fetch<'a> {
             .iter()
             .map(|&topic| board.writes(topic))
             .collect();
+        let mut missed = writes_since(&writes, probed_since);
         let mut turn = 0;
         // Kept across write wakes, so steady writes to one topic do not stop the rounds.
         let mut round_at = (Instant::now() + PROBE_INTERVAL).min(wait_until);
         while Instant::now() < wait_until {
-            let written = tokio::select! {
-                () = sleep_until(round_at) => None,
-                written = next_writes(&mut writes) => Some(written),
+            let written = if missed.is_empty() {
+                tokio::select! {
+                    () = sleep_until(round_at) => None,
+                    written = next_writes(&mut writes) => Some(written),
+                }
+            } else {
+                Some(std::mem::take(&mut missed))
             };
             let timed = written.is_none();
             // A write needs a probe that started after it. A round needs one newer than the last.
@@ -458,7 +503,7 @@ impl<'a> Fetch<'a> {
                 // A probe late for the round still lands on the board for the next Fetch.
                 let probe = self.probe_topic(self.topics[topic], since, wait_until);
                 if let Some(snapshot) = probe.await {
-                    probes[topic].clone_from(&snapshot.probe);
+                    probes[topic] = readable(&snapshot);
                 }
             }
             if timed {
@@ -547,6 +592,16 @@ fn response_bytes(max_bytes: i32, max_frame_size: usize) -> usize {
 
 /// Per topic in `Fetch::topics`, its probe, or one code for the whole topic.
 type Probes = Vec<TopicProbed>;
+
+/// The probe to read with. A refresh that failed with a code the consumer retries at once gives
+/// way to the last good probe, so a blip in `get_topic` leaves the polls to decide rather than
+/// answering 6 or -1 for partitions that hold records.
+fn readable(snapshot: &Snapshot) -> TopicProbed {
+    match (&snapshot.probe, &snapshot.last_good) {
+        (Err(code), Some(good)) if retried_at_once(*code) => Ok(Arc::clone(good)),
+        (probe, _) => probe.clone(),
+    }
+}
 
 /// Whether a partition now fails, as an error ends Kafka's wait too, or the bytes waiting reach
 /// `min_bytes`. Skips `held` partitions.
@@ -649,7 +704,8 @@ struct Reader<'a> {
     /// the limits say (KIP-74). A record larger than every limit would stall the consumer
     /// otherwise.
     owes_first_record: bool,
-    /// Taken at the first poll. A poll given up on keeps it until the poll ends.
+    /// Taken at the first poll, and freed before a probe that confirms an empty one. A poll given
+    /// up on keeps it until the poll ends.
     slot: Option<FetchSlot>,
 }
 
@@ -675,7 +731,7 @@ impl<'a> Reader<'a> {
                 }
                 Position::Behind { index, offset, .. } | Position::Unsure { index, offset, .. }
                     if held(
-                        &fetch.state.stuck_offsets,
+                        fetch.stuck_offsets,
                         want.topic,
                         index,
                         offset,
@@ -749,7 +805,7 @@ impl<'a> Reader<'a> {
                 served(want.partition, polled.high_watermark, batch)
             }
             Err(error) => {
-                let stuck = &self.fetch.state.stuck_offsets;
+                let stuck = self.fetch.stuck_offsets;
                 let now = Instant::now();
                 let first = hold(stuck, want.topic, index, offset, now, self.fetch.max_wait);
                 log_stuck(first, want.topic, index, offset, &error);
@@ -800,13 +856,16 @@ impl<'a> Reader<'a> {
     /// Answers an empty poll at `offset`, made at `asked`, from `before` and a probe taken after
     /// it. See [`empty_poll`].
     async fn after_empty_poll(
-        &self,
+        &mut self,
         want: &Wanted<'_>,
         index: u32,
         offset: u64,
         before: PartitionProbe,
         asked: Instant,
     ) -> PartitionData {
+        // The probe can wait behind other Iggy calls until the deadline, and every Fetch needs a
+        // slot to poll. The next poll takes one again.
+        self.slot = None;
         let after = self.fetch.probe_partition(want.topic, index, asked).await;
         match empty_poll(offset, before, after) {
             EmptyPoll::OutOfRange { high_watermark } => {
@@ -850,7 +909,7 @@ impl<'a> Reader<'a> {
         let code = refusal(want.topic, error);
         if code == ERROR_UNKNOWN_SERVER_ERROR {
             hold(
-                &self.fetch.state.stuck_offsets,
+                self.fetch.stuck_offsets,
                 want.topic,
                 index,
                 offset,
@@ -1070,7 +1129,11 @@ fn log_not_ready(first: bool, topic: &str, partition: u32, offset: u64) {
     }
 }
 
-/// Per Kafka topic, then partition, where a partition last answered -1.
+/// Per Kafka topic, then partition, where a partition last answered one connection -1.
+///
+/// Each connection keeps its own. A consumer reads one offset per partition, so a map holds one
+/// stop per partition, and a stop spares Iggy that consumer's retries without taking another
+/// consumer's read.
 pub(crate) type StuckOffsets = PartitionMap<Stuck>;
 
 /// A partition answered -1 at `offset`. Until `until`, it answers -1 there without a read.
@@ -1669,12 +1732,66 @@ mod tests {
     }
 
     #[test]
+    fn given_a_write_before_the_wait_subscribed_when_waiting_should_still_probe_that_topic() {
+        let board = ProbeBoard::default();
+        let early = board.writes("b");
+        let probed_since = Instant::now();
+        board.wrote("b");
+        let writes = vec![board.writes("a"), board.writes("b")];
+        assert!(
+            early.has_changed().unwrap(),
+            "a receiver from before the write wakes"
+        );
+        assert!(
+            !writes[1].has_changed().unwrap(),
+            "one from after it does not"
+        );
+
+        let missed = writes_since(&writes, probed_since);
+        let topics: Vec<usize> = missed.iter().map(|&(topic, _)| topic).collect();
+        assert_eq!(topics, vec![1]);
+        assert!(
+            writes_since(&writes, Instant::now()).is_empty(),
+            "a write before the probes shows in them"
+        );
+    }
+
+    #[test]
+    fn given_a_failed_refresh_when_read_should_fall_back_only_on_codes_retried_at_once() {
+        let good = Arc::new(TopicProbe::default());
+        let failed = |code, last_good: Option<&Arc<TopicProbe>>| Snapshot {
+            started: Instant::now(),
+            probe: Err(code),
+            last_good: last_good.cloned(),
+        };
+        for code in [ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR] {
+            let probe = readable(&failed(code, Some(&good)));
+            assert!(
+                probe.is_ok_and(|probe| Arc::ptr_eq(&probe, &good)),
+                "{code}"
+            );
+        }
+        for code in [
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            ERROR_TOPIC_AUTHORIZATION_FAILED,
+        ] {
+            assert_eq!(readable(&failed(code, Some(&good))), Err(code), "{code}");
+        }
+        assert_eq!(
+            readable(&failed(ERROR_NOT_LEADER_OR_FOLLOWER, None)),
+            Err(ERROR_NOT_LEADER_OR_FOLLOWER),
+            "no good probe to fall back to"
+        );
+    }
+
+    #[test]
     fn given_many_stale_topics_when_probing_should_load_the_oldest_first_up_to_the_cap() {
         let now = Instant::now();
         let snapshot = |age| {
             Some(Arc::new(Snapshot {
                 started: now - Duration::from_millis(age),
                 probe: Ok(Arc::new(TopicProbe::default())),
+                last_good: None,
             }))
         };
         let snapshots = [snapshot(500), None, snapshot(10), snapshot(900)];
