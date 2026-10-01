@@ -202,8 +202,10 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
     // Verify the output is the same as without --fresh
     let output_with_fresh = String::from_utf8(output.stdout).expect("UTF-8 output");
 
+    let directory_fresh = tempfile::tempdir().expect("temporary directory");
     let output_without_fresh = Command::cargo_bin("iggy-server")
         .expect("binary should be built")
+        .current_dir(directory_fresh.path())
         .arg("--list-config-env-vars")
         .timeout(LIST_ENV_VARS_TIMEOUT)
         .output()
