@@ -78,7 +78,7 @@ struct Args {
 
 Lists all supported IGGY_* environment variable names and templates,
 sorted and deduplicated. Template syntax:
-- <N> represents vector indices
+- <N> represents vector indices (0-255 for stream fields)
 - <KEY> represents connector keys (uppercased from config).
   Overrides via <KEY> require the local connectors provider.
 - <FIELD> represents plugin configuration field names, excluding

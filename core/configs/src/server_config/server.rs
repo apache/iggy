@@ -58,8 +58,9 @@ pub const SERVER_RUNTIME_ENV_VARS: &[&str] = &[
     "IGGY_SHARD_RUNTIME_CAPACITY",
 ];
 
-/// Test/CI-only vars: never advertised, but still non-config (suppress
-/// "unknown env var" warnings the same as `SERVER_RUNTIME_ENV_VARS` does).
+/// Vars used by sibling binaries (iggy CLI) or test/CI-only: never advertised,
+/// but still non-config. Included in `SERVER_PROCESS_ENV_VARS` to suppress
+/// "unknown env var" warnings during config scanning.
 pub const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_TEST_VERBOSE",
     "IGGY_TEST_CLUSTER_NODES",
@@ -70,11 +71,10 @@ pub const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_PASSWORD",
 ];
 
-/// All non-config env vars the server process reads directly — the union of
-/// `SERVER_RUNTIME_ENV_VARS` and `SERVER_SCAN_ONLY_ENV_VARS`. Kept as one
-/// list (rather than requiring every call site to chain both) so existing
-/// consumers are unaffected; a test below pins its contents to the split so
-/// the two views can't silently diverge.
+/// All non-config env vars — the union of `SERVER_RUNTIME_ENV_VARS` and
+/// `SERVER_SCAN_ONLY_ENV_VARS`. Kept as one list (rather than requiring every
+/// call site to chain both) so existing consumers are unaffected; a test below
+/// pins its contents to the split so the two views can't silently diverge.
 pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_CONFIG_PATH",
     "IGGY_ENV_PATH",
