@@ -43,7 +43,6 @@ use tokio::time::timeout;
 use tracing::warn;
 use url::Url;
 
-const ACK_RETRY_ATTEMPTS: usize = 5;
 const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
 
@@ -276,6 +275,7 @@ impl MqttDriver {
         ack_tokens: &mut Vec<AckToken>,
         poll_timeout: Duration,
         max_buffered_messages: usize,
+        max_retries: u32,
     ) -> Result<(), iggy_connector_sdk::Error> {
         // Process tokens in order. On failure, remove only tokens already
         // acknowledged so the remaining suffix can be retried.
@@ -284,7 +284,7 @@ impl MqttDriver {
         while acknowledged < ack_tokens.len() {
             let mut last_error = None;
             let mut acknowledged_token = false;
-            for attempt in 0..=ACK_RETRY_ATTEMPTS {
+            for attempt in 0..=max_retries {
                 match self.try_acknowledge(&ack_tokens[acknowledged]) {
                     Ok(()) => {
                         acknowledged_token = true;
@@ -292,7 +292,7 @@ impl MqttDriver {
                     }
                     Err(error) => {
                         last_error = Some(error);
-                        if attempt == ACK_RETRY_ATTEMPTS {
+                        if attempt == max_retries {
                             break;
                         }
                         // rumqttc may need event-loop progress before try_ack can
@@ -1078,6 +1078,7 @@ mod tests {
             request_capacity: Some(4),
             batch_size: Some(3),
             batch_timeout: Some("10ms".to_string()),
+            max_retries: None,
             verbose_logging: None,
         };
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
@@ -1123,6 +1124,7 @@ mod tests {
             request_capacity: Some(4),
             batch_size: Some(3),
             batch_timeout: Some("10ms".to_string()),
+            max_retries: None,
             verbose_logging: None,
         };
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
@@ -1163,6 +1165,7 @@ mod tests {
             request_capacity: Some(4),
             batch_size: Some(3),
             batch_timeout: Some("10ms".to_string()),
+            max_retries: None,
             verbose_logging: None,
         };
 

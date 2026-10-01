@@ -47,6 +47,7 @@ const DEFAULT_POLL_TIMEOUT: &str = "1s";
 const DEFAULT_REQUEST_CAPACITY: usize = 32;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_BATCH_TIMEOUT: &str = "10ms";
+const DEFAULT_MAX_RETRIES: u32 = 5;
 
 /// MQTT wire protocol selected for the broker connection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -127,6 +128,11 @@ pub struct MqttSourceConfig {
     pub batch_size: Option<usize>,
     /// Maximum time to wait after the first message before flushing a batch.
     pub batch_timeout: Option<String>,
+    /// Number of retries for a broker acknowledgement after the initial attempt.
+    /// After retries are exhausted, the source abandons the broker acknowledgement
+    /// and continues. The broker may redeliver the message later, producing duplicates.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
     /// Enables per-message MQTT logging for troubleshooting.
     pub verbose_logging: Option<bool>,
 }
@@ -344,6 +350,10 @@ impl MqttSource {
         self.state.lock().await.clone()
     }
 
+    fn max_retries(&self) -> u32 {
+        self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+    }
+
     async fn collect_batch(
         &self,
         driver: &mut MqttDriver,
@@ -548,14 +558,21 @@ impl Source for MqttSource {
                 &mut pending_batch.ack_tokens,
                 self.poll_timeout,
                 self.batch_size,
+                self.max_retries(),
             )
             .await;
         *self.driver.lock().await = Some(driver);
         if let Err(error) = acknowledgement {
-            // The driver retains tokens that were not acknowledged, allowing a
-            // later retry without losing partial progress.
-            *self.pending_batch.lock().await = Some(pending_batch);
-            return Err(error);
+            warn!(
+                "MQTT acknowledgement retries exhausted for connector with ID {}; abandoning the broker acknowledgement and continuing; the broker may redeliver the message later, producing duplicates: {error}",
+                self.id
+            );
+            // Iggy already accepted and persisted this batch. Continuing after
+            // the bounded MQTT retry policy prevents a transient broker failure
+            // from stopping the source. Any later broker redelivery is a valid
+            // at-least-once duplicate.
+            *self.state.lock().await = pending_batch.candidate_state;
+            return Ok(());
         }
         *self.state.lock().await = pending_batch.candidate_state;
         Ok(())
@@ -666,6 +683,7 @@ mod tests {
             request_capacity: Some(4),
             batch_size: Some(3),
             batch_timeout: Some("10ms".to_string()),
+            max_retries: None,
             verbose_logging: None,
         }
     }
@@ -693,6 +711,22 @@ mod tests {
             let state = source.current_state().await;
             assert_eq!(state.acknowledged_messages, 0);
         });
+    }
+
+    #[test]
+    fn given_no_max_retries_should_use_default() {
+        let source = MqttSource::new(7, test_config(), None);
+
+        assert_eq!(source.max_retries(), DEFAULT_MAX_RETRIES);
+    }
+
+    #[test]
+    fn given_configured_max_retries_should_use_configured_value() {
+        let mut config = test_config();
+        config.max_retries = Some(2);
+        let source = MqttSource::new(7, config, None);
+
+        assert_eq!(source.max_retries(), 2);
     }
 
     #[test]
