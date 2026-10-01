@@ -39,12 +39,12 @@ use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
-    DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS,
-    decode_acl_filter, decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome,
-    encode_error_for_key, handle_request_bounded, respond_describe_acls_error,
-    sasl_authenticate_outcome, sasl_handshake_outcome,
+    ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
+    ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter, decode_sasl_auth_bytes,
+    decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
+    respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
 };
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
@@ -501,6 +501,7 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 struct ConnectionContext<'a> {
     config: &'a GatewayConfig,
     state: &'a GatewayState,
+    connection: &'a ConnectionState,
     authenticator: Option<&'a dyn SaslAuthenticator>,
     auth_slots: &'a Semaphore,
     failed_logins: &'a FailedLoginThrottle,
@@ -546,8 +547,9 @@ async fn route_frame(
             describe_acls(principal.as_ref(), req.request_api_version, body, peer)
         }
         SaslAction::Dispatch => {
-            handle_request_bounded(
+            handle_connection_request(
                 ctx.state,
+                ctx.connection,
                 req.request_api_key,
                 req.request_api_version,
                 body,
@@ -561,8 +563,9 @@ async fn route_frame(
             // peer repeat a rejected version forever, resetting the pre-authentication read budget
             // on every frame and holding a `max_connections` permit with it.
             sasl_state.count_api_versions_answer();
-            handle_request_bounded(
+            handle_connection_request(
                 ctx.state,
+                ctx.connection,
                 req.request_api_key,
                 req.request_api_version,
                 body,
@@ -641,9 +644,11 @@ async fn handle_connection(
         SaslState::Authenticated
     };
     let mut principal: Option<AuthenticatedPrincipal> = None;
+    let connection = ConnectionState::default();
     let ctx = ConnectionContext {
         config: &config,
         state: &state,
+        connection: &connection,
         authenticator: shared_auth.authenticator.as_deref(),
         auth_slots: &shared_auth.slots,
         failed_logins: &shared_auth.failed_logins,
