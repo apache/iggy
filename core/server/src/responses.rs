@@ -545,6 +545,8 @@ where
         threads_count: system.threads_count,
         free_disk_space,
         total_disk_space,
+        open_files_count: system.open_files_count,
+        open_files_limit: system.open_files_limit,
     })
 }
 

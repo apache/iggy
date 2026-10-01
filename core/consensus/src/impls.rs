@@ -1403,12 +1403,23 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // The one line proving the durable record was READ BACK, not merely
             // written: a replica that came back at view 0 is otherwise
             // indistinguishable from one that resumed correctly until it votes.
-            tracing::info!(
-                group,
-                view,
-                log_view,
-                "restored group view from its superblock"
-            );
+            // Only the metadata group says so at INFO. Every partition group
+            // restores through here too, and one line each floods the boot log.
+            if group == METADATA_GROUP {
+                tracing::info!(
+                    group,
+                    view,
+                    log_view,
+                    "restored group view from its superblock"
+                );
+            } else {
+                tracing::debug!(
+                    group,
+                    view,
+                    log_view,
+                    "restored group view from its superblock"
+                );
+            }
             consensus.set_view(view);
             consensus.set_log_view(log_view);
             consensus.mark_superblock_durable(view, log_view);

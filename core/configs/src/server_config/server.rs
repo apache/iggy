@@ -409,6 +409,27 @@ mod tests {
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
         assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
+        assert_eq!(cfg.message_bus.connections_max, None);
+        assert_eq!(ServerConfig::default().message_bus.connections_max, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_zero_connections_max_env_var_when_loading_should_disable_the_cap() {
+        const NAME: &str = "IGGY_MESSAGE_BUS_CONNECTIONS_MAX";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "0") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.message_bus.connections_max, Some(0));
     }
 
     #[test]

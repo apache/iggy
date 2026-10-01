@@ -499,6 +499,13 @@ impl SessionManager {
             .map(|(&id, conn)| record_from(id, conn))
     }
 
+    /// The number of locally-homed connected clients, which
+    /// [`Self::iter_clients`] would yield, without building their records.
+    #[must_use]
+    pub fn client_count(&self) -> usize {
+        self.connections.len()
+    }
+
     pub fn iter_consumer_sessions(&self) -> impl Iterator<Item = ConsumerSession> + '_ {
         self.connections.values().filter_map(|connection| {
             if let ConnectionState::Bound {
@@ -817,10 +824,12 @@ mod tests {
         assert_eq!(mgr.get_session(c1), Some((100, 10)));
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
         assert_eq!(mgr.iter_clients().count(), 2);
+        assert_eq!(mgr.client_count(), 2);
 
         assert_eq!(mgr.remove_connection(c1), Some((100, 10)));
         assert!(mgr.get_session(c1).is_none());
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
+        assert_eq!(mgr.client_count(), 1);
     }
     // Every disconnect releases its consensus session, group member or not.
     // Holding the slot open for a resume window instead leaked it: nothing

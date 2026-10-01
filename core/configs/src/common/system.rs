@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::defaults::default_sysinfo_print_interval;
 use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
@@ -44,6 +45,10 @@ pub struct LoggingConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_sysinfo_print_interval")]
+    pub sysinfo_print_interval: IggyDuration,
 }
 
 impl From<&LoggingConfig> for LoggingSettings {
