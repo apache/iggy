@@ -40,9 +40,7 @@ from .utils import (
 )
 
 
-def binary_transport_configs(
-    auto_login: AutoLogin | None = None, websocket_marks: tuple = ()
-) -> list:
+def binary_transport_configs(auto_login: AutoLogin | None = None) -> list:
     """Return a config for every transport that holds a connection.
 
     Auto-login is disabled by default: with credentials to replay, a ping sent
@@ -68,7 +66,6 @@ def binary_transport_configs(
                 server_address=f"{ws_host}:{ws_port}", auto_login=auto_login
             ),
             id="websocket",
-            marks=websocket_marks,
         ),
         pytest.param(
             QuicConfig(
@@ -307,17 +304,7 @@ class TestLifecycle:
         with pytest.raises(RuntimeError, match="Client shutdown"):
             await client.ping()
 
-    @pytest.mark.parametrize(
-        "config",
-        binary_transport_configs(
-            websocket_marks=(
-                pytest.mark.xfail(
-                    reason="WebSocketClient connects again after shutdown: #4287",
-                    strict=True,
-                ),
-            )
-        ),
-    )
+    @pytest.mark.parametrize("config", binary_transport_configs())
     @pytest.mark.asyncio
     async def test_shutdown_client_cannot_connect_again(
         self, config: TcpConfig | WebSocketConfig | QuicConfig

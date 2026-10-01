@@ -156,7 +156,12 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn set_state(&self, state: ClientState) {
-        *self.state.lock().await = state;
+        let mut current = self.state.lock().await;
+        // Shutdown is final: a later write, such as a disconnect or a lost
+        // connection, must not make the client usable again.
+        if *current != ClientState::Shutdown {
+            *current = state;
+        }
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
