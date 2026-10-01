@@ -70,6 +70,8 @@ zstd = { workspace = true }
 [dev-dependencies]
 # Repairs the CRC of a batch header a test rewrote, which the decoder checks first.
 crc32c = { workspace = true }
+# The client half, so a test encodes requests and decodes responses the way a consumer does.
+kafka-protocol = { workspace = true, features = ["client"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [

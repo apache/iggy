@@ -95,12 +95,10 @@ Two consequences worth naming rather than discovering:
   traffic on that shard. Measured on debug builds, a single login takes about 10 ms and 32 concurrent
   logins take about 75 ms each, with throughput flattening near 410 per second. The shape is the point,
   latency climbing while throughput plateaus, not the absolute numbers. `MANUAL_TESTING.md` has the table.
-- **Nothing holds the verified session.** The connection that proved a credential drops it immediately,
-  because no handler consumes an Iggy session yet. When Produce and Fetch need one
-  ([#3535](https://github.com/apache/iggy/issues/3535),
-  [#3536](https://github.com/apache/iggy/issues/3536)), the question of how a principal's data client is
-  pooled becomes live, and it is a separate question from how its credentials are verified. Pooling clients
-  is gateway-side code over the existing public SDK and needs no SDK change.
+- **Nothing holds the verified session.** The connection that proved a credential drops it at once.
+  Produce and Fetch act as the bridge's Iggy user for every client. A data client per principal needs
+  pooling, a separate question from how credentials are verified. Pooling is gateway-side code over the
+  public SDK and needs no SDK change.
 
 If either consequence starts to hurt, the lever is below, and it is a smaller change than a credential
 cache because it moves cost off the server without weakening what the gateway checks.
