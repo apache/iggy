@@ -21,12 +21,16 @@
 services:
   iggy-server:
     # Prebuilt, CI-refreshed on every master merge - avoids a full from-scratch workspace
-    # release build (including the web UI this quick start doesn't use) on first `up --build`.
-    # Testing a local server change: comment this out and uncomment `build:` below instead.
+    # release build on first `up --build`. Testing a local server change: comment this out
+    # and uncomment `build:` below instead - `core/server/Dockerfile`'s `runtime` target is
+    # the same Dockerfile and target `apache/iggy:edge` itself is published from
+    # (.github/config/publish.yml), so the healthcheck/volume/listener-address settings below
+    # stay correct either way.
     image: apache/iggy:edge
     # build:
     #   context: ../..
-    #   dockerfile: Dockerfile
+    #   dockerfile: core/server/Dockerfile
+    #   target: runtime
     restart: unless-stopped
     cap_add:
       - SYS_NICE
@@ -43,6 +47,15 @@ services:
       # Dev-only - never reuse these outside a local compose stack.
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy-gateway-quickstart
+      # config.toml's own defaults are all 127.0.0.1 - fine for a single binary on the host,
+      # not reachable from a sibling container. The gateway dials iggy-server:8090 over this
+      # compose network, so TCP at minimum has to bind the wildcard address; the other three
+      # are overridden too since this file also publishes them to the host (see bdd's own
+      # docker-compose.server.yml for the same pattern against the same image).
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
     networks:
       - iggy-kafka-gateway
     ports:
@@ -51,7 +64,9 @@ services:
       - 127.0.0.1:8090:8090
       - 127.0.0.1:8092:8092
     volumes:
-      - iggy-server:/local_data
+      # apache/iggy:edge (core/server/Dockerfile's `runtime`/`runtime-prebuilt` targets) sets
+      # WORKDIR /app; config.toml's own `path = "local_data"` is relative to that, not to `/`.
+      - iggy-server:/app/local_data
     # This gates the gateway's start on the server actually answering a command, not just
     # accepting a TCP connect (a bare connect succeeds before the request-processing loop is
     # wired up; `ping` is unauthenticated - see core/cli/src/commands/binary_system/ping.rs's
@@ -62,7 +77,7 @@ services:
     # (3 retries after the first attempt, 4 attempts total) exists for transient connect
     # failures, not for waiting out root provisioning.
     healthcheck:
-      test: ["CMD", "/iggy", "ping"]
+      test: ["CMD", "/usr/local/bin/iggy", "ping"]
       # start_interval covers startup (forks a process + fresh TCP connect every 2s only until
       # healthy); interval is the steady-state cadence for the rest of the container's life, so
       # it stays slow enough not to matter.

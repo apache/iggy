@@ -61,10 +61,12 @@ cd gateways/kafka
 docker compose up --build
 ```
 
-First run compiles three release binaries (`iggy`, `iggy-server`, `iggy-gateway-kafka`) plus the
-web UI's static assets from scratch under the workspace's `lto = true, codegen-units = 1` profile
-(no build cache mount) - budget several minutes for `--build` alone the first time; subsequent
-runs without a source change reuse Docker's image cache.
+`iggy-server` pulls the prebuilt `apache/iggy:edge` image (CI-refreshed on every master merge),
+so only `iggy-gateway-kafka` compiles from source. Its Dockerfile mounts a cargo registry/target
+cache, so a first run costs one real compile and every run after reuses it, even across a source
+change elsewhere in the workspace. Testing a local `iggy-server` change: comment out `image:` and
+uncomment `build:` in `docker-compose.yml` first - that path has no cache mount and is a full
+from-scratch release build, several minutes on its own.
 
 This starts `iggy-server` (the real Iggy broker) and `iggy-gateway-kafka` (bridge enabled,
 pointed at that server) on a shared Docker network, with the gateway waiting for the server's
@@ -102,8 +104,8 @@ one-shot read; see [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) for group-
 Polling Iggy directly still works too, if you want to see the record from the other side:
 
 ```bash
-docker compose exec iggy-server /iggy --username iggy --password iggy-gateway-quickstart \
-  message poll kafka orders 0 --offset 0 --message-count 1
+docker compose exec iggy-server /usr/local/bin/iggy --username iggy \
+  --password iggy-gateway-quickstart message poll kafka orders 0 --offset 0 --message-count 1
 ```
 
 **Ports**: gateway `9093` (Kafka wire, the one a client dials), Iggy `8090` (TCP, `iggy` CLI/SDK),

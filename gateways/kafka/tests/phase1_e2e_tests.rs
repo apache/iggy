@@ -57,6 +57,8 @@ mod gateway_process;
 mod iggy_server;
 #[path = "common/tcp.rs"]
 mod tcp;
+#[path = "common/wire.rs"]
+mod wire;
 
 use codec::{Decoder, Encoder};
 use gateway_process::TestGateway;
@@ -253,22 +255,6 @@ fn decode_produce_response(body: Bytes) -> (i16, i64) {
     (error_code, base_offset)
 }
 
-fn build_list_offsets_request(topic: &str) -> Bytes {
-    let mut enc = Encoder::with_capacity(64);
-    enc.write_i32(-1); // replica_id
-    enc.write_i8(0); // isolation_level: READ_UNCOMMITTED
-    enc.write_varint(2); // one topic
-    enc.write_compact_nullable_string(Some(topic));
-    enc.write_varint(2); // one partition
-    enc.write_i32(0); // partition_index
-    enc.write_i32(-1); // current_leader_epoch
-    enc.write_i64(-1); // timestamp: latest
-    enc.write_empty_tagged_fields(); // partition tagged fields
-    enc.write_empty_tagged_fields(); // topic tagged fields
-    enc.write_empty_tagged_fields(); // request tagged fields
-    enc.freeze()
-}
-
 /// `(error_code, offset)` for the requested partition's latest-offset result.
 fn decode_list_offsets_response(body: Bytes) -> (i16, i64) {
     let mut d = Decoder::new(body);
@@ -337,7 +323,7 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         API_KEY_LIST_OFFSETS,
         LIST_OFFSETS_VERSION,
         4,
-        &build_list_offsets_request(TOPIC),
+        &wire::build_list_offsets_request(LIST_OFFSETS_VERSION, TOPIC, 0),
     )
     .await;
     assert_eq!(corr, 4, "correlation id must echo the request");

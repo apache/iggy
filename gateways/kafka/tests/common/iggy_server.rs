@@ -316,34 +316,8 @@ impl TestServer {
     /// `close()`, leaking a session server-side. A TCP accept slightly ahead of the app being
     /// ready to authenticate is fine - every caller's own subsequent `IggyBridge::connect` already
     /// retries a few times, which covers the last few hundred ms of that gap.
-    ///
-    /// Checks `try_wait()` every iteration: a server that fails at boot (bad config, a port
-    /// stolen between `PortGuard::acquire` and its own bind) exits almost immediately, and without
-    /// this check that reads as "still starting" for the full 30s budget - the eventual failure
-    /// names the wrong cause ("did not become ready") instead of the real one (exited early, with
-    /// whatever it printed before dying).
     async fn wait_ready(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child status") {
-                panic!(
-                    "iggy-server at {} exited during startup with {status}",
-                    self.address
-                );
-            }
-            if tokio::net::TcpStream::connect(self.address.as_str())
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "iggy-server at {} did not become ready within the startup budget",
-                self.address
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_for_listener(&mut self.child, &self.address, "iggy-server").await;
     }
 
     pub fn test_config(&self) -> IggyBridgeConfig {
@@ -368,6 +342,31 @@ impl TestServer {
 /// before this fix.
 const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGKILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Shared by `TestServer::wait_ready` and `TestGateway::wait_ready` (`gateway_process.rs`) -
+/// identical poll loop, only the process label in the panic/assert messages differs.
+///
+/// Checks `try_wait()` every iteration: a process that fails at boot (bad config, a port stolen
+/// between `PortGuard::acquire` and its own bind) exits almost immediately, and without this
+/// check that reads as "still starting" for the full 30s budget - the eventual failure names the
+/// wrong cause ("did not become ready") instead of the real one (exited early, with whatever it
+/// printed before dying).
+pub async fn wait_for_listener(child: &mut Child, address: &str, label: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            panic!("{label} at {address} exited during startup with {status}");
+        }
+        if tokio::net::TcpStream::connect(address).await.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{label} at {address} did not become ready within the startup budget"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 pub fn graceful_kill(child: &mut Child) {
     // `wait_ready` calls `try_wait()` too (and panics on an early exit, unwinding into this via

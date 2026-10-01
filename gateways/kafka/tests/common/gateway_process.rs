@@ -24,9 +24,8 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::time::Duration;
 
-use crate::iggy_server::{PortGuard, TestServer, graceful_kill};
+use crate::iggy_server::{PortGuard, TestServer, graceful_kill, wait_for_listener};
 
 /// Locates the already-built `iggy-gateway-kafka` binary.
 ///
@@ -87,27 +86,7 @@ impl TestGateway {
     /// the gateway's own accept loop can't happen here - `main.rs` connects the bridge before
     /// binding the listener, so a successful connect already implies the bridge is up too.
     async fn wait_ready(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child status") {
-                panic!(
-                    "iggy-gateway-kafka at {} exited during startup with {status}",
-                    self.address
-                );
-            }
-            if tokio::net::TcpStream::connect(self.address.as_str())
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "iggy-gateway-kafka at {} did not become ready within the startup budget",
-                self.address
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_for_listener(&mut self.child, &self.address, "iggy-gateway-kafka").await;
     }
 }
 
