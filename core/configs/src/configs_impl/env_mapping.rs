@@ -80,10 +80,6 @@ impl EnvVarTemplate {
     /// substituting each `<N>` placeholder left-to-right with `0..limit`.
     /// A leaf template (`max_elements: &[]`) expands to itself.
     pub fn expand_names(&self) -> Vec<String> {
-        if self.max_elements.is_empty() {
-            return vec![self.env_name.to_string()];
-        }
-
         let mut results = vec![self.env_name.to_string()];
 
         for &limit in self.max_elements {

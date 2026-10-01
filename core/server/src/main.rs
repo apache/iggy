@@ -43,7 +43,7 @@ fn main() -> Result<(), ServerError> {
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
     if args.list_config_env_vars {
-        print_config_env_vars()?;
+        print_config_env_vars().map_err(ServerError::ListConfigEnvVars)?;
         return Ok(());
     }
     banner::print(server::VERSION);

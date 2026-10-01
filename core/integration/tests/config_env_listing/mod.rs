@@ -21,6 +21,30 @@ use std::time::Duration;
 
 const LIST_ENV_VARS_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[allow(dead_code)]
+fn run_list_config_env_vars<I, K, V>(binary: &str, env: I, extra_args: &[&str]) -> std::process::Output
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut cmd = Command::cargo_bin(binary).expect("binary should be built");
+    cmd.current_dir(directory.path())
+        .arg("--list-config-env-vars")
+        .timeout(LIST_ENV_VARS_TIMEOUT);
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+
+    cmd.output().expect("listing command should run")
+}
+
 #[test]
 fn config_env_listing_exits_before_startup_for_each_binary() {
     for (binary, config_env, dotenv_env) in [
