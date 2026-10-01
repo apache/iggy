@@ -20,7 +20,7 @@ suite goes through `tests/common/fixtures.rs::load_fixture_body_or_skip`, which 
 regeneration hint when a fixture is missing, and panics instead when `KAFKA_FIXTURES_REQUIRED=1`
 is set (CI sets this) so a broken generation step can't leave a suite green with zero assertions.
 
-### `iggy-server` binary (required for `bridge_iggy_integration_tests`, `list_offsets_real_bridge_tests` and `produce_real_bridge_tests`)
+### `iggy-server` binary (required for `bridge_iggy_integration_tests` and every `*_real_bridge_tests` suite)
 
 No fixtures needed, but `iggy-server` has to be built *first* - these suites spawn it directly and
 do not build it for you:
@@ -66,8 +66,10 @@ file under `tests/` anymore.
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
 | [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
 | [`sasl_tests.rs`](../tests/sasl_tests.rs) | SASL/PLAIN over a socket — full handshake, every refusal path, and the disabled default. Drives a stub verifier implementing `SaslAuthenticator`, so no Iggy server is needed | No |
-| [`kafka_client_e2e_tests.rs`](../tests/kafka_client_e2e_tests.rs) | **Real Kafka clients** against the whole stack: a spawned `iggy-server`, the gateway in-process with a real authenticator, and kcat / the Java tools from containers. The only suite that can catch a client-compatibility bug, since every other one hand-builds frames | No, but needs Docker and a built `iggy-server` |
+| [`kafka_client_e2e_tests.rs`](../tests/kafka_client_e2e_tests.rs) | **Real Kafka clients** against the whole stack: a spawned `iggy-server`, the gateway in-process with a real authenticator, and kcat / the Java tools from containers. With a bridge, kcat writes records, and kcat and the Java consumer read them back through Fetch. The only suite that can catch a client-compatibility bug, since every other one hand-builds frames | No, but needs Docker and a built `iggy-server` |
 | [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`list_offsets_real_bridge_tests.rs`](../tests/list_offsets_real_bridge_tests.rs) | ListOffsets (key 2) through the whole handler against a real, spawned `iggy-server`: LATEST, EARLIEST, codes 3 and 43 | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`fetch_real_bridge_tests.rs`](../tests/fetch_real_bridge_tests.rs) | Fetch (key 1) through the whole handler against a real, spawned `iggy-server` — records go in through the Iggy SDK or the Produce handler and come back through `kafka_protocol`'s client decoder, at every version, with codes 0, 1, 3, 6, -1 and 70, paged polls, and the wait | No (needs the `iggy-server` binary - see Prerequisites) |
 | [`produce_real_bridge_tests.rs`](../tests/produce_real_bridge_tests.rs) | Produce (key 0) through the whole handler against a real, spawned `iggy-server` — records go in as Kafka wire bytes and come back through the Iggy SDK, plus one error code per partition | No (needs the `iggy-server` binary - see Prerequisites) |
 
 `tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `scope.rs`, `server.rs`,

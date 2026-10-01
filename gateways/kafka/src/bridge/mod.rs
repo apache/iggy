@@ -18,8 +18,8 @@
 //! Iggy SDK integration layer.
 //!
 //! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
-//! high-watermark lookups, and translates Iggy errors to Kafka wire error codes. `ListOffsets`
-//! and Produce call it. Fetch does not yet (`#3536`).
+//! high-watermark lookups, and translates Iggy errors to Kafka wire error codes. `ListOffsets`,
+//! Produce, Fetch, Metadata and `CreateTopics` call it.
 
 pub mod config;
 pub mod error;
