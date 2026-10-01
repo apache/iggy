@@ -733,6 +733,17 @@ func (e RequestTooOld) Is(target error) bool {
 	return ok
 }
 
+type DurabilityRequired struct{}
+
+func (e DurabilityRequired) Error() string {
+	return "durable retries require persisted durability and quorum offset acknowledgments"
+}
+func (e DurabilityRequired) Code() Code { return 86 }
+func (e DurabilityRequired) Is(target error) bool {
+	_, ok := target.(DurabilityRequired)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2746,6 +2757,7 @@ var (
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
 	ErrRequestTooOld                              = RequestTooOld{}
+	ErrDurabilityRequired                         = DurabilityRequired{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2992,6 +3004,7 @@ const (
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
 	RequestTooOldCode                              Code = 85
+	DurabilityRequiredCode                         Code = 86
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3306,6 +3319,8 @@ func (c Code) String() string {
 		return "InvalidNumberValue"
 	case RequestTooOldCode:
 		return "RequestTooOld"
+	case DurabilityRequiredCode:
+		return "DurabilityRequired"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3795,6 +3810,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidNumberValue
 	case RequestTooOldCode:
 		return ErrRequestTooOld
+	case DurabilityRequiredCode:
+		return ErrDurabilityRequired
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:

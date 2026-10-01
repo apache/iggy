@@ -31,7 +31,7 @@ const [
   rustHeader,
   rustCommand,
   rustOperation,
-  rustProtocolCargo,
+  rustProtocolVersion,
   nodeCodes,
   nodeHeader,
   nodeOperation,
@@ -42,7 +42,7 @@ const [
   read('core/binary_protocol/src/consensus/header.rs'),
   read('core/binary_protocol/src/consensus/command.rs'),
   read('core/binary_protocol/src/consensus/operation.rs'),
-  read('core/binary_protocol/Cargo.toml'),
+  read('core/binary_protocol/src/version.rs'),
   readNode('src/wire/command.code.ts'),
   readNode('src/wire/vsr/header.ts'),
   readNode('src/wire/vsr/operation.ts'),
@@ -283,8 +283,8 @@ for (const [name, value] of rustOperations) {
 }
 
 const protocolVersion =
-  rustProtocolCargo.match(/^version = "([0-9]+)\.([0-9]+)\.([0-9]+)/m);
-assert.ok(protocolVersion, 'binary protocol crate version is missing');
+  rustProtocolVersion.match(/pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version\(([0-9]+), ([0-9]+), ([0-9]+)\);/);
+assert.ok(protocolVersion, 'binary protocol wire version is missing');
 const nodePackedVersion = nodeRegister.match(
   /export const IGGY_PROTOCOL_VERSION =\s*\(([0-9]+) << 20\) \| \(([0-9]+) << 10\) \| ([0-9]+);/
 );
@@ -292,7 +292,7 @@ assert.ok(nodePackedVersion, 'Node packed protocol version source changed');
 assert.deepEqual(
   [Number(nodePackedVersion[1]), Number(nodePackedVersion[2])],
   [Number(protocolVersion[1]), Number(protocolVersion[2])],
-  'Node protocol major.minor differs from iggy_binary_protocol'
+  'Node protocol major.minor differs from the Rust wire version'
 );
 
 console.log('Node VSR protocol mirror matches Rust sources');

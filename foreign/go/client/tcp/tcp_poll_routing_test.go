@@ -58,8 +58,9 @@ func newPrimaryPollFixture(t *testing.T,
 			}
 			switch {
 			case read.operation() == vsr.OperationRegister:
-				return registerReplyFrame(7, uint64(200+connection))
-			case read.code() == uint32(command.AttachConsumerSessionCode):
+				t.Error("an auxiliary connection must bind the parent session without Register")
+				return statusReplyFrame(vsr.OperationRegister, uint32(ierror.ErrUnauthenticated.Code()), nil)
+			case read.code() == uint32(command.BindSessionCode):
 				return replyFrame(vsr.OperationNonReplicated, nil)
 			case read.code() == uint32(command.PollMessagesOnPrimaryCode):
 				partition := routedPollPartition(t, read)
@@ -133,6 +134,17 @@ func routedPollPartition(t *testing.T, read request) uint32 {
 	return polledPartition(t, read)
 }
 
+func bindIdentity(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	offset := 4
+	for range 2 {
+		require.Greater(t, len(payload), offset)
+		offset += 1 + int(payload[offset])
+	}
+	require.Len(t, payload[offset:], vsr.SessionIdentityBytes+vsr.BindSecretBytes)
+	return payload[offset : offset+vsr.SessionIdentityBytes]
+}
+
 func requestCount(reads []request, code command.Code) int {
 	count := 0
 	for _, read := range reads {
@@ -163,12 +175,13 @@ func TestPrimaryPoll_SplitPrimariesKeepCoordinatorMembershipAndReuseConnections(
 	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
 	for _, primary := range fixture.primaries {
 		assert.Equal(t, 1, primary.connections())
-		assert.Equal(t, 1, requestCount(primary.recorded(), command.AttachConsumerSessionCode))
+		assert.Equal(t, 1, requestCount(primary.recorded(), command.BindSessionCode))
 		assert.Equal(t, 2, requestCount(primary.recorded(), command.PollMessagesOnPrimaryCode))
 		for _, read := range primary.recorded() {
-			if read.code() == uint32(command.AttachConsumerSessionCode) {
-				assert.NotEqual(t, parent, read.clientID(), "the data connection authenticates independently")
-				assert.Equal(t, (consumerSession{client: parent, session: session, watermark: 11}).bytes(), read.payload)
+			if read.code() == uint32(command.BindSessionCode) {
+				assert.Equal(t, parent, read.clientID(), "the data connection shares the coordinator identity")
+				assert.Equal(t, (consumerSession{client: parent, session: session, watermark: 11}).bytes(), bindIdentity(t, read.payload))
+				assert.Equal(t, fixture.client.session.BindSecret(), [vsr.BindSecretBytes]byte(read.payload[len(read.payload)-vsr.BindSecretBytes:]))
 			}
 		}
 	}
@@ -186,8 +199,8 @@ func TestPrimaryPoll_MetadataReplyRefreshesRouteAndAttachment(t *testing.T) {
 	}
 	var floors []uint64
 	for _, read := range fixture.primaries[0].recorded() {
-		if read.code() == uint32(command.AttachConsumerSessionCode) {
-			floors = append(floors, binary.LittleEndian.Uint64(read.payload[24:]))
+		if read.code() == uint32(command.BindSessionCode) {
+			floors = append(floors, binary.LittleEndian.Uint64(bindIdentity(t, read.payload)[24:]))
 		}
 	}
 	assert.Equal(t, []uint64{1, 11}, floors)
@@ -234,7 +247,7 @@ func TestPrimaryPoll_RefusalRefreshesAttachmentWithoutMovingCoordinator(t *testi
 	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
-	assert.Equal(t, 2, requestCount(fixture.primaries[0].recorded(), command.AttachConsumerSessionCode))
+	assert.Equal(t, 2, requestCount(fixture.primaries[0].recorded(), command.BindSessionCode))
 	assert.Equal(t, 1, fixture.primaries[0].connections())
 	assert.Equal(t, 1, fixture.coordinator.connections())
 }
@@ -329,7 +342,7 @@ func TestPrimaryPoll_CompleteStatusRepliesKeepTheDataConnection(t *testing.T) {
 			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
 			assert.Equal(t, 1, fixture.primaries[0].connections())
-			assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.AttachConsumerSessionCode))
+			assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.BindSessionCode))
 			assert.Equal(t, int32(2), polls.Load())
 		})
 	}
@@ -397,8 +410,8 @@ func TestPrimaryPoll_ForwardedTruncateReplyRefreshesMetadataFence(t *testing.T) 
 	require.NoError(t, err)
 	var floors []uint64
 	for _, read := range fixture.primaries[0].recorded() {
-		if read.code() == uint32(command.AttachConsumerSessionCode) {
-			floors = append(floors, binary.LittleEndian.Uint64(read.payload[24:]))
+		if read.code() == uint32(command.BindSessionCode) {
+			floors = append(floors, binary.LittleEndian.Uint64(bindIdentity(t, read.payload)[24:]))
 		}
 	}
 	assert.Equal(t, []uint64{1, 42}, floors)
@@ -410,7 +423,7 @@ func TestPrimaryPoll_RetirementDuringAttachmentIsNotCallerCancellation(t *testin
 	release := make(chan struct{})
 	defer close(release)
 	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
-		if read.code() == uint32(command.AttachConsumerSessionCode) {
+		if read.code() == uint32(command.BindSessionCode) {
 			close(entered)
 			<-release
 			return nil, true
@@ -474,7 +487,7 @@ func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
 				})
 				polls := 0
 				serve(primaryConn, func(_ int, read request) []byte {
-					if read.code() == uint32(command.AttachConsumerSessionCode) {
+					if read.code() == uint32(command.BindSessionCode) {
 						return replyFrame(vsr.OperationNonReplicated, nil)
 					}
 					polls++
@@ -622,7 +635,7 @@ func TestPrimaryPoll_ControlConnectionRecoversBeforeRouting(t *testing.T) {
 	assert.Equal(t, 1, fixture.primaries[0].connections())
 }
 
-func TestPrimaryPoll_ManualIdentityAndChangedCredentialsAuthenticateNewDataConnections(t *testing.T) {
+func TestPrimaryPoll_ManualIdentityAndChangedCredentialsBindNewDataConnections(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, nil, nil)
 	_, err := fixture.client.LoginUser(context.Background(), "manual", "manual-secret")
 	require.NoError(t, err)
@@ -635,13 +648,11 @@ func TestPrimaryPoll_ManualIdentityAndChangedCredentialsAuthenticateNewDataConne
 	require.NoError(t, fixture.client.ChangePassword(context.Background(), named, "manual-secret", "changed-secret"))
 	_, err = pollPrimaryPartition(context.Background(), fixture.client, 1)
 	require.NoError(t, err)
-	for index, credentials := range []Credentials{
-		NewUsernamePasswordCredentials("manual", "manual-secret"),
-		NewUsernamePasswordCredentials("renamed", "changed-secret"),
-	} {
-		payload, err := vsr.SerializeLoginRegister(credentials.username, credentials.password, iggcon.Version)
+	for _, primary := range fixture.primaries {
+		payload, err := vsr.SerializeBindSession(
+			(consumerSession{client: fixture.client.session.ClientID(), session: fixture.client.session.SessionID(), watermark: 11}).bytes(), iggcon.Version, fixture.client.session.BindSecret())
 		require.NoError(t, err)
-		assert.Equal(t, payload, fixture.primaries[index].recorded()[0].payload)
+		assert.Equal(t, payload, primary.recorded()[0].payload)
 	}
 	configured, ok := fixture.client.signInCredentials()
 	require.True(t, ok)
@@ -662,14 +673,15 @@ func TestPrimaryPoll_ConfiguredCredentialsFollowSuccessfulSelfUpdates(t *testing
 	configured, ok := fixture.client.signInCredentials()
 	require.True(t, ok)
 	assert.Equal(t, expected, configured)
-	payload, err := vsr.SerializeLoginRegister(expected.username, expected.password, iggcon.Version)
+	payload, err := vsr.SerializeBindSession((consumerSession{client: fixture.client.session.ClientID(), session: fixture.client.session.SessionID(), watermark: 11}).bytes(),
+		iggcon.Version, fixture.client.session.BindSecret())
 	require.NoError(t, err)
 	assert.Equal(t, payload, fixture.primaries[0].recorded()[0].payload)
 }
 
 func TestPrimaryPoll_StaleAttachmentReconnectsDataWithoutRejoining(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, func(_, connection int, read request) ([]byte, bool) {
-		if connection == 0 && read.code() == uint32(command.AttachConsumerSessionCode) {
+		if connection == 0 && read.code() == uint32(command.BindSessionCode) {
 			return evictionFrame(vsr.EvictionStaleClient, 0, 0), true
 		}
 		return nil, false
@@ -781,8 +793,8 @@ func TestPrimaryPoll_MetadataAcknowledgedWhileQueuedRefreshesBeforeAdmission(t *
 	reads := fixture.primaries[0].recorded()
 	var lastFloor uint64
 	for _, read := range reads {
-		if read.code() == uint32(command.AttachConsumerSessionCode) {
-			lastFloor = binary.LittleEndian.Uint64(read.payload[24:])
+		if read.code() == uint32(command.BindSessionCode) {
+			lastFloor = binary.LittleEndian.Uint64(bindIdentity(t, read.payload)[24:])
 		}
 	}
 	assert.Equal(t, uint64(11), lastFloor)

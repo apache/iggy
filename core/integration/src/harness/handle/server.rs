@@ -73,6 +73,7 @@ pub struct ServerHandle {
     context: Arc<TestContext>,
     envs: HashMap<String, String>,
     child_handle: Option<Child>,
+    has_started: bool,
     addrs: ServerProtocolAddr,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
@@ -698,6 +699,7 @@ impl ServerHandle {
             context,
             envs: cluster_envs,
             child_handle: None,
+            has_started: false,
             addrs: ServerProtocolAddr::empty(),
             stdout_path: None,
             stderr_path: None,
@@ -877,6 +879,7 @@ impl TestBinary for ServerHandle {
             context,
             envs: HashMap::new(),
             child_handle: None,
+            has_started: false,
             addrs: ServerProtocolAddr::empty(),
             stdout_path: None,
             stderr_path: None,
@@ -1008,6 +1011,9 @@ impl TestBinary for ServerHandle {
         // unconditionally; bootstrap only validates it when
         // `cluster.enabled=true`, so single-node tests see no effect.
         command.arg("--replica-id").arg(self.server_id.to_string());
+        if !self.has_started && !data_path.exists() {
+            command.arg("--fresh");
+        }
 
         let verbose = std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
             || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR);
@@ -1042,6 +1048,7 @@ impl TestBinary for ServerHandle {
             source: e,
         })?;
         self.child_handle = Some(child);
+        self.has_started = true;
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;

@@ -80,12 +80,16 @@ use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{error, info, warn};
+
+const STORAGE_FORMAT_FILE: &str = "storage-format";
+const STORAGE_FORMAT: &[u8] = b"IGGY-DURABLE-SESSIONS-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -113,6 +117,15 @@ pub async fn prepare_runtime_dirs(
     logging: &mut Logging,
     fresh: bool,
 ) -> Result<(), ServerError> {
+    let system_path = PathBuf::from(config.get_system_path());
+    let format_present = if fresh {
+        false
+    } else {
+        validate_storage_format(&system_path)?
+    };
+    if !fresh && !format_present && !config.cluster.enabled {
+        return Err(ServerError::UnsupportedStorage { path: system_path });
+    }
     if fresh {
         wipe_system_path(config).await?;
     }
@@ -124,6 +137,9 @@ pub async fn prepare_runtime_dirs(
         );
         source
     })?;
+    if !format_present {
+        publish_storage_format(&system_path)?;
+    }
     logging
         .late_init(
             config.get_system_path(),
@@ -133,6 +149,67 @@ pub async fn prepare_runtime_dirs(
         .map_err(ServerError::Logging)?;
 
     Ok(())
+}
+
+fn validate_storage_format(system_path: &Path) -> Result<bool, ServerError> {
+    let path = system_path.join(STORAGE_FORMAT_FILE);
+    match std::fs::File::open(&path) {
+        Ok(mut file) => {
+            let result = (|| -> std::io::Result<bool> {
+                if file.metadata()?.len() != STORAGE_FORMAT.len() as u64 {
+                    return Ok(false);
+                }
+                let mut bytes = vec![0; STORAGE_FORMAT.len()];
+                file.read_exact(&mut bytes)?;
+                Ok(bytes == STORAGE_FORMAT)
+            })()
+            .map_err(|source| ServerError::StorageFormatIo {
+                path: path.clone(),
+                source,
+            })?;
+            if !result {
+                return Err(ServerError::UnsupportedStorage { path });
+            }
+            Ok(true)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read_dir(system_path) {
+                Ok(mut entries) => {
+                    if let Some(entry) = entries.next() {
+                        entry.map_err(|source| ServerError::StorageFormatIo {
+                            path: system_path.to_owned(),
+                            source,
+                        })?;
+                        return Err(ServerError::UnsupportedStorage {
+                            path: system_path.to_owned(),
+                        });
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ServerError::StorageFormatIo {
+                        path: system_path.to_owned(),
+                        source,
+                    });
+                }
+            }
+            Ok(false)
+        }
+        Err(source) => Err(ServerError::StorageFormatIo { path, source }),
+    }
+}
+
+fn publish_storage_format(system_path: &Path) -> Result<(), ServerError> {
+    let path = system_path.join(STORAGE_FORMAT_FILE);
+    (|| -> std::io::Result<()> {
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(STORAGE_FORMAT)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, &path)?;
+        std::fs::File::open(system_path)?.sync_all()
+    })()
+    .map_err(|source| ServerError::StorageFormatIo { path, source })
 }
 
 /// Delete the configured system path so the server boots on empty state.
@@ -199,6 +276,7 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 pub fn bootstrap(
     config: ServerConfig,
     current_replica_id: Option<u8>,
+    fresh: bool,
 ) -> Result<ShardHandles, ServerError> {
     // One process-wide rustls provider, installed before any shard thread
     // exists. rustls is compiled with both `ring` and `aws-lc-rs`, so a
@@ -344,6 +422,7 @@ pub fn bootstrap(
                     shard_id,
                     total_shards,
                     current_replica_id,
+                    fresh,
                     assignment,
                     senders_for_shard,
                     inbox,
@@ -419,6 +498,7 @@ async fn shard_main(
     shard_id: u16,
     total_shards: u16,
     replica_id: Option<u8>,
+    fresh: bool,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     reply_inbox: ShardReceiver<ShardFrame>,
@@ -443,6 +523,8 @@ async fn shard_main(
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: message_bus::replica::handshake::binary_identity(crate::VERSION)
+            .map_err(ServerError::BinaryIdentity)?,
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,
@@ -580,7 +662,8 @@ async fn shard_main(
         // it. Reuse that superblock rather than re-opening it, which would fork the
         // ping-pong sequence counter. Consensus recovers its true (view, log_view)
         // from `recovered_state` instead of inferring a stale view from the WAL.
-        let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
+        let consensus =
+            restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus), fresh);
         let superblock = Rc::new(owner.superblock);
         (
             Some(consensus),
@@ -912,6 +995,7 @@ async fn shard_main(
 
         if let Err(error) = start_tcp_runtime(
             &shard,
+            Rc::clone(&consumer_group_liveness),
             config,
             &topology,
             roster,
@@ -1073,6 +1157,35 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incompatible_storage_is_refused_without_changing_existing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("journal");
+        let marker = directory.path().join(STORAGE_FORMAT_FILE);
+        let bytes = b"existing durable data";
+        std::fs::write(&wal, bytes).unwrap();
+        assert!(matches!(
+            validate_storage_format(directory.path()),
+            Err(ServerError::UnsupportedStorage { .. })
+        ));
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        assert!(!marker.exists());
+        for format in [
+            b"old format\n".as_slice(),
+            &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
+        ] {
+            std::fs::write(&marker, format).unwrap();
+            assert!(matches!(
+                validate_storage_format(directory.path()),
+                Err(ServerError::UnsupportedStorage { .. })
+            ));
+            assert_eq!(std::fs::read(&marker).unwrap(), format);
+            assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        }
+        std::fs::write(&marker, STORAGE_FORMAT).unwrap();
+        assert!(validate_storage_format(directory.path()).unwrap());
+    }
 
     #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {

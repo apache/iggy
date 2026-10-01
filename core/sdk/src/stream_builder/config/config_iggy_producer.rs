@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::prelude::{
-    EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration, Partitioning,
+    Durability, EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration,
+    Partitioning,
 };
 use bon::Builder;
 use std::str::FromStr;
@@ -35,6 +36,9 @@ pub struct IggyProducerConfig {
     topic_name: String,
     /// Sets the number of partitions to create for the topic
     topic_partitions_count: u32,
+    /// Message durability for topic creation. Producer sends require Persisted.
+    #[builder(default)]
+    topic_durability: Durability,
     /// Maximum messages per direct-send request. Zero uses the SDK's maximum batch length.
     batch_length: u32,
     /// Minimum gap between sequential direct sends, measured from the previous successful send.
@@ -64,6 +68,7 @@ impl Default for IggyProducerConfig {
             linger_time: IggyDuration::from_str("5ms").unwrap(),
             partitioning: Partitioning::balanced(),
             topic_partitions_count: 1,
+            topic_durability: Durability::default(),
             encryptor: None,
             send_retries_count: Some(3),
             send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
@@ -111,6 +116,7 @@ impl IggyProducerConfig {
             topic_id,
             topic_name,
             topic_partitions_count,
+            topic_durability: Durability::default(),
             batch_length,
             linger_time,
             partitioning,
@@ -151,6 +157,7 @@ impl IggyProducerConfig {
             linger_time,
             partitioning: Partitioning::balanced(),
             topic_partitions_count: 1,
+            topic_durability: Durability::default(),
             encryptor: None,
             send_retries_count: Some(3),
             send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
@@ -185,6 +192,16 @@ impl IggyProducerConfig {
 
     pub fn partitioning(&self) -> &Partitioning {
         &self.partitioning
+    }
+
+    /// Sets message durability when this configuration creates a topic.
+    pub fn with_topic_durability(mut self, durability: Durability) -> Self {
+        self.topic_durability = durability;
+        self
+    }
+
+    pub fn topic_durability(&self) -> Durability {
+        self.topic_durability
     }
 
     pub fn topic_partitions_count(&self) -> u32 {

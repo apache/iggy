@@ -26,7 +26,8 @@ pub const GET_STATS_CODE: u32 = 10;
 pub const GET_SNAPSHOT_FILE_CODE: u32 = 11;
 pub const GET_CLUSTER_METADATA_CODE: u32 = 12;
 pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
-pub const ATTACH_CONSUMER_SESSION_CODE: u32 = 14;
+// Code 14 is retired.
+pub const BIND_SESSION_CODE: u32 = 15;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -120,7 +121,7 @@ mod tests {
         GET_SNAPSHOT_FILE_CODE,
         GET_CLUSTER_METADATA_CODE,
         DESCRIBE_OPTIONS_CODE,
-        ATTACH_CONSUMER_SESSION_CODE,
+        BIND_SESSION_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,

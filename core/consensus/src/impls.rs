@@ -39,7 +39,7 @@ use server_common::Message;
 use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -416,6 +416,48 @@ where
     pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
         entry.received_at = self.clock_realtime_micros();
         self.pipeline.borrow_mut().push_request(entry)
+    }
+}
+
+impl<B, P> VsrConsensus<B, P>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    #[must_use]
+    pub fn retry_capacity(&self, table: &crate::ClientTable) -> usize {
+        if table.capacity_committed() {
+            return table.capacity();
+        }
+        self.pipeline
+            .borrow()
+            .head()
+            .filter(|entry| entry.header.retry_capacity != 0)
+            .map_or_else(
+                || table.capacity(),
+                |entry| entry.header.retry_capacity as usize,
+            )
+    }
+
+    /// Both queues own reservations. Clearing or refusing an entry releases it
+    /// automatically, and a commit replaces its reservation with live protection.
+    #[must_use]
+    pub fn has_retry_capacity(&self, table: &crate::ClientTable, client: u128) -> bool {
+        if table.contains(client) || message_bus::is_auto_commit_client(client) {
+            return true;
+        }
+        let capacity = self.retry_capacity(table);
+        let pipeline = self.pipeline.borrow();
+        let pending: HashSet<_> = pipeline
+            .pending_client_ids()
+            .into_iter()
+            .filter(|candidate| {
+                *candidate != 0
+                    && !message_bus::is_auto_commit_client(*candidate)
+                    && !table.contains(*candidate)
+            })
+            .collect();
+        pending.contains(&client) || table.count() + pending.len() < capacity
     }
 }
 
@@ -807,8 +849,44 @@ impl LocalPipeline {
 }
 
 impl Pipeline for LocalPipeline {
+    fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)> {
+        self.prepare_queue
+            .iter()
+            .find(|entry| entry.header.client == client_id)
+            .map(|entry| {
+                (
+                    entry.header.session,
+                    entry.header.request,
+                    entry.header.operation,
+                )
+            })
+            .or_else(|| {
+                self.request_queue
+                    .iter()
+                    .find(|entry| entry.message.header().client == client_id)
+                    .map(|entry| {
+                        let header = entry.message.header();
+                        (header.session, header.request, header.operation)
+                    })
+            })
+    }
     type Entry = PipelineEntry;
     type Request = RequestEntry;
+
+    fn pending_client_ids(&self) -> Vec<u128> {
+        self.prepare_queue
+            .iter()
+            .map(|entry| entry.header.client)
+            .chain(
+                self.request_queue
+                    .iter()
+                    .map(|entry| entry.message.header().client),
+            )
+            .collect()
+    }
 
     fn push(&mut self, entry: Self::Entry) {
         Self::push(self, entry);
@@ -1169,6 +1247,7 @@ where
     /// `[cluster] view_probe_attempts_max`. The simulator and tests keep the
     /// built-in default.
     probe_attempts_max: Cell<u32>,
+    recovery_election_allowed: Cell<bool>,
 
     /// This replica's own uncommitted suffix, with the head, commit point and
     /// mutation count the journal was at when it was read.
@@ -1558,6 +1637,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
+            recovery_election_allowed: Cell::new(true),
             local_dvc_suffix: RefCell::new(None),
             journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
@@ -1632,6 +1712,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// run before `init` / `init_as_backup`.
     pub fn set_probe_attempts_max(&self, max: u32) {
         self.probe_attempts_max.set(max);
+    }
+
+    pub fn set_recovery_election_allowed(&self, allowed: bool) {
+        self.recovery_election_allowed.set(allowed);
+    }
+
+    #[must_use]
+    pub const fn recovery_election_allowed(&self) -> bool {
+        self.recovery_election_allowed.get()
     }
 
     pub fn init(&self) {
@@ -1969,6 +2058,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub fn pipeline_has_message_from_client(&self, client_id: u128) -> bool {
         self.pipeline.borrow().has_message_from_client(client_id)
+    }
+
+    #[must_use]
+    pub fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)> {
+        self.pipeline.borrow().pending_request(client_id)
     }
 
     /// True iff this exact `(client, request)` is already in flight. The
@@ -2549,9 +2646,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     // rejoined journal-less elects on equal terms and stands
                     // on its recovered durable state. Any still-live settled
                     // primary answers well before the fallback fires.
-                    let attempts = self.probe_attempts.get() + 1;
+                    let attempts = self.probe_attempts.get().saturating_add(1);
                     self.probe_attempts.set(attempts);
-                    if attempts >= self.probe_attempts_max.get() {
+                    if attempts >= self.probe_attempts_max.get()
+                        && self.recovery_election_allowed.get()
+                    {
                         // Nobody answered: full-cluster bootstrap, so there
                         // is no live primary to fetch state from. Local
                         // recovery is authoritative; abandon the transfer
@@ -4223,6 +4322,7 @@ where
                 parent: consensus.last_prepare_checksum(),
                 request_checksum: old.request_checksum,
                 request: old.request,
+                session: old.session,
                 commit: consensus.commit_max.get(),
                 op,
                 timestamp,

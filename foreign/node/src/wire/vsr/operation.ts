@@ -34,6 +34,7 @@ export const Operation = {
   RemoveConsumerGroupMember: 66,
   CompleteConsumerGroupRevocation: 67,
   TruncatePartition: 68,
+  FinalizeSession: 70,
   CreateStream: 128,
   UpdateStream: 129,
   DeleteStream: 130,
@@ -58,7 +59,8 @@ export const Operation = {
   LeaveConsumerGroup: 149,
   SendMessages: 160,
   StoreConsumerOffset: 161,
-  DeleteConsumerOffset: 162
+  DeleteConsumerOffset: 162,
+  RetireSession: 166
 } as const;
 
 const INTERNAL_START = 64;

@@ -52,6 +52,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct AppliedFrontier {
     op: AtomicU64,
+    recovered_revision: AtomicU64,
     /// Waits currently registered, so an advancing commit can skip the lock.
     /// `Release` on the way in and `Acquire` on the way out, NOT relaxed: the
     /// count is what tells [`Self::advance`] a waiter exists at all, so if it
@@ -98,6 +99,7 @@ impl AppliedFrontier {
     pub const fn new(read_budget: Duration) -> Self {
         Self {
             op: AtomicU64::new(0),
+            recovered_revision: AtomicU64::new(0),
             parked: AtomicUsize::new(0),
             waiters: Mutex::new(Waiters {
                 next_id: 0,
@@ -118,6 +120,17 @@ impl AppliedFrontier {
     #[must_use]
     pub fn get(&self) -> u64 {
         self.op.load(Ordering::Acquire)
+    }
+
+    /// Highest stream revision imported from recovery or transfer. A missing
+    /// partition at or below it requires recovery rather than fresh bootstrap.
+    pub fn recovered_revision(&self) -> u64 {
+        self.recovered_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_recovery_revision(&self, revision: u64) {
+        self.recovered_revision
+            .fetch_max(revision, Ordering::Release);
     }
 
     /// Publish `op` as applied and wake every read waiting at or below it.

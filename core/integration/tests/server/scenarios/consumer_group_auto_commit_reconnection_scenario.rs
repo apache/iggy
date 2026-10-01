@@ -47,6 +47,8 @@ async fn init_system(client: &IggyClient) {
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

@@ -215,6 +215,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
+            false,
             Rc::clone(&bus),
             &partitions,
         )
@@ -503,6 +504,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     topology: &TcpTopology,
     config: &ServerConfig,
     bus: Rc<IggyMessageBus>,
+    fresh: bool,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let journal = &owner.journal;
     let replica_count = topology.replica_count;
@@ -545,7 +547,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     // finds, then journal repair fills the tail. If the probe exhausts
     // instead -- full-cluster bootstrap, nobody live to fetch from -- the
     // election fallback clears the stage and this local recovery stands.
-    let join = if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
+    let join = if replica_count > 1 && (!fresh || restored_op > 0 || recovered_state.is_some()) {
         JoinMode::ProbeAsBackup {
             await_state_transfer: true,
         }
@@ -589,6 +591,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
             join,
         },
     );
+    consensus.set_recovery_election_allowed(fresh || restored_op > 0);
     consensus.sequencer().set_sequence(restored_op);
     // A SOLO replica's durable journal head IS its commit point: quorum is
     // 1-of-1, so an entry commits the instant it is durable, and the acks

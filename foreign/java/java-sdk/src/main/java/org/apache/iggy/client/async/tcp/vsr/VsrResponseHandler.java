@@ -61,6 +61,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     public VsrResponseHandler(ConsensusSession session, IntConsumer onEviction) {
         this.session = session;
         this.onEviction = onEviction;
+        session.onChannelCreated();
     }
 
     void registerRequest(CompletableFuture<ByteBuf> future, int operation, long requestId) {

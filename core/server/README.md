@@ -10,6 +10,11 @@ Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP 
 cargo run --bin iggy-server --release
 ```
 
+Initialize a new data directory once with `--fresh`. This deletes any existing
+data in the configured system path, so omit it on subsequent starts. An empty
+replacement disk in cluster mode must recover through a live quorum. It cannot
+initialize a new history merely because its peers are unreachable.
+
 The Docker image `apache/iggy:latest` ships the server together with the CLI; the `edge` tag tracks the latest development build.
 
 The image binds every listener to `0.0.0.0` so the container is reachable from outside it. A wildcard bind says which interfaces accept connections, not where a client reaches the server, so the address to publish in cluster metadata has to be supplied and the server refuses to start without it. On a single host with published ports that address is `localhost`:
@@ -27,7 +32,8 @@ To run one node of a cluster, pass its replica ID from the `cluster.nodes` roste
 cargo run --bin iggy-server --release -- --replica-id 0
 ```
 
-`--replica-id` is the only command line argument; everything else is configuration.
+`--replica-id` selects the configured replica. `--fresh` explicitly initializes
+its storage. Other settings come from configuration.
 
 ## Configuration
 
@@ -41,22 +47,27 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
-During a rolling upgrade from `server-0.9.0`, stop HTTP clients until every
-server runs the new version. A `server-0.9.0` node seeds its HTTP client id
-counter from the ids that newer nodes mint, so it can mint an id that a newer
-node also mints. If two HTTP sessions share a client id, the server can
-acknowledge a write of one session from the deduplication record of the other
-and not append it.
+Protocol 0.11 uses client-owned registration proofs and `BindSession` (15) to
+share a logical session across connections. Command 14 is retired. Primary
+polling uses commands 103 and 104; offset routing uses 123. Disconnecting a
+connection does not log out its logical session. Server-observed activity renews
+the session lease, and expiry or explicit logout retires it before capacity is
+reused.
 
-For cluster auto-commit consumers, upgrade all servers and binary SDKs together.
-Pause those consumers, upgrade every server, then update their SDKs and restart
-them to rejoin their groups. Primary polling uses binary commands 14, 103 and
-104; routed manual and interval offset writes also use command 123.
-Older SDKs can lose membership when a backup refuses an offset commit,
-and new SDKs require servers supporting those commands. HTTP polling is
-forwarded by the server and keeps its existing client API.
+Durability defaults remain `Replicated`. Explicit sends require `Persisted`;
+explicit offset writes require `Persisted` and `Quorum`. Weaker settings return
+`DurabilityRequired` (86) before mutation. Internal auto-commit polls keep their
+existing durability policy.
 
 ## Upgrade recovery
+
+This release changes protocol and storage formats. Servers and compatible
+clients deploy together; mixed versions and rolling upgrades are unsupported.
+Peers verify protocol, release and executable identity before admission.
+An unsupported data directory is refused before WAL scanning or file changes.
+Replacing the binary does not migrate old data. Restore or migrate retained data
+only through a separately verified procedure; copying a format marker is not
+a migration.
 
 Partition recovery refuses a superblock whose nonzero `log_view`
 is below the partition's committed `created_view`. It also refuses a WAL
@@ -110,6 +121,19 @@ In every other case:
 There is no automatic in-place migration for below-floor log certificates. Do not edit
 view numbers or delete superblocks or WAL directories to bypass the refusal:
 an empty history could then replace committed data during a view change.
+
+A recovered partition with no durable prepare-WAL frontier is also fenced as
+missing history. This includes a crash before its first frontier was published:
+the remaining files cannot prove that the partition never accepted a write.
+If every replica is in this state, none can supply the history needed to elect
+a partition primary. Restarting the replicas does not clear the fence.
+
+Preserve the files and restore a verified consistent backup or use a validated
+recovery procedure. If the partition is independently known to be empty, or its
+data may be discarded, delete and recreate it through the metadata API. This
+creates a new partition incarnation and removes the old data. Missing files
+alone are not evidence that discarding that data is safe. Do not create a WAL
+frontier or remove the recovery fence manually.
 
 ## Systemd integration
 

@@ -49,6 +49,7 @@ var (
 // serializes access through its exchange lock, which the lockstep request
 // model already requires.
 type Session struct {
+	bindSecret       [BindSecretBytes]byte
 	client           ClientID
 	session          uint64
 	bound            bool
@@ -66,6 +67,12 @@ func NewSession() *Session {
 func NewSessionWithClientID(client ClientID) *Session {
 	return &Session{client: client, requestCounter: 1}
 }
+
+// BindSecret returns the registered session proof.
+func (s *Session) BindSecret() [BindSecretBytes]byte { return s.bindSecret }
+
+// SetBindSecret records the proof of a committed registration.
+func (s *Session) SetBindSecret(secret [BindSecretBytes]byte) { s.bindSecret = secret }
 
 // ClientID returns the current ephemeral client identifier.
 func (s *Session) ClientID() ClientID {
@@ -143,6 +150,7 @@ func (s *Session) Reset() {
 }
 
 func (s *Session) reset() {
+	s.bindSecret = [BindSecretBytes]byte{}
 	s.client = newClientID()
 	s.session = 0
 	s.bound = false

@@ -63,7 +63,8 @@ final class VsrLoginCodec {
      * {@code [username:u8-len][password:u8-len]}. Anything after the password
      * is ignored.
      */
-    static ByteBuf rewriteUserLogin(ByteBufAllocator alloc, ByteBuf loginPayload) {
+    static ByteBuf rewriteUserLogin(ByteBufAllocator alloc, ByteBuf loginPayload, byte[] bindSecret) {
+        requireBindSecret(bindSecret);
         ByteBuf in = loginPayload.slice();
         byte[] username = readShortField(in, "username");
         byte[] password = readShortField(in, "password");
@@ -71,6 +72,7 @@ final class VsrLoginCodec {
 
         ByteBuf body = alloc.buffer();
         writeVersionInfo(body);
+        body.writeBytes(bindSecret);
         writeShortField(body, username);
         body.writeByte(password.length);
         body.writeBytes(password);
@@ -82,13 +84,15 @@ final class VsrLoginCodec {
      * {@code LoginWithPersonalAccessToken} (code 44) payload in:
      * {@code [token:u8-len]}.
      */
-    static ByteBuf rewritePatLogin(ByteBufAllocator alloc, ByteBuf loginPayload) {
+    static ByteBuf rewritePatLogin(ByteBufAllocator alloc, ByteBuf loginPayload, byte[] bindSecret) {
+        requireBindSecret(bindSecret);
         ByteBuf in = loginPayload.slice();
         byte[] token = readShortField(in, "token");
         requireShortField(token, "token");
 
         ByteBuf body = alloc.buffer();
         writeVersionInfo(body);
+        body.writeBytes(bindSecret);
         writeShortField(body, token);
         body.writeIntLE(0);
         return body;
@@ -100,6 +104,25 @@ final class VsrLoginCodec {
      */
     static long readSessionEpoch(ByteBuf registerBody) {
         return registerBody.getLongLE(registerBody.readerIndex() + 4);
+    }
+
+    static ByteBuf bindSession(
+            ByteBufAllocator alloc, long clientLow, long clientHigh, long session, long watermark, byte[] bindSecret) {
+        requireBindSecret(bindSecret);
+        ByteBuf body = alloc.buffer();
+        writeVersionInfo(body);
+        body.writeLongLE(clientLow);
+        body.writeLongLE(clientHigh);
+        body.writeLongLE(session);
+        body.writeLongLE(watermark);
+        body.writeBytes(bindSecret);
+        return body;
+    }
+
+    private static void requireBindSecret(byte[] bindSecret) {
+        if (bindSecret.length != ConsensusSession.BIND_SECRET_BYTES) {
+            throw new IggyInvalidArgumentException("Bind secret must be 32 bytes");
+        }
     }
 
     private static void writeVersionInfo(ByteBuf body) {

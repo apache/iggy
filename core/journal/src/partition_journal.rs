@@ -109,6 +109,7 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     file: S::File,
     frontier: S::File,
     frontier_sequence: u64,
+    recovered_frontier: bool,
     storage: S,
     capacity: u64,
     state: JournalState,
@@ -155,6 +156,18 @@ struct StoredPrepare {
 }
 
 impl PartitionPrepareJournal {
+    /// Check prior publication without creating a frontier. Opening the WAL
+    /// still validates its complete identity and referenced history.
+    ///
+    /// # Errors
+    /// Returns an error if the frontier cannot be read.
+    pub async fn has_published_frontier(directory: &Path) -> io::Result<bool> {
+        let (frontier, slots) =
+            Self::open_frontier(&DiskStorage, &directory.join(FRONTIER_FILE_NAME)).await?;
+        let (state, _, _) = Self::read_frontier(frontier.as_ref(), slots).await?;
+        Ok(state.is_some())
+    }
+
     /// # Errors
     /// Returns an error on I/O failure or invalid durable history.
     pub async fn open(directory: &Path, group: u64, incarnation: u64) -> io::Result<Self> {
@@ -266,6 +279,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             file,
             frontier,
             frontier_sequence,
+            recovered_frontier: existing.is_some(),
             storage,
             capacity,
             state,
@@ -305,6 +319,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         journal.recover_segment_files().await?;
         journal.migrate_segment_prepares().await?;
         Ok(journal)
+    }
+
+    /// An existing verified frontier proves this WAL survived a prior process.
+    #[must_use]
+    pub const fn recovered_frontier(&self) -> bool {
+        self.recovered_frontier
     }
 
     /// Open the frontier slot file without creating it, with the number of whole

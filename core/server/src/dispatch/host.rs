@@ -33,7 +33,6 @@
 //! upgrade per replica frame.
 
 use crate::consumer_group::lease::ConsumerGroupLiveness;
-use crate::dispatch::session_ops::submit_disconnect_logout;
 use crate::dispatch::submit::handle_metadata_submit;
 use crate::dispatch::{
     ActiveClientRequests, ClientRequestQueues, enqueue_client_request, upgrade_shard_handle,
@@ -51,7 +50,6 @@ use shard::{ListClientsReply, MetadataSubmit, ShardHost};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::error;
 
 /// The shard host the server runs; see the module docs.
 ///
@@ -98,7 +96,6 @@ where
         let queues: ClientRequestQueues = Rc::new(RefCell::new(AHashMap::new()));
         let queues_for_disconnect = Rc::clone(&queues);
         let sessions_for_disconnect = Rc::clone(&sessions);
-        let shard_handle_for_disconnect = Rc::clone(&shard_handle);
         bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
             // The socket is gone, so nothing will drain what a live drain task
             // left queued. The active slot is NOT released here: the transport
@@ -107,28 +104,9 @@ where
             // buffered spawn a second drain over the same queue. The drain task's
             // own guard covers every exit, the panic compio catches included.
             queues_for_disconnect.borrow_mut().remove(&client_id);
-            // Upgrade FIRST: `remove_connection` strips the `SessionManager`
-            // entry, so running it ahead of a failed upgrade would drop the
-            // binding without ever submitting the replicated `Logout`, leaking
-            // the `ClientTable` entry and its consumer-group memberships. The
-            // window is pre-build / post-runtime-drop only.
-            let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect) else {
-                // Nothing reaps what stays behind: the heartbeat verifier is
-                // optional and only collects `Bound` / `Authenticated` sessions,
-                // so a `Connected` row survives to process exit.
-                error!(
-                    client_id,
-                    "client connection lost with no live shard; session and client-table entries \
-                     leak until process exit"
-                );
-                return;
-            };
-            if let Some((vsr_client_id, session)) = sessions_for_disconnect
+            sessions_for_disconnect
                 .borrow_mut()
-                .remove_connection(client_id)
-            {
-                submit_disconnect_logout(shard, vsr_client_id, session);
-            }
+                .remove_connection(client_id);
         }));
         Self {
             bus: bus.clone(),
@@ -206,7 +184,17 @@ where
                 let _ = reply.try_send(self.sessions.borrow().iter_clients().collect());
             }
             ListClientsReply::Sessions(reply) => {
-                let _ = reply.try_send(self.sessions.borrow().iter_consumer_sessions().collect());
+                let _ = reply.try_send(
+                    self.sessions
+                        .borrow()
+                        .iter_consumer_sessions(
+                            self.server_config
+                                .consumer_group
+                                .session_timeout
+                                .get_duration(),
+                        )
+                        .collect(),
+                );
             }
             ListClientsReply::Count(reply) => {
                 let _ = reply.try_send(self.sessions.borrow().client_count());

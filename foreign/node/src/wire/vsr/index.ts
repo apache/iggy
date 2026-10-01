@@ -23,6 +23,7 @@ import { HEADER_SIZE, encodeRequestHeader } from './header.js';
 import { Operation, operationForCode } from './operation.js';
 import {
   deserializeLoginRegister,
+  serializeBindSession,
   serializeLoginRegister,
   serializeLoginRegisterWithPat,
 } from './register.js';
@@ -54,6 +55,18 @@ export class VsrSession {
 
   get hasActivity(): boolean {
     return this.state.hasActivity;
+  }
+
+  get clientId(): bigint {
+    return this.state.clientId;
+  }
+
+  get bindSecret(): Buffer {
+    return this.state.bindSecret;
+  }
+
+  bindPayload(identity: Buffer): Buffer {
+    return serializeBindSession(identity, SDK_VERSION, this.state.bindSecret);
   }
 
   encode(command: number, payload: Buffer): Buffer {
@@ -108,21 +121,22 @@ export const readRegisteredSession = (response: CommandResponse): bigint =>
 
 export const prepareVsrCommand = (
   command: number,
-  payload: Buffer
+  payload: Buffer,
+  bindSecret: Buffer
 ): { command: number, payload: Buffer } => {
   if (command === COMMAND_CODE.LoginUser) {
     const username = readWireName(payload, 0);
     const password = readWireName(payload, username.next);
     return {
       command: COMMAND_CODE.LoginRegister,
-      payload: serializeLoginRegister(username.value, password.value, SDK_VERSION),
+      payload: serializeLoginRegister(username.value, password.value, SDK_VERSION, bindSecret),
     };
   }
   if (command === COMMAND_CODE.LoginWithAccessToken) {
     const token = readWireName(payload, 0);
     return {
       command: COMMAND_CODE.LoginRegisterWithAccessToken,
-      payload: serializeLoginRegisterWithPat(token.value, SDK_VERSION),
+      payload: serializeLoginRegisterWithPat(token.value, SDK_VERSION, bindSecret),
     };
   }
   return { command, payload };

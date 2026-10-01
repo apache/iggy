@@ -1388,10 +1388,10 @@ pub(in crate::http) async fn get_consumer_offset(
 /// legacy server accepts (partitioning + base64 messages); stream and topic
 /// come from the path.
 ///
-/// Data plane, not control plane: the batch rides the partition group's own
-/// consensus (at-least-once, no dedup, no session gate - concurrent produces
-/// on one credential are legal), and the committed reply comes back through
-/// the session's in-process reply slot rather than a submit return value.
+/// The batch rides partition consensus under a server-generated request ID.
+/// Each caller POST is a new mutation; repeated POSTs do not automatically
+/// deduplicate. Awaited writes on one token queue behind the session's data
+/// gate, and the committed reply reaches its in-process reply slot.
 /// The default answers 201 with the completed message durability only
 /// after the quorum commit, with the commit's per-partition confirmations as
 /// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
@@ -1495,26 +1495,13 @@ pub(in crate::http) async fn store_consumer_offset(
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();
-    let consumer_kind = command.consumer.kind;
-    let result = SendWrapper::new(partition_write_replicated(
+    SendWrapper::new(partition_write_replicated(
         &state,
         &identity.session,
         Operation::StoreConsumerOffset,
         &body,
     ))
-    .await;
-    if matches!(
-        &result,
-        Err(PartitionWriteError::Rejected(
-            IggyError::TooManyConsumerOffsets
-        ))
-    ) {
-        state
-            .shard
-            .metrics()
-            .record_consumer_offset_denied(consumer_kind);
-    }
-    result?;
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

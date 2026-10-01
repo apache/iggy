@@ -20,6 +20,7 @@ mod background;
 use bytes::Bytes;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
+use integration::iggy_harness;
 
 const PARTITION_ID: u32 = 0;
 const STREAM_NAME: &str = "test-stream-producer";
@@ -28,6 +29,44 @@ const PARTITIONS_COUNT: u32 = 3;
 
 fn create_message_payload(offset: u64) -> Bytes {
     Bytes::from(format!("message {offset}"))
+}
+
+#[iggy_harness]
+async fn given_persisted_auto_creation_when_producer_sends_should_confirm_and_poll(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    let producer = client
+        .producer(STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .topic_durability(Durability::Persisted)
+        .partitioning(Partitioning::partition_id(PARTITION_ID))
+        .build();
+    producer.init().await.unwrap();
+    let payload = create_message_payload(0);
+    let message = IggyMessage::builder()
+        .id(1)
+        .payload(payload.clone())
+        .build()
+        .unwrap();
+    let response = producer.send_one(message).await.unwrap();
+    assert_eq!(response.confirmations.len(), 1);
+    assert_eq!(response.confirmations[0].base_offset, 0);
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.messages.len(), 1);
+    assert_eq!(polled.messages[0].payload, payload);
+    cleanup(&client).await;
 }
 
 async fn init_system(client: &IggyClient) {
@@ -42,6 +81,7 @@ async fn init_system(client: &IggyClient) {
             &TopicCreateOptions {
                 partitions_count: Some(PARTITIONS_COUNT),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

@@ -62,6 +62,7 @@ var goOperations = map[string]Operation{
 	"RemoveConsumerGroupMember":       OperationRemoveConsumerGroupMember,
 	"CompleteConsumerGroupRevocation": OperationCompleteConsumerGroupRevocation,
 	"TruncatePartition":               OperationTruncatePartition,
+	"FinalizeSession":                 OperationFinalizeSession,
 	"CreateStream":                    OperationCreateStream,
 	"UpdateStream":                    OperationUpdateStream,
 	"DeleteStream":                    OperationDeleteStream,
@@ -87,6 +88,7 @@ var goOperations = map[string]Operation{
 	"SendMessages":                    OperationSendMessages,
 	"StoreConsumerOffset":             OperationStoreConsumerOffset,
 	"DeleteConsumerOffset":            OperationDeleteConsumerOffset,
+	"RetireSession":                   OperationRetireSession,
 }
 
 // goEvictionReasons names every eviction discriminant the codec declares.
@@ -419,6 +421,7 @@ func TestProtocolParity_OperationClassification(t *testing.T) {
 	rustValues := rustEnumValues(sources["operation"], "Operation")
 	require.NotEmpty(t, rustValues)
 
+	internalNames := rustMatchesAllowlist(t, sources["operation"], "is_internal")
 	metadataNames := rustMatchesAllowlist(t, sources["operation"], "is_metadata")
 	resultFramedNames := rustMatchesAllowlist(t, sources["operation"], "is_result_framed")
 
@@ -429,9 +432,10 @@ func TestProtocolParity_OperationClassification(t *testing.T) {
 
 	for name, value := range rustValues {
 		operation := Operation(value)
-		internal := value >= internalStart && value < metadataStart
+		_, inInternalList := internalNames[name]
+		internal := value >= internalStart && value < metadataStart || inInternalList
 		_, inMetadataList := metadataNames[name]
-		metadata := internal || inMetadataList
+		metadata := internal && value < rustValues["SendMessages"] || inMetadataList
 		_, inResultFramedList := resultFramedNames[name]
 
 		assert.Equal(t, internal, IsInternal(operation), "IsInternal(%s)", name)

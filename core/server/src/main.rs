@@ -100,7 +100,7 @@ fn main() -> Result<(), ServerError> {
     let config = bootstrap_result?;
     drop(bootstrap_runtime);
 
-    let shards = bootstrap(config, args.replica_id)?;
+    let shards = bootstrap(config, args.replica_id, args.fresh)?;
     if let Err(error) = shards.install_ctrlc_handler() {
         // Without a working SIGINT handler the server has no way to
         // observe an operator Ctrl-C and the shutdown flag would never

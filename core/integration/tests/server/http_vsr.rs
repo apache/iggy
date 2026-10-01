@@ -45,7 +45,7 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 const DURABILITY_HEADER: &str = "iggy-durability";
-const DURABILITY_REPLICATED: &str = "replicated";
+const DURABILITY_PERSISTED: &str = "persisted";
 const DURABILITY_NONE: &str = "none";
 
 /// `?ack=none` answers before the commit; poll until visible, never unbounded.
@@ -116,7 +116,13 @@ impl HttpSessionExt for HttpClient {
             message_expiry: IggyExpiry::NeverExpire,
             max_topic_size: MaxTopicSize::ServerDefault,
             name: topic.to_string(),
-            options: Default::default(),
+            options: BTreeMap::from([
+                ("durability".to_string(), Durability::Persisted.to_string()),
+                (
+                    "consumer_offset_durability".to_string(),
+                    Durability::Persisted.to_string(),
+                ),
+            ]),
         };
         let response = self
             .client
@@ -264,6 +270,63 @@ fn text_message(id: u128, payload: String) -> IggyMessage {
         .expect("message build")
 }
 
+#[iggy_harness(cluster_nodes = 1, server(metadata.clients_table_max = "4"))]
+async fn given_full_http_capacity_when_registration_is_refused_should_allow_tcp_registration(
+    harness: &TestHarness,
+) {
+    const HTTP_CAPACITY: usize = 2;
+    const TCP_HEADROOM: usize = 2;
+    const REFUSED_REQUESTS: usize = 4;
+    let mut admitted = Vec::new();
+    for index in 0..HTTP_CAPACITY {
+        let http = HttpClient::login_root(harness).await;
+        assert_eq!(
+            http.post_json(
+                "/streams",
+                &json!({ "name": format!("capacity-admitted-{index}") })
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        admitted.push(http);
+    }
+    let refused = HttpClient::login_root(harness).await;
+    for attempt in 0..REFUSED_REQUESTS {
+        assert_eq!(
+            refused
+                .post_json("/streams", &json!({ "name": "capacity-refused" }))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HTTP request {attempt} must be refused before Register"
+        );
+    }
+    let mut tcp_clients = Vec::new();
+    for _ in 0..TCP_HEADROOM {
+        tcp_clients.push(
+            harness
+                .tcp_root_client()
+                .await
+                .expect("refused HTTP credentials must not consume TCP capacity"),
+        );
+    }
+    for tcp in tcp_clients {
+        tcp.ping().await.unwrap();
+    }
+    for (index, http) in admitted.into_iter().enumerate() {
+        assert_eq!(
+            http.post_json(
+                "/streams",
+                &json!({ "name": format!("capacity-reused-{index}") })
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+}
+
 #[iggy_harness]
 async fn given_http_session_when_producing_and_polling_should_round_trip(harness: &TestHarness) {
     let http = HttpClient::login_root(harness).await;
@@ -297,7 +360,7 @@ async fn given_http_session_when_producing_and_polling_should_round_trip(harness
         StatusCode::CREATED,
         "produce must commit"
     );
-    assert_eq!(durability(&response), DURABILITY_REPLICATED);
+    assert_eq!(durability(&response), DURABILITY_PERSISTED);
 
     let polled = http
         .poll("http-stream", "http-topic", PARTITION_ID, 0, 10)
@@ -353,8 +416,8 @@ async fn given_one_session_when_producing_concurrently_should_not_cross_talk(
             "concurrent produce {i} must commit"
         );
         assert_eq!(
-            durability, DURABILITY_REPLICATED,
-            "concurrent produce {i} must attest a replicated commit"
+            durability, DURABILITY_PERSISTED,
+            "concurrent produce {i} must attest a persisted commit"
         );
     }
 
@@ -687,26 +750,29 @@ async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHar
 
 #[iggy_harness]
 async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &TestHarness) {
+    const BURST_SIZE: u32 = 8;
     let http = HttpClient::login_root(harness).await;
     http.create_stream_and_topic("http-ack-none", "fire", 1)
         .await;
 
-    let message = text_message(1, "fire-and-forget".to_string());
-    let response = http
-        .produce_with_query(
-            "http-ack-none",
-            "fire",
-            PARTITION_ID,
-            vec![message],
-            "?ack=none",
-        )
-        .await;
-    assert_eq!(
-        response.status(),
-        StatusCode::ACCEPTED,
-        "ack=none must answer before the commit"
-    );
-    assert_eq!(durability(&response), DURABILITY_NONE);
+    for index in 0..BURST_SIZE {
+        let message = text_message(u128::from(index) + 1, format!("fire-and-forget-{index}"));
+        let response = http
+            .produce_with_query(
+                "http-ack-none",
+                "fire",
+                PARTITION_ID,
+                vec![message],
+                "?ack=none",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "ack=none must answer before the commit"
+        );
+        assert_eq!(durability(&response), DURABILITY_NONE);
+    }
 
     // The commit still happens, just asynchronously: poll bounded until the
     // message becomes visible. A 404 counts as not-yet-visible for the same
@@ -717,14 +783,15 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
         if let Some(polled) = http
             .try_poll("http-ack-none", "fire", PARTITION_ID, 0, 10)
             .await
-            && !polled.messages.is_empty()
+            && polled.messages.len() == BURST_SIZE as usize
         {
-            assert_eq!(polled.messages.len(), 1, "exactly one message was produced");
-            assert_eq!(
-                polled.messages[0].payload,
-                bytes::Bytes::from("fire-and-forget"),
-                "ack=none payload must round trip"
-            );
+            for (index, message) in polled.messages.iter().enumerate() {
+                assert_eq!(
+                    message.payload,
+                    bytes::Bytes::from(format!("fire-and-forget-{index}")),
+                    "every ack=none write in the burst must round trip in order"
+                );
+            }
             break;
         }
         assert!(
@@ -1041,15 +1108,7 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
         let policies = iggy_common::TopicRuntimeOptions::from_resource_options(&details.options);
         assert_eq!(policies.durability, message_policy);
         assert_eq!(policies.consumer_offset_durability, offset_policy);
-        for (query, status, expected) in [
-            ("", StatusCode::CREATED, message_policy.as_ref()),
-            (
-                "?ack=replicated",
-                StatusCode::CREATED,
-                message_policy.as_ref(),
-            ),
-            ("?ack=none", StatusCode::ACCEPTED, "none"),
-        ] {
+        for query in ["", "?ack=replicated", "?ack=none"] {
             let message = IggyMessage::builder()
                 .payload("policy".into())
                 .build()
@@ -1063,8 +1122,17 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
                     query,
                 )
                 .await;
-            assert_eq!(response.status(), status);
-            assert_eq!(durability(&response), expected);
+            if query == "?ack=none" {
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                assert_eq!(durability(&response), DURABILITY_NONE);
+            } else if message_policy.is_persisted() {
+                assert_eq!(response.status(), StatusCode::CREATED);
+                assert_eq!(durability(&response), DURABILITY_PERSISTED);
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let error: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(error["id"], IggyError::DurabilityRequired.as_code());
+            }
         }
     }
 }

@@ -20,8 +20,8 @@ use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, NonZeroIggyDuration, Partitioner,
-    Partitioning,
+    Durability, EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, NonZeroIggyDuration,
+    Partitioner, Partitioning,
 };
 use std::sync::Arc;
 
@@ -51,6 +51,7 @@ pub struct IggyProducerBuilder {
     send_retries_interval: Option<NonZeroIggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
+    topic_durability: Durability,
     partitioning: Option<Partitioning>,
     mode: SendMode,
 }
@@ -80,6 +81,7 @@ impl IggyProducerBuilder {
             topic_partitions_count: 1,
             topic_message_expiry: IggyExpiry::ServerDefault,
             topic_max_size: MaxTopicSize::ServerDefault,
+            topic_durability: Durability::default(),
             send_retries_count: Some(3),
             send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
             mode: SendMode::default(),
@@ -176,6 +178,16 @@ impl IggyProducerBuilder {
         }
     }
 
+    /// Sets message durability for an automatically created topic.
+    /// Defaults to Replicated. Producer sends require `Durability::Persisted`
+    /// and otherwise fail with `IggyError::DurabilityRequired`.
+    pub fn topic_durability(self, durability: Durability) -> Self {
+        Self {
+            topic_durability: durability,
+            ..self
+        }
+    }
+
     /// Does not create the topic if it does not exist.
     pub fn do_not_create_topic_if_not_exists(self) -> Self {
         Self {
@@ -184,9 +196,11 @@ impl IggyProducerBuilder {
         }
     }
 
-    /// Sets the retry policy (maximum number of retries and interval between them) in case of messages sending failure.
-    /// The error can be related either to disconnecting from the server or to the server rejecting the messages.
-    /// Default is 3 retries with 1 second interval between them.
+    /// Starts a new attempt only after `IggyError::TransientNotAccepted`.
+    /// An ambiguous outcome or terminal refusal stops producer retries. The
+    /// transport may replay the exact request within its original session.
+    /// Defaults to 3 retries with a one-second interval. See the
+    /// [retry contract](super::producer::IggyProducer#retry-contract).
     pub fn send_retries(self, retries: Option<u32>, interval: Option<NonZeroIggyDuration>) -> Self {
         Self {
             send_retries_count: retries,
@@ -225,6 +239,7 @@ impl IggyProducerBuilder {
             self.topic_partitions_count,
             self.topic_message_expiry,
             self.topic_max_size,
+            self.topic_durability,
             self.send_retries_count,
             self.send_retries_interval,
             self.mode,

@@ -27,9 +27,8 @@ use bytes::Bytes;
 use consensus::{PIPELINE_PREPARE_QUEUE_MAX, PartitionsHandle, Sequencer};
 use iggy_binary_protocol::{AckLevel, Command, PrepareOkHeader};
 use iggy_common::{ConsumerKind, IggyByteSize, IggyError};
-use partitions::{Partition, PollingConsumer, RetainedPartitionState};
+use partitions::PollingConsumer;
 use server_common::sharding::IggyNamespace;
-use std::mem;
 
 #[test]
 fn given_queued_offset_when_owner_history_is_reloaded_should_reject_across_seeded_schedules() {
@@ -51,13 +50,18 @@ fn history_reload_trace(seed: u64) -> u64 {
         bucket_capacity: 1,
     });
     let namespace = IggyNamespace::new(1, 1, 0);
+    let producers = (3..3 + PIPELINE_PREPARE_QUEUE_MAX as u128)
+        .map(SimClient::new)
+        .collect::<Vec<_>>();
     let mut simulator = Simulator::with_shards(
         3,
         2,
-        [1, 2].into_iter(),
+        [1, 2]
+            .into_iter()
+            .chain(producers.iter().map(SimClient::client_id)),
         PacketSimulatorOptions {
             node_count: 3,
-            client_count: 2,
+            client_count: u8::try_from(producers.len() + 2).unwrap(),
             seed,
             ..PacketSimulatorOptions::default()
         },
@@ -67,6 +71,9 @@ fn history_reload_trace(seed: u64) -> u64 {
     let consumer = SimClient::new(2);
     simulator.register_client_with_primary(&producer);
     simulator.register_client_with_primary(&consumer);
+    for producer in &producers {
+        simulator.register_client_with_primary(producer);
+    }
     let reply = submit_and_wait_for_reply(
         &mut simulator,
         1,
@@ -86,9 +93,9 @@ fn history_reload_trace(seed: u64) -> u64 {
             .link_drop_packet_fn(ProcessId::Replica(backup), ProcessId::Replica(0)) =
             Some(drop_partition_acknowledgment);
     }
-    for _ in 0..PIPELINE_PREPARE_QUEUE_MAX {
+    for producer in &producers {
         simulator.submit_request(
-            1,
+            producer.client_id(),
             0,
             producer
                 .send_messages(namespace, &[Bytes::from_static(b"pending record")])
@@ -139,15 +146,7 @@ fn history_reload_trace(seed: u64) -> u64 {
     // retaining bytes avoids real filesystem timing in the seeded executor.
     let owner = simulator.replicas[0].partition_shard(namespace);
     let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
-    let offsets = partition.offsets();
-    let retained = RetainedPartitionState {
-        consumer_offsets: partition.retained_consumer_offsets(ConsumerKind::Consumer),
-        consumer_group_offsets: partition.retained_consumer_offsets(ConsumerKind::ConsumerGroup),
-        durable_offset: offsets.commit_offset,
-        write_offset: offsets.write_offset,
-        offset_space_used: partition.offset_space_used(),
-        log: mem::take(&mut partition.log),
-    };
+    let retained = partition.take_retained_state();
     partition.adopt_retained_log(retained);
     let expected_operation = partition.consensus().sequencer().current_sequence();
     assert_eq!(

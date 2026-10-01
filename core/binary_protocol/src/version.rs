@@ -17,9 +17,8 @@
 
 //! Binary protocol versioning.
 //!
-//! The protocol version is this crate's own semver, const-parsed from
-//! `CARGO_PKG_VERSION` into a packed `u32` so it auto-bumps with releases
-//! and stays cheaply comparable. It is exchanged during the login/register
+//! The wire version is an explicit packed semver, independent of crate
+//! releases. It is exchanged during the login/register
 //! handshake: clients send [`ClientVersionInfo`] as the body prefix of both
 //! login-register request shapes, the server gates on
 //! [`is_protocol_compatible`] before touching credentials and advertises
@@ -45,8 +44,7 @@
 //! value = major << 20 | minor << 10 | patch
 //! ```
 //!
-//! Integer order equals semver order. The value tracks the
-//! `iggy_binary_protocol` crate release; under 0.x a minor bump may break
+//! Integer order equals semver order. Under 0.x a minor bump may break
 //! the wire, so the gate is minor-scoped. Compatibility across minor versions
 //! after 1.0.0 requires changing the minimum-version calculation below.
 //!
@@ -98,9 +96,8 @@ const COMPONENT_BITS: u32 = 10;
 const COMPONENT_MAX: u32 = (1 << COMPONENT_BITS) - 1;
 const PATCH_MASK: u32 = COMPONENT_MAX;
 
-/// Current binary protocol version: this crate's semver, packed.
-/// Pre-release tags (`-edge.N`) are ignored.
-pub const IGGY_PROTOCOL_VERSION: u32 = parse_packed_semver(env!("CARGO_PKG_VERSION"));
+/// Current binary protocol version, independent of the crate's release version.
+pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 0);
 
 /// Oldest protocol version this build still accepts at login: the current
 /// version with patch zeroed (patch releases never change the wire).
@@ -162,6 +159,7 @@ impl std::fmt::Display for ProtocolVersion {
 
 /// Const-parse `major.minor.patch[-pre]` into a packed `u32`.
 /// Malformed input is a compile error in const context.
+#[cfg(test)]
 const fn parse_packed_semver(version: &str) -> u32 {
     let bytes = version.as_bytes();
     let (major, i) = parse_component(bytes, 0);
@@ -183,6 +181,7 @@ const fn parse_packed_semver(version: &str) -> u32 {
 }
 
 /// Parse a decimal run starting at `start`; returns (value, index past digits).
+#[cfg(test)]
 const fn parse_component(bytes: &[u8], start: usize) -> (u32, usize) {
     assert!(
         start < bytes.len() && bytes[start].is_ascii_digit(),
@@ -204,8 +203,8 @@ const fn parse_component(bytes: &[u8], start: usize) -> (u32, usize) {
 /// [protocol_version:u32 LE][sdk_name_len:u8][sdk_name:N][sdk_version_len:u8][sdk_version:N]
 /// ```
 ///
-/// `protocol_version` is the packed `iggy_binary_protocol` crate version the
-/// client was built against; `sdk_version` is the client crate's own version
+/// `protocol_version` is the packed wire version the client implements;
+/// `sdk_version` is the client crate's own version
 /// (e.g. the `iggy` crate for the Rust SDK). Encoded first so the server can
 /// parse and gate on it regardless of how the rest of the body evolves.
 #[derive(Debug, Clone, PartialEq, Eq)]

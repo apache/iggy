@@ -1376,7 +1376,8 @@ impl IggyClient {
     /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
     /// `None` selects direct mode. `BackgroundProducerConfig` starts background
     /// workers and makes successful sends mean queue acceptance rather than a
-    /// server commit. The returned producer is ready to send.
+    /// server commit. Set `topic_durability=Durability.PERSISTED` for an
+    /// automatically created topic; Replicated defaults reject producer writes.
     ///
     /// Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
     /// when stream/topic initialization fails.
@@ -1393,6 +1394,7 @@ impl IggyClient {
         topic_max_size=None,
         send_retries=Some(3),
         send_retry_interval=RetryInterval::default(),
+        topic_durability=None,
     ))]
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
     fn producer<'a>(
@@ -1418,6 +1420,8 @@ impl IggyClient {
         >,
         send_retries: Option<i64>,
         send_retry_interval: RetryInterval,
+        #[gen_stub(override_type(type_repr = "Durability | None"))]
+        topic_durability: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mode = mode.unwrap_or_default();
 
@@ -1441,7 +1445,8 @@ impl IggyClient {
             .inner
             .producer(stream, topic)
             .map_err(to_value_error)?
-            .send_retries(send_retries, send_retry_interval);
+            .send_retries(send_retries, send_retry_interval)
+            .topic_durability(crate::durability::Durability::try_from(topic_durability)?.0);
 
         builder = match mode {
             ProducerMode::Direct(config) => builder.direct((&config).into()),
