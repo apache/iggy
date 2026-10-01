@@ -82,7 +82,7 @@ pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
 /// How long after a poll returns the source still counts as live. Generous
 /// against the SDK's 30s batch-result timeout, which is the longest a healthy
 /// source sits between polls.
-const POLL_LIVENESS_SECONDS: u64 = 60;
+pub(crate) const POLL_LIVENESS_SECONDS: u64 = 60;
 
 /// HTTP handler side of an instance's bridge. The pair comes from
 /// `bounded_async` because the `poll()` side needs `recv().await`; the handler
@@ -390,15 +390,16 @@ impl SharedState {
     /// bridge for hours, which is the normal state of a quiet gateway. The
     /// timestamp covers the other case, where the SDK is between polls waiting
     /// for a batch result. Neither advances once the poll task has stopped.
-    /// A staged batch that keeps receiving NACKs eventually fails readiness
-    /// even though replay keeps updating the poll timestamp.
     pub fn poll_is_live(&self, now_seconds: u64) -> bool {
-        let staged_nack_since = self.staged_nack_since.load(Ordering::Acquire);
-        (staged_nack_since == 0
-            || now_seconds.saturating_sub(staged_nack_since) <= POLL_LIVENESS_SECONDS)
-            && (self.poll_active.load(Ordering::Acquire)
-                || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
-                    <= POLL_LIVENESS_SECONDS)
+        self.poll_active.load(Ordering::Acquire)
+            || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
+                <= POLL_LIVENESS_SECONDS
+    }
+
+    /// Whether a retained webhook batch has been NACKed beyond the readiness window.
+    pub(crate) fn staged_batch_is_stuck(&self, now_seconds: u64) -> bool {
+        let since = self.staged_nack_since.load(Ordering::Acquire);
+        since != 0 && now_seconds.saturating_sub(since) > POLL_LIVENESS_SECONDS
     }
 
     /// Marks the instance as having left the route table, before anything
@@ -1378,7 +1379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_staged_batch_failing_past_liveness_window_should_not_be_ready() {
+    async fn given_repeated_nacks_should_keep_first_stamp_and_poll_liveness() {
         let source = HttpSource::new(1, parse(minimal_config_json()), None);
         source.shared.poll_active.store(true, Ordering::Release);
         source.stage(vec![queued("event")]);
@@ -1391,8 +1392,23 @@ mod tests {
             .staged_nack_since
             .store(100, Ordering::Release);
 
+        source
+            .on_nack()
+            .expect("a repeated NACK should retain the staged batch");
+        assert_eq!(source.shared.staged_nack_since.load(Ordering::Acquire), 100);
+
         assert!(source.shared.poll_is_live(100 + POLL_LIVENESS_SECONDS));
-        assert!(!source.shared.poll_is_live(101 + POLL_LIVENESS_SECONDS));
+        assert!(source.shared.poll_is_live(101 + POLL_LIVENESS_SECONDS));
+        assert!(
+            !source
+                .shared
+                .staged_batch_is_stuck(100 + POLL_LIVENESS_SECONDS)
+        );
+        assert!(
+            source
+                .shared
+                .staged_batch_is_stuck(101 + POLL_LIVENESS_SECONDS)
+        );
 
         source
             .on_batch_result(SourceBatchResult::Ack)
@@ -1400,6 +1416,11 @@ mod tests {
             .expect("ACK should clear the staged batch");
         assert_eq!(source.shared.staged_nack_since.load(Ordering::Acquire), 0);
         assert!(source.shared.poll_is_live(101 + POLL_LIVENESS_SECONDS));
+        assert!(
+            !source
+                .shared
+                .staged_batch_is_stuck(101 + POLL_LIVENESS_SECONDS)
+        );
     }
 
     #[test]
@@ -1716,9 +1737,8 @@ mod tests {
 
     #[test]
     fn given_repeated_refusals_when_retried_should_back_off_to_a_ceiling() {
-        // Growth is what stops a latched store burning the SDK's five-NACK
-        // budget in a tight loop; the ceiling is what stops a recovered store
-        // waiting minutes to be noticed.
+        // Growth avoids a tight retry loop against a latched store; the ceiling
+        // lets a recovered store be noticed promptly.
         let delays: Vec<Duration> = (1..=10).map(state_flush_retry_delay).collect();
         for pair in delays.windows(2) {
             assert!(

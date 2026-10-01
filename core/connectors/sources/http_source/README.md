@@ -13,7 +13,9 @@ Loss windows, explicitly:
 1. **Process crash** between HTTP 200 and the producer send. Buffered messages are volatile.
 2. **Producer failure.** Narrowed by #3855, which gave sources a delivery result. The runtime NACKs a batch it could not send, or whose state it could not persist, and neither is abandoned here: a message batch is held and replayed on the next `poll()`, and a state-only batch re-arms the flush so the mutation is handed out again. Answering 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 handlers return once the bridge fills.
 3. **Shutdown.** Narrowed by #3321, which closes the plugin before tearing down the forwarding channel so in-flight batches drain. Messages still in the bridge when the poll task stops are lost; the connector logs the count and increments `http_source_dropped_on_close_total`.
-4. **Poll task stopped by the SDK.** The HTTP source now retries NACKed batches without a fixed stop limit by default, with capped backoff. A configured `max_consecutive_nacks` can still stop it; the runtime reports the stop as `Error` and removes it from the running gauge. Rebuild the plugin with the current SDK to enable stop reporting. A stopped source cannot drain its in-memory bridge, so accepted messages remain at risk until the connector is restarted.
+4. **Poll task stopped by the SDK.** The HTTP source retries NACKed batches without a fixed stop limit by default, with capped backoff. A configured `max_consecutive_nacks` can still stop it; the runtime reports the stop as `Error` and removes it from the running gauge. Rebuild the plugin with the current SDK to enable stop reporting.
+
+   The listener keeps answering 200 until its bridge fills, even though a stopped source cannot drain it. Restarting closes the old instance and loses its staged batch and buffered messages; `http_source_dropped_on_close_total` counts them. Do not set a NACK limit unless those accepted events can be replayed outside the connector.
 
 What mitigates this in practice is the caller: webhook senders such as GitHub, Stripe, and Twilio retry on timeout and 5xx, so the sender side is at-least-once up to the moment this connector returns 200. The connector's job is to make the post-200 window as small and as observable as possible.
 
@@ -109,7 +111,7 @@ The stream's `schema` **must be `raw`**. This connector always produces raw bodi
 
 The batch is then replayed on every poll. This source disables the SDK's consecutive-NACK breaker by default because accepted webhooks exist only in its in-memory bridge. Repeated failures back off to a five-second retry delay, and the listener answers 429 once the bridge fills.
 
-Empty bodies are rejected with 400. `max_body_size_bytes` cannot exceed Iggy's 64,000,000-byte payload cap; requests above the configured limit are rejected with 413. A staged batch that keeps failing for more than 60 seconds makes `/health` and `/admin/health` report unavailable, even while retries continue.
+Empty bodies are rejected with 400. `max_body_size_bytes` cannot exceed Iggy's 64,000,000-byte payload cap; requests above the configured limit are rejected with 413. A staged batch that keeps failing for more than 60 seconds makes `/health` answer 503 while retries continue. `/admin/health` still answers 200, but reports `"status":"degraded"` and marks that instance's `staged_batch_is_stuck` true while `poll_is_live` remains true.
 
 Set `max_consecutive_nacks` in `[plugin_config]` to a positive integer only if an external replay mechanism makes stopping safe. This does not make a mismatched stream schema valid: `schema` lives under `[[streams]]` and the plugin only receives `[plugin_config]`.
 
@@ -128,7 +130,7 @@ Rebuild the HTTP source plugin with SDK 0.6 to get this behavior and the `iggy_s
 | `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 64000000**, Iggy's message payload cap, since a body becomes the payload unchanged; a larger value fails `open()`. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
-| `max_consecutive_nacks` | positive integer | disabled | Optional SDK breaker limit. Omit to keep retrying NACKed batches with capped backoff; set only when accepted events can be replayed after a restart. Zero is invalid. |
+| `max_consecutive_nacks` | positive integer | disabled | Optional SDK breaker limit. Omit to keep retrying NACKed batches and refused state flushes with capped backoff; set only when accepted events can be replayed after a restart. An idle gateway can hit this limit on state-flush NACKs alone. Zero is invalid. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
 | `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie`, because forwarding a reusable credential would copy it onto every message and persist it in the log. |
 | `endpoints` | array | `[]` | Static secret-path endpoints. |
@@ -303,7 +305,7 @@ The chain below holds end to end. It did not always: the runtime's forwarding ch
 
 What closed the gap instead was #3855. The SDK now keeps one batch in flight and will not call `poll()` again until the runtime acknowledges the last one, so a slow Iggy stalls the poll loop directly. The bridge then fills on arrival and the handlers answer 429, which is the coupling that was missing.
 
-That coupling holds only while the runtime answers inside the SDK's batch-result timeout, 30s. Past it the SDK stops waiting, NACKs, and polls again, so the bridge drains and the pressure moves into the runtime's unbounded forwarding channel instead of reaching the sender. Tracked in #3981.
+That coupling holds only while the runtime answers inside the SDK's batch-result timeout, 30s. Past it the SDK stops waiting, NACKs, and polls again. The HTTP source replays its staged batch first, so the bridge does not drain while that batch keeps failing; the same batch can be queued repeatedly in the runtime's unbounded forwarding channel. Tracked in #3981.
 
 ```text
 Iggy slow -> forwarding loop blocks -> batch stays unacknowledged -> poll() stalls

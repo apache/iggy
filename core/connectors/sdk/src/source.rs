@@ -88,8 +88,10 @@ struct StopNotification {
 
 impl StopNotification {
     fn report(mut self, reason: SourceStopReason) {
-        if !self.closing.load(Ordering::Acquire)
-            && let Some(callback) = self.callback.take()
+        let callback = self.callback.take();
+        if reason != SourceStopReason::Shutdown
+            && !self.closing.load(Ordering::Acquire)
+            && let Some(callback) = callback
         {
             callback(self.plugin_id, reason as u8);
         }
@@ -106,7 +108,7 @@ impl Drop for StopNotification {
     }
 }
 
-/// Default maximum time the runtime may take to report a source batch result.
+/// Maximum time the runtime may take to report a source batch result.
 pub const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const NACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_NACK_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -165,10 +167,6 @@ pub struct BatchPolicy {
 }
 
 impl BatchPolicy {
-    pub fn result_timeout(&self) -> Duration {
-        self.result_timeout
-    }
-
     pub fn max_consecutive_nacks(&self) -> Option<NonZeroU32> {
         self.max_consecutive_nacks
     }
@@ -858,6 +856,7 @@ mod tests {
     static STOP_REASON: AtomicU32 = AtomicU32::new(0);
     static STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CLOSE_STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SHUTDOWN_STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     extern "C" fn record_stop(plugin_id: u32, reason: u8) {
         STOPPED_PLUGIN.store(plugin_id, Ordering::SeqCst);
@@ -875,6 +874,10 @@ mod tests {
 
     extern "C" fn record_close_stop(_: u32, _: u8) {
         CLOSE_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn record_shutdown_stop(_: u32, _: u8) {
+        SHUTDOWN_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
     #[test]
@@ -967,6 +970,38 @@ mod tests {
 
         assert_eq!(unsafe { container.close() }, 0);
         assert_eq!(CLOSE_STOP_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn given_shutdown_reason_without_close_should_not_notify_runtime() {
+        SHUTDOWN_STOP_COUNT.store(0, Ordering::SeqCst);
+        StopNotification {
+            plugin_id: 36,
+            callback: Some(record_shutdown_stop),
+            closing: Arc::new(AtomicBool::new(false)),
+        }
+        .report(SourceStopReason::Shutdown);
+        assert_eq!(SHUTDOWN_STOP_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn source_stop_reasons_should_keep_their_wire_bytes() {
+        for (reason, byte) in [
+            (SourceStopReason::Unexpected, 0),
+            (SourceStopReason::NackLimit, 1),
+            (SourceStopReason::BatchResultError, 2),
+            (SourceStopReason::ResultChannelClosed, 3),
+            (SourceStopReason::RegistrationFailed, 4),
+            (SourceStopReason::HandlerFailed, 5),
+            (SourceStopReason::Shutdown, 6),
+        ] {
+            assert_eq!(reason as u8, byte);
+            assert_eq!(SourceStopReason::from(byte), reason);
+        }
+        assert_eq!(
+            SourceStopReason::from(u8::MAX),
+            SourceStopReason::Unexpected
+        );
     }
 
     fn test_policy() -> BatchPolicy {

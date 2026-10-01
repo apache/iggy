@@ -334,6 +334,20 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
     fixture.store.conflict_mode.store(true, Ordering::SeqCst);
     wait_for_status(harness, ConnectorStatus::Error).await;
 
+    let version_after_conflict = fixture.store.version.load(Ordering::SeqCst);
+    let puts_after_conflict = fixture.store.put_count.load(Ordering::SeqCst);
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fixture.store.put_count.load(Ordering::SeqCst),
+        puts_after_conflict,
+        "a latched provider must not send further PUTs"
+    );
+    assert_eq!(
+        fixture.store.version.load(Ordering::SeqCst),
+        version_after_conflict,
+        "the checkpoint must not advance after a 412"
+    );
+
     let deadline = Instant::now() + WAIT_DEADLINE;
     loop {
         let source = fetch_source(harness).await;
@@ -369,20 +383,6 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
     assert_eq!(
         stats.sources_running, 0,
         "a latched source has Error status and must not count as running"
-    );
-
-    let version_after_conflict = fixture.store.version.load(Ordering::SeqCst);
-    let puts_after_conflict = fixture.store.put_count.load(Ordering::SeqCst);
-    sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        fixture.store.put_count.load(Ordering::SeqCst),
-        puts_after_conflict,
-        "a latched provider must not send further PUTs"
-    );
-    assert_eq!(
-        fixture.store.version.load(Ordering::SeqCst),
-        version_after_conflict,
-        "the checkpoint must not advance after a 412"
     );
 }
 

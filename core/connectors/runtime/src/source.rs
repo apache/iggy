@@ -1243,27 +1243,22 @@ mod tests {
         0
     }
 
-    async fn assert_start_failure(
-        register_stop_callback: Option<RegisterStopCallback>,
-        expected_reason: SourceStopReason,
-    ) {
-        let plugin_id = next_plugin_id();
-        let plugin_key = format!("source_{plugin_id}");
-        let directory = tempfile::tempdir().expect("test directory should exist");
+    async fn test_source_runtime(
+        plugin_id: u32,
+        plugin_key: &str,
+        directory: &std::path::Path,
+    ) -> (Arc<RuntimeContext>, StateStorage, IggyProducer) {
         let config_provider =
             create_connectors_config_provider(&ConnectorsConfig::Local(LocalConnectorsConfig {
-                config_dir: directory.path().display().to_string(),
+                config_dir: directory.display().to_string(),
             }))
             .await
             .expect("local config provider should initialize");
-        let state_factory = Arc::new(FileStateFactory::new(
-            directory.path().display().to_string(),
-        ));
+        let state_factory = Arc::new(FileStateFactory::new(directory.display().to_string()));
         let state_storage = state_factory
-            .storage_for(&plugin_key)
+            .storage_for(plugin_key)
             .expect("file state storage should initialize");
-        let client = IggyClient::default();
-        let producer = client
+        let producer = IggyClient::default()
             .producer("stream", "topic")
             .expect("producer builder should initialize")
             .build();
@@ -1272,8 +1267,8 @@ mod tests {
             sources: SourceManager::new(vec![SourceDetails {
                 info: SourceInfo {
                     id: plugin_id,
-                    key: plugin_key.clone(),
-                    name: plugin_key.clone(),
+                    key: plugin_key.to_string(),
+                    name: plugin_key.to_string(),
                     path: "test".to_string(),
                     version: "test".to_string(),
                     enabled: true,
@@ -1282,7 +1277,7 @@ mod tests {
                     plugin_config_format: None,
                 },
                 config: SourceConfig {
-                    key: plugin_key.clone(),
+                    key: plugin_key.to_string(),
                     ..SourceConfig::default()
                 },
                 handler_tasks: vec![],
@@ -1299,6 +1294,18 @@ mod tests {
             }),
             state_factory,
         });
+        (context, state_storage, producer)
+    }
+
+    async fn assert_start_failure(
+        register_stop_callback: Option<RegisterStopCallback>,
+        expected_reason: SourceStopReason,
+    ) {
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
 
         let tasks = spawn_source_handler(
             plugin_id,
@@ -1640,6 +1647,28 @@ mod tests {
         cleanup_sender(plugin_id);
     }
 
+    #[test]
+    fn given_old_plugin_without_stop_export_should_still_start_handle() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        start_source_polling(plugin_id, reject_source_handle_untracked, None);
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::HandlerFailed)
+        );
+        cleanup_sender(plugin_id);
+    }
+
     #[tokio::test]
     async fn given_stop_registration_failure_should_report_restart_required() {
         assert_start_failure(
@@ -1656,6 +1685,83 @@ mod tests {
             SourceStopReason::HandlerFailed,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn given_queued_batch_and_existing_error_when_stopped_should_not_process_or_recount() {
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+        let (sender, receiver) = flume::unbounded();
+        let queued = receiver.clone();
+        let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        let labels = Arc::new(SourceLabels::new(&plugin_key));
+        let forwarding = tokio::spawn(source_forwarding_loop(
+            plugin_id,
+            plugin_key.clone(),
+            false,
+            false,
+            producer,
+            Schema::Raw.encoder(),
+            vec![],
+            state_storage,
+            receiver,
+            stop_receiver,
+            ignore_batch_result,
+            Arc::clone(&context),
+            Arc::clone(&labels),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while context.metrics.get_sources_running() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarding loop should reach Running");
+        context
+            .sources
+            .set_error(&plugin_key, "prior send failure", Some(&context.metrics))
+            .await;
+        sender
+            .send(ProducedBatch {
+                id: 1,
+                messages: ProducedMessages {
+                    schema: Schema::Raw,
+                    messages: vec![],
+                    state: None,
+                },
+            })
+            .expect("batch should enter the queue");
+        stop_sender
+            .send(SourceStopReason::NackLimit)
+            .expect("stop should reach the forwarding loop");
+
+        tokio::time::timeout(Duration::from_secs(2), forwarding)
+            .await
+            .expect("forwarding loop should stop")
+            .expect("forwarding task should complete");
+        assert_eq!(queued.try_recv().expect("queued batch must remain").id, 1);
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should remain registered");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert!(
+            source
+                .info
+                .last_error
+                .as_ref()
+                .expect("stop reason should replace the prior error")
+                .message
+                .contains("NackLimit")
+        );
+        assert_eq!(context.metrics.get_sources_running(), 0);
+        assert_eq!(context.metrics.error_counter(&labels.counter).get(), 0);
     }
 
     #[test]
