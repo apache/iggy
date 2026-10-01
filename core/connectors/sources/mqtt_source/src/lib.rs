@@ -20,6 +20,7 @@ mod driver;
 use async_trait::async_trait;
 use base64::Engine;
 use humantime::Duration as HumanDuration;
+use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     source::SourceBatchResult, source_connector,
@@ -174,9 +175,42 @@ impl fmt::Debug for MqttSource {
 
 #[derive(Debug)]
 struct PendingBatch {
-    // Tokens are kept separately from ProducedMessage because the runtime
-    // acknowledges Iggy before the driver acknowledges MQTT.
+    replay_messages: Vec<ReplayMessage>,
+    schema: Schema,
+    // Tokens are kept separately because the runtime acknowledges Iggy before
+    // the driver acknowledges MQTT.
     ack_tokens: Vec<AckToken>,
+    // The SDK permits one batch in flight. A NACK leaves this false so poll()
+    // can replay the batch before reading newer MQTT messages.
+    in_flight: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayMessage {
+    headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
+    payload: Vec<u8>,
+}
+
+impl PendingBatch {
+    fn replay(&self) -> ProducedMessages {
+        ProducedMessages {
+            schema: self.schema,
+            messages: self
+                .replay_messages
+                .iter()
+                .cloned()
+                .map(|message| ProducedMessage {
+                    id: None,
+                    checksum: None,
+                    timestamp: None,
+                    origin_timestamp: None,
+                    headers: message.headers,
+                    payload: message.payload,
+                })
+                .collect(),
+            state: None,
+        }
+    }
 }
 
 impl MqttSource {
@@ -415,8 +449,15 @@ impl Source for MqttSource {
         sleep(Duration::from_millis(10)).await;
         // The SDK permits one source batch in flight. A second poll would lose
         // the association between messages, candidate state, and ACK tokens.
-        if self.pending_batch.lock().await.is_some() {
-            return Err(Error::InvalidState);
+        {
+            let mut pending_batch = self.pending_batch.lock().await;
+            if let Some(pending_batch) = pending_batch.as_mut() {
+                if pending_batch.in_flight {
+                    return Err(Error::InvalidState);
+                }
+                pending_batch.in_flight = true;
+                return Ok(pending_batch.replay());
+            }
         }
 
         let mut driver = self
@@ -435,6 +476,7 @@ impl Source for MqttSource {
         }
 
         let mut messages = Vec::with_capacity(received.len());
+        let mut replay_messages = Vec::with_capacity(received.len());
         let mut ack_tokens = Vec::with_capacity(received.len());
         for received in received {
             if self.config.verbose_logging.unwrap_or(false) {
@@ -455,6 +497,10 @@ impl Source for MqttSource {
             } else {
                 received.message.payload
             };
+            replay_messages.push(ReplayMessage {
+                headers: Some(received.message.headers.clone()),
+                payload: payload.clone(),
+            });
             messages.push(ProducedMessage {
                 id: None,
                 checksum: None,
@@ -464,32 +510,43 @@ impl Source for MqttSource {
                 payload,
             });
         }
-        *self.pending_batch.lock().await = Some(PendingBatch { ack_tokens });
+        let schema = if self.config.include_metadata {
+            Schema::Json
+        } else {
+            Schema::Raw
+        };
+        *self.pending_batch.lock().await = Some(PendingBatch {
+            replay_messages,
+            schema,
+            ack_tokens,
+            in_flight: true,
+        });
 
         Ok(ProducedMessages {
-            schema: if self.config.include_metadata {
-                Schema::Json
-            } else {
-                Schema::Raw
-            },
+            schema,
             messages,
             state: None,
         })
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
-        // A Nack means the runtime could not confirm the Iggy write. Leave the
-        // MQTT acknowledgement pending so QoS 1/2 messages can be redelivered.
-        let Some(mut pending_batch) = self.pending_batch.lock().await.take() else {
+        let mut pending_batches = self.pending_batch.lock().await;
+        let Some(pending_batch) = pending_batches.as_mut() else {
             return Ok(());
         };
         if result == SourceBatchResult::Nack {
+            pending_batch.in_flight = false;
             warn!(
-                "NACK received for MQTT source connector with ID {}; broker redelivery depends on the configured QoS",
+                "NACK received for MQTT source connector with ID {}; replaying the batch before reading new messages",
                 self.id
             );
             return Ok(());
         }
+
+        let Some(mut pending_batch) = pending_batches.take() else {
+            return Ok(());
+        };
+        drop(pending_batches);
 
         if pending_batch.ack_tokens.is_empty() {
             // QoS 0 has no broker token, so there is no broker acknowledgement
@@ -642,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn given_nack_should_discard_pending_mqtt_acknowledgements() {
+    fn given_nack_should_replay_pending_mqtt_batch() {
         let source = MqttSource::new(7, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
@@ -657,13 +714,88 @@ mod tests {
                 .ack_token
                 .expect("QoS 1 publish should have an acknowledgement token");
             *source.pending_batch.lock().await = Some(PendingBatch {
+                replay_messages: vec![ReplayMessage {
+                    headers: None,
+                    payload: b"payload".to_vec(),
+                }],
+                schema: Schema::Raw,
                 ack_tokens: vec![ack_token],
+                in_flight: true,
             });
 
             source
                 .on_batch_result(SourceBatchResult::Nack)
                 .await
                 .expect("nack should be handled");
+            assert!(
+                !source
+                    .pending_batch
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("NACKed batch should be retained")
+                    .in_flight
+            );
+
+            let replayed = source.poll().await.expect("replay poll should succeed");
+            assert_eq!(replayed.schema, Schema::Raw);
+            assert_eq!(replayed.messages.len(), 1);
+            assert_eq!(replayed.messages[0].payload, b"payload");
+            assert!(replayed.state.is_none());
+        });
+    }
+
+    #[test]
+    fn given_repeated_nack_should_replay_same_batch_before_new_messages() {
+        let source = MqttSource::new(7, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            *source.pending_batch.lock().await = Some(PendingBatch {
+                replay_messages: vec![ReplayMessage {
+                    headers: None,
+                    payload: b"payload".to_vec(),
+                }],
+                schema: Schema::Raw,
+                ack_tokens: Vec::new(),
+                in_flight: false,
+            });
+
+            let first_replay = source.poll().await.expect("first replay should succeed");
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("first replay NACK should be handled");
+            let second_replay = source.poll().await.expect("second replay should succeed");
+
+            assert_eq!(first_replay.messages.len(), second_replay.messages.len());
+            assert_eq!(
+                first_replay.messages[0].payload,
+                second_replay.messages[0].payload
+            );
+            assert!(source.pending_batch.lock().await.is_some());
+        });
+    }
+
+    #[test]
+    fn given_replayed_qos_zero_batch_when_acked_should_clear_pending_batch() {
+        let source = MqttSource::new(7, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
+        runtime.block_on(async {
+            *source.pending_batch.lock().await = Some(PendingBatch {
+                replay_messages: vec![ReplayMessage {
+                    headers: None,
+                    payload: b"payload".to_vec(),
+                }],
+                schema: Schema::Raw,
+                ack_tokens: Vec::new(),
+                in_flight: false,
+            });
+
+            source.poll().await.expect("replay should succeed");
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should clear replayed batch");
             assert!(source.pending_batch.lock().await.is_none());
         });
     }
