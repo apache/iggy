@@ -17,7 +17,7 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
-use crate::stm::authz::gated_apply;
+use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
@@ -62,6 +62,7 @@ use journal::superblock::{
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
@@ -145,10 +146,12 @@ impl IggySnapshot {
 
         let tmp_path = path.with_extension("bin.tmp");
 
-        let mut file = fs::File::create(&tmp_path).map_err(|e| SnapshotError::Persist {
-            stage: PersistStage::Write,
-            source: e,
-        })?;
+        let mut file = fs::File::create(&tmp_path)
+            .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
         file.write_all(encoded)
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Write,
@@ -177,10 +180,12 @@ impl IggySnapshot {
 
         // Fsync the parent directory to ensure the rename is durable.
         if let Some(parent) = path.parent() {
-            let dir = fs::File::open(parent).map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::DirSync,
-                source: e,
-            })?;
+            let dir = fs::File::open(parent)
+                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
+                .map_err(|e| SnapshotError::Persist {
+                    stage: PersistStage::DirSync,
+                    source: e,
+                })?;
             dir.sync_all().map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::DirSync,
                 source: e,
@@ -802,6 +807,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     ///
     /// `Cell` because every method on this type takes `&self`.
     prepare_gap_drops: Cell<u64>,
+    /// `[metadata] partitions_max`, zero for no cap. See
+    /// [`Self::admit_partitions`].
+    partitions_max: Cell<u32>,
     /// Highest metadata op whose apply has been PUBLISHED on this node, plus
     /// the reads parked on it. Shared by every shard; see
     /// [`AppliedFrontier`] for the ordering and the wake contract.
@@ -865,6 +873,7 @@ where
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
             prepare_gap_drops: Cell::new(0),
+            partitions_max: Cell::new(0),
             applied_frontier: Arc::default(),
         }
     }
@@ -1003,6 +1012,14 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// rebuilds the table, so a recovered one installed first would be lost.
     pub fn set_clients_table_max(&self, max_clients: usize) {
         self.client_table.borrow_mut().set_capacity(max_clients);
+    }
+
+    /// Cap the partitions of all streams and topics at `[metadata]
+    /// partitions_max`, zero for no cap. Only the primary checks it, with the
+    /// value of its own node, when it admits a `CreateTopic` or
+    /// `CreatePartitions`, so every node needs the same value.
+    pub fn set_partitions_max(&self, partitions_max: u32) {
+        self.partitions_max.set(partitions_max);
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -2220,6 +2237,76 @@ where
         }
     }
 
+    /// `[metadata] partitions_max` admission for a `CreateTopic` or
+    /// `CreatePartitions`. Other operations pass.
+    ///
+    /// A soft cap: the apply must not branch on node config, so this counts
+    /// the partitions this primary has committed. The creates in flight, up to
+    /// a full prepare queue and request queue of them, each pass it on their
+    /// own, so together they can overshoot it by up to 1000 partitions each.
+    ///
+    /// A body that does not decode passes here, and `prepare_request` evicts
+    /// the session for it. A create that the gated apply refuses, for a
+    /// missing target, a missing grant or a topic name already in use, also
+    /// passes, so it gets that error and not the cap's.
+    fn admit_partitions(&self, message: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
+        let partitions_max = self.partitions_max.get();
+        if partitions_max == 0 {
+            return Ok(());
+        }
+        let header = message.header();
+        let body = &message.as_slice()[size_of::<RoutedRequestHeader>()..header.size as usize];
+        let (requested, stream_id, create) = match header.operation {
+            Operation::CreateTopic => match WireCreateTopicRequest::decode_from(body) {
+                Ok(request) => (
+                    request.partitions_count,
+                    request.stream_id,
+                    PartitionsCreate::Topic { name: request.name },
+                ),
+                Err(_) => return Ok(()),
+            },
+            Operation::CreatePartitions => match WireCreatePartitionsRequest::decode_from(body) {
+                Ok(request) => (
+                    request.partitions_count,
+                    request.stream_id,
+                    PartitionsCreate::Partitions {
+                        topic_id: request.topic_id,
+                    },
+                ),
+                Err(_) => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let committed = self.mux_stm.streams().partition_count();
+        let admitted = validate_partitions_limit(partitions_max, requested, committed);
+        if admitted.is_err() {
+            let applies =
+                resolve_acting_user_id(header.operation, header.client, &self.client_table)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|user_id| {
+                        admits_partitions_create(
+                            self.mux_stm.users(),
+                            self.mux_stm.streams(),
+                            user_id,
+                            &stream_id,
+                            &create,
+                        )
+                    });
+            if !applies {
+                return Ok(());
+            }
+            warn!(
+                operation = ?header.operation,
+                partitions_max,
+                committed,
+                requested,
+                "refused a create that would take the node past metadata.partitions_max"
+            );
+        }
+        admitted
+    }
+
     /// Submit `Logout` from in-process, await commit.
     ///
     /// # Returns
@@ -2631,6 +2718,18 @@ where
         );
         if let Some(answer) = Self::answer_preflight(consensus, &request_header, outcome) {
             return answer;
+        }
+
+        // After the dedup above: a same-id replay of a create that already
+        // committed got its cached reply there, so its partitions are never
+        // counted twice.
+        if let Err(error) = self.admit_partitions(&message) {
+            return Ok(build_result_rejection_reply(
+                &request_header,
+                consensus.commit_max(),
+                error.as_code(),
+            )
+            .into_generic());
         }
 
         // Prepare queue full: backpressure, not failure. Absorb into the
@@ -4260,19 +4359,44 @@ fn unreplayable_secret_refusal(
     )
 }
 
+/// `requested` more partitions on top of the `committed` count against a
+/// nonzero `partitions_max` cap. A create of zero partitions adds nothing, so
+/// it passes also on a node already past the cap, for example after the cap
+/// was lowered.
+fn validate_partitions_limit(
+    partitions_max: u32,
+    requested: u32,
+    committed: usize,
+) -> Result<(), IggyError> {
+    if requested == 0 {
+        return Ok(());
+    }
+    let total = u64::try_from(committed)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(requested));
+    if total > u64::from(partitions_max) {
+        return Err(IggyError::PartitionsLimitReached);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::stm::StateHandler;
     use crate::stm::consumer_group::JoinConsumerGroupRequest;
     use crate::stm::stream::{Streams, StreamsInner};
-    use crate::stm::user::Users;
+    use crate::stm::user::{Users, UsersInner};
     use consensus::LocalPipeline;
     use iggy_binary_protocol::WireOptions;
+    use iggy_binary_protocol::primitives::permissions::{
+        WireGlobalPermissions, WirePermissions, WireStreamPermissions,
+    };
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_common::{IggyTimestamp, variadic};
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::{
         BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
@@ -4656,10 +4780,19 @@ mod tests {
     }
 
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {
+        create_named_topic_request(client, wire_user_id, WireIdentifier::numeric(0), "t")
+    }
+
+    fn create_named_topic_request(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+    ) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
-            stream_id: WireIdentifier::numeric(1),
+            stream_id,
             partitions_count: 1,
-            name: WireName::new("t").unwrap(),
+            name: WireName::new(name).unwrap(),
             options: WireOptions::empty(),
         }
         .to_bytes();
@@ -4879,6 +5012,250 @@ mod tests {
             Some(rejected_code),
             "a cached PAT rejection is safe to replay verbatim"
         );
+    }
+
+    /// A same-id replay of a `CreateTopic` that already committed must get its
+    /// cached reply at the partitions cap. Admitting it again would count the
+    /// committed topic's own partitions a second time and deny an op that
+    /// succeeded.
+    #[compio::test]
+    async fn given_committed_create_topic_at_partitions_cap_when_replayed_should_serve_cached_reply()
+     {
+        const CLIENT: u128 = 1;
+        const USER: u32 = TOPIC_MANAGER;
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_partitions_max(1);
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, USER, register_reply(CLIENT, 1));
+        // The commit that created the topic above cached its success.
+        metadata.client_table.borrow_mut().commit_reply(
+            CLIENT,
+            USER,
+            committed_reply(CLIENT, 1, Operation::CreateTopicWithAssignments, 0),
+        );
+
+        let replay = metadata
+            .submit_request_in_process(create_topic_request(CLIENT, USER))
+            .await
+            .expect("a replay is a reply, not a submit error");
+        assert_eq!(
+            iggy_binary_protocol::result_code(&replay.as_slice()[size_of::<ReplyHeader>()..]),
+            Some(0),
+            "the replay must get the cached success, not a cap denial"
+        );
+
+        let mut fresh = create_topic_request(CLIENT, USER);
+        bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
+            &mut fresh.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+        )
+        .request = 2;
+        let denied = metadata
+            .submit_request_in_process(fresh)
+            .await
+            .expect("a denial is a reply, not a submit error");
+        assert_eq!(
+            iggy_binary_protocol::result_code(&denied.as_slice()[size_of::<ReplyHeader>()..]),
+            Some(IggyError::PartitionsLimitReached.as_code()),
+            "a new create past the cap must be denied"
+        );
+    }
+
+    #[test]
+    fn given_no_partitions_cap_when_admitting_create_topic_should_admit() {
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+
+        assert!(
+            metadata
+                .admit_partitions(&create_topic_request(1, TOPIC_MANAGER))
+                .is_ok(),
+            "a zero partitions_max must admit a create on a node with partitions"
+        );
+    }
+
+    /// The gated apply answers a create from a user without the grant, for a
+    /// stream that does not exist, or of a topic name in use, with
+    /// `Unauthorized`, `NotFound` or `TopicNameAlreadyExists`. The cap must not
+    /// answer first, or that user could probe the cap state, and a client that
+    /// creates a topic only when it is missing would get the wrong error.
+    #[test]
+    fn given_create_topic_past_partitions_cap_when_apply_would_refuse_should_leave_it_to_apply() {
+        const UNGRANTED_CLIENT: u128 = 1;
+        const MANAGER_CLIENT: u128 = 2;
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_partitions_max(1);
+
+        metadata.client_table.borrow_mut().commit_register(
+            UNGRANTED_CLIENT,
+            UNGRANTED,
+            register_reply(UNGRANTED_CLIENT, 1),
+        );
+        assert!(
+            metadata
+                .admit_partitions(&create_topic_request(UNGRANTED_CLIENT, UNGRANTED))
+                .is_ok(),
+            "a user without create_topic must get Unauthorized from apply"
+        );
+
+        metadata.client_table.borrow_mut().commit_register(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            register_reply(MANAGER_CLIENT, 1),
+        );
+        let missing_stream = create_named_topic_request(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            WireIdentifier::numeric(9),
+            "t",
+        );
+        assert!(
+            metadata.admit_partitions(&missing_stream).is_ok(),
+            "a create for a missing stream must get NotFound from apply"
+        );
+
+        let taken_name = create_named_topic_request(
+            MANAGER_CLIENT,
+            TOPIC_MANAGER,
+            WireIdentifier::numeric(0),
+            "existing",
+        );
+        assert!(
+            metadata.admit_partitions(&taken_name).is_ok(),
+            "a create of a topic name in use must get TopicNameAlreadyExists from apply"
+        );
+
+        assert!(
+            matches!(
+                metadata.admit_partitions(&create_topic_request(MANAGER_CLIENT, TOPIC_MANAGER)),
+                Err(IggyError::PartitionsLimitReached)
+            ),
+            "a create that apply would carry out is denied at the cap"
+        );
+    }
+
+    /// Slab ids of `users_with_topic_manager`: root takes 0.
+    const TOPIC_MANAGER: u32 = 1;
+    const UNGRANTED: u32 = 2;
+
+    /// Root, then `TOPIC_MANAGER` with `manage_topics` on stream 0, then
+    /// `UNGRANTED` with no permissions.
+    fn users_with_topic_manager() -> Users {
+        let mut inner = UsersInner::new();
+        let timestamp = IggyTimestamp::now();
+        let no_grants = WireGlobalPermissions {
+            manage_servers: false,
+            read_servers: false,
+            manage_users: false,
+            read_users: false,
+            manage_streams: false,
+            read_streams: false,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: false,
+            send_messages: false,
+        };
+        for (username, streams) in [
+            ("iggy", Vec::new()),
+            (
+                "manager",
+                vec![WireStreamPermissions {
+                    stream_id: 0,
+                    manage_stream: false,
+                    read_stream: false,
+                    manage_topics: true,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                    topics: Vec::new(),
+                }],
+            ),
+            ("ungranted", Vec::new()),
+        ] {
+            let reply = StateHandler::apply(
+                &CreateUserRequest {
+                    username: WireName::new(username).unwrap(),
+                    password: "hash".to_string(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: Some(WirePermissions {
+                        global: no_grants.clone(),
+                        streams,
+                    }),
+                    options: WireOptions::empty(),
+                },
+                &mut inner,
+                timestamp,
+            );
+            assert_eq!(reply.code, 0, "fixture user {username} must be created");
+        }
+        inner.into()
+    }
+
+    /// Stream 0 holding one topic with one partition.
+    fn stream_with_one_partition() -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        let timestamp = IggyTimestamp::now();
+        let _ = StateHandler::apply(
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            },
+            &mut inner,
+            timestamp,
+        );
+        let _ = StateHandler::apply(
+            &PersistedCreateTopicRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("existing").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                created_view: 0,
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                }],
+            },
+            &mut inner,
+            timestamp,
+        );
+        inner
+    }
+
+    #[test]
+    fn given_zero_partitions_create_past_partitions_cap_when_validating_should_admit() {
+        assert!(validate_partitions_limit(10, 0, 12).is_ok());
+    }
+
+    #[test]
+    fn given_create_reaching_partitions_cap_when_validating_should_admit() {
+        assert!(validate_partitions_limit(10, 4, 6).is_ok());
+    }
+
+    #[test]
+    fn given_create_past_partitions_cap_when_validating_should_deny() {
+        assert!(matches!(
+            validate_partitions_limit(10, 5, 6),
+            Err(IggyError::PartitionsLimitReached)
+        ));
+        assert!(matches!(
+            validate_partitions_limit(10, 1, 10),
+            Err(IggyError::PartitionsLimitReached)
+        ));
     }
 
     /// Committed-reply fixture shaped like the commit path's output: a result

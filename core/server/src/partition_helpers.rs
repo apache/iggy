@@ -51,6 +51,7 @@ use partitions::{
     create_partition_file_hierarchy, ensure_initial_segment, hydrate_partition_log,
     load_persisted_segments, load_persisted_segments_with_checkpoint,
 };
+use server_common::fatal::is_descriptor_exhaustion;
 use server_common::sharding::IggyNamespace;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -339,6 +340,17 @@ pub async fn load_partition_or_fence(
             ))
             .await
             .map(Some)
+        }
+        // No free file descriptor says nothing about the record, so the load
+        // fails like any other, and a tombstone would keep the group dark after
+        // descriptors free up. At boot the error stops the server with exit
+        // status 4, because the superblock read notes it. Later, the reconciler
+        // retries the load with backoff.
+        Err(error)
+            if matches!(&error, ServerError::PartitionSuperblockIo { source, .. }
+                if is_descriptor_exhaustion(source)) =>
+        {
+            Err(error)
         }
         // An untrustworthy superblock fences ONE group, not the node. The
         // segment files stay exactly where they are -- unlike a refused

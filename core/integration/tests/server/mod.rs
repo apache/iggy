@@ -76,8 +76,13 @@ mod partition_view_durability_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;
+// The node-wide cap on client sockets closes a socket past it at accept.
+mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
+// A write that runs out of file descriptors flushes, then exits with status 4.
+mod descriptor_exhaustion_vsr;
 mod general;
+mod partitions_limit_vsr;
 // The per-shard segment cleaner deletes expired / oversize segments from disk.
 mod message_cleanup;
 mod message_retrieval;

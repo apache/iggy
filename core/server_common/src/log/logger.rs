@@ -16,7 +16,9 @@
 // under the License.
 
 use super::runtime::CompioRuntime;
-use super::settings::{LoggingSettings, TelemetrySettings, TelemetryTransport};
+use super::settings::{
+    LogFilter, LogFilterError, LoggingSettings, TelemetrySettings, TelemetryTransport,
+};
 use iggy_common::{IggyByteSize, IggyDuration};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -43,7 +45,7 @@ use tracing_subscriber::fmt::format::DefaultVisitor;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{
-    EnvFilter, Layer, Registry, filter::LevelFilter, fmt, fmt::MakeWriter, fmt::format::Format,
+    EnvFilter, Layer, Registry, fmt, fmt::MakeWriter, fmt::format::Format, layer::Identity,
     layer::Layered, reload, reload::Handle,
 };
 
@@ -60,6 +62,9 @@ pub enum LogError {
 
     #[error("Logging file reload failure")]
     FileReloadFailure,
+
+    #[error("Invalid logging level: {0}")]
+    InvalidLevel(#[from] LogFilterError),
 }
 
 // Writer that does nothing
@@ -175,7 +180,7 @@ impl Logging {
         // - EnvFilter: Applied FIRST via .with() to filter all subsequent layers
         // - Stdout layer: writes to NullWriter (discarded), replaced with real stdout in late_init
         // - File layer: writes to in-memory buffer, replaced with rolling file in late_init
-        // - Telemetry layers: no-op placeholders (LevelFilter::OFF), replaced if telemetry enabled
+        // - Telemetry layers: no-op placeholders, replaced if telemetry enabled
         //
         // EnvFilter MUST be applied first. All subsequent layers are typed for FilteredRegistry.
         // This ensures the filter is evaluated before any output layer processes events.
@@ -190,14 +195,13 @@ impl Logging {
         // All output layers are typed for FilteredRegistry (Registry + EnvFilter)
         let mut layers: Vec<Box<dyn Layer<FilteredRegistry> + Send + Sync>> = vec![];
 
-        // Telemetry layers - no-op placeholders (LevelFilter::OFF) replaced in late_init if enabled
-        let (otel_logs_layer, otel_logs_reload_handle) =
-            reload::Layer::new(LevelFilter::OFF.boxed());
+        // Telemetry layers - no-op placeholders replaced in late_init if enabled
+        let (otel_logs_layer, otel_logs_reload_handle) = reload::Layer::new(Self::inactive_layer());
         self.otel_logs_reload_handle = Some(otel_logs_reload_handle);
         layers.push(Box::new(otel_logs_layer));
 
         let (otel_traces_layer, otel_traces_reload_handle) =
-            reload::Layer::new(LevelFilter::OFF.boxed());
+            reload::Layer::new(Self::inactive_layer());
         self.otel_traces_reload_handle = Some(otel_traces_reload_handle);
         layers.push(Box::new(otel_traces_layer));
 
@@ -244,7 +248,7 @@ impl Logging {
             std::env::var("RUST_LOG").unwrap()
         } else {
             // Use config level as EnvFilter directive
-            let env_filter = EnvFilter::new(&config.level);
+            let env_filter: EnvFilter = config.level.parse::<LogFilter>()?.into();
             self.env_filter_reload_handle
                 .as_ref()
                 .ok_or(LogError::FilterReloadFailure)?
@@ -271,13 +275,8 @@ impl Logging {
         self.dump_to_stdout();
 
         // Initialize file logging if enabled
-        let logs_path = if config.file_enabled {
-            let base_directory = PathBuf::from(base_directory);
-            let logs_subdirectory = PathBuf::from(config.path.clone());
-            let logs_subdirectory = logs_subdirectory
-                .canonicalize()
-                .unwrap_or(logs_subdirectory);
-            let logs_path = base_directory.join(logs_subdirectory);
+        let (file_layer, logs_path) = if config.file_enabled {
+            let logs_path = PathBuf::from(base_directory).join(&config.path);
 
             if let Err(e) = fs::create_dir_all(&logs_path) {
                 warn!("Failed to create logs directory {logs_path:?}: {e}");
@@ -297,21 +296,9 @@ impl Logging {
             }
 
             let max_files = Self::calculate_max_files(config.max_total_size, config.max_file_size);
-
-            // If max_file_size == 0, then keep interpreting behavior as same
-            // as fn IggyByteSize::as_human_string_with_zero_as_unlimited do.
-            // This will cover all log rotations if expecting unlimited.
-            let mut condition_builder = RollingConditionBasic::new();
-            let max_file_size_bytes = config.max_file_size.as_bytes_u64();
-
-            if max_file_size_bytes != 0 {
-                condition_builder = condition_builder.max_size(max_file_size_bytes).hourly();
-            }
-            let condition = condition_builder;
-
             let file_appender = BasicRollingFileAppender::new(
                 logs_path.join(IGGY_LOG_FILE_PREFIX),
-                condition,
+                Self::rolling_condition(config.max_file_size),
                 max_files,
             )
             .map_err(|e| {
@@ -332,16 +319,17 @@ impl Logging {
                 .boxed();
 
             self.file_guard = Some(file_guard);
-            self.file_reload_handle
-                .as_ref()
-                .ok_or(LogError::FileReloadFailure)?
-                .modify(|layer| *layer = file_layer)
-                .expect("Failed to modify file layer");
-
-            Some(logs_path)
+            (file_layer, Some(logs_path))
         } else {
-            None
+            (Self::inactive_layer(), None)
         };
+        self.file_reload_handle
+            .as_ref()
+            .ok_or(LogError::FileReloadFailure)?
+            .modify(|layer| *layer = file_layer)
+            .expect("Failed to modify file layer");
+        // Both dumps are done and the early layer is replaced, so free its lines.
+        *self.early_logs_buffer.lock().unwrap() = Vec::new();
 
         // Initialize telemetry if enabled
         if telemetry_config.enabled {
@@ -463,6 +451,14 @@ impl Logging {
         Format::default().with_thread_names(true)
     }
 
+    /// Stands in for an output that is off. It must enable every event: the
+    /// `Vec` of output layers enables an event only when all of its layers do,
+    /// so a disabling placeholder such as `LevelFilter::OFF` drops the events
+    /// that a `[span]` directive in the filter enables.
+    fn inactive_layer() -> Box<dyn Layer<FilteredRegistry> + Send + Sync> {
+        Identity::new().boxed()
+    }
+
     fn calculate_max_files(
         max_total_size_bytes: IggyByteSize,
         max_file_size_bytes: IggyByteSize,
@@ -477,6 +473,17 @@ impl Logging {
             let max_files =
                 max_total_size_bytes.as_bytes_u64() / max_file_size_bytes.as_bytes_u64();
             max_files.clamp(1, ONE_HUNDRED_THOUSAND) as usize
+        }
+    }
+
+    /// Rotates on size only. A time trigger fills the `max_files` archive
+    /// slots with small files and deletes logs long before `retention` ends.
+    /// A zero `max_file_size` never rotates.
+    fn rolling_condition(max_file_size: IggyByteSize) -> RollingConditionBasic {
+        let condition = RollingConditionBasic::new();
+        match max_file_size.as_bytes_u64() {
+            0 => condition,
+            max_size => condition.max_size(max_size),
         }
     }
 
@@ -635,7 +642,8 @@ impl Logging {
         let mut removed_files_count = 0;
         let cutoff = if !retention.is_zero() {
             match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(now) => Some(now - retention.get_duration()),
+                // A retention longer than the time since the epoch expires nothing.
+                Ok(now) => now.checked_sub(retention.get_duration()),
                 Err(e) => {
                     warn!("Failed to get current time: {e}");
                     return;
@@ -781,30 +789,15 @@ impl<'writer> FormatFields<'writer> for NoAnsiFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::TelemetryEndpointSettings;
+    use chrono::{Local, TimeDelta};
+    use rolling_file::RollingCondition;
+    use std::fs::File;
+    use std::path::Path;
     use tempfile::TempDir;
+    use tracing::info_span;
 
-    #[test]
-    fn test_log_directory_creation() {
-        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let base_path = temp_dir.path().to_str().unwrap().to_string();
-        let log_subdir = "test_logs".to_string();
-
-        let log_path = PathBuf::from(&base_path).join(&log_subdir);
-        assert!(!log_path.exists());
-        fs::create_dir_all(&log_path).expect("Failed to create log directory");
-        assert!(log_path.exists());
-    }
-
-    #[test]
-    fn test_disk_space_check() {
-        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let log_path = temp_dir.path();
-        let result = fs2::available_space(log_path);
-        assert!(result.is_ok());
-
-        let available_space = result.unwrap();
-        assert!(available_space > 0);
-    }
+    const HOUR: Duration = Duration::from_secs(3600);
 
     #[test]
     fn test_calculate_max_files() {
@@ -842,23 +835,180 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_log_files_functions() {
-        use std::time::Duration;
-        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let log_path = temp_dir.path().to_path_buf();
-        Logging::cleanup_log_files(
-            &log_path,
-            IggyDuration::new(Duration::from_secs(3600)),
-            IggyByteSize::from(2048 * 1024),
-            IggyByteSize::from(512 * 1024),
+    fn given_max_file_size_when_hours_pass_should_rotate_only_on_size() {
+        let mut condition = Logging::rolling_condition(IggyByteSize::from(1_000));
+        let start = Local::now();
+        let two_hours_later = start + TimeDelta::hours(2);
+
+        assert!(!condition.should_rollover(&start, 0));
+        assert!(
+            !condition.should_rollover(&two_hours_later, 999),
+            "rotated on time while the file is below max_file_size"
         );
+        assert!(condition.should_rollover(&two_hours_later, 1_000));
     }
 
     #[test]
-    fn test_logging_creation() {
-        let logging = Logging::new("0.0.0-test");
-        assert!(logging.stdout_guard.is_none());
-        assert!(logging.file_guard.is_none());
-        assert!(logging.env_filter_reload_handle.is_none());
+    fn given_retention_when_cleaning_should_delete_only_expired_archives() {
+        let logs = TempDir::new().expect("create logs directory");
+        let active = create_log_file(logs.path(), IGGY_LOG_FILE_PREFIX, 1, 2 * HOUR);
+        let expired = create_log_file(logs.path(), &archive_name(2), 1, 2 * HOUR);
+        let recent = create_log_file(logs.path(), &archive_name(1), 1, Duration::ZERO);
+        let unrelated = create_log_file(logs.path(), "notes.txt", 1, 2 * HOUR);
+
+        Logging::cleanup_log_files(
+            &logs.path().to_path_buf(),
+            IggyDuration::new(HOUR),
+            IggyByteSize::from(0),
+            IggyByteSize::from(0),
+        );
+
+        assert!(!expired.exists(), "the expired archive was kept");
+        for kept in [&active, &recent, &unrelated] {
+            assert!(kept.exists(), "{} was deleted", kept.display());
+        }
+    }
+
+    #[test]
+    fn given_retention_that_never_expires_when_cleaning_should_keep_old_archives() {
+        const LONGER_THAN_SINCE_EPOCH: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+        for retention in [Duration::ZERO, LONGER_THAN_SINCE_EPOCH] {
+            let logs = TempDir::new().expect("create logs directory");
+            let archive = create_log_file(logs.path(), &archive_name(1), 1, 2 * HOUR);
+
+            Logging::cleanup_log_files(
+                &logs.path().to_path_buf(),
+                IggyDuration::new(retention),
+                IggyByteSize::from(0),
+                IggyByteSize::from(0),
+            );
+
+            assert!(
+                archive.exists(),
+                "retention {retention:?} deleted an archive"
+            );
+        }
+    }
+
+    #[test]
+    fn given_archives_over_total_size_when_cleaning_should_delete_oldest_first() {
+        let logs = TempDir::new().expect("create logs directory");
+        let minute = Duration::from_secs(60);
+        let active = create_log_file(logs.path(), IGGY_LOG_FILE_PREFIX, 100, Duration::ZERO);
+        let newest = create_log_file(logs.path(), &archive_name(1), 100, minute);
+        let middle = create_log_file(logs.path(), &archive_name(2), 100, 2 * minute);
+        let oldest = create_log_file(logs.path(), &archive_name(3), 100, 3 * minute);
+
+        // The active file does not count, so deleting the oldest archive is enough.
+        Logging::cleanup_log_files(
+            &logs.path().to_path_buf(),
+            IggyDuration::new(Duration::ZERO),
+            IggyByteSize::from(250),
+            IggyByteSize::from(100),
+        );
+
+        assert!(!oldest.exists(), "the oldest archive was kept");
+        for kept in [&active, &newest, &middle] {
+            assert!(kept.exists(), "{} was deleted", kept.display());
+        }
+    }
+
+    #[test]
+    fn given_span_directive_when_event_is_inside_span_should_reach_outputs() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let filter: EnvFilter = "warn,[probe]=info"
+            .parse::<LogFilter>()
+            .expect("valid filter")
+            .into();
+        let (filter_layer, _filter_handle) = reload::Layer::new(filter);
+        let outputs: Vec<Box<dyn Layer<FilteredRegistry> + Send + Sync>> = vec![
+            Logging::inactive_layer(),
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(VecStringMakeWriter(captured.clone()))
+                .boxed(),
+        ];
+        let subscriber = Registry::default().with(filter_layer).with(outputs);
+
+        tracing::subscriber::with_default(subscriber, || {
+            info_span!("probe").in_scope(|| info!("inside the span"));
+            info!("outside the span");
+        });
+
+        let lines = captured.lock().unwrap().concat();
+        assert!(
+            lines.contains("inside the span"),
+            "the span directive was dropped: {lines:?}"
+        );
+        assert!(
+            !lines.contains("outside the span"),
+            "the warn default was ignored: {lines:?}"
+        );
+    }
+
+    // The only test here that calls `early_init`: it installs the process-wide subscriber.
+    #[test]
+    fn given_file_output_disabled_when_logging_after_late_init_should_not_buffer_lines() {
+        let mut logging = Logging::new("0.0.0-test");
+        logging.early_init();
+        error!("line before late_init");
+        assert!(
+            !logging.early_logs_buffer.lock().unwrap().is_empty(),
+            "the early layer did not capture the probe line; RUST_LOG may filter it out"
+        );
+
+        logging
+            .late_init(
+                String::new(),
+                &file_disabled_settings(),
+                &telemetry_disabled_settings(),
+            )
+            .expect("late_init");
+        error!("line after late_init");
+
+        let buffered = logging.early_logs_buffer.lock().unwrap();
+        assert!(
+            buffered.is_empty(),
+            "the early buffer still holds {} lines",
+            buffered.len()
+        );
+    }
+
+    fn archive_name(index: usize) -> String {
+        format!("{IGGY_LOG_FILE_PREFIX}.{index}")
+    }
+
+    fn create_log_file(directory: &Path, name: &str, size: u64, age: Duration) -> PathBuf {
+        let path = directory.join(name);
+        let file = File::create(&path).expect("create log file");
+        file.set_len(size).expect("size log file");
+        file.set_modified(SystemTime::now() - age)
+            .expect("age log file");
+        path
+    }
+
+    fn file_disabled_settings() -> LoggingSettings {
+        LoggingSettings {
+            path: "logs".to_owned(),
+            level: "info".to_owned(),
+            file_enabled: false,
+            max_file_size: IggyByteSize::from(0),
+            max_total_size: IggyByteSize::from(0),
+            rotation_check_interval: IggyDuration::new(HOUR),
+            retention: IggyDuration::new(Duration::ZERO),
+        }
+    }
+
+    fn telemetry_disabled_settings() -> TelemetrySettings {
+        let endpoint = TelemetryEndpointSettings {
+            transport: TelemetryTransport::HTTP,
+            endpoint: String::new(),
+        };
+        TelemetrySettings {
+            enabled: false,
+            service_name: String::new(),
+            logs: endpoint.clone(),
+            traces: endpoint,
+        }
     }
 }

@@ -135,7 +135,7 @@ impl FromRequestParts<HttpState> for Identity {
         let client_ip = parts
             .extensions
             .get::<ConnectInfo<ClientAddr>>()
-            .map(|ConnectInfo(address)| address.0.ip());
+            .map(|ConnectInfo(address)| address.addr.ip());
         if client_ip.is_none() {
             debug!(
                 path = parts.uri.path(),
