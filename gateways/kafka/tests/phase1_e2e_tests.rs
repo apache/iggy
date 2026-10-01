@@ -160,6 +160,43 @@ fn decode_metadata_response(body: Bytes) -> (i16, i16, i32, Vec<i32>, i32, Optio
     )
 }
 
+fn assert_metadata_response(body: Bytes, gateway_addr: SocketAddr) {
+    let (
+        error_code,
+        partition_error_code,
+        leader_id,
+        node_ids,
+        controller_id,
+        broker_host,
+        broker_port,
+    ) = decode_metadata_response(body);
+    assert_eq!(error_code, ERROR_NONE, "Metadata must report the new topic");
+    assert_eq!(
+        partition_error_code, ERROR_NONE,
+        "the single partition must report no error"
+    );
+    assert_eq!(leader_id, 1, "this gateway is the sole broker");
+    assert!(
+        node_ids.contains(&leader_id),
+        "leader_id {leader_id} must name a broker actually present in the brokers array \
+         {node_ids:?} - a real client cannot route to a leader it was never told about"
+    );
+    assert_eq!(
+        controller_id, 1,
+        "single-broker cluster: the controller is the same broker"
+    );
+    assert_eq!(
+        broker_host.as_deref(),
+        Some(gateway_addr.ip().to_string().as_str()),
+        "Metadata must advertise the address a client can actually reach this gateway on"
+    );
+    assert_eq!(
+        broker_port,
+        i32::from(gateway_addr.port()),
+        "Metadata must advertise the port this gateway is actually listening on"
+    );
+}
+
 fn record(offset: i64, value: &[u8]) -> Record {
     Record {
         transactional: false,
@@ -279,40 +316,7 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
     )
     .await;
     assert_eq!(corr, 2, "correlation id must echo the request");
-    let (
-        error_code,
-        partition_error_code,
-        leader_id,
-        node_ids,
-        controller_id,
-        broker_host,
-        broker_port,
-    ) = decode_metadata_response(body);
-    assert_eq!(error_code, ERROR_NONE, "Metadata must report the new topic");
-    assert_eq!(
-        partition_error_code, ERROR_NONE,
-        "the single partition must report no error"
-    );
-    assert_eq!(leader_id, 1, "this gateway is the sole broker");
-    assert!(
-        node_ids.contains(&leader_id),
-        "leader_id {leader_id} must name a broker actually present in the brokers array \
-         {node_ids:?} - a real client cannot route to a leader it was never told about"
-    );
-    assert_eq!(
-        controller_id, 1,
-        "single-broker cluster: the controller is the same broker"
-    );
-    assert_eq!(
-        broker_host.as_deref(),
-        Some(addr.ip().to_string().as_str()),
-        "Metadata must advertise the address a client can actually reach this gateway on"
-    );
-    assert_eq!(
-        broker_port,
-        i32::from(addr.port()),
-        "Metadata must advertise the port this gateway is actually listening on"
-    );
+    assert_metadata_response(body, addr);
 
     let records = [record(0, b"phase1-hello"), record(1, b"phase1-world")];
     let (corr, body) = round_trip(
@@ -341,8 +345,8 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
     assert_eq!(error_code, ERROR_NONE, "ListOffsets must succeed");
     assert_eq!(offset, 2, "high watermark after two produced records");
 
-    // Read the produced records back through the Iggy SDK directly, since #3536 (Fetch) does not
-    // exist yet - this is the only client-visible way to confirm the bytes actually landed.
+    // Read the produced records back through the Iggy SDK directly rather than a real Kafka
+    // Fetch - see this file's module doc for why (Fetch itself is implemented).
     let raw = raw_client(&server).await;
     let polled = raw
         .poll_messages(

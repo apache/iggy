@@ -180,14 +180,11 @@ impl PortGuard {
             else {
                 continue;
             };
-            if file.try_lock().is_ok() {
-                if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                    return Self { port, _lock: file };
-                }
-                // A stale listener (not another PortGuard user, the flock already excludes
-                // those) is still holding this port - skip it, leave the lock file for the
-                // next acquire to try again, keep scanning.
-                continue;
+            // A stale listener (not another PortGuard user, the flock already excludes those)
+            // can still hold this port - skip it on a failed bind, leave the lock file for the
+            // next acquire to try again, keep scanning.
+            if file.try_lock().is_ok() && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return Self { port, _lock: file };
             }
         }
         panic!(
