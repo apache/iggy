@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp.vsr;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 
 import java.security.SecureRandom;
@@ -29,12 +30,15 @@ import java.security.SecureRandom;
  *
  * <p>The (client id, request id) pair is the server's dedup key for
  * replicated operations, and the session value is the fence epoch of the
- * latest committed {@code Register}. None of these are bearer tokens; auth
- * is bound to the transport connection server-side.
+ * latest committed {@code Register}. The bind secret is a bearer credential
+ * that authenticates another connection to this identity. Keep it private to
+ * the client and never log or expose it.
  */
 public final class ConsensusSession {
 
+    static final int BIND_SECRET_BYTES = 32;
     private static final SecureRandom RANDOM = new SecureRandom();
+    private final byte[] bindSecret = new byte[BIND_SECRET_BYTES];
 
     private long clientIdLow;
     private long clientIdHigh;
@@ -44,6 +48,7 @@ public final class ConsensusSession {
     private boolean registerConsumed;
     private long generation;
     private long metadataWatermark;
+    private boolean shared;
 
     public ConsensusSession() {
         regenerateClientId();
@@ -66,6 +71,7 @@ public final class ConsensusSession {
      */
     synchronized long beginRegister() {
         if (registerConsumed || session != null) {
+            generation++;
             regenerateClientId();
             session = null;
         }
@@ -75,8 +81,8 @@ public final class ConsensusSession {
 
     /** Binds the fence epoch returned by a committed Register reply. */
     synchronized void bind(long sessionEpoch) {
-        if (sessionEpoch <= 0) {
-            throw new IllegalStateException("Register reply carried a non-positive session epoch: " + sessionEpoch);
+        if (sessionEpoch == 0) {
+            throw new IllegalStateException("Register reply carried a zero session epoch");
         }
         this.session = sessionEpoch;
         generation++;
@@ -137,6 +143,36 @@ public final class ConsensusSession {
         generation++;
     }
 
+    public synchronized byte[] bindSecret() {
+        return bindSecret.clone();
+    }
+
+    public synchronized byte[] bindSecret(long clientLow, long clientHigh, long epoch) {
+        if (session == null || session != epoch || clientIdLow != clientLow || clientIdHigh != clientHigh) {
+            throw new IggyNotConnectedException("Poll attachment no longer belongs to the parent session");
+        }
+        return bindSecret.clone();
+    }
+
+    /** Uses a parent identity for BindSession and non-replicated requests only. */
+    public synchronized void bindShared(long clientLow, long clientHigh, long epoch, byte[] secret) {
+        if ((clientLow == 0 && clientHigh == 0) || epoch == 0 || secret == null || secret.length != BIND_SECRET_BYTES) {
+            throw new IggyInvalidArgumentException("Shared session requires a nonzero client, a nonzero epoch and a "
+                    + BIND_SECRET_BYTES + "-byte bind secret");
+        }
+        bind(epoch);
+        clientIdLow = clientLow;
+        clientIdHigh = clientHigh;
+        System.arraycopy(secret, 0, bindSecret, 0, BIND_SECRET_BYTES);
+        shared = true;
+    }
+
+    synchronized void onChannelCreated() {
+        if (shared) {
+            generation++;
+        }
+    }
+
     public synchronized long generation() {
         return generation;
     }
@@ -160,6 +196,7 @@ public final class ConsensusSession {
     }
 
     private void regenerateClientId() {
+        RANDOM.nextBytes(bindSecret);
         do {
             clientIdLow = RANDOM.nextLong();
             clientIdHigh = RANDOM.nextLong();

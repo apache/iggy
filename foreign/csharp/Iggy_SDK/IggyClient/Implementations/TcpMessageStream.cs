@@ -699,7 +699,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         await SendAckAsync(CommandCodes.UPDATE_USER_CODE, message, token);
         if (userName is not null)
         {
-            RefreshPollCredentials(userId, userName, null);
+            RefreshRememberedCredentials(userId, userName, null);
         }
     }
 
@@ -717,7 +717,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
         await SendAckAsync(CommandCodes.CHANGE_PASSWORD_CODE, message, token);
-        RefreshPollCredentials(userId, null, newPassword);
+        RefreshRememberedCredentials(userId, null, newPassword);
     }
 
     /// <inheritdoc />
@@ -729,7 +729,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
 
         var identity = await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_CODE,
-            LoginRegister.Serialize(userName, password), token);
+            LoginRegister.Serialize(userName, password, LoginRegister.CreateBindSecret()), token);
         _rememberedLogin = new AutoLoginSettings
         {
             Enabled = true,
@@ -808,7 +808,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     public async Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default)
     {
         var identity = await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
-            LoginRegister.SerializeWithPersonalAccessToken(token), ct);
+            LoginRegister.SerializeWithPersonalAccessToken(token, LoginRegister.CreateBindSecret()), ct);
         _rememberedLogin = new AutoLoginSettings { Enabled = true, PersonalAccessToken = token };
         _rememberedUserId = identity?.UserId;
 

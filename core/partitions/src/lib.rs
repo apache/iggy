@@ -108,6 +108,12 @@ pub type RetainedPartitionLog =
 #[cfg(any(test, feature = "simulator"))]
 pub struct RetainedPartitionState {
     pub log: RetainedPartitionLog,
+    pub head_op: u64,
+    pub applied_op: u64,
+    pub prepare_checksum: u128,
+    pub retry_capacity: Option<usize>,
+    pub retry_protection: Vec<consensus::DedupWatermark>,
+    pub required_metadata_frontier: u64,
     /// Offset counter the previous incarnation had proved durable.
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.

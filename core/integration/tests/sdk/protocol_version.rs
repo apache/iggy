@@ -26,6 +26,7 @@ use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireName,
 };
@@ -37,6 +38,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 // Wire bytes pinned to `EvictionReason` discriminants in `consensus::header`.
+const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
+
 const EVICTION_REASON_INCOMPATIBLE_PROTOCOL: u8 = 14;
 const EVICTION_REASON_MALFORMED_LOGIN: u8 = 15;
 
@@ -53,6 +56,7 @@ async fn given_incompatible_protocol_version_when_logging_in_should_receive_evic
         username: WireName::new(DEFAULT_ROOT_USERNAME).unwrap(),
         password: SecretString::from(DEFAULT_ROOT_PASSWORD),
         client_context: None,
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
     }
     .to_bytes();
 

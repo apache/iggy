@@ -777,6 +777,13 @@ async fn reconcile_additions(
                 ctx.cluster_id,
                 ctx.self_replica_id,
                 ctx.replica_count,
+                created_revision
+                    > ctx
+                        .shard
+                        .plane
+                        .metadata()
+                        .applied_frontier()
+                        .recovered_revision(),
                 Rc::clone(&ctx.shard.bus),
                 partitions,
             )
@@ -792,6 +799,13 @@ async fn reconcile_additions(
                 ctx.cluster_id,
                 ctx.self_replica_id,
                 ctx.replica_count,
+                created_revision
+                    > ctx
+                        .shard
+                        .plane
+                        .metadata()
+                        .applied_frontier()
+                        .recovered_revision(),
                 created_view,
                 Rc::clone(&ctx.shard.bus),
             )
@@ -1497,10 +1511,9 @@ mod tests {
         PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
-        RequestPreparesHeader, RoutedRequestHeader, WireIdentifier, WireOptions,
+        AckLevel, Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestPreparesHeader, RoutedRequestHeader, WireConsumer, WireIdentifier, WireOptions,
     };
-    use journal::Journal;
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
     use metadata::MuxStateMachine;
@@ -1570,6 +1583,7 @@ mod tests {
         header.size = u32::try_from(total_size).expect("prepare size fits u32");
         header.op = op;
         header.operation = operation;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
         msg
     }
 
@@ -2314,6 +2328,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            true,
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -2345,17 +2360,15 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            true,
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
-        .await
-        .expect("redundant build succeeds over the live incarnation's path");
-        ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
-            namespace: ns,
-            partition: Box::new(redundant),
-            epoch: LIVE_EPOCH + 1,
-        });
-        ctx.shard.apply_reconcile_ops();
+        .await;
+        assert!(
+            redundant.is_err(),
+            "the live WAL must retain its exclusive writer"
+        );
 
         assert_eq!(
             shard.plane.partitions().len(),
@@ -3175,42 +3188,76 @@ mod tests {
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
-        let served = CreateStreamRequest {
-            name: WireName::new("served-op").expect("test stream name fits WireName"),
-            options: WireOptions::empty(),
+        let served = iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::NoAck,
         };
         {
             let partitions = shard.plane.partitions();
             let partition = partitions
                 .get_mut_by_ns(&ns)
                 .expect("partition is materialised");
-            // Ops 5..=7 committed and evicted after the request went out, op 8
-            // is the served remainder, and the window's first batch sits above
-            // the boot-recovered durable end.
-            partition.consensus().restore_commit_state(7, 8);
-            partition.recovered_durable_offset = Some(10);
-            partition
-                .log
-                .journal()
-                .inner
-                .append(build_prepare(8, Operation::CreateStream, &served).into_frozen())
-                .await
-                .expect("journal the served op");
             partition.repair = Some(RepairSession {
                 nonce: NONCE,
                 view: 0,
                 commit_to_op: 8,
                 fetch_to_op: 8,
-                floor: Some(5),
+                floor: None,
                 peer: 1,
-                first_batch_offset: Some(20),
+                first_batch_offset: None,
                 idle_ticks: 0,
             });
+            for op in 1..=8 {
+                let parent = partition.consensus().last_prepare_checksum();
+                let group = partition.consensus().group();
+                let cluster = partition.consensus().cluster();
+                let prepare = build_prepare(op, Operation::StoreConsumerOffset, &served)
+                    .transmute_header(|old, header| {
+                        *header = old;
+                        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                        header.session = 1;
+                        header.request = op;
+                        header.parent = parent;
+                        header.group = group;
+                        header.cluster = cluster;
+                        header.checksum = header.identity_checksum();
+                    });
+                partition.apply_repaired_prepare(prepare).await;
+                if op < 8 {
+                    partition.consensus().advance_commit_max(op);
+                    partition.commit_journal(partitions.config()).await;
+                }
+            }
+            assert_eq!(partition.consensus().commit_min(), 7);
+            partition.consensus().advance_commit_max(8);
+            partition.recovered_durable_offset = Some(10);
+            let repair = partition.repair.as_mut().expect("repair remains armed");
+            repair.floor = Some(5);
+            repair.first_batch_offset = Some(20);
         }
 
-        shard
-            .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
-            .await;
+        compio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                shard
+                    .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+                    .await;
+                if shard
+                    .plane
+                    .partitions()
+                    .get_by_ns(&ns)
+                    .is_some_and(|partition| partition.repair.is_none())
+                {
+                    break;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("repair finishes after its WAL becomes durable");
 
         let partitions = shard.plane.partitions();
         let partition = partitions

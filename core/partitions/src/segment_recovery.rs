@@ -699,7 +699,7 @@ pub async fn load_persisted_segments_with_checkpoint(
         // the walk exists rather than refusing the partition.
         let recovered_empty = bounds.is_none() && !checkpoint_segment;
         let bounds = bounds.unwrap_or_else(|| {
-            if raw_messages_size > 0 {
+            if raw_messages_size > 0 && !checkpoint_segment {
                 warn!(
                     stream_id,
                     topic_id,

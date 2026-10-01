@@ -1873,7 +1873,13 @@ impl Streams {
                                 .expect("sim partition count fits u32"),
                             name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
                                 .expect("sim topic name is valid"),
-                            options: WireOptions::empty(),
+                            options: iggy_common::TopicCreateOptions {
+                                durability: iggy_common::Durability::Persisted,
+                                consumer_offset_durability: iggy_common::Durability::Persisted,
+                                ..Default::default()
+                            }
+                            .to_wire()
+                            .expect("valid simulator durability options"),
                         },
                         derived_options: WireOptions::empty(),
                         partitions,

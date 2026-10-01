@@ -665,7 +665,7 @@ func (c *IggyTcpClient) sendFrame(
 	}
 	if code == uint32(command.PollMessagesOnPrimaryCode) ||
 		code == uint32(command.GetPollRoutingCode) ||
-		code == uint32(command.AttachConsumerSessionCode) {
+		code == uint32(command.BindSessionCode) {
 		response, generation, _, err := c.sendPollFrame(ctx, code, frame)
 		return response, generation, err
 	}

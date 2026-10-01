@@ -167,6 +167,7 @@ impl CheckpointBarrier {
 pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     group: u64,
     instance: u64,
+    recovered_frontier: bool,
     lease: Option<Arc<WriterLease>>,
     epoch: Cell<u64>,
     journal: RefCell<Option<PartitionPrepareJournal<S>>>,
@@ -489,6 +490,23 @@ struct AppendBatchBytes {
 }
 
 impl PartitionPersistence {
+    /// Persist the recovery fence before a replacement WAL can publish an
+    /// empty frontier that a later process could mistake for intact history.
+    ///
+    /// # Errors
+    /// Returns an error if the prior frontier or recovery fence cannot be read or written.
+    pub async fn fence_missing_history(directory: &Path, incarnation: u64) -> io::Result<()> {
+        if !PartitionPrepareJournal::has_published_frontier(directory).await? {
+            let partition_directory =
+                directory.parent().and_then(Path::to_str).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid partition path")
+                })?;
+            crate::state_transfer::mark_materialization_missing(partition_directory, incarnation)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// # Errors
     /// Returns an error if the partition WAL cannot be recovered.
     pub async fn open(
@@ -564,6 +582,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         let persistence = Rc::new(Self {
             group,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            recovered_frontier: journal.recovered_frontier(),
             lease,
             epoch: Cell::new(0),
             accepted_head: Cell::new(journal.head()),
@@ -609,6 +628,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             failed_writes: Cell::new(0),
         });
         Ok((persistence, prepares))
+    }
+
+    #[must_use]
+    pub const fn recovered_frontier(&self) -> bool {
+        self.recovered_frontier
     }
 
     #[cfg(test)]

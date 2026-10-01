@@ -376,7 +376,11 @@ pub(in crate::dispatch) fn classify(header: &RoutedRequestHeader, bound: bool) -
         ) {
             return RequestClass::LegacyLogin;
         }
-        if nr_code != PING_CODE && !bound {
+        if !matches!(
+            nr_code,
+            PING_CODE | iggy_binary_protocol::codes::BIND_SESSION_CODE
+        ) && !bound
+        {
             return RequestClass::UnauthenticatedRead;
         }
         return RequestClass::NonReplicatedRead;
@@ -604,10 +608,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `bound` is Some here: `classify` sends unbound transports to
             // `UnboundReplicated`.
             let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
-            let consumer_session = if matches!(
-                request.header().operation,
-                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) {
+            let consumer_session = {
                 let attachment = sessions
                     .borrow()
                     .attached_consumer_session(transport_client_id);
@@ -624,8 +625,6 @@ async fn handle_client_request<B, MJ, S, SB>(
                         return;
                     }
                 }
-            } else {
-                None
             };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on

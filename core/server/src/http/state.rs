@@ -38,7 +38,8 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::session_ops::submit_register_on_owner;
+use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
+use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 
 use crate::http::jwt::JwtManager;
@@ -75,6 +76,38 @@ pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("igg
 /// and never weaker.
 pub(in crate::http) const APPLIED_OP_HEADER: HeaderName =
     HeaderName::from_static("iggy-applied-op");
+
+struct RegisteredSessionGuard {
+    shard: Rc<ServerShard>,
+    identity: Option<(u128, u64)>,
+}
+
+impl Drop for RegisteredSessionGuard {
+    fn drop(&mut self) {
+        if let Some((client_id, epoch)) = self.identity {
+            discard_registration(Rc::clone(&self.shard), client_id, epoch);
+        }
+    }
+}
+
+fn discard_registration(shard: Rc<ServerShard>, client_id: u128, epoch: u64) {
+    compio::runtime::spawn(async move {
+        if let Err(error) = submit_logout_on_owner(
+            &shard,
+            client_id,
+            epoch,
+            consensus::client_table::EXPIRED_SESSION_REQUEST_ID,
+        )
+        .await
+        {
+            warn!(
+                ?error,
+                client_id, epoch, "server HTTP: orphan registration awaits lease expiry"
+            );
+        }
+    })
+    .detach();
+}
 
 /// Per-user read-your-writes floors: the highest metadata op each user has
 /// been told committed BY THIS NODE.
@@ -155,6 +188,7 @@ pub(in crate::http) struct ForwardState {
 /// session table so every handler and the [`Authenticated`] extractor reach
 /// them through one axum `State`.
 pub(in crate::http) struct HttpInner {
+    pub(crate) session_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     pub(in crate::http) shard: Rc<ServerShard>,
     pub(in crate::http) jwt: JwtManager,
     /// Read-only server config for the snapshot collector (log directory +
@@ -258,13 +292,32 @@ impl HttpInner {
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
             let now = IggyTimestamp::now().to_secs();
+            {
+                let metadata = self.shard.plane.metadata();
+                let mut registry = metadata.client_table.borrow_mut();
+                for session in self
+                    .sessions
+                    .borrow()
+                    .values()
+                    .filter(|session| session.expiry > now)
+                {
+                    session.reattach(&mut registry);
+                }
+            }
             if let Some(session) = self.live_session(&key, now) {
                 return Ok(session);
             }
 
             // Miss. Serialize registration per credential so a herd of
             // concurrent first-requests runs one `Register`, not N.
-            match self.registrations.enter(&key) {
+            let (available_slots, torn) = {
+                let mut table = self.sessions.borrow_mut();
+                let torn = sweep_expired(&mut table, now);
+                (self.max_http_sessions.saturating_sub(table.len()), torn)
+            };
+            self.teardown_reply_targets(torn);
+            match self.registrations.enter(&key, available_slots) {
+                BarrierEntry::Full => return Err(AuthError::SessionUnavailable),
                 BarrierEntry::Wait(waiter) => {
                     // Another first-request is registering this credential.
                     // Park until it finishes (its guard wakes us on drop),
@@ -272,29 +325,13 @@ impl HttpInner {
                     let _ = waiter.await;
                 }
                 BarrierEntry::Lead(_guard) => {
-                    // Sole registrant for this key: mint + Register with no
-                    // borrow held (an async VSR commit). The guard wakes any
-                    // waiters when this scope ends, cancellation drop included.
+                    // The guard reserves local capacity across Register and
+                    // releases it on failure or cancellation, waking waiters.
                     let fresh = self.register_session(key.clone(), user_id, expiry).await?;
-                    // Resample after the await: the pre-await stamp is stale for
-                    // the expiry sweep and cap check below.
-                    let now = IggyTimestamp::now().to_secs();
-                    let (admitted, torn) = {
-                        let mut table = self.sessions.borrow_mut();
-                        let torn = sweep_expired(&mut table, now);
-                        if table.len() >= self.max_http_sessions {
-                            // Still full after dropping expired entries: too many
-                            // genuinely live sessions. Refuse rather than evict a
-                            // live one (its `fresh` client id is orphaned on the
-                            // peers until they evict it - a rare at-cap cost).
-                            (None, torn)
-                        } else {
-                            table.insert(key.clone(), Rc::clone(&fresh));
-                            (Some(fresh), torn)
-                        }
-                    };
-                    self.teardown_reply_targets(torn);
-                    return admitted.ok_or(AuthError::SessionUnavailable);
+                    self.sessions
+                        .borrow_mut()
+                        .insert(key.clone(), Rc::clone(&fresh));
+                    return Ok(fresh);
                 }
             }
         }
@@ -310,7 +347,9 @@ impl HttpInner {
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
     /// shared `RefCell` borrow to this call so it can never span an `.await`.
     fn live_session(&self, key: &str, now_secs: u64) -> Option<Rc<HttpSession>> {
-        live_entry(&self.sessions.borrow(), key, now_secs)
+        let session = live_entry(&self.sessions.borrow(), key, now_secs)?;
+        session.activity.touch();
+        Some(session)
     }
 
     /// Mint a shard-0 client id and run the VSR `Register` for a fresh session,
@@ -393,10 +432,14 @@ impl HttpInner {
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
-            let result = submit_register_on_owner(&shard, client_id, user_id).await;
-            // A failed send means the handler died mid-await; the Register
-            // itself has already committed, which is what matters.
-            let _ = result_slot.send(result);
+            let verifier =
+                consensus::client_table::bind_verifier(client_id, user_id, &rand::random());
+            let result = submit_register_on_owner(&shard, client_id, user_id, verifier).await;
+            if let Err(Ok(bound)) = result_slot.send(result)
+                && bound.watermark == FRESH_ENTRY_WATERMARK
+            {
+                discard_registration(shard, client_id, bound.epoch);
+            }
         })
         .detach();
         let bound = committed
@@ -419,13 +462,44 @@ impl HttpInner {
             );
             return Err(AuthError::SessionIdTaken);
         }
+        // A handler canceled during catch-up must not orphan a committed slot.
+        let mut registration = RegisteredSessionGuard {
+            shard: Rc::clone(&self.shard),
+            identity: Some((client_id, bound.epoch)),
+        };
         // `bound.epoch` also floors the read gate: a HEALTHY BACKUP forwards the
         // register to the primary (see `submit_register_local_or_forward`), so
         // this node can hand back an epoch its own commit walk has not
         // reached, and the caller's first read would otherwise be served from
         // state older than the register it is holding.
         self.metadata_watermarks.record(user_id, bound.epoch);
+        let metadata = self.shard.plane.metadata();
+        let frontier = metadata.applied_frontier();
+        shard::bus_timeout(
+            &self.shard.bus,
+            frontier.read_budget(),
+            frontier.reached(bound.epoch),
+        )
+        .await
+        .ok_or(AuthError::SessionUnavailable)?;
+        let attachment = metadata
+            .client_table
+            .borrow_mut()
+            .attach_session(client_id, bound.epoch, user_id)
+            .ok_or(AuthError::SessionUnavailable)?;
+        let activity = Rc::new(SessionActivity::new(
+            iggy_binary_protocol::ConsumerSession {
+                client_id,
+                session: bound.epoch,
+            },
+        ));
+        self.session_liveness
+            .borrow_mut()
+            .observe_local_session(&activity);
+        registration.identity = None;
         Ok(Rc::new(HttpSession {
+            attachment: RefCell::new(attachment),
+            activity,
             key,
             client_id,
             session: bound.epoch,
@@ -433,6 +507,7 @@ impl HttpInner {
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
             data_gate: Mutex::new(FIRST_REQUEST_ID),
+            partition_gates: RefCell::default(),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         }))

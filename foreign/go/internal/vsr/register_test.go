@@ -43,7 +43,7 @@ func TestProtocolVersion_PacksTheWireContractSemver(t *testing.T) {
 }
 
 func TestSerializeLoginRegister_EncodesTheDeclaredLayout(t *testing.T) {
-	body, err := SerializeLoginRegister("iggy", "secret", "0.9.0-edge.1")
+	body, err := SerializeLoginRegister("iggy", "secret", "0.9.0-edge.1", [BindSecretBytes]byte{})
 	require.NoError(t, err)
 
 	offset := 0
@@ -57,6 +57,8 @@ func TestSerializeLoginRegister_EncodesTheDeclaredLayout(t *testing.T) {
 	assert.Equal(t, byte(12), body[offset])
 	assert.Equal(t, "0.9.0-edge.1", string(body[offset+1:offset+13]))
 	offset += 13
+	assert.Equal(t, make([]byte, BindSecretBytes), body[offset:offset+BindSecretBytes])
+	offset += BindSecretBytes
 
 	assert.Equal(t, byte(4), body[offset])
 	assert.Equal(t, "iggy", string(body[offset+1:offset+5]))
@@ -71,7 +73,7 @@ func TestSerializeLoginRegister_EncodesTheDeclaredLayout(t *testing.T) {
 }
 
 func TestSerializeLoginRegister_AllowsAnEmptyPassword(t *testing.T) {
-	body, err := SerializeLoginRegister("iggy", "", "1.0.0")
+	body, err := SerializeLoginRegister("iggy", "", "1.0.0", [BindSecretBytes]byte{})
 	require.NoError(t, err)
 	assert.NotEmpty(t, body)
 }
@@ -91,40 +93,40 @@ func TestSerializeLoginRegister_RejectsNamesPastTheLengthPrefix(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := SerializeLoginRegister(test.username, test.password, test.version)
+			_, err := SerializeLoginRegister(test.username, test.password, test.version, [BindSecretBytes]byte{})
 			assert.ErrorIs(t, err, ErrWireNameLength)
 		})
 	}
 }
 
 func TestSerializeLoginRegister_AcceptsTheLengthPrefixBoundary(t *testing.T) {
-	_, err := SerializeLoginRegister(strings.Repeat("u", 255), strings.Repeat("p", 255), "1")
+	_, err := SerializeLoginRegister(strings.Repeat("u", 255), strings.Repeat("p", 255), "1", [BindSecretBytes]byte{})
 	assert.NoError(t, err)
 }
 
 func TestSerializeLoginRegister_CountsUTF8Bytes(t *testing.T) {
 	// The rune is two UTF-8 bytes, so 128 of them are 256 bytes and overflow
 	// the u8 prefix even though the rune count fits.
-	_, err := SerializeLoginRegister(strings.Repeat("ł", 128), "p", "1")
+	_, err := SerializeLoginRegister(strings.Repeat("ł", 128), "p", "1", [BindSecretBytes]byte{})
 	assert.ErrorIs(t, err, ErrWireNameLength)
 
-	body, err := SerializeLoginRegister("łł", "p", "1")
+	body, err := SerializeLoginRegister("łł", "p", "1", [BindSecretBytes]byte{})
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "łł")
 }
 
 func TestSerializeLoginRegisterWithToken_EncodesTheDeclaredLayout(t *testing.T) {
-	body, err := SerializeLoginRegisterWithToken("token-value", "0.9.0-edge.1")
+	body, err := SerializeLoginRegisterWithToken("token-value", "0.9.0-edge.1", [BindSecretBytes]byte{})
 	require.NoError(t, err)
 
-	offset := 4 + 1 + len(SDKName) + 1 + len("0.9.0-edge.1")
+	offset := 4 + 1 + len(SDKName) + 1 + len("0.9.0-edge.1") + BindSecretBytes
 	assert.Equal(t, byte(11), body[offset])
 	assert.Equal(t, "token-value", string(body[offset+1:offset+12]))
 	assert.Equal(t, []byte{0, 0, 0, 0}, body[offset+12:])
 }
 
 func TestSerializeLoginRegisterWithToken_RejectsATokenPastTheLengthPrefix(t *testing.T) {
-	_, err := SerializeLoginRegisterWithToken(strings.Repeat("t", 256), "1")
+	_, err := SerializeLoginRegisterWithToken(strings.Repeat("t", 256), "1", [BindSecretBytes]byte{})
 	assert.ErrorIs(t, err, ErrWireNameLength)
 }
 
@@ -159,4 +161,28 @@ func TestDecodeLoginRegister_IgnoresTrailingBytes(t *testing.T) {
 	response, err := DecodeLoginRegister(body)
 	require.NoError(t, err)
 	assert.Equal(t, "1.0.0", response.ServerVersion)
+}
+
+func TestBindSession_CarriesTheRegisteredProofAfterVersionAndIdentity(t *testing.T) {
+	var secret [BindSecretBytes]byte
+	for index := range secret {
+		secret[index] = byte(index + 1)
+	}
+	login, err := SerializeLoginRegister("iggy", "secret", "1", secret)
+	require.NoError(t, err)
+	recovered, err := RegisterBindSecret(login)
+	require.NoError(t, err)
+	require.Equal(t, secret, recovered)
+	identity := make([]byte, SessionIdentityBytes)
+	binary.LittleEndian.PutUint64(identity, 7)
+	binary.LittleEndian.PutUint64(identity[16:], 11)
+	bound, err := SerializeBindSession(identity, "1", recovered)
+	require.NoError(t, err)
+	offset := 4 + 1 + len(SDKName) + 1 + 1
+	assert.Equal(t, identity, bound[offset:offset+SessionIdentityBytes])
+	assert.Equal(t, secret[:], bound[offset+SessionIdentityBytes:])
+	for length := range offset + BindSecretBytes {
+		_, err := RegisterBindSecret(login[:length])
+		assert.ErrorIs(t, err, ErrTruncatedRegisterRequest, "truncated at %d", length)
+	}
 }

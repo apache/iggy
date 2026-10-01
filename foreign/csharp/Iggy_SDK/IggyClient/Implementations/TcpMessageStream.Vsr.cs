@@ -152,7 +152,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     await SendWithResponseAsync(code, message, autoLoginOnReconnect: false, token: token);
 
                 response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
-                _consensusSession.Bind(response.Session);
+                _consensusSession.Bind(response.Session, LoginRegister.ReadBindSecret(message));
             }
             catch
             {

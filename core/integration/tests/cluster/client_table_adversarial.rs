@@ -57,6 +57,7 @@ use iggy_binary_protocol::consensus::{
 use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireIdentifier, WireName, WireOptions,
@@ -73,10 +74,11 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
 
 /// The client whose dedup state each test puts under pressure.
+const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
+
 const CLIENT_A: u128 = 0xA11CE0001;
 
-/// Churn identities that overflow the capacity-2 table and force the
-/// eviction of `CLIENT_A`'s entry.
+/// New identities refused while every registry slot is protected.
 const CHURN_CLIENTS: [u128; 3] = [0xB0B0001, 0xB0B0002, 0xB0B0003];
 
 /// The topic the gap spec produces into, and how many batches it sends before
@@ -96,19 +98,7 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// Capacity eviction must not erase a live client's dedup watermark.
-///
-/// With the table floored at two slots, three fresh registrations evict
-/// `CLIENT_A` (its commit is the oldest) while its connection is still open
-/// and its request 1 is committed. The client then does exactly what the
-/// resume contract tells a disconnected client to do: reconnect,
-/// re-authenticate under its own identity, and retry the request it never saw
-/// answered. The register finds no entry to rebind, so it restores the fence
-/// eviction left and the retry is answered from it.
-///
-/// A committed duplicate-name rejection is the proof of re-execution: a dedup
-/// hit replays the cached success bytes, so any committed rejection means the
-/// state machine ran the operation a second time.
+/// Registry pressure refuses newcomers while preserving live receipts.
 #[iggy_harness(cluster_nodes = 1, server(metadata.clients_table_max = "2"))]
 async fn given_a_low_client_table_cap_when_connects_churn_should_keep_a_live_dedup_watermark(
     harness: &mut TestHarness,
@@ -118,49 +108,29 @@ async fn given_a_low_client_table_cap_when_connects_churn_should_keep_a_live_ded
     let payload = create_stream_payload("adv-k-dedup");
     let committed = commit_request(&mut stream_a, CLIENT_A, session_a, 1, &payload).await;
 
-    // Each register is a commit, so after the first churn client the table
-    // holds [A, churn0]; the second churn register evicts A (oldest commit).
-    // The sockets stay open so no Logout frees a slot and dodges the
-    // capacity pressure.
     let mut churn_streams = Vec::with_capacity(CHURN_CLIENTS.len());
-    for churn_client in CHURN_CLIENTS {
-        churn_streams.push(register(addr, churn_client).await);
+    let mut refused = 0;
+    for client in CHURN_CLIENTS {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        refused += usize::from(login_on(&mut stream, client).await.is_none());
+        churn_streams.push(stream);
     }
+    assert!(
+        refused > 0,
+        "registry pressure must refuse without eviction"
+    );
 
-    // The eviction is observable on the still-open connection: the entry is
-    // gone, so the next request on it draws an eviction, not an answer. This
-    // stages the scenario; the contract violation comes after the resume.
-    let probe = request_header(CLIENT_A, session_a, 2, payload.len());
-    match exchange(&mut stream_a, &probe, &payload).await.verdict() {
-        Verdict::Evicted(reason) => {
-            eprintln!("churn evicted CLIENT_A's entry (wire eviction reason byte {reason})");
-        }
-        Verdict::NoResultSection | Verdict::Ignored => {}
-        other => panic!(
-            "the churn must evict CLIENT_A's entry before the replay is meaningful; \
-             its live connection still got {other:?}"
-        ),
+    match replay_request(&mut stream_a, CLIENT_A, session_a, 1, &payload).await {
+        Verdict::Success(replayed) => assert_replayed_from_cache(&committed, &replayed, 1),
+        other => panic!("registry pressure erased a live receipt: {other:?}"),
     }
     drop(stream_a);
 
-    // Resume exactly as the contract prescribes: fresh connection,
-    // credential-bearing re-register under the same client id, then retry
-    // the committed request id under the new epoch.
     let (mut resumed_stream, resumed_session) = register(addr, CLIENT_A).await;
-    let replay = replay_request(&mut resumed_stream, CLIENT_A, resumed_session, 1, &payload).await;
-
-    match replay {
-        Verdict::Success(replayed) => {
-            assert_replayed_from_cache(&committed, &replayed, 1);
-        }
-        other => panic!(
-            "capacity eviction erased a live client's dedup watermark: request 1 was \
-             committed and its reply delivered, but after the table (capacity 2) evicted \
-             the entry to admit churn registrations, the resume did not restore the fence, \
-             so the retry of request 1 was re-executed by the state machine instead of \
-             being answered from the dedup cache (at-most-once broken for any client the \
-             table evicts while it is merely quiet); got {other:?}"
-        ),
+    assert_eq!(resumed_session, session_a);
+    match replay_request(&mut resumed_stream, CLIENT_A, resumed_session, 1, &payload).await {
+        Verdict::Success(replayed) => assert_replayed_from_cache(&committed, &replayed, 1),
+        other => panic!("matching Register lost the original receipt: {other:?}"),
     }
 }
 
@@ -213,8 +183,7 @@ async fn given_a_retry_past_the_reply_floor_when_the_retention_budget_still_hold
 /// A metadata request that lands above a gap the partition plane opened must
 /// still deduplicate.
 ///
-/// Every replicated request on a session spends an id, but only the metadata
-/// plane keeps a client table, so a session that produces reaches its next
+/// Every replicated request on a session spends an id, so producing reaches its next
 /// metadata request several ids above the watermark. The entry records the
 /// highest committed request rather than a contiguous run, so the gapped
 /// request executes once and the retry of its exact frame is answered from the
@@ -236,6 +205,7 @@ async fn given_partition_batches_spent_request_ids_when_a_metadata_request_is_re
             GAP_TOPIC,
             &TopicCreateOptions {
                 partitions_count: Some(1),
+                durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -267,6 +237,31 @@ async fn given_partition_batches_spent_request_ids_when_a_metadata_request_is_re
              watermark is a high-water mark, not a contiguity check; got {other:?}"
         ),
     }
+
+    let changed_payload = create_stream_payload("adv-m-changed-retry");
+    match replay_request(
+        &mut stream,
+        CLIENT_A,
+        session,
+        gapped_request,
+        &changed_payload,
+    )
+    .await
+    {
+        Verdict::Success(replayed) => {
+            assert_replayed_from_cache(&committed, &replayed, gapped_request);
+        }
+        other => panic!("changed payload must return the first metadata receipt: {other:?}"),
+    }
+    let observer = harness.tcp_root_client().await.unwrap();
+    assert!(
+        observer
+            .get_stream(&Identifier::named("adv-m-changed-retry").unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "a changed retry must not create another stream"
+    );
 }
 
 fn tcp_addr(harness: &TestHarness) -> SocketAddr {
@@ -351,6 +346,7 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
         username: WireName::new(DEFAULT_ROOT_USERNAME).unwrap(),
         password: SecretString::from(DEFAULT_ROOT_PASSWORD),
         client_context: None,
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
     }
     .to_bytes();
     let header = RequestHeader {
@@ -371,6 +367,9 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
             Some(response.session)
         }
         Verdict::Rejected(code) if is_transient(code) => None,
+        Verdict::Evicted(reason) => {
+            panic!("register of client {client:#x} was evicted with reason {reason}")
+        }
         other => panic!("register of client {client:#x} did not commit: {other:?}"),
     }
 }

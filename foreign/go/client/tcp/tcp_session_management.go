@@ -29,7 +29,7 @@ import (
 )
 
 func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password string) (*iggcon.IdentityInfo, error) {
-	body, err := vsr.SerializeLoginRegister(username, password, iggcon.Version)
+	body, err := vsr.SerializeLoginRegister(username, password, iggcon.Version, vsr.NewBindSecret())
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +42,7 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
-	body, err := vsr.SerializeLoginRegisterWithToken(token, iggcon.Version)
+	body, err := vsr.SerializeLoginRegisterWithToken(token, iggcon.Version, vsr.NewBindSecret())
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +126,13 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 	c.mtx.Lock()
 	err = c.session.Bind(registered.Session)
 	if err == nil {
+		secret, secretErr := vsr.RegisterBindSecret(body)
+		if secretErr != nil {
+			c.invalidateConnLocked()
+			c.mtx.Unlock()
+			return nil, secretErr
+		}
+		c.session.SetBindSecret(secret)
 		c.sessionState = iggcon.SessionStateAuthenticated
 		c.sessionUserID = registered.UserID
 		c.clearPollSession()

@@ -18,6 +18,7 @@
 package vsr
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -37,6 +38,12 @@ func packProtocolVersion(major, minor, patch uint32) uint32 {
 // SDKName identifies this SDK to the server during the register handshake.
 const SDKName = "go-sdk"
 
+// BindSecretBytes is the size of the server session binding proof.
+const BindSecretBytes = 32
+
+// SessionIdentityBytes is the encoded logical session identity size.
+const SessionIdentityBytes = 32
+
 // maxWireNameLength is the u8 length prefix ceiling shared by every
 // length-prefixed name in the register bodies.
 const maxWireNameLength = 255
@@ -53,12 +60,14 @@ var (
 	// ErrTruncatedRegisterReply is returned when a register reply is shorter
 	// than its declared layout requires.
 	ErrTruncatedRegisterReply = errors.New("vsr: register reply is truncated")
+	// ErrTruncatedRegisterRequest reports a missing register identity or proof.
+	ErrTruncatedRegisterRequest = errors.New("vsr: register request is truncated")
 )
 
 // SerializeLoginRegister builds the LoginRegister body:
-// [protocol version u32][sdk name][sdk version][username][password]
+// [protocol version u32][sdk name][sdk version][bind secret 32 bytes][username][password]
 // [context length u32]. Each name is a u8 length prefix followed by its bytes.
-func SerializeLoginRegister(username, password, sdkVersion string) ([]byte, error) {
+func SerializeLoginRegister(username, password, sdkVersion string, bindSecret [BindSecretBytes]byte) ([]byte, error) {
 	if len(password) > maxWireNameLength {
 		return nil, fmt.Errorf("password: %w", ErrWireNameLength)
 	}
@@ -66,6 +75,7 @@ func SerializeLoginRegister(username, password, sdkVersion string) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
+	body = append(body, bindSecret[:]...)
 	body, err = appendWireName(body, username)
 	if err != nil {
 		return nil, fmt.Errorf("username: %w", err)
@@ -78,7 +88,7 @@ func SerializeLoginRegister(username, password, sdkVersion string) ([]byte, erro
 
 // SerializeLoginRegisterWithToken builds the LoginRegisterWithPat body, where
 // a personal access token takes the credential slot.
-func SerializeLoginRegisterWithToken(token, sdkVersion string) ([]byte, error) {
+func SerializeLoginRegisterWithToken(token, sdkVersion string, bindSecret [BindSecretBytes]byte) ([]byte, error) {
 	if len(token) > maxWireNameLength {
 		return nil, fmt.Errorf("access token: %w", ErrWireNameLength)
 	}
@@ -86,9 +96,47 @@ func SerializeLoginRegisterWithToken(token, sdkVersion string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	body = append(body, bindSecret[:]...)
 	body = append(body, byte(len(token)))
 	body = append(body, token...)
 	return append(body, 0, 0, 0, 0), nil
+}
+
+// NewBindSecret generates a proof for a new logical session.
+func NewBindSecret() [BindSecretBytes]byte {
+	var secret [BindSecretBytes]byte
+	_, _ = rand.Read(secret[:])
+	return secret
+}
+
+// RegisterBindSecret extracts the proof from a register request.
+func RegisterBindSecret(body []byte) ([BindSecretBytes]byte, error) {
+	var secret [BindSecretBytes]byte
+	offset := 4
+	for range 2 {
+		if offset >= len(body) || int(body[offset])+1 > len(body)-offset {
+			return secret, ErrTruncatedRegisterRequest
+		}
+		offset += 1 + int(body[offset])
+	}
+	if len(body)-offset < BindSecretBytes {
+		return secret, ErrTruncatedRegisterRequest
+	}
+	copy(secret[:], body[offset:offset+BindSecretBytes])
+	return secret, nil
+}
+
+// SerializeBindSession encodes a logical session identity and its proof.
+func SerializeBindSession(identity []byte, sdkVersion string, secret [BindSecretBytes]byte) ([]byte, error) {
+	if len(identity) != SessionIdentityBytes {
+		return nil, fmt.Errorf("session identity must be %d bytes", SessionIdentityBytes)
+	}
+	body, err := appendVersionInfo(nil, sdkVersion)
+	if err != nil {
+		return nil, err
+	}
+	body = append(body, identity...)
+	return append(body, secret[:]...), nil
 }
 
 // LoginRegisterResponse is the decoded register reply.

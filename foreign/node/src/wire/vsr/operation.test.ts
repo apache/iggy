@@ -94,7 +94,9 @@ describe('VSR operation classification', () => {
   it('recognizes only declared operation discriminants', () => {
     assert.equal(isKnownOperation(Operation.Register), true);
     assert.equal(isKnownOperation(Operation.SendMessages), true);
-    for (const undeclared of [69, 127, 150, 159, 163, 164, 165, 166, 255])
+    assert.equal(isKnownOperation(Operation.RetireSession), true);
+    assert.equal(isKnownOperation(Operation.FinalizeSession), true);
+    for (const undeclared of [69, 127, 150, 159, 163, 164, 165, 167, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });

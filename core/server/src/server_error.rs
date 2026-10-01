@@ -27,6 +27,18 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServerError {
+    #[error(
+        "storage at {path} does not match the durable-session format; offline migration or explicit --fresh initialization is required"
+    )]
+    UnsupportedStorage { path: PathBuf },
+    #[error("cannot validate or publish the storage format at {path}: {source}")]
+    StorageFormatIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot fingerprint the server artifact: {0}")]
+    BinaryIdentity(#[source] std::io::Error),
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
     #[error("failed to load server config")]

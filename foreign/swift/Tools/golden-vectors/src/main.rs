@@ -31,6 +31,8 @@ use iggy_binary_protocol::batch::{
     BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, calculate_batch_checksum,
 };
 use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
@@ -720,6 +722,7 @@ fn main() {
             username: name("iggy"),
             password: SecretString::from("iggy"),
             client_context: None,
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );
     add(
@@ -729,6 +732,16 @@ fn main() {
             version_info: version_info(),
             token: SecretString::from("pat-abc123def456"),
             client_context: None,
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
+        },
+    );
+    add(
+        &mut vectors,
+        "request.bind_session",
+        &BindSessionRequest {
+            version_info: version_info(),
+            identity: SessionIdentity { client_id: 1, session: 100, metadata_watermark: 120 },
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );
     add(&mut vectors, "request.logout_user", &LogoutUserRequest);

@@ -179,6 +179,7 @@ pub async fn load_partition_or_fence(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
+    allow_bootstrap: bool,
     bus: Rc<IggyMessageBus>,
     partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
 ) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
@@ -302,6 +303,7 @@ pub async fn load_partition_or_fence(
         cluster_id,
         self_replica_id,
         replica_count,
+        allow_bootstrap,
         Rc::clone(&bus),
     ))
     .await
@@ -449,6 +451,7 @@ pub async fn load_partition_or_fence(
                 cluster_id,
                 self_replica_id,
                 replica_count,
+                false,
                 partition_metadata.created_view,
                 Rc::clone(&bus),
             ))
@@ -510,6 +513,7 @@ async fn load_partition(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
+    allow_bootstrap: bool,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let stream_id = namespace.stream_id();
@@ -569,6 +573,7 @@ async fn load_partition(
             join,
         },
     );
+    consensus.set_recovery_election_allowed(allow_bootstrap);
 
     // No prepare-timestamp floor is restored here: the partition consensus
     // journal is non-durable today, so there is no persisted head to observe
@@ -578,24 +583,10 @@ async fn load_partition(
     // recovered message timestamp here, or an NTP rewind across a restart could
     // regress persisted `base_timestamp`.
 
-    let recovered_persistence = if replica_count > 1
-        && (runtime_options.durability.is_persisted()
-            || runtime_options.consumer_offset_durability.is_persisted())
-    {
+    let recovered_persistence = {
         let directory = Path::new(&partition_dir)
             .join(format!("prepares-{}", partition_metadata.created_revision));
-        let (persistence, prepares) = PartitionPersistence::open_with_capacity(
-            &directory,
-            namespace.inner(),
-            partition_metadata.created_revision,
-            DiskStorage,
-            config.partition.wal_bytes_max.as_bytes_u64(),
-            runtime_options
-                .preallocate_segments
-                .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
-        )
-        .await
-        .map_err(|source| match source.kind() {
+        let wal_error = |source: std::io::Error| match source.kind() {
             std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
                 ServerError::PartitionRecovery(PartitionRecoveryError::Refused {
                     dir: PathBuf::from(&partition_dir),
@@ -612,7 +603,27 @@ async fn load_partition(
                 dir: directory.clone(),
                 source,
             },
-        })?;
+        };
+        if replica_count > 1 && !allow_bootstrap {
+            PartitionPersistence::fence_missing_history(
+                &directory,
+                partition_metadata.created_revision,
+            )
+            .await
+            .map_err(&wal_error)?;
+        }
+        let (persistence, prepares) = PartitionPersistence::open_with_capacity(
+            &directory,
+            namespace.inner(),
+            partition_metadata.created_revision,
+            DiskStorage,
+            config.partition.wal_bytes_max.as_bytes_u64(),
+            runtime_options
+                .preallocate_segments
+                .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
+        )
+        .await
+        .map_err(wal_error)?;
         if let Some(log_view) = persistence.certified_log_view()
             && log_view != 0
             && log_view < partition_metadata.created_view
@@ -624,21 +635,10 @@ async fn load_partition(
             });
         }
         Some((persistence, prepares))
-    } else {
-        None
     };
     let segment_checkpoint = recovered_persistence
         .as_ref()
         .and_then(|(persistence, _)| persistence.segment_checkpoint());
-    let recovered_segments = recover_partition_segments(
-        partitions_config,
-        namespace,
-        runtime_options,
-        &stats,
-        segment_checkpoint,
-    )
-    .await?;
-
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
@@ -656,6 +656,24 @@ async fn load_partition(
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
     partition.set_created_revision(partition_metadata.created_revision);
+    if let Some((persistence, _)) = &recovered_persistence {
+        partition
+            .restore_retry_checkpoint(persistence.checkpoint_op())
+            .await
+            .map_err(|source| ServerError::PartitionPrepareWalIo {
+                dir: Path::new(&partition_dir)
+                    .join(format!("prepares-{}", partition_metadata.created_revision)),
+                source,
+            })?;
+    }
+    let recovered_segments = recover_partition_segments(
+        partitions_config,
+        namespace,
+        runtime_options,
+        &stats,
+        segment_checkpoint,
+    )
+    .await?;
     partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
@@ -768,7 +786,7 @@ async fn restore_partition_offsets(
     // Solo only, in step with the reservation itself: a replicated group's
     // segment boundaries must be a function of the batches alone or the
     // reconciler's offset-keyed segment GC never converges.
-    if partition.consensus().replica_count() == 1 {
+    if partition.consensus().replica_count() == 1 && !partition.durability().is_persisted() {
         partition
             .reanchor_to_offset_frontier(partitions_config)
             .await
@@ -857,7 +875,7 @@ async fn recover_partition_segments(
 ///
 /// Returns [`ServerError`] when directory creation, superblock recovery,
 /// segment provisioning, or the first offset-reservation claim fails.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn build_partition_fresh(
     config: &ServerConfig,
     partitions_config: &PartitionsConfig,
@@ -868,6 +886,7 @@ pub async fn build_partition_fresh(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
+    allow_bootstrap: bool,
     created_view: u32,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
@@ -880,7 +899,8 @@ pub async fn build_partition_fresh(
     // empty -- committed-but-unflushed data dies with the journal), while a
     // genuinely fresh create finds nothing.
     let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
-    let restarted = replica_count > 1 && std::fs::metadata(&partition_dir).is_ok();
+    let restarted =
+        replica_count > 1 && (!allow_bootstrap || std::fs::metadata(&partition_dir).is_ok());
     create_partition_file_hierarchy(stream_id, topic_id, partition_id, partitions_config)
         .await
         .map_err(|source| {
@@ -977,6 +997,9 @@ pub async fn build_partition_fresh(
     );
 
     let mut partition = IggyPartition::new(stats, consensus);
+    partition
+        .consensus()
+        .set_recovery_election_allowed(allow_bootstrap);
     partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
@@ -1162,6 +1185,9 @@ mod tests {
     const CLUSTER: u128 = 7;
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
+    const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
+    const OFFSETS_VERSION: u8 = 3;
+    const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
     async fn given_uncertified_view_when_loading_or_rebuilding_should_persist_creation_floor() {
@@ -1187,6 +1213,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                true,
                 CREATED_VIEW,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1195,6 +1222,8 @@ mod tests {
             assert_eq!(fresh.consensus().view(), CREATED_VIEW);
             assert!(fresh.consensus().needs_superblock_persist());
             drop(fresh);
+
+            std::fs::remove_dir_all(Path::new(&directory).join("prepares-0")).unwrap();
 
             if let Some(view) = old_view {
                 let (store, _) = open_partition_superblock(&directory, test_identity(), 0)
@@ -1218,6 +1247,7 @@ mod tests {
                     CLUSTER,
                     REPLICA,
                     REPLICAS,
+                    false,
                     Rc::new(IggyMessageBus::new(0)),
                 )
                 .await
@@ -1232,6 +1262,7 @@ mod tests {
                     CLUSTER,
                     REPLICA,
                     REPLICAS,
+                    true,
                     CREATED_VIEW,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1285,6 +1316,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                false,
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1312,6 +1344,7 @@ mod tests {
                     CLUSTER,
                     REPLICA,
                     REPLICAS,
+                    true,
                     CREATED_VIEW,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1353,6 +1386,7 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
+            false,
             Rc::new(IggyMessageBus::new(0)),
         )
         .await;
@@ -1373,6 +1407,7 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
+            false,
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
         )
@@ -1585,6 +1620,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                true,
                 CREATED_VIEW,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1649,6 +1685,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                false,
                 Rc::new(IggyMessageBus::new(0)),
             )
             .await
@@ -1708,6 +1745,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                true,
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1735,6 +1773,10 @@ mod tests {
                 header.cluster = CLUSTER;
                 header.group = namespace.inner();
                 header.op = offset + 1;
+                header.retry_capacity = u32::try_from(config.partition.dedup_clients_max).unwrap();
+                header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                header.session = 1;
+                header.request = offset + 1;
                 header.parent = parent;
                 header.size = u32::try_from(total).unwrap();
                 header.checksum = header.identity_checksum();
@@ -1742,6 +1784,30 @@ mod tests {
             parent = prepare.header().checksum;
             journal.append(prepare.into_frozen()).await.unwrap();
         }
+        let mut protection = OFFSETS_MAGIC.to_vec();
+        protection.push(OFFSETS_VERSION);
+        for value in [0_u64, 1, 0] {
+            protection.extend_from_slice(&value.to_le_bytes());
+        }
+        protection.extend_from_slice(
+            &u32::try_from(config.partition.dedup_clients_max)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        protection.extend_from_slice(&[0; 3 * size_of::<u32>()]);
+        protection.push(0);
+        protection.extend_from_slice(&0_u128.to_le_bytes());
+        protection.extend_from_slice(&0_u32.to_le_bytes());
+        protection
+            .extend_from_slice(&consensus::state_artifact_checksum(&protection).to_le_bytes());
+        let mut checkpoint = RETRY_CHECKPOINT_MAGIC.to_vec();
+        checkpoint.extend_from_slice(&namespace.inner().to_le_bytes());
+        checkpoint.extend_from_slice(&0_u64.to_le_bytes());
+        checkpoint.extend_from_slice(&1_u64.to_le_bytes());
+        checkpoint.extend_from_slice(&protection);
+        checkpoint
+            .extend_from_slice(&consensus::state_artifact_checksum(&checkpoint).to_le_bytes());
+        std::fs::write(wal.join("receipts-1.checkpoint"), checkpoint).unwrap();
         journal.checkpoint(1).await.unwrap();
         drop(journal);
         let partitions_config = solo_partitions_config(&config);
@@ -1758,6 +1824,7 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
+            false,
             Rc::new(IggyMessageBus::new(0)),
         )
         .await
@@ -1801,6 +1868,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                true,
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1836,6 +1904,7 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
+                false,
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1924,6 +1993,7 @@ mod tests {
             CLUSTER,
             0,
             1,
+            true,
             0,
             Rc::new(IggyMessageBus::new(0)),
         )
@@ -1968,6 +2038,7 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
+            true,
             created_view,
             Rc::new(IggyMessageBus::new(0)),
         )
@@ -2014,6 +2085,7 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
+            false,
             Rc::new(IggyMessageBus::new(0)),
             partitions,
         )
@@ -2153,6 +2225,7 @@ mod tests {
             CLUSTER,
             0,
             1,
+            false,
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
         )

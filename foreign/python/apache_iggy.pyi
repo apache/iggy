@@ -1848,6 +1848,7 @@ class IggyClient:
         topic_max_size: MaxTopicSize | None = None,
         send_retries: builtins.int | None = 3,
         send_retry_interval: datetime.timedelta | None = ...,
+        topic_durability: Durability | None = None,
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
         Creates and initializes a high-level producer bound to a stream and topic.
@@ -1856,7 +1857,8 @@ class IggyClient:
         producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
         `None` selects direct mode. `BackgroundProducerConfig` starts background
         workers and makes successful sends mean queue acceptance rather than a
-        server commit. The returned producer is ready to send.
+        server commit. Set `topic_durability=Durability.PERSISTED` for an
+        automatically created topic; Replicated defaults reject producer writes.
 
         Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
         when stream/topic initialization fails.

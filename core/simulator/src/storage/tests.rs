@@ -2681,6 +2681,10 @@ fn prepare_with_payload(op: u64, parent: u128, payload: &[u8]) -> Message<Prepar
     header.operation = Operation::SendMessages;
     header.group = 42;
     header.op = op;
+    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+    header.session = 1;
+    header.request = op;
+    header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
     header.parent = parent;
     header.size = u32::try_from(length).unwrap();
     header.checksum_body = u128::from(XxHash3_64::oneshot(payload));

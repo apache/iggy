@@ -86,6 +86,13 @@ pub trait Pipeline {
         false
     }
 
+    fn pending_client_ids(&self) -> Vec<u128>;
+    /// The unresolved session, request number, and operation.
+    fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)>;
+
     /// Drop reply senders on every entry; receivers wake `Canceled`.
     /// View-change reset uses this to unblock awaiters while preserving
     /// pipeline for DVC reconciliation.
@@ -171,8 +178,8 @@ pub mod client_table;
 pub mod le_cursor;
 pub use client_table::{
     CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableMode,
-    ClientTableSnapshot, ClientTableWireError, CommitReply, DISCONNECT_LOGOUT_REQUEST_ID,
-    DedupWatermark, FenceSnapshot, RESERVED_CLIENT_ID, SessionEnd, SliceRequestStatus,
+    ClientTableSnapshot, ClientTableWireError, CommitReply, DedupWatermark,
+    EXPIRED_SESSION_REQUEST_ID, RESERVED_CLIENT_ID,
 };
 pub mod state_manifest;
 pub use state_manifest::{

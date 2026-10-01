@@ -178,6 +178,8 @@ pub enum IggyError {
         "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
     )]
     RequestTooOld = 85,
+    #[error("Durable retries require persisted durability and quorum offset acknowledgments")]
+    DurabilityRequired = 86,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]

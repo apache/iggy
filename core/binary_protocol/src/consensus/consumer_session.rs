@@ -86,6 +86,13 @@ impl ConsensusHeader for ConsumerSessionHeartbeatHeader {
     const FRAME_SEALED: bool = true;
     const COMMAND: Command = Command::ConsumerSessionHeartbeat;
 
+    fn accepts(command: Command) -> bool {
+        matches!(
+            command,
+            Command::ConsumerSessionHeartbeat | Command::SessionRetirementProgress
+        )
+    }
+
     fn checksum(&self) -> u128 {
         self.checksum
     }
@@ -107,7 +114,7 @@ impl ConsensusHeader for ConsumerSessionHeartbeatHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Self::COMMAND {
+        if !Self::accepts(self.command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: Self::COMMAND,
                 found: self.command,

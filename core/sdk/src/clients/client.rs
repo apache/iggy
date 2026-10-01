@@ -148,6 +148,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// // and creates a topic.
 /// let producer = client
 ///     .producer("stream_name", "topic_name")?
+///     .topic_durability(iggy::prelude::Durability::Persisted)
 ///     .background(
 ///         BackgroundConfig::builder()
 ///             .batch_length(1000)
@@ -755,7 +756,8 @@ impl IggyClient {
     /// client.connect().await?;
     ///
     /// let producer = client
-    ///     .producer("stream_name", "topic_name")? // returns IggyProducerBuilder from IggyClient
+    ///     .producer("stream_name", "topic_name")?
+    ///     .topic_durability(iggy::prelude::Durability::Persisted) // returns IggyProducerBuilder from IggyClient
     ///     .partitioning(Partitioning::balanced())
     ///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
     ///     .create_topic_if_not_exists(

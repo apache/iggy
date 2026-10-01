@@ -240,9 +240,8 @@ async fn submit_gated(
     let mut request = message;
     let mut saw_not_committed = false;
     let reply = loop {
-        // The submit consumes the request; keep a byte-identical copy for a
-        // possible replay. Re-running the rewrites instead would mint a fresh
-        // PAT token / password hash and break same-id dedup idempotency.
+        // Retry the same rewritten body: a newly minted PAT token could differ
+        // from the token hash protected by the first receipt.
         let retry_request = request.clone();
         let Some(reply) = submit_client_request_on_owner(shard, request).await else {
             return Err(WriteError::Unavailable);
@@ -310,13 +309,12 @@ pub(in crate::http) async fn submit_write(
 }
 
 /// Tear down a caller's session for `DELETE /users/logout`: submit the VSR
-/// `Logout` that releases its client-table slot on every replica (the commit a
-/// TCP disconnect also submits), then forget the local session-table entry and
-/// its reply target so neither leaks.
+/// `Logout` that ends its logical session on every replica, then forget the
+/// local entry and reply target. Partition retirement releases the shared slot.
 ///
 /// Best-effort: a transient submit failure is logged and the local entry is
-/// dropped anyway, matching the disconnect path's contract that a logout never
-/// blocks on peer slot release (the orphaned slot LRU-evicts). The bearer is not
+/// dropped anyway. An orphaned slot remains until lease expiry and retirement.
+/// The bearer is not
 /// revoked here - this listener's JWT half is issue+verify only, with no
 /// revocation list - so the SDK dropping the token client-side is what ends the
 /// credential; a caller that re-presents it just re-registers a fresh session.
@@ -343,49 +341,56 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
         Ok(Ok(_)) => {}
         Ok(Err(error)) => warn!(
             ?error,
-            "server HTTP: VSR Logout submit failed; slot lingers until eviction"
+            "server HTTP: VSR Logout submit failed; session remains until lease expiry"
         ),
         Err(_canceled) => warn!(
-            "server HTTP: VSR Logout task dropped before replying; slot lingers until eviction"
+            "server HTTP: VSR Logout task dropped before replying; session remains until lease expiry"
         ),
     }
     state.forget_session(session);
 }
 
-/// Run one awaited partition write (produce / consumer-offset write) end to
-/// end: admit against the in-flight caps, install the reply slot, dispatch
-/// into the partition plane, and wait (bounded) for the committed reply.
-///
-/// Slot-before-dispatch is load-bearing: every pre-dispatch gate failure
-/// inside [`dispatch_partition_request`] replies through `send_to_client`,
-/// which fires an installed slot, so one slot catches every exit. The slot
-/// guard borrows the registry, which is why this whole future runs inside
-/// the caller's `SendWrapper` on shard 0.
-///
-/// Hands back the graded reply frame and the header grading read, so a caller
-/// that renders a committed payload can bound the body without parsing the
-/// header again; the offset writes answer 204 and drop both.
 pub(in crate::http) async fn partition_write_replicated(
     state: &HttpInner,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
 ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
-    // Admission sits here rather than before body decode: axum's extractors
-    // already buffered and deserialized the body (bounded by the router-wide
-    // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
-    // actually unbounded - the slot install, the dispatch, and the parked
-    // reply await that pins this request's buffers for up to the reply
-    // timeout. Held across every exit below; released by `Drop`.
+    partition_write(state, session, operation, body, &mut None).await
+}
+
+async fn partition_write(
+    state: &HttpInner,
+    session: &HttpSession,
+    operation: Operation,
+    body: &[u8],
+    dispatched: &mut Option<oneshot::Sender<Result<(), PartitionWriteError>>>,
+) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
+    let deadline = Instant::now() + PARTITION_WRITE_REPLY_TIMEOUT;
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
+    let namespace = crate::namespace::resolve_partition_request_namespace(
+        &state.shard,
+        operation,
+        body,
+        session.client_id,
+    )
+    .map_err(PartitionWriteError::Rejected)?;
+    let gate = session.partition_gate(namespace);
+    let _partition_guard = compio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        gate.lock(),
+    )
+    .await
+    .map_err(|_| PartitionWriteError::Rejected(IggyError::TransientNotAccepted))?;
     ensure_in_process_reply_target(state, session);
-    // Held from the mint until `dispatch_partition_request` returns, which is
-    // past the owning shard's inbox: mint order prevents a delayed write from
-    // aging out of the dedup window. Released before the commit wait so writes
-    // still overlap there.
-    let mut next_data_request_id = session.data_gate.lock().await;
-    let request_id = *next_data_request_id;
-    *next_data_request_id += 1;
+    let request_id = {
+        let mut next_id = session.data_gate.lock().await;
+        let request_id = *next_id;
+        *next_id = next_id
+            .checked_add(1)
+            .ok_or(PartitionWriteError::Unavailable)?;
+        request_id
+    };
     let message = build_request_message(
         operation,
         session.client_id,
@@ -406,75 +411,63 @@ pub(in crate::http) async fn partition_write_replicated(
             );
             PartitionWriteError::Unavailable
         })?;
-    dispatch_partition_request(
-        &state.shard,
-        message,
-        session.client_id,
-        session.session,
-        session.client_id,
-        Some(session.user_id),
-        None,
-    )
-    .await;
-    drop(next_data_request_id);
-    let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
-    // Removes the slot unless the reply already fired, so a late commit
-    // reply after a timeout sheds at the bus instead of leaking a waiter.
+    let attachment = session.attachment.borrow().clone();
+    let outcome =
+        compio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+            dispatch_partition_request(
+                &state.shard,
+                message,
+                session.client_id,
+                session.session,
+                session.client_id,
+                Some(session.user_id),
+                Some((session.client_id, attachment)),
+            )
+            .await;
+            if let Some(dispatched) = dispatched.take() {
+                let _ = dispatched.send(Ok(()));
+            }
+            receiver.await
+        })
+        .await;
     drop(guard);
     match outcome {
         Ok(Ok(reply)) => {
             let reply = reply.into_contiguous();
             classify_partition_reply(&reply).map(|header| (reply, header))
         }
-        // Cancelled (reply target torn down by session eviction mid-wait) or
-        // elapsed: same caller contract either way - outcome unknown, 504.
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),
     }
 }
 
-/// Fire-and-forget produce (`?ack=none`): installs no reply slot and never
-/// awaits a commit. The commit still happens; its reply (and any gate-failure
-/// reply) targets a request id with no slot installed and is shed at the bus by
-/// design.
-///
-/// Admitted against the in-flight caps exactly like the acked path
-/// ([`partition_write_replicated`]): being reply-less does not make it free.
-/// The request still parks inside [`dispatch_partition_request`] for the
-/// routable-wait budget while pinning its buffered body, so it must count
-/// against the per-session and shard-global budgets or it would be an uncapped
-/// bypass. The in-flight guard is held across dispatch and released by `Drop`.
-/// A refusal is a synchronous 429/503, which is honest for `?ack=none`:
-/// admission runs before dispatch, so it is not a commit reply the caller
-/// opted out of - it is the request being turned away up front.
+/// Return after dispatch while a detached task holds the partition gate until
+/// the reply or deadline. A 202 still carries no commit or admission guarantee.
 pub(in crate::http) async fn produce_unacked(
-    state: &HttpInner,
-    session: &HttpSession,
+    state: &Rc<HttpInner>,
+    session: &Rc<HttpSession>,
     body: &[u8],
 ) -> Result<(), PartitionWriteError> {
-    let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
-    // Same gate as the acked path, for the same ordering reason.
-    let mut next_data_request_id = session.data_gate.lock().await;
-    let request_id = *next_data_request_id;
-    *next_data_request_id += 1;
-    let message = build_request_message(
-        Operation::SendMessages,
-        session.client_id,
-        session.session,
-        request_id,
-        body,
-    );
-    dispatch_partition_request(
-        &state.shard,
-        message,
-        session.client_id,
-        session.session,
-        session.client_id,
-        Some(session.user_id),
-        None,
-    )
-    .await;
-    drop(next_data_request_id);
-    Ok(())
+    let state = Rc::clone(state);
+    let session = Rc::clone(session);
+    let body = body.to_vec();
+    let (sent, dispatched) = oneshot::channel();
+    compio::runtime::spawn(async move {
+        let mut sent = Some(sent);
+        let result =
+            partition_write(&state, &session, Operation::SendMessages, &body, &mut sent).await;
+        if let Some(sent) = sent {
+            let _ = sent.send(result.map(|_| ()));
+        } else if let Err(error) = result {
+            tracing::debug!(
+                ?error,
+                "server HTTP: unacked produce resolved without a committed reply"
+            );
+        }
+    })
+    .detach();
+    dispatched
+        .await
+        .map_err(|_| PartitionWriteError::Unavailable)?
 }
 
 /// Install this session's in-process reply target on first data-plane use.

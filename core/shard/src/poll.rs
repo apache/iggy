@@ -86,14 +86,16 @@ where
     M: StreamsFrontend,
     SB: SuperblockStore,
 {
-    pub(crate) fn validate_offset_attachment(
+    pub(crate) fn validate_partition_attachment(
         &self,
         request: &Message<RoutedRequestHeader>,
         attachment: &ConsumerAttachment,
     ) -> Result<(), IggyError> {
         if !matches!(
             request.header().operation,
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            Operation::SendMessages
+                | Operation::StoreConsumerOffset
+                | Operation::DeleteConsumerOffset
         ) {
             return Err(IggyError::InvalidCommand);
         }
@@ -172,6 +174,11 @@ where
             read => (read, None),
         };
         let result = match read {
+            PartitionRead::SessionRetired { identity } => partitions
+                .with_partition(&namespace, |partition| {
+                    PartitionReadReply::SessionRetired(partition.session_retired(identity))
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();

@@ -72,14 +72,12 @@ use tracing::{debug, warn};
 /// `header.client` carries the VSR consensus id (the dedup key) rather than
 /// the transport id.
 ///
-/// How the committed reply gets back depends on whether the bus can route that
-/// id. HTTP registers each session under its own shard-0 transport id, so the
-/// two are equal and the plane's `send_to_client` fires the session's
-/// in-process reply slot directly; the request is dispatched and forgotten
-/// here (`?ack=none` relies on exactly that: nothing listening, reply shed at
-/// the bus). Every other transport registers under a client-chosen id the bus
-/// cannot route, so the request is submitted with an in-process channel and
-/// the reply is relayed to the socket this shard holds.
+/// Attached requests retain their session fence through the owning shard's
+/// materialization queue and relay the committed reply through an in-process
+/// channel. HTTP registers its session id on the bus, which delivers that
+/// reply to its installed request slot, including detached `?ack=none` writes.
+/// Binary transports relay to the socket's transport id. An unattached request
+/// whose consensus id is directly routable may dispatch without a relay.
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
@@ -181,6 +179,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
                 request_body(&request),
                 parent,
                 session,
+                header.operation,
             )
         })
         .transpose();
@@ -259,6 +258,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         // gate above failed closed on `None`, so `0` (unattributed) is only a
         // type-level fallback here.
         new_header.user_id = acting_user_id.unwrap_or(0);
+        new_header.metadata_watermark = shard.plane.metadata().applied_frontier().get();
     });
     if attachment.is_none() && vsr_client_id == transport_client_id {
         shard.dispatch(request.into_generic());
@@ -341,12 +341,11 @@ async fn relay_partition_reply<B, MJ, S, SB>(
             .send_to_client(transport_client_id, reply.into_frozen())
             .await
         {
-            warn!(
-                transport_client_id,
-                operation = ?operation,
-                error = %error,
-                "failed to forward committed partition reply to its socket"
-            );
+            if matches!(error, message_bus::SendError::ClientNotFound(_)) {
+                tracing::debug!(transport_client_id, ?operation, %error, "partition reply target is gone");
+            } else {
+                warn!(transport_client_id, ?operation, %error, "failed to forward committed partition reply to its socket");
+            }
         }
     });
 }
@@ -357,14 +356,21 @@ fn capture_offset_attachment(
     body: &[u8],
     parent: u128,
     session: SessionAttachment,
+    operation: Operation,
 ) -> Result<ConsumerAttachment, IggyError> {
     if !session.is_valid() {
         return Err(IggyError::StaleClient);
     }
-    let (wire, _) =
-        GetConsumerOffsetRequest::decode(body).map_err(|_| IggyError::InvalidCommand)?;
-    // An external group has no members, so its reads carry no membership.
-    let group = if wire.consumer.kind == KIND_CONSUMER_GROUP {
+    let wire = if operation == Operation::SendMessages {
+        None
+    } else {
+        Some(
+            GetConsumerOffsetRequest::decode(body)
+                .map_err(|_| IggyError::InvalidCommand)?
+                .0,
+        )
+    };
+    let group = if let Some(wire) = wire.filter(|wire| wire.consumer.kind == KIND_CONSUMER_GROUP) {
         Some(crate::namespace::resolve_offset_group_id(
             streams,
             &wire.stream_id,
@@ -428,12 +434,15 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         .await;
         return;
     };
-    if attachment.is_some() && !wire.auto_commit {
+    if attachment
+        .as_ref()
+        .is_some_and(|attachment| !attachment.is_valid())
+    {
         send_non_replicated_deny(
             shard,
             request,
             transport_client_id,
-            IggyError::InvalidCommand.as_code(),
+            IggyError::StaleClient.as_code(),
         )
         .await;
         return;

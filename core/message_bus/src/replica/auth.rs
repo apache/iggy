@@ -66,6 +66,8 @@ pub const EXPORTER_LABEL: &[u8] = b"iggy replica psk binding";
 /// reject reason, so a zeroed (`Ok`) challenge carries `nonce_a` + `mac_a` while
 /// a reject carries the reason here and leaves the nonce/MAC regions zero.
 pub const STATUS_OFFSET: usize = NONCE_LEN + MAC_LEN;
+pub const IDENTITY_OFFSET: usize = STATUS_OFFSET + 1;
+pub const IDENTITY_LEN: usize = 32;
 
 /// Domain separation tag mixed into every MAC transcript.
 const DOMAIN_TAG: &[u8] = b"apache-iggy replica-auth v1";
@@ -153,6 +155,7 @@ pub enum HandshakeStatus {
     AuthRequired = 4,
     /// The dialer's finish MAC did not verify (log-only).
     MacMismatch = 5,
+    IncompatibleBuild = 6,
 }
 
 impl HandshakeStatus {
@@ -166,6 +169,7 @@ impl HandshakeStatus {
             Self::DirectionalRule => "directional_rule",
             Self::AuthRequired => "auth_required",
             Self::MacMismatch => "mac_mismatch",
+            Self::IncompatibleBuild => "incompatible_build",
         }
     }
 }
@@ -184,6 +188,7 @@ pub const fn read_status(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Hands
         3 => HandshakeStatus::DirectionalRule,
         4 => HandshakeStatus::AuthRequired,
         5 => HandshakeStatus::MacMismatch,
+        6 => HandshakeStatus::IncompatibleBuild,
         // 1 and every unrecognised byte: a reject the dialer must not read as Ok.
         _ => HandshakeStatus::UnknownCommand,
     }
@@ -223,6 +228,7 @@ impl ChannelBinding {
 
 /// The fields bound into a handshake MAC. Identical on both peers.
 pub struct Transcript {
+    pub binary_identity: [u8; IDENTITY_LEN],
     pub cluster_id: u128,
     pub dialer_id: u8,
     pub acceptor_id: u8,
@@ -321,6 +327,7 @@ impl ReplicaAuth {
     fn mac(key: &[u8; 32], dir: u8, transcript: &Transcript) -> Hash {
         let mut hasher = blake3::Hasher::new_keyed(key);
         hasher.update(DOMAIN_TAG);
+        hasher.update(&transcript.binary_identity);
         hasher.update(&transcript.cluster_id.to_le_bytes());
         hasher.update(&[transcript.dialer_id, transcript.acceptor_id]);
         hasher.update(&transcript.nonce_d);
@@ -340,6 +347,7 @@ mod tests {
 
     fn transcript() -> Transcript {
         Transcript {
+            binary_identity: [0x5a; IDENTITY_LEN],
             cluster_id: 0xDEAD_BEEF,
             dialer_id: 3,
             acceptor_id: 1,
@@ -423,6 +431,18 @@ mod tests {
         let t = transcript();
         assert!(!auth.verify_dialer_mac(&t, &auth.acceptor_mac(&t)));
         assert!(!auth.verify_acceptor_mac(&t, &auth.dialer_mac(&t)));
+    }
+
+    #[test]
+    fn changed_binary_identity_is_rejected_in_both_directions() {
+        let auth = ReplicaAuth::new(SECRET);
+        let original = transcript();
+        let changed = Transcript {
+            binary_identity: [0x33; IDENTITY_LEN],
+            ..transcript()
+        };
+        assert!(!auth.verify_dialer_mac(&changed, &auth.dialer_mac(&original)));
+        assert!(!auth.verify_acceptor_mac(&changed, &auth.acceptor_mac(&original)));
     }
 
     #[test]
