@@ -138,10 +138,12 @@ fn main() -> Result<(), ServerError> {
 }
 
 fn print_config_env_vars() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
     print_env_var_names(
         ServerConfig::env_templates()
             .iter()
             .map(|t| t.env_name)
             .chain(configs::server::SERVER_RUNTIME_ENV_VARS.iter().copied()),
+        &mut stdout,
     )
 }

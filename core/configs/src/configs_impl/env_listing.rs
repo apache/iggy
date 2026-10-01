@@ -15,26 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Write;
-
-/// Writes each name in `names`, sorted and deduplicated, to stdout — one
-/// call, one lock, one error policy. A closed stdout (e.g.
-/// `iggy-server --list-config-env-vars | head -1`) is expected, not a
-/// failure: on `BrokenPipe` this stops writing and returns `Ok(())`. Any
+/// Writes each name in `names`, sorted and deduplicated, to the provided writer — one
+/// call, one error policy. A closed writer (e.g. `iggy-server --list-config-env-vars | head -1`)
+/// is expected, not a failure: on `BrokenPipe` this stops writing and returns `Ok(())`. Any
 /// other I/O error is real and is propagated so the caller exits non-zero.
-pub fn print_env_var_names<I, S>(names: I) -> std::io::Result<()>
+pub fn print_env_var_names<I, S, W>(names: I, writer: &mut W) -> std::io::Result<()>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
+    W: std::io::Write,
 {
     let mut names: Vec<String> = names.into_iter().map(Into::into).collect();
     names.sort_unstable();
     names.dedup();
 
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
     for name in names {
-        if let Err(err) = writeln!(lock, "{name}") {
+        if let Err(err) = writeln!(writer, "{name}") {
             return if err.kind() == std::io::ErrorKind::BrokenPipe {
                 Ok(())
             } else {

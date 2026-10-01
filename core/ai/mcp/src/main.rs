@@ -68,11 +68,13 @@ fn main() -> Result<(), McpRuntimeError> {
 }
 
 fn print_config_env_vars() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
     print_env_var_names(
         McpServerConfig::env_templates()
             .iter()
             .map(|t| t.env_name)
             .chain(MCP_RUNTIME_ENV_VARS.iter().copied()),
+        &mut stdout,
     )
 }
 
