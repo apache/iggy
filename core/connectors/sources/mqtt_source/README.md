@@ -95,6 +95,7 @@ Configuration operates in **two distinct layers**:
 | `request_capacity` | Integer | No | `32` | Bounded capacity for `rumqttc` internal request channel (must be `> 0`). |
 | `batch_size` | Integer | No | `100` | Maximum messages accumulated into a single source batch. |
 | `batch_timeout` | Duration | No | `"10ms"` | Maximum wait duration after the first message arrives before flushing a batch. |
+| `max_retries` | Integer | No | `5` | Number of retries after the initial MQTT acknowledgement attempt. After retries are exhausted, the source abandons the broker acknowledgement and continues; the broker may redeliver the message later, producing duplicates. |
 | `verbose_logging` | Boolean | No | `false` | Enables additional debug logging inside the plugin driver. |
 | `tls.ca_file` | String | No | None | File path to custom CA root certificates in PEM format. |
 | `tls.client_cert_file` | String | No | None | File path to mTLS client certificate in PEM format (must pair with `client_key_file`). |
@@ -136,6 +137,7 @@ session_expiry_interval = 3600
 keep_alive = "30s"
 batch_size = 100
 batch_timeout = "10ms"
+max_retries = 5
 ```
 
 ### 2. MQTT 5 Metadata Envelope
@@ -350,7 +352,12 @@ persisting the MQTT payload and other valid headers. This also applies to
 
 ## Redelivery & Acknowledgment Mechanism
 
-The connector guarantees **At-Least-Once Delivery** for QoS 1 and QoS 2 messages using manual protocol acknowledgments.
+The connector normally provides **At-Least-Once Delivery** for QoS 1 and QoS 2
+messages using manual protocol acknowledgments. `max_retries` bounds the
+acknowledgement attempts so a transient broker failure does not stop the source.
+After `max_retries` failures, the MQTT source abandons the broker
+acknowledgement and continues. The broker may redeliver the message later,
+producing duplicates.
 
 ```text
   MQTT Broker             MQTT Source Plugin            Connector Runtime           Iggy Server
@@ -383,8 +390,9 @@ The connector guarantees **At-Least-Once Delivery** for QoS 1 and QoS 2 messages
 2. **Polling & FFI Handoff**: The runtime calls `Source::poll()`. The plugin packages staged messages into a batch, records `AckTokens` inside `pending_batch`, serializes candidate `ConnectorState`, and returns `ProducedMessages` with `Schema::Raw`.
 3. **Iggy Persistence & State Save**: The runtime sends the batch to `iggy-server` over TCP/QUIC and saves candidate state checkpoints to disk or HTTP storage.
 4. **Ack Callback**: Upon successful Iggy write, the runtime calls `Source::on_batch_result(Ack)`.
-5. **Broker Acknowledgment**: The plugin retrieves in-flight `AckTokens` and executes `client.try_ack(&publish)`. `rumqttc` transmits the `PUBACK` (for QoS 1) or initiates `PUBREC` (for QoS 2) to EMQX.
-6. **Nack Rollback**: If Iggy delivery fails or times out, the runtime returns `SourceBatchResult::Nack`. The plugin drops the candidate state **without acknowledging the MQTT tokens**. The broker's QoS 1/2 retry loop will subsequently redeliver the unacknowledged messages.
+5. **Broker Acknowledgment**: The plugin retrieves in-flight `AckTokens` and executes `client.try_ack(&publish)`. `rumqttc` transmits the `PUBACK` (for QoS 1) or initiates `PUBREC` (for QoS 2) to EMQX. The plugin retries failed acknowledgements according to `max_retries`.
+6. **Bounded failure**: If all acknowledgement retries fail, the plugin commits the already-persisted candidate state, discards the remaining acknowledgement tokens, and continues polling. The broker may redeliver the abandoned message, so downstream consumers must tolerate duplicates.
+7. **Nack Rollback**: If Iggy delivery fails or times out, the runtime returns `SourceBatchResult::Nack`. The plugin drops the candidate state **without acknowledging the MQTT tokens**. The broker's QoS 1/2 retry loop will subsequently redeliver the unacknowledged messages.
 
 ---
 

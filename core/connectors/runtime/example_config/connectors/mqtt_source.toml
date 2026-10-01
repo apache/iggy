@@ -48,6 +48,10 @@ poll_timeout = "1s"
 request_capacity = 32
 batch_size = 100
 batch_timeout = "10ms"
+# Number of retries after the initial MQTT acknowledgement attempt. After
+# retries are exhausted, the source abandons the broker acknowledgement and
+# continues. The broker may redeliver the message later, producing duplicates.
+max_retries = 5
 verbose_logging = false
 
 # Optional TLS configuration for mqtts:// brokers. The client certificate and
