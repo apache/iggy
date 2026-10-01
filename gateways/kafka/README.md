@@ -409,6 +409,8 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
   own text is "below 1", a different condition)
 - Too many partitions requested (`TooManyPartitions`) → `INVALID_PARTITIONS` (37), reachable
   through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
+- A create past the node's partition cap (`PartitionsLimitReached`, 2022) → `POLICY_VIOLATION`
+  (44). See `metadata.partitions_max` below
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 
 Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
@@ -421,15 +423,20 @@ an operator has to.
 | Limit | Default | Where |
 | ------- | --------- | ------- |
 | Consumer offset keys per partition, per consumer kind | 4096, ceiling 262144 | `partition.consumer_offsets_max` |
+| Partitions of one node, all streams and topics | 0, no cap | `metadata.partitions_max` |
 | One user header name, and one header value | 255 bytes | fixed, `user_headers.rs` |
 | All user headers of one message | 100 KB | fixed, `MAX_USER_HEADERS_SIZE` |
 | Message payload | 64 MB | fixed, `MAX_PAYLOAD_SIZE` |
 
-Only the first is configurable. A Kafka consumer group commits one offset key per partition it
-holds, so `partition.consumer_offsets_max` is what bounds the number of groups that can commit
+Only the first two are configurable. A Kafka consumer group commits one offset key per partition
+it holds, so `partition.consumer_offsets_max` is what bounds the number of groups that can commit
 against one partition. Passing it returns `TooManyConsumerOffsets` (3024), which reaches the
 client as `UNKNOWN_SERVER_ERROR` because Kafka has no code for the condition. The gateway logs
 the real Iggy error, so the server log is where an operator diagnoses it.
+
+A `CreateTopics` that would take the node past `metadata.partitions_max` returns
+`PartitionsLimitReached` (2022), which reaches the client as `POLICY_VIOLATION` (44). The cap
+counts committed partitions only, so creates that run at the same time can go past it.
 
 The other three decide when a Kafka record goes into the envelope instead of being stored
 natively. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) and

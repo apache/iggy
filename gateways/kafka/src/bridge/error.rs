@@ -20,8 +20,9 @@ use thiserror::Error;
 
 use crate::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -198,6 +199,9 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
         // client-visible error message that contradicts the actual request it sent.
         IggyError::TooManyPartitions => ERROR_INVALID_REQUEST,
+        // The node is at `[metadata] partitions_max`. Kafka answers a create that breaks a
+        // broker-side rule with 44, and the request itself is valid, so not `INVALID_REQUEST`.
+        IggyError::PartitionsLimitReached => ERROR_POLICY_VIOLATION,
         // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
         // handler's error path, but "the operation did commit, so report success" only holds for
         // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
@@ -267,6 +271,12 @@ mod tests {
         // message that contradicts the request it just sent.
         let err = BridgeError::Iggy(IggyError::TooManyPartitions);
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn partitions_limit_reached_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::PartitionsLimitReached);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
     }
 
     #[test]

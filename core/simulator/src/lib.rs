@@ -1925,7 +1925,8 @@ mod tests {
             sim.executor.spawn(async move {
                 *gathered.borrow_mut() = Some(futures::join!(
                     shard.gather_clients(),
-                    shard.gather_consumer_sessions()
+                    shard.gather_consumer_sessions(),
+                    shard.count_all_clients()
                 ));
             });
             assert!(matches!(
@@ -1943,12 +1944,17 @@ mod tests {
                     RunOutcome::Quiescent { .. }
                 ));
             }
-            let (gathered, sessions) = result
+            let (gathered, sessions, count) = result
                 .borrow_mut()
                 .take()
                 .expect("gather must complete within its deadline");
             assert_eq!(gathered.complete, !missing_shard);
             assert_eq!(sessions.complete, !missing_shard);
+            assert_eq!(
+                count,
+                gathered.clients.len(),
+                "the count must cover the same shards as the client list"
+            );
             if !missing_shard {
                 assert!(
                     gathered

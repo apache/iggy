@@ -799,7 +799,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     // Stats is the one default read with an async input: the cross-shard
     // connected-client gather. Run it here so the shared builder stays sync.
     let clients_count = if code == GET_STATS_CODE {
-        u32::try_from(shard.list_all_clients().await.len()).unwrap_or(u32::MAX)
+        u32::try_from(shard.count_all_clients().await).unwrap_or(u32::MAX)
     } else {
         0
     };
