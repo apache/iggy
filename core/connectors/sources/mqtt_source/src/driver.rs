@@ -18,7 +18,10 @@
 use super::{MqttProtocol, MqttSourceConfig, Qos, qos_for_subscription};
 use base64::Engine;
 use iggy_common::{HeaderKey, HeaderValue};
-use rumqttc::tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
+use rumqttc::tokio_rustls::rustls::{
+    self, ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
 use rumqttc::v5::{
     AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
     Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
@@ -36,7 +39,7 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{BufReader, Cursor},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 use tokio::time::timeout;
@@ -45,6 +48,29 @@ use url::Url;
 
 const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
+const MQTT_PROTOCOL_HEADER: &str = "mqtt.protocol";
+const MQTT_TOPIC_HEADER: &str = "mqtt.topic";
+
+static MQTT_PROTOCOL_HEADER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| {
+    HeaderKey::try_from(MQTT_PROTOCOL_HEADER).expect("MQTT protocol header key is valid")
+});
+static MQTT_TOPIC_HEADER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| {
+    HeaderKey::try_from(MQTT_TOPIC_HEADER).expect("MQTT topic header key is valid")
+});
+static MQTT_QOS_HEADER_KEY: LazyLock<HeaderKey> =
+    LazyLock::new(|| HeaderKey::try_from("mqtt.qos").expect("MQTT QoS header key is valid"));
+static MQTT_DUP_HEADER_KEY: LazyLock<HeaderKey> =
+    LazyLock::new(|| HeaderKey::try_from("mqtt.dup").expect("MQTT duplicate header key is valid"));
+static MQTT_RETAIN_HEADER_KEY: LazyLock<HeaderKey> =
+    LazyLock::new(|| HeaderKey::try_from("mqtt.retain").expect("MQTT retain header key is valid"));
+#[cfg(test)]
+static MQTT_PACKET_ID_HEADER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| {
+    HeaderKey::try_from("mqtt.packet_id").expect("MQTT packet ID header key is valid")
+});
+#[cfg(test)]
+static MQTT_RESPONSE_TOPIC_HEADER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| {
+    HeaderKey::try_from("mqtt.response_topic").expect("MQTT response topic header key is valid")
+});
 
 // Metadata is kept separate from the payload so protocol details can be
 // preserved in Iggy headers without changing the application bytes.
@@ -161,14 +187,15 @@ impl MqttDriver {
                             iggy_connector_sdk::Error::Connection(error.to_string())
                         })?;
                 }
-                poll_mqtt311(&mut event_loop, poll_timeout).await?;
+                let buffered_messages =
+                    poll_mqtt311(&mut event_loop, config.subscriptions.len(), poll_timeout).await?;
 
                 Ok(Self {
                     connection: MqttConnection::Mqtt311 {
                         client: Box::new(client),
                         event_loop: Box::new(event_loop),
                     },
-                    buffered_messages: VecDeque::new(),
+                    buffered_messages,
                 })
             }
             MqttProtocol::Mqtt5 => {
@@ -201,14 +228,15 @@ impl MqttDriver {
                             iggy_connector_sdk::Error::Connection(error.to_string())
                         })?;
                 }
-                poll_mqtt5(&mut event_loop, poll_timeout).await?;
+                let buffered_messages =
+                    poll_mqtt5(&mut event_loop, config.subscriptions.len(), poll_timeout).await?;
 
                 Ok(Self {
                     connection: MqttConnection::Mqtt5 {
                         client: Box::new(client),
                         event_loop: Box::new(event_loop),
                     },
-                    buffered_messages: VecDeque::new(),
+                    buffered_messages,
                 })
             }
         }
@@ -434,9 +462,10 @@ fn read_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Err
     })
 }
 
-fn read_certificate_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
-    // Validate PEM contents during initialization so bad certificates produce an
-    // actionable configuration error before the broker connection starts.
+fn read_certificate_file(
+    path: &str,
+    field: &str,
+) -> Result<Vec<CertificateDer<'static>>, iggy_connector_sdk::Error> {
     let contents = read_file(path, field)?;
     let mut reader = BufReader::new(Cursor::new(&contents));
     let certificates = certs(&mut reader)
@@ -449,23 +478,24 @@ fn read_certificate_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connec
             "{field} does not contain a PEM certificate"
         )));
     }
-    Ok(contents)
+    Ok(certificates)
 }
 
-fn read_private_key_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
+fn read_private_key_file(
+    path: &str,
+    field: &str,
+) -> Result<PrivateKeyDer<'static>, iggy_connector_sdk::Error> {
     let contents = read_file(path, field)?;
     let mut reader = BufReader::new(Cursor::new(&contents));
-    if private_key(&mut reader)
+    private_key(&mut reader)
         .map_err(|error| {
             iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} is invalid: {error}"))
         })?
-        .is_none()
-    {
-        return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
-            "{field} does not contain a PEM private key"
-        )));
-    }
-    Ok(contents)
+        .ok_or_else(|| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "{field} does not contain a PEM private key"
+            ))
+        })
 }
 
 fn system_root_cert_store() -> Result<RootCertStore, iggy_connector_sdk::Error> {
@@ -488,24 +518,13 @@ fn system_root_cert_store() -> Result<RootCertStore, iggy_connector_sdk::Error> 
 }
 
 fn build_tls_config(
-    ca: Option<Vec<u8>>,
-    client_auth: Option<(Vec<u8>, Vec<u8>)>,
+    ca: Option<Vec<CertificateDer<'static>>>,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
 ) -> Result<ClientConfig, iggy_connector_sdk::Error> {
-    // Client authentication is optional, but certificate and key parsing stays
-    // here so mismatches fail before rumqttc starts its reconnect loop.
     let root_cert_store = match ca {
         Some(ca) => {
-            let mut reader = BufReader::new(Cursor::new(ca));
-            let certificates =
-                certs(&mut reader)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        iggy_connector_sdk::Error::InvalidConfigValue(format!(
-                            "tls.ca_file is invalid: {error}"
-                        ))
-                    })?;
             let mut root_cert_store = RootCertStore::empty();
-            for certificate in certificates {
+            for certificate in ca {
                 root_cert_store.add(certificate).map_err(|error| {
                     iggy_connector_sdk::Error::InvalidConfigValue(format!(
                         "tls.ca_file contains an invalid certificate: {error}"
@@ -523,32 +542,12 @@ fn build_tls_config(
     };
     let client_config = ClientConfig::builder().with_root_certificates(root_cert_store);
 
-    let Some((client_certificate, client_key)) = client_auth else {
+    let Some((client_certificates, client_key)) = client_auth else {
         return Ok(client_config.with_no_client_auth());
     };
-    let mut reader = BufReader::new(Cursor::new(client_certificate));
-    let certificates = certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            iggy_connector_sdk::Error::InvalidConfigValue(format!(
-                "tls.client_cert_file is invalid: {error}"
-            ))
-        })?;
-    let mut key_reader = BufReader::new(Cursor::new(client_key));
-    let key = private_key(&mut key_reader)
-        .map_err(|error| {
-            iggy_connector_sdk::Error::InvalidConfigValue(format!(
-                "tls.client_key_file is invalid: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            iggy_connector_sdk::Error::InvalidConfigValue(
-                "tls.client_key_file does not contain a PEM private key".to_string(),
-            )
-        })?;
 
     client_config
-        .with_client_auth_cert(certificates, key)
+        .with_client_auth_cert(client_certificates, client_key)
         .map_err(|error| {
             iggy_connector_sdk::Error::InvalidConfigValue(format!(
                 "TLS client certificate and key do not match: {error}"
@@ -556,12 +555,20 @@ fn build_tls_config(
         })
 }
 
+fn client_id(config: &MqttSourceConfig, id: u32) -> String {
+    config
+        .client_id
+        .clone()
+        .unwrap_or_else(|| format!("iggy-mqtt-source-{id}"))
+}
+
 fn broker_url_with_client_id(
     config: &MqttSourceConfig,
     id: u32,
 ) -> Result<String, iggy_connector_sdk::Error> {
-    // rumqttc reads the client ID from the URL query when parsing options. Add a
-    // generated value only when the operator did not configure one explicitly.
+    // rumqttc requires client_id to be present in the URL before parse_url can
+    // create MqttOptions. set_client_id below still makes the precedence
+    // explicit for both protocol versions.
     let mut url = Url::parse(&config.broker_url).map_err(|error| {
         iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
     })?;
@@ -579,13 +586,6 @@ fn broker_url_with_client_id(
     Ok(url.into())
 }
 
-fn client_id(config: &MqttSourceConfig, id: u32) -> String {
-    config
-        .client_id
-        .clone()
-        .unwrap_or_else(|| format!("iggy-mqtt-source-{id}"))
-}
-
 fn set_mqtt311_credentials(options: &mut Mqtt311Options, config: &MqttSourceConfig) {
     if let (Some(username), Some(password)) = (&config.username, &config.password) {
         options.set_credentials(username.clone(), password.expose_secret().to_string());
@@ -600,32 +600,88 @@ fn set_mqtt5_credentials(options: &mut Mqtt5Options, config: &MqttSourceConfig) 
 
 async fn poll_mqtt311(
     event_loop: &mut Mqtt311EventLoop,
+    subscription_count: usize,
     poll_timeout: Duration,
-) -> Result<(), iggy_connector_sdk::Error> {
-    timeout(poll_timeout, event_loop.poll())
-        .await
-        .map_err(|_| {
-            iggy_connector_sdk::Error::Connection(
-                "timed out connecting to MQTT 3.1.1 broker".to_string(),
-            )
-        })?
-        .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-    Ok(())
+) -> Result<VecDeque<ReceivedMessage>, iggy_connector_sdk::Error> {
+    let mut acknowledged_subscriptions = 0;
+    let mut buffered_messages = VecDeque::new();
+
+    while acknowledged_subscriptions < subscription_count {
+        let event = timeout(poll_timeout, event_loop.poll())
+            .await
+            .map_err(|_| {
+                iggy_connector_sdk::Error::Connection(
+                    "timed out waiting for MQTT 3.1.1 subscription acknowledgements".to_string(),
+                )
+            })?
+            .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+
+        match event {
+            Mqtt311Event::Incoming(Mqtt311Incoming::SubAck(suback)) => {
+                if let Some(reason) = suback.return_codes.iter().find(|reason| {
+                    !matches!(
+                        reason,
+                        rumqttc::mqttbytes::v4::SubscribeReasonCode::Success(_)
+                    )
+                }) {
+                    return Err(iggy_connector_sdk::Error::Connection(format!(
+                        "MQTT 3.1.1 broker rejected subscription (packet id {}): {reason:?}",
+                        suback.pkid
+                    )));
+                }
+                acknowledged_subscriptions += 1;
+            }
+            Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
+                buffered_messages.push_back(normalize_mqtt311(publish)?);
+            }
+            Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => {}
+        }
+    }
+
+    Ok(buffered_messages)
 }
 
 async fn poll_mqtt5(
     event_loop: &mut Mqtt5EventLoop,
+    subscription_count: usize,
     poll_timeout: Duration,
-) -> Result<(), iggy_connector_sdk::Error> {
-    timeout(poll_timeout, event_loop.poll())
-        .await
-        .map_err(|_| {
-            iggy_connector_sdk::Error::Connection(
-                "timed out connecting to MQTT 5 broker".to_string(),
-            )
-        })?
-        .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-    Ok(())
+) -> Result<VecDeque<ReceivedMessage>, iggy_connector_sdk::Error> {
+    let mut acknowledged_subscriptions = 0;
+    let mut buffered_messages = VecDeque::new();
+
+    while acknowledged_subscriptions < subscription_count {
+        let event = timeout(poll_timeout, event_loop.poll())
+            .await
+            .map_err(|_| {
+                iggy_connector_sdk::Error::Connection(
+                    "timed out waiting for MQTT 5 subscription acknowledgements".to_string(),
+                )
+            })?
+            .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+
+        match event {
+            Mqtt5Event::Incoming(Mqtt5Incoming::SubAck(suback)) => {
+                if let Some(reason) = suback.return_codes.iter().find(|reason| {
+                    !matches!(
+                        reason,
+                        rumqttc::v5::mqttbytes::v5::SubscribeReasonCode::Success(_)
+                    )
+                }) {
+                    return Err(iggy_connector_sdk::Error::Connection(format!(
+                        "MQTT 5 broker rejected subscription (packet id {}): {reason:?}",
+                        suback.pkid
+                    )));
+                }
+                acknowledged_subscriptions += 1;
+            }
+            Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
+                buffered_messages.push_back(normalize_mqtt5(publish)?);
+            }
+            Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => {}
+        }
+    }
+
+    Ok(buffered_messages)
 }
 
 fn normalize_mqtt311(
@@ -714,16 +770,27 @@ fn metadata_headers(
     // Stable lowercase header names let consumers inspect MQTT metadata without
     // decoding the original MQTT packet again.
     let mut headers = BTreeMap::new();
-    insert_string_header(&mut headers, "mqtt.protocol", protocol)?;
-    insert_string_header(&mut headers, "mqtt.topic", topic)?;
-    headers.insert(header_key("mqtt.qos")?, qos_value(metadata.qos).into());
-    headers.insert(header_key("mqtt.dup")?, metadata.dup.into());
-    headers.insert(header_key("mqtt.retain")?, metadata.retain.into());
+    insert_string_header(
+        &mut headers,
+        &MQTT_PROTOCOL_HEADER_KEY,
+        MQTT_PROTOCOL_HEADER,
+        protocol,
+    )?;
+    insert_string_header(
+        &mut headers,
+        &MQTT_TOPIC_HEADER_KEY,
+        MQTT_TOPIC_HEADER,
+        topic,
+    )?;
+    headers.insert(MQTT_QOS_HEADER_KEY.clone(), qos_value(metadata.qos).into());
+    headers.insert(MQTT_DUP_HEADER_KEY.clone(), metadata.dup.into());
+    headers.insert(MQTT_RETAIN_HEADER_KEY.clone(), metadata.retain.into());
     Ok(headers)
 }
 
 fn insert_string_header(
     headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    key: &HeaderKey,
     name: &str,
     value: &str,
 ) -> Result<(), iggy_connector_sdk::Error> {
@@ -741,7 +808,7 @@ fn insert_string_header(
             "invalid MQTT header value for {name}: {error}"
         ))
     })?;
-    headers.insert(header_key(name)?, header_value);
+    headers.insert(key.clone(), header_value);
     Ok(())
 }
 
@@ -754,12 +821,6 @@ fn warn_omitted_header(name: &str, reason: &str, value_length: usize) {
         max_length = MAX_HEADER_VALUE_LENGTH,
         "MQTT metadata header omitted"
     );
-}
-
-fn header_key(name: &str) -> Result<HeaderKey, iggy_connector_sdk::Error> {
-    HeaderKey::try_from(name).map_err(|error| {
-        iggy_connector_sdk::Error::Serialization(format!("invalid MQTT header key {name}: {error}"))
-    })
 }
 
 fn qos_value(qos: Qos) -> u8 {
@@ -853,30 +914,17 @@ mod tests {
         let headers = &received.message.headers;
 
         assert_eq!(
-            headers[&header_key("mqtt.protocol").unwrap()]
-                .as_str()
-                .unwrap(),
+            headers[&MQTT_PROTOCOL_HEADER_KEY].as_str().unwrap(),
             "mqtt311"
         );
         assert_eq!(
-            headers[&header_key("mqtt.topic").unwrap()]
-                .as_str()
-                .unwrap(),
+            headers[&MQTT_TOPIC_HEADER_KEY].as_str().unwrap(),
             "devices/test"
         );
-        assert_eq!(
-            headers[&header_key("mqtt.qos").unwrap()]
-                .as_uint8()
-                .unwrap(),
-            1
-        );
-        assert!(!headers.contains_key(&header_key("mqtt.packet_id").unwrap()));
-        assert!(headers[&header_key("mqtt.dup").unwrap()].as_bool().unwrap());
-        assert!(
-            headers[&header_key("mqtt.retain").unwrap()]
-                .as_bool()
-                .unwrap()
-        );
+        assert_eq!(headers[&MQTT_QOS_HEADER_KEY].as_uint8().unwrap(), 1);
+        assert!(!headers.contains_key(&MQTT_PACKET_ID_HEADER_KEY));
+        assert!(headers[&MQTT_DUP_HEADER_KEY].as_bool().unwrap());
+        assert!(headers[&MQTT_RETAIN_HEADER_KEY].as_bool().unwrap());
     }
 
     #[test]
@@ -891,13 +939,13 @@ mod tests {
             !received
                 .message
                 .headers
-                .contains_key(&header_key("mqtt.topic").unwrap())
+                .contains_key(&MQTT_TOPIC_HEADER_KEY)
         );
         assert!(
             received
                 .message
                 .headers
-                .contains_key(&header_key("mqtt.protocol").unwrap())
+                .contains_key(&MQTT_PROTOCOL_HEADER_KEY)
         );
     }
 
@@ -921,13 +969,13 @@ mod tests {
             !received
                 .message
                 .headers
-                .contains_key(&header_key("mqtt.response_topic").unwrap())
+                .contains_key(&MQTT_RESPONSE_TOPIC_HEADER_KEY)
         );
         assert!(
             received
                 .message
                 .headers
-                .contains_key(&header_key("mqtt.topic").unwrap())
+                .contains_key(&MQTT_TOPIC_HEADER_KEY)
         );
     }
 
@@ -1112,7 +1160,6 @@ mod tests {
                 ca_file: Some("/path/that/does/not/exist.pem".to_string()),
                 client_cert_file: None,
                 client_key_file: None,
-                server_name: Some("127.0.0.1".to_string()),
             }),
             client_id: Some("test-source".to_string()),
             username: None,
