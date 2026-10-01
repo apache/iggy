@@ -232,7 +232,7 @@ records, in request order. One uncompressed batch per partition.
 | Field | Gateway |
 | ----- | ------- |
 | Partition, offset | As sent. Both systems count from 0. |
-| Iggy replica | The one on the node the bridge connects to. |
+| Iggy replica | The one on the node each bridge client is on. Every client signs in at the metadata leader, and a view change or a refused call can move it. So in a cluster, a probe and a poll can read nodes that are not at the same offset. |
 | Offset below the oldest kept one | Reads from the oldest kept one. If none is kept, no records until the next write, because a cluster replica that lost records after a crash reads the same. Kafka answers `1` here, so `auto.offset.reset=none` gets no error. |
 | Purge | Iggy restarts the partition at offset 0, and Fetch cannot see it. Seek consumers to 0 after a purge. Otherwise writes past a consumer's old offset make it skip the records below. |
 | `high_watermark` | One past the last committed offset. |
@@ -249,9 +249,9 @@ records, in request order. One uncompressed batch per partition.
 
 | Code | When | Java consumer |
 | ---- | ---- | ------------- |
-| `OFFSET_OUT_OF_RANGE` (1) | Offset below 0, or past `high_watermark`. A partition with no offset past 0 answers 6 instead for its first 30 s, because Iggy reports that while it loads or fences one. | Resets its offset (`auto.offset.reset`). |
+| `OFFSET_OUT_OF_RANGE` (1) | Offset below 0. Or an offset still past `high_watermark` after 30 s of 6 on the same connection, counted from its first 6 there. A read there in range starts the 30 s over. A node that lags clears within them. A partition with no offset past 0 never answers 1, because Iggy reports that while it loads, fences or rebuilds one. | Resets its offset (`auto.offset.reset`). |
 | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Topic or partition not in Iggy, or a name Kafka refuses | Refreshes metadata, retries. |
-| `NOT_LEADER_OR_FOLLOWER` (6) | Iggy unreachable, too slow, not signed in, loading the partition, or returning no records where it reports some. Alone, it goes out after `max_wait_ms`. | Refreshes metadata, retries. |
+| `NOT_LEADER_OR_FOLLOWER` (6) | Iggy unreachable, too slow, not signed in, loading the partition, returning no records where it reports some, or an offset past the end (see 1). Alone, it goes out after `max_wait_ms`. | Refreshes metadata, retries. |
 | `TOPIC_AUTHORIZATION_FAILED` (29) | The bridge's Iggy user lacks permission. Fetch reads as that user, not as the client. | Fails. |
 | `UNKNOWN_SERVER_ERROR` (-1) | Anything else, such as a stored message the gateway cannot map. Alone, it goes out after `max_wait_ms`. Each connection reads the partition again at most once per `max_wait_ms`. | Retries the same offset. |
 | `FETCH_SESSION_ID_NOT_FOUND` (70) | Top level. The request continues a session. | Sends a full request. |
@@ -262,19 +262,31 @@ Limits:
 
 - 20 s per request, wait included, so a waiting Fetch fits the 25 s shutdown drain. Partitions
   not read by then answer `0` with no records.
-- 4 requests read and encode at once. A waiting request, a probe that confirms an empty poll, or a
-  response on a slow socket holds no slot. So response memory grows with connections: `max_bytes`
+- 4 requests read and encode at once. A waiting request, the probes that decide empty polls, or a
+  response on a slow socket hold no slot. So response memory grows with connections: `max_bytes`
   each, or one larger record.
 - A message the gateway cannot map stops the consumer at its offset. Records before it are served.
   The log shows it once per connection at `warn`.
 - Each slot polls on its own Iggy client, which connects at the slot's first poll. A poll ends at
-  the request deadline, so a partition that Iggy refuses holds up only its own slot.
+  the request deadline, so a partition that Iggy refuses holds up only its own slot. The SDK can
+  hold that connection for up to 30 s more, so the slot drops the client and connects a new one.
 - Iggy polls by count, not bytes. One poll can load 16 of the largest messages: about 1 GB, and
-  about 4 GB over the 4 slots. It also costs polls: 1000 small records take 63. A byte cap on Iggy
-  polls would lift both.
+  about 4 GB over the 4 slots. It also costs polls: 1000 small records take 63. When Iggy polls
+  take a byte cap, both limits go away.
+- Probes run on one more Iggy client of their own, so they never wait behind a Produce. A request
+  waits at most 2 s for its probes, then reads with what it has.
 - A request loads at most 100 new topic probes per round, the oldest first. Other topics use an
   older probe. A waiting request probes 100 topics per round, in turn.
-- A probe that fails with 6 or -1 leaves the last good probe in use, and the polls decide.
+- An empty poll waits for a probe of its topic that starts after it. A read takes one such probe
+  per topic, after its last empty poll there, for at most 100 topics. The other empty polls answer
+  no records.
+- A partition with no room left in `max_bytes` gets no poll, unless the request still owes its
+  first record.
+- A probe that fails with 6 or -1 leaves the last good probe in use for up to 30 s, and the polls
+  decide. That probe never proves a consumer caught up, so an offset at its end gets a poll too.
+- A partition that Iggy reports as loading answers 6 for 30 s, counted for the whole gateway.
+  After that, Fetch polls it and the log warns once. Counters that drift read the same way.
+  `ListOffsets` answers 6 for it all along, and warns too.
 - A Produce through the gateway wakes a waiting Fetch of that topic at once. That includes a
   Produce that ends during the Fetch's first read. A native Iggy write wakes it at the next probe,
   within about 200 ms.
@@ -359,15 +371,16 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-- One `IggyClient` serves every Kafka connection, one Iggy request at a time. Fetch polls use 4
-  more, one per read slot.
+- One `IggyClient` serves Produce, Metadata and CreateTopics for every Kafka connection, one Iggy
+  request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
 - `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in
   [docs/SCOPE.md](docs/SCOPE.md).
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
   can land after later ones.
 
 Fetches share topic probes: one `get_topic` per topic at a time, for all consumers together, on
-that same client. A caught-up consumer of a busy topic can start one per Fetch.
+the probe client. A caught-up consumer of a busy topic can start one per Fetch. A waiting Fetch
+costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on that client too.
 
 ### Error mapping
 

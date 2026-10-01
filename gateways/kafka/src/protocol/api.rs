@@ -308,8 +308,9 @@ pub struct GatewayState {
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
-    /// Per Kafka topic and partition, how long Fetch finds it not ready.
-    pub(crate) not_ready: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, how long probes read it as loading. Fetch and `ListOffsets`
+    /// share it, since every consumer sees the same probe.
+    pub(crate) loading: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
 }
@@ -336,7 +337,7 @@ impl GatewayState {
             producer_ids: ProducerIdAllocator::new(instance_id),
             produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
             groups,
-            not_ready: Mutex::default(),
+            loading: Mutex::default(),
             probe_board: ProbeBoard::default(),
         }
     }
@@ -359,12 +360,15 @@ impl GatewayState {
 
 /// What a handler keeps for one Kafka connection, across its requests.
 ///
-/// Fetch keeps its -1 holds here. One consumer's stuck offset then neither skips another
-/// consumer's read of it nor replaces the hold of a consumer stuck elsewhere in the partition.
+/// Fetch keeps its -1 holds and the offsets it cannot place here. One consumer's stuck offset then
+/// neither skips another consumer's read of it nor replaces the hold of a consumer stuck elsewhere
+/// in the partition, and one consumer's wait for an offset never spends another's grace.
 #[derive(Default)]
 pub struct ConnectionState {
     /// Partitions that answered -1 to this connection's Fetches, per Kafka topic.
     pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
+    /// Offsets this connection's Fetches cannot place, per Kafka topic.
+    pub(crate) unplaced: Mutex<fetch::Unplaced>,
 }
 
 /// Default `max_frame_size` used by [`handle_request`] - the direct call sites across this

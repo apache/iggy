@@ -47,13 +47,28 @@ pub struct Snapshot {
     pub started: Instant,
     pub probe: TopicProbed,
     /// When `probe` failed, the newest probe of the topic that did not.
-    pub last_good: Option<Arc<TopicProbe>>,
+    pub last_good: Option<Good>,
+}
+
+/// A probe that succeeded, and when its `get_topic` started.
+#[derive(Debug, Clone)]
+pub struct Good {
+    pub started: Instant,
+    pub probe: Arc<TopicProbe>,
 }
 
 impl Snapshot {
     /// The newest probe of the topic that succeeded: this one, or the one before it failed.
-    pub fn good(&self) -> Option<&Arc<TopicProbe>> {
-        self.probe.as_ref().ok().or(self.last_good.as_ref())
+    pub fn good(&self) -> Option<Good> {
+        self.probe.as_ref().map_or_else(
+            |_| self.last_good.clone(),
+            |probe| {
+                Some(Good {
+                    started: self.started,
+                    probe: Arc::clone(probe),
+                })
+            },
+        )
     }
 }
 
@@ -158,7 +173,7 @@ impl ProbeBoard {
                             .newest
                             .borrow()
                             .as_ref()
-                            .and_then(|newest| newest.good().cloned()),
+                            .and_then(|newest| newest.good()),
                     };
                     topic.newest.send_replace(Some(Arc::new(Snapshot {
                         started,
@@ -354,7 +369,8 @@ mod tests {
             .probe("a", Instant::now(), deadline, done)
             .await
             .unwrap();
-        let good = Arc::clone(first.good().expect("the first probe succeeded"));
+        let good = first.good().expect("the first probe succeeded");
+        assert_eq!(good.started, first.started);
 
         for _ in 0..2 {
             sleep(Duration::from_millis(1)).await;
@@ -364,7 +380,11 @@ mod tests {
                 .unwrap();
             assert_eq!(failed.probe, Err(6));
             let kept = failed.good().expect("the last good probe");
-            assert!(Arc::ptr_eq(kept, &good), "kept through each failure");
+            assert!(
+                Arc::ptr_eq(&kept.probe, &good.probe),
+                "kept through each failure"
+            );
+            assert_eq!(kept.started, first.started, "with the time it started");
         }
 
         sleep(Duration::from_millis(1)).await;

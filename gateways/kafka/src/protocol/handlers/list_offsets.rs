@@ -18,6 +18,7 @@
 //! `ListOffsets` (API key 2).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
@@ -35,6 +36,7 @@ use crate::protocol::api::{
     HandleOutcome, REQUEST_DEADLINE, UNKNOWN_OFFSET,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
+use crate::protocol::handlers::fetch::{Spells, sight_loading};
 use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -86,7 +88,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 
     // No `timeout_ms` below v10, so the ceiling is fixed. It bounds the sum of the topic calls.
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let topics = resolve_all_topics(bridge, &req.topics, deadline).await;
+    let topics = resolve_all_topics(bridge, &state.loading, &req.topics, deadline).await;
     let resp = ListOffsetsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets")
 }
@@ -151,8 +153,13 @@ fn group_requested_topics(requested: &[ListOffsetsTopic]) -> (Vec<&str>, HashMap
 /// when time runs out keeps its real answer. A topic with no *valid* partition index at all
 /// skips the call - there is nothing `high_watermarks` could tell us that would change any
 /// partition's answer, since every one of them already fails its own index check.
+///
+/// A partition that reads as loading counts toward its `loading` spell, so the log shows one that
+/// stays so. It answers 6 past the grace too: a high watermark read during a load is too low, and
+/// a consumer that seeks to it reads those records again.
 async fn resolve_topic_lookups<'a>(
     bridge: &IggyBridge,
+    loading: &Mutex<Spells>,
     order: &[&'a str],
     partitions_by_name: &HashMap<&'a str, Vec<u32>>,
     deadline: Instant,
@@ -226,6 +233,11 @@ async fn resolve_topic_lookups<'a>(
                 tracing::error!(topic = name, %call_err, "ListOffsets bridge lookup failed");
             }
         }
+        for (partition, watermark) in result.iter().flatten() {
+            if matches!(watermark, Err(BridgeError::PartitionLoading { .. })) {
+                sight_loading(loading, name, *partition, Instant::now());
+            }
+        }
         lookups.insert(name, TopicLookup::Watermarks(result));
     }
     lookups
@@ -238,11 +250,13 @@ async fn resolve_topic_lookups<'a>(
 /// [`ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT`] rather than a fabricated offset.
 async fn resolve_all_topics(
     bridge: &IggyBridge,
+    loading: &Mutex<Spells>,
     requested: &[ListOffsetsTopic],
     deadline: Instant,
 ) -> Vec<ListOffsetsTopicResponse> {
     let (order, partitions_by_name) = group_requested_topics(requested);
-    let lookups = resolve_topic_lookups(bridge, &order, &partitions_by_name, deadline).await;
+    let lookups =
+        resolve_topic_lookups(bridge, loading, &order, &partitions_by_name, deadline).await;
 
     requested
         .iter()

@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use iggy::prelude::{HeaderKey, HeaderValue, Identifier, IggyMessage, MessageClient, Partitioning};
+use iggy::prelude::{
+    HeaderKey, HeaderValue, Identifier, IggyMessage, MessageClient, Partitioning, TopicClient,
+};
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::fetch_response::PartitionData;
@@ -45,7 +47,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_FETCH, API_KEY_PRODUCE, BrokerAdvertise, GatewayState, handle_request_bounded,
+    API_KEY_FETCH, API_KEY_PRODUCE, BrokerAdvertise, ConnectionState, GatewayState,
+    handle_connection_request, handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
@@ -149,6 +152,48 @@ async fn send(server: &TestServer, partition: u32, messages: &mut [IggyMessage])
         .expect("store the messages");
 }
 
+/// A message that claims a mapping version this build does not read.
+fn unmappable() -> IggyMessage {
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        HeaderKey::try_from(VERSION_HEADER).expect("valid header name"),
+        HeaderValue::try_from(&[MAPPING_VERSION + 1][..]).expect("valid header value"),
+    );
+    IggyMessage::builder()
+        .payload(Bytes::from_static(b"v"))
+        .user_headers(headers)
+        .build()
+        .expect("valid message")
+}
+
+/// Purges the topic, and waits until every partition reads empty.
+async fn purge(server: &TestServer) {
+    let client = raw_client(server).await;
+    let stream = Identifier::named(STREAM).expect("valid stream name");
+    let topic = Identifier::named(TOPIC).expect("valid topic name");
+    client
+        .purge_topic(&stream, &topic)
+        .await
+        .expect("purge the topic");
+    let deadline = Instant::now() + PROMPT;
+    loop {
+        let details = client
+            .get_topic(&stream, &topic)
+            .await
+            .expect("read the topic")
+            .expect("the topic outlives a purge");
+        let empty = details
+            .partitions
+            .iter()
+            .all(|partition| partition.current_offset == 0 && partition.messages_count == 0);
+        if empty {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the purge never showed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A consumer's full request for `topic`, each partition as `(index, fetch_offset)`.
 fn request(topic: &str, partitions: &[(i32, i64)]) -> FetchRequest {
     FetchRequest::default()
@@ -192,6 +237,27 @@ async fn fetch(state: &GatewayState, request: &FetchRequest) -> FetchResponse {
     tokio::time::timeout(PROMPT, fetch_at(state, VERSION, request))
         .await
         .expect("records or an error answer at once")
+}
+
+/// [`fetch`] as one request of `connection`, which keeps what its earlier Fetches left.
+async fn fetch_on(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    request: &FetchRequest,
+) -> FetchResponse {
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, VERSION)
+        .expect("the request encodes at this version");
+    let handled =
+        handle_connection_request(state, connection, API_KEY_FETCH, VERSION, body.freeze());
+    let mut response = tokio::time::timeout(PROMPT, handled)
+        .await
+        .expect("records or an error answer at once")
+        .expect_response("Fetch always answers");
+    let decoded = FetchResponse::decode(&mut response, VERSION).expect("a Kafka client decodes it");
+    assert!(response.is_empty(), "no bytes after the response");
+    decoded
 }
 
 /// The one partition of an answer to a one-partition request.
@@ -450,19 +516,7 @@ async fn given_a_message_that_does_not_map_when_fetching_should_answer_minus_one
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        HeaderKey::try_from(VERSION_HEADER).expect("valid header name"),
-        HeaderValue::try_from(&[MAPPING_VERSION + 1][..]).expect("valid header value"),
-    );
-    let mut messages = vec![
-        IggyMessage::builder()
-            .payload(Bytes::from_static(b"v"))
-            .user_headers(headers)
-            .build()
-            .expect("valid message"),
-    ];
-    send(&server, 0, &mut messages).await;
+    send(&server, 0, &mut [unmappable()]).await;
     let max_wait = Duration::from_millis(300);
 
     let started = Instant::now();
@@ -476,6 +530,45 @@ async fn given_a_message_that_does_not_map_when_fetching_should_answer_minus_one
     );
     assert!(waited < PROMPT, "answered after {waited:?}");
     assert_refused(only(&response), ERROR_UNKNOWN_SERVER_ERROR);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_minus_one_holds_on_two_connections_when_both_retry_should_keep_each_its_own() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 2).await;
+    store(&server, 0, &[keyed(b"a")]).await;
+    send(&server, 0, &mut [unmappable(), unmappable()]).await;
+    store(&server, 1, &[keyed(b"b")]).await;
+
+    // Records on partition 1 end each request at once, and the -1 on partition 0 holds it for
+    // the whole wait the request allowed.
+    let (stuck_at_1, stuck_at_2) = (ConnectionState::default(), ConnectionState::default());
+    for (connection, offset) in [(&stuck_at_1, 1), (&stuck_at_2, 2)] {
+        let held = request(TOPIC, &[(0, offset), (1, 0)]).with_max_wait_ms(18_000);
+        let response = fetch_on(&state, connection, &held).await;
+        let partitions = &response.responses[0].partitions;
+        assert_refused(&partitions[0], ERROR_UNKNOWN_SERVER_ERROR);
+        assert_eq!(values(&partitions[1]), vec![Some(Bytes::from_static(b"b"))]);
+    }
+
+    // A read of partition 0 now finds nothing, so only a hold answers -1 there.
+    purge(&server).await;
+    let at = |offset| request(TOPIC, &[(0, offset)]).with_max_wait_ms(0);
+    assert_refused(
+        only(&fetch_on(&state, &stuck_at_1, &at(1)).await),
+        ERROR_UNKNOWN_SERVER_ERROR,
+    );
+    assert_refused(
+        only(&fetch_on(&state, &stuck_at_2, &at(2)).await),
+        ERROR_UNKNOWN_SERVER_ERROR,
+    );
+    let fresh = ConnectionState::default();
+    assert_refused(
+        only(&fetch_on(&state, &fresh, &at(2)).await),
+        ERROR_NOT_LEADER_OR_FOLLOWER,
+    );
 }
 
 #[tokio::test]
@@ -500,14 +593,15 @@ async fn given_zero_max_wait_when_fetching_should_answer_at_once() {
 
 #[tokio::test]
 #[serial]
-async fn given_offset_past_high_watermark_when_fetching_should_return_offset_out_of_range() {
+async fn given_offset_past_high_watermark_when_fetching_should_answer_6_within_the_grace() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
     store(&server, 0, &[keyed(b"a"), keyed(b"b")]).await;
 
-    let past = fetch(&state, &request(TOPIC, &[(0, 3)])).await;
-    assert_refused(only(&past), ERROR_OFFSET_OUT_OF_RANGE);
+    // An Iggy node that lags reads the same, so a 1 waits out the connection's 30 s grace.
+    let past = fetch(&state, &request(TOPIC, &[(0, 3)]).with_max_wait_ms(0)).await;
+    assert_refused(only(&past), ERROR_NOT_LEADER_OR_FOLLOWER);
 
     let negative = fetch(&state, &request(TOPIC, &[(0, -1)])).await;
     assert_refused(only(&negative), ERROR_OFFSET_OUT_OF_RANGE);
