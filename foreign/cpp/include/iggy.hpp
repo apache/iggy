@@ -2339,6 +2339,18 @@ class Stats final {
      */
     [[nodiscard]] std::uint64_t TotalDiskSpace() const noexcept { return total_disk_space_; }
 
+    /**
+     * @brief Returns the number of file descriptors the server process holds open.
+     * @return Open descriptor count, or zero when the server cannot count them.
+     */
+    [[nodiscard]] std::uint64_t OpenFilesCount() const noexcept { return open_files_count_; }
+
+    /**
+     * @brief Returns the server's soft `RLIMIT_NOFILE`, the count at which opens fail.
+     * @return Descriptor limit, or zero when the server cannot read it.
+     */
+    [[nodiscard]] std::uint64_t OpenFilesLimit() const noexcept { return open_files_limit_; }
+
   private:
     Stats(std::uint32_t process_id,
           float cpu_usage,
@@ -2367,7 +2379,9 @@ class Stats final {
           std::vector<CacheMetricEntry> cache_metrics,
           std::uint32_t threads_count,
           std::uint64_t free_disk_space,
-          std::uint64_t total_disk_space)
+          std::uint64_t total_disk_space,
+          std::uint64_t open_files_count,
+          std::uint64_t open_files_limit)
         : process_id_(process_id),
           cpu_usage_(cpu_usage),
           total_cpu_usage_(total_cpu_usage),
@@ -2395,7 +2409,9 @@ class Stats final {
           cache_metrics_(std::move(cache_metrics)),
           threads_count_(threads_count),
           free_disk_space_(free_disk_space),
-          total_disk_space_(total_disk_space) {}
+          total_disk_space_(total_disk_space),
+          open_files_count_(open_files_count),
+          open_files_limit_(open_files_limit) {}
 
     static Stats FromFfi(ffi::Stats stats);
 
@@ -2429,6 +2445,8 @@ class Stats final {
     std::uint32_t threads_count_;
     std::uint64_t free_disk_space_;
     std::uint64_t total_disk_space_;
+    std::uint64_t open_files_count_;
+    std::uint64_t open_files_limit_;
 };
 
 /**

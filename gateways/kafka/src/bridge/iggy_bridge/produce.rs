@@ -21,17 +21,13 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 use iggy::prelude::{IggyError, IggyMessage, MessageClient, Partitioning};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{IggyBridge, TopicTarget};
+use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot};
 use crate::bridge::error::BridgeError;
-
-/// How long a send may hold the slot: the SDK read deadline (30 s) plus a reconnect (15 s).
-const SEND_LIMIT: Duration = Duration::from_secs(45);
 
 /// Frame bytes besides the messages: request header, batch header and ids.
 const SEND_FRAME_ROOM: u64 = 4 * 1024;
@@ -51,7 +47,7 @@ impl IggyBridge {
     /// `Ok(None)`: committed, but the server named no offset (a duplicate request, or a journal
     /// entry that is gone). Do not retry it.
     ///
-    /// A stuck send holds the slot up to `SEND_LIMIT`. Other sends answer 7 meanwhile.
+    /// A stuck send holds the slot up to `SLOT_LIMIT`. Other sends answer 7 meanwhile.
     ///
     /// # Errors
     ///
@@ -96,20 +92,16 @@ async fn send_in_slot<T: Send + 'static>(
         Ok(Ok(permit)) if Instant::now() < deadline => permit,
         _ => return Err(BridgeError::Timeout),
     };
-    let (sender, receiver) = oneshot::channel();
-    tokio::spawn(async move {
-        let result = match timeout(SEND_LIMIT, send).await {
+    let send = async move {
+        match timeout(SLOT_LIMIT, send).await {
             Ok(result) => result.map_err(send_error),
             Err(_elapsed) => Err(BridgeError::Timeout),
-        };
-        drop(permit);
-        // The caller may have stopped waiting.
-        let _ = sender.send(result);
-    });
-    match timeout_at(deadline, receiver).await {
-        Ok(Ok(result)) => result,
-        _ => Err(BridgeError::Timeout),
-    }
+        }
+    };
+    // The permit comes back only to be dropped. A send that outlives the caller frees it in its task.
+    in_slot(permit, deadline, send)
+        .await
+        .map_or(Err(BridgeError::Timeout), |(result, _permit)| result)
 }
 
 /// The SDK does not replay a send after these, so it may have landed.
@@ -126,6 +118,9 @@ const fn send_error(error: IggyError) -> BridgeError {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
 
     use super::*;
 

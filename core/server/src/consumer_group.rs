@@ -1011,8 +1011,8 @@ mod tests {
         let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
             .await
             .unwrap();
-        let messages_size = storage.messages_writer.as_ref().unwrap().size_counter();
-        let index_size = storage.index_writer.as_ref().unwrap().size_counter();
+        let messages_size = storage.messages_size.clone().unwrap();
+        let index_size = storage.index_size.clone().unwrap();
         partition.log.messages_writers_mut()[0] = Some(Rc::new(
             MessagesWriter::new(&messages_path, messages_size, false, false, None)
                 .await

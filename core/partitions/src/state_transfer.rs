@@ -49,6 +49,7 @@ use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -644,6 +645,46 @@ const fn validate_consumer_offset_transfer_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_segment_read_error_when_classifying_should_tell_local_faults_from_stale_offers() {
+        const EIO: i32 = 5;
+
+        assert!(matches!(
+            SegmentLoadError::classify(std::io::Error::from_raw_os_error(EIO)),
+            SegmentLoadError::LocalFault(_)
+        ));
+        assert!(matches!(
+            SegmentLoadError::classify(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            SegmentLoadError::LocalFault(_)
+        ));
+        assert!(matches!(
+            SegmentLoadError::classify(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            SegmentLoadError::Stale(_)
+        ));
+    }
+
+    #[compio::test]
+    async fn given_segment_read_error_when_loading_artifact_should_classify_the_os_error() {
+        // The open succeeds on a directory, and the read then fails with EISDIR.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let entry = consensus::StateArtifact {
+            kind: artifact_kind::SEGMENT_LOG,
+            frontier: 0,
+            len: 1,
+            checksum: 0,
+        };
+
+        let error =
+            load_verified_segment_artifact(directory.path().to_str().expect("UTF-8 path"), &entry)
+                .await
+                .expect_err("a directory holds no segment bytes");
+
+        assert!(
+            matches!(&error, SegmentLoadError::Stale(source) if source.raw_os_error().is_some()),
+            "the read error must reach the classification with its OS code, got {error:?}"
+        );
+    }
 
     #[compio::test]
     async fn given_transient_offset_io_failure_when_retried_should_succeed_without_exhausting_budget()
@@ -1593,7 +1634,8 @@ pub async fn mark_materialization_missing(directory: &str, revision: u64) -> std
         .truncate(true)
         .write(true)
         .open(&temporary)
-        .await?;
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
     file.write_all_at(revision.to_le_bytes().to_vec(), 0)
         .await
         .0?;
@@ -1835,7 +1877,8 @@ async fn discard_offset_writes(planned: &[PlannedOffsetWrite]) {
 /// every other future on the pump keeps running through it.
 pub(crate) async fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
     compio::fs::File::open(partition_dir)
-        .await?
+        .await
+        .note_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))?
         .sync_all()
         .await
 }
@@ -2903,10 +2946,8 @@ where
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
         let namespace_raw = self.consensus().group();
-        while let Some((segment, mut storage)) = self.log.retire_front() {
+        while let Some((segment, storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
             // Anchors go with the chain they describe, as everywhere else.
             // Unreachable for an install today, since anchors are planted only
             // by the solo boot re-anchor, but a record outliving its segment is
@@ -2997,6 +3038,7 @@ where
         // is an `open`+`close` per segment for no durability gain.
         let dir_handle = compio::fs::File::open(partition_dir)
             .await
+            .note_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))
             .map_err(|source| PartitionInstallError::SwapIo {
                 path: partition_dir.to_owned(),
                 source,
@@ -3022,7 +3064,7 @@ where
         // segments with metadata from the validation walk, real storage over
         // the final paths, and writers on the LAST segment only (the
         // hydrate pattern; earlier segments are sealed and never written).
-        for meta in &staged {
+        for (index, meta) in staged.iter().enumerate() {
             let (log_final, index_final) = final_paths(partition_dir, meta.start_offset);
             // Retried once: by this point every rename already landed, so a
             // failed open converges away a chain that is COMPLETE AND DURABLE
@@ -3045,7 +3087,7 @@ where
                         .await
                 }
             };
-            let storage = match open().await {
+            let mut storage = match open().await {
                 Ok(storage) => storage,
                 Err(_) => open()
                     .await
@@ -3054,6 +3096,10 @@ where
                         source,
                     })?,
             };
+            // Only the tail takes writes, as after a rotation.
+            if index + 1 < staged.len() {
+                storage.seal();
+            }
             let mut segment = Segment::new(meta.start_offset, self.effective_segment_size());
             segment.sealed = true;
             segment.start_timestamp = meta.start_timestamp;
@@ -3094,13 +3140,13 @@ where
             let preallocate_segments = self.effective_preallocate_segments(config);
             let last = self.log.segments().len() - 1;
             let storage = self.log.storages()[last].clone();
-            if let (Some(messages_reader), Some(messages_w)) = (
+            if let (Some(messages_reader), Some(messages_size)) = (
                 storage.messages_reader.as_ref(),
-                storage.messages_writer.as_ref(),
+                storage.messages_size.as_ref(),
             ) {
                 let messages_writer = MessagesWriter::new(
                     &messages_reader.path(),
-                    messages_w.size_counter(),
+                    Rc::clone(messages_size),
                     persisted,
                     true,
                     preallocate_segments.then_some(segment_size),
@@ -3112,12 +3158,12 @@ where
                 })?;
                 self.log.messages_writers_mut()[last] = Some(Rc::new(messages_writer));
             }
-            if let (Some(index_reader), Some(index_w)) =
-                (storage.index_reader.as_ref(), storage.index_writer.as_ref())
+            if let (Some(index_reader), Some(index_size)) =
+                (storage.index_reader.as_ref(), storage.index_size.as_ref())
             {
                 let index_writer = IggyIndexWriter::new(
                     &index_reader.path(),
-                    index_w.size_counter(),
+                    Rc::clone(index_size),
                     persisted,
                     true,
                 )
@@ -3510,9 +3556,7 @@ where
         // inodes as live data. Same hazard and same fix as `purge`.
         self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
-        while let Some((_, mut storage)) = self.log.retire_front() {
-            let _ = storage.shutdown();
-        }
+        while self.log.retire_front().is_some() {}
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
         self.consumer_offsets.pin().clear();
@@ -3765,10 +3809,9 @@ async fn hash_segment_range(
         }
         let compio::BufResult(read, returned) = file.read_exact_at(buf, position).await;
         buf = returned;
-        read.map_err(|source| {
-            std::io::Error::other(format!(
-                "reading segment bytes at {position} of {to} failed: {source}"
-            ))
+        // The caller's log line shows the error but not where it happened.
+        read.inspect_err(|error| {
+            tracing::debug!(path, position, to, %error, "reading segment bytes failed");
         })?;
         hasher.update(&buf);
         if let Some(sink) = sink.as_deref_mut() {
@@ -3980,7 +4023,9 @@ fn segment_manifest_digest(manifest: &[consensus::StateArtifact]) -> u64 {
 }
 
 async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()> {
-    let mut file = compio::fs::File::create(path).await?;
+    let mut file = compio::fs::File::create(path)
+        .await
+        .note_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
     let (result, _) = file.write_all_at(payload, 0).await.into();
     result?;
     file.sync_data().await?;

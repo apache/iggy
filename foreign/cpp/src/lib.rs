@@ -304,6 +304,10 @@ mod ffi {
         threads_count: u32,
         free_disk_space: u64,
         total_disk_space: u64,
+        // `0` when the server cannot count its open file descriptors.
+        open_files_count: u64,
+        // `0` when the server cannot read its soft `RLIMIT_NOFILE`.
+        open_files_limit: u64,
     }
 
     struct TransportEndpoints {

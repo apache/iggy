@@ -27,18 +27,29 @@
 //! with a real `IggyAuthenticator`, and a client from a container. They automate categories S and T
 //! of `docs/MANUAL_TESTING.md`.
 //!
+//! The Fetch tests swap the authenticator for a bridge: kcat writes records through Produce, and
+//! kcat and the Java consumer read them back through Fetch.
+//!
 //! Prerequisites are Docker and an already-built `iggy-server`. Missing either skips, the way the
 //! wire-fixture suites do, unless `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure
 //! so a broken CI step cannot leave these silently green.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use iggy_gateway_kafka::GatewayConfig;
+use secrecy::SecretString;
+use tokio::sync::broadcast;
+
 use iggy_gateway_kafka::auth::IggyAuthenticator;
+use iggy_gateway_kafka::bridge::{
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, TopicMapping,
+};
+use iggy_gateway_kafka::server::bind_listener;
+use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[path = "common/server.rs"]
 mod server;
@@ -51,6 +62,10 @@ const ROOT_USER: &str = "iggy";
 const ROOT_PASSWORD: &str = "iggy";
 /// Password for every non-root principal these tests create.
 const USER_PASSWORD: &str = "s3cretpass";
+/// The topic the bridged tests write to and read from. It has one partition.
+const TOPIC: &str = "orders";
+/// What the bridged tests write, as `(key, value)`, and read back in this order.
+const RECORDS: [(&str, &str); 3] = [("k1", "alpha"), ("k2", "beta"), ("k3", "gamma")];
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -261,6 +276,40 @@ async fn spawn_gateway(iggy_address: &str) -> SocketAddr {
     addr
 }
 
+/// Starts the gateway with a bridge to `server` and SASL off. Creates `TOPIC` first, because
+/// neither Produce nor Fetch creates one.
+async fn spawn_bridged_gateway(server: &TestServer) -> SocketAddr {
+    let config = IggyBridgeConfig {
+        address: server.address.clone(),
+        username: ROOT_USER.to_string(),
+        password: SecretString::from(ROOT_PASSWORD.to_string()),
+        topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
+            .expect("the default mapping is valid"),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+    };
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects to a ready server");
+    bridge
+        .ensure_stream_and_topic(TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let config = GatewayConfig {
+        bind_addr: addr.to_string(),
+        ..GatewayConfig::default()
+    };
+    let gateway = KafkaGateway::new(config).with_bridge(Some(Arc::new(bridge)));
+    let (shutdown, receiver) = broadcast::channel(1);
+    tokio::spawn(async move {
+        let _ = gateway.run(listener, receiver).await;
+    });
+    // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
+    std::mem::forget(shutdown);
+    addr
+}
+
 /// Runs a container against the host network and returns its combined output.
 ///
 /// `--network host` is what lets a containerised client reach a gateway bound to the host's
@@ -428,6 +477,20 @@ fn java_client_config(username: &str, password: &str) -> (tempfile::TempDir, Pat
 
 /// Brings up a server and a gateway, or reports why it could not.
 async fn stack() -> Option<(TestServer, SocketAddr)> {
+    let server = ready_server()?;
+    let gateway = spawn_gateway(&server.address).await;
+    Some((server, gateway))
+}
+
+/// As [`stack`], with a bridged gateway and SASL off.
+async fn bridged_stack() -> Option<(TestServer, SocketAddr)> {
+    let server = ready_server()?;
+    let gateway = spawn_bridged_gateway(&server).await;
+    Some((server, gateway))
+}
+
+/// Brings up a server once every prerequisite holds, or reports why it could not.
+fn ready_server() -> Option<TestServer> {
     if host_unsupported() || docker_missing() {
         return None;
     }
@@ -440,15 +503,47 @@ async fn stack() -> Option<(TestServer, SocketAddr)> {
         ));
         return None;
     }
-    let server = match TestServer::spawn() {
-        Ok(server) => server,
+    match TestServer::spawn() {
+        Ok(server) => Some(server),
         Err(reason) => {
             skip(&reason);
-            return None;
+            None
         }
-    };
-    let gateway = spawn_gateway(&server.address).await;
-    Some((server, gateway))
+    }
+}
+
+/// Writes `RECORDS` to partition 0 of `TOPIC` through the gateway, with kcat's producer and one
+/// header on each record.
+fn produce_with_kcat(gateway: SocketAddr) {
+    let dir = tempfile::tempdir().expect("create records dir");
+    let path = dir.path().join("records.txt");
+    let lines = RECORDS
+        .map(|(key, value)| format!("{key}:{value}\n"))
+        .join("");
+    std::fs::write(&path, lines).expect("write records");
+    run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &gateway.to_string(),
+            "-P",
+            "-t",
+            TOPIC,
+            "-p",
+            "0",
+            "-K",
+            ":",
+            "-H",
+            "trace=e2e",
+            "-l",
+            "/tmp/records.txt",
+        ],
+        &[(
+            path.to_str().expect("records path is utf-8"),
+            "/tmp/records.txt",
+        )],
+    )
+    .expect_ran("kcat produce");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -722,4 +817,106 @@ fn list_acls(gateway: SocketAddr, username: &str, password: &str) -> String {
         )],
     )
     .expect_ran(&format!("listing ACLs as {username}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back_in_order() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway);
+    // `-e` stops at the end of the partition, which kcat takes from the high watermark that Fetch
+    // sends. A wrong watermark stops it early or holds it until the container timeout.
+    let output = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &gateway.to_string(),
+            "-C",
+            "-t",
+            TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "record %o %k=%s %h\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat consume");
+    let read: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect();
+    let expected: Vec<String> = RECORDS
+        .iter()
+        .enumerate()
+        .map(|(offset, (key, value))| format!("record {offset} {key}={value} trace=e2e"))
+        .collect();
+    assert_eq!(
+        read, expected,
+        "librdkafka must read every record in order, with its key and header, got: {output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "Reached end of topic {TOPIC} [0] at offset {}",
+            RECORDS.len()
+        )),
+        "kcat must stop at the high watermark, got: {output}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_records_when_the_java_consumer_reads_the_partition_should_get_them_in_order() {
+    // A second Fetch client with its own code: the Java consumer resolves `earliest` through
+    // ListOffsets, then fetches. `--partition` makes it assign the partition, with no group
+    // offsets to load or commit.
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway);
+    let count = RECORDS.len().to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--partition",
+            "0",
+            "--offset",
+            "earliest",
+            "--max-messages",
+            &count,
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer");
+    let read: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("Offset:"))
+        .collect();
+    let expected: Vec<String> = RECORDS
+        .iter()
+        .enumerate()
+        .map(|(offset, (key, value))| format!("Offset:{offset}\t{key}\t{value}"))
+        .collect();
+    assert_eq!(
+        read, expected,
+        "the Java consumer must read every record in order, with its key, got: {output}"
+    );
+    assert!(
+        output.contains(&format!("Processed a total of {count} messages")),
+        "the Java consumer must stop after the records it asked for, got: {output}"
+    );
 }

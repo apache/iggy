@@ -147,6 +147,7 @@ Repo-wide, user-invoked only. `disable-model-invocation: true` keeps it
 out of the agent's context; do not replicate its steps. When a
 non-trivial change passes verification, suggest `/team-review <target>`.
 
+- [connector-review](.claude/skills/connector-review/SKILL.md) - adversarial connectors PR/branch review with validation
 - [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
 
 ## Repo-wide principles

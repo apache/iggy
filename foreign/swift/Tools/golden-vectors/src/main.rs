@@ -1258,6 +1258,8 @@ fn main() {
             threads_count: 16,
             free_disk_space: 107_374_182_400,
             total_disk_space: 512_110_190_592,
+            open_files_count: 128,
+            open_files_limit: 10_240,
         },
     );
     add(

@@ -172,7 +172,7 @@ pub mod le_cursor;
 pub use client_table::{
     CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableMode,
     ClientTableSnapshot, ClientTableWireError, CommitReply, DISCONNECT_LOGOUT_REQUEST_ID,
-    DedupWatermark, FenceSnapshot, SessionEnd,
+    DedupWatermark, FenceSnapshot, RESERVED_CLIENT_ID, SessionEnd,
 };
 pub mod state_manifest;
 pub use state_manifest::{
@@ -188,8 +188,7 @@ pub use state_transfer::{
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver, Sender, channel as oneshot_channel};
 
-mod fatal;
-pub use fatal::{FatalReason, fatal};
+pub use server_common::fatal::{FatalReason, fatal};
 
 mod impls;
 pub use impls::*;
