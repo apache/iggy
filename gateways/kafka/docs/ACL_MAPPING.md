@@ -22,10 +22,8 @@ not rendered. See [What is not mapped](#what-is-not-mapped).
 
 ## Why this is worth doing before the data plane exists
 
-Authorization cannot be *enforced* yet. Produce and Fetch are stubs
-([#3535](https://github.com/apache/iggy/issues/3535),
-[#3536](https://github.com/apache/iggy/issues/3536)), so there is no operation to gate, and the
-verified identity is currently discarded.
+Authorization cannot be *enforced* yet. Produce and Fetch act as the bridge's Iggy user for every
+client, so no operation runs as the principal, and the verified identity is discarded.
 
 `DescribeAcls` is the one authorization surface that needs neither. It is a read: take the
 authenticated principal, take the permissions Iggy already holds for it, and answer in Kafka's
