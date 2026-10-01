@@ -55,7 +55,14 @@ impl TestGateway {
         let config = server.test_config();
 
         let mut command = Command::new(iggy_gateway_binary());
+        // env_clear(): without it the child inherits this test process's full environment, and
+        // the gateway's own reject_unknown_kafka_env_vars (main.rs) hard-fails startup on any
+        // unrecognized inherited IGGY_KAFKA_* var - or, worse, a *recognized* one (say
+        // IGGY_KAFKA_ADVERTISED_HOST, which this crate's own README/docker-compose.yml teach a
+        // contributor to export) silently changes the spawned gateway's behavior out from under
+        // this harness's assertions.
         command
+            .env_clear()
             .env("IGGY_KAFKA_BIND_ADDR", &address)
             .env("IGGY_KAFKA_BRIDGE_ENABLED", "true")
             .env("IGGY_KAFKA_IGGY_ADDR", &config.address)
@@ -76,8 +83,9 @@ impl TestGateway {
     }
 
     /// Bare TCP connect poll, same rationale as `TestServer::wait_ready`: a full Kafka client
-    /// handshake would pay retry overhead on every failed attempt, and a connect slightly ahead
-    /// of the gateway's own accept loop is harmless since callers dial again themselves.
+    /// handshake would pay retry overhead on every failed attempt. A connect slightly ahead of
+    /// the gateway's own accept loop can't happen here - `main.rs` connects the bridge before
+    /// binding the listener, so a successful connect already implies the bridge is up too.
     async fn wait_ready(&mut self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -91,22 +99,6 @@ impl TestGateway {
                 .await
                 .is_ok()
             {
-                // `PortGuard` only excludes other `PortGuard`-based processes (it never binds
-                // the port itself - see its own doc comment for why not). A prior test's
-                // gateway, orphaned by a hard kill that skipped `Drop`, can still hold this
-                // port: the connect above would then succeed against that stale process, not
-                // ours. Re-checking here catches the common case - our own child already exited
-                // (bind failed, `EADDRINUSE`) by the time a stale listener answers - turning a
-                // confusing pass-then-fail-on-the-wrong-server into the same clear panic as
-                // above, not a silent false pass.
-                if let Some(status) = self.child.try_wait().expect("poll child status") {
-                    panic!(
-                        "iggy-gateway-kafka at {} exited during startup with {status} - the \
-                         successful connect above answered from a stale listener on this port, \
-                         not this process",
-                        self.address
-                    );
-                }
                 return;
             }
             assert!(

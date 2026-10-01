@@ -20,10 +20,13 @@
 
 services:
   iggy-server:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-    container_name: iggy-server
+    # Prebuilt, CI-refreshed on every master merge - avoids a full from-scratch workspace
+    # release build (including the web UI this quick start doesn't use) on first `up --build`.
+    # Testing a local server change: comment this out and uncomment `build:` below instead.
+    image: apache/iggy:edge
+    # build:
+    #   context: ../..
+    #   dockerfile: Dockerfile
     restart: unless-stopped
     cap_add:
       - SYS_NICE
@@ -60,8 +63,12 @@ services:
     # failures, not for waiting out root provisioning.
     healthcheck:
       test: ["CMD", "/iggy", "ping"]
-      interval: 2s
-      timeout: 5s
+      # start_interval covers startup (forks a process + fresh TCP connect every 2s only until
+      # healthy); interval is the steady-state cadence for the rest of the container's life, so
+      # it stays slow enough not to matter.
+      start_interval: 2s
+      interval: 30s
+      timeout: 3s
       start_period: 10s
       retries: 30
 
@@ -90,6 +97,16 @@ services:
       - iggy-kafka-gateway
     ports:
       - 127.0.0.1:9093:9093
+    # `depends_on: service_healthy` only gates the initial `up`, never a later restart - without
+    # its own healthcheck this container crash-loops invisibly (no state `docker compose ps` can
+    # show) if restarted while iggy-server happens to be down. The listener binds only after the
+    # bridge connects (src/main.rs), so "port answers" already implies "bridge is up".
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9093"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
 
 volumes:
   iggy-server:

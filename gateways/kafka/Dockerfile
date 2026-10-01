@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -29,14 +30,28 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release --package iggy-gateway-kafka --bin iggy-gateway-kafka
+# Cache mounts persist across builds but not into the image layer, so the binary is copied out
+# to a plain path before the mount unmounts. --locked matches CI (scripts never resolve a
+# dependency version CI didn't already lock).
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release --locked --package iggy-gateway-kafka --bin iggy-gateway-kafka && \
+    cp target/release/iggy-gateway-kafka /iggy-gateway-kafka
 
 FROM debian:trixie-slim
+# netcat-openbsd: nothing in the gateway's own dependency graph needs it - it's here only so
+# docker-compose.yml's healthcheck has a TCP-probe primitive to call.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/iggy-gateway-kafka .
+COPY --from=builder /iggy-gateway-kafka .
 
 ENV IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
+# Wildcard bind means the gateway cannot derive its own advertised host (server.rs's
+# BrokerAdvertise::from_server_config refuses to start without one) - default to localhost so
+# `docker run <image>` works standalone, not just via this directory's docker-compose.yml.
+# Override when the host reachable from a client is not actually localhost.
+ENV IGGY_KAFKA_ADVERTISED_HOST=localhost
 
 CMD ["/iggy-gateway-kafka"]

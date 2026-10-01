@@ -17,15 +17,23 @@
 
 //! #3539 acceptance test: the whole Phase 1 flow (`CreateTopics` -> `Metadata` -> `Produce` ->
 //! `ListOffsets`) driven over real TCP against the real compiled `iggy-gateway-kafka` binary,
-//! itself bridged to a real compiled `iggy-server` binary - exactly the two processes
-//! `docker-compose.yml` wires together, not `KafkaGateway::run` spawned in-process the way every
-//! other "e2e" suite in this crate does (`common/server.rs`). A regression only the actual
-//! binaries' startup, env parsing, or process wiring can produce (as opposed to a handler-level
-//! bug the in-process suites already cover) fails here and nowhere else.
+//! itself bridged to a real compiled `iggy-server` binary - the same two processes
+//! `docker-compose.yml` wires together, spawned directly as host binaries rather than through
+//! Docker Compose itself. Not `KafkaGateway::run` spawned in-process the way every other "e2e"
+//! suite in this crate does (`common/server.rs`). A regression only the actual binaries'
+//! startup, env parsing, or process wiring can produce (as opposed to a handler-level bug the
+//! in-process suites already cover) fails here and nowhere else.
 //!
-//! Fetch (`#3536`) is unimplemented, so this cannot drive a real consumer through the Kafka
-//! wire; the final read-back step goes through the Iggy SDK directly instead, the same substitute
-//! `produce_real_bridge_tests.rs` uses.
+//! This does **not** exercise `docker-compose.yml`, the `Dockerfile`s, image builds, container
+//! networking, or the health-check gate - those are covered by `docs/MANUAL_TESTING.md`'s
+//! Category I (manual) only, not by any automated suite. A broken compose file, a missing
+//! runtime library in the image, or a wrong port/network mapping would not be caught here.
+//!
+//! The final read-back step goes through the Iggy SDK directly rather than a real Kafka Fetch,
+//! the same substitute `produce_real_bridge_tests.rs` uses - Fetch is implemented
+//! (`src/protocol/handlers/fetch.rs`, exercised by `fetch_real_bridge_tests.rs`), but wiring a
+//! hand-built Fetch request/response codec into this specific acceptance test is left as a
+//! follow-up rather than bundled into this PR's scope.
 
 use std::net::SocketAddr;
 
@@ -102,9 +110,11 @@ fn build_metadata_request(topic: &str) -> Bytes {
     enc.freeze()
 }
 
-/// `(topic error_code, leader_id of partition 0, first broker's host, first broker's port)` for
-/// the single requested topic.
-fn decode_metadata_response(body: Bytes) -> (i16, i32, Option<String>, i32) {
+/// `(topic error_code, partition error_code, leader_id of partition 0, node_ids in the brokers
+/// array, controller_id, first broker's host, first broker's port)` for the single requested
+/// topic.
+#[allow(clippy::type_complexity)]
+fn decode_metadata_response(body: Bytes) -> (i16, i16, i32, Vec<i32>, i32, Option<String>, i32) {
     let mut d = Decoder::new(body);
     let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
 
@@ -112,19 +122,21 @@ fn decode_metadata_response(body: Bytes) -> (i16, i32, Option<String>, i32) {
     assert!(brokers_plus_one >= 2, "at least one broker in the list");
     let mut broker_host = None;
     let mut broker_port = 0;
+    let mut node_ids = Vec::new();
     for i in 1..brokers_plus_one {
-        d.read_i32().expect("node_id");
+        let node_id = d.read_i32().expect("node_id");
         let host = d.read_compact_nullable_string().expect("host");
         let port = d.read_i32().expect("port");
         d.read_compact_nullable_string().expect("rack");
         d.read_tagged_fields().expect("broker tagged fields");
+        node_ids.push(node_id);
         if i == 1 {
             broker_host = host;
             broker_port = port;
         }
     }
     d.read_compact_nullable_string().expect("cluster_id");
-    d.read_i32().expect("controller_id");
+    let controller_id = d.read_i32().expect("controller_id");
 
     let topics_plus_one = d.read_varint().expect("topics array count");
     assert_eq!(topics_plus_one, 2, "exactly one topic was requested");
@@ -134,10 +146,18 @@ fn decode_metadata_response(body: Bytes) -> (i16, i32, Option<String>, i32) {
 
     let partitions_plus_one = d.read_varint().expect("partitions array count");
     assert_eq!(partitions_plus_one, 2, "one partition was created");
-    d.read_i16().expect("partition error_code");
+    let partition_error_code = d.read_i16().expect("partition error_code");
     d.read_i32().expect("partition_index");
     let leader_id = d.read_i32().expect("leader_id");
-    (error_code, leader_id, broker_host, broker_port)
+    (
+        error_code,
+        partition_error_code,
+        leader_id,
+        node_ids,
+        controller_id,
+        broker_host,
+        broker_port,
+    )
 }
 
 fn record(offset: i64, value: &[u8]) -> Record {
@@ -259,9 +279,30 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
     )
     .await;
     assert_eq!(corr, 2, "correlation id must echo the request");
-    let (error_code, leader_id, broker_host, broker_port) = decode_metadata_response(body);
+    let (
+        error_code,
+        partition_error_code,
+        leader_id,
+        node_ids,
+        controller_id,
+        broker_host,
+        broker_port,
+    ) = decode_metadata_response(body);
     assert_eq!(error_code, ERROR_NONE, "Metadata must report the new topic");
+    assert_eq!(
+        partition_error_code, ERROR_NONE,
+        "the single partition must report no error"
+    );
     assert_eq!(leader_id, 1, "this gateway is the sole broker");
+    assert!(
+        node_ids.contains(&leader_id),
+        "leader_id {leader_id} must name a broker actually present in the brokers array \
+         {node_ids:?} - a real client cannot route to a leader it was never told about"
+    );
+    assert_eq!(
+        controller_id, 1,
+        "single-broker cluster: the controller is the same broker"
+    );
     assert_eq!(
         broker_host.as_deref(),
         Some(addr.ip().to_string().as_str()),

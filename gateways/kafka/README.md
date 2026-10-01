@@ -90,8 +90,16 @@ producer = KafkaProducer(bootstrap_servers="127.0.0.1:9093")
 producer.send("orders", b"hello from kafka-python").get(timeout=5)
 ```
 
-Fetch is unimplemented (see the stub warning above), so read the record back through Iggy
-directly rather than a Kafka consumer:
+Read the record back with a real Kafka consumer - Fetch is wired to Iggy with the bridge on (see
+the stub warning above), so `kcat` reads it the same way it would against a real broker:
+
+```bash
+kcat -b 127.0.0.1:9093 -C -t orders -o beginning -e
+```
+
+`-e` exits once `kcat` catches up rather than waiting for more. No consumer group needed for a
+one-shot read; see [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) for group-based consuming.
+Polling Iggy directly still works too, if you want to see the record from the other side:
 
 ```bash
 docker compose exec iggy-server /iggy --username iggy --password iggy-gateway-quickstart \
@@ -107,14 +115,21 @@ gateway's `IGGY_KAFKA_IGGY_PASSWORD` is known ahead of time - never reuse them o
 stack. See `gateways/kafka/docker-compose.yml` and the environment variable tables below for
 every other knob.
 
-**Limitations** (see the stub warning above for the full list): Fetch is unimplemented, so a
-Kafka consumer group can form and get assigned partitions, but cannot actually read anything back
-through the gateway yet - poll Iggy directly with the `iggy` CLI or SDK instead. Single gateway,
-single Iggy node, SASL off by default. This is a development quick start, not a production
-deployment shape. Neither this
-quick start nor `phase1_e2e_tests.rs` exercises crash/restart durability (stopping and
-restarting `iggy-server` against its existing volume, then re-reading) - both only prove a
-produced record is readable from the still-live process that wrote it.
+**Limitations** (see the stub warning above for the full list): OffsetCommit and OffsetFetch are
+not implemented yet, so a consumer group can form and get assigned partitions but can't commit or
+resume from a saved offset - use `assign()` with an explicit start offset, as the Fetch example
+above does with `-o beginning`. Single gateway, single Iggy node, SASL off by default. This is a
+development quick start, not a production deployment shape.
+
+This quick start's topics use Iggy's default `Durability::Replicated` - a Produce ack is a
+quorum commit, not an fsync. A `docker kill` or host power loss can lose acked records despite
+the named Docker volume; the volume protects a clean `docker compose down`/`up`, not a crash.
+Neither this quick start nor `phase1_e2e_tests.rs` exercises crash durability - the automated
+test and the manual read-back above both only prove a produced record is readable from the
+still-live process that wrote it. `docs/MANUAL_TESTING.md`'s Category I covers a *restart* (a
+graceful `docker compose restart`, which flushes on the way down) as a smoke test for "does the
+volume actually persist across a container restart" - it is not a crash test and does not
+contradict this limitation.
 
 **Success criteria** (tracked for [#3539](https://github.com/apache/iggy/issues/3539)): a new
 contributor should reach a successful produce (and an Iggy-side read-back confirming it landed)
