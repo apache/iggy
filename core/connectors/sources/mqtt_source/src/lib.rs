@@ -145,8 +145,6 @@ pub struct MqttTlsConfig {
     pub client_cert_file: Option<String>,
     /// Client private key for mutual TLS, paired with `client_cert_file`.
     pub client_key_file: Option<String>,
-    /// TLS server name, which must match the broker URL host.
-    pub server_name: Option<String>,
 }
 
 pub struct MqttSource {
@@ -158,10 +156,8 @@ pub struct MqttSource {
     // The driver is moved out briefly during event-loop I/O to avoid holding a
     // mutex guard across await points.
     driver: Mutex<Option<MqttDriver>>,
-    // Committed only after the runtime confirms the corresponding Iggy batch.
-    state: Mutex<State>,
     // At most one batch is staged because the SDK reports one batch result at a
-    // time. It pairs candidate state with QoS acknowledgement tokens.
+    // time. It holds the MQTT acknowledgement tokens for that batch.
     pending_batch: Mutex<Option<PendingBatch>>,
 }
 
@@ -176,35 +172,15 @@ impl fmt::Debug for MqttSource {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct State {
-    // This is an operational counter rather than a broker offset. MQTT
-    // redelivery is controlled by the broker session and acknowledgement state.
-    acknowledged_messages: u64,
-}
-
 #[derive(Debug)]
 struct PendingBatch {
     // Tokens are kept separately from ProducedMessage because the runtime
     // acknowledges Iggy before the driver acknowledges MQTT.
     ack_tokens: Vec<AckToken>,
-    // State is staged until the same batch has been persisted and acknowledged.
-    candidate_state: State,
 }
 
 impl MqttSource {
-    pub fn new(id: u32, config: MqttSourceConfig, state: Option<ConnectorState>) -> Self {
-        // Invalid or incompatible state starts from a safe empty counter. The
-        // broker can still redeliver unacknowledged QoS messages after reconnect.
-        let restored_state = state.and_then(|state| {
-            state.deserialize::<State>(CONNECTOR_NAME, id).inspect(|state| {
-                info!(
-                    "Restored MQTT source state for connector with ID {id}. Acknowledged messages: {}",
-                    state.acknowledged_messages
-                );
-            })
-        });
-
+    pub fn new(id: u32, config: MqttSourceConfig, _state: Option<ConnectorState>) -> Self {
         Self {
             id,
             config,
@@ -212,13 +188,8 @@ impl MqttSource {
             batch_size: DEFAULT_BATCH_SIZE,
             batch_timeout: Duration::from_millis(10),
             driver: Mutex::new(None),
-            state: Mutex::new(restored_state.unwrap_or_default()),
             pending_batch: Mutex::new(None),
         }
-    }
-
-    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
-        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
     fn validate_config(&self) -> Result<(Qos, Duration, Duration, usize, usize, Duration), Error> {
@@ -346,10 +317,6 @@ impl MqttSource {
         ))
     }
 
-    async fn current_state(&self) -> State {
-        self.state.lock().await.clone()
-    }
-
     fn max_retries(&self) -> u32 {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
     }
@@ -467,17 +434,6 @@ impl Source for MqttSource {
             return Ok(empty_messages());
         }
 
-        let state = self.current_state().await;
-        // This is only a candidate. The runtime persists the returned batch and
-        // reports Ack or Nack through on_batch_result afterward.
-        let candidate_state = State {
-            acknowledged_messages: state
-                .acknowledged_messages
-                .saturating_add(received.len() as u64),
-        };
-        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
-            Error::Serialization("failed to serialize MQTT source state".to_string())
-        })?;
         let mut messages = Vec::with_capacity(received.len());
         let mut ack_tokens = Vec::with_capacity(received.len());
         for received in received {
@@ -508,10 +464,7 @@ impl Source for MqttSource {
                 payload,
             });
         }
-        *self.pending_batch.lock().await = Some(PendingBatch {
-            ack_tokens,
-            candidate_state,
-        });
+        *self.pending_batch.lock().await = Some(PendingBatch { ack_tokens });
 
         Ok(ProducedMessages {
             schema: if self.config.include_metadata {
@@ -520,13 +473,13 @@ impl Source for MqttSource {
                 Schema::Raw
             },
             messages,
-            state: Some(persisted_state),
+            state: None,
         })
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
-        // A Nack means the runtime could not confirm the Iggy write or state save.
-        // Keep committed state unchanged so QoS 1/2 messages can be redelivered.
+        // A Nack means the runtime could not confirm the Iggy write. Leave the
+        // MQTT acknowledgement pending so QoS 1/2 messages can be redelivered.
         let Some(mut pending_batch) = self.pending_batch.lock().await.take() else {
             return Ok(());
         };
@@ -539,9 +492,8 @@ impl Source for MqttSource {
         }
 
         if pending_batch.ack_tokens.is_empty() {
-            // QoS 0 has no broker token. Iggy persistence is the only completion
-            // event needed before committing the candidate state.
-            *self.state.lock().await = pending_batch.candidate_state;
+            // QoS 0 has no broker token, so there is no broker acknowledgement
+            // to perform after Iggy accepts the batch.
             return Ok(());
         }
 
@@ -571,10 +523,8 @@ impl Source for MqttSource {
             // the bounded MQTT retry policy prevents a transient broker failure
             // from stopping the source. Any later broker redelivery is a valid
             // at-least-once duplicate.
-            *self.state.lock().await = pending_batch.candidate_state;
             return Ok(());
         }
-        *self.state.lock().await = pending_batch.candidate_state;
         Ok(())
     }
 
@@ -644,19 +594,6 @@ fn validate_tls_config(config: &MqttSourceConfig) -> Result<(), Error> {
             "tls client_cert_file and client_key_file must be configured together".to_string(),
         ));
     }
-    if let Some(server_name) = &tls.server_name {
-        if server_name.trim().is_empty() {
-            return Err(Error::InvalidConfigValue(
-                "tls server_name must not be empty".to_string(),
-            ));
-        }
-        if broker_url.host_str() != Some(server_name.as_str()) {
-            return Err(Error::InvalidConfigValue(
-                "tls server_name must match the broker_url host with the current rumqttc version"
-                    .to_string(),
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -689,31 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn given_persisted_state_should_restore_acknowledged_messages() {
-        let state = State {
-            acknowledged_messages: 42,
-        };
-        let persisted = ConnectorState::serialize(&state, CONNECTOR_NAME, 7);
-        let source = MqttSource::new(7, test_config(), persisted);
-
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
-        runtime.block_on(async {
-            let restored = source.current_state().await;
-            assert_eq!(restored.acknowledged_messages, 42);
-        });
-    }
-
-    #[test]
-    fn given_no_state_should_start_fresh() {
-        let source = MqttSource::new(7, test_config(), None);
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
-        runtime.block_on(async {
-            let state = source.current_state().await;
-            assert_eq!(state.acknowledged_messages, 0);
-        });
-    }
-
-    #[test]
     fn given_no_max_retries_should_use_default() {
         let source = MqttSource::new(7, test_config(), None);
 
@@ -730,55 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_state_should_start_fresh() {
-        let source = MqttSource::new(
-            7,
-            test_config(),
-            Some(ConnectorState(b"not valid msgpack".to_vec())),
-        );
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
-        runtime.block_on(async {
-            let state = source.current_state().await;
-            assert_eq!(state.acknowledged_messages, 0);
-        });
-    }
-
-    #[test]
-    fn state_should_be_serializable_and_deserializable() {
-        let original = State {
-            acknowledged_messages: 17,
-        };
-        let persisted = ConnectorState::serialize(&original, CONNECTOR_NAME, 7)
-            .expect("state should serialize");
-        let restored = persisted
-            .deserialize::<State>(CONNECTOR_NAME, 7)
-            .expect("state should deserialize");
-
-        assert_eq!(restored.acknowledged_messages, 17);
-    }
-
-    #[test]
-    fn given_ack_without_mqtt_token_should_commit_candidate_state() {
-        let source = MqttSource::new(7, test_config(), None);
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
-        runtime.block_on(async {
-            *source.pending_batch.lock().await = Some(PendingBatch {
-                ack_tokens: Vec::new(),
-                candidate_state: State {
-                    acknowledged_messages: 1,
-                },
-            });
-
-            source
-                .on_batch_result(SourceBatchResult::Ack)
-                .await
-                .expect("ack should commit state");
-            assert_eq!(source.current_state().await.acknowledged_messages, 1);
-        });
-    }
-
-    #[test]
-    fn given_nack_should_not_commit_candidate_state() {
+    fn given_nack_should_discard_pending_mqtt_acknowledgements() {
         let source = MqttSource::new(7, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("runtime should start");
         runtime.block_on(async {
@@ -794,16 +658,12 @@ mod tests {
                 .expect("QoS 1 publish should have an acknowledgement token");
             *source.pending_batch.lock().await = Some(PendingBatch {
                 ack_tokens: vec![ack_token],
-                candidate_state: State {
-                    acknowledged_messages: 1,
-                },
             });
 
             source
                 .on_batch_result(SourceBatchResult::Nack)
                 .await
                 .expect("nack should be handled");
-            assert_eq!(source.current_state().await.acknowledged_messages, 0);
             assert!(source.pending_batch.lock().await.is_none());
         });
     }
@@ -1059,7 +919,6 @@ mod tests {
             ca_file: None,
             client_cert_file: Some("client.pem".to_string()),
             client_key_file: None,
-            server_name: Some("localhost".to_string()),
         });
         let source = MqttSource::new(7, config, None);
 
@@ -1073,22 +932,6 @@ mod tests {
             ca_file: None,
             client_cert_file: None,
             client_key_file: None,
-            server_name: Some("localhost".to_string()),
-        });
-        let source = MqttSource::new(7, config, None);
-
-        assert!(source.validate_config().is_err());
-    }
-
-    #[test]
-    fn given_tls_server_name_different_from_broker_host_should_reject_configuration() {
-        let mut config = test_config();
-        config.broker_url = "mqtts://localhost:8883".to_string();
-        config.tls = Some(MqttTlsConfig {
-            ca_file: None,
-            client_cert_file: None,
-            client_key_file: None,
-            server_name: Some("emqx.example.com".to_string()),
         });
         let source = MqttSource::new(7, config, None);
 

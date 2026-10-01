@@ -100,7 +100,6 @@ Configuration operates in **two distinct layers**:
 | `tls.ca_file` | String | No | None | File path to custom CA root certificates in PEM format. |
 | `tls.client_cert_file` | String | No | None | File path to mTLS client certificate in PEM format (must pair with `client_key_file`). |
 | `tls.client_key_file` | String | No | None | File path to mTLS client private key in PEM format (must pair with `client_cert_file`). |
-| `tls.server_name` | String | No | None | TLS Server Name Indication (SNI) string (must match `broker_url` host). |
 
 ---
 
@@ -218,7 +217,6 @@ qos = 1
 ca_file = "/etc/iggy/certs/ca.pem"
 client_cert_file = "/etc/iggy/certs/client-cert.pem"
 client_key_file = "/etc/iggy/certs/client-key.pem"
-server_name = "emqx.example.com"
 ```
 
 ### 5. Multi-Instance Route Isolation
@@ -423,5 +421,5 @@ producing duplicates.
 4. **Single In-Flight Batch Constraint**:
    * The Iggy Connector SDK enforces that only **one batch may be in flight** at a time. Calling `poll()` while a previous batch is awaiting `Ack`/`Nack` returns `Err(Error::InvalidState)`.
 
-5. **TLS Server Name (SNI) Coupling**:
-   * The underlying `rumqttc` client derives TLS Server Name Indication (SNI) hostname verification directly from `broker_url`. If `tls.server_name` is configured, it **must match the host component** specified in `broker_url`.
+5. **TLS Server Name (SNI)**:
+   * The underlying `rumqttc` client derives the TLS Server Name Indication (SNI) and certificate hostname verification directly from the host in `broker_url`. Use the broker's certificate hostname in `broker_url`; a separate TLS server-name override is not supported.

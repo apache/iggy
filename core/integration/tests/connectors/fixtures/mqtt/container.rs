@@ -26,7 +26,7 @@ use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, Image
 use tokio::time::{sleep, timeout};
 
 const EMQX_IMAGE: &str = "docker.io/emqx/emqx";
-const EMQX_TAG: &str = "latest";
+const EMQX_TAG: &str = "5.8.8";
 const EMQX_MQTT_PORT: u16 = 1883;
 const EMQX_DASHBOARD_PORT: u16 = 18083;
 const EMQX_START_ATTEMPTS: usize = 240;
