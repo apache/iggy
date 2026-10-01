@@ -91,6 +91,11 @@ impl CachedReply {
 /// Real requests start at 1 (header validation enforces `request > 0`).
 pub const REGISTER_REQUEST_ID: u64 = 0;
 
+/// Client id of server-originated ops, for example the expired-token cleaner.
+/// It never registers, so the table caches nothing for it. Header validation
+/// rejects it on the wire, so no client can claim it.
+pub const RESERVED_CLIENT_ID: u128 = 0;
+
 /// Request number the server stamps on the `Logout` it submits for a connection
 /// that dropped without one.
 ///
@@ -523,7 +528,8 @@ pub enum RequestStatus {
 pub enum CommitReply {
     /// Reply cached and the watermark advanced (or refreshed in place).
     Cached,
-    /// No entry for this client (evicted between prepare and commit).
+    /// No entry for this client: evicted between prepare and commit, or a
+    /// server-originated op, whose client id never registers.
     NoEntry,
     /// The committed op is older than what the entry already holds, which
     /// replica-local eviction makes reachable on a replay. Skipped.
@@ -930,7 +936,10 @@ impl ClientTable {
         request: u64,
         request_checksum: u128,
     ) -> RequestStatus {
-        assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        assert!(
+            client_id != RESERVED_CLIENT_ID,
+            "client_id 0 is reserved for internal use"
+        );
         // Header validation guarantees both > 0 at wire layer.
         debug_assert!(
             epoch > 0 || !self.mode.fence_epoch(),
@@ -1020,7 +1029,10 @@ impl ClientTable {
     /// # Panics
     /// If `client_id == 0` or `client_id != reply.header().client`.
     pub fn commit_register(&mut self, client_id: u128, user_id: u32, reply: Message<ReplyHeader>) {
-        assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        assert!(
+            client_id != RESERVED_CLIENT_ID,
+            "client_id 0 is reserved for internal use"
+        );
         assert_eq!(
             client_id,
             reply.header().client,
@@ -1110,23 +1122,26 @@ impl ClientTable {
     ///
     /// Best-effort by design: the wire reply ships regardless, so anything
     /// that makes this entry uncacheable is reported as a [`CommitReply`]
-    /// variant rather than faulting the commit. Two such cases exist, both
-    /// downstream of replica-local eviction (capacity pressure and transport
-    /// disconnect are not replicated, so replicas disagree on which sessions
-    /// exist): a missing entry, and a committed request older than the stored
+    /// variant rather than faulting the commit. Two such cases come from
+    /// replica-local eviction (capacity pressure and transport disconnect are
+    /// not replicated, so replicas disagree on which sessions exist): a
+    /// missing entry, and a committed request older than the stored
     /// watermark. Panicking on either would take down a replica for a state
     /// difference that is expected.
     ///
+    /// A third is a server-originated op, whose client id never registers
+    /// (for example [`RESERVED_CLIENT_ID`] of the expired-token cleaner).
+    /// There is nothing to cache, so the result is [`CommitReply::NoEntry`].
+    ///
     /// # Panics
-    /// If `client_id == 0` or `client_id != reply.header().client`. Neither is
-    /// reachable from a well-formed reply, both indicate a caller bug.
+    /// If `client_id != reply.header().client`. No well-formed reply reaches
+    /// it, so it indicates a caller bug.
     pub fn commit_reply(
         &mut self,
         client_id: u128,
         user_id: u32,
         reply: Message<ReplyHeader>,
     ) -> CommitReply {
-        assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let new_header = reply.header();
         let new_client = new_header.client;
         let new_request = new_header.request;
@@ -1136,6 +1151,11 @@ impl ClientTable {
             client_id, new_client,
             "commit_reply: client_id mismatch (arg={client_id}, header={new_client})",
         );
+        // Ahead of the register guard below, which the default `request` 0 of
+        // a server-originated header would trip.
+        if client_id == RESERVED_CLIENT_ID {
+            return CommitReply::NoEntry;
+        }
         debug_assert!(
             new_request > REGISTER_REQUEST_ID,
             "commit_reply: register replies go through commit_register"
@@ -1267,7 +1287,7 @@ impl ClientTable {
         // sites). Kept as a return rather than an assert so that an artifact
         // slipping past the decoder degrades to no dedup for that entry instead
         // of taking the replica down.
-        if client_id == 0 {
+        if client_id == RESERVED_CLIENT_ID {
             return;
         }
 
@@ -1337,7 +1357,7 @@ impl ClientTable {
         self.index.clear();
         let mut entries: Vec<DedupWatermark> = entries
             .into_iter()
-            .filter(|entry| entry.client != 0)
+            .filter(|entry| entry.client != RESERVED_CLIENT_ID)
             .collect();
         entries.sort_unstable_by_key(|entry| Reverse(entry.latest_commit));
         entries.truncate(self.clients_max);
@@ -2733,6 +2753,34 @@ mod tests {
             table.evicted_fences.len(),
             table.slots.len(),
             "fences must be trimmed to the slot count"
+        );
+    }
+
+    /// The expired-token cleaner commits its delete under the reserved client
+    /// id 0 with an otherwise default header (no user, request 0). No session
+    /// registers under that id, so the commit must record nothing rather than
+    /// fault the shard that commits it.
+    #[test]
+    fn a_server_originated_commit_under_the_reserved_id_is_not_cached() {
+        const NO_USER: u32 = 0;
+        const DEFAULT_REQUEST: u64 = 0;
+        const COMMIT: u64 = 5;
+
+        let mut table = ClientTable::new(2);
+        let outcome = table.commit_reply(
+            RESERVED_CLIENT_ID,
+            NO_USER,
+            make_reply_for(RESERVED_CLIENT_ID, DEFAULT_REQUEST, COMMIT),
+        );
+
+        assert_eq!(outcome, CommitReply::NoEntry);
+        assert!(
+            table.index.is_empty(),
+            "the reserved id must not gain an entry"
+        );
+        assert!(
+            table.evicted_fences.is_empty(),
+            "the reserved id must not gain a fence"
         );
     }
 

@@ -83,6 +83,9 @@ mod consumer_offset_quota_vsr;
 mod descriptor_exhaustion_vsr;
 mod general;
 mod partitions_limit_vsr;
+// The expired-token cleaner deletes under the reserved client id, and later
+// writes must still commit behind that delete.
+mod personal_access_token_cleaner_vsr;
 // The per-shard segment cleaner deletes expired / oversize segments from disk.
 mod message_cleanup;
 mod message_retrieval;
