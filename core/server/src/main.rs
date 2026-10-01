@@ -123,7 +123,7 @@ fn main() -> Result<(), ServerError> {
     if let Err(error) = &joined
         && descriptors_exhausted()
     {
-        // `fatal` skips destructors, and the log flush must run
+        // `fatal` skips destructors, and the log appenders flush on drop.
         fatal_with_log_flush(
             FatalReason::DescriptorsExhausted,
             &error.to_string(),

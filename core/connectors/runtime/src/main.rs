@@ -161,13 +161,10 @@ fn print_config_env_vars() -> std::io::Result<()> {
         templates
             .iter()
             .map(move |template| format!("{prefix}{kind}_<KEY>_{}", template.env_name))
-            .chain(
-                [
-                    format!("{prefix}{kind}_<KEY>_ENABLED"),
-                    format!("{prefix}{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"),
-                ]
-                .into_iter(),
-            )
+            .chain([
+                format!("{prefix}{kind}_<KEY>_ENABLED"),
+                format!("{prefix}{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"),
+            ])
     })
     .collect();
 
@@ -175,7 +172,7 @@ fn print_config_env_vars() -> std::io::Result<()> {
         .iter()
         .map(|t| t.env_name.to_string())
         .chain(CONNECTORS_RUNTIME_ENV_VARS.iter().map(|s| s.to_string()))
-        .chain(sink_source_templates.into_iter());
+        .chain(sink_source_templates);
 
     print_env_var_names(names)
 }

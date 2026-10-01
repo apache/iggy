@@ -43,7 +43,12 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             .output()
             .expect("listing command should run");
 
-        assert!(output.status.success(), "{binary} failed");
+        assert!(
+            output.status.success(),
+            "{binary} failed: {:?}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(output.stderr.is_empty(), "{binary} wrote to stderr");
 
         let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
@@ -53,7 +58,10 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             names.windows(2).all(|pair| pair[0] < pair[1]),
             "{binary} output must be sorted and deduplicated"
         );
-        assert!(names.iter().all(|name| name.starts_with("IGGY_")));
+        assert!(
+            names.iter().all(|name| name.starts_with("IGGY_")),
+            "{binary} output contained non-IGGY_ prefixed names"
+        );
     }
 }
 
@@ -162,7 +170,9 @@ fn config_env_listing_exits_before_runtime_with_invalid_env_values() {
 
     assert!(
         output.status.success(),
-        "listing should exit before validating environment values"
+        "listing should exit before validating environment values: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty(), "should not log validation errors");
 }
@@ -188,7 +198,12 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
         .output()
         .expect("listing command should run");
 
-    assert!(output.status.success(), "command failed");
+    assert!(
+        output.status.success(),
+        "command failed: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         sentinel.exists(),
         "sentinel file should not be deleted by early exit"
