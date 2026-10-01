@@ -87,7 +87,9 @@ For more information, visit: https://iggy.apache.org/docs/introduction/getting-s
 // variable names and paths must stay unquoted rather than wear rustdoc backticks.
 #[allow(clippy::doc_markdown)]
 pub struct Args {
-    #[arg(long, long_help = r#"Print supported configuration environment variables and exit.
+    #[arg(
+        long,
+        long_help = r#"Print supported configuration environment variables and exit.
 
 Lists all supported IGGY_* environment variable names and templates,
 sorted and deduplicated. Template syntax:
@@ -99,7 +101,8 @@ logging, runtimes, credentials, plugins, filesystem or network activity).
 Works even with missing or invalid configuration files.
 
 Example:
-  iggy-server --list-config-env-vars"#)]
+  iggy-server --list-config-env-vars"#
+    )]
     pub list_config_env_vars: bool,
 
     /// Remove the system path before starting (WARNING: THIS WILL DELETE ALL DATA!)

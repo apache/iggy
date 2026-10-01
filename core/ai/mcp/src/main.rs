@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ::configs::{ConfigEnvMappings, ConfigProvider, print_env_var_names, MCP_RUNTIME_ENV_VARS};
+use ::configs::{ConfigEnvMappings, ConfigProvider, MCP_RUNTIME_ENV_VARS, print_env_var_names};
 use clap::Parser;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;

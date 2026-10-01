@@ -20,7 +20,9 @@ use crate::configs::connectors::{
     create_connectors_config_provider,
 };
 use crate::metrics::ConnectorType;
-use ::configs::{ConfigEnvMappings, ConfigProvider, print_env_var_names, CONNECTORS_RUNTIME_ENV_VARS};
+use ::configs::{
+    CONNECTORS_RUNTIME_ENV_VARS, ConfigEnvMappings, ConfigProvider, print_env_var_names,
+};
 use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
@@ -70,7 +72,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[derive(Parser, Debug)]
 #[command(author = "Apache Iggy", version)]
 struct Args {
-    #[arg(long, long_help = r#"Print supported configuration environment variables and exit.
+    #[arg(
+        long,
+        long_help = r#"Print supported configuration environment variables and exit.
 
 Lists all supported IGGY_* environment variable names and templates,
 sorted and deduplicated. Template syntax:
@@ -80,7 +84,8 @@ sorted and deduplicated. Template syntax:
 - <FIELD> represents plugin configuration field names, excluding
   FORMAT (handled separately as a strongly-typed field)
 
-Exits immediately before any startup."#)]
+Exits immediately before any startup."#
+    )]
     list_config_env_vars: bool,
 }
 

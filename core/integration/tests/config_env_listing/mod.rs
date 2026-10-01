@@ -211,7 +211,8 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
         .output()
         .expect("command should run");
 
-    let output_without_fresh = String::from_utf8(output_without_fresh.stdout).expect("UTF-8 output");
+    let output_without_fresh =
+        String::from_utf8(output_without_fresh.stdout).expect("UTF-8 output");
     assert_eq!(
         output_with_fresh, output_without_fresh,
         "output should be identical with and without --fresh"

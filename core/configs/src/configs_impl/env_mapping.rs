@@ -103,12 +103,12 @@ impl EnvVarTemplate {
 #[cfg(test)]
 mod consistency_tests {
     use super::*;
-    use std::collections::HashSet;
-    use crate::server::ServerConfig;
-    use crate::cluster::ClusterConfig;
     use crate::McpServerConfig;
-    use configs::runtime::ConnectorsRuntimeConfig;
+    use crate::cluster::ClusterConfig;
+    use crate::server::ServerConfig;
     use configs::connectors::{SinkConfig, SourceConfig};
+    use configs::runtime::ConnectorsRuntimeConfig;
+    use std::collections::HashSet;
 
     #[test]
     fn server_config_templates_and_mappings_align() {
@@ -120,7 +120,10 @@ mod consistency_tests {
             .iter()
             .map(|m| m.env_name.to_string())
             .collect();
-        assert_eq!(expanded, mapped, "ServerConfig env_templates and env_mappings must align");
+        assert_eq!(
+            expanded, mapped,
+            "ServerConfig env_templates and env_mappings must align"
+        );
     }
 
     #[test]
@@ -133,7 +136,10 @@ mod consistency_tests {
             .iter()
             .map(|m| m.env_name.to_string())
             .collect();
-        assert_eq!(expanded, mapped, "ClusterConfig env_templates and env_mappings must align");
+        assert_eq!(
+            expanded, mapped,
+            "ClusterConfig env_templates and env_mappings must align"
+        );
     }
 
     #[test]
@@ -146,7 +152,10 @@ mod consistency_tests {
             .iter()
             .map(|m| m.env_name.to_string())
             .collect();
-        assert_eq!(expanded, mapped, "McpServerConfig env_templates and env_mappings must align");
+        assert_eq!(
+            expanded, mapped,
+            "McpServerConfig env_templates and env_mappings must align"
+        );
     }
 
     #[test]
@@ -175,7 +184,10 @@ mod consistency_tests {
             .iter()
             .map(|m| m.env_name.to_string())
             .collect();
-        assert_eq!(expanded, mapped, "SinkConfig env_templates and env_mappings must align");
+        assert_eq!(
+            expanded, mapped,
+            "SinkConfig env_templates and env_mappings must align"
+        );
     }
 
     #[test]
@@ -188,6 +200,9 @@ mod consistency_tests {
             .iter()
             .map(|m| m.env_name.to_string())
             .collect();
-        assert_eq!(expanded, mapped, "SourceConfig env_templates and env_mappings must align");
+        assert_eq!(
+            expanded, mapped,
+            "SourceConfig env_templates and env_mappings must align"
+        );
     }
 }
