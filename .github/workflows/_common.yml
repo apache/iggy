@@ -124,6 +124,9 @@ jobs:
       - name: Run markdownlint
         run: ./scripts/ci/markdownlint.sh --check
 
+      - name: Check agent skills
+        run: ./scripts/ci/skills.sh
+
   shellcheck:
     name: Shell scripts lint
     runs-on: ubuntu-latest
@@ -309,9 +312,9 @@ jobs:
           fi
 
           if [ "$MARKDOWN" = "success" ]; then
-            echo "| ✅ Markdown Lint | success | All markdown files are valid |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ Markdown Lint | success | All markdown files and agent skills are valid |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$MARKDOWN" = "failure" ]; then
-            echo "| ❌ Markdown Lint | failure | Markdown formatting issues found |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ Markdown Lint | failure | Markdown or agent skill issues found |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| ⏭️ Markdown Lint | $MARKDOWN | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi

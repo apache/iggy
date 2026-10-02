@@ -411,19 +411,21 @@ mod tests {
 
     #[test]
     fn reply_with_nonzero_status_surfaces_as_typed_error() {
-        // A dispatch-time authorization denial rides `ReplyHeader.status`; the
-        // decode funnel surfaces it as the typed error before any body decode,
-        // even though the deny body is empty.
-        let header = ReplyHeader {
-            command: Command::Reply,
-            size: HEADER_SIZE as u32,
-            status: IggyError::Unauthorized.as_code(),
-            ..Default::default()
-        };
-        let mut buf = [0u8; HEADER_SIZE];
-        buf.copy_from_slice(bytemuck::bytes_of(&header));
-        let result = decode_response_split(&buf, Bytes::new());
-        assert!(matches!(result, Err(IggyError::Unauthorized)));
+        for error in [IggyError::Unauthorized, IggyError::RequestTooOld] {
+            let header = ReplyHeader {
+                command: Command::Reply,
+                operation: Operation::SendMessages,
+                size: HEADER_SIZE as u32,
+                status: error.as_code(),
+                ..Default::default()
+            };
+            let mut buffer = [0u8; HEADER_SIZE];
+            buffer.copy_from_slice(bytemuck::bytes_of(&header));
+            assert!(
+                matches!(decode_response_split(&buffer, Bytes::new()), Err(result) if result == error),
+                "an empty denial body must preserve {error}"
+            );
+        }
     }
 
     #[test]

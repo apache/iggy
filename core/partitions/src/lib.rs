@@ -73,9 +73,9 @@ pub use iggy_partition::{PollCompletion, PollReplication};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
-    configure_consumer_offsets, configure_consumer_offsets_with_storage,
+    CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
     create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
-    hydrate_partition_log,
+    hydrate_partition_log, read_created_revision, write_created_revision,
 };
 pub use poll_plan::{PollPlan, PollReadResult};
 pub use segment::Segment;

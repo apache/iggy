@@ -208,6 +208,7 @@ where
                 total_shards,
                 self.coord_config.clone(),
                 self.metrics.clone(),
+                crate::boot_nonce(self.metadata.consensus.as_ref()),
             )?))
         } else {
             None

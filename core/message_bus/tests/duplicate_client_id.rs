@@ -16,7 +16,7 @@
 // under the License.
 
 //! Shard 0 mints monotonic client ids so the registry should never see a
-//! collision. If one leaks in anyway (bad foreign mint, wrap at 2^112),
+//! collision. If one leaks in anyway (bad foreign mint, wrap after 2^48 mints),
 //! the installer must drop the duplicate fd instead of panicking. This
 //! test forces the collision and verifies the first entry survives while
 //! the second is dropped cleanly.

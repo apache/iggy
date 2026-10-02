@@ -21,6 +21,7 @@ using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Tests.ClientTests;
@@ -206,6 +207,24 @@ public sealed class HttpTopicOptionsTests
         Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
         Assert.True(error.FromServer);
         Assert.Equal("/streams/1/topics/2/purge", handler.RequestPath);
+    }
+
+    [Fact]
+    public async Task SendMessages_Should_ReportAnAgedOutRequestAsOutcomeUnknown()
+    {
+        var handler = new StubHandler("""{"id":85,"code":"request_too_old","reason":"Request too old."}""")
+        {
+            StatusCode = HttpStatusCode.BadRequest
+        };
+        using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
+
+        var unknown = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.SendMessagesAsync(StreamId, Identifier.Numeric(1), Kinds.Partitioning.PartitionId(1),
+                [new Message(Guid.NewGuid(), new byte[] { 1 })], TestContext.Current.CancellationToken));
+
+        var refusal = Assert.IsType<IggyInvalidStatusCodeException>(unknown.InnerException);
+        Assert.Equal(VsrError.REQUEST_TOO_OLD, refusal.StatusCode);
+        Assert.True(refusal.FromServer);
     }
 
     private sealed class StubHandler(string json) : HttpMessageHandler

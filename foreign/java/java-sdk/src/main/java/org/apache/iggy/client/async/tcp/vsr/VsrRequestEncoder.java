@@ -77,9 +77,8 @@ public final class VsrRequestEncoder {
                 requestId = session.nextCorrelationId();
                 sessionId = session.sessionOrZero();
             } else {
-                // Partition ops consume the dedup counter too, even though no
-                // partition-plane dedup exists yet: dedup needs each send to
-                // carry a distinct number, and the metadata watermark
+                // Partition ops consume the dedup counter too: dedup needs each
+                // send to carry a distinct number, and the metadata watermark
                 // tolerates the gaps.
                 sessionId = session.boundSession();
                 requestId = session.nextRequestId();
