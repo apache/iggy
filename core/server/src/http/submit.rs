@@ -380,9 +380,9 @@ pub(in crate::http) async fn partition_write_replicated(
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     ensure_in_process_reply_target(state, session);
     // Held from the mint until `dispatch_partition_request` returns, which is
-    // past the owning shard's inbox: the ids of this session's writes must
-    // reach the partition in mint order or the watermark absorbs the overtaken
-    // one. Released before the commit wait so writes still overlap there.
+    // past the owning shard's inbox: mint order prevents a delayed write from
+    // aging out of the dedup window. Released before the commit wait so writes
+    // still overlap there.
     let mut next_data_request_id = session.data_gate.lock().await;
     let request_id = *next_data_request_id;
     *next_data_request_id += 1;

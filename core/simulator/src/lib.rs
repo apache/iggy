@@ -1686,14 +1686,15 @@ mod consumer_offset_history_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::partition_repair_driver_tests::cluster;
     use super::*;
     use crate::client::SimClient;
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
-    use consensus::Status;
+    use consensus::{Status, client_table::COMMITTED_WINDOW_BITS};
     use futures::FutureExt;
     use iggy_binary_protocol::{AckLevel, RoutedRequestHeader, WireIdentifier};
-    use iggy_common::ConsumerKind;
+    use iggy_common::{ConsumerKind, IggyError};
     use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT};
 
     const DISCONNECT_STREAM: &str = "sim-stream-0";
@@ -3234,6 +3235,174 @@ mod tests {
             schedule_a, schedule_b,
             "shell schedule diverged at same seed"
         );
+    }
+
+    #[test]
+    fn given_aged_out_request_when_replayed_should_report_unknown_outcome() {
+        for initially_committed in [false, true] {
+            let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.init_partition(namespace);
+            sim.register_client_with_primary(&client);
+
+            let delayed = client.send_messages(namespace, &[Bytes::from_static(b"aged-out")]);
+            let destination = u8::from(!initially_committed);
+            let first = submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                destination,
+                delayed.deep_copy(),
+            );
+            assert_eq!(
+                first.header().status,
+                if initially_committed {
+                    0
+                } else {
+                    IggyError::TransientNotAccepted.as_code()
+                },
+                "the original attempt must establish the intended admission outcome",
+            );
+            for _ in 0..COMMITTED_WINDOW_BITS {
+                let later =
+                    client.send_messages(namespace, &[Bytes::from_static(b"committed-later")]);
+                let committed = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, later);
+                assert_eq!(committed.header().status, 0);
+            }
+
+            let expected = sim
+                .offsets(0, namespace)
+                .expect("committed partition offsets");
+            let replay = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delayed);
+            assert_eq!(
+                replay.header().status,
+                IggyError::RequestTooOld.as_code(),
+                "aging out cannot prove whether request 1 committed",
+            );
+            assert_eq!(
+                sim.offsets(0, namespace),
+                Some(expected),
+                "rejecting an aged-out request must not append another payload",
+            );
+        }
+    }
+
+    #[test]
+    fn given_reordered_requests_within_dedup_window_when_retried_should_commit_once() {
+        let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let delayed = client.send_messages(namespace, &[Bytes::from_static(b"delayed")]);
+        let later = client.send_messages(namespace, &[Bytes::from_static(b"later")]);
+        let committed =
+            submit_and_wait_for_reply(&mut sim, client.client_id(), 0, later.deep_copy());
+        assert_eq!(committed.header().status, 0);
+        let committed =
+            submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delayed.deep_copy());
+        assert_eq!(committed.header().status, 0);
+        let expected = sim.offsets(0, namespace).unwrap();
+        assert_eq!(
+            expected.commit_offset, 1,
+            "both reordered requests must append"
+        );
+        for replay in [delayed, later] {
+            let duplicate = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, replay);
+            assert_eq!(duplicate.header().status, 0);
+            assert_eq!(
+                sim.offsets(0, namespace),
+                Some(expected),
+                "a retained duplicate must not append again"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_unpersisted_creation_view_when_replicas_restart_should_preserve_acknowledged_writes() {
+        const PROGRESS_STEPS: usize = 2_000;
+        const PAYLOAD: &[u8] = b"acknowledged-before-late-materialization";
+        for created_view in [1, 2] {
+            let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+            sim.register_client_with_primary(&client);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.partition_created_views.insert(namespace, created_view);
+            sim.seed_stream_topic_partition(namespace);
+            for replica in &sim.replicas[..2] {
+                materialise_partition(
+                    replica,
+                    namespace,
+                    false,
+                    created_view,
+                    sim.consumer_offsets_max,
+                );
+                assert!(
+                    replica.partition_superblocks.borrow()[&namespace]
+                        .read_latest_sync()
+                        .is_none(),
+                    "the crash must precede the first durable view write"
+                );
+            }
+            for replica in 0..2 {
+                sim.replica_crash(replica);
+            }
+            for replica in 0..2 {
+                sim.replica_restart(replica);
+            }
+            let primary = (0..PROGRESS_STEPS)
+                .find_map(|_| {
+                    sim.step();
+                    (0..2).find(|replica| {
+                        sim.partition_consensus_state(usize::from(*replica), namespace)
+                            .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                    })
+                })
+                .expect("the restarted quorum must elect a primary");
+            let request = client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]);
+            let committed =
+                submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+            assert_eq!(committed.header().status, 0);
+            let committed_op = committed.header().commit;
+            let expected = sim
+                .offsets(usize::from(primary), namespace)
+                .expect("acknowledged partition offsets");
+
+            materialise_partition(
+                &sim.replicas[2],
+                namespace,
+                false,
+                created_view,
+                sim.consumer_offsets_max,
+            );
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    (0..3).all(|replica| {
+                        sim.partition_consensus_state(replica, namespace)
+                            .is_some_and(|state| {
+                                state.status == Status::Normal && state.commit_min >= committed_op
+                            })
+                            && sim.offsets(replica, namespace) == Some(expected)
+                    })
+                }),
+                "late materialization must preserve the acknowledged prefix: states={:?}, offsets={:?}",
+                (0..3)
+                    .map(|replica| sim.partition_consensus_state(replica, namespace))
+                    .collect::<Vec<_>>(),
+                (0..3)
+                    .map(|replica| sim.offsets(replica, namespace))
+                    .collect::<Vec<_>>()
+            );
+            for replica in 0..3 {
+                let prepare = retained_prepare(&sim, replica, namespace, committed_op);
+                assert!(
+                    prepare
+                        .body()
+                        .windows(PAYLOAD.len())
+                        .any(|bytes| bytes == PAYLOAD),
+                    "replica {replica} lost the acknowledged payload at op {committed_op}"
+                );
+            }
+        }
     }
 
     fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {
@@ -5855,6 +6024,149 @@ mod view_change_data_loss_tests {
             metadata_holds(&sim, primary, committed),
             "op {committed} must be repaired back into the new primary's journal"
         );
+    }
+
+    thread_local! {
+        /// The primary's first `StartView` to the prober. A link hook is a bare `fn`
+        /// and cannot capture.
+        static PROBE_ANSWER: RefCell<Option<Message<GenericHeader>>> = const { RefCell::new(None) };
+    }
+
+    /// Keep a copy of the probe answer and let the original through. No partition
+    /// group exists in the test that installs it, so every `StartView` is metadata.
+    fn copy_probe_answer(packet: &packet::Packet) -> bool {
+        if packet.message.header().command == Command::StartView {
+            PROBE_ANSWER.with_borrow_mut(|answer| {
+                answer.get_or_insert_with(|| packet.message.deep_copy());
+            });
+        }
+        false
+    }
+
+    /// A probe answer delivered twice must not take back what the prober acked in
+    /// between: re-adopting the copy drops its head, and the plane truncates above
+    /// it. With the other backup down, the prober holds the only copy of the op
+    /// besides the primary, so the next view would lose an op the client saw commit.
+    #[test]
+    fn given_a_prober_that_acked_past_its_probe_answer_when_a_copy_arrives_late_should_keep_the_op()
+    {
+        const PRIMARY: u8 = 0;
+        const OTHER_BACKUP: u8 = 1;
+        const PROBER: u8 = 2;
+        const STEPS_MAX: usize = 5_000;
+        const LATE_DELIVERY_STEPS: usize = 50;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        // The prober restarts and probes, and a copy of the primary's answer is kept
+        // for a second, late delivery.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(PRIMARY), ProcessId::Replica(PROBER)) =
+            Some(copy_probe_answer);
+        sim.replica_crash(PROBER);
+        sim.replica_restart(PROBER);
+        for _ in 0..STEPS_MAX {
+            sim.step();
+            if metadata_status(&sim, PROBER) == Status::Normal {
+                break;
+            }
+        }
+        assert_eq!(
+            metadata_status(&sim, PROBER),
+            Status::Normal,
+            "the prober must adopt the primary's answer"
+        );
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(PRIMARY), ProcessId::Replica(PROBER)) = None;
+        let answer = PROBE_ANSWER
+            .take()
+            .expect("the primary must have answered the probe");
+        let (answered_head, answered_commit) = metadata_progress(&sim, PROBER);
+        assert_eq!(
+            answered_head, answered_commit,
+            "the answer must find the cluster idle, so its head is the prober's commit point"
+        );
+
+        // The next op commits on the prober's ack alone, and with commit heartbeats
+        // withheld the prober still takes the answer's head as the commit point.
+        sim.replica_crash(OTHER_BACKUP);
+        sim.network
+            .link_filter_mut(ProcessId::Replica(PRIMARY), ProcessId::Replica(PROBER))
+            .remove(Command::Commit);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            PRIMARY,
+            client.create_stream("acked-by-the-prober"),
+        );
+        assert_eq!(reply.header().status, 0);
+        let acked_op = answered_head + 1;
+        assert_eq!(metadata_progress(&sim, PRIMARY).1, acked_op);
+        assert_eq!(metadata_progress(&sim, PROBER), (acked_op, answered_head));
+
+        // The kept copy, delayed in the network until now.
+        sim.network.submit(
+            ProcessId::Replica(PRIMARY),
+            ProcessId::Replica(PROBER),
+            answer,
+        );
+        for _ in 0..LATE_DELIVERY_STEPS {
+            sim.step();
+        }
+        assert_eq!(
+            metadata_progress(&sim, PROBER).0,
+            acked_op,
+            "the late answer moved the prober's head back below an op it acked"
+        );
+        assert!(
+            metadata_holds(&sim, PROBER, acked_op),
+            "the late answer truncated op {acked_op} from the prober's journal"
+        );
+
+        // The primary dies before the other backup ever saw the op.
+        sim.replica_crash(PRIMARY);
+        sim.replica_restart(OTHER_BACKUP);
+        let mut primary = None;
+        for _ in 0..STEPS_MAX {
+            sim.step();
+            primary = (1..replica_count).find(|&replica| is_new_metadata_primary(&sim, replica));
+            if primary.is_some_and(|primary| metadata_progress(&sim, primary).1 >= acked_op) {
+                break;
+            }
+        }
+        let primary =
+            primary.expect("a metadata primary must be elected after the old one crashes");
+        assert!(
+            metadata_progress(&sim, primary).1 >= acked_op,
+            "the next view lost op {acked_op}, which the client saw commit"
+        );
+    }
+
+    fn metadata_status(sim: &Simulator, replica: u8) -> Status {
+        sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus")
+            .status()
     }
 }
 

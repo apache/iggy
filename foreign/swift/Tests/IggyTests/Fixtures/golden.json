@@ -712,6 +712,7 @@
     "82": "invalid_number_encoding",
     "83": "invalid_boolean_value",
     "84": "invalid_number_value",
+    "85": "request_too_old",
     "100": "client_not_found",
     "101": "invalid_client_id",
     "206": "connection_closed",

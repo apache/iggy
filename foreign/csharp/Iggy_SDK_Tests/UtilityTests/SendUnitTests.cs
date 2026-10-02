@@ -18,6 +18,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
@@ -232,6 +233,29 @@ public class SendUnitTests
 
         gate.SetResult(new SendMessagesResponse { Confirmations = [] });
         await drain.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Processor_DoesNotResend_WhenTheSendOutcomeIsUnknown()
+    {
+        var client = new Mock<IIggyClient>();
+        client.Setup(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new VsrRequestOutcomeUnknownException(new IOException("connection reset")));
+        var config = BackgroundConfig(1);
+        config.EnableRetry = true;
+        config.InitialRetryDelay = TimeSpan.FromMilliseconds(1);
+
+        await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
+        processor.Start();
+
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null),
+            CancellationToken.None);
+        await processor.WaitForDrainAsync(CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        client.Verify(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+            It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     private static Mock<IIggyClient> MockClient(List<int> sentCounts)

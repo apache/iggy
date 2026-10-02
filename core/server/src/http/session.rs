@@ -107,10 +107,9 @@ pub(in crate::http) struct HttpSession {
     /// Serializes this session's data-plane writes the way `gate` does its
     /// metadata writes: the guarded value is the NEXT request id, and the write
     /// path holds the lock from the mint until the request has been handed to
-    /// the owning shard's inbox. The partition slice dedups on a per-client
-    /// watermark, so two handlers that minted in one order but reached the
-    /// shard in the other (one slept in the routable wait, say) would have the
-    /// lower id absorbed as a duplicate with a success status. Concurrent
+    /// the owning shard's inbox. The partition slice admits unmarked ids within
+    /// its dedup window, but refuses older ids with `RequestTooOld`. Keeping
+    /// dispatch in mint order prevents a delayed write from aging out. Concurrent
     /// awaits stay legal: the lock covers admission, not the commit round trip.
     /// Shared with the `?ack=none` path so a shed reply's id never collides
     /// with a live awaited slot on this session. Ids are minted monotonically

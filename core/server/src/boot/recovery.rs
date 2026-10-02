@@ -569,10 +569,12 @@ pub(in crate::boot) fn restore_metadata_consensus(
             // A present but unreadable superblock already refused boot in
             // `recover()`, so no durable record means genuinely absent: a
             // fresh node, or one that took writes but never checkpointed or
-            // changed view. There, inferring the view from the last WAL
-            // prepare is safe, since the persist-before-send gate guarantees
-            // this replica never externalized a view beyond what a re-probe
-            // re-derives, and it re-probes as a backup.
+            // changed view. The view of the last WAL prepare stands in there,
+            // and raises the view of a record whose `log_view` is zero; it
+            // never sets `log_view`. Inferring it is safe, since the
+            // persist-before-send gate guarantees this replica never
+            // externalized a view beyond what a re-probe re-derives, and it
+            // re-probes as a backup.
             durable_view: recovered_state.map(|state| (state.view, state.log_view)),
             view_fallback: last_header.map(|header| header.view),
             // Metadata, not a partition group: it has a journal to infer from
