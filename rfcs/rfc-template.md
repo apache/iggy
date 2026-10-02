@@ -3,6 +3,7 @@
 - Feature Name: (fill me in with a unique ident, `my_awesome_feature`)
 - Start Date: (fill me in with today's date, YYYY-MM-DD)
 - RFC PR: [apache/iggy#0000](https://github.com/apache/iggy/pull/0000)
+- Discussion: [apache/iggy#0000](https://github.com/apache/iggy/discussions/0000)
 - Iggy Issue: [apache/iggy#0000](https://github.com/apache/iggy/issues/0000)
 
 ## Summary

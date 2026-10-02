@@ -166,7 +166,8 @@ A pull request that adds or amends an RFC under `rfcs/` uses the type `rfc`
 and, like every other type, a scope from the list in
 `.github/workflows/pr-title.yml`, for example `rfc(storage): tiered storage`.
 If no existing scope fits, add the RFC's feature name to that list in the same
-pull request.
+pull request. The pull request carries the text; the design is debated in a
+GitHub Discussion opened after the initial review. See `rfcs/README.md`.
 
 ## PR Triage Commands
 

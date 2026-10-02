@@ -79,9 +79,10 @@ impact on the project requires concerted effort toward consensus-building.
 
 The most common preparations for writing and submitting an RFC include talking
 the idea over on our [Discord server], discussing the topic in [GitHub
-Discussions], and occasionally posting "pre-RFCs" there. You may file issues on
-this repo for discussion, but these are not actively looked at by the
-maintainers.
+Discussions], and occasionally posting "pre-RFCs" there. A pre-RFC thread is
+separate from the RFC's own Discussion, which is opened later, once the text
+exists and has had its initial review. You may file issues on this repo for
+discussion, but these are not actively looked at by the maintainers.
 
 As a rule of thumb, receiving encouraging feedback from long-standing project
 developers, and particularly from the [maintainers], is a good indication that
@@ -106,29 +107,35 @@ inclusion into Iggy.
   impact, or are disingenuous about the drawbacks or alternatives tend to
   be poorly-received.
 - Submit a pull request titled `rfc(<scope>): <subject>`, where the scope is
-  one of those accepted by the PR title check. As a pull request the RFC will
-  receive design feedback from the larger community, and the author should be
-  prepared to revise it in response.
+  one of those accepted by the PR title check. The pull request carries the
+  text. A maintainer gives it an initial review within a week: whether the
+  change needs an RFC at all, whether the text is complete enough to debate,
+  and editorial comments on the writing.
 - Now that your RFC has an open pull request, update the "RFC PR" link at the
   top of the file to point at it.
+- Once a maintainer marks the RFC ready for discussion, open a GitHub
+  Discussion in the RFCs category titled `RFC: <feature>`, linking the pull
+  request and quoting the summary, and update the "Discussion" link at the top
+  of the file to point at it. The Discussion is where the design is debated;
+  the pull request keeps editorial review.
 - Build consensus and integrate feedback. RFCs that have broad support are
   much more likely to make progress than those that don't receive any
   comments. Feel free to reach out to the maintainers in particular to get
   help identifying stakeholders and obstacles.
-- The maintainers will discuss the RFC pull request, as much as possible in the
-  comment thread of the pull request itself. Offline discussion will be
-  summarized on the pull request comment thread.
+- The maintainers will discuss the RFC, as much as possible in the Discussion
+  itself. Offline discussion will be summarized in the Discussion.
 - RFCs rarely go through this process unchanged, especially as alternatives
   and drawbacks are shown. You can make edits, big and small, to the RFC to
   clarify or change the design, but make changes as new commits to the pull
-  request, and leave a comment on the pull request explaining your changes.
-  **Specifically, do not squash or rebase commits after they are visible on
-  the pull request.**
+  request, and reply in the Discussion with the commit hash and permalinks to
+  the changed lines, explaining your changes. **Specifically, do not squash or
+  rebase commits after they are visible on the pull request.**
 - At some point, a maintainer will propose a "motion for final comment period"
-  (FCP), along with a *disposition* for the RFC (merge, close, or postpone).
+  (FCP) in the Discussion, along with a *disposition* for the RFC (merge,
+  close, or postpone).
   - This step is taken when enough of the tradeoffs have been discussed that
     the maintainers are in a position to make a decision. That does not require
-    consensus amongst all participants in the RFC thread (which is usually
+    consensus amongst all participants in the Discussion (which is usually
     impossible). However, the argument supporting the disposition on the RFC
     needs to have already been clearly articulated, and there should not be a
     strong consensus *against* that position outside of the maintainers.
@@ -155,8 +162,9 @@ inclusion into Iggy.
 RFC numbers are small sequential integers without zero padding, assigned when
 an RFC is accepted, so the first RFC is `rfc-1`. Whoever merges the pull request
 renames `rfcs/rfc-0-my-feature.md` to the next free number, for example
-`rfcs/rfc-7-my-feature.md`, and fills in the "Iggy Issue" link with the
-tracking issue opened for the implementation.
+`rfcs/rfc-7-my-feature.md`, fills in the "Iggy Issue" link with the tracking
+issue opened for the implementation, and marks the Discussion as answered with
+links to the merged RFC and that issue.
 
 Pull request numbers are not used as RFC numbers because this repository's
 counter is shared with every other pull request, which would make RFC numbers
@@ -196,16 +204,16 @@ as a "very minor change" is up to the maintainers to decide.
 
 [Reviewing RFCs]: #reviewing-rfcs
 
-While the RFC pull request is up, the maintainers may schedule a call with the
-author and/or relevant stakeholders to discuss the issues in greater detail, or
-discuss the topic on Discord. In either case a summary from the discussion will
-be posted back to the RFC pull request.
+While the RFC is open, the maintainers may schedule a call with the author
+and/or relevant stakeholders to discuss the issues in greater detail, or
+discuss the topic on Discord. In either case a summary will be posted back to
+the RFC's Discussion.
 
 The maintainers make final decisions about RFCs after the benefits and
 drawbacks are well understood. These decisions can be made at any time, but the
 maintainers will regularly issue decisions. When a decision is made, the RFC
 pull request will either be merged or closed. In either case, if the reasoning
-is not clear from the discussion in thread, the maintainers will add a comment
+is not clear from the Discussion, the maintainers will add a comment there
 describing the rationale for the decision.
 
 ## Implementing an RFC
