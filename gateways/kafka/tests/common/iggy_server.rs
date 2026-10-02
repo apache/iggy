@@ -271,7 +271,7 @@ impl TestServer {
         if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
                command.env("LLVM_PROFILE_FILE", llvm_profile_file);
         }
-        command    
+        command
             .env("IGGY_PATH", data_dir.display().to_string())
             .env("IGGY_TCP_ADDRESS", &address)
             .env("IGGY_HTTP_ENABLED", "false")

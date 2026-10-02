@@ -65,7 +65,7 @@ impl TestGateway {
             .env_clear();
         if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
                command.env("LLVM_PROFILE_FILE", llvm_profile_file);
-        }   
+        }
         command
             .env("IGGY_KAFKA_BIND_ADDR", &address)
             .env("IGGY_KAFKA_BRIDGE_ENABLED", "true")
