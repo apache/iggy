@@ -42,12 +42,10 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 fluss-rs = { workspace = true }
 humantime = { workspace = true }
-iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

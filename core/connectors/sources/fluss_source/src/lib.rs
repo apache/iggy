@@ -22,6 +22,7 @@ use fluss::client::{EARLIEST_OFFSET, FlussConnection, LogScanner};
 use fluss::config::Config;
 use fluss::metadata::{DataField, RowType, TablePath};
 use fluss::record::ScanRecords;
+use fluss::row::InternalRow;
 use fluss::rpc::message::OffsetSpec;
 use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
@@ -30,10 +31,9 @@ use iggy_connector_sdk::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -60,7 +60,9 @@ const REWIND_RETRY: RetryPolicy = RetryPolicy {
     max_delay: Duration::from_secs(1),
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Deliberately not `Serialize`. The runtime hands plugin configuration over as raw JSON and
+/// never serializes this struct, so leaving it out keeps `sasl_password` unserializable.
+#[derive(Debug, Deserialize)]
 pub struct FlussSourceConfig {
     pub bootstrap_servers: String,
     pub database: String,
@@ -84,7 +86,6 @@ pub struct FlussSourceConfig {
     /// under that prefix is rejected while it is on.
     pub include_metadata: Option<bool>,
     pub sasl_username: Option<String>,
-    #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
     pub sasl_password: Option<SecretString>,
     pub verbose_logging: Option<bool>,
 }
@@ -94,6 +95,11 @@ struct State {
     /// Next offset to read per bucket. Absent buckets fall back to the configured start.
     bucket_offsets: HashMap<i32, i64>,
     messages_produced: u64,
+    /// Unconvertible rows this run dropped, reported when the connector closes. It moves with
+    /// the offsets on ACK, so rows read again after a NACK are not counted twice, and it is
+    /// not persisted.
+    #[serde(skip)]
+    rows_skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +144,6 @@ pub struct FlussSource {
     /// them through the ACK handshake even without rows, so a restart before the first row does
     /// not resolve `latest` again and skip what was written in between.
     start_offsets_unsaved: AtomicBool,
-    rows_skipped: AtomicU64,
 }
 
 /// `FlussConnection` and `LogScanner` do not implement `Debug`, so the derive is replaced by
@@ -201,7 +206,6 @@ impl FlussSource {
             state: Mutex::new(restored_state.unwrap_or_default()),
             pending_state: Mutex::new(None),
             start_offsets_unsaved: AtomicBool::new(false),
-            rows_skipped: AtomicU64::new(0),
         }
     }
 
@@ -358,8 +362,9 @@ impl FlussSource {
     }
 
     /// A row that cannot be converted fails the same way on every read, so failing the batch
-    /// would read it again forever. It is dropped and logged with its position instead, and the
-    /// offsets still move past it.
+    /// would read it again forever. That includes a failed column read, since the scanner hands
+    /// rows over already decoded in memory. Such a row is dropped and logged with its position
+    /// instead, and the offsets still move past it.
     async fn build_batch(
         &self,
         records: &ScanRecords,
@@ -367,14 +372,16 @@ impl FlussSource {
         let buckets = records.records_by_buckets();
         let mut messages = Vec::with_capacity(records.count());
         let mut polled_offsets = HashMap::with_capacity(buckets.len());
-        let mut skipped = 0u64;
+        let mut skipped = 0;
         for (bucket, bucket_records) in buckets {
             let bucket_id = bucket.bucket_id();
             for record in bucket_records {
-                let message = mapping::row_to_json(record.row(), &self.fields).and_then(|row| {
-                    self.build_message(bucket_id, record.offset(), record.timestamp(), row)
-                });
-                match message {
+                match self.build_message(
+                    bucket_id,
+                    record.offset(),
+                    record.timestamp(),
+                    record.row(),
+                ) {
                     Ok(message) => messages.push(message),
                     Err(error) => {
                         skipped += 1;
@@ -391,12 +398,9 @@ impl FlussSource {
                 polled_offsets.insert(bucket_id, last.offset() + 1);
             }
         }
-        if skipped > 0 {
-            self.rows_skipped.fetch_add(skipped, Ordering::Relaxed);
-        }
 
         let state = self
-            .stage_batch_state(polled_offsets, messages.len())
+            .stage_batch_state(polled_offsets, messages.len(), skipped)
             .await?;
         Ok((messages, state))
     }
@@ -406,19 +410,21 @@ impl FlussSource {
         bucket: i32,
         offset: i64,
         timestamp_millis: i64,
-        mut record: serde_json::Map<String, Value>,
+        row: &dyn InternalRow,
     ) -> Result<ProducedMessage, Error> {
-        if self.include_metadata {
-            record.insert(METADATA_BUCKET.to_owned(), Value::from(bucket));
-            record.insert(METADATA_OFFSET.to_owned(), Value::from(offset));
-            record.insert(METADATA_TIMESTAMP.to_owned(), Value::from(timestamp_millis));
-        }
+        let record_metadata = [
+            (METADATA_BUCKET, i64::from(bucket)),
+            (METADATA_OFFSET, offset),
+            (METADATA_TIMESTAMP, timestamp_millis),
+        ];
+        let metadata: &[(&str, i64)] = if self.include_metadata {
+            &record_metadata
+        } else {
+            &[]
+        };
 
-        let payload = simd_json::to_vec(&Value::Object(record)).map_err(|error| {
-            Error::Serialization(format!(
-                "failed to serialize Apache Fluss row at bucket {bucket}, offset {offset}: {error}"
-            ))
-        })?;
+        let payload = serde_json::to_vec(&mapping::JsonRow::new(row, &self.fields, metadata))
+            .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
 
         Ok(ProducedMessage {
             id: Some(message_id(bucket, offset)),
@@ -438,6 +444,7 @@ impl FlussSource {
         &self,
         polled_offsets: HashMap<i32, i64>,
         produced: usize,
+        skipped: usize,
     ) -> Result<Option<ConnectorState>, Error> {
         if polled_offsets.is_empty() && !self.start_offsets_unsaved.load(Ordering::Acquire) {
             return Ok(None);
@@ -446,6 +453,7 @@ impl FlussSource {
         let mut candidate = self.state.lock().await.clone();
         candidate.bucket_offsets.extend(polled_offsets);
         candidate.messages_produced += produced as u64;
+        candidate.rows_skipped += skipped as u64;
         let persisted = self.serialize_state(&candidate).ok_or_else(|| {
             Error::Serialization(format!(
                 "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
@@ -688,9 +696,7 @@ impl Source for FlussSource {
         info!(
             "Closed {CONNECTOR_NAME} connector with ID: {}, total messages produced: {}, rows \
              skipped: {}",
-            self.id,
-            state.messages_produced,
-            self.rows_skipped.load(Ordering::Relaxed)
+            self.id, state.messages_produced, state.rows_skipped
         );
         Ok(())
     }
@@ -770,6 +776,8 @@ fn ensure_no_metadata_collision(fields: &[DataField]) -> Result<(), Error> {
 mod tests {
     use super::*;
     use fluss::metadata::DataTypes;
+    use fluss::row::GenericRow;
+    use serde_json::Value;
 
     fn test_config() -> FlussSourceConfig {
         FlussSourceConfig {
@@ -794,6 +802,7 @@ mod tests {
         State {
             bucket_offsets: offsets.iter().copied().collect(),
             messages_produced: produced,
+            ..State::default()
         }
     }
 
@@ -1095,7 +1104,7 @@ mod tests {
             *source.state.lock().await = state_with(&[(0, 42)], 42);
 
             let state = source
-                .stage_batch_state(HashMap::new(), 0)
+                .stage_batch_state(HashMap::new(), 0, 0)
                 .await
                 .expect("An empty batch should stage");
 
@@ -1113,7 +1122,7 @@ mod tests {
             source.start_offsets_unsaved.store(true, Ordering::Release);
 
             let state = source
-                .stage_batch_state(HashMap::new(), 0)
+                .stage_batch_state(HashMap::new(), 0, 0)
                 .await
                 .expect("An empty batch should stage");
 
@@ -1133,7 +1142,7 @@ mod tests {
             *source.state.lock().await = state_with(&[(0, 42), (1, 7)], 42);
 
             let state = source
-                .stage_batch_state(HashMap::from([(0, 45)]), 3)
+                .stage_batch_state(HashMap::from([(0, 45)]), 3, 0)
                 .await
                 .expect("A polled batch should stage");
 
@@ -1173,15 +1182,45 @@ mod tests {
         });
     }
 
+    #[test]
+    fn given_skipped_rows_read_again_after_a_nack_should_count_them_once() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            source
+                .stage_batch_state(HashMap::from([(0, 3)]), 1, 2)
+                .await
+                .expect("A batch with skipped rows should stage");
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+            assert_eq!(source.state.lock().await.rows_skipped, 0);
+
+            source
+                .stage_batch_state(HashMap::from([(0, 3)]), 1, 2)
+                .await
+                .expect("The rewound batch should stage again");
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            assert_eq!(source.state.lock().await.rows_skipped, 2);
+        });
+    }
+
     fn field(name: &str) -> DataField {
         DataField::new(name, DataTypes::int(), None)
     }
 
-    fn json_row(columns: &[(&str, Value)]) -> serde_json::Map<String, Value> {
-        columns
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), value.clone()))
-            .collect()
+    fn source_with_id_column(include_metadata: bool) -> (FlussSource, GenericRow<'static>) {
+        let mut config = test_config();
+        config.include_metadata = Some(include_metadata);
+        let mut source = FlussSource::new(1, config, None);
+        source.fields = vec![field("id")];
+        let mut row = GenericRow::new(1);
+        row.set_field(0, 7i32);
+        (source, row)
     }
 
     #[test]
@@ -1293,17 +1332,10 @@ mod tests {
 
     #[test]
     fn given_include_metadata_should_add_bucket_offset_and_timestamp() {
-        let mut config = test_config();
-        config.include_metadata = Some(true);
-        let source = FlussSource::new(1, config, None);
+        let (source, row) = source_with_id_column(true);
 
         let message = source
-            .build_message(
-                2,
-                41,
-                1_700_000_000_123,
-                json_row(&[("id", Value::from(7))]),
-            )
+            .build_message(2, 41, 1_700_000_000_123, &row)
             .expect("The row should build");
 
         let payload: Value =
@@ -1323,15 +1355,10 @@ mod tests {
 
     #[test]
     fn given_metadata_left_off_should_emit_only_the_columns() {
-        let source = FlussSource::new(1, test_config(), None);
+        let (source, row) = source_with_id_column(false);
 
         let message = source
-            .build_message(
-                2,
-                41,
-                1_700_000_000_123,
-                json_row(&[("id", Value::from(7))]),
-            )
+            .build_message(2, 41, 1_700_000_000_123, &row)
             .expect("The row should build");
 
         let payload: Value =
@@ -1371,7 +1398,7 @@ mod tests {
             *source.state.lock().await = state_with(&[(0, 42)], 42);
 
             let state = source
-                .stage_batch_state(HashMap::from([(0, 45)]), 0)
+                .stage_batch_state(HashMap::from([(0, 45)]), 0, 0)
                 .await
                 .expect("A batch of skipped rows should stage");
 

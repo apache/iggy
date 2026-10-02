@@ -15,31 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use base64::Engine;
+use base64::display::Base64Display;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use fluss::metadata::{DataField, DataType};
 use fluss::row::InternalRow;
 use iggy_connector_sdk::Error;
-use serde_json::{Map, Number, Value};
+use serde::ser::{Error as _, SerializeMap};
+use serde::{Serialize, Serializer};
 
 const MILLIS_PER_SECOND: i64 = 1_000;
 const NANOS_PER_MILLI: i64 = 1_000_000;
 
+/// One row written as a JSON object straight into the payload, with the `metadata` entries
+/// after the columns. Names and values are written from the schema and the Arrow batch as
+/// they are read, without building a `serde_json::Value` or copying a column name per row.
+///
 /// Temporal values are formatted with their full fractional precision, the way the
 /// PostgreSQL source formats them. A number of milliseconds would drop the microseconds of
 /// the default `TIMESTAMP(6)`. `TIMESTAMP` carries no timezone and is written without one,
 /// while `TIMESTAMP_LTZ` is an instant and is written in UTC.
-pub(crate) fn row_to_json(
-    row: &dyn InternalRow,
-    fields: &[DataField],
-) -> Result<Map<String, Value>, Error> {
-    let mut object = Map::with_capacity(fields.len());
-    for (position, field) in fields.iter().enumerate() {
-        let value = read_field(row, position, field.data_type())?;
-        object.insert(field.name().to_owned(), value);
+pub(crate) struct JsonRow<'a> {
+    row: &'a dyn InternalRow,
+    fields: &'a [DataField],
+    metadata: &'a [(&'a str, i64)],
+}
+
+impl<'a> JsonRow<'a> {
+    pub(crate) fn new(
+        row: &'a dyn InternalRow,
+        fields: &'a [DataField],
+        metadata: &'a [(&'a str, i64)],
+    ) -> Self {
+        Self {
+            row,
+            fields,
+            metadata,
+        }
     }
-    Ok(object)
+}
+
+impl Serialize for JsonRow<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut object = serializer.serialize_map(Some(self.fields.len() + self.metadata.len()))?;
+        for (position, field) in self.fields.iter().enumerate() {
+            let value = JsonField {
+                row: self.row,
+                position,
+                field,
+            };
+            object.serialize_entry(field.name(), &value)?;
+        }
+        for (name, value) in self.metadata {
+            object.serialize_entry(name, value)?;
+        }
+        object.end()
+    }
 }
 
 /// Rejects column types with no JSON representation before the first poll, so a table with
@@ -64,85 +95,125 @@ fn is_supported(data_type: &DataType) -> bool {
     )
 }
 
-fn read_field(
-    row: &dyn InternalRow,
+struct JsonField<'a> {
+    row: &'a dyn InternalRow,
     position: usize,
-    data_type: &DataType,
-) -> Result<Value, Error> {
-    if row.is_null_at(position).map_err(read_error)? {
-        return Ok(Value::Null);
-    }
+    field: &'a DataField,
+}
 
-    let value = match data_type {
-        DataType::Boolean(_) => Value::Bool(row.get_boolean(position).map_err(read_error)?),
-        DataType::TinyInt(_) => Value::from(row.get_byte(position).map_err(read_error)?),
-        DataType::SmallInt(_) => Value::from(row.get_short(position).map_err(read_error)?),
-        DataType::Int(_) => Value::from(row.get_int(position).map_err(read_error)?),
-        DataType::BigInt(_) => Value::from(row.get_long(position).map_err(read_error)?),
-        DataType::Float(_) => float_value(f64::from(row.get_float(position).map_err(read_error)?)),
-        DataType::Double(_) => float_value(row.get_double(position).map_err(read_error)?),
-        DataType::Char(inner) => Value::String(
-            row.get_char(position, inner.length() as usize)
-                .map_err(read_error)?
-                .to_owned(),
-        ),
-        DataType::String(_) => {
-            Value::String(row.get_string(position).map_err(read_error)?.to_owned())
+impl Serialize for JsonField<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let row = self.row;
+        let position = self.position;
+        let name = self.field.name();
+        let data_type = self.field.data_type();
+        let read_error = |error: fluss::error::Error| {
+            S::Error::custom(format_args!("failed to read column '{name}': {error}"))
+        };
+        let out_of_range = || {
+            S::Error::custom(format_args!(
+                "column '{name}' holds a {data_type:?} value outside the range that can be \
+                 formatted"
+            ))
+        };
+
+        if row.is_null_at(position).map_err(read_error)? {
+            return serializer.serialize_none();
         }
-        DataType::Decimal(inner) => {
-            let decimal = row
-                .get_decimal(position, inner.precision() as usize, inner.scale() as usize)
-                .map_err(read_error)?;
-            Value::String(decimal.to_big_decimal().to_string())
-        }
-        DataType::Date(_) => {
-            let days = row.get_date(position).map_err(read_error)?.get_inner();
-            let date = NaiveDate::from_epoch_days(days).ok_or_else(|| out_of_range(data_type))?;
-            Value::String(date.to_string())
-        }
-        DataType::Time(_) => {
-            let millis = row.get_time(position).map_err(read_error)?.get_inner();
-            let time = time_of_day(millis).ok_or_else(|| out_of_range(data_type))?;
-            Value::String(time.to_string())
-        }
-        DataType::Timestamp(inner) => {
-            let timestamp = row
-                .get_timestamp_ntz(position, inner.precision())
-                .map_err(read_error)?;
-            let instant = instant(
-                timestamp.get_millisecond(),
-                timestamp.get_nano_of_millisecond(),
-            )
-            .ok_or_else(|| out_of_range(data_type))?;
-            Value::String(instant.naive_utc().to_string())
-        }
-        DataType::TimestampLTz(inner) => {
-            let timestamp = row
-                .get_timestamp_ltz(position, inner.precision())
-                .map_err(read_error)?;
-            let instant = instant(
-                timestamp.get_epoch_millisecond(),
-                timestamp.get_nano_of_millisecond(),
-            )
-            .ok_or_else(|| out_of_range(data_type))?;
-            Value::String(instant.to_rfc3339())
-        }
-        DataType::Bytes(_) => {
-            Value::String(BASE64.encode(row.get_bytes(position).map_err(read_error)?))
-        }
-        DataType::Binary(inner) => Value::String(
-            BASE64.encode(
-                row.get_binary(position, inner.length())
+
+        match data_type {
+            DataType::Boolean(_) => {
+                serializer.serialize_bool(row.get_boolean(position).map_err(read_error)?)
+            }
+            DataType::TinyInt(_) => {
+                serializer.serialize_i8(row.get_byte(position).map_err(read_error)?)
+            }
+            DataType::SmallInt(_) => {
+                serializer.serialize_i16(row.get_short(position).map_err(read_error)?)
+            }
+            DataType::Int(_) => {
+                serializer.serialize_i32(row.get_int(position).map_err(read_error)?)
+            }
+            DataType::BigInt(_) => {
+                serializer.serialize_i64(row.get_long(position).map_err(read_error)?)
+            }
+            DataType::Float(_) => serialize_float(
+                serializer,
+                f64::from(row.get_float(position).map_err(read_error)?),
+            ),
+            DataType::Double(_) => {
+                serialize_float(serializer, row.get_double(position).map_err(read_error)?)
+            }
+            DataType::Char(inner) => serializer.serialize_str(
+                row.get_char(position, inner.length() as usize)
                     .map_err(read_error)?,
             ),
-        ),
-        DataType::Array(_) | DataType::Map(_) | DataType::Row(_) => {
-            return Err(Error::SchemaMismatch(format!(
-                "nested type {data_type:?} is not supported by the Apache Fluss source"
-            )));
+            DataType::String(_) => {
+                serializer.serialize_str(row.get_string(position).map_err(read_error)?)
+            }
+            DataType::Decimal(inner) => {
+                let decimal = row
+                    .get_decimal(position, inner.precision() as usize, inner.scale() as usize)
+                    .map_err(read_error)?;
+                serializer.collect_str(&decimal.to_big_decimal())
+            }
+            DataType::Date(_) => {
+                let days = row.get_date(position).map_err(read_error)?.get_inner();
+                serializer.collect_str(&NaiveDate::from_epoch_days(days).ok_or_else(out_of_range)?)
+            }
+            DataType::Time(_) => {
+                let millis = row.get_time(position).map_err(read_error)?.get_inner();
+                serializer.collect_str(&time_of_day(millis).ok_or_else(out_of_range)?)
+            }
+            DataType::Timestamp(inner) => {
+                let timestamp = row
+                    .get_timestamp_ntz(position, inner.precision())
+                    .map_err(read_error)?;
+                let instant = instant(
+                    timestamp.get_millisecond(),
+                    timestamp.get_nano_of_millisecond(),
+                )
+                .ok_or_else(out_of_range)?;
+                serializer.collect_str(&instant.naive_utc())
+            }
+            DataType::TimestampLTz(inner) => {
+                let timestamp = row
+                    .get_timestamp_ltz(position, inner.precision())
+                    .map_err(read_error)?;
+                let instant = instant(
+                    timestamp.get_epoch_millisecond(),
+                    timestamp.get_nano_of_millisecond(),
+                )
+                .ok_or_else(out_of_range)?;
+                serializer.serialize_str(&instant.to_rfc3339())
+            }
+            DataType::Bytes(_) => serializer.collect_str(&Base64Display::new(
+                row.get_bytes(position).map_err(read_error)?,
+                &BASE64,
+            )),
+            DataType::Binary(inner) => serializer.collect_str(&Base64Display::new(
+                row.get_binary(position, inner.length())
+                    .map_err(read_error)?,
+                &BASE64,
+            )),
+            DataType::Array(_) | DataType::Map(_) | DataType::Row(_) => {
+                Err(S::Error::custom(format_args!(
+                    "column '{name}' has nested type {data_type:?}, which the Apache Fluss \
+                     source does not support"
+                )))
+            }
         }
-    };
-    Ok(value)
+    }
+}
+
+/// JSON has no encoding for NaN or infinity, so those collapse to null rather than
+/// failing the whole batch over one degenerate float.
+fn serialize_float<S: Serializer>(serializer: S, value: f64) -> Result<S::Ok, S::Error> {
+    if value.is_finite() {
+        serializer.serialize_f64(value)
+    } else {
+        serializer.serialize_none()
+    }
 }
 
 /// Fluss keeps a timestamp as epoch milliseconds plus the nanoseconds within that
@@ -164,30 +235,22 @@ fn time_of_day(millis: i32) -> Option<NaiveTime> {
     )
 }
 
-/// JSON has no encoding for NaN or infinity, so those collapse to null rather than
-/// failing the whole batch over one degenerate float.
-fn float_value(value: f64) -> Value {
-    Number::from_f64(value).map_or(Value::Null, Value::Number)
-}
-
-fn read_error(error: fluss::error::Error) -> Error {
-    Error::InvalidRecordValue(format!("failed to read Apache Fluss column: {error}"))
-}
-
-fn out_of_range(data_type: &DataType) -> Error {
-    Error::InvalidRecordValue(format!(
-        "Apache Fluss {data_type:?} value is outside the range that can be formatted"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use fluss::metadata::DataTypes;
     use fluss::row::{Date, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
+    use serde_json::Value;
 
     fn field(name: &str, data_type: DataType) -> DataField {
         DataField::new(name, data_type, None)
+    }
+
+    fn to_json(row: &GenericRow, fields: &[DataField]) -> Value {
+        let payload =
+            serde_json::to_vec(&JsonRow::new(row, fields, &[])).expect("Failed to map row");
+        serde_json::from_slice(&payload).expect("The payload should be JSON")
     }
 
     #[test]
@@ -218,7 +281,7 @@ mod tests {
                 .expect("Failed to build timestamp"),
         );
 
-        let object = row_to_json(&row, &fields).expect("Failed to map row");
+        let object = to_json(&row, &fields);
 
         assert_eq!(object["date"], Value::from("2024-02-29"));
         assert_eq!(object["time"], Value::from("12:34:56.789"));
@@ -245,9 +308,21 @@ mod tests {
             TimestampNtz::from_millis_nanos(-1, 0).expect("Failed to build timestamp"),
         );
 
-        let object = row_to_json(&row, &fields).expect("Failed to map row");
+        let object = to_json(&row, &fields);
 
         assert_eq!(object["timestamp"], Value::from("1969-12-31 23:59:59.999"));
+    }
+
+    #[test]
+    fn given_date_beyond_what_can_be_formatted_should_fail_naming_the_column() {
+        let fields = vec![field("shipped_on", DataTypes::date())];
+        let mut row = GenericRow::new(1);
+        row.set_field(0, Date::new(i32::MAX));
+
+        let error = serde_json::to_vec(&JsonRow::new(&row, &fields, &[]))
+            .expect_err("A date chrono cannot hold should fail");
+
+        assert!(error.to_string().contains("'shipped_on'"), "{error}");
     }
 
     #[test]
@@ -265,7 +340,7 @@ mod tests {
         row.set_field(1, "abcde");
         row.set_field(2, [4u8, 5, 6].as_slice());
 
-        let object = row_to_json(&row, &fields).expect("Failed to map row");
+        let object = to_json(&row, &fields);
 
         assert_eq!(object["amount"], Value::from("123.45"));
         assert_eq!(object["code"], Value::from("abcde"));
@@ -288,7 +363,7 @@ mod tests {
         row.set_field(3, 1.5f64);
         row.set_field(4, 90i64);
 
-        let object = row_to_json(&row, &fields).expect("Failed to map row");
+        let object = to_json(&row, &fields);
 
         assert_eq!(object["id"], Value::from(7));
         assert_eq!(object["name"], Value::from("alice"));
@@ -306,7 +381,7 @@ mod tests {
         let mut row = GenericRow::new(2);
         row.set_field(0, 1i32);
 
-        let object = row_to_json(&row, &fields).expect("Failed to map row");
+        let object = to_json(&row, &fields);
 
         assert_eq!(object["id"], Value::from(1));
         assert_eq!(object["name"], Value::Null);
@@ -318,7 +393,7 @@ mod tests {
         let mut row = GenericRow::new(1);
         row.set_field(0, [1u8, 2, 3].as_slice());
 
-        let object = row_to_json(&row, &fields).expect("Failed to map row");
+        let object = to_json(&row, &fields);
 
         assert_eq!(object["blob"], Value::from(BASE64.encode([1u8, 2, 3])));
     }
@@ -347,9 +422,21 @@ mod tests {
     }
 
     #[test]
-    fn given_non_finite_float_should_map_to_null() {
-        assert_eq!(float_value(f64::NAN), Value::Null);
-        assert_eq!(float_value(f64::INFINITY), Value::Null);
-        assert_eq!(float_value(2.5), Value::from(2.5));
+    fn given_non_finite_floats_should_map_to_null() {
+        let fields = vec![
+            field("nan", DataTypes::double()),
+            field("infinite", DataTypes::float()),
+            field("finite", DataTypes::double()),
+        ];
+        let mut row = GenericRow::new(3);
+        row.set_field(0, f64::NAN);
+        row.set_field(1, f32::INFINITY);
+        row.set_field(2, 2.5f64);
+
+        let object = to_json(&row, &fields);
+
+        assert_eq!(object["nan"], Value::Null);
+        assert_eq!(object["infinite"], Value::Null);
+        assert_eq!(object["finite"], Value::from(2.5));
     }
 }
