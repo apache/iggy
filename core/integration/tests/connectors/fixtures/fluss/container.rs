@@ -64,8 +64,7 @@ pub(super) struct FlussContainer {
 
 impl FlussContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
-        let coordinator_port = reserve_host_port()?;
-        let tablet_port = reserve_host_port()?;
+        let [coordinator_port, tablet_port] = reserve_host_ports()?;
 
         let container = GenericImage::new(FLUSS_IMAGE, FLUSS_VERSION)
             .with_wait_for(WaitFor::message_on_stdout(READY_MESSAGE))
@@ -120,21 +119,27 @@ fn startup_script(tablet_port: u16) -> String {
     )
 }
 
-/// Binds port 0, reads back what the kernel picked, then releases it. The port is only
-/// reserved by convention until the container claims it, which is the same trade every
-/// fixture that needs a known port ahead of time makes.
-fn reserve_host_port() -> Result<u16, TestBinaryError> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|error| TestBinaryError::FixtureSetup {
-            fixture_type: "FlussContainer".to_string(),
-            message: format!("Failed to reserve a host port: {error}"),
-        })?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| TestBinaryError::FixtureSetup {
-            fixture_type: "FlussContainer".to_string(),
-            message: format!("Failed to read the reserved host port: {error}"),
-        })?
-        .port();
-    Ok(port)
+/// Binds port 0 once per port, reads back what the kernel picked, then releases them all.
+/// Every listener stays open until the last port is read, so the kernel cannot hand out the
+/// same port twice. The ports are only reserved by convention until the container claims
+/// them, which is the same trade every fixture that needs a known port ahead of time makes.
+fn reserve_host_ports<const N: usize>() -> Result<[u16; N], TestBinaryError> {
+    let mut listeners = Vec::with_capacity(N);
+    let mut ports = [0; N];
+    for port in &mut ports {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "FlussContainer".to_string(),
+                message: format!("Failed to reserve a host port: {error}"),
+            })?;
+        *port = listener
+            .local_addr()
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "FlussContainer".to_string(),
+                message: format!("Failed to read the reserved host port: {error}"),
+            })?
+            .port();
+        listeners.push(listener);
+    }
+    Ok(ports)
 }

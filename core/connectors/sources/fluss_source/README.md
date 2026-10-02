@@ -20,7 +20,7 @@ Each Fluss row becomes one Apache Iggy message. Offsets are tracked per bucket a
 | `payload_format` | no | `json` | Only `json` is accepted. See [Limitations](#limitations). |
 | `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` to each JSON object. While it is on, a column whose name starts with `_fluss_` is rejected at startup, since it would be overwritten. |
 | `sasl_username` | no | | Enables SASL/PLAIN together with `sasl_password`. Set both or neither. |
-| `sasl_password` | no | | Stored as a secret and redacted from logs and the `/stats` endpoint. |
+| `sasl_password` | no | | The connector never logs it and `/stats` never shows it, but the runtime does not redact it: it logs the raw plugin config at trace level and returns it from its config API, such as `GET /sources/{key}/configs/plugin`. |
 | `verbose_logging` | no | `false` | Logs per-batch counts at info instead of debug. |
 
 ## Example
@@ -69,7 +69,9 @@ Temporal values keep every fractional digit the column holds, so the default `TI
 
 Rows are decoded with the table schema read when the connector starts. A row written before a column was added carries `null` for it, and a column added after startup stays out of the output until the connector restarts.
 
-Every message carries an `id` derived from its bucket and offset, so a consumer can spot a record replayed after an at-least-once redelivery (the Apache Iggy server does not deduplicate on it), and an `origin_timestamp` taken from the Fluss record timestamp.
+Every message carries an `id` derived from its bucket and offset, so a consumer can spot a record replayed after an at-least-once redelivery (the Apache Iggy server does not deduplicate on it).
+
+The connector also hands the runtime the Fluss record timestamp as `origin_timestamp`, but the runtime does not pass it on, so Apache Iggy stamps each message with its own time. Turn on `include_metadata` to keep the record timestamp in the payload as `_fluss_timestamp`.
 
 ## Limitations
 
