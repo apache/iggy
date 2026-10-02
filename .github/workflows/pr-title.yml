@@ -50,6 +50,7 @@ jobs:
             revert
             repo
             deps
+            rfc
           scopes: |
             bdd
             bench

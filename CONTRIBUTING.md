@@ -162,6 +162,12 @@ chore(integration): remove streaming tests superseded by API-level coverage
 
 Keep subject under 72 chars. Use body for details if needed.
 
+A pull request that adds or amends an RFC under `rfcs/` uses the type `rfc`
+and, like every other type, a scope from the list in
+`.github/workflows/pr-title.yml`, for example `rfc(storage): tiered storage`.
+If no existing scope fits, add the RFC's feature name to that list in the same
+pull request.
+
 ## PR Triage Commands
 
 Move a PR around the review queue by posting a slash command on its own
