@@ -157,6 +157,10 @@ public interface StreamsClient {
      *
      * <p>Unlike {@link #deleteStream(StreamId)}, the stream itself and its topics are kept.
      *
+     * <p>The server wipes the partitions after it acknowledges the purge, so old
+     * messages stay readable briefly, and a message sent right after the returned
+     * future completes can still be deleted by the pending wipe.
+     *
      * @param streamId the numeric stream identifier
      * @return a {@link CompletableFuture} that completes when the server accepts the purge
      */
@@ -168,6 +172,13 @@ public interface StreamsClient {
      * Purges a stream, deleting all messages in all of its topics and partitions.
      *
      * <p>Unlike {@link #deleteStream(StreamId)}, the stream itself and its topics are kept.
+     *
+     * <p>Purging restarts partition offsets at 0 and clears the offsets stored for
+     * consumers and consumer groups. It cannot be undone.
+     *
+     * <p>The server wipes the partitions after it acknowledges the purge, so old
+     * messages stay readable briefly, and a message sent right after the returned
+     * future completes can still be deleted by the pending wipe.
      *
      * @param streamId the stream identifier (numeric or string-based)
      * @return a {@link CompletableFuture} that completes when the server accepts the purge

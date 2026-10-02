@@ -102,23 +102,36 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
         var streamDetails = streamsClient.createStream("test-stream");
         trackStream(streamDetails.id());
         var streamId = StreamId.of(streamDetails.id());
-        var topicDetails = client.topics()
-                .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
+        var topicsClient = client.topics();
+        var topicDetails = topicsClient.createTopic(
+                streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
         var topicId = TopicId.of(topicDetails.id());
+        var secondTopicDetails = topicsClient.createTopic(
+                streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic-2");
+        var secondTopicId = TopicId.of(secondTopicDetails.id());
         var messagesClient = client.messages();
         messagesClient.sendMessages(
                 streamId, topicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
+        messagesClient.sendMessages(
+                streamId, secondTopicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
 
-        // The send is acknowledged before this runs, so the message must already be visible.
+        // The sends are acknowledged before this runs, so the messages must already be visible.
         assertThat(pollMessages(messagesClient, streamId, topicId).messages()).hasSize(1);
+        assertThat(pollMessages(messagesClient, streamId, secondTopicId).messages())
+                .hasSize(1);
 
         // when
         streamsClient.purgeStream(streamDetails.id());
 
-        // then
+        // then — the stream and both topics remain, and every message is gone
         var streamOptional = streamsClient.getStream(streamDetails.id());
         assertThat(streamOptional).isPresent();
+        assertThat(topicsClient.getTopic(streamId, topicId)).isPresent();
+        assertThat(topicsClient.getTopic(streamId, secondTopicId)).isPresent();
         assertThat(pollUntilEmpty(messagesClient, streamId, topicId))
+                .as("messages are purged from the stream")
+                .isTrue();
+        assertThat(pollUntilEmpty(messagesClient, streamId, secondTopicId))
                 .as("messages are purged from the stream")
                 .isTrue();
     }

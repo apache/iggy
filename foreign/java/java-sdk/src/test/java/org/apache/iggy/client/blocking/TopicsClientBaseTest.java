@@ -78,7 +78,8 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
                 STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
 
         // The send is acknowledged before this runs, so the message must already be visible.
-        assertThat(pollMessages(messagesClient, STREAM_NAME, topicId).messages()).hasSize(1);
+        assertThat(pollMessages(messagesClient, STREAM_NAME, topicId).messages())
+                .hasSize(1);
 
         // when
         topicsClient.purgeTopic(STREAM_NAME, topicId);
@@ -88,6 +89,15 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
         assertThat(pollUntilEmpty(messagesClient, STREAM_NAME, topicId))
                 .as("messages are purged from the topic")
                 .isTrue();
+
+        // when — a message is sent after the purge
+        messagesClient.sendMessages(
+                STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(Message.of("message after purge")));
+
+        // then — it is stored as the first message, at offset 0
+        var polled = pollMessages(messagesClient, STREAM_NAME, topicId);
+        assertThat(polled.messages()).hasSize(1);
+        assertThat(polled.messages().get(0).header().offset()).isEqualTo(BigInteger.ZERO);
     }
 
     @Test

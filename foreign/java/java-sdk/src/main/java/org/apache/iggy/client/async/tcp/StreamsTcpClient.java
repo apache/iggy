@@ -116,6 +116,6 @@ public class StreamsTcpClient implements StreamsClient {
     public CompletableFuture<Void> purgeStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection().send(CommandCode.Stream.PURGE.getValue(), payload).thenAccept(ReferenceCounted::release);
+        return connection().sendAndRelease(CommandCode.Stream.PURGE, payload);
     }
 }

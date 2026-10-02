@@ -216,8 +216,6 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection()
-                .send(CommandCode.Topic.PURGE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection().sendAndRelease(CommandCode.Topic.PURGE, payload);
     }
 }

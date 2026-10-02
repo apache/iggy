@@ -125,8 +125,7 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
         }
     }
 
-    protected static PolledMessages pollMessages(
-            MessagesClient messagesClient, StreamId streamId, TopicId topicId) {
+    protected static PolledMessages pollMessages(MessagesClient messagesClient, StreamId streamId, TopicId topicId) {
         return messagesClient.pollMessages(
                 streamId,
                 topicId,
@@ -142,8 +141,7 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
      * server accepts it, but the messages can still be visible to a poll issued right after, so a
      * single poll is not a reliable assertion that the purge took effect.
      */
-    protected static boolean pollUntilEmpty(
-            MessagesClient messagesClient, StreamId streamId, TopicId topicId) {
+    protected static boolean pollUntilEmpty(MessagesClient messagesClient, StreamId streamId, TopicId topicId) {
         var deadline = System.currentTimeMillis() + 10_000;
         do {
             if (pollMessages(messagesClient, streamId, topicId).messages().isEmpty()) {

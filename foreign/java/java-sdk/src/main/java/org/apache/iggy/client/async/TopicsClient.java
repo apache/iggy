@@ -195,6 +195,10 @@ public interface TopicsClient {
      *
      * <p>Unlike {@link #deleteTopic(StreamId, TopicId)}, the topic itself is kept.
      *
+     * <p>The server wipes the partitions after it acknowledges the purge, so old
+     * messages stay readable briefly, and a message sent right after the returned
+     * future completes can still be deleted by the pending wipe.
+     *
      * @param streamId the numeric stream identifier
      * @param topicId  the numeric topic identifier
      * @return a {@link CompletableFuture} that completes when the server accepts the purge
@@ -207,6 +211,13 @@ public interface TopicsClient {
      * Purges a topic, deleting all messages in all of its partitions.
      *
      * <p>Unlike {@link #deleteTopic(StreamId, TopicId)}, the topic itself is kept.
+     *
+     * <p>Purging restarts partition offsets at 0 and clears the offsets stored for
+     * consumers and consumer groups. It cannot be undone.
+     *
+     * <p>The server wipes the partitions after it acknowledges the purge, so old
+     * messages stay readable briefly, and a message sent right after the returned
+     * future completes can still be deleted by the pending wipe.
      *
      * @param streamId the stream identifier containing the topic
      * @param topicId  the topic identifier to purge
