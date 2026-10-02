@@ -49,6 +49,7 @@ const DEFAULT_REQUEST_CAPACITY: usize = 32;
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_BATCH_TIMEOUT: &str = "10ms";
 const DEFAULT_MAX_RETRIES: u32 = 5;
+const DEFAULT_SESSION_EXPIRY_INTERVAL: u32 = 3600;
 
 /// MQTT wire protocol selected for the broker connection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -118,6 +119,7 @@ pub struct MqttSourceConfig {
     #[serde(default)]
     pub clean_start: bool,
     /// MQTT 5 session expiry interval in seconds.
+    #[serde(default = "default_session_expiry_interval")]
     pub session_expiry_interval: Option<u32>,
     /// MQTT keep-alive interval.
     pub keep_alive: Option<String>,
@@ -365,7 +367,7 @@ impl MqttSource {
             return Ok(Vec::new());
         };
 
-        let mut messages = Vec::with_capacity(self.batch_size);
+        let mut messages = Vec::new();
         messages.push(first);
         let deadline = tokio::time::Instant::now() + self.batch_timeout;
         while messages.len() < self.batch_size {
@@ -560,7 +562,7 @@ impl Source for MqttSource {
                 "MQTT driver is not initialized".to_string(),
             ));
         };
-        let acknowledgement = driver
+        let mut acknowledgement = driver
             // MQTT acknowledgements are sent only after Iggy acknowledges the
             // batch, preserving at-least-once delivery.
             .acknowledge_batch(
@@ -570,6 +572,20 @@ impl Source for MqttSource {
                 self.max_retries(),
             )
             .await;
+        for _ in 0..driver::ACK_BATCH_RETRY_ATTEMPTS {
+            if acknowledgement.is_ok() || pending_batch.ack_tokens.is_empty() {
+                break;
+            }
+            tokio::time::sleep(driver::ACK_RETRY_DELAY.min(self.poll_timeout)).await;
+            acknowledgement = driver
+                .acknowledge_batch(
+                    &mut pending_batch.ack_tokens,
+                    self.poll_timeout,
+                    self.batch_size,
+                    self.max_retries(),
+                )
+                .await;
+        }
         *self.driver.lock().await = Some(driver);
         if let Err(error) = acknowledgement {
             warn!(
@@ -595,6 +611,10 @@ impl Source for MqttSource {
 
 fn default_qos() -> u8 {
     1
+}
+
+fn default_session_expiry_interval() -> Option<u32> {
+    Some(DEFAULT_SESSION_EXPIRY_INTERVAL)
 }
 
 #[derive(Debug, Serialize)]
@@ -687,6 +707,36 @@ mod tests {
         let source = MqttSource::new(7, test_config(), None);
 
         assert_eq!(source.max_retries(), DEFAULT_MAX_RETRIES);
+    }
+
+    #[test]
+    fn given_missing_session_expiry_interval_should_use_nonzero_default() {
+        let config: MqttSourceConfig = serde_json::from_str(
+            r#"{
+                "broker_url": "mqtt://localhost:1883",
+                "subscriptions": ["devices/test"]
+            }"#,
+        )
+        .expect("config should deserialize");
+
+        assert_eq!(
+            config.session_expiry_interval,
+            Some(DEFAULT_SESSION_EXPIRY_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn given_explicit_zero_session_expiry_interval_should_preserve_it() {
+        let config: MqttSourceConfig = serde_json::from_str(
+            r#"{
+                "broker_url": "mqtt://localhost:1883",
+                "subscriptions": ["devices/test"],
+                "session_expiry_interval": 0
+            }"#,
+        )
+        .expect("config should deserialize");
+
+        assert_eq!(config.session_expiry_interval, Some(0));
     }
 
     #[test]

@@ -67,7 +67,7 @@ max_request_size = "2 MB"
 # a warning will be logged at startup but the server will continue to run.
 # `true` enables the embedded Web UI (requires server built with 'iggy-web' feature).
 # `false` disables the embedded Web UI (default).
-web_ui = true
+web_ui = false
 
 # Configuration for Cross-Origin Resource Sharing (CORS).
 [http.cors]
