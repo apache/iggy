@@ -7502,13 +7502,11 @@ dependencies = [
  "dashmap",
  "fluss-rs",
  "humantime",
- "iggy_common",
  "iggy_connector_sdk",
  "rmp-serde",
  "secrecy",
  "serde",
  "serde_json",
- "simd-json",
  "tokio",
  "tracing",
 ]
