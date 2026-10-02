@@ -842,6 +842,14 @@ class HeaderField final {
         return HeaderField(kind, std::move(value));
     }
 
+    /**
+     * @brief Creates a typed header field by copying bytes from a string view.
+     * @param kind Type tag for @p value.
+     * @param value Bytes to copy into the field.
+     * @return Header field containing the supplied type and bytes.
+     * @note This overload does not validate that the bytes match @p kind or
+     *       that a HeaderKind::String value contains valid UTF-8.
+     */
     static HeaderField Create(HeaderKind kind, std::string_view value) {
         return HeaderField(kind, std::vector<std::uint8_t>(value.begin(), value.end()));
     }
@@ -3238,9 +3246,32 @@ class PollingStrategy final {
     std::uint64_t polling_strategy_value_;
 };
 
+/**
+ * @brief Selects the destination partition for a batch of messages.
+ *
+ * Balanced() distributes batches across the topic's partitions. PartitionId()
+ * selects one partition explicitly. MessagesKey() hashes the supplied bytes
+ * modulo the topic's partition count, so changing that count can change the
+ * destination for a key.
+ *
+ * The selected strategy applies to the entire SendMessages() call. Validation
+ * is deferred until the batch is sent. In particular, a message key must
+ * contain between 1 and 255 bytes.
+ */
 class Partitioning final {
   public:
+    /**
+     * @brief Selects partitions using the client's balanced strategy.
+     * @return Balanced partitioning with no value payload.
+     */
     static Partitioning Balanced() { return Partitioning("balanced", {}); }
+
+    /**
+     * @brief Selects a partition by numeric ID.
+     * @param partition_id Destination partition ID.
+     * @return Explicit partitioning whose value is the ID encoded as four
+     *         little-endian bytes.
+     */
     static Partitioning PartitionId(std::uint32_t partition_id) {
         constexpr std::size_t kPartitionIdBytes = 4;
         constexpr std::uint32_t kBitsPerByte    = 8;
@@ -3250,10 +3281,29 @@ class Partitioning final {
         }
         return Partitioning("partition_id", std::move(partitioning_value));
     }
+
+    /**
+     * @brief Selects a partition by hashing a message key.
+     * @param key Binary key used to select the destination partition.
+     * @return Key-based partitioning owning @p key.
+     * @note The key length is validated by SendMessages() and must be between
+     *       1 and 255 bytes.
+     */
     static Partitioning MessagesKey(std::vector<std::uint8_t> key) {
         return Partitioning("messages_key", std::move(key));
     }
+
+    /**
+     * @brief Returns the partitioning strategy name.
+     * @return `balanced`, `partition_id`, or `messages_key`.
+     */
     [[nodiscard]] std::string_view Kind() const { return partitioning_kind_; }
+
+    /**
+     * @brief Returns the strategy's encoded value.
+     * @return Empty bytes for balanced partitioning, four little-endian bytes
+     *         for an explicit partition ID, or the message key bytes.
+     */
     [[nodiscard]] const std::vector<std::uint8_t> &Value() const noexcept { return partitioning_value_; }
 
   private:
@@ -3264,11 +3314,39 @@ class Partitioning final {
     std::vector<std::uint8_t> partitioning_value_;
 };
 
+/**
+ * @brief Commit information for one partition written by SendMessages().
+ *
+ * BaseOffset() identifies where the first message from the committed batch
+ * landed in this partition. Sending is at least once, so a retry may have
+ * committed the same batch at an earlier offset. The confirmation therefore
+ * does not establish uniqueness. It reports quorum commit; recoverable
+ * stable-storage durability depends on the topic's durability policy.
+ */
 class SendMessagesConfirmation final {
   public:
+    /**
+     * @brief Returns the numeric stream ID resolved by the server.
+     * @return Stream ID containing the committed batch.
+     */
     [[nodiscard]] std::uint32_t StreamId() const noexcept { return stream_id_; }
+
+    /**
+     * @brief Returns the numeric topic ID resolved by the server.
+     * @return Topic ID containing the committed batch.
+     */
     [[nodiscard]] std::uint32_t TopicId() const noexcept { return topic_id_; }
+
+    /**
+     * @brief Returns the partition that received the batch.
+     * @return Numeric partition ID.
+     */
     [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /**
+     * @brief Returns the offset assigned to the batch's first message.
+     * @return First committed message offset in this partition.
+     */
     [[nodiscard]] std::uint64_t BaseOffset() const noexcept { return base_offset_; }
 
   private:
@@ -3288,8 +3366,20 @@ class SendMessagesConfirmation final {
     std::uint64_t base_offset_;
 };
 
+/**
+ * @brief Result of a successful SendMessages() operation.
+ *
+ * Confirmations are returned per partition. The collection may be empty when
+ * the server reports no offsets, including successful sends to a legacy
+ * server. An empty collection does not mean the send failed.
+ */
 class SendMessagesResponse final {
   public:
+    /**
+     * @brief Returns the available per-partition commit information.
+     * @return Confirmations owned by this response. The reference remains
+     *         valid while this SendMessagesResponse remains alive.
+     */
     [[nodiscard]] const std::vector<SendMessagesConfirmation> &Confirmations() const noexcept { return confirmations_; }
 
   private:
@@ -3303,11 +3393,40 @@ class SendMessagesResponse final {
     std::vector<SendMessagesConfirmation> confirmations_;
 };
 
+/**
+ * @brief Messages and partition state returned by PollMessages().
+ *
+ * CurrentOffset() is the partition's current offset observed for this request,
+ * not the offset of the last returned message. For a consumer-group member
+ * with no assigned partitions, an empty result can use
+ * `std::numeric_limits<std::uint32_t>::max() - 1` as its partition ID.
+ */
 class PolledMessages final {
   public:
+    /**
+     * @brief Returns the partition selected for this poll.
+     * @return Numeric partition ID, or the no-assignment sentinel described by
+     *         PolledMessages when no consumer-group partition is available.
+     */
     [[nodiscard]] std::uint32_t PartitionId() const noexcept { return partition_id_; }
+
+    /**
+     * @brief Returns the partition's current message offset.
+     * @return Current offset observed by the server for this request.
+     */
     [[nodiscard]] std::uint64_t CurrentOffset() const noexcept { return current_offset_; }
+
+    /**
+     * @brief Returns the number of messages in this result.
+     * @return Message count reported by the server.
+     */
     [[nodiscard]] std::uint32_t Count() const noexcept { return count_; }
+
+    /**
+     * @brief Returns the polled messages in partition order.
+     * @return Messages owned by this result. The reference remains valid while
+     *         this PolledMessages remains alive.
+     */
     [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
 
   private:
@@ -3327,11 +3446,37 @@ class PolledMessages final {
     std::vector<IggyMessagePolled> messages_;
 };
 
+/**
+ * @brief One server-supported resource option returned by DescribeOptions().
+ *
+ * The default value is encoded according to Kind(), using the same HeaderKind
+ * codes as typed header fields. An empty default value means that the option
+ * has no default.
+ */
 class OptionSpec final {
   public:
+    /**
+     * @brief Returns the option name accepted by the resource command.
+     * @return Option key owned by this value.
+     */
     [[nodiscard]] const std::string &Key() const noexcept { return key_; }
+
+    /**
+     * @brief Returns the HeaderKind code for the option's default value.
+     * @return Numeric code corresponding to a HeaderKind enumerator.
+     */
     [[nodiscard]] std::uint8_t Kind() const noexcept { return kind_; }
+
+    /**
+     * @brief Returns the server default encoded according to Kind().
+     * @return Encoded default value, or an empty vector when none is defined.
+     */
     [[nodiscard]] const std::vector<std::uint8_t> &DefaultValue() const noexcept { return default_value_; }
+
+    /**
+     * @brief Returns the server-provided option description.
+     * @return Human-readable description owned by this value.
+     */
     [[nodiscard]] const std::string &Description() const noexcept { return description_; }
 
   private:
@@ -3351,11 +3496,36 @@ class OptionSpec final {
     std::string description_;
 };
 
+/**
+ * @brief Client-facing transport ports advertised for a cluster node.
+ *
+ * A port value of zero means that the corresponding transport is not
+ * advertised for the node.
+ */
 class TransportEndpoints final {
   public:
+    /**
+     * @brief Returns the advertised TCP port.
+     * @return TCP port, or zero when TCP is not advertised.
+     */
     [[nodiscard]] std::uint16_t Tcp() const noexcept { return tcp_; }
+
+    /**
+     * @brief Returns the advertised QUIC port.
+     * @return QUIC port, or zero when QUIC is not advertised.
+     */
     [[nodiscard]] std::uint16_t Quic() const noexcept { return quic_; }
+
+    /**
+     * @brief Returns the advertised HTTP port.
+     * @return HTTP port, or zero when HTTP is not advertised.
+     */
     [[nodiscard]] std::uint16_t Http() const noexcept { return http_; }
+
+    /**
+     * @brief Returns the advertised WebSocket port.
+     * @return WebSocket port, or zero when WebSocket is not advertised.
+     */
     [[nodiscard]] std::uint16_t Websocket() const noexcept { return websocket_; }
 
   private:
@@ -3372,12 +3542,44 @@ class TransportEndpoints final {
     std::uint16_t websocket_;
 };
 
+/**
+ * @brief One node in the server's cluster topology.
+ *
+ * The address and ports are client-facing endpoints selected for the requesting
+ * client's network. Role and status are lowercase server values. Current role
+ * values are `leader` and `follower`; status values include `healthy`,
+ * `starting`, `stopping`, `unreachable`, `maintenance`, and `unknown`.
+ */
 class ClusterNode final {
   public:
+    /**
+     * @brief Returns the configured node name.
+     * @return Node name owned by this value.
+     */
     [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the client-facing node address.
+     * @return IP address or host name owned by this value, without a port.
+     */
     [[nodiscard]] const std::string &Ip() const noexcept { return ip_; }
+
+    /**
+     * @brief Returns the node's advertised client transport ports.
+     * @return Transport endpoints owned by this value.
+     */
     [[nodiscard]] const TransportEndpoints &Endpoints() const noexcept { return endpoints_; }
+
+    /**
+     * @brief Returns the node's current cluster role.
+     * @return Lowercase role name supplied by the server.
+     */
     [[nodiscard]] const std::string &Role() const noexcept { return role_; }
+
+    /**
+     * @brief Returns the node's current status.
+     * @return Lowercase status name supplied by the server.
+     */
     [[nodiscard]] const std::string &Status() const noexcept { return status_; }
 
   private:
@@ -3399,9 +3601,26 @@ class ClusterNode final {
     std::string status_;
 };
 
+/**
+ * @brief Snapshot of the server's advertised cluster topology.
+ *
+ * The result contains one entry per configured cluster node. A server without
+ * an enabled cluster reports a synthesized single-node cluster. Leadership and
+ * status can change immediately after the metadata is returned.
+ */
 class ClusterMetadata final {
   public:
+    /**
+     * @brief Returns the advertised cluster name.
+     * @return Cluster name owned by this value.
+     */
     [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the advertised cluster nodes.
+     * @return Nodes owned by this value. The reference remains valid while
+     *         this ClusterMetadata remains alive.
+     */
     [[nodiscard]] const std::vector<ClusterNode> &Nodes() const noexcept { return nodes_; }
 
   private:
@@ -4241,10 +4460,68 @@ class IggyBlockingClient final {
      *         the request fails.
      */
     Stats GetStats();
+
+    /**
+     * @brief Sends a non-empty batch of messages to one topic.
+     *
+     * The partitioning strategy selects one destination for the entire batch.
+     * Message and partitioning constraints are validated before the request is
+     * sent. The Rust SDK assigns generated IDs to messages whose ID is zero;
+     * the C++ input objects are not modified.
+     *
+     * Delivery is at least once. A failed or unknown transport outcome can
+     * leave the batch committed, so retrying may append duplicates. Successful
+     * responses can contain no confirmations; see SendMessagesResponse.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Destination topic, addressed by numeric ID or name.
+     * @param partitioning Strategy used to select the destination partition.
+     * @param messages Messages to send. The collection must not be empty.
+     * @return Available per-partition commit confirmations.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier, partitioning strategy, message, or batch is
+     *         invalid; the stream, topic, or partition does not exist; the
+     *         caller lacks send permission; or the request fails.
+     */
     SendMessagesResponse SendMessages(const Identifier &stream,
                                       const Identifier &topic,
                                       const Partitioning &partitioning,
                                       const std::vector<IggyMessageToSend> &messages);
+
+    /**
+     * @brief Polls messages for an individual consumer or consumer group.
+     *
+     * For an individual consumer, an omitted partition selects partition zero.
+     * For a consumer group, an omitted partition lets the stateful client
+     * select one of this connection's assigned partitions. An explicit group
+     * partition must belong to the current connection. Group membership is not
+     * supported by the HTTP transport.
+     *
+     * With @p auto_commit enabled, the server can advance the consumer cursor
+     * before the response reaches the caller. Retrying a missing response with
+     * PollingStrategy::Next() can therefore skip messages. Applications that
+     * require controlled recovery should checkpoint processed message offsets
+     * and resume with PollingStrategy::Offset(). CurrentOffset() is not such a
+     * checkpoint because it describes the partition rather than the last
+     * message returned.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Topic to poll, addressed by numeric ID or name.
+     * @param partition_id Partition to poll, or `std::nullopt` for the default
+     *        individual partition or client-selected group partition. The
+     *        maximum `std::uint32_t` value is reserved by the FFI and rejected.
+     * @param consumer Consumer identity that owns the polling cursor.
+     * @param strategy Starting position for this poll.
+     * @param count Maximum number of messages to return. Must be greater than
+     *        zero.
+     * @param auto_commit Whether to advance the consumer offset automatically.
+     * @return Selected partition state and the messages read from it.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         an identifier, partition, strategy, or count is invalid; a
+     *         resource does not exist; group membership or partition ownership
+     *         is missing; the caller lacks poll permission; or the request
+     *         fails.
+     */
     PolledMessages PollMessages(const Identifier &stream,
                                 const Identifier &topic,
                                 std::optional<std::uint32_t> partition_id,
@@ -4252,14 +4529,131 @@ class IggyBlockingClient final {
                                 const PollingStrategy &strategy,
                                 std::uint32_t count,
                                 bool auto_commit);
+
+    /**
+     * @brief Retrieves the server's option catalog for one resource type.
+     *
+     * The catalog describes accepted create-option keys, their HeaderKind
+     * encodings, defaults, and descriptions. A supported scope with no option
+     * keys returns an empty collection. This is currently the case for the
+     * `stream` and `user` scopes.
+     *
+     * @param scope Resource scope. Must be `topic`, `stream`, or `user`.
+     * @return Option specifications for the requested scope.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         @p scope is invalid; or the request fails.
+     */
     std::vector<OptionSpec> DescribeOptions(std::string scope);
+
+    /**
+     * @brief Checks whether the configured server can answer a request.
+     *
+     * Ping does not require authentication and returns no server data.
+     *
+     * @throws IggyException if the client is unavailable or the request fails.
+     */
     void Ping();
+
+    /**
+     * @brief Returns the client's configured heartbeat interval.
+     * @return Non-zero interval in microseconds.
+     * @note This reads client configuration and does not contact the server.
+     * @throws IggyException if this client has been moved from.
+     */
     std::chrono::microseconds HeartbeatInterval();
+
+    /**
+     * @brief Captures server diagnostics as a ZIP archive.
+     *
+     * Duplicate snapshot types are removed. SystemSnapshotType::All() must be
+     * the only requested type and expands to all production diagnostic
+     * sections. The server runs only one snapshot collection at a time; a
+     * concurrent request fails. A section that cannot be captured can be
+     * omitted while the remaining archive is still returned.
+     *
+     * @param compression Compression method used for ZIP entries.
+     * @param types Non-empty collection of diagnostic sections to capture.
+     * @return Complete ZIP archive bytes owned by the caller.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the caller lacks read-servers or manage-servers permission; the
+     *         requested types are invalid; another snapshot is in progress;
+     *         archive creation fails; or the request fails.
+     */
     std::vector<std::uint8_t> Snapshot(const SnapshotCompression &compression,
                                        const std::vector<SystemSnapshotType> &types);
+
+    /**
+     * @brief Sends one command through the raw Iggy binary protocol.
+     *
+     * The caller supplies only the command body and receives only the response
+     * body; the configured transport adds and removes protocol framing. The
+     * command keeps its normal authentication, authorization, and mutation
+     * semantics. Session-control commands for login, logout, and registration
+     * are rejected so that the SDK's session state cannot be bypassed.
+     *
+     * @param code Iggy binary-protocol command code.
+     * @param payload Command body encoded for @p code.
+     * @return Raw response body without protocol framing.
+     * @throws IggyException if the transport is HTTP; @p code is a
+     *         session-control or unsupported command; the payload is invalid;
+     *         the command's access checks fail; or the request fails.
+     */
     std::vector<std::uint8_t> SendBinaryRequest(std::uint32_t code, const std::vector<std::uint8_t> &payload);
+
+    /**
+     * @brief Replaces or removes a user's complete permission assignment.
+     *
+     * Passing `std::nullopt` removes the permission object. Passing a
+     * default-constructed Permissions assigns an explicit permission object
+     * with no enabled grants. The root user's permissions are immutable.
+     *
+     * A failed or unknown transport outcome can leave the replacement
+     * committed. Retrieve the user before retrying with a different value.
+     *
+     * @param user User to update, addressed by numeric ID or name.
+     * @param permissions Replacement assignment, or `std::nullopt` to remove
+     *        the current assignment.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the identifier or permissions are invalid; the user does not
+     *         exist or is the root user; the caller lacks manage-users
+     *         permission; or the request fails.
+     */
     void UpdatePermissions(const Identifier &user, const std::optional<Permissions> &permissions);
+
+    /**
+     * @brief Changes a user's password after verifying its current value.
+     *
+     * Both passwords must contain between 3 and 100 bytes. The current password
+     * is checked against the target user even when an administrator changes
+     * another account. A user may change its own password without manage-users
+     * permission; changing another user's password requires that permission.
+     *
+     * A failed or unknown transport outcome can leave the password changed.
+     * Verify which credential works before retrying.
+     *
+     * @param user User whose password is changed, addressed by numeric ID or
+     *        name.
+     * @param current_password Target user's current password.
+     * @param new_password Replacement password.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the identifier or password is invalid; the user does not exist;
+     *         the current password does not match; the caller lacks permission;
+     *         or the request fails.
+     */
     void ChangePassword(const Identifier &user, std::string current_password, std::string new_password);
+
+    /**
+     * @brief Retrieves the server's current cluster topology.
+     *
+     * The result includes client-facing addresses, transport ports, roles, and
+     * statuses for the configured nodes. No cluster-wide read grant is needed,
+     * but the caller must be authenticated. A server without an enabled cluster
+     * reports a synthesized single-node topology.
+     *
+     * @return Cluster metadata observed for this request.
+     * @throws IggyException if the client is unavailable or unauthenticated;
+     *         the response is invalid; or the request fails.
+     */
     ClusterMetadata GetClusterMetadata();
 
   private:
