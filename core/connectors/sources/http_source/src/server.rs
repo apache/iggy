@@ -337,7 +337,10 @@ impl Published {
                 .instances
                 .iter()
                 .filter(|instance| instance.has_polled())
-                .all(|instance| instance.poll_is_live(now_seconds))
+                .all(|instance| {
+                    instance.poll_is_live(now_seconds)
+                        && !instance.staged_batch_is_stuck(now_seconds)
+                })
     }
 }
 
@@ -991,12 +994,10 @@ async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> Response
 
 /// Readiness for a load balancer: unavailable until an instance is serving.
 ///
-/// A joined instance is not the same as a polling one. The SDK stops the poll
-/// task after five consecutive NACKs without calling `close()`, so the instance
-/// stays joined and this kept answering 200 to the load balancer while handlers
-/// accepted into a bridge nobody drained, until it filled and 429d forever.
-/// Readiness needs all three: an instance, a route it can reach, and a poll
-/// task still running behind it.
+/// A joined instance is not the same as a polling one. A configured NACK
+/// limit can stop polling without calling `close()`;
+/// repeated NACKs can also leave a staged batch stuck while polling continues.
+/// Readiness needs an instance, a reachable route, and a healthy poll path.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     let now = unix_now_seconds();
     // One guard, so readiness cannot be computed from a route table and an
@@ -1024,29 +1025,7 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
     let instances = published
         .instances
         .iter()
-        .map(|instance| {
-            let registry = instance.registry();
-            InstanceHealth {
-                instance: instance.instance_name.clone(),
-                topic_path: instance.config.topic_path.clone(),
-                buffer_used: instance.sender.len(),
-                buffer_capacity: instance.config.buffer_capacity,
-                endpoints_static: registry.serving_count_by_origin(EndpointOrigin::Static, now),
-                endpoints_dynamic: registry.serving_count_by_origin(EndpointOrigin::Dynamic, now),
-                endpoints_expired: registry.expired_count(now),
-                endpoints_revoked: registry.revoked_count(),
-                named_path: instance.config.topic_path.is_some(),
-                poll_is_live: instance.poll_is_live(now),
-                has_polled: instance.has_polled(),
-                // The registry is handed over whole, so an owed flush is the
-                // whole answer. Still not `persisted`: the flag clears when the
-                // state leaves the plugin, and the runtime's write landing is
-                // something no poll return value reports back.
-                state_submitted: !instance.has_pending_state(),
-                headers_dropped: state.metrics.headers_dropped(&instance.instance_name),
-                headers_clamped: state.metrics.headers_clamped(&instance.instance_name),
-            }
-        })
+        .map(|instance| InstanceHealth::from_instance(instance, &state.metrics, now))
         .collect();
 
     // Derived, not a constant: this answered "ok" while `/health` was
@@ -1360,10 +1339,9 @@ struct InstanceHealth {
     /// Whether a poll has run recently enough to believe one still will.
     ///
     /// `state_submitted` says a change was handed over; this says whether
-    /// anything is still there to hand the next one to. The SDK stops the poll
-    /// task after five consecutive NACKs without calling `close()`, so the
-    /// instance stays registered and keeps accepting mutations that will never
-    /// be persisted. See #3941.
+    /// anything is still there to hand the next one to. A configured NACK
+    /// limit can stop polling without calling `close()`,
+    /// leaving registered routes that cannot drain or persist mutations.
     ///
     /// Read it with `has_polled`, which separates the two ways this can be
     /// false. `has_polled` false alongside it is an instance still starting
@@ -1372,6 +1350,9 @@ struct InstanceHealth {
     /// listener out of rotation. This one true with `has_polled` false is
     /// simply a first poll in flight.
     poll_is_live: bool,
+    /// A retained batch is still being retried after the readiness window.
+    /// Polling may continue even when this is true.
+    staged_batch_is_stuck: bool,
     has_polled: bool,
     state_submitted: bool,
     /// Named to mirror the metric families exactly, so an operator reading
@@ -1379,6 +1360,33 @@ struct InstanceHealth {
     /// of one thing.
     headers_dropped: u64,
     headers_clamped: u64,
+}
+
+impl InstanceHealth {
+    fn from_instance(instance: &SharedState, metrics: &Metrics, now: u64) -> Self {
+        let registry = instance.registry();
+        Self {
+            instance: instance.instance_name.clone(),
+            topic_path: instance.config.topic_path.clone(),
+            buffer_used: instance.sender.len(),
+            buffer_capacity: instance.config.buffer_capacity,
+            endpoints_static: registry.serving_count_by_origin(EndpointOrigin::Static, now),
+            endpoints_dynamic: registry.serving_count_by_origin(EndpointOrigin::Dynamic, now),
+            endpoints_expired: registry.expired_count(now),
+            endpoints_revoked: registry.revoked_count(),
+            named_path: instance.config.topic_path.is_some(),
+            poll_is_live: instance.poll_is_live(now),
+            staged_batch_is_stuck: instance.staged_batch_is_stuck(now),
+            has_polled: instance.has_polled(),
+            // The registry is handed over whole, so an owed flush is the
+            // whole answer. Still not `persisted`: the flag clears when the
+            // state leaves the plugin, and the runtime's write landing is
+            // something no poll return value reports back.
+            state_submitted: !instance.has_pending_state(),
+            headers_dropped: metrics.headers_dropped(&instance.instance_name),
+            headers_clamped: metrics.headers_clamped(&instance.instance_name),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1912,6 +1920,7 @@ mod tests {
         assert_eq!(instance["endpoints_dynamic"], 0);
         assert_eq!(instance["endpoints_revoked"], 0);
         assert_eq!(instance["named_path"], true);
+        assert_eq!(instance["staged_batch_is_stuck"], false);
         assert_eq!(instance["state_submitted"], true);
         close(&mut source).await;
     }
@@ -2743,6 +2752,43 @@ mod tests {
             .expect("the request must reach the listener");
 
         assert_eq!(response.status(), StatusCode::OK);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_stuck_batch_when_polling_continues_should_fail_readiness() {
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        let shared = Arc::clone(&source.shared);
+        let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let batch = source
+            .poll()
+            .await
+            .expect("the accepted webhook should be polled");
+        assert_eq!(batch.messages.len(), 1);
+        source
+            .on_batch_result(iggy_connector_sdk::source::SourceBatchResult::Nack)
+            .await
+            .expect("the NACK should retain the batch");
+
+        let polling = shared.enter_poll();
+        let later = unix_now_seconds() + crate::POLL_LIVENESS_SECONDS + 1;
+        let state = {
+            let servers = SERVERS.lock().await;
+            Arc::clone(
+                &servers
+                    .get(&source.shared.config.listen_addr)
+                    .expect("source listener should be registered")
+                    .state,
+            )
+        };
+        assert!(shared.poll_is_live(later));
+        assert!(shared.staged_batch_is_stuck(later));
+        assert!(!state.published().is_ready(later));
+        let health = InstanceHealth::from_instance(&shared, &state.metrics, later);
+        assert!(health.poll_is_live);
+        assert!(health.staged_batch_is_stuck);
+        drop(polling);
         close(&mut source).await;
     }
 

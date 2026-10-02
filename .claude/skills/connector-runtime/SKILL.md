@@ -110,7 +110,7 @@ Don't mix.
 1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
 2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
 3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside). The FFI callback bumps errors on deserialize or channel-closed failure with one relaxed atomic - no `Family` lookup, no `Arc<Metrics>` handle.
-4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer.
+4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer. If the SDK times out awaiting a result, it NACKs and polls again. A source that retains its NACKed batch, such as `http_source`, replays it before draining fresh input; repeated timeouts can queue copies of that batch in this unbounded channel.
 5. On success, save returned `ConnectorState` via `FileStateProvider`.
 
 **Shutdown ordering (`manager/source.rs::stop_connector`):**

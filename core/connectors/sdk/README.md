@@ -29,11 +29,19 @@ The crash behavior is intentionally at-least-once:
 
 An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decides whether that confirmation also waits for stable storage on the quorum. Both policies normally write messages to disk.
 
-Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
+Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after five consecutive NACKs by default.
 
-The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it. The SDK stops polling if the handler returns an error, preventing a failed rollback from advancing to another batch.
+A source whose accepted input cannot be re-read after a restart can override `Source::batch_policy()` and call `BatchPolicy::with_max_consecutive_nacks(None)` to keep retrying until shutdown. The batch-result timeout remains fixed at 30 seconds until the late-result handling in #3981 is addressed.
 
-This contract is a breaking FFI change. Source plugins must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK.
+The source receives only ACK or NACK, not the runtime's failure cause. It cannot classify a NACK as transient. Disable the limit only when repeated replay is safer than stopping; a permanent failure still needs operator attention. If `on_batch_result()` returns an error, polling stops because its staged-work outcome is unknown.
+
+The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it.
+
+SDK 0.6 adds `Source::batch_policy()` with a default implementation, so existing source implementations need no code change when rebuilt. Sources that opt out of the NACK breaker must retain and replay their rejected batch; otherwise disabling the stop only turns a visible failure into a silent drop.
+
+Rebuild source plugins to export `iggy_source_register_stop_callback`; the runtime warns when an older plugin lacks it. The callback reports why polling stopped so the runtime can mark the source `Error` and update its running gauge.
+
+The original batch-acknowledgment contract introduced a breaking FFI change. Source plugins built before it must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK. SDK 0.6 also adds the optional stop-callback export; older plugins cannot report an unexpected poll-task exit.
 
 Moreover, it contains both, the `decoders` and `encoders` modules, implementing either `StreamDecoder` or `StreamEncoder` traits, which are used when consuming or producing data from/to Iggy streams.
 
