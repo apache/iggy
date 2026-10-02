@@ -30,7 +30,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// Clear any pending Java exception on the current thread. The JNI spec forbids
@@ -267,6 +267,12 @@ pub struct JdbcSourceConfig {
     /// runtime, which opens sources sequentially at startup) indefinitely.
     #[serde(default = "default_login_timeout")]
     pub login_timeout_ms: u64,
+
+    /// Bound on each query execution (default: 30000). Applied through JDBC's
+    /// `Statement.setQueryTimeout`, which uses whole seconds, so the configured
+    /// value is rounded up to at least one second.
+    #[serde(default = "default_query_timeout")]
+    pub query_timeout_ms: u64,
 }
 
 fn default_connection_timeout() -> u64 {
@@ -274,6 +280,10 @@ fn default_connection_timeout() -> u64 {
 }
 
 fn default_login_timeout() -> u64 {
+    30000
+}
+
+fn default_query_timeout() -> u64 {
     30000
 }
 
@@ -311,6 +321,7 @@ impl std::fmt::Debug for JdbcSourceConfig {
             .field("verbose_logging", &self.verbose_logging)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
             .field("login_timeout_ms", &self.login_timeout_ms)
+            .field("query_timeout_ms", &self.query_timeout_ms)
             .finish()
     }
 }
@@ -368,9 +379,6 @@ pub struct JdbcSource {
     poll_interval: Duration,
     // Whether per-poll details should be promoted from debug to info.
     verbose: bool,
-    // Scheduled start of the next poll, used to pace polls at a fixed cadence
-    // that does not drift with per-poll work time. `None` until the first poll.
-    next_poll_at: Mutex<Option<Instant>>,
 }
 
 /// Sanitize JDBC URL by masking passwords for logging
@@ -423,7 +431,6 @@ impl JdbcSource {
             pending_state: Mutex::new(None),
             poll_interval,
             verbose,
-            next_poll_at: Mutex::new(None),
         }
     }
 
@@ -432,7 +439,11 @@ impl JdbcSource {
     /// instances (see [`get_or_create_jvm`]).
     fn initialize_jvm(&mut self) -> Result<(), Error> {
         info!("Initializing JVM for JDBC source connector [{}]", self.id);
-        let jvm = get_or_create_jvm(&self.config.driver_jar_path, &self.config.jvm_options)?;
+        let jvm = get_or_create_jvm(
+            &self.config.driver_jar_path,
+            &self.config.jvm_options,
+            self.id,
+        )?;
         self.jvm = Some(jvm);
         Ok(())
     }
@@ -449,7 +460,8 @@ impl JdbcSource {
             .map_err(|e| Error::InitError(format!("Failed to attach thread to JVM: {}", e)))?;
 
         info!(
-            "Creating direct JDBC connection to: {}",
+            "{CONNECTOR_NAME} connector [{}] creating direct connection to: {}",
+            self.id,
             sanitize_jdbc_url(self.config.jdbc_url.expose_secret())
         );
         let conn = self.create_direct_connection_internal(&mut env)?;
@@ -537,8 +549,8 @@ impl JdbcSource {
         );
 
         info!(
-            "Loading JDBC driver via the system class loader: {}",
-            self.config.driver_class
+            "{CONNECTOR_NAME} connector [{}] loading driver via the system class loader: {}",
+            self.id, self.config.driver_class
         );
 
         let class_class = jni!(
@@ -569,7 +581,10 @@ impl JdbcSource {
             Error::InitError
         );
 
-        info!("JDBC driver loaded and registered successfully");
+        info!(
+            "{CONNECTOR_NAME} connector [{}] loaded and registered the JDBC driver",
+            self.id
+        );
 
         // Get connection from DriverManager
         let driver_manager = jni!(
@@ -585,6 +600,14 @@ impl JdbcSource {
             "Failed to create JDBC URL string",
             Error::InitError
         );
+
+        // DriverManager's login timeout is process-global. Keep setting it and
+        // opening the corresponding connection in one critical section so two
+        // connector instances cannot apply each other's timeout.
+        let _driver_manager_guard = lock_mutex(
+            &DRIVER_MANAGER_CONNECT_LOCK,
+            "JDBC DriverManager connection",
+        )?;
 
         // Bound connection establishment so an unreachable or slow-DNS database
         // fails instead of hanging open() (which the runtime drives sequentially
@@ -612,7 +635,10 @@ impl JdbcSource {
         let connection_obj = if let (Some(username), Some(password)) =
             (&self.config.username, &self.config.password)
         {
-            info!("Using separate username/password authentication");
+            info!(
+                "{CONNECTOR_NAME} connector [{}] using separate username/password authentication",
+                self.id
+            );
             let username_jstring = jni!(
                 env,
                 env.new_string(username),
@@ -643,7 +669,10 @@ impl JdbcSource {
                 Error::InitError
             )
         } else {
-            info!("Using connection string with embedded credentials");
+            info!(
+                "{CONNECTOR_NAME} connector [{}] using credentials from the connection string",
+                self.id
+            );
             jni!(
                 env,
                 env.call_static_method(
@@ -665,7 +694,10 @@ impl JdbcSource {
             Error::InitError
         );
 
-        info!("Direct database connection established successfully");
+        info!(
+            "{CONNECTOR_NAME} connector [{}] established the database connection",
+            self.id
+        );
         Ok(global_ref)
     }
 
@@ -686,7 +718,10 @@ impl JdbcSource {
         };
 
         if needs_reconnect {
-            info!("Direct JDBC connection is not valid; re-establishing");
+            info!(
+                "{CONNECTOR_NAME} connector [{}] connection is invalid; re-establishing",
+                self.id
+            );
             // Best-effort close of the old handle, then drop it before creating
             // the replacement so a failed reconnect leaves no stale reference.
             if let Some(old) = guard.as_ref() {
@@ -749,7 +784,10 @@ impl JdbcSource {
             self.build_query(&state)
         }?;
         // Logged at debug: the built query embeds the substituted offset value.
-        debug!("Executing query: {}", query.sql);
+        debug!(
+            "{CONNECTOR_NAME} connector [{}] executing query: {}",
+            self.id, query.sql
+        );
 
         let (messages, row_count, max_offset) =
             self.execute_statement_and_fetch_rows(env, &connection, &query)?;
@@ -844,6 +882,24 @@ impl JdbcSource {
         ) {
             best_effort_close(env, &statement);
             return Err(Error::Connection(format!("Failed to set max rows: {err}")));
+        }
+
+        let query_timeout_secs = self
+            .config
+            .query_timeout_ms
+            .div_ceil(1000)
+            .clamp(1, i32::MAX as u64) as i32;
+        if let Err(err) = env.call_method(
+            &statement,
+            "setQueryTimeout",
+            "(I)V",
+            &[JValue::Int(query_timeout_secs)],
+        ) {
+            clear_pending_exception(env);
+            best_effort_close(env, &statement);
+            return Err(Error::Connection(format!(
+                "Failed to set query timeout: {err}"
+            )));
         }
 
         let result_set = match env
@@ -970,9 +1026,9 @@ impl JdbcSource {
                 source_name.clone()
             };
             if !output_names.insert(output_name.clone()) {
-                warn!(
-                    "Column '{source_name}' maps to output key '{output_name}', which is already in the result; later values overwrite earlier ones"
-                );
+                return Err(Error::InvalidConfigValue(format!(
+                    "query result contains duplicate output key '{output_name}' after mapping column '{source_name}'; use unique column aliases"
+                )));
             }
             let is_tracking = self
                 .config
@@ -1153,14 +1209,13 @@ impl JdbcSource {
                 .map_err(|e| Error::Serialization(format!("Failed to serialize row data: {e}")))?
         };
 
-        let now_ms = now.timestamp_millis() as u64;
         Ok(ProducedMessage {
             id: None,
             payload,
             headers: None,
             checksum: None,
-            timestamp: Some(now_ms),
-            origin_timestamp: Some(now_ms),
+            timestamp: None,
+            origin_timestamp: None,
         })
     }
 
@@ -1495,6 +1550,12 @@ impl JdbcSource {
             }
         }
 
+        if self.config.query_timeout_ms == 0 {
+            return Err(Error::InvalidConfigValue(
+                "query_timeout_ms must be greater than zero".to_string(),
+            ));
+        }
+
         // The query must be non-empty; an empty query only fails later at
         // prepareStatement with an opaque driver error.
         if self.config.query.trim().is_empty() {
@@ -1573,7 +1634,8 @@ impl Source for JdbcSource {
     async fn open(&mut self) -> Result<(), Error> {
         info!("Opening JDBC source connector [{}]", self.id);
         info!(
-            "Configuration: JDBC URL={}, Driver={}, Mode={:?}",
+            "{CONNECTOR_NAME} connector [{}] configuration: JDBC URL={}, Driver={}, Mode={:?}",
+            self.id,
             sanitize_jdbc_url(self.config.jdbc_url.expose_secret()),
             self.config.driver_class,
             self.config.mode
@@ -1608,23 +1670,10 @@ impl Source for JdbcSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        // Pace polls on a fixed cadence measured from a scheduled start instant,
-        // so per-poll work time does not accumulate as drift and the first poll
-        // is not delayed by a full interval. The schedule is clamped forward to
-        // `now` whenever it has fallen behind (a long pause, a poll that overran
-        // the interval, or the runtime re-polling immediately after an error),
-        // so a lagging schedule can never collapse the sleep into a busy loop
-        // that hammers the database.
-        let scheduled = {
-            let mut next = lock_mutex(&self.next_poll_at, "next_poll_at")?;
-            let scheduled = next.map_or_else(Instant::now, |planned| planned.max(Instant::now()));
-            *next = Some(scheduled + self.poll_interval);
-            scheduled
-        };
-        let now = Instant::now();
-        if scheduled > now {
-            tokio::time::sleep(scheduled - now).await;
-        }
+        // Wait before every fetch. This keeps startup from hammering the
+        // database and guarantees an error followed by an immediate runtime
+        // retry still observes the configured poll interval.
+        tokio::time::sleep(self.poll_interval).await;
 
         // The JDBC/JNI fetch is synchronous, blocking work; run it via
         // block_in_place so it does not monopolize a shared async-runtime worker
@@ -1728,7 +1777,10 @@ impl Source for JdbcSource {
                 let mut guard = lock_mutex(&self.connection, "connection")?;
                 if let Some(connection) = guard.as_ref() {
                     best_effort_close(&mut env, connection.as_obj());
-                    info!("Database connection closed");
+                    info!(
+                        "{CONNECTOR_NAME} connector [{}] database connection closed",
+                        self.id
+                    );
                 }
                 *guard = None;
                 Ok(())
@@ -1805,6 +1857,10 @@ impl JvmConfiguration {
 /// connector instance in this dynamic library shares this one.
 static GLOBAL_JVM: Mutex<Option<SharedJvm>> = Mutex::new(None);
 
+/// Serializes the process-global `DriverManager.setLoginTimeout` setting with
+/// the connection attempt it governs.
+static DRIVER_MANAGER_CONNECT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Return the process JVM, creating it on first use within this dynamic
 /// library. Later callers reuse it only when their classpath and options match;
 /// otherwise startup fails instead of silently running with the wrong driver.
@@ -1813,12 +1869,16 @@ static GLOBAL_JVM: Mutex<Option<SharedJvm>> = Mutex::new(None);
 /// and do not share this static, so configuring both in the *same* connectors
 /// runtime process is not supported (the second to start cannot create a second
 /// JVM). Run them in separate runtime processes.
-fn get_or_create_jvm(driver_jar_path: &str, jvm_options: &[String]) -> Result<Arc<JavaVM>, Error> {
+fn get_or_create_jvm(
+    driver_jar_path: &str,
+    jvm_options: &[String],
+    connector_id: u32,
+) -> Result<Arc<JavaVM>, Error> {
     let requested = JvmConfiguration::new(driver_jar_path, jvm_options)?;
     let mut guard = lock_mutex(&GLOBAL_JVM, "jvm")?;
     if let Some(shared) = guard.as_ref() {
         shared.configuration.ensure_compatible_with(&requested)?;
-        info!("Reusing existing process JVM");
+        info!("{CONNECTOR_NAME} connector [{connector_id}] reusing existing process JVM");
         return Ok(shared.vm.clone());
     }
 
@@ -1836,7 +1896,9 @@ fn get_or_create_jvm(driver_jar_path: &str, jvm_options: &[String]) -> Result<Ar
     let jvm = JavaVM::new(jvm_args)
         .map_err(|e| Error::InitError(format!("Failed to create JVM: {e:?}")))?;
 
-    info!("JVM initialized successfully (classpath: {canonical_jar_path})");
+    info!(
+        "{CONNECTOR_NAME} connector [{connector_id}] initialized JVM successfully (classpath: {canonical_jar_path})"
+    );
     let arc = Arc::new(jvm);
     *guard = Some(SharedJvm {
         vm: arc.clone(),
@@ -1978,42 +2040,83 @@ fn query_orders_by_tracking_column(
     let Some(order_by) = outer_order_by(query) else {
         return false;
     };
-    let first_term = order_by.split(',').next().unwrap_or("").trim();
+    let first_term = order_by
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
     let mut tokens = first_term.split_whitespace();
     let key = tokens.next().unwrap_or("");
-    // Any explicit descending direction breaks ascending offset advancement.
-    if tokens.any(|token| token.eq_ignore_ascii_case("desc")) {
+    let modifiers = tokens
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if !modifiers.is_empty()
+        && !matches!(modifiers.as_slice(), [direction] if direction == "asc")
+        && !matches!(
+            modifiers.as_slice(),
+            [nulls, position]
+                if nulls == "nulls" && matches!(position.as_str(), "first" | "last")
+        )
+        && !matches!(
+            modifiers.as_slice(),
+            [direction, nulls, position]
+                if direction == "asc"
+                    && nulls == "nulls"
+                    && matches!(position.as_str(), "first" | "last")
+        )
+    {
         return false;
     }
-    if key.starts_with("{tracking_column}") {
+    if key == "{tracking_column}" {
         return true;
     }
-    // Compare the final path segment (`t.updated_at` -> `updated_at`), first
-    // stripping a surrounding identifier quote (`"pg"`, `` `mysql` ``, `[mssql]`)
-    // then keeping only leading identifier characters so trailing punctuation is
-    // ignored. A case-preserving column such as PostgreSQL's `ORDER BY
-    // "OrderDate"` must validate against the same `tracking_column` that matches
-    // its unquoted driver label when reading rows.
-    let segment = key
-        .rsplit('.')
-        .next()
-        .unwrap_or(key)
-        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
-    let key_ident: String = segment
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    if key_ident.is_empty() {
+    // Compare the final path segment (`t.updated_at` -> `updated_at`) after
+    // validating every segment as a complete plain or quoted identifier. A
+    // case-preserving column such as PostgreSQL's `ORDER BY "OrderDate"` must
+    // validate against the same `tracking_column` that matches its unquoted
+    // driver label when reading rows.
+    let Some(key_ident) = exact_identifier_final_segment(key) else {
         return false;
-    }
+    };
     // Normalize identically to the read-time path so validate-time cannot reject
     // a config whose ORDER BY column would match a returned row at runtime.
     let normalized = if snake_case_columns {
-        to_snake_case(&key_ident)
+        to_snake_case(key_ident)
     } else {
-        key_ident.clone()
+        key_ident.to_string()
     };
-    tracking_column_matches(tracking_column, &key_ident, &normalized)
+    tracking_column_matches(tracking_column, key_ident, &normalized)
+}
+
+/// Return the final segment of a plain or qualified SQL identifier. Expressions,
+/// function calls, casts, and trailing operators are rejected so validation
+/// cannot mistake `ORDER BY id % 10` for ordering by the cursor itself.
+fn exact_identifier_final_segment(identifier: &str) -> Option<&str> {
+    let mut final_segment = None;
+    for segment in identifier.split('.') {
+        let unquoted = if segment.starts_with('"') && segment.ends_with('"')
+            || segment.starts_with('`') && segment.ends_with('`')
+            || segment.starts_with('[') && segment.ends_with(']')
+        {
+            &segment[1..segment.len().checked_sub(1)?]
+        } else {
+            segment
+        };
+        if unquoted.is_empty()
+            || !unquoted.chars().enumerate().all(|(index, character)| {
+                character == '_'
+                    || character == '$'
+                    || character.is_ascii_alphanumeric()
+                        && (index > 0 || !character.is_ascii_digit())
+            })
+        {
+            return None;
+        }
+        final_segment = Some(unquoted);
+    }
+    final_segment
 }
 
 /// Return the text following the outer `ORDER BY` (the last `order by` token at
@@ -2264,6 +2367,7 @@ mod tests {
             jvm_options: vec![],
             connection_timeout_ms: 30000,
             login_timeout_ms: 30000,
+            query_timeout_ms: 30000,
         }
     }
 
@@ -2276,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_poll_interval() {
+    fn given_poll_interval_should_parse_or_default() {
         assert_eq!(parse_poll_interval(Some("30s")), Duration::from_secs(30));
         assert_eq!(parse_poll_interval(Some("5m")), Duration::from_secs(300));
         // Unset, empty, and unparsable all fall back to the default.
@@ -2289,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_bad_poll_interval() {
+    fn given_invalid_poll_interval_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_poll_interval.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2302,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_zero_poll_interval() {
+    fn given_zero_poll_interval_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_zero_poll_interval.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2315,7 +2419,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_removes_predicate_case_and_whitespace_insensitive() {
+    fn given_zero_query_timeout_should_be_rejected() {
+        let jar = write_temp_jar("jdbc_validate_query_timeout.jar");
+        let mut config = base_config();
+        config.driver_jar_path = jar;
+        config.query_timeout_ms = 0;
+        let source = JdbcSource::new(1, config, None);
+        assert!(
+            matches!(source.validate_config(), Err(Error::InvalidConfigValue(message)) if message.contains("query_timeout_ms"))
+        );
+    }
+
+    #[test]
+    fn given_cold_start_should_remove_offset_predicate() {
         for query in [
             "select * from t where {tracking_column} > {last_offset} order by id",
             "SELECT * FROM t WHERE  {tracking_column}   >   {last_offset} ORDER BY id",
@@ -2338,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_offset_predicate_preserves_other_conditions() {
+    fn given_compound_predicate_should_preserve_other_conditions() {
         // Offset term followed by a companion condition (the README-advised
         // IS NOT NULL): the AND and the companion condition survive.
         assert_eq!(
@@ -2364,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_cold_start_compound_predicate_is_valid() {
+    fn given_cold_start_compound_predicate_should_build_valid_query() {
         let mut config = base_config();
         config.mode = Mode::Incremental;
         config.tracking_column = Some("id".to_string());
@@ -2383,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_half_set_credentials() {
+    fn given_half_set_credentials_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_half_creds.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2397,7 +2513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_missing_driver_jar() {
+    fn given_missing_driver_jar_should_be_rejected() {
         let mut config = base_config();
         config.driver_jar_path = "/nonexistent/path/to/driver.jar".to_string();
         let source = JdbcSource::new(1, config, None);
@@ -2406,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_dry_runs_query() {
+    fn given_invalid_built_query_should_fail_validation() {
         let jar = write_temp_jar("jdbc_validate_dry_run.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2424,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_accepts_valid_bulk() {
+    fn given_valid_bulk_config_should_pass_validation() {
         let jar = write_temp_jar("jdbc_validate_ok.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2433,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_accepts_valid_incremental() {
+    fn given_valid_incremental_config_should_pass_validation() {
         let jar = write_temp_jar("jdbc_validate_ok_incremental.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2449,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_incremental_requires_last_offset_placeholder() {
+    fn given_incremental_query_without_offset_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_last_offset.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2464,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_incremental_metadata_rejects_duplicate_tracking_labels() {
+    fn given_duplicate_tracking_labels_should_be_rejected() {
         let mut config = base_config();
         config.mode = Mode::Incremental;
         config.tracking_column = Some("id".to_string());
@@ -2476,7 +2592,18 @@ mod tests {
     }
 
     #[test]
-    fn test_incremental_metadata_requires_tracking_column_in_result() {
+    fn given_duplicate_bulk_labels_should_be_rejected() {
+        let source = JdbcSource::new(1, base_config(), None);
+        let error = source
+            .prepare_column_metadata(vec![("id".to_string(), 4), ("id".to_string(), 4)])
+            .expect_err("duplicate output keys must be rejected in every mode");
+        assert!(
+            matches!(error, Error::InvalidConfigValue(message) if message.contains("duplicate output key"))
+        );
+    }
+
+    #[test]
+    fn given_missing_tracking_result_column_should_be_rejected() {
         let mut config = base_config();
         config.mode = Mode::Incremental;
         config.tracking_column = Some("id".to_string());
@@ -2488,7 +2615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_incremental_requires_tracking_column() {
+    fn given_incremental_config_without_tracking_column_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_no_tracking.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2503,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_incremental_requires_order_by_tracking_column() {
+    fn given_unordered_incremental_query_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_no_order.jar");
         let mut config = base_config();
         config.driver_jar_path = jar;
@@ -2519,7 +2646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_query_orders_by_tracking_column_accepts_valid() {
+    fn given_valid_tracking_order_should_be_accepted() {
         assert!(query_orders_by_tracking_column(
             "SELECT * FROM t WHERE id > {last_offset} ORDER BY id",
             "id",
@@ -2550,7 +2677,7 @@ mod tests {
     }
 
     #[test]
-    fn test_query_orders_by_tracking_column_rejects_invalid() {
+    fn given_invalid_tracking_order_should_be_rejected() {
         // No ORDER BY.
         assert!(!query_orders_by_tracking_column(
             "SELECT * FROM t WHERE id > 0",
@@ -2586,10 +2713,22 @@ mod tests {
             "id",
             false
         ));
+        // An expression beginning with the tracking column does not produce a
+        // contiguous cursor-ordered prefix.
+        assert!(!query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY id % 10, id",
+            "id",
+            false
+        ));
+        assert!(!query_orders_by_tracking_column(
+            "SELECT * FROM t ORDER BY lower(id)",
+            "id",
+            false
+        ));
     }
 
     #[test]
-    fn test_query_orders_by_tracking_column_ignores_window_order_by() {
+    fn given_window_order_by_should_not_satisfy_result_ordering() {
         // A window function's internal ORDER BY orders values within the frame,
         // not the emitted ResultSet, so it must not satisfy the outer-ordering
         // requirement even though it is the only `order by` in the text.
@@ -2642,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn test_query_orders_by_tracking_column_snake_case_matches_read_time() {
+    fn given_snake_case_tracking_order_should_match_read_time() {
         // snake_case_columns = true: a CamelCase ORDER BY column with a
         // snake_cased tracking_column validates, mirroring tracking_column_matches
         // so validate-time never rejects a config that reads rows correctly.
@@ -2667,7 +2806,7 @@ mod tests {
     }
 
     #[test]
-    fn test_query_orders_by_tracking_column_strips_identifier_quotes() {
+    fn given_quoted_tracking_identifier_should_match() {
         // PostgreSQL preserves case only for quoted identifiers, so a genuinely
         // CamelCase column is ordered as `"OrderDate"`; the surrounding quotes
         // must not defeat the match against its unquoted driver label.
@@ -2695,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_empty_query_and_blank_offsets() {
+    fn given_empty_query_or_offset_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_blanks.jar");
         // Empty query.
         let mut config = base_config();
@@ -2728,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_config_rejects_bad_batch_size() {
+    fn given_invalid_batch_size_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_batch_size.jar");
         for bad in [0u32, i32::MAX as u32] {
             let mut config = base_config();
@@ -2743,7 +2882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracking_column_matches_case_and_normalization() {
+    fn given_tracking_column_should_match_case_and_normalization() {
         // Case-insensitive against the raw driver label (driver case-folding).
         assert!(tracking_column_matches(
             "OrderDate",
@@ -2763,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracking_offset_or_error_rejects_null_in_incremental() {
+    fn given_null_incremental_cursor_should_be_rejected() {
         let mut config = base_config();
         config.mode = Mode::Incremental;
         config.tracking_column = Some("id".to_string());
@@ -2782,13 +2921,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tracking_offset_or_error_allows_null_in_bulk() {
+    fn given_null_bulk_cursor_should_be_allowed() {
         let source = JdbcSource::new(1, base_config(), None); // base_config is bulk
         assert_eq!(source.tracking_offset_or_error(None, "id").unwrap(), None);
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_mysql_format() {
+    fn given_mysql_url_should_redact_password() {
         let url = "jdbc:mysql://root:SuperSecret123@localhost:3306/mydb";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(sanitized, "jdbc:mysql://root:***@localhost:3306/mydb");
@@ -2796,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_masks_password_through_last_at_sign() {
+    fn given_password_with_at_sign_should_be_fully_redacted() {
         let url = "jdbc:mysql://root:p@ss@localhost:3306/mydb";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(sanitized, "jdbc:mysql://root:***@localhost:3306/mydb");
@@ -2804,7 +2943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_error_masks_echoed_url() {
+    fn given_echoed_jdbc_url_should_be_redacted_from_error() {
         let url = "jdbc:mysql://root:p@ss@localhost:3306/mydb";
         let error = Error::InitError(format!("No suitable driver found for {url}"));
         let sanitized = sanitize_jdbc_error(error, url).to_string();
@@ -2816,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_postgresql_query_params() {
+    fn given_postgres_url_should_redact_password() {
         let url = "jdbc:postgresql://localhost:5432/mydb?user=admin&password=P@ssw0rd&ssl=true";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(
@@ -2827,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_oracle_format() {
+    fn given_oracle_url_should_redact_password() {
         let url = "jdbc:oracle:thin:system/oracle123@localhost:1521:XE";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(sanitized, "jdbc:oracle:thin:system/***@localhost:1521:XE");
@@ -2835,7 +2974,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_sqlserver_format() {
+    fn given_sql_server_url_should_redact_password() {
         let url = "jdbc:sqlserver://localhost:1433;user=sa;password=MySecretPass;database=Sales";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(
@@ -2846,7 +2985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_h2_format() {
+    fn given_h2_url_should_redact_password() {
         let url = "jdbc:h2:mem:testdb;USER=sa;PASSWORD=secret";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(sanitized, "jdbc:h2:mem:testdb;USER=sa;PASSWORD=***");
@@ -2854,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_case_insensitive() {
+    fn given_mixed_case_password_key_should_be_redacted() {
         let url1 = "jdbc:postgresql://localhost?password=secret";
         let url2 = "jdbc:postgresql://localhost?PASSWORD=secret";
         let url3 = "jdbc:postgresql://localhost?pwd=secret";
@@ -2868,14 +3007,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_no_password() {
+    fn given_url_without_password_should_remain_unchanged() {
         let url = "jdbc:h2:mem:testdb";
         let sanitized = sanitize_jdbc_url(url);
         assert_eq!(sanitized, url);
     }
 
     #[test]
-    fn test_sanitize_jdbc_url_multiple_passwords() {
+    fn given_multiple_passwords_should_all_be_redacted() {
         let url = "jdbc:postgresql://localhost?password=secret1&pwd=secret2";
         let sanitized = sanitize_jdbc_url(url);
         assert!(!sanitized.contains("secret1"));
@@ -2887,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jvm_configuration_rejects_different_jar_or_options() {
+    fn given_different_jvm_config_should_be_rejected() {
         let first_jar = write_temp_jar("jdbc_jvm_first.jar");
         let second_jar = write_temp_jar("jdbc_jvm_second.jar");
         let first = JvmConfiguration::new(&first_jar, &["-Xmx128m".to_string()])
@@ -2905,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_incremental_with_offset() {
+    fn given_incremental_offset_should_be_bound() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM users WHERE id > {last_offset} ORDER BY id".to_string(),
             tracking_column: Some("id".to_string()),
@@ -2961,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_substitutes_tracking_column() {
+    fn given_tracking_placeholder_should_be_substituted() {
         let config = JdbcSourceConfig {
             query:
                 "SELECT * FROM orders WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
@@ -2985,7 +3124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_no_offset_substitutes_tracking_column_in_order_by() {
+    fn given_no_offset_should_still_substitute_ordering_column() {
         let config = JdbcSourceConfig {
             query:
                 "SELECT * FROM orders WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
@@ -3018,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_rejects_injection_in_tracking_column() {
+    fn given_unsafe_tracking_identifier_should_be_rejected() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM t WHERE {tracking_column} > {last_offset}".to_string(),
             tracking_column: Some("id; DROP TABLE t".to_string()),
@@ -3031,7 +3170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_bulk_mode_no_limit_appended() {
+    fn given_bulk_query_should_not_append_limit() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM products".to_string(),
             poll_interval: Some("60s".to_string()),
@@ -3048,7 +3187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_restoration_from_connector_state() {
+    fn given_persisted_state_should_restore_cursor_and_count() {
         let original_state = State {
             last_offset: Some("2024-06-15 12:00:00".to_string()),
             processed_rows: 1500,
@@ -3072,7 +3211,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_transient_sql_state() {
+    fn state_should_be_serializable_and_deserializable() {
+        let original = State {
+            last_offset: Some("2026-10-02T10:15:00Z".to_string()),
+            processed_rows: 42,
+        };
+        let bytes = rmp_serde::to_vec(&original).expect("state should serialize");
+        let restored: State = rmp_serde::from_slice(&bytes).expect("state should deserialize");
+        assert_eq!(restored.last_offset, original.last_offset);
+        assert_eq!(restored.processed_rows, original.processed_rows);
+    }
+
+    #[test]
+    fn given_built_message_should_leave_broker_timestamps_unset() {
+        let source = JdbcSource::new(1, base_config(), None);
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_string(), serde_json::json!(1));
+
+        let message = source.build_message(row).expect("message should build");
+
+        assert!(message.timestamp.is_none());
+        assert!(message.origin_timestamp.is_none());
+        let payload: DatabaseRecord =
+            serde_json::from_slice(&message.payload).expect("metadata payload should deserialize");
+        assert_eq!(payload.data["id"], 1);
+    }
+
+    #[test]
+    fn given_sql_state_should_be_classified() {
         for s in [
             "08001", "08006", "40001", "40P01", "53300", "57P01", "58030",
         ] {
@@ -3086,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_identifier() {
+    fn given_sql_identifier_should_be_validated() {
         assert!(is_valid_identifier("id"));
         assert!(is_valid_identifier("updated_at"));
         assert!(is_valid_identifier("t.updated_at"));
@@ -3097,7 +3263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_snake_case() {
+    fn given_column_name_should_convert_to_snake_case() {
         assert_eq!(to_snake_case("OrderDate"), "order_date");
         assert_eq!(to_snake_case("updatedAt"), "updated_at");
         assert_eq!(to_snake_case("ID"), "id"); // consecutive uppers stay together
@@ -3110,7 +3276,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_config_deserialization_minimal_toml() {
+    fn given_minimal_toml_should_apply_defaults() {
         let toml_str = r#"
             jdbc_url = "jdbc:h2:mem:test"
             driver_class = "org.h2.Driver"
@@ -3134,6 +3300,8 @@ mod tests {
         assert!(!config.snake_case_columns);
         assert_eq!(config.verbose_logging, None);
         assert_eq!(config.connection_timeout_ms, 5000);
+        assert_eq!(config.login_timeout_ms, 30000);
+        assert_eq!(config.query_timeout_ms, 30000);
         assert!(config.username.is_none());
         assert!(config.password.is_none());
         assert!(config.tracking_column.is_none());
@@ -3142,7 +3310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_deserialization_full_toml() {
+    fn given_full_toml_should_deserialize_all_fields() {
         let toml_str = r#"
             jdbc_url = "jdbc:mysql://localhost:3306/mydb"
             driver_class = "com.mysql.cj.jdbc.Driver"
@@ -3160,6 +3328,8 @@ mod tests {
             verbose_logging = true
             jvm_options = ["-Xmx512m", "-Xms128m"]
             connection_timeout_ms = 60000
+            login_timeout_ms = 45000
+            query_timeout_ms = 120000
         "#;
         let config: JdbcSourceConfig =
             toml::from_str(toml_str).expect("Failed to parse full TOML config");
@@ -3175,6 +3345,8 @@ mod tests {
         assert_eq!(config.verbose_logging, Some(true));
         assert_eq!(config.jvm_options, vec!["-Xmx512m", "-Xms128m"]);
         assert_eq!(config.connection_timeout_ms, 60000);
+        assert_eq!(config.login_timeout_ms, 45000);
+        assert_eq!(config.query_timeout_ms, 120000);
         assert_eq!(
             parse_poll_interval(config.poll_interval.as_deref()),
             Duration::from_secs(300)
@@ -3182,7 +3354,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_deserialization_bulk_mode() {
+    fn given_bulk_toml_should_deserialize_mode() {
         let toml_str = r#"
             jdbc_url = "jdbc:h2:mem:test"
             driver_class = "org.h2.Driver"
@@ -3201,7 +3373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_deserialization_invalid_mode_fails() {
+    fn given_invalid_mode_should_fail_deserialization() {
         let toml_str = r#"
             jdbc_url = "jdbc:h2:mem:test"
             driver_class = "org.h2.Driver"
@@ -3273,7 +3445,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_state_restoration_with_malformed_bytes_falls_back_to_default() {
+    fn given_malformed_state_should_start_fresh() {
         let connector_state = ConnectorState(vec![0xFF, 0xFE, 0xFD, 0x00]);
 
         let source = JdbcSource::new(1, base_config(), Some(connector_state));
@@ -3284,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_restoration_with_empty_bytes_falls_back_to_default() {
+    fn given_empty_state_should_start_fresh() {
         let connector_state = ConnectorState(vec![]);
 
         let source = JdbcSource::new(1, base_config(), Some(connector_state));
@@ -3294,7 +3466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_restoration_none_uses_initial_offset() {
+    fn given_no_state_should_use_initial_offset() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM orders WHERE id > {last_offset}".to_string(),
             tracking_column: Some("id".to_string()),
@@ -3309,7 +3481,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_restoration_none_without_initial_offset() {
+    fn given_no_state_or_initial_offset_should_start_fresh() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM products".to_string(),
             poll_interval: Some("60s".to_string()),
@@ -3326,14 +3498,14 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_extract_offset_value_with_integer() {
+    fn given_integer_cursor_should_extract_as_string() {
         let mut row = serde_json::Map::new();
         row.insert("id".to_string(), serde_json::json!(42));
         assert_eq!(extract_offset_value(&row, "id"), Some("42".to_string()));
     }
 
     #[test]
-    fn test_extract_offset_value_with_string() {
+    fn given_string_cursor_should_extract_unchanged() {
         let mut row = serde_json::Map::new();
         row.insert(
             "updated_at".to_string(),
@@ -3346,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_offset_value_with_float() {
+    fn given_float_cursor_should_extract_as_string() {
         let mut row = serde_json::Map::new();
         row.insert("version".to_string(), serde_json::json!(3.5));
         assert_eq!(
@@ -3356,7 +3528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_offset_value_with_null() {
+    fn given_null_cursor_should_not_extract() {
         let mut row = serde_json::Map::new();
         row.insert("id".to_string(), serde_json::Value::Null);
         // A SQL NULL tracking value must not become the persisted offset.
@@ -3364,7 +3536,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_offset_value_missing_column() {
+    fn given_missing_cursor_column_should_not_extract() {
         let row = serde_json::Map::new();
         assert_eq!(extract_offset_value(&row, "nonexistent"), None);
     }
@@ -3374,7 +3546,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_build_query_incremental_no_offset_no_initial_removes_where_clause() {
+    fn given_no_incremental_offset_should_remove_where_clause() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM users WHERE {tracking_column} > {last_offset} ORDER BY id"
                 .to_string(),
@@ -3397,7 +3569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_rejects_unresolved_placeholder() {
+    fn given_unresolved_placeholder_should_be_rejected() {
         // Incremental, no offset, and a non-canonical predicate that the
         // auto-remove does not match: the unresolved {last_offset} must produce
         // an error rather than being shipped to the driver as invalid SQL.
@@ -3411,7 +3583,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_bulk_mode_ignores_offset() {
+    fn given_bulk_mode_should_ignore_offset() {
         let config = JdbcSourceConfig {
             query: "SELECT * FROM users ORDER BY id".to_string(),
             tracking_column: Some("id".to_string()),
@@ -3433,7 +3605,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_mode_serialization_roundtrip() {
+    fn given_mode_should_round_trip_through_json() {
         let incremental = Mode::Incremental;
         let serialized = serde_json::to_string(&incremental).unwrap();
         assert_eq!(serialized, r#""incremental""#);
@@ -3448,7 +3620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_deserialization_rejects_unknown() {
+    fn given_unknown_mode_should_fail_deserialization() {
         let result = serde_json::from_str::<Mode>(r#""streaming""#);
         assert!(
             result.is_err(),
@@ -3461,7 +3633,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_config_debug_does_not_leak_password() {
+    fn given_config_debug_should_not_leak_password() {
         let config = JdbcSourceConfig {
             jdbc_url: SecretString::from("jdbc:mysql://root:SuperSecret@localhost/db"),
             driver_class: "com.mysql.cj.jdbc.Driver".to_string(),
@@ -3578,7 +3750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_debug_without_password() {
+    fn given_config_without_password_should_debug_safely() {
         let debug_output = format!("{:?}", base_config());
         // Should not panic and should contain the struct name
         assert!(debug_output.contains("JdbcSourceConfig"));

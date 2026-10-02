@@ -310,6 +310,7 @@ serde_yaml_ng = "0.10.0"
 serial_test = "4.0.1"
 server = { path = "core/server", default-features = false }
 server_common = { path = "core/server_common" }
+sha2 = "0.10.9"
 shard = { path = "core/shard" }
 simd-json = { version = "0.18.1", features = ["serde_impl"] }
 smallvec = "1.16"

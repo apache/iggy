@@ -48,3 +48,6 @@ initial_offset = "0"
 mode = "incremental"
 snake_case_columns = false
 include_metadata = true
+connection_timeout_ms = 5000
+login_timeout_ms = 30000
+query_timeout_ms = 30000

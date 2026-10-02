@@ -25,6 +25,7 @@ mod floci;
 mod http;
 mod iceberg;
 mod influxdb;
+mod jdbc;
 mod meilisearch;
 mod mongodb;
 mod postgres;
@@ -74,6 +75,11 @@ pub use influxdb::{
     InfluxDb3SinkFixture, InfluxDb3SourceFixture, InfluxDbSinkBase64Fixture, InfluxDbSinkFixture,
     InfluxDbSinkNoMetadataFixture, InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
     InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
+};
+pub use jdbc::{
+    JdbcBulkFixture, JdbcBulkOverflowFixture, JdbcBulkRowsFixture, JdbcIncrementalFixture,
+    JdbcLargeResultFixture, JdbcMetadataFixture, JdbcQueryTimeoutFixture, JdbcRecoveryFixture,
+    JdbcTextCursorFixture, JdbcTieBoundaryFixture,
 };
 pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{

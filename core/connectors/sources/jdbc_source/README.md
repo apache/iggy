@@ -1,6 +1,6 @@
 # JDBC Source Connector
 
-A generic JDBC source connector for Iggy that supports any JDBC-compliant database including MySQL, PostgreSQL, Oracle, SQL Server, H2, Derby, and more.
+A JDBC source connector for Iggy designed to work with JDBC-compliant relational databases. PostgreSQL is covered by the runtime integration suite; the other driver examples below are configuration guides and are not yet exercised in CI.
 
 ## Overview
 
@@ -8,7 +8,7 @@ This connector reads data from relational databases using JDBC (Java Database Co
 
 ## Features
 
-- **Universal Database Support**: Works with any database that has a JDBC driver
+- **JDBC Driver Support**: Uses a supplied JDBC driver without database-specific connector code
 - **Incremental Sync**: Track changes using timestamps or auto-increment IDs
 - **Bulk Mode**: Re-runs the query each poll for snapshots (capped at `batch_size` rows; see limitations)
 - **Type Mapping**: Automatic conversion of SQL types to JSON
@@ -18,10 +18,13 @@ This connector reads data from relational databases using JDBC (Java Database Co
 
 ## Supported Databases
 
-**ALL JDBC-compliant databases are supported for both bulk and incremental modes:**
+PostgreSQL bulk and incremental modes are covered by end-to-end tests with a
+real database and the PostgreSQL JDBC driver. The connector is designed around
+standard JDBC APIs, so the following databases are expected to work with a
+compatible driver, but they are not currently part of the integration test
+matrix:
 
 - MySQL / MariaDB
-- PostgreSQL
 - Oracle Database
 - Microsoft SQL Server
 - H2 Database
@@ -33,9 +36,11 @@ This connector reads data from relational databases using JDBC (Java Database Co
 - Snowflake
 - Amazon Redshift
 - Google BigQuery
-- Any other JDBC-compliant database
+- Other JDBC-compliant relational databases
 
-**Key Point:** The JDBC connector provides a **single, universal implementation** that works with all these databases. You don't need separate connectors for MySQL, Oracle, etc. Just swap the JDBC driver JAR and connection string!
+Driver behavior and SQL syntax vary. Validate the query, type mappings, timeout
+behavior, and cursor semantics against the exact driver version before using an
+untested database in production.
 
 ## Prerequisites
 
@@ -199,9 +204,10 @@ topic = "orders"
 | `batch_size` | u32 | No | 1000 | Maximum rows to fetch per poll |
 | `tracking_column` | string | Incremental | - | Column to track for incremental reads (required in incremental mode; the query must also `ORDER BY` it) |
 | `initial_offset` | string | No | - | Starting offset value for first poll |
-| `mode` | string | No | "incremental" | Sync mode: "incremental" or "bulk" (bulk works with ALL databases) |
+| `mode` | string | No | "incremental" | Sync mode: "incremental" or "bulk" |
 | `connection_timeout_ms` | u64 | No | 5000 | Timeout (ms) for the per-poll `isValid` liveness check; converted to seconds and capped at 5s |
 | `login_timeout_ms` | u64 | No | 30000 | Bound on establishing the connection (`DriverManager.setLoginTimeout`); rounded up to whole seconds. Stops an unreachable database from hanging startup |
+| `query_timeout_ms` | u64 | No | 30000 | Positive bound on each query execution (`Statement.setQueryTimeout`); rounded up to whole seconds |
 | `jvm_options` | array | No | [] | Custom JVM options (e.g., ["-Xmx1g"]) |
 | `snake_case_columns` | bool | No | false | Convert column names to snake_case |
 | `include_metadata` | bool | No | true | Wrap each row with metadata (operation type, timestamp). `table_name` is a reserved field and is currently always null |
@@ -382,6 +388,10 @@ JDBC SQL types are automatically mapped to JSON:
   dropped. The check runs on the shared `block_in_place` worker, so its timeout
   (`connection_timeout_ms`) is intentionally converted to whole seconds and
   capped at 5s: a dead connection must not block the worker for tens of seconds.
+- **Bounded query execution.** Every prepared statement receives
+  `query_timeout_ms` through `Statement.setQueryTimeout`. JDBC drivers implement
+  cancellation differently, so verify timeout behavior for drivers outside the
+  PostgreSQL integration matrix.
 - **`SQLState` classification is informational today.** Query failures are
   classified into transient vs permanent error variants, but the runtime does
   not yet apply differentiated backoff based on that distinction; it currently
@@ -551,9 +561,10 @@ jdbc_url = "jdbc:h2:file:/data/mydb;USER=sa;PASSWORD=sa"
 
 ## Mode Comparison
 
-### Incremental Mode (Universal)
+### Incremental Mode
 
-**Works with ALL databases** - requires only a tracking column:
+Uses standard JDBC prepared statements and requires an orderable tracking
+column. PostgreSQL is integration-tested; validate this mode with other drivers.
 
 ```toml
 mode = "incremental"
@@ -579,9 +590,10 @@ column requirements above):
 - SQL Server: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; same fail-closed boundary behavior as MySQL)
 - PostgreSQL: `WHERE id > {last_offset} ORDER BY id`
 
-### Bulk Mode (Universal)
+### Bulk Mode
 
-**Works with ALL databases** - no special requirements:
+Uses standard JDBC result-set APIs and requires no tracking column. PostgreSQL
+is integration-tested; validate query and type behavior with other drivers.
 
 ```toml
 mode = "bulk"

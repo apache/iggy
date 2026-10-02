@@ -22,7 +22,7 @@ edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "jdbc", "source"]
 categories = ["database"]
-description = "Generic JDBC source connector for Iggy - supports MySQL, Oracle, SQL Server, H2, and any JDBC-compliant database"
+description = "JDBC source connector for Iggy with PostgreSQL integration coverage"
 readme = "README.md"
 publish = false
 
@@ -61,6 +61,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+rmp-serde = { workspace = true }
 toml = { workspace = true }
 
 [lints]
