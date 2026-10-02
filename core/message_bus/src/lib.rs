@@ -75,9 +75,11 @@
 //! transport (TCP, TCP-TLS, WS, WSS, QUIC) plugs in behind the same
 //! registry, fencing, and dispatch logic.
 
+pub mod accept;
 pub mod cache;
 pub mod client_listener;
 pub mod config;
+pub mod connection_cap;
 pub mod connector;
 mod error;
 pub mod fd_transfer;
@@ -89,6 +91,7 @@ pub(crate) mod socket_opts;
 pub mod transports;
 
 pub use config::{IOV_MAX_LIMIT, MessageBusConfig, QuicTuning, WebSocketConfig};
+pub use connection_cap::{ConnectionCap, ConnectionPermit};
 pub use error::SendError;
 pub use installer::ConnectionInstaller;
 pub use installer::conn_info::{

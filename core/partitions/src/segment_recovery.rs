@@ -33,6 +33,7 @@ use crate::segment_anchor::ANCHOR_EXTENSION;
 use crate::state_transfer::STAGING_SUFFIX;
 use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -494,7 +495,8 @@ impl From<IggyError> for PartitionRecoveryError {
 }
 
 /// A persisted segment recovered from disk: its metadata plus the storage
-/// handles (readers/writers) opened over its `.log` / `.index` files.
+/// handles opened over its `.log` / `.index` files. Only the last segment of
+/// a chain keeps its write cursors.
 pub struct RecoveredSegment {
     pub segment: Segment,
     pub storage: SegmentStorage,
@@ -770,7 +772,7 @@ pub async fn load_persisted_segments_with_checkpoint(
             truncate_to(&plan.index_path, plan.index_size)?;
         }
 
-        let storage = if checkpoint.is_some() {
+        let mut storage = if checkpoint.is_some() {
             SegmentStorage::with_read_only_messages(
                 &plan.messages_path,
                 &plan.index_path,
@@ -815,6 +817,10 @@ pub async fn load_persisted_segments_with_checkpoint(
                 transient => transient.into(),
             }
         })?;
+        // Only the tail takes writes, as after a rotation.
+        if plan.segment.sealed {
+            storage.seal();
+        }
 
         stats.increment_segments_count(1);
         stats.increment_size_bytes(messages_size);
@@ -1111,7 +1117,11 @@ async fn ensure_contiguous_chain(
 fn sweep_scratch_files_and_collect_offsets(
     partition_path: &str,
 ) -> Result<Vec<u64>, PartitionRecoveryError> {
-    let entries = match fs::read_dir(partition_path) {
+    // The recovery opens are read-only, but a failed one fails the partition
+    // load, which stops the server at boot, so they count like write opens.
+    let entries = match fs::read_dir(partition_path)
+        .note_descriptor_exhaustion(|| format!("listing directory {partition_path}"))
+    {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
@@ -1244,6 +1254,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
+        .note_descriptor_exhaustion(|| format!("opening {path}"))
         .map_err(|source| {
             error!(
                 path,
@@ -1291,6 +1302,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Parti
         .create(true)
         .truncate(true)
         .open(&staging_path)
+        .note_descriptor_exhaustion(|| format!("opening {staging_path}"))
         .map_err(|source| {
             error!(
                 path = %staging_path,
@@ -1343,6 +1355,7 @@ fn install_rebuilt_index(
 /// other mutation in this module (see [`FileScanner`]).
 fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::open(dir)
+        .note_descriptor_exhaustion(|| format!("opening directory {dir}"))
         .and_then(|handle| handle.sync_all())
         .map_err(|source| {
             error!(
@@ -1471,6 +1484,7 @@ fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRe
 
 fn seed_empty_file(path: &str) -> Result<(), PartitionRecoveryError> {
     fs::File::create(path)
+        .note_descriptor_exhaustion(|| format!("creating {path}"))
         .and_then(|file| file.sync_all())
         .map_err(|source| {
             error!(
@@ -1501,17 +1515,22 @@ async fn load_index_anchors(
     if file_len(index_path)? == 0 {
         return Ok((0, None, None));
     }
-    let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %index_path,
-            error = %source,
-            "failed to open sparse index during recovery"
-        );
-        source
-    })?;
+    // Opened here, not by `IggyIndexReader::new`, which drops the `io::Error`.
+    let file = compio::fs::File::open(index_path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {index_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to open sparse index during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
+    let reader = IggyIndexReader::from_file(index_path, file);
     let entry_count = reader.entry_count().await.map_err(|source| {
         error!(
             stream_id = identity.stream_id,
@@ -2242,17 +2261,19 @@ async fn find_provable_index_anchor(
             searched_entries: 0,
         });
     };
-    let file = fs::File::open(index_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %index_path,
-            error = %source,
-            "failed to open sparse index for anchor search during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })?;
+    let file = fs::File::open(index_path)
+        .note_descriptor_exhaustion(|| format!("opening {index_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to open sparse index for anchor search during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
     let mut raw = [0u8; IGGY_INDEX_SIZE];
     // Lowest log byte a probed entry has already paid for; the next probed
     // entry is budgeted by the span from its own position up to here.
@@ -2367,28 +2388,32 @@ async fn index_is_consistent(
     messages_size: u64,
     scratch: &mut ScanScratch,
 ) -> Result<IndexValidation, PartitionRecoveryError> {
-    let index_file = fs::File::open(index_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %index_path,
-            error = %source,
-            "failed to open sparse index for validation during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })?;
-    let messages_file = fs::File::open(messages_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %messages_path,
-            error = %source,
-            "failed to open segment log for sparse index validation"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })?;
+    let index_file = fs::File::open(index_path)
+        .note_descriptor_exhaustion(|| format!("opening {index_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to open sparse index for validation during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
+    let messages_file = fs::File::open(messages_path)
+        .note_descriptor_exhaustion(|| format!("opening {messages_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %messages_path,
+                error = %source,
+                "failed to open segment log for sparse index validation"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
     let ScanScratch {
         window: index_window,
         spill: log_window,
@@ -2503,17 +2528,19 @@ fn open_messages_file(
     identity: PartitionIdentity<'_>,
     messages_path: &str,
 ) -> Result<fs::File, PartitionRecoveryError> {
-    fs::File::open(messages_path).map_err(|source| {
-        error!(
-            stream_id = identity.stream_id,
-            topic_id = identity.topic_id,
-            partition_id = identity.partition_id,
-            path = %messages_path,
-            error = %source,
-            "failed to open a segment messages file during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotReadFile)
-    })
+    fs::File::open(messages_path)
+        .note_descriptor_exhaustion(|| format!("opening {messages_path}"))
+        .map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %messages_path,
+                error = %source,
+                "failed to open a segment messages file during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })
 }
 
 /// The batch header at `position`, or `None` when the walk must stop there
@@ -3383,6 +3410,38 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_sealed_segments_when_recovering_should_keep_write_cursors_on_the_tail_only() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        for start_offset in [0, 2, 4] {
+            write_segment(
+                &config,
+                start_offset,
+                &encoded_batch(start_offset, 2),
+                &index_entry(start_offset, 0),
+            );
+        }
+
+        let recovered = recover(&config).await.expect("recover three-segment chain");
+
+        assert_eq!(recovered.len(), 3);
+        for sealed in &recovered[..2] {
+            assert!(sealed.segment.sealed);
+            assert!(
+                sealed.storage.messages_size.is_none() && sealed.storage.index_size.is_none(),
+                "a sealed segment must not keep write cursors"
+            );
+            assert!(sealed.storage.messages_reader.is_some());
+        }
+        let tail = &recovered[2].storage;
+        assert!(
+            tail.messages_size.is_some() && tail.index_size.is_some(),
+            "the tail segment must keep its write cursors"
+        );
+    }
+
+    #[compio::test]
     async fn given_valid_batch_after_damage_when_recovering_should_refuse_and_preserve_files() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
@@ -3803,7 +3862,7 @@ mod tests {
                 let recovered = result.unwrap();
                 assert_eq!(recovered.len(), 2);
                 assert_eq!(recovered[0].segment.end_offset, 1);
-                assert!(recovered[0].storage.messages_writer.is_none());
+                assert!(recovered[0].storage.messages_size.is_none());
             }
             assert_eq!(bytes_of(&messages_path), sealed);
             assert_eq!(bytes_of(&index_path), index);

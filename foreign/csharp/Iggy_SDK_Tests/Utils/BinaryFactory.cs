@@ -177,9 +177,18 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateStatsPayload(StatsResponse stats)
+    internal static byte[] CreateStatsPayload(StatsResponse stats, bool withOpenFiles = true)
     {
-        var bytes = new byte[1024];
+        var hostnameBytes = Encoding.UTF8.GetBytes(stats.Hostname);
+        var osNameBytes = Encoding.UTF8.GetBytes(stats.OsName);
+        var osVersionBytes = Encoding.UTF8.GetBytes(stats.OsVersion);
+        var kernelVersionBytes = Encoding.UTF8.GetBytes(stats.KernelVersion);
+        var iggyServerVersionBytes = Encoding.UTF8.GetBytes(stats.IggyServerVersion);
+        var stringsSize = 5 * 4 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length
+                          + kernelVersionBytes.Length + iggyServerVersionBytes.Length;
+        var tailSize = 4 + 4 + stats.CacheMetrics.Count * 32 + 4 + 8 + 8 + (withOpenFiles ? 16 : 0);
+
+        var bytes = new byte[108 + stringsSize + tailSize];
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0, 4), stats.ProcessId);
         BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(4, 4), stats.CpuUsage);
         BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(8, 8), stats.TotalCpuUsage);
@@ -200,26 +209,48 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(100, 4), stats.ClientsCount);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(104, 4), stats.ConsumerGroupsCount);
 
-        // Convert string properties to bytes and set them in the byte array
-        var hostnameBytes = Encoding.UTF8.GetBytes(stats.Hostname);
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(108, 4), (uint)hostnameBytes.Length);
-        hostnameBytes.CopyTo(bytes, 112);
+        var position = 108;
+        position = WriteString(bytes, position, hostnameBytes);
+        position = WriteString(bytes, position, osNameBytes);
+        position = WriteString(bytes, position, osVersionBytes);
+        position = WriteString(bytes, position, kernelVersionBytes);
+        position = WriteString(bytes, position, iggyServerVersionBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), stats.IggyServerSemver);
+        position += 4;
 
-        var osNameBytes = Encoding.UTF8.GetBytes(stats.OsName);
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(112 + hostnameBytes.Length, 4), (uint)osNameBytes.Length);
-        osNameBytes.CopyTo(bytes, 116 + hostnameBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), (uint)stats.CacheMetrics.Count);
+        position += 4;
+        foreach (var (key, metrics) in stats.CacheMetrics)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), key.StreamId);
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position + 4, 4), key.TopicId);
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position + 8, 4), key.PartitionId);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position + 12, 8), metrics.Hits);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position + 20, 8), metrics.Misses);
+            BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(position + 28, 4), metrics.HitRatio);
+            position += 32;
+        }
 
-        var osVersionBytes = Encoding.UTF8.GetBytes(stats.OsVersion);
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(116 + hostnameBytes.Length + osNameBytes.Length, 4),
-            (uint)osVersionBytes.Length);
-        osVersionBytes.CopyTo(bytes, 120 + hostnameBytes.Length + osNameBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), stats.ThreadsCount);
+        position += 4;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), stats.FreeDiskSpace);
+        position += 8;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), stats.TotalDiskSpace);
+        position += 8;
 
-        var kernelVersionBytes = Encoding.UTF8.GetBytes(stats.KernelVersion);
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            bytes.AsSpan(120 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length, 4),
-            (uint)kernelVersionBytes.Length);
-        kernelVersionBytes.CopyTo(bytes, 124 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length);
+        if (withOpenFiles)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position, 8), stats.OpenFilesCount);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(position + 8, 8), stats.OpenFilesLimit);
+        }
 
         return bytes;
+    }
+
+    private static int WriteString(byte[] bytes, int position, byte[] value)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), (uint)value.Length);
+        value.CopyTo(bytes, position + 4);
+        return position + 4 + value.Length;
     }
 }

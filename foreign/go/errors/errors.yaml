@@ -651,6 +651,10 @@
   code: 2021
   format: "too many topics"
   fields: []
+- name: PartitionsLimitReached
+  code: 2022
+  format: "partitions limit reached, raise [metadata] partitions_max"
+  fields: []
 - name: CannotCreatePartition
   code: 3000
   format: "cannot create partition with id: %d for stream with id: %d and topic with id: %d"

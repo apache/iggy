@@ -174,4 +174,14 @@ public sealed class StatsResponse
     /// </summary>
     [JsonConverter(typeof(SizeConverter))]
     public ulong TotalDiskSpace { get; init; }
+
+    /// <summary>
+    ///     Number of file descriptors the server process holds open, 0 when unknown.
+    /// </summary>
+    public ulong OpenFilesCount { get; init; }
+
+    /// <summary>
+    ///     Soft limit on open file descriptors (RLIMIT_NOFILE) of the server process, 0 when unknown.
+    /// </summary>
+    public ulong OpenFilesLimit { get; init; }
 }
