@@ -19,7 +19,7 @@ import type { CommandResponse } from '../../client/index.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { wrapCommand } from '../command.utils.js';
 
-export const SNAPSHOT_COMPRESSION = {
+export const SnapshotCompression = {
   Stored: 1,
   Deflated: 2,
   Bzip2: 3,
@@ -29,9 +29,9 @@ export const SNAPSHOT_COMPRESSION = {
 } as const;
 
 export type SnapshotCompression =
-  typeof SNAPSHOT_COMPRESSION[keyof typeof SNAPSHOT_COMPRESSION];
+  typeof SnapshotCompression[keyof typeof SnapshotCompression];
 
-export const SYSTEM_SNAPSHOT_TYPE = {
+export const SystemSnapshotType = {
   FilesystemOverview: 1,
   ProcessList: 2,
   ResourceUsage: 3,
@@ -42,24 +42,33 @@ export const SYSTEM_SNAPSHOT_TYPE = {
 } as const;
 
 export type SystemSnapshotType =
-  typeof SYSTEM_SNAPSHOT_TYPE[keyof typeof SYSTEM_SNAPSHOT_TYPE];
+  typeof SystemSnapshotType[keyof typeof SystemSnapshotType];
 
-export type Snapshot = {
+export const SNAPSHOT_COMPRESSION = SnapshotCompression;
+export const SYSTEM_SNAPSHOT_TYPE = SystemSnapshotType;
+
+export type SnapshotOptions = {
   compression?: SnapshotCompression,
   snapshotTypes?: SystemSnapshotType[]
 };
 
-const serializeSnapshot = (payload?: Snapshot | void): Buffer => {
+export type Snapshot = SnapshotOptions;
+
+const serializeSnapshot = (payload?: SnapshotOptions | void): Buffer => {
   const compression =
-    payload && payload.compression ? payload.compression : SNAPSHOT_COMPRESSION.Deflated;
+    payload && payload.compression ? payload.compression : SnapshotCompression.Deflated;
   const snapshotTypes =
-    payload && payload.snapshotTypes ? payload.snapshotTypes : [SYSTEM_SNAPSHOT_TYPE.All];
+    payload && payload.snapshotTypes ? payload.snapshotTypes : [SystemSnapshotType.All];
 
   if (snapshotTypes.length > 255) {
     throw new Error('snapshotTypes count cannot exceed 255');
   }
 
-  const buf = Buffer.alloc(2 + snapshotTypes.length);
+  if (snapshotTypes.length > 1 && snapshotTypes.includes(SystemSnapshotType.All)) {
+    throw new Error('SystemSnapshotType.All cannot be combined with specific snapshot types');
+  }
+
+  const buf = Buffer.allocUnsafe(2 + snapshotTypes.length);
   buf.writeUInt8(compression, 0);
   buf.writeUInt8(snapshotTypes.length, 1);
   for (let i = 0; i < snapshotTypes.length; i++) {
@@ -71,9 +80,24 @@ const serializeSnapshot = (payload?: Snapshot | void): Buffer => {
 export const SNAPSHOT = {
   code: COMMAND_CODE.GetSnapshot,
 
-  serialize: (payload?: Snapshot | void): Buffer => serializeSnapshot(payload),
+  serialize: serializeSnapshot,
 
   deserialize: (r: CommandResponse): Buffer => r.data
 };
 
-export const snapshot = wrapCommand<Snapshot | void, Buffer>(SNAPSHOT);
+/**
+ * Captures and packages the current system state as a raw ZIP archive.
+ *
+ * @param options - Optional configuration for snapshot compression and section types.
+ * Defaults to Deflated compression and `SystemSnapshotType.All` (code 100), capturing all
+ * available diagnostic sections (filesystem overview, process list, resource usage, server
+ * logs, and server configuration) for complete debugging.
+ * @returns A Buffer containing the raw ZIP archive bytes.
+ *
+ * @remarks
+ * - Authentication is required, and the caller must have administrative permissions.
+ * - The server enforces a single-flight mutex guard: only one snapshot can be collected
+ *   at a time across the cluster.
+ * - Subject to the client's default 30-second socket timeout budget.
+ */
+export const snapshot = wrapCommand<SnapshotOptions | void, Buffer>(SNAPSHOT);

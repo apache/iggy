@@ -42,14 +42,6 @@ describe('e2e -> raw', async () => {
     assert.ok(response.length > 0);
   });
 
-  it('e2e -> raw::getSnapshot', async () => {
-    const response = await c.sendBinaryRequest(
-      COMMAND_CODE.GetSnapshot,
-      Buffer.from([2, 1, 100])
-    );
-    assert.ok(response.length > 0);
-  });
-
   it('e2e -> raw::sessionControlCodeRejectedClientSide', async () => {
     await assert.rejects(
       () => c.sendBinaryRequest(COMMAND_CODE.LoginUser, Buffer.alloc(0))

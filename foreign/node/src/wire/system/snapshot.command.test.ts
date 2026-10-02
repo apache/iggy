@@ -20,9 +20,10 @@ import assert from 'node:assert/strict';
 import { COMMAND_CODE } from '../command.code.js';
 import {
   SNAPSHOT,
+  SnapshotCompression,
+  SystemSnapshotType,
   SNAPSHOT_COMPRESSION,
-  SYSTEM_SNAPSHOT_TYPE,
-  type SystemSnapshotType
+  SYSTEM_SNAPSHOT_TYPE
 } from './snapshot.command.js';
 
 describe('SnapshotCommand', () => {
@@ -35,44 +36,60 @@ describe('SnapshotCommand', () => {
     it('serializes default options (Deflated compression and All snapshot type)', () => {
       const buf = SNAPSHOT.serialize();
       assert.equal(buf.length, 3);
-      assert.equal(buf.readUInt8(0), SNAPSHOT_COMPRESSION.Deflated);
+      assert.equal(buf.readUInt8(0), SnapshotCompression.Deflated);
       assert.equal(buf.readUInt8(1), 1);
-      assert.equal(buf.readUInt8(2), SYSTEM_SNAPSHOT_TYPE.All);
+      assert.equal(buf.readUInt8(2), SystemSnapshotType.All);
     });
 
     it('serializes custom compression and snapshot types', () => {
       const buf = SNAPSHOT.serialize({
-        compression: SNAPSHOT_COMPRESSION.Stored,
+        compression: SnapshotCompression.Stored,
         snapshotTypes: [
-          SYSTEM_SNAPSHOT_TYPE.FilesystemOverview,
-          SYSTEM_SNAPSHOT_TYPE.ServerLogs
+          SystemSnapshotType.FilesystemOverview,
+          SystemSnapshotType.ServerLogs
         ]
       });
       assert.equal(buf.length, 4);
-      assert.equal(buf.readUInt8(0), SNAPSHOT_COMPRESSION.Stored);
+      assert.equal(buf.readUInt8(0), SnapshotCompression.Stored);
       assert.equal(buf.readUInt8(1), 2);
-      assert.equal(buf.readUInt8(2), SYSTEM_SNAPSHOT_TYPE.FilesystemOverview);
-      assert.equal(buf.readUInt8(3), SYSTEM_SNAPSHOT_TYPE.ServerLogs);
+      assert.equal(buf.readUInt8(2), SystemSnapshotType.FilesystemOverview);
+      assert.equal(buf.readUInt8(3), SystemSnapshotType.ServerLogs);
     });
 
     it('serializes empty snapshot types', () => {
       const buf = SNAPSHOT.serialize({
-        compression: SNAPSHOT_COMPRESSION.Bzip2,
+        compression: SnapshotCompression.Bzip2,
         snapshotTypes: []
       });
       assert.equal(buf.length, 2);
-      assert.equal(buf.readUInt8(0), SNAPSHOT_COMPRESSION.Bzip2);
+      assert.equal(buf.readUInt8(0), SnapshotCompression.Bzip2);
       assert.equal(buf.readUInt8(1), 0);
     });
 
     it('throws when snapshotTypes count exceeds 255', () => {
-      const oversizedTypes: SystemSnapshotType[] = new Array(256).fill(
-        SYSTEM_SNAPSHOT_TYPE.Test
-      );
+      const oversizedTypes = new Array(256).fill(SystemSnapshotType.Test);
       assert.throws(
         () => SNAPSHOT.serialize({ snapshotTypes: oversizedTypes }),
         /snapshotTypes count cannot exceed 255/
       );
+    });
+
+    it('throws when SystemSnapshotType.All is mixed with other types', () => {
+      assert.throws(
+        () =>
+          SNAPSHOT.serialize({
+            snapshotTypes: [
+              SystemSnapshotType.All,
+              SystemSnapshotType.ProcessList
+            ]
+          }),
+        /SystemSnapshotType\.All cannot be combined with specific snapshot types/
+      );
+    });
+
+    it('supports backwards-compatible enum aliases', () => {
+      assert.equal(SNAPSHOT_COMPRESSION.Deflated, SnapshotCompression.Deflated);
+      assert.equal(SYSTEM_SNAPSHOT_TYPE.All, SystemSnapshotType.All);
     });
   });
 
