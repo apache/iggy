@@ -75,4 +75,24 @@ public class PartitionsTcpClient implements PartitionsClient {
                     response.release();
                 });
     }
+
+    @Override
+    public CompletableFuture<Void> deleteSegments(
+            StreamId streamId, TopicId topicId, Long partitionId, Long segmentsCount) {
+        var payload = BytesSerializer.toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
+        payload.writeIntLE(partitionId.intValue());
+        payload.writeIntLE(segmentsCount.intValue());
+
+        log.debug(
+                "Deleting {} segments from partition: {} for stream: {}, topic: {}",
+                segmentsCount,
+                partitionId,
+                streamId,
+                topicId);
+
+        return connection().send(CommandCode.Segment.DELETE.getValue(), payload).thenAccept(response -> {
+            response.release();
+        });
+    }
 }

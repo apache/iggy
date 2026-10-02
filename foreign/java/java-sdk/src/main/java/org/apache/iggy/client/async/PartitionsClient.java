@@ -72,4 +72,15 @@ public interface PartitionsClient {
      * @return A CompletableFuture that completes when the operation is done
      */
     CompletableFuture<Void> deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount);
+
+    /**
+     * Deletes the oldest sealed segments from a partition asynchronously.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param partitionId The partition identifier
+     * @param segmentsCount The number of segments to delete
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    CompletableFuture<Void> deleteSegments(StreamId streamId, TopicId topicId, Long partitionId, Long segmentsCount);
 }

@@ -19,9 +19,16 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.topic.TopicOptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.math.BigInteger;
+import java.util.List;
 
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
@@ -59,5 +66,36 @@ public abstract class PartitionsClientBaseTest extends IntegrationTest {
         // then
         topic = topicsClient.getTopic(STREAM_NAME, TOPIC_NAME).get();
         assertThat(topic.partitionsCount()).isEqualTo(1L);
+    }
+
+    @Test
+    void shouldDeleteSegments() {
+        // given
+        var topicId = TopicId.of("segments-topic");
+        topicsClient.createTopic(
+                STREAM_NAME,
+                1L,
+                org.apache.iggy.topic.CompressionAlgorithm.None,
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                "segments-topic",
+                TopicOptions.builder()
+                        .segmentSize(BigInteger.valueOf(1024 * 1024))
+                        .messagesRequiredToSave(1)
+                        .build());
+        var message = Message.of("a".repeat(220_000));
+        for (int count = 0; count < 5; count++) {
+            client.messages().sendMessages(STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(message));
+        }
+
+        var topic = topicsClient.getTopic(STREAM_NAME, topicId).orElseThrow();
+        assertThat(topic.partitions().get(0).segmentsCount()).isEqualTo(2L);
+
+        // when
+        partitionsClient.deleteSegments(STREAM_NAME, topicId, 0L, 1L);
+
+        // then
+        topic = topicsClient.getTopic(STREAM_NAME, topicId).orElseThrow();
+        assertThat(topic.partitions().get(0).segmentsCount()).isEqualTo(1L);
     }
 }
