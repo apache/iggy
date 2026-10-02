@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 
 use crate::iggy_server::{PortGuard, TestServer, graceful_kill, wait_for_listener};
+use std::env;
 
 /// Locates the already-built `iggy-gateway-kafka` binary.
 ///
@@ -61,7 +62,11 @@ impl TestGateway {
         // contributor to export) silently changes the spawned gateway's behavior out from under
         // this harness's assertions.
         command
-            .env_clear()
+            .env_clear();
+        if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
+               command.env("LLVM_PROFILE_FILE", llvm_profile_file);
+        }   
+        command
             .env("IGGY_KAFKA_BIND_ADDR", &address)
             .env("IGGY_KAFKA_BRIDGE_ENABLED", "true")
             .env("IGGY_KAFKA_IGGY_ADDR", &config.address)

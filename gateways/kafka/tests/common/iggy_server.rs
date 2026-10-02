@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::env;
 
 use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilder};
 use secrecy::SecretString;
@@ -266,7 +267,11 @@ impl TestServer {
         // a stray recognized IGGY_* var could silently change the spawned server's behavior out
         // from under this harness's assertions (same reasoning as gateway_process.rs's spawn).
         command
-            .env_clear()
+            .env_clear();
+        if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
+               command.env("LLVM_PROFILE_FILE", llvm_profile_file);
+        }
+        command    
             .env("IGGY_PATH", data_dir.display().to_string())
             .env("IGGY_TCP_ADDRESS", &address)
             .env("IGGY_HTTP_ENABLED", "false")
