@@ -43,8 +43,8 @@ from .utils import (
 def binary_transport_configs(auto_login: AutoLogin | None = None) -> list:
     """Return a config for every transport that holds a connection.
 
-    Auto-login is disabled by default: with credentials to replay, a ping sent
-    while disconnected reconnects on its own instead of failing.
+    Auto-login is disabled by default, so a test opts in only when it checks
+    the auto-login behavior.
 
     TCP and QUIC wait out `reestablish_after` before they connect again, so the
     configs set it to zero to keep the reconnect cases fast.

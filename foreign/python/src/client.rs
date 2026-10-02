@@ -522,12 +522,10 @@ impl IggyClient {
     /// for the rest of `reestablish_after` (5 s by default). The sign-in made
     /// with `login_user` is dropped, so it must be repeated after reconnecting.
     /// A client configured with auto-login credentials signs in again on
-    /// `connect`. Over HTTP there is no connection to close and this call does
-    /// nothing.
-    ///
-    /// Known issue: unless reconnection is disabled, the heartbeat of a client
-    /// with auto-login credentials connects it again and signs in within one
-    /// heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+    /// `connect`. Until then, requests fail with `RuntimeError`, and nothing
+    /// connects the client again in the background, even with auto-login
+    /// credentials. Over HTTP there is no connection to close and this call
+    /// does nothing.
     ///
     /// Raises:
     ///     RuntimeError: If the connection cannot be closed.

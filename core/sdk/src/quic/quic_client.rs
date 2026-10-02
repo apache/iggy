@@ -100,6 +100,11 @@ pub struct QuicClient {
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -119,10 +124,12 @@ impl Default for QuicClient {
 #[async_trait]
 impl Client for QuicClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         QuicClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
         QuicClient::disconnect(self).await
     }
 
@@ -171,6 +178,9 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if self.disconnected_by_caller.load(Ordering::SeqCst) {
+            return Err(IggyError::NotConnected);
+        }
         if is_poll_routing_code(code) {
             return self.send_poll_request(code, payload).await;
         }
@@ -600,6 +610,7 @@ impl QuicClient {
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),

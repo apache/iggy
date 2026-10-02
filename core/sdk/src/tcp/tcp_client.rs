@@ -110,6 +110,11 @@ pub struct TcpClient {
     /// Set once a sign-in on this client has gone looking for the roster, so
     /// that read happens once (see [`TcpClient::learn_roster_once`]).
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Credentials a sign-in on this client succeeded with, so a reconnect --
     /// onto this node or, after a failover, another one -- can re-establish
     /// the session instead of surfacing `Unauthenticated`. Cleared on logout.
@@ -168,10 +173,12 @@ impl Default for TcpClient {
 #[async_trait]
 impl Client for TcpClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         TcpClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
         // An explicit disconnect is caller intent, like a logout: the session
         // it ends must not be resurrected by the next reconnect, so the
         // remembered sign-in goes with it. Involuntary drops (a dead socket,
@@ -225,6 +232,9 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if self.disconnected_by_caller.load(Ordering::SeqCst) {
+            return Err(IggyError::NotConnected);
+        }
         if is_poll_routing_code(code) {
             return self.send_poll_request(code, payload).await;
         }
@@ -582,6 +592,7 @@ impl TcpClient {
             current_server_address: Mutex::new(server_address),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             configured_password: Mutex::new(None),
             configured_username: Mutex::new(None),
             session_credentials: Mutex::new(None),

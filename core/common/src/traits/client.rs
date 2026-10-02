@@ -49,6 +49,11 @@ pub trait Client:
     async fn connect(&self) -> Result<(), IggyError>;
 
     /// Disconnect from the server. If the client is not connected, it will do nothing.
+    ///
+    /// On TCP, QUIC and WebSocket, the disconnect holds until the next `connect()`:
+    /// requests fail with `IggyError::NotConnected`, and nothing reconnects the
+    /// client on its own, even with auto-login credentials. A connection that drops
+    /// without this call can still reconnect on its own.
     async fn disconnect(&self) -> Result<(), IggyError>;
 
     /// Shut down the client and release all the resources. Repeated calls are safe.
