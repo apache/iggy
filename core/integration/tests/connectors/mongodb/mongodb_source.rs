@@ -1,0 +1,307 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
+use crate::connectors::fixtures::MongoDbSourceFixture;
+use iggy::prelude::IggyClient;
+use iggy_common::MessageClient;
+use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
+use integration::harness::seeds;
+use integration::iggy_harness;
+use std::time::Duration;
+use tokio::time::sleep;
+
+/// Polls the seeded topic until `expected` JSON messages arrived or
+/// `POLL_ATTEMPTS` ran out, returning whatever was received.
+async fn poll_json_messages(
+    client: &IggyClient,
+    consumer: &str,
+    expected: usize,
+) -> Vec<serde_json::Value> {
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = consumer.try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                100,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= expected {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    received
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mongodb_source_produces_messages_to_iggy(
+    harness: &TestHarness,
+    fixture: MongoDbSourceFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+
+    fixture
+        .insert_documents(TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to insert documents");
+
+    let doc_count = fixture
+        .get_document_count()
+        .await
+        .expect("Failed to get document count");
+    assert_eq!(
+        doc_count, TEST_MESSAGE_COUNT,
+        "Expected {TEST_MESSAGE_COUNT} documents in MongoDB"
+    );
+
+    let received = poll_json_messages(&client, "test_consumer", TEST_MESSAGE_COUNT).await;
+
+    assert!(
+        received.len() >= TEST_MESSAGE_COUNT,
+        "Expected at least {TEST_MESSAGE_COUNT} messages, got {}",
+        received.len()
+    );
+
+    for (i, record) in received.iter().take(TEST_MESSAGE_COUNT).enumerate() {
+        let expected_id = (i + 1) as i64;
+        let expected_name = format!("doc_{}", i + 1);
+
+        assert_eq!(
+            record.get("id").and_then(|v| v.as_i64()),
+            Some(expected_id),
+            "ID mismatch at record {i}"
+        );
+        assert_eq!(
+            record.get("name").and_then(|v| v.as_str()),
+            Some(expected_name.as_str()),
+            "Name mismatch at record {i}"
+        );
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mongodb_source_handles_empty_collection(
+    harness: &TestHarness,
+    fixture: MongoDbSourceFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+
+    let doc_count = fixture
+        .get_document_count()
+        .await
+        .expect("Failed to get document count");
+    assert_eq!(doc_count, 0, "Expected empty collection");
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let sources: Vec<SourceInfoResponse> = reqwest::get(format!("{api_address}/sources"))
+        .await
+        .expect("Failed to query /sources")
+        .json()
+        .await
+        .expect("Failed to parse sources");
+    let source = sources
+        .iter()
+        .find(|source| source.key == "mongodb")
+        .expect("MongoDB source should be reported");
+    assert_eq!(
+        source.status,
+        ConnectorStatus::Running,
+        "Source should start against an empty collection"
+    );
+
+    let polled = client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &Consumer::new(consumer_id),
+            &PollingStrategy::next(),
+            10,
+            false,
+        )
+        .await
+        .expect("Failed to poll messages");
+
+    assert!(
+        polled.messages.is_empty(),
+        "Expected no messages from an empty collection, got {}",
+        polled.messages.len()
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mongodb_source_produces_bulk_messages(
+    harness: &TestHarness,
+    fixture: MongoDbSourceFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let bulk_count = 10;
+
+    fixture
+        .insert_documents(bulk_count)
+        .await
+        .expect("Failed to insert documents");
+
+    let received = poll_json_messages(&client, "test_consumer", bulk_count).await;
+
+    assert!(
+        received.len() >= bulk_count,
+        "Expected at least {bulk_count} messages, got {}",
+        received.len()
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mongodb_source_reads_shared_timestamp_split_across_batches(
+    harness: &TestHarness,
+    fixture: MongoDbSourceFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    // The fixture configures batch_size = 100, so one millisecond spanning
+    // 150 documents can only be drained through the `_id` tie-break.
+    let doc_count = 150;
+
+    fixture
+        .insert_documents_sharing_timestamp(
+            doc_count,
+            mongodb::bson::DateTime::now().timestamp_millis(),
+        )
+        .await
+        .expect("Failed to insert documents");
+
+    let mut received = poll_json_messages(&client, "test_consumer", doc_count).await;
+    // Poll a few more times past the expected count so a `$gte` fallback
+    // re-delivering the boundary millisecond would show up as duplicates.
+    sleep(Duration::from_millis(POLL_INTERVAL_MS * 10)).await;
+    received.extend(poll_json_messages(&client, "test_consumer", 1).await);
+
+    let received_ids: Vec<i64> = received
+        .iter()
+        .map(|json| json.get("id").and_then(|v| v.as_i64()).unwrap_or(0))
+        .collect();
+    let mut unique_ids = received_ids.clone();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    assert_eq!(
+        unique_ids,
+        (1..=doc_count as i64).collect::<Vec<_>>(),
+        "every document sharing the millisecond should be produced once"
+    );
+    assert_eq!(
+        received_ids.len(),
+        doc_count,
+        "documents sharing the millisecond should not be re-delivered"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn state_persists_across_connector_restart(
+    harness: &mut TestHarness,
+    fixture: MongoDbSourceFixture,
+) {
+    fixture
+        .insert_documents(TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to insert first batch");
+
+    let client = harness.root_client().await.unwrap();
+    let received_before =
+        poll_json_messages(&client, "state_test_consumer", TEST_MESSAGE_COUNT).await;
+    assert_eq!(received_before.len(), TEST_MESSAGE_COUNT);
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors");
+
+    // Second batch must use timestamps strictly greater than batch 1 so the
+    // source's incremental `$gt last_poll_timestamp` filter selects only them.
+    let second_batch_start_id = (TEST_MESSAGE_COUNT + 1) as i32;
+    let batch_two_base = mongodb::bson::DateTime::now().timestamp_millis() + 1_000_000;
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_document_at(
+                second_batch_start_id + i as i32,
+                &format!("doc_batch2_{i}"),
+                (TEST_MESSAGE_COUNT + i) as i32 * 10,
+                batch_two_base + i as i64,
+            )
+            .await
+            .expect("Failed to insert document");
+    }
+
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors");
+    sleep(Duration::from_millis(100)).await;
+
+    let received_after =
+        poll_json_messages(&client, "state_test_consumer", TEST_MESSAGE_COUNT).await;
+    assert_eq!(received_after.len(), TEST_MESSAGE_COUNT);
+
+    for record in &received_after {
+        let id = record.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        assert!(
+            id > TEST_MESSAGE_COUNT as i64,
+            "After restart, got ID {id} from first batch"
+        );
+    }
+}
