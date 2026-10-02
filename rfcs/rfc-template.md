@@ -1,5 +1,3 @@
-<!-- markdownlint-disable MD053 -->
-
 - Feature Name: (fill me in with a unique ident, `my_awesome_feature`)
 - Start Date: (fill me in with today's date, YYYY-MM-DD)
 - RFC PR: [apache/iggy#0000](https://github.com/apache/iggy/pull/0000)
@@ -8,13 +6,9 @@
 
 ## Summary
 
-[summary]: #summary
-
 One paragraph explanation of the feature.
 
 ## Motivation
-
-[motivation]: #motivation
 
 Any changes to Iggy should focus on solving a problem that users of Iggy are having.
 This section should explain this problem in detail, including necessary background.
@@ -25,8 +19,6 @@ This can then be used to guide the design of the feature.
 This section is one of the most important sections of any RFC, and can be lengthy.
 
 ## Guide-level explanation
-
-[guide-level-explanation]: #guide-level-explanation
 
 Explain the proposal as if it was already included in Iggy and you were teaching it to another Iggy user. That generally means:
 
@@ -41,33 +33,26 @@ For implementation-oriented RFCs (e.g. for server internals), this section shoul
 
 ## Reference-level explanation
 
-[reference-level-explanation]: #reference-level-explanation
-
 This is the technical portion of the RFC. Explain the design in sufficient detail that:
 
 - Its interaction with other features is clear.
 - It is reasonably clear how the feature would be implemented.
 - Corner cases are dissected by example.
+- Failure behavior, crash recovery, and compatibility with existing wire and on-disk formats are spelled out.
 
 The section should return to the examples given in the previous section, and explain more fully how the detailed proposal makes those examples work.
 
 ## Drawbacks
 
-[drawbacks]: #drawbacks
-
 Why should we *not* do this?
 
 ## Rationale and alternatives
-
-[rationale-and-alternatives]: #rationale-and-alternatives
 
 - Why is this design the best in the space of possible designs?
 - What other designs have been considered and what is the rationale for not choosing them?
 - What is the impact of not doing this?
 
 ## Prior art
-
-[prior-art]: #prior-art
 
 Discuss prior art, both the good and the bad, in relation to this proposal.
 A few examples of what this can include are:
@@ -84,8 +69,6 @@ Note that while precedent set by other systems is some motivation, it does not o
 Please also take into consideration that Iggy sometimes intentionally diverges from common streaming system features.
 
 ## Unresolved questions
-
-[unresolved-questions]: #unresolved-questions
 
 - What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?
 - What can be covered by the deterministic simulator, and what can only be tested in integration against real infrastructure or not at all?

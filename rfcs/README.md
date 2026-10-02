@@ -1,8 +1,4 @@
-<!-- markdownlint-disable MD053 -->
-
 # Iggy RFCs
-
-[Iggy RFCs]: #iggy-rfcs
 
 The "RFC" (request for comments) process is intended to provide a consistent
 and controlled path for changes to Iggy (such as new features) so that all
@@ -26,9 +22,6 @@ the [maintainers].
 - [What the process is]
 - [RFC numbering]
 - [The RFC life-cycle]
-- [Reviewing RFCs]
-- [Implementing an RFC]
-- [RFC Postponement]
 - [Help this is all too informal]
 - [License]
 - [Contributions]
@@ -106,14 +99,22 @@ inclusion into Iggy.
   convincing motivation, demonstrate lack of understanding of the design's
   impact, or are disingenuous about the drawbacks or alternatives tend to
   be poorly-received.
-- Submit a pull request titled `rfc(<scope>): <subject>`, where the scope is
-  one of those accepted by the PR title check. The pull request carries the
-  text. A maintainer gives it an initial review within a week: whether the
-  change needs an RFC at all, whether the text is complete enough to debate,
-  and editorial comments on the writing.
+- Submit a pull request titled `rfc(<scope>): <subject>`, choosing the scope
+  as described in the commit message section of [CONTRIBUTING.md], which also
+  covers a scope that matches nothing yet. The pull request carries the text.
+  A maintainer gives it an initial review within a week: whether the change
+  needs an RFC at all, whether the text is complete enough to debate, and
+  editorial comments on the writing. If the change does not need an RFC, the
+  pull request is closed and the change goes through the normal pull request
+  workflow. If the text is not complete enough to debate, the maintainer
+  labels the pull request `S-waiting-on-author` until it is.
 - Now that your RFC has an open pull request, update the "RFC PR" link at the
   top of the file to point at it.
-- Once a maintainer marks the RFC ready for discussion, open a GitHub
+- A maintainer marks the RFC ready for discussion by labeling the pull request
+  `S-waiting-on-review`. The label stays for the lifetime of the RFC, because
+  the debate happens outside the pull request and the stale bot otherwise
+  closes a pull request after 14 days without activity on it.
+- Once the RFC is ready for discussion, open a GitHub
   Discussion in the RFCs category titled `RFC: <feature>`, linking the pull
   request and quoting the summary, and update the "Discussion" link at the top
   of the file to point at it. The Discussion is where the design is debated;
@@ -131,8 +132,8 @@ inclusion into Iggy.
   the changed lines, explaining your changes. **Specifically, do not squash or
   rebase commits after they are visible on the pull request.**
 - At some point, a maintainer will propose a "motion for final comment period"
-  (FCP) in the Discussion, along with a *disposition* for the RFC (merge,
-  close, or postpone).
+  (FCP) in the Discussion, along with a *disposition* for the RFC (merge or
+  close).
   - This step is taken when enough of the tradeoffs have been discussed that
     the maintainers are in a position to make a decision. That does not require
     consensus amongst all participants in the Discussion (which is usually
@@ -146,25 +147,32 @@ inclusion into Iggy.
     a *summary comment* trying to lay out the current state of the discussion
     and major tradeoffs/points of disagreement.
   - Before actually entering FCP, the maintainers must sign off; this is often
-    the point at which many of them first review the RFC in full depth.
+    the point at which many of them first review the RFC in full depth. The
+    maintainer who proposed the motion records the sign-offs in the
+    Discussion and announces there when the FCP starts and when it ends.
 - The FCP lasts ten calendar days, so that it is open for at least 5 business
-  days. It is also advertised on the [dev mailing list]. This way all
-  stakeholders have a chance to lodge any final objections before a decision
-  is reached.
+  days. The Discussion is mirrored to the [dev mailing list], but replies on
+  the list do not reach the Discussion, so final objections must be raised in
+  the Discussion itself.
 - In most cases, the FCP period is quiet, and the RFC is either merged or
   closed. However, sometimes substantial new arguments or ideas are raised,
-  the FCP is canceled, and the RFC goes back into development mode.
+  the FCP is canceled, and the RFC goes back into development mode. If the
+  reasoning behind the decision is not clear from the Discussion, the
+  maintainers add a comment there describing it.
 
 ## RFC numbering
 
 [RFC numbering]: #rfc-numbering
 
 RFC numbers are small sequential integers without zero padding, assigned when
-an RFC is accepted, so the first RFC is `rfc-1`. Whoever merges the pull request
-renames `rfcs/rfc-0-my-feature.md` to the next free number, for example
-`rfcs/rfc-7-my-feature.md`, fills in the "Iggy Issue" link with the tracking
-issue opened for the implementation, and marks the Discussion as answered with
-links to the merged RFC and that issue.
+an RFC is accepted, so the first RFC is `rfc-1`. When an FCP ends with a merge
+disposition, the maintainer who announced its end opens the tracking issue for
+the implementation and tells the author the next free number. The author then
+renames `rfcs/rfc-0-my-feature.md` to that number, for example
+`rfcs/rfc-7-my-feature.md`, and fills in the "Iggy Issue" link, before the
+final approvals, since a push after approval dismisses it. The pull request is
+then squash-merged, and the maintainer posts a summary comment in the
+Discussion linking the merged RFC and the tracking issue.
 
 Pull request numbers are not used as RFC numbers because this repository's
 counter is shared with every other pull request, which would make RFC numbers
@@ -180,6 +188,12 @@ feature as a pull request to the Iggy repository. Being "active" is not a
 rubber stamp, and in particular still does not mean the feature will ultimately
 be merged; it does mean that in principle all the major stakeholders have
 agreed to the feature and are amenable to merging it.
+
+Every accepted RFC has an associated issue tracking its implementation in the
+Iggy repository, so it can be assigned a priority via the triage process that
+the maintainers use for all issues. If you are interested in working on the
+implementation for an "active" RFC, but cannot determine if someone else is
+already working on it, feel free to ask on that issue.
 
 Furthermore, the fact that a given RFC has been accepted and is "active"
 implies nothing about what priority is assigned to its implementation, nor does
@@ -200,42 +214,7 @@ minor changes should be submitted as amendments. More substantial changes
 should be new RFCs, with a note added to the original RFC. Exactly what counts
 as a "very minor change" is up to the maintainers to decide.
 
-## Reviewing RFCs
-
-[Reviewing RFCs]: #reviewing-rfcs
-
-While the RFC is open, the maintainers may schedule a call with the author
-and/or relevant stakeholders to discuss the issues in greater detail, or
-discuss the topic on Discord. In either case a summary will be posted back to
-the RFC's Discussion.
-
-The maintainers make final decisions about RFCs after the benefits and
-drawbacks are well understood. These decisions can be made at any time, but the
-maintainers will regularly issue decisions. When a decision is made, the RFC
-pull request will either be merged or closed. In either case, if the reasoning
-is not clear from the Discussion, the maintainers will add a comment there
-describing the rationale for the decision.
-
-## Implementing an RFC
-
-[Implementing an RFC]: #implementing-an-rfc
-
-Some accepted RFCs represent vital features that need to be implemented right
-away. Other accepted RFCs can represent features that can wait until some
-arbitrary developer feels like doing the work. Every accepted RFC has an
-associated issue tracking its implementation in the Iggy repository; thus that
-associated issue can be assigned a priority via the triage process that the
-maintainers use for all issues in the Iggy repository.
-
-The author of an RFC is not obligated to implement it. Of course, the RFC
-author (like any other developer) is welcome to post an implementation for
-review after the RFC has been accepted.
-
-If you are interested in working on the implementation for an "active" RFC, but
-cannot determine if someone else is already working on it, feel free to ask
-(e.g. by leaving a comment on the associated issue).
-
-### Help this is all too informal
+## Help this is all too informal
 
 [Help this is all too informal]: #help-this-is-all-too-informal
 
@@ -251,6 +230,10 @@ The contents of this directory are licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 like the rest of the repository.
 
+This README and `rfc-template.md` are adapted from the
+[rust-lang/rfcs](https://github.com/rust-lang/rfcs) repository, which is
+licensed under the MIT and Apache 2.0 licenses.
+
 ### Contributions
 
 [Contributions]: #contributions
@@ -263,4 +246,5 @@ licensed as above, without any additional terms or conditions.
 [GitHub Discussions]: https://github.com/apache/iggy/discussions
 [dev mailing list]: mailto:dev@iggy.apache.org
 [Iggy repository]: https://github.com/apache/iggy
-[maintainers]: https://github.com/apache/iggy/blob/master/.asf.yaml
+[maintainers]: https://github.com/apache/iggy/blob/master/.github/CODEOWNERS
+[CONTRIBUTING.md]: https://github.com/apache/iggy/blob/master/CONTRIBUTING.md
