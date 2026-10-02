@@ -1,15 +1,20 @@
 ---
 name: team-review-slim
 description: |
- Team-review without the verification chain. Reviews a PR, the current branch against master, or of a ref range.
+ Four-expert review of a PR, branch, or ref range, without independent validation rounds.
+ Use only when the user explicitly requests team-review-slim.
 argument-hint: "[PR number | branch | ref range]"
 disable-model-invocation: true
 ---
 
 # Apache Iggy Team Review (slim version)
 
-`<TARGET>` = `$ARGUMENTS`: a PR number, a branch, or a ref range. Empty means `origin/master..HEAD`. Mission critical
-code.
+`<TARGET>` is the PR number, branch, or ref range supplied after the skill name. With no target, review `HEAD`
+from its merge base with `origin/master`. Mission critical code.
+
+Read [execution instructions](../team-review/references/execution.md) before starting. Use the section for your client to
+translate the tool calls below. Include those instructions in worker prompts. Keep this skill's Charter, roles, and report.
+Do not add the full review's validation rounds.
 
 You = **moderator**. You never open the diff or a source file: you route paths, merge claims, synthesize. Every token
 you load rides along every later turn. Reviewers are one-shot agents that deliver by writing a file, they do not chat.
@@ -121,20 +126,8 @@ you load rides along every later turn. Reviewers are one-shot agents that delive
 
 ## Step 1: Identify the target (no reading)
 
-- Classify `<TARGET>`: matches `^#?(pr)?[0-9]+$` case-insensitively -> PR, the digits are `<PR>`. Anything else -> ref
-  range or bare branch. Empty -> review `origin/master..HEAD`.
-- `<TOPIC>`: `<TARGET>` lowercased, chars outside `[a-z0-9-]` replaced by `-`, repeats collapsed, trimmed, max 40 chars
-  (`PR3123` -> `pr3123`, `origin/master..HEAD` -> `origin-master-head`). Empty -> `date +%s`.
-- `<DIR>` = `<session scratchpad dir from your system prompt>/review-<TOPIC>`. `mkdir -p` it.
-- PR: `gh pr view <PR> --json title,body,headRefOid > <DIR>/pr.json`, `gh pr diff <PR> > <DIR>/diff.patch`,
-  `gh pr diff <PR> --name-only > <DIR>/files.txt`. `<SHORTCOMMIT>` = first 8 of `headRefOid`.
-- Ref range or bare branch: `git diff $(git merge-base origin/master HEAD)..HEAD > <DIR>/diff.patch`, same with
-  `--name-only`, `<SHORTCOMMIT>` = `git rev-parse --short=8 HEAD`. No `pr.json` on this path.
-- Guard: `git rev-parse HEAD` must equal the reviewed head. Experts read the local checkout; if it differs, stop and ask
-  the user to check out the reviewed head.
-- `<DESCR>`: 1-3 word `snake_case` summary, `[a-z0-9_]`, \<= 24 chars. From the PR title; no PR -> from
-  `git log -1 --format=%s`.
-- Report path: `<DIR>/report.md`.
+Prepare the target and artifacts as the execution instructions specify. Use the resolved starting commit and reviewed
+head for every role. Do not read the diff or source files in the moderator context.
 
 Do not `cat` any of the files you just wrote. `wc -l <DIR>/diff.patch` is the only look you take.
 
@@ -215,7 +208,7 @@ Reason: one sentence. Only `critical` and `warning` entries with conf:H or conf:
 Simplifications are informational.
 
 Counts: critical N, warning N, nit N, simplify N
-Verification: none ran. Open each cited line and confirm the finding before you change the code.
+Verification: <actual commands and outcomes, or none ran>. Open each cited line and confirm the finding before you change the code.
 ```
 
 Then write `<DIR>/report.md` with:
@@ -227,4 +220,4 @@ Then write `<DIR>/report.md` with:
 4. Appendix `## Raw findings per expert`: each role file verbatim, in a fenced block.
 
 Last user-facing line: `Findings written: <DIR>/report.md`. Then name the highest-severity entry in one sentence, and
-stop. There is no cleanup: the one-shot agents end themselves, and `<DIR>` stays in the scratchpad.
+stop. There is no cleanup: the one-shot agents end themselves, and `<DIR>` keeps its artifacts.
