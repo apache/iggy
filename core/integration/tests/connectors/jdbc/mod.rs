@@ -15,21 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod cdc;
-mod container;
-mod sink;
-mod source;
-
-pub use cdc::{PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture};
-pub(crate) use container::PostgresContainer;
-pub use container::{PostgresOps, PostgresSourceOps};
-pub use sink::{
-    POSTGRES_LARGE_BATCH_SIZE, PostgresSinkByteaFixture, PostgresSinkFixture,
-    PostgresSinkJsonFixture, PostgresSinkLargeBatchFixture,
-};
-pub use source::{
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceDeleteSlowPollFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceNonUniqueCleanupFixture, PostgresSourceNonUniqueTrackingFixture,
-    PostgresSourceNumericTrackingFixture, PostgresSourceTextKeyFixture,
-};
+// JDBC connector tests, exercised against PostgreSQL over the JDBC driver.
+mod jdbc_source;

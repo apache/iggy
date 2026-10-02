@@ -96,6 +96,7 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
+sha2 = { workspace = true }
 sqlparser = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
