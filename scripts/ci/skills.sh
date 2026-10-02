@@ -74,9 +74,12 @@ for f in "${files[@]}"; do
       has_name=1
     }
     state==1 && /^description:[[:space:]]/ {
-      desc=$0; sub(/^description:[[:space:]]*/, "", desc);
+      desc=$0; sub(/^description:[[:space:]]*/, "", desc); sub(/[[:space:]]+$/, "", desc)
       has_desc=1
-      if (desc ~ /^[|>][-+]?$/) { desc=""; in_desc=1; next }
+      # Block scalar header: indentation (1-9) and chomping (+/-) in either order, then a comment.
+      if (desc ~ /^[|>]([-+]?[1-9]?|[1-9][-+])([[:space:]]+#.*)?$/) { desc=""; in_desc=1; next }
+      # Measure a quoted value without its quotes, so "" is empty.
+      if (desc ~ /^".*"$/ || desc ~ /^\047.*\047$/) desc=substr(desc, 2, length(desc) - 2)
       check_desc()
     }
     END {
@@ -96,7 +99,7 @@ for f in "${files[@]}"; do
   codex_skill="$CODEX_SKILLS_DIR/${skill_dir##*/}"
   # Only a relative target resolves in every clone.
   if [ "$(readlink "$codex_skill")" != "../../$skill_dir" ]; then
-    echo "  ❌ $codex_skill: must be a symlink to ../../$skill_dir (ln -s ../../$skill_dir $codex_skill)"
+    echo "  ❌ $codex_skill: must be a symlink to ../../$skill_dir (ln -sfn ../../$skill_dir $codex_skill)"
     fail=1
   fi
 
@@ -116,11 +119,11 @@ for f in "${files[@]}"; do
   case "$claude_flag/$codex_flag" in
     true/false | / | /true | false/ | false/true) ;;
     true/ | true/true | /false | false/false)
-      echo "  ❌ $skill_dir: set disable-model-invocation: true and policy.allow_implicit_invocation: false together, or neither"
+      echo "  ❌ $f, $policy: set disable-model-invocation: true and policy.allow_implicit_invocation: false together, or neither"
       fail=1
       ;;
     *)
-      echo "  ❌ $skill_dir: disable-model-invocation and policy.allow_implicit_invocation take a bare true or false"
+      echo "  ❌ $f, $policy: disable-model-invocation and policy.allow_implicit_invocation take a bare true or false"
       fail=1
       ;;
   esac
