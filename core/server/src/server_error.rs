@@ -170,6 +170,12 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to read or write the created revision of partition directory {dir}: {source}")]
+    PartitionCreatedRevisionIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's
     // `RecoveryError::SuperblockUnreadable` policy, minus the boot refusal,
@@ -206,6 +212,26 @@ pub enum ServerError {
         field: metadata::IdentityField,
         expected: u128,
         found: u128,
+    },
+    #[error(
+        "partition superblock at {dir} falls below committed creation view {created_view}: \
+         view {view}, log_view {log_view} (written by an older server, or left behind by a \
+         deleted partition with the same ids)"
+    )]
+    PartitionViewBelowCreation {
+        dir: PathBuf,
+        view: u32,
+        log_view: u32,
+        created_view: u32,
+    },
+    #[error(
+        "partition WAL certificate at {dir} falls below committed creation view {created_view}: \
+         log_view {log_view} (written by an older server)"
+    )]
+    PartitionWalViewBelowCreation {
+        dir: PathBuf,
+        log_view: u32,
+        created_view: u32,
     },
     // Only the `Refused` shape is per-partition: the loader's fence-or-tombstone
     // arm catches it. Everything else the partition readers raise fails the

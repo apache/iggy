@@ -85,6 +85,7 @@ export const translateErrorCode = (code: number): string => {
     case '82': return "Invalid number encoding";
     case '83': return "Invalid boolean value";
     case '84': return "Invalid number value";
+    case '85': return "Request is below the deduplication window; outcome unknown, resending may duplicate the write";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";

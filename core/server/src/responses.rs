@@ -222,7 +222,7 @@ where
             .len() as u32;
         count
     });
-    // The transport client id is a u128 `(shard << 112) | seq`; the wire
+    // The transport client id is a u128 `shard | boot nonce | seq`; the wire
     // `client_id` is the u32 seq tail.
     #[allow(clippy::cast_possible_truncation)]
     ClientResponse {

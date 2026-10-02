@@ -172,7 +172,7 @@ pub mod le_cursor;
 pub use client_table::{
     CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableMode,
     ClientTableSnapshot, ClientTableWireError, CommitReply, DISCONNECT_LOGOUT_REQUEST_ID,
-    DedupWatermark, FenceSnapshot, RESERVED_CLIENT_ID, SessionEnd,
+    DedupWatermark, FenceSnapshot, RESERVED_CLIENT_ID, SessionEnd, SliceRequestStatus,
 };
 pub mod state_manifest;
 pub use state_manifest::{
