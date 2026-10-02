@@ -23,16 +23,15 @@ use iggy_connector_sdk::{
 };
 use mongodb::{
     Client, Collection,
-    bson::{Bson, Document, doc},
-    options::ClientOptions,
+    bson::{Bson, Document, doc, spec::BinarySubtype},
+    options::{ClientOptions, ReadConcern},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 source_connector!(MongoDbSource);
 
@@ -43,7 +42,6 @@ struct State {
     poll_count: usize,
     // `_id` of the document at `last_poll_timestamp`, so documents sharing that
     // millisecond but cut off by `batch_size` are picked up on the next poll.
-    #[serde(default)]
     last_id: Option<String>,
 }
 
@@ -52,7 +50,6 @@ pub struct MongoDbSourceConfig {
     pub connection_uri: SecretString,
     pub database: String,
     pub collection: String,
-    pub max_pool_size: Option<u32>,
     pub query: Option<Document>,
     pub timestamp_field: Option<String>,
     pub batch_size: Option<NonZeroU32>,
@@ -70,16 +67,16 @@ pub struct MongoDbSource {
 }
 
 const CONNECTOR_NAME: &str = "MongoDB source";
+const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_BATCH_SIZE: u32 = 100;
 
 impl MongoDbSource {
     pub fn new(id: u32, config: MongoDbSourceConfig, state: Option<ConnectorState>) -> Self {
         let polling_interval = config
             .polling_interval
             .as_deref()
-            .unwrap_or("10s")
-            .parse::<humantime::Duration>()
-            .unwrap_or_else(|_| humantime::Duration::from_str("10s").unwrap())
-            .into();
+            .and_then(|interval| interval.parse::<humantime::Duration>().ok())
+            .map_or(DEFAULT_POLLING_INTERVAL, Duration::from);
 
         let restored_state = state
             .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
@@ -115,8 +112,9 @@ impl MongoDbSource {
             ClientOptions::parse(self.config.connection_uri.expose_secret())
                 .await
                 .map_err(|e| Error::InitError(format!("Failed to parse connection URI: {e}")))?;
-        if let Some(pool_size) = self.config.max_pool_size {
-            client_options.max_pool_size = Some(pool_size);
+        // Local reads can return documents a primary failover later rolls back.
+        if client_options.read_concern.is_none() {
+            client_options.read_concern = Some(ReadConcern::majority());
         }
         let client = Client::with_options(client_options)
             .map_err(|e| Error::InitError(format!("Failed to create client: {e}")))?;
@@ -132,11 +130,12 @@ impl MongoDbSource {
         let collections = database
             .list_collection_names()
             .filter(doc! { "name": &self.config.collection })
+            .authorized_collections(true)
             .await
             .map_err(|e| Error::InitError(format!("Failed to list collections: {e}")))?;
         if collections.is_empty() {
             return Err(Error::InvalidConfigValue(format!(
-                "collection '{}' not found in database '{}'",
+                "collection '{}' not found or not readable in database '{}'",
                 self.config.collection, self.config.database
             )));
         }
@@ -173,7 +172,11 @@ impl MongoDbSource {
         client: &Client,
     ) -> Result<(Vec<ProducedMessage>, State), Error> {
         let state = self.state.lock().await.clone();
-        let batch_size = i64::from(self.config.batch_size.map_or(100, NonZeroU32::get));
+        let batch_size = i64::from(
+            self.config
+                .batch_size
+                .map_or(DEFAULT_BATCH_SIZE, NonZeroU32::get),
+        );
 
         let coll: Collection<Document> = client
             .database(&self.config.database)
@@ -241,22 +244,35 @@ impl MongoDbSource {
         };
         Ok((messages, candidate_state))
     }
+
+    async fn open_inner(&mut self) -> Result<(), Error> {
+        let client = self.create_client().await?;
+        self.check_collection(&client).await?;
+        self.check_timestamp_field(&client).await?;
+        self.client = Some(client);
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Source for MongoDbSource {
     async fn open(&mut self) -> Result<(), Error> {
         info!(
-            "Opening Mongodb source connector with ID: {}, collection: {}",
+            "Opening {CONNECTOR_NAME} connector with ID: {}, collection: {}",
             self.id, self.config.collection
         );
 
-        let client = self.create_client().await?;
-        self.check_collection(&client).await?;
-        self.check_timestamp_field(&client).await?;
-        self.client = Some(client);
-
-        Ok(())
+        // The SDK `open` shim drops the `Err` payload and the runtime reports
+        // "Plugin initialization failed", so this log is the only place the
+        // reason survives.
+        let opened = self.open_inner().await;
+        if let Err(error) = &opened {
+            error!(
+                "Failed to open {CONNECTOR_NAME} connector with ID: {}: {error}",
+                self.id
+            );
+        }
+        opened
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
@@ -266,7 +282,7 @@ impl Source for MongoDbSource {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| Error::Storage("Mongodb client not initialized".to_string()))?;
+            .ok_or_else(|| Error::Storage(format!("{CONNECTOR_NAME} client not initialized")))?;
 
         let (messages, candidate_state) = self.search_documents(client).await?;
 
@@ -274,7 +290,7 @@ impl Source for MongoDbSource {
             None
         } else {
             Some(self.serialize_state(&candidate_state).ok_or_else(|| {
-                Error::Serialization("failed to serialize MongoDB source state".to_string())
+                Error::Serialization(format!("failed to serialize {CONNECTOR_NAME} state"))
             })?)
         };
         *self.pending_state.lock().await = Some(candidate_state);
@@ -297,12 +313,12 @@ impl Source for MongoDbSource {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!("Mongodb Connector with ID: {} is closing", self.id);
+        info!("{CONNECTOR_NAME} connector with ID: {} is closing", self.id);
 
         let state = self.state.lock().await;
 
         info!(
-            "Mongodb source connector ID: {} closed. Total documents processed: {}",
+            "{CONNECTOR_NAME} connector with ID: {} closed. Total documents processed: {}",
             self.id, state.total_documents_fetched
         );
         Ok(())
@@ -319,7 +335,23 @@ fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
 }
 
 fn validate_timestamp_field(doc: &Document, timestamp_field: &str) -> Result<(), Error> {
-    match field_value(doc, timestamp_field) {
+    let mut segments = timestamp_field.split('.');
+    let mut value = doc.get(segments.next().unwrap_or_default());
+    for segment in segments {
+        value = match value {
+            Some(Bson::Document(embedded)) => embedded.get(segment),
+            // The server matches dotted paths through arrays, but the cursor
+            // only reads embedded documents, so such documents would never
+            // advance it.
+            Some(Bson::Array(_)) => {
+                return Err(Error::InvalidConfigValue(format!(
+                    "timestamp_field '{timestamp_field}' crosses an array; only paths through embedded documents are supported"
+                )));
+            }
+            _ => None,
+        };
+    }
+    match value {
         Some(Bson::DateTime(_)) => Ok(()),
         Some(value) => Err(Error::InvalidConfigValue(format!(
             "timestamp_field '{timestamp_field}' must hold a BSON Date, found {:?}",
@@ -340,6 +372,11 @@ fn message_id(id: &Bson) -> Option<u128> {
         }
         Bson::Int32(value) => u128::try_from(*value).ok(),
         Bson::Int64(value) => u128::try_from(*value).ok(),
+        Bson::Binary(binary) if binary.subtype == BinarySubtype::Uuid => {
+            <[u8; 16]>::try_from(binary.bytes.as_slice())
+                .ok()
+                .map(u128::from_be_bytes)
+        }
         _ => None,
     }
 }
@@ -378,14 +415,13 @@ fn cursor_filter(timestamp_field: &str, state: &State) -> Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::{Binary, oid::ObjectId, spec::BinarySubtype};
+    use mongodb::bson::{Binary, oid::ObjectId};
 
     fn test_config() -> MongoDbSourceConfig {
         MongoDbSourceConfig {
             connection_uri: SecretString::from("mongodb://localhost:27017"),
             database: "test_db".to_string(),
             collection: "test_collection".to_string(),
-            max_pool_size: None,
             query: None,
             timestamp_field: Some("timestamp".to_string()),
             batch_size: NonZeroU32::new(100),
@@ -477,31 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn given_state_saved_without_last_id_should_restore_with_none() {
-        #[derive(Serialize)]
-        struct StateWithoutLastId {
-            last_poll_timestamp: Option<i64>,
-            total_documents_fetched: usize,
-            poll_count: usize,
-        }
-        let legacy = StateWithoutLastId {
-            last_poll_timestamp: Some(1_700_000_000_000),
-            total_documents_fetched: 10,
-            poll_count: 1,
-        };
-        let connector_state = ConnectorState::serialize(&legacy, CONNECTOR_NAME, 1)
-            .expect("state should be serializable");
-
-        let restored = connector_state
-            .deserialize::<State>(CONNECTOR_NAME, 1)
-            .expect("state without last_id should still deserialize");
-
-        assert_eq!(restored.last_poll_timestamp, legacy.last_poll_timestamp);
-        assert_eq!(restored.total_documents_fetched, 10);
-        assert!(restored.last_id.is_none());
-    }
-
-    #[test]
     fn given_last_id_when_building_filter_should_break_timestamp_ties_on_id() {
         let last_id = Bson::ObjectId(ObjectId::parse_str("65a4f0c2e1b2c3d4e5f60718").unwrap());
         let state = State {
@@ -573,6 +584,12 @@ mod tests {
                 "{doc:?} should be rejected"
             );
         }
+
+        let array_path = doc! { "meta": [{ "updated_at": mongodb::bson::DateTime::now() }] };
+        assert!(matches!(
+            validate_timestamp_field(&array_path, "meta.updated_at"),
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 
     #[test]
@@ -583,6 +600,22 @@ mod tests {
             Some(0x65a4_f0c2_e1b2_c3d4_e5f6_0718)
         );
         assert_eq!(message_id(&Bson::Int64(42)), Some(42));
+        assert_eq!(
+            message_id(&Bson::Binary(Binary {
+                subtype: BinarySubtype::Uuid,
+                bytes: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef_u128
+                    .to_be_bytes()
+                    .to_vec(),
+            })),
+            Some(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)
+        );
+        assert_eq!(
+            message_id(&Bson::Binary(Binary {
+                subtype: BinarySubtype::Generic,
+                bytes: vec![0u8; 16],
+            })),
+            None
+        );
         assert_eq!(message_id(&Bson::Int32(-1)), None);
         assert_eq!(message_id(&Bson::String("doc-1".to_string())), None);
     }

@@ -27,7 +27,7 @@ use integration::harness::{TestBinaryError, TestFixture};
 use mongodb::bson::{DateTime as BsonDateTime, Document, doc};
 use std::collections::HashMap;
 
-/// MongoDB source fixture for basic document polling.
+/// MongoDB source fixture with the source collection pre-created.
 pub struct MongoDbSourceFixture {
     container: MongoDbContainer,
 }
@@ -143,7 +143,9 @@ impl MongoDbSourceFixture {
 impl TestFixture for MongoDbSourceFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = MongoDbContainer::start().await?;
-        Ok(Self { container })
+        let fixture = Self { container };
+        fixture.create_collection().await?;
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -180,36 +182,5 @@ impl TestFixture for MongoDbSourceFixture {
             "../../target/debug/libiggy_connector_mongodb_source".to_string(),
         );
         envs
-    }
-}
-
-/// MongoDB source fixture with pre-created collection.
-pub struct MongoDbSourcePreCreatedFixture {
-    inner: MongoDbSourceFixture,
-}
-
-impl std::ops::Deref for MongoDbSourcePreCreatedFixture {
-    type Target = MongoDbSourceFixture;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl MongoDbOps for MongoDbSourcePreCreatedFixture {
-    fn container(&self) -> &MongoDbContainer {
-        &self.inner.container
-    }
-}
-
-#[async_trait]
-impl TestFixture for MongoDbSourcePreCreatedFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        let inner = MongoDbSourceFixture::setup().await?;
-        inner.create_collection().await?;
-        Ok(Self { inner })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
     }
 }

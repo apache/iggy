@@ -16,7 +16,8 @@
 // under the License.
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
-use crate::connectors::fixtures::MongoDbSourcePreCreatedFixture;
+use crate::connectors::fixtures::MongoDbSourceFixture;
+use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
@@ -25,13 +26,52 @@ use integration::iggy_harness;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// Polls the seeded topic until `expected` JSON messages arrived or
+/// `POLL_ATTEMPTS` ran out, returning whatever was received.
+async fn poll_json_messages(
+    client: &IggyClient,
+    consumer: &str,
+    expected: usize,
+) -> Vec<serde_json::Value> {
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = consumer.try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                100,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= expected {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    received
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn mongodb_source_produces_messages_to_iggy(
     harness: &TestHarness,
-    fixture: MongoDbSourcePreCreatedFixture,
+    fixture: MongoDbSourceFixture,
 ) {
     let client = harness.root_client().await.unwrap();
 
@@ -49,35 +89,7 @@ async fn mongodb_source_produces_messages_to_iggy(
         "Expected {TEST_MESSAGE_COUNT} documents in MongoDB"
     );
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
-
-    let mut received: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                10,
-                true,
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= TEST_MESSAGE_COUNT {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
+    let received = poll_json_messages(&client, "test_consumer", TEST_MESSAGE_COUNT).await;
 
     assert!(
         received.len() >= TEST_MESSAGE_COUNT,
@@ -108,7 +120,7 @@ async fn mongodb_source_produces_messages_to_iggy(
 )]
 async fn mongodb_source_handles_empty_collection(
     harness: &TestHarness,
-    fixture: MongoDbSourcePreCreatedFixture,
+    fixture: MongoDbSourceFixture,
 ) {
     let client = harness.root_client().await.unwrap();
 
@@ -170,7 +182,7 @@ async fn mongodb_source_handles_empty_collection(
 )]
 async fn mongodb_source_produces_bulk_messages(
     harness: &TestHarness,
-    fixture: MongoDbSourcePreCreatedFixture,
+    fixture: MongoDbSourceFixture,
 ) {
     let client = harness.root_client().await.unwrap();
     let bulk_count = 10;
@@ -180,35 +192,7 @@ async fn mongodb_source_produces_bulk_messages(
         .await
         .expect("Failed to insert documents");
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
-
-    let mut received: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                100,
-                true,
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received.push(json);
-                }
-            }
-            if received.len() >= bulk_count {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
+    let received = poll_json_messages(&client, "test_consumer", bulk_count).await;
 
     assert!(
         received.len() >= bulk_count,
@@ -223,7 +207,7 @@ async fn mongodb_source_produces_bulk_messages(
 )]
 async fn mongodb_source_reads_shared_timestamp_split_across_batches(
     harness: &TestHarness,
-    fixture: MongoDbSourcePreCreatedFixture,
+    fixture: MongoDbSourceFixture,
 ) {
     let client = harness.root_client().await.unwrap();
     // The fixture configures batch_size = 100, so one millisecond spanning
@@ -238,44 +222,16 @@ async fn mongodb_source_reads_shared_timestamp_split_across_batches(
         .await
         .expect("Failed to insert documents");
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+    let mut received = poll_json_messages(&client, "test_consumer", doc_count).await;
+    // Poll a few more times past the expected count so a `$gte` fallback
+    // re-delivering the boundary millisecond would show up as duplicates.
+    sleep(Duration::from_millis(POLL_INTERVAL_MS * 10)).await;
+    received.extend(poll_json_messages(&client, "test_consumer", 1).await);
 
-    let mut received_ids: Vec<i64> = Vec::new();
-    let mut idle_polls = 0;
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                100,
-                true,
-            )
-            .await
-        {
-            if polled.messages.is_empty() {
-                idle_polls += 1;
-            } else {
-                idle_polls = 0;
-            }
-            for msg in polled.messages {
-                let json: serde_json::Value =
-                    serde_json::from_slice(&msg.payload).expect("payload should be JSON");
-                received_ids.push(json.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
-            }
-            // Keep polling a little past the expected count so a `$gte`
-            // fallback re-delivering the boundary millisecond would show up.
-            if received_ids.len() >= doc_count && idle_polls >= 10 {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
+    let received_ids: Vec<i64> = received
+        .iter()
+        .map(|json| json.get("id").and_then(|v| v.as_i64()).unwrap_or(0))
+        .collect();
     let mut unique_ids = received_ids.clone();
     unique_ids.sort_unstable();
     unique_ids.dedup();
@@ -297,46 +253,16 @@ async fn mongodb_source_reads_shared_timestamp_split_across_batches(
 )]
 async fn state_persists_across_connector_restart(
     harness: &mut TestHarness,
-    fixture: MongoDbSourcePreCreatedFixture,
+    fixture: MongoDbSourceFixture,
 ) {
     fixture
         .insert_documents(TEST_MESSAGE_COUNT)
         .await
         .expect("Failed to insert first batch");
 
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "state_test_consumer".try_into().unwrap();
-
     let client = harness.root_client().await.unwrap();
-    let received_before = {
-        let mut received: Vec<serde_json::Value> = Vec::new();
-        for _ in 0..POLL_ATTEMPTS {
-            if let Ok(polled) = client
-                .poll_messages(
-                    &stream_id,
-                    &topic_id,
-                    None,
-                    &Consumer::new(consumer_id.clone()),
-                    &PollingStrategy::next(),
-                    10,
-                    true,
-                )
-                .await
-            {
-                for msg in polled.messages {
-                    if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                        received.push(json);
-                    }
-                }
-                if received.len() >= TEST_MESSAGE_COUNT {
-                    break;
-                }
-            }
-            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-        }
-        received
-    };
+    let received_before =
+        poll_json_messages(&client, "state_test_consumer", TEST_MESSAGE_COUNT).await;
     assert_eq!(received_before.len(), TEST_MESSAGE_COUNT);
 
     harness
@@ -367,32 +293,8 @@ async fn state_persists_across_connector_restart(
         .expect("Failed to restart connectors");
     sleep(Duration::from_millis(100)).await;
 
-    let mut received_after: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                10,
-                true,
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received_after.push(json);
-                }
-            }
-            if received_after.len() >= TEST_MESSAGE_COUNT {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-
+    let received_after =
+        poll_json_messages(&client, "state_test_consumer", TEST_MESSAGE_COUNT).await;
     assert_eq!(received_after.len(), TEST_MESSAGE_COUNT);
 
     for record in &received_after {
