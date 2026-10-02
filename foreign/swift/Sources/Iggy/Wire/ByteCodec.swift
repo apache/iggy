@@ -216,3 +216,10 @@ extension UInt64 {
         self = bytes.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(as: UInt64.self)) }
     }
 }
+
+extension FixedWidthInteger {
+    /// Little-endian wire bytes, the layout user header values carry.
+    var littleEndianBytes: [UInt8] {
+        withUnsafeBytes(of: littleEndian) { Array($0) }
+    }
+}

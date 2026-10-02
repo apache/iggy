@@ -90,7 +90,8 @@ use iggy_binary_protocol::{
 };
 use iggy_common::{
     CompressionAlgorithm, Durability, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
-    MaxTopicSize, TopicCreateOptions, TopicUpdateOptions,
+    MaxTopicSize, NO_ASSIGNED_PARTITION, RESYNC_REQUIRED_PARTITION_SENTINEL, TopicCreateOptions,
+    TopicUpdateOptions,
 };
 use secrecy::SecretString;
 use serde::Serialize;
@@ -103,6 +104,8 @@ use twox_hash::{XxHash3_64, XxHash32};
 struct Golden {
     protocol_version: u32,
     protocol_version_min: u32,
+    no_assigned_partition: u32,
+    resync_required_partition: u32,
     xxh3_64: BTreeMap<usize, String>,
     xxh32: BTreeMap<usize, String>,
     errors: BTreeMap<u32, String>,
@@ -1255,6 +1258,8 @@ fn main() {
             threads_count: 16,
             free_disk_space: 107_374_182_400,
             total_disk_space: 512_110_190_592,
+            open_files_count: 128,
+            open_files_limit: 10_240,
         },
     );
     add(
@@ -1414,6 +1419,8 @@ fn main() {
     let golden = Golden {
         protocol_version: IGGY_PROTOCOL_VERSION,
         protocol_version_min: IGGY_PROTOCOL_VERSION_MIN,
+        no_assigned_partition: NO_ASSIGNED_PARTITION,
+        resync_required_partition: RESYNC_REQUIRED_PARTITION_SENTINEL,
         xxh3_64,
         xxh32,
         errors,

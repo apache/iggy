@@ -1,6 +1,6 @@
 # Consumer offset storage
 
-Status: proposed. Answers [#3540](https://github.com/apache/iggy/issues/3540) and blocks
+Status: accepted. Answers [#3540](https://github.com/apache/iggy/issues/3540) and unblocks
 [#3542](https://github.com/apache/iggy/issues/3542), OffsetCommit and OffsetFetch.
 
 ## Decision
@@ -138,6 +138,34 @@ Kafka code it sends is less specific than the Iggy error it received.
 An Iggy name is capped at 255 bytes (`core/common/src/lib.rs:168`), which leaves 246 for a Kafka
 group id after the prefix. A longer group id is rejected with `INVALID_GROUP_ID` (24).
 
+### Committed offsets hold back retention
+
+Iggy deletes a partition's segments, by retention or by `DeleteSegments`, only up to the lowest
+offset any consumer or consumer group has committed there
+(`core/partitions/src/iggy_partition.rs`, `min_committed_offset`). Every `kafka.cg.*` offset is
+one of those, so a Kafka group that stops consuming stops retention on every partition it
+committed on, for as long as the offset exists. Kafka itself never lets committed offsets block
+retention, and it expires them after `offsets.retention.minutes`. Iggy has no offset expiry, so an
+abandoned group's offsets stay, keep that barrier in place, and keep counting against the
+4096-key limit above until an operator deletes the Iggy consumer group `kafka.cg.<group>` on every
+topic the group committed on, since [the key](#the-key) creates one per topic. The gateway never
+does, since it does not implement `DeleteGroups` (42).
+
+The barrier reads the stored value as Iggy's last consumed offset and keeps a segment only while
+its end offset is above it, but a `kafka.cg.*` key holds the Kafka commit, the next offset to
+read (see [What is stored](#what-is-stored)). A sealed segment that ends exactly at that offset
+is therefore deletable while its last record is still unread. OffsetCommit and OffsetFetch
+([#3542](https://github.com/apache/iggy/issues/3542)) have to close this before any `kafka.cg.*`
+offset is written, for example by having the barrier subtract one for those keys.
+
+A blocked trim stays pending rather than failing. The reconciler restages a `DeleteSegments`
+trim the barrier blocks on every pass (`reconcile_segment_truncations`), and each blocked
+attempt, by that trim or by retention, logs `segment retained: blocked by committed consumer
+offset` at `warn!`, for as long as an abandoned group's offsets exist.
+
+`PurgeTopic` resets each partition to offset 0 and clears its consumer offsets, Kafka groups'
+included, so a purge leaves every group with nothing committed.
+
 ## More than one gateway instance
 
 Two gateway instances that share an Iggy cluster read and write the same offset keys. The key
@@ -147,12 +175,23 @@ agree on committed offsets without talking to each other.
 They do not agree on group membership. That belongs to the coordinator
 ([#3541](https://github.com/apache/iggy/issues/3541)) and is not settled here.
 
-## Open question
+## Partition assignment
 
-Iggy consumer offsets keyed by group, as above, or one of A, B and C from the issue?
+The gateway runs no assignor: the group leader assigns on the client, whatever its configured
+strategy ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#assignment-is-the-clients-job)). Offset
+storage does not depend on the choice, since a commit names the partition it is for, whichever
+member owns it.
+Iggy's balanced consumer-group assignment is not used for Kafka groups, and KIP-848's server-side
+assignment (`ConsumerGroupHeartbeat`, key 68) is out of scope.
 
-If no answer lands by 2026-09-22, the design above is taken and the work proceeds. This document
-is then updated to record that it was decided by default.
+## Decision record
+
+The open question was whether to store offsets as Iggy consumer offsets keyed by group, as above,
+or take one of A, B and C from the issue. This document proposed a default: the design above
+unless an answer landed by 2026-09-22. It was merged in
+[#4205](https://github.com/apache/iggy/pull/4205) as a proposal, approved by @hubcio and
+@numinnex. No alternative was raised by that date, so it was decided by default and the design
+above is the one taken.
 
 ## References
 

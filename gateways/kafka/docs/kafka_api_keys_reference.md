@@ -113,10 +113,13 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 19 | **CreateTopics** | 2 | 7 | v5 | 🟠 Required Stub |
 | 20 | **DeleteTopics** | 1 | 6 | v4 | 🟡 Optional Stub |
-| 21 | **DeleteRecords** | 0 | 2 | v2 | 🟡 Optional Stub |
+| 21 | **DeleteRecords** | 0 | 2 | v2 | ❌ Unadvertised |
 | 37 | **CreatePartitions** | 0 | 3 | v2 | 🟡 Optional Stub |
 
 > ⚠️ `SUPPORTED_RANGES` in `api.rs` currently advertises CreateTopics max=5; actual max is v7.
+>
+> DeleteRecords stays unadvertised until Iggy exposes a log-start offset; see
+> [`SCOPE.md`](SCOPE.md#deleterecords-is-not-advertised-3547).
 
 ---
 
@@ -266,8 +269,8 @@ Key new minimums:
 | ---------- | :-----: | ------- |
 | 🔴 Bridge (data path) | 7 | Produce, Fetch, Metadata, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
 | 🟠 Required Stub (client state machine) | 13 | ListOffsets, consumer group (8-14), CreateTopics, InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
-| 🟡 Optional Stub (admin/observability) | 42 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
-| ❌ Unadvertised (transactions) | 4 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28). Absent from ApiVersions, so a conforming client never sends one |
+| 🟡 Optional Stub (admin/observability) | 41 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
+| ❌ Unadvertised | 5 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28), and DeleteRecords (21). Absent from ApiVersions, so a conforming client never sends one |
 | ❌ Reject (broker/KRaft internal) | 22 | Return `INVALID_REQUEST` with valid frame — never close the TCP connection |
 | **Total API Keys in this document** | **88** | Key IDs 0-88 with a gap at 73 |
 

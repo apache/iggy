@@ -59,6 +59,7 @@ pub fn install_client_quic(
         bus,
         meta,
         QuicTransportConn::new(connection).with_close_grace(close_grace),
+        None,
         on_request,
     );
 }

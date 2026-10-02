@@ -60,13 +60,14 @@ max-threads = 4
 [[profile.default.overrides]]
 filter = '''
     binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)
+    + binary_id(iggy-gateway-kafka::fetch_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)
 '''
 test-group = "kafka_bridge"
 
 # The real-client suite spawns its own server too, so it needs serializing for the same reason, but
-# in its own group rather than queued behind the bridge tests: sharing one group would put six
+# in its own group rather than queued behind the bridge tests: sharing one group would put eight
 # container-driven tests behind twenty-one unrelated ones, serially, for no isolation gained. Both
 # groups cap their servers' shard pools themselves, so running the two alongside each other is
 # bounded.

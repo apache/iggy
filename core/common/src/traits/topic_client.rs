@@ -40,6 +40,11 @@ pub trait TopicClient {
     /// server's defaults at admission, so a future key costs no signature
     /// change here. Authentication is required, and the permission to manage
     /// the topics.
+    ///
+    /// If the new partitions would take the node past `[metadata]
+    /// partitions_max`, a binary transport returns
+    /// `IggyError::PartitionsLimitReached`. `HttpClient` returns
+    /// `IggyError::HttpResponseError` instead.
     async fn create_topic(
         &self,
         stream_id: &Identifier,

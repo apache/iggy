@@ -19,10 +19,10 @@
 
 use super::conn_info::ClientConnMeta;
 use super::tcp::install_client_conn;
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::socket_opts::apply_nodelay_for_connection;
 use crate::transports::tcp_tls::TcpTlsTransportConn;
+use crate::{ConnectionPermit, IggyMessageBus};
 use compio::net::TcpStream;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -52,6 +52,7 @@ pub fn install_client_tcp_tls(
     meta: ClientConnMeta,
     stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -68,6 +69,7 @@ pub fn install_client_tcp_tls(
         TcpTlsTransportConn::new_server(stream, config)
             .with_close_grace(cfg.close_grace)
             .with_handshake_grace(cfg.handshake_grace),
+        Some(permit),
         on_request,
     );
 }

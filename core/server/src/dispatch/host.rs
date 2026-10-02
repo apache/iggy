@@ -208,6 +208,9 @@ where
             ListClientsReply::Sessions(reply) => {
                 let _ = reply.try_send(self.sessions.borrow().iter_consumer_sessions().collect());
             }
+            ListClientsReply::Count(reply) => {
+                let _ = reply.try_send(self.sessions.borrow().client_count());
+            }
         }
     }
 }
