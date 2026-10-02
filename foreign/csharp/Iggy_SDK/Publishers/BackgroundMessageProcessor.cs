@@ -532,9 +532,8 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             }
             catch (VsrRequestOutcomeUnknownException ex)
             {
-                // The send may already have committed. The partition plane is sessionless - it keeps no
-                // client-table entry to deduplicate an append against - so a retry cannot be matched to the
-                // original under any client id and would simply append the batch twice. Report it instead.
+                // The send may already have committed. A retry takes a fresh request id, so the dedup window
+                // cannot match it to the original, and the batch would be appended twice. Report it instead.
                 LogFailedToSendBatch(ex, wire.Count);
                 if (_messageBatchErrorAggregator.HasSubscribers)
                 {

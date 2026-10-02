@@ -1115,7 +1115,14 @@ public class HttpMessageStream : IIggyClient
             // the exception message.
         }
 
-        throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
+        var error = new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
+        if (error.StatusCode == VsrError.REQUEST_TOO_OLD)
+        {
+            // The server no longer knows whether the request committed, so a resend could duplicate it.
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+
+        throw error;
     }
 
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)

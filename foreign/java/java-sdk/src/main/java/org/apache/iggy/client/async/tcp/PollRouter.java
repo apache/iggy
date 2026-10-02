@@ -50,24 +50,33 @@ import java.util.function.Supplier;
  * Polls have no deduplication key; only explicit non-admission permits replay.
  */
 final class PollRouter {
+    private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
     private static final int POLL_PARAMETERS_BYTES = 14;
     private static final int ATTACHMENT_BYTES = 32;
-    private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     private static final long RETRY_INTERVAL_MILLIS = 50;
 
     private final Supplier<AsyncTcpConnection> coordinator;
     private final Function<ConnectionInfo, AsyncTcpConnection> connectData;
+    private final Duration pollTimeout;
     private final Map<String, Route> routes = new HashMap<>();
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
     private final Set<Poll> pending = new HashSet<>();
     private long metadataWatermark;
 
     PollRouter(Supplier<AsyncTcpConnection> coordinator, Function<ConnectionInfo, AsyncTcpConnection> connectData) {
+        this(coordinator, connectData, POLL_TIMEOUT);
+    }
+
+    PollRouter(
+            Supplier<AsyncTcpConnection> coordinator,
+            Function<ConnectionInfo, AsyncTcpConnection> connectData,
+            Duration pollTimeout) {
         this.coordinator = coordinator;
         this.connectData = connectData;
+        this.pollTimeout = pollTimeout;
     }
 
     CompletableFuture<ByteBuf> poll(ByteBuf payload) {
@@ -75,7 +84,7 @@ final class PollRouter {
         try {
             String key = ByteBufUtil.hexDump(
                     payload, payload.readerIndex(), payload.readableBytes() - POLL_PARAMETERS_BYTES);
-            poll = new Poll(key, ByteBufUtil.getBytes(payload));
+            poll = new Poll(key, ByteBufUtil.getBytes(payload), pollTimeout);
         } finally {
             payload.release();
         }
@@ -85,8 +94,7 @@ final class PollRouter {
             }
             pending.add(poll);
         }
-        var timeout =
-                coordinator.get().eventLoop().schedule(poll::expire, POLL_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS);
+        var timeout = coordinator.get().eventLoop().schedule(poll::expire, pollTimeout.toNanos(), TimeUnit.NANOSECONDS);
         poll.result.whenComplete((response, error) -> {
             timeout.cancel(false);
             synchronized (this) {
@@ -118,7 +126,7 @@ final class PollRouter {
     }
 
     private void attempt(Poll poll) {
-        if (!poll.beginAttempt()) {
+        if (poll.result.isDone()) {
             return;
         }
         route(poll).thenCompose(route -> enqueue(route, poll)).whenComplete((response, error) -> {
@@ -221,6 +229,7 @@ final class PollRouter {
     }
 
     private CompletableFuture<ByteBuf> enqueue(Route route, Poll poll) {
+        poll.routed();
         synchronized (this) {
             Slot slot = connections.get(route.endpoint);
             if (slot == null) {
@@ -428,13 +437,14 @@ final class PollRouter {
         private final String key;
         private final byte[] payload;
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
-        private final long deadline = System.nanoTime() + POLL_TIMEOUT.toNanos();
+        private final long deadline;
         private volatile Slot activeSlot;
         private boolean retryingRefusal;
 
-        private Poll(String key, byte[] payload) {
+        private Poll(String key, byte[] payload, Duration pollTimeout) {
             this.key = key;
             this.payload = payload;
+            this.deadline = System.nanoTime() + pollTimeout.toNanos();
         }
 
         private void discardConnection() {
@@ -444,12 +454,10 @@ final class PollRouter {
             }
         }
 
-        private synchronized boolean beginAttempt() {
-            if (result.isDone()) {
-                return false;
-            }
+        // A refusal leaves nothing in flight on a primary until the next route is known,
+        // so the flag must survive the route lookup that follows it.
+        private synchronized void routed() {
             retryingRefusal = false;
-            return true;
         }
 
         private synchronized boolean retryRefusal() {

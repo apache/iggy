@@ -67,6 +67,12 @@ public enum IggyErrorCode {
     INVALID_BOOLEAN_VALUE(83),
     INVALID_NUMBER_VALUE(84),
 
+    /**
+     * The request is below the server's deduplication window. Its outcome is unknown;
+     * resending can duplicate the write.
+     */
+    REQUEST_TOO_OLD(85),
+
     // Client errors
     CLIENT_NOT_FOUND(100),
 

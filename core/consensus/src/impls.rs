@@ -1262,8 +1262,9 @@ pub struct VsrRestore<'a> {
     pub timers: &'a ConsensusTimers,
     /// `(view, log_view)` read back from the group's durable superblock.
     pub durable_view: Option<(u32, u32)>,
-    /// View inferred from the last journaled prepare, consulted only when no
-    /// durable record exists; `log_view` cannot be inferred and stays 0.
+    /// Known view floor from journaled prepares or committed creation metadata.
+    /// Used without a durable record, or to raise its view when `log_view` is zero.
+    /// It does not certify `log_view`.
     pub view_fallback: Option<u32>,
     /// Starting `(view, log_view)` for a group with NO history of its own,
     /// consulted only when neither of the two above applies: the view the
@@ -1291,18 +1292,33 @@ pub struct VsrRestore<'a> {
     pub join: JoinMode,
 }
 
+/// The rungs of the [`VsrConsensus::restore_view`] ladder.
+///
+/// Each is documented on the [`VsrRestore`] field of the same name. Named
+/// rather than positional: `view_fallback` and `seed_view` are both
+/// `Option<u32>`, and swapping them would set `log_view` to an uncertified
+/// floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewRestore {
+    pub durable_view: Option<(u32, u32)>,
+    pub view_fallback: Option<u32>,
+    pub seed_view: Option<u32>,
+}
+
 /// How a group with no consensus state in memory should come up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreshGroupStart {
     pub join: JoinMode,
-    /// Starting view for a group with no durable record; see
-    /// [`VsrRestore::seed_view`]. Always `None` when a durable record exists,
-    /// so a caller can apply the two in either order.
+    /// Recovery floor without log certification; see [`VsrRestore::view_fallback`].
+    pub view_fallback: Option<u32>,
+    /// Starting view for a group with no durable record, the last rung of the
+    /// [`VsrConsensus::restore_view`] ladder; see [`VsrRestore::seed_view`].
+    /// Always `None` when a durable record exists.
     pub seed_view: Option<u32>,
 }
 
-/// Decide how a group being materialised should join, and what view it starts
-/// in when it has no record of its own.
+/// Decide how a group being materialised should join, and the floor and seed
+/// it feeds into the [`VsrConsensus::restore_view`] ladder.
 ///
 /// One function because there are two materialisation paths and they must not
 /// drift: `build_partition_fresh` on the server, and the simulator's
@@ -1329,15 +1345,15 @@ pub const fn fresh_group_start(
     } else {
         JoinMode::Init
     };
-    // A durable record outranks the seed, and a probing backup takes neither:
-    // it must sit at or below the group's real view for the primary's
-    // `StartView` to move it forward, and seeded above that the reply reads as
-    // stale and is dropped.
-    let seed_view = match (durable_view, join) {
-        (None, JoinMode::Init) => Some(created_view),
-        _ => None,
+    let (view_fallback, seed_view) = match (durable_view, join) {
+        (None, JoinMode::Init) => (None, Some(created_view)),
+        _ => (Some(created_view), None),
     };
-    FreshGroupStart { join, seed_view }
+    FreshGroupStart {
+        join,
+        view_fallback,
+        seed_view,
+    }
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -1399,7 +1415,32 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if let Some(incarnation) = restore.incarnation {
             consensus.set_incarnation(incarnation);
         }
-        if let Some((view, log_view)) = restore.durable_view {
+        consensus.restore_view(ViewRestore {
+            durable_view: restore.durable_view,
+            view_fallback: restore.view_fallback,
+            seed_view: restore.seed_view,
+        });
+        consensus.join(restore.join);
+        consensus
+    }
+
+    /// The view ladder of every boot path: the durable record, else the
+    /// uncertified floor, else the seed. See [`VsrRestore`] for each rung.
+    ///
+    /// Must run before `init` / `init_as_backup`: restoring after either would
+    /// advertise a view older than the recorded one.
+    pub fn restore_view(&mut self, restore: ViewRestore) {
+        let ViewRestore {
+            durable_view,
+            view_fallback,
+            seed_view,
+        } = restore;
+        let group = self.group;
+        if let Some((view, log_view)) = durable_view {
+            let installed_view = match view_fallback {
+                Some(floor) if log_view == 0 => view.max(floor),
+                _ => view,
+            };
             // The one line proving the durable record was READ BACK, not merely
             // written: a replica that came back at view 0 is otherwise
             // indistinguishable from one that resumed correctly until it votes.
@@ -1410,6 +1451,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     group,
                     view,
                     log_view,
+                    installed_view,
                     "restored group view from its superblock"
                 );
             } else {
@@ -1417,36 +1459,40 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     group,
                     view,
                     log_view,
+                    installed_view,
                     "restored group view from its superblock"
                 );
             }
-            consensus.set_view(view);
-            consensus.set_log_view(log_view);
-            consensus.mark_superblock_durable(view, log_view);
-        } else if let Some(view) = restore.view_fallback {
-            consensus.set_view(view);
-        } else if let Some(view) = restore.seed_view {
+            self.set_view(installed_view);
+            self.set_log_view(log_view);
+            self.mark_superblock_durable(view, log_view);
+        } else if let Some(view) = view_fallback {
+            self.set_view(view);
+        } else if let Some(view) = seed_view {
             tracing::info!(
                 group,
                 view,
                 "seeded a group with no history of its own at its creation view"
             );
-            consensus.set_view(view);
-            consensus.set_log_view(view);
+            self.set_view(view);
+            self.set_log_view(view);
         }
-        match restore.join {
-            JoinMode::Init => consensus.init(),
+    }
+
+    /// Enter the role `mode` selects. Call it after [`Self::restore_view`].
+    pub fn join(&self, mode: JoinMode) {
+        match mode {
+            JoinMode::Init => self.init(),
             JoinMode::ProbeAsBackup {
                 await_state_transfer,
             } => {
-                consensus.init_as_backup();
-                consensus.begin_view_probe();
+                self.init_as_backup();
+                self.begin_view_probe();
                 if await_state_transfer {
-                    consensus.begin_state_transfer_await();
+                    self.begin_state_transfer_await();
                 }
             }
         }
-        consensus
     }
 
     /// [`Self::new`] with an explicit time source. Simulator and clock
@@ -1843,8 +1889,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// "nothing gated" and skips the `commit_min` comparison, so writing it would
     /// open the gate rather than lower it. Reachable on the wire:
     /// `adopt_start_view_suffix` returns `StartViewHeader.op` verbatim when the
-    /// suffix fails to decode, `validate` does not require `op >= 1`, and the
-    /// low-op guard binds only while `msg_view == log_view`.
+    /// suffix fails to decode, `validate` does not require `op >= 1`, and
+    /// `head == 0` passes the committed-prefix guard of `handle_start_view` only
+    /// while `commit_max` is 0.
     fn redecide_recovery_barrier(&self, head: u64) {
         let barrier = self.recovery_barrier.get();
         if barrier == 0 || head == 0 {
@@ -3357,6 +3404,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// `commit_journal` stops at the gap. Requires message repair.
     /// `suffix_body` is the message body: the view's canonical headers, empty
     /// when the announcement carries numbers only.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep StartView validation and both commit paths together"
+    )]
     pub fn handle_start_view(
         &self,
         plane: PlaneKind,
@@ -3411,29 +3462,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        // Skip an equal-view StartView whose op is below our COMMITTED floor. Such a
-        // message can only be stale: a live primary's head covers every op it ever
-        // told us was committed. Already in this view, so re-running
-        // reset_view_change_state for one would cancel subscribers (waking register
-        // awaiters Canceled) and clear the pipeline for nothing. log_view (not
-        // self.view) tracks the last-normal view.
+        // Within one view the primary's log only grows. A Normal replica already
+        // in that log_view must keep its acknowledged head when a StartView arrives
+        // late or forwarded prepares overtake it. Only its commit watermark can advance.
+        // Normal only: a restarted replica re-derives its head from a journal that
+        // can still hold a suffix the view discarded. Skipping on that head would
+        // drop the answer to its own probe, and its election would push the
+        // discarded suffix back.
+        let head = self.sequencer.current_sequence();
+        if self.status.get() == Status::Normal && msg_view == self.log_view.get() && msg_op <= head
+        {
+            if msg_commit > self.commit_max() {
+                self.advance_commit_max(msg_commit);
+                return vec![VsrAction::CommitJournal];
+            }
+            return Vec::new();
+        }
+
+        // Adoption may discard an uncommitted WAL suffix, never a committed prefix. A
+        // newer view's head covers every op committed before that view, the skip
+        // above keeps what a Normal replica acked in its view, and this guard keeps
+        // what this replica knows is committed. A restarted replica relies on no
+        // StartView sent before its restart reaching it; the incarnation guard
+        // enforces that for probe answers when incarnations are set.
         //
-        // The bound is deliberately the commit floor and NOT the sequencer head.
-        // Adopting a StartView drops the head (below) without truncating the WAL, so
-        // a replica that adopted at head H and then restarted re-derives a LONGER
-        // head from its own journal while log_view stays at that same view. Skipping
-        // on the head would drop the primary's StartView there -- including the reply
-        // echoing this replica's own probe -- leaving it to time the probe out and
-        // elect instead, with a DoViewChange of (log_view, discarded_head) that
-        // outranks the real primary's and pushes ops that view already discarded back
-        // over committed bodies.
-        //
-        // Re-adoption drops the head again while the WAL still holds the discarded
-        // suffix. Consensus is sans-io and cannot truncate it; the plane sweeps it
-        // on every adoption (`reconcile_{metadata,partition}_view_divergence`,
-        // above-head branch) before the primary's next prepare can collide with a
-        // relic in `append`'s slot-collision check.
-        if msg_view == self.log_view.get() && msg_op < self.commit_min() {
+        // Adoption can leave the WAL above the adopted head. Consensus is sans-io and
+        // cannot truncate it; the plane sweeps it on every adoption
+        // (`reconcile_{metadata,partition}_view_divergence`, above-head branch)
+        // before the primary's next prepare can land on a relic.
+        if msg_op < self.commit_max() {
+            tracing::warn!(
+                group = self.group,
+                replica = self.replica,
+                current_view = self.view.get(),
+                view = msg_view,
+                op = msg_op,
+                commit_min = self.commit_min(),
+                commit_max = self.commit_max(),
+                "ignoring StartView that omits known committed entries"
+            );
             return Vec::new();
         }
 
@@ -4260,7 +4327,9 @@ where
 
 #[cfg(test)]
 mod fresh_group_start_tests {
-    use super::{JoinMode, fresh_group_start};
+    use super::{JoinMode, METADATA_GROUP, ViewRestore, VsrConsensus, fresh_group_start};
+    use crate::LocalPipeline;
+    use crate::test_bus::NoopBus;
 
     const CREATED_VIEW: u32 = 4;
 
@@ -4272,6 +4341,7 @@ mod fresh_group_start_tests {
         let start = fresh_group_start(false, None, CREATED_VIEW);
         assert_eq!(start.join, JoinMode::Init);
         assert_eq!(start.seed_view, Some(CREATED_VIEW));
+        assert_eq!(start.view_fallback, None);
     }
 
     /// A durable record outranks the seed: it is what this replica actually
@@ -4280,16 +4350,50 @@ mod fresh_group_start_tests {
     fn given_a_durable_record_when_seeding_should_prefer_the_record() {
         let start = fresh_group_start(false, Some((7, 7)), CREATED_VIEW);
         assert_eq!(start.seed_view, None);
+        assert_eq!(start.view_fallback, Some(CREATED_VIEW));
     }
 
     /// A probing backup must sit at or below the group's real view for the
     /// primary's `StartView` to move it forward. Seeded above it, the reply
     /// reads as stale and the replica never rejoins.
     #[test]
-    fn given_a_prior_life_when_seeding_should_probe_without_a_seed() {
+    fn given_a_prior_life_when_seeding_should_probe_at_the_creation_floor() {
         let start = fresh_group_start(true, None, CREATED_VIEW);
         assert!(matches!(start.join, JoinMode::ProbeAsBackup { .. }));
         assert_eq!(start.seed_view, None);
+        assert_eq!(start.view_fallback, Some(CREATED_VIEW));
+    }
+
+    /// The floor certifies no log, so it raises only a record that certifies
+    /// none either, and a raised view is never marked durable.
+    #[test]
+    fn given_each_restore_source_when_restoring_view_should_follow_the_ladder() {
+        const FLOOR: Option<u32> = Some(CREATED_VIEW);
+        for (durable_view, view_fallback, seed_view, expected, needs_persist) in [
+            (Some((1, 0)), FLOOR, None, (CREATED_VIEW, 0), true),
+            (Some((7, 0)), FLOOR, None, (7, 0), false),
+            (Some((1, 1)), FLOOR, None, (1, 1), false),
+            (None, FLOOR, None, (CREATED_VIEW, 0), true),
+            (None, None, FLOOR, (CREATED_VIEW, CREATED_VIEW), true),
+        ] {
+            let mut consensus =
+                VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+            consensus.restore_view(ViewRestore {
+                durable_view,
+                view_fallback,
+                seed_view,
+            });
+            assert_eq!(
+                (consensus.view(), consensus.log_view()),
+                expected,
+                "durable {durable_view:?}, floor {view_fallback:?}, seed {seed_view:?}"
+            );
+            assert_eq!(
+                consensus.needs_superblock_persist(),
+                needs_persist,
+                "durable {durable_view:?}, floor {view_fallback:?}, seed {seed_view:?}"
+            );
+        }
     }
 }
 
@@ -4791,7 +4895,7 @@ mod timestamp_clamp_tests {
 
         // Replica 0 of 3, recovered at view 1 with head op 5, still Recovering
         // (probing). The primary for view 1 is replica 1 (view % replica_count),
-        // and log_view stays 0 so the equal-view-old-op skip does not fire.
+        // and commit_max stays 0 so the committed-prefix guard does not fire.
         let mut consensus = VsrConsensus::with_clock(
             1,
             0,
@@ -4892,70 +4996,155 @@ mod timestamp_clamp_tests {
     }
 
     #[test]
-    fn given_restored_log_view_when_start_view_head_behind_wal_should_adopt() {
-        // A replica that adopted a StartView at head 105 in view 7, then crashed,
-        // recovers log_view = 7 from the superblock but re-derives head 120 from its
-        // own WAL: adoption drops the head without truncating the journal. The
-        // primary's StartView for view 7 then carries an op BEHIND that head, and
-        // skipping it on the head comparison would leave this replica probing until it
-        // elected instead, carrying a DoViewChange of (7, 120) that outranks the real
-        // primary's (7, 105) and resurrects ops view 7 already discarded.
-        //
-        // Replica 0 of 3 at view 7, whose primary is replica 1 (7 % 3). Incarnation
-        // left at 0 so the recovering-replica guard stays inert and this exercises the
-        // equal-view path alone.
-        let mut consensus = VsrConsensus::with_clock(
-            1,
-            0,
-            3,
-            METADATA_GROUP,
-            NoopBus,
-            LocalPipeline::new(),
-            ConsensusClock::system(),
-        );
-        consensus.set_view(7);
-        consensus.set_log_view(7);
-        consensus.restore_commit_state(105, 105);
-        consensus.sequencer().set_sequence(120);
+    fn given_committed_prefix_when_start_view_head_behind_wal_should_preserve_commits() {
+        const RESTORED_VIEW: u32 = 7;
+        const CHECKPOINT: u64 = 100;
+        const COMMIT: u64 = 105;
+        const WAL_HEAD: u64 = 120;
+        for checkpoint in [COMMIT, CHECKPOINT] {
+            for view in [RESTORED_VIEW, RESTORED_VIEW + 1] {
+                let mut consensus = VsrConsensus::with_clock(
+                    1,
+                    0,
+                    3,
+                    METADATA_GROUP,
+                    NoopBus,
+                    LocalPipeline::new(),
+                    ConsensusClock::system(),
+                );
+                consensus.set_view(RESTORED_VIEW);
+                consensus.set_log_view(RESTORED_VIEW);
+                consensus.restore_commit_state(checkpoint, COMMIT);
+                consensus.sequencer().set_sequence(WAL_HEAD);
+                consensus.init_as_backup();
+                consensus.begin_view_probe();
+                let primary = u8::try_from(view % 3).unwrap();
 
-        // Below the committed floor: stale by construction, since a live primary's
-        // head covers every op it told us was committed.
-        assert!(
-            consensus
-                .handle_start_view(
-                    PlaneKind::Metadata,
-                    make_start_view(7, 104, 104, 1, 0).header(),
-                    &[]
-                )
-                .is_empty(),
-            "an equal-view StartView below the commit floor must be skipped"
-        );
-        assert_eq!(
-            consensus.sequencer().current_sequence(),
-            120,
-            "a skipped StartView must not move the head"
-        );
+                assert!(
+                    consensus
+                        .handle_start_view(
+                            PlaneKind::Metadata,
+                            make_start_view(view, COMMIT - 1, COMMIT - 1, primary, 0).header(),
+                            &[],
+                        )
+                        .is_empty(),
+                    "StartView in view {view} must preserve commit {COMMIT} above checkpoint {checkpoint}",
+                );
+                assert_eq!(consensus.view(), RESTORED_VIEW);
+                assert_eq!(consensus.sequencer().current_sequence(), WAL_HEAD);
+                assert_eq!(consensus.commit_min(), checkpoint);
+                assert_eq!(consensus.commit_max(), COMMIT);
+                assert_eq!(consensus.status(), Status::Recovering);
 
-        // At the committed floor but behind our WAL head: the primary's real head.
-        // Adopt it and drop the discarded suffix.
-        assert!(
-            !consensus
-                .handle_start_view(
+                assert!(
+                    !consensus
+                        .handle_start_view(
+                            PlaneKind::Metadata,
+                            make_start_view(view, COMMIT, COMMIT, primary, 0).header(),
+                            &[],
+                        )
+                        .is_empty(),
+                    "StartView in view {view} may discard an uncommitted WAL suffix",
+                );
+                assert_eq!(consensus.view(), view);
+                assert_eq!(consensus.sequencer().current_sequence(), COMMIT);
+                assert_eq!(consensus.commit_min(), checkpoint);
+                assert_eq!(consensus.commit_max(), COMMIT);
+                assert_eq!(consensus.status(), Status::Normal);
+            }
+        }
+    }
+
+    #[test]
+    fn given_normal_backup_when_same_view_start_view_is_behind_head_should_keep_acked_ops() {
+        const VIEW: u32 = 4;
+        const ADOPTED_HEAD: u64 = 20;
+        const COMMIT: u64 = 22;
+        const STALE_HEAD: u64 = 23;
+        const HEAD: u64 = 25;
+        let primary = u8::try_from(VIEW % 3).unwrap();
+        // Both probers go Normal on the first StartView, while another of the same
+        // view can still be in flight.
+        for probing_from_view_change in [false, true] {
+            let mut consensus = VsrConsensus::with_clock(
+                1,
+                0,
+                3,
+                METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+                ConsensusClock::system(),
+            );
+            if probing_from_view_change {
+                consensus.enter_view_change(
                     PlaneKind::Metadata,
-                    make_start_view(7, 105, 105, 1, 0).header(),
-                    &[]
-                )
-                .is_empty(),
-            "an equal-view StartView at or above the commit floor must be adopted, \
-             even when its head is behind a WAL suffix the view already discarded"
-        );
-        assert_eq!(
-            consensus.sequencer().current_sequence(),
-            105,
-            "adoption must drop the head to the primary's, so a later DoViewChange \
-             cannot outrank it with a discarded suffix"
-        );
-        assert_eq!(consensus.status(), Status::Normal);
+                    VIEW,
+                    ViewChangeReason::NormalHeartbeatTimeout,
+                );
+            } else {
+                consensus.set_view(VIEW);
+                consensus.begin_view_probe();
+            }
+            let start_view = |op, commit| make_start_view(VIEW, op, commit, primary, 0);
+            assert!(
+                !consensus
+                    .handle_start_view(
+                        PlaneKind::Metadata,
+                        start_view(ADOPTED_HEAD, ADOPTED_HEAD).header(),
+                        &[],
+                    )
+                    .is_empty()
+            );
+            // Journaled and acked above the adopted head, as `on_replicate` does.
+            consensus.sequencer().set_sequence(HEAD);
+            consensus.advance_commit_max(COMMIT);
+
+            for op in [STALE_HEAD, HEAD] {
+                assert!(
+                    consensus
+                        .handle_start_view(
+                            PlaneKind::Metadata,
+                            start_view(op, ADOPTED_HEAD).header(),
+                            &[],
+                        )
+                        .is_empty(),
+                    "StartView at op {op} must not be re-adopted at head {HEAD}: the plane \
+                     would truncate the acked ops above it",
+                );
+                assert_eq!(consensus.sequencer().current_sequence(), HEAD);
+                assert_eq!(consensus.commit_max(), COMMIT);
+                assert_eq!(consensus.view(), VIEW);
+                assert_eq!(consensus.status(), Status::Normal);
+            }
+
+            for commit in [STALE_HEAD, HEAD] {
+                let actions = consensus.handle_start_view(
+                    PlaneKind::Metadata,
+                    start_view(commit, commit).header(),
+                    &[],
+                );
+                assert!(
+                    matches!(actions.as_slice(), [VsrAction::CommitJournal]),
+                    "a duplicate StartView with a newer commit must apply it without adopting its head"
+                );
+                assert_eq!(consensus.commit_max(), commit);
+                assert_eq!(consensus.sequencer().current_sequence(), HEAD);
+                assert_eq!(consensus.view(), VIEW);
+                assert_eq!(consensus.status(), Status::Normal);
+            }
+
+            assert!(
+                !consensus
+                    .handle_start_view(
+                        PlaneKind::Metadata,
+                        start_view(HEAD + 1, HEAD).header(),
+                        &[]
+                    )
+                    .is_empty(),
+                "a backup behind the primary must still adopt its head",
+            );
+            assert_eq!(consensus.sequencer().current_sequence(), HEAD + 1);
+        }
     }
 
     /// The split-brain gate's predicate: `view` and `log_view` each independently
