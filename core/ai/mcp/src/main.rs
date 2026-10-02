@@ -54,7 +54,7 @@ struct Args {
 fn main() -> Result<(), McpRuntimeError> {
     let args = Args::parse();
     if args.list_config_env_vars {
-        print_config_env_vars()?;
+        print_config_env_vars().map_err(McpRuntimeError::ListConfigEnvVars)?;
         return Ok(());
     }
     let runtime = Builder::new_multi_thread()

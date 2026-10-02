@@ -21,16 +21,22 @@ use std::time::Duration;
 
 const LIST_ENV_VARS_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[allow(dead_code)]
-fn run_list_config_env_vars<I, K, V>(binary: &str, env: I, extra_args: &[&str]) -> std::process::Output
+/// Runs `binary --list-config-env-vars` (plus `extra_args`) with `env` applied,
+/// isolated to `directory`. Shared by every test below so each only states
+/// what differs: the binary, the env it sets, and any extra flags.
+fn run_list_config_env_vars_in<I, K, V>(
+    binary: &str,
+    directory: &std::path::Path,
+    env: I,
+    extra_args: &[&str],
+) -> std::process::Output
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
-    let directory = tempfile::tempdir().expect("temporary directory");
     let mut cmd = Command::cargo_bin(binary).expect("binary should be built");
-    cmd.current_dir(directory.path())
+    cmd.current_dir(directory)
         .arg("--list-config-env-vars")
         .timeout(LIST_ENV_VARS_TIMEOUT);
 
@@ -45,6 +51,28 @@ where
     cmd.output().expect("listing command should run")
 }
 
+/// Convenience wrapper over [`run_list_config_env_vars_in`] for tests that
+/// don't need to inspect the working directory afterward.
+fn run_list_config_env_vars<I, K, V>(
+    binary: &str,
+    env: I,
+    extra_args: &[&str],
+) -> std::process::Output
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let directory = tempfile::tempdir().expect("temporary directory");
+    run_list_config_env_vars_in(binary, directory.path(), env, extra_args)
+}
+
+/// Convenience wrapper over [`run_list_config_env_vars`] for tests that don't
+/// need to set any environment variables.
+fn run_list_config_env_vars_plain(binary: &str, extra_args: &[&str]) -> std::process::Output {
+    run_list_config_env_vars(binary, std::iter::empty::<(&str, &str)>(), extra_args)
+}
+
 #[test]
 fn config_env_listing_exits_before_startup_for_each_binary() {
     for (binary, config_env, dotenv_env) in [
@@ -57,15 +85,15 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
         ("iggy-mcp", "IGGY_MCP_CONFIG_PATH", "IGGY_MCP_ENV_PATH"),
     ] {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let output = Command::cargo_bin(binary)
-            .expect("binary should be built")
-            .current_dir(directory.path())
-            .arg("--list-config-env-vars")
-            .env(config_env, directory.path().join("missing-config.toml"))
-            .env(dotenv_env, directory.path().join("missing.env"))
-            .timeout(LIST_ENV_VARS_TIMEOUT)
-            .output()
-            .expect("listing command should run");
+        let output = run_list_config_env_vars_in(
+            binary,
+            directory.path(),
+            [
+                (config_env, directory.path().join("missing-config.toml")),
+                (dotenv_env, directory.path().join("missing.env")),
+            ],
+            &[],
+        );
 
         assert!(
             output.status.success(),
@@ -92,14 +120,7 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
 #[test]
 fn config_env_listing_includes_vector_index_templates() {
     // Verify that vector fields are correctly represented with <N> placeholder
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let output = Command::cargo_bin("iggy-server")
-        .expect("binary should be built")
-        .current_dir(directory.path())
-        .arg("--list-config-env-vars")
-        .timeout(LIST_ENV_VARS_TIMEOUT)
-        .output()
-        .expect("listing command should run");
+    let output = run_list_config_env_vars_plain("iggy-server", &[]);
 
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     let names: HashSet<_> = stdout.lines().collect();
@@ -124,14 +145,7 @@ fn config_env_listing_includes_vector_index_templates() {
 #[test]
 fn config_env_listing_includes_connector_templates() {
     // Verify that connector SINK/SOURCE templates are correctly formatted
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let output = Command::cargo_bin("iggy-connectors")
-        .expect("binary should be built")
-        .current_dir(directory.path())
-        .arg("--list-config-env-vars")
-        .timeout(LIST_ENV_VARS_TIMEOUT)
-        .output()
-        .expect("listing command should run");
+    let output = run_list_config_env_vars_plain("iggy-connectors", &[]);
 
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     let names: HashSet<_> = stdout.lines().collect();
@@ -182,15 +196,11 @@ fn config_env_listing_includes_connector_templates() {
 #[test]
 fn config_env_listing_exits_before_runtime_with_invalid_env_values() {
     // Verify that invalid environment values don't cause failures
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let output = Command::cargo_bin("iggy-server")
-        .expect("binary should be built")
-        .current_dir(directory.path())
-        .arg("--list-config-env-vars")
-        .env("IGGY_HTTP_ADDRESS", "invalid::address") // Invalid address
-        .timeout(LIST_ENV_VARS_TIMEOUT)
-        .output()
-        .expect("listing command should run");
+    let output = run_list_config_env_vars(
+        "iggy-server",
+        [("IGGY_HTTP_ADDRESS", "invalid::address")], // Invalid address
+        &[],
+    );
 
     assert!(
         output.status.success(),
@@ -212,15 +222,12 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
     std::fs::write(&sentinel, "sentinel content").expect("write sentinel file");
 
     // Run with both --fresh and --list-config-env-vars
-    let output = Command::cargo_bin("iggy-server")
-        .expect("binary should be built")
-        .current_dir(directory.path())
-        .arg("--fresh")
-        .arg("--list-config-env-vars")
-        .env("IGGY_PATH", data_dir.to_string_lossy().as_ref())
-        .timeout(LIST_ENV_VARS_TIMEOUT)
-        .output()
-        .expect("listing command should run");
+    let output = run_list_config_env_vars_in(
+        "iggy-server",
+        directory.path(),
+        [("IGGY_PATH", data_dir.to_string_lossy().into_owned())],
+        &["--fresh"],
+    );
 
     assert!(
         output.status.success(),
@@ -241,14 +248,7 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
     // Verify the output is the same as without --fresh
     let output_with_fresh = String::from_utf8(output.stdout).expect("UTF-8 output");
 
-    let directory_fresh = tempfile::tempdir().expect("temporary directory");
-    let output_without_fresh = Command::cargo_bin("iggy-server")
-        .expect("binary should be built")
-        .current_dir(directory_fresh.path())
-        .arg("--list-config-env-vars")
-        .timeout(LIST_ENV_VARS_TIMEOUT)
-        .output()
-        .expect("command should run");
+    let output_without_fresh = run_list_config_env_vars_plain("iggy-server", &[]);
 
     let output_without_fresh =
         String::from_utf8(output_without_fresh.stdout).expect("UTF-8 output");
