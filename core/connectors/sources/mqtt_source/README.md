@@ -89,7 +89,7 @@ Configuration operates in **two distinct layers**:
 | `username` | String | No | None | Broker authentication username (must be supplied together with `password`). |
 | `password` | String | No | None | Broker authentication password (wrapped as a secret, never logged). |
 | `clean_start` | Boolean | No | `false` | MQTT clean start flag (or clean session for MQTT 3.1.1). |
-| `session_expiry_interval` | Integer | No | None | MQTT 5 session expiry interval in seconds. |
+| `session_expiry_interval` | Integer | No | `3600` | MQTT 5 session expiry interval in seconds. Set to `0` only when immediate session discard is intentional. |
 | `keep_alive` | Duration | No | `"30s"` | Ping interval string (minimum `1s` for MQTT 3.1.1, minimum `5s` for MQTT 5). |
 | `poll_timeout` | Duration | No | `"1s"` | Maximum duration spent waiting on network events per driver poll tick. |
 | `request_capacity` | Integer | No | `32` | Bounded capacity for `rumqttc` internal request channel (must be `> 0`). |
@@ -303,7 +303,7 @@ connector `config_dir`, and restart `iggy-connectors`.
 
 ## Environment Variable Overrides
 
-Any property inside `[plugin_config]` can be overridden at runtime using environment variables without modifying configuration files:
+Top-level properties inside `[plugin_config]` can be overridden at runtime using environment variables without modifying configuration files. The runtime treats the suffix as one flat key, so nested tables such as `tls` and `subscription_qos` cannot be overridden through environment variables and must remain in the configuration file:
 
 ```bash
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_BROKER_URL="mqtt://127.0.0.1:1883"
@@ -312,6 +312,10 @@ export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_PASSWORD="secret-password"
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_QOS=1
 export IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_SUBSCRIPTIONS='["devices/+/telemetry"]'
 ```
+
+For example, an override such as
+`IGGY_CONNECTORS_SOURCE_MQTT_PLUGIN_CONFIG_TLS_CA_FILE` is interpreted as the
+flat key `tls_ca_file` and is ignored; it does not update `tls.ca_file`.
 
 ---
 
@@ -385,12 +389,12 @@ producing duplicates.
 ### Transaction Steps
 
 1. **Inbound Staging**: When `rumqttc` receives a QoS 1 or QoS 2 `PUBLISH` packet, the driver stages the message into an internal pending buffer along with its deferred `AckToken`. **No `PUBACK` or `PUBREC` is sent to the broker yet**.
-2. **Polling & FFI Handoff**: The runtime calls `Source::poll()`. The plugin packages staged messages into a batch, records `AckTokens` inside `pending_batch`, serializes candidate `ConnectorState`, and returns `ProducedMessages` with `Schema::Raw`.
-3. **Iggy Persistence & State Save**: The runtime sends the batch to `iggy-server` over TCP/QUIC and saves candidate state checkpoints to disk or HTTP storage.
+2. **Polling & FFI Handoff**: The runtime calls `Source::poll()`. The plugin packages staged messages into a batch and records the corresponding `AckTokens` inside `pending_batch` before returning `ProducedMessages` with `Schema::Raw`.
+3. **Iggy Persistence**: The runtime sends the batch to `iggy-server` over TCP/QUIC. The MQTT source does not use a connector state checkpoint or a durable MQTT cursor.
 4. **Ack Callback**: Upon successful Iggy write, the runtime calls `Source::on_batch_result(Ack)`.
 5. **Broker Acknowledgment**: The plugin retrieves in-flight `AckTokens` and executes `client.try_ack(&publish)`. `rumqttc` transmits the `PUBACK` (for QoS 1) or initiates `PUBREC` (for QoS 2) to EMQX. The plugin retries failed acknowledgements according to `max_retries`.
-6. **Bounded failure**: If all acknowledgement retries fail, the plugin commits the already-persisted candidate state, discards the remaining acknowledgement tokens, and continues polling. The broker may redeliver the abandoned message, so downstream consumers must tolerate duplicates.
-7. **Nack Rollback**: If Iggy delivery fails or times out, the runtime returns `SourceBatchResult::Nack`. The plugin drops the candidate state **without acknowledging the MQTT tokens**. The broker's QoS 1/2 retry loop will subsequently redeliver the unacknowledged messages.
+6. **Bounded failure**: If all acknowledgement retries fail, the plugin abandons the broker acknowledgement and continues polling because Iggy has already accepted the batch. The broker may redeliver the unacknowledged message later, so downstream consumers must tolerate duplicates.
+7. **Nack Replay**: If Iggy delivery fails or times out, the runtime returns `SourceBatchResult::Nack`. The plugin retains the batch and its MQTT tokens, then replays the batch on the next poll without acknowledging the MQTT messages. If the connector itself restarts, broker redelivery depends on the MQTT session being retained (`clean_start = false` and a non-zero MQTT 5 session expiry interval).
 
 ---
 
@@ -408,8 +412,8 @@ producing duplicates.
 ## Critical End-User & Operational Notes
 
 1. **At-Least-Once Delivery & Duplicate Tolerance**:
-   * The persisted `ConnectorState` records an `acknowledged_messages: u64` count for runtime tracking—**it is not a durable MQTT broker cursor**.
-   * If a crash or network drop occurs after Iggy persists a batch but before `PUBACK` reaches the MQTT broker, the broker will redeliver those messages upon reconnecting. **Downstream Iggy consumers must be designed to handle duplicate messages idempotently**.
+   * The connector returns `state: None`; it does not persist an `acknowledged_messages` counter or use connector state as an MQTT recovery cursor.
+   * Recovery relies on deferred MQTT acknowledgements: if a crash or network drop occurs after Iggy persists a batch but before `PUBACK`/the QoS 2 acknowledgement completes, the broker can redeliver those messages when the session is resumed. **Downstream Iggy consumers must be designed to handle duplicate messages idempotently**.
 
 2. **Single Destination per Connector Instance**:
    * A single source connector instance writes to **one** static Iggy stream and topic.

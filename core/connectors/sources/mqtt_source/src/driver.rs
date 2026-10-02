@@ -46,7 +46,8 @@ use tokio::time::timeout;
 use tracing::warn;
 use url::Url;
 
-const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
+pub(crate) const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
+pub(crate) const ACK_BATCH_RETRY_ATTEMPTS: usize = 1;
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
 const MQTT_PROTOCOL_HEADER: &str = "mqtt.protocol";
 const MQTT_TOPIC_HEADER: &str = "mqtt.topic";
@@ -329,7 +330,7 @@ impl MqttDriver {
                             .poll_for_ack_progress(poll_timeout, max_buffered_messages)
                             .await
                         {
-                            retain_unacknowledged_tokens(ack_tokens, acknowledged);
+                            ack_tokens.drain(..acknowledged);
                             return Err(error);
                         }
                         if !retry_delay.is_zero() {
@@ -340,7 +341,7 @@ impl MqttDriver {
             }
 
             if !acknowledged_token {
-                retain_unacknowledged_tokens(ack_tokens, acknowledged);
+                ack_tokens.drain(..acknowledged);
                 return Err(last_error.unwrap_or(iggy_connector_sdk::Error::InvalidState));
             }
             acknowledged += 1;
@@ -406,22 +407,20 @@ impl MqttDriver {
         };
 
         if let Some(received) = received {
-            if self.buffered_messages.len() >= max_buffered_messages {
+            // The event loop has already handed ownership of this publish to
+            // the driver. Buffer it before reporting a full queue so an error
+            // does not turn the received message into silent data loss.
+            let buffer_full = self.buffered_messages.len() >= max_buffered_messages;
+            self.buffered_messages.push_back(received);
+            if buffer_full {
                 return Err(iggy_connector_sdk::Error::Connection(
                     "MQTT message buffer reached batch_size while flushing acknowledgements"
                         .to_string(),
                 ));
             }
-            self.buffered_messages.push_back(received);
         }
         Ok(())
     }
-}
-
-fn retain_unacknowledged_tokens(ack_tokens: &mut Vec<AckToken>, acknowledged: usize) {
-    // The prefix has already been accepted by the broker. Keep the suffix so a
-    // retry does not repeat successful acknowledgements or discard failures.
-    ack_tokens.drain(..acknowledged);
 }
 
 fn install_rustls_provider() {
@@ -1084,26 +1083,6 @@ mod tests {
         assert_eq!(properties.subscription_identifiers, vec![7, 9]);
         assert_eq!(properties.content_type.as_deref(), Some("application/json"));
         assert_eq!(received.message.headers.len(), 5);
-    }
-
-    #[test]
-    fn given_partial_ack_failure_should_retain_unacknowledged_tokens() {
-        let first = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"first");
-        let second = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"second");
-        let third = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"third");
-        let mut ack_tokens = vec![
-            AckToken(AckTokenKind::Mqtt311(first)),
-            AckToken(AckTokenKind::Mqtt311(second)),
-            AckToken(AckTokenKind::Mqtt311(third)),
-        ];
-
-        retain_unacknowledged_tokens(&mut ack_tokens, 1);
-
-        assert_eq!(ack_tokens.len(), 2);
-        let AckToken(AckTokenKind::Mqtt311(publish)) = &ack_tokens[0] else {
-            panic!("expected MQTT 3.1.1 acknowledgement token");
-        };
-        assert_eq!(publish.payload.as_ref(), b"second");
     }
 
     #[test]
