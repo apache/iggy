@@ -345,7 +345,10 @@ func TestE2E_GetMeDescribesTheCallingClient(t *testing.T) {
 	require.NotNil(t, me)
 	assert.Positive(t, me.ID)
 	assert.Equal(t, identity.UserId, me.UserID)
-	assert.Equal(t, string(iggcon.Tcp), me.Transport)
+	// The literal pins the wire value: MapClientInfo writes string(iggcon.Tcp)
+	// for transport byte 1, so comparing against the constant would pass for
+	// any value of it.
+	assert.Equal(t, "tcp", me.Transport)
 }
 
 func TestE2E_RejectsSessionControlCodesOnTheRawPath(t *testing.T) {
@@ -423,6 +426,10 @@ func TestE2E_OnlyPingWorksBeforeSigningIn(t *testing.T) {
 	metadata, err := connected.GetClusterMetadata(context.Background())
 	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
 	assert.Nil(t, metadata, "no roster leaks to an unauthenticated reader")
+
+	me, err := connected.GetMe(context.Background())
+	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Nil(t, me, "the caller's own client info is not served before sign-in")
 }
 
 func TestE2E_LogoutEndsTheSession(t *testing.T) {
