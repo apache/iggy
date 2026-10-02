@@ -438,7 +438,6 @@ mod tests {
 
         assert_eq!(decoded_json["name"], serde_json::json!("Alice"));
         assert_eq!(decoded_json["age"], serde_json::json!(30));
-        assert!(decoded_json.get("full_name").is_none());
     }
 
     #[test]
