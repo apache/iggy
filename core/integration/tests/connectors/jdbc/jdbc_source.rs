@@ -540,6 +540,65 @@ async fn incremental_mode_advances_offset_across_polls() {
     );
 }
 
+/// Text cursors are bound as JDBC parameters. A backslash must reach PostgreSQL
+/// unchanged instead of being doubled for MySQL literal syntax, which would
+/// move the comparison boundary and re-read the row at the saved cursor.
+#[tokio::test]
+#[serial]
+async fn incremental_text_offset_with_backslash_preserves_cursor_boundary() {
+    let (_container, jdbc_url, postgres_jar) = match setup_postgres_container().await {
+        Ok(result) => result,
+        Err(error) => panic!("Failed to set up Postgres container: {error}"),
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&pg_sqlx_url(&jdbc_url))
+        .await
+        .expect("Failed to connect to Postgres for seeding");
+    sqlx::query(
+        "CREATE TABLE text_cursor_test (id INT PRIMARY KEY, cursor_value TEXT UNIQUE NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to create table");
+    sqlx::query("INSERT INTO text_cursor_test (id, cursor_value) VALUES ($1, $2), ($3, $4)")
+        .bind(1_i32)
+        .bind(r"a\b")
+        .bind(2_i32)
+        .bind("z")
+        .execute(&pool)
+        .await
+        .expect("Failed to insert text cursor rows");
+
+    let iggy_setup = IggySetup::default();
+    let query = "SELECT id, cursor_value FROM text_cursor_test \
+                 WHERE cursor_value > {last_offset} ORDER BY cursor_value";
+    let mut envs = build_jdbc_env(&jdbc_url, &postgres_jar, query, "incremental", &iggy_setup);
+    envs.insert(
+        "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_TRACKING_COLUMN".to_owned(),
+        "cursor_value".to_owned(),
+    );
+    envs.insert(
+        "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_INITIAL_OFFSET".to_owned(),
+        r"a\b".to_owned(),
+    );
+
+    let mut runtime = setup_runtime();
+    runtime
+        .init("jdbc/config_postgres.toml", Some(envs), iggy_setup)
+        .await;
+    let client = runtime.create_client().await;
+
+    let (ids, received) = poll_until_ids_seen(&client, &[2], POLL_TIMEOUT).await;
+    assert_eq!(
+        ids,
+        vec![2],
+        "Expected only the row after the exact backslash cursor; got ids {ids:?} from \
+         {received} received message(s)"
+    );
+}
+
 /// Test: a single poll over many rows succeeds. This exercises the JNI
 /// local-reference frame management in `read_rows`: a few-hundred-row result set
 /// creates hundreds of per-column local references in one native call, which

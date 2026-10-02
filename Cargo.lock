@@ -7343,7 +7343,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_jdbc_source"
-version = "0.4.1-edge.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7359,7 +7359,6 @@ dependencies = [
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
- "uuid",
 ]
 
 [[package]]

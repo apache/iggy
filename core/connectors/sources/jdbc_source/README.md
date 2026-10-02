@@ -99,6 +99,7 @@ initial_offset = "2024-01-01 00:00:00"
 mode = "incremental"
 snake_case_columns = true
 include_metadata = true
+verbose_logging = false
 
 [[streams]]
 stream = "ecommerce"
@@ -204,12 +205,13 @@ topic = "orders"
 | `jvm_options` | array | No | [] | Custom JVM options (e.g., ["-Xmx1g"]) |
 | `snake_case_columns` | bool | No | false | Convert column names to snake_case |
 | `include_metadata` | bool | No | true | Wrap each row with metadata (operation type, timestamp). `table_name` is a reserved field and is currently always null |
+| `verbose_logging` | bool | No | false | Log per-poll row and column counts at info instead of debug |
 
 ## Query Placeholders
 
 The `query` parameter supports placeholders for dynamic queries:
 
-- `{last_offset}`: Replaced with the last tracked offset value, wrapped in quotes and escaped
+- `{last_offset}`: Replaced with a JDBC `PreparedStatement` parameter and bound using the parameter's reported SQL type
 - `{tracking_column}`: Replaced with the configured `tracking_column` (validated as a plain SQL identifier)
 
 Incremental mode is validated at `open()` and enforces the following (the
@@ -256,7 +258,8 @@ The tracking column must also be:
   auto-increment ID is ideal. Keyset pagination with a tie-break is a planned
   follow-up.
 - **Monotonic under the database's own ordering.** Because the cursor is the last
-  ordered row and is fed back as `WHERE {tracking_column} > '<value>'`, the column
+  ordered row and is fed back as a bound parameter in `WHERE {tracking_column} >
+  ?`, the column
   must increase monotonically under the same ordering the database applies to that
   `>` (including its collation, for text). Prefer an auto-increment ID or a
   timestamp; a case-insensitively-collated text key can order differently than its
@@ -266,9 +269,9 @@ The tracking column must also be:
   the query is fixed. Exclude NULLs in the query, e.g. `AND {tracking_column} IS
   NOT NULL`.
 - **Round-trippable string form, for timestamps.** Timestamp columns are read as
-  the driver's string form and substituted back into the next `WHERE`; ensure the
-  driver emits a form the database orders correctly and can parse back (ISO-8601
-  is safe; a locale format such as `MM/DD/YYYY` is not).
+  the driver's string form and rebound through JDBC using the parameter's SQL
+  type; ensure the driver emits a form it can convert back (ISO-8601 is safe; a
+  locale format such as `MM/DD/YYYY` may not be).
 
 **Example:**
 
@@ -278,11 +281,11 @@ tracking_column = "id"
 query = "SELECT * FROM users WHERE id > {last_offset} ORDER BY id"
 initial_offset = "0"
 
--- First poll (initial_offset configured as 0)
-SELECT * FROM users WHERE id > '0' ORDER BY id
+-- Prepared SQL for the first poll; JDBC binds parameter 1 to 0 as the type of id
+SELECT * FROM users WHERE id > ? ORDER BY id
 
--- After processing rows up to id=100
-SELECT * FROM users WHERE id > '100' ORDER BY id
+-- After processing rows up to id=100, the SQL stays the same and parameter 1 is 100
+SELECT * FROM users WHERE id > ? ORDER BY id
 ```
 
 ## Output Format
@@ -367,10 +370,13 @@ JDBC SQL types are automatically mapped to JSON:
   rebuilds the same query from the committed offset, so the batch is **re-read
   rather than skipped** - for a transient in-process send failure as well as for
   a crash or restart. Rows can therefore be delivered more than once (message
-  IDs are random per poll, so downstream consumers must dedupe on a business key
-  if they need exactly-once); send or checkpoint failures do not silently drop
-  an already-fetched batch. The separate tracking-column uniqueness requirement
-  above still applies while fetching rows from the database.
+  IDs are assigned by the producer and are not stable across a replay, so
+  downstream consumers must dedupe on a business key if they need exactly-once);
+  send or checkpoint failures do not silently drop an already-fetched batch.
+  Five consecutive Nacks stop the source; an operator must restart it after the
+  underlying send or checkpoint failure is fixed. The separate tracking-column
+  uniqueness requirement above still applies while fetching rows from the
+  database.
 - **Connection recovery.** The connection is validated with `Connection.isValid`
   each poll and transparently re-established (closing the old handle) if it has
   dropped. The check runs on the shared `block_in_place` worker, so its timeout

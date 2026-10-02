@@ -53,6 +53,7 @@ initial_offset = "0"
 mode = "incremental"
 snake_case_columns = false
 include_metadata = true
+verbose_logging = false
 
 [[streams]]
 stream = "test"

@@ -16,11 +16,13 @@
 // under the License.
 
 use async_trait::async_trait;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     source::SourceBatchResult, source_connector,
 };
+use java::sql::Types;
 use jni::objects::{GlobalRef, JByteArray, JObject, JString, JThrowable, JValue};
 use jni::{JNIEnv, JavaVM};
 use regex::Regex;
@@ -30,7 +32,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 /// Clear any pending Java exception on the current thread. The JNI spec forbids
 /// making most calls while an exception is pending; doing so aborts the whole
@@ -101,22 +102,9 @@ fn best_effort_close(env: &mut JNIEnv, handle: &JObject) {
 /// being left pending for the next JNI call on this thread.
 macro_rules! jni {
     ($env:expr, $call:expr, $ctx:expr) => {
-        match $call {
-            Ok(value) => value,
-            Err(err) => {
-                let java_exception = take_pending_java_exception(&mut *$env);
-                let detail = java_exception
-                    .map(|exception| format!("{err}: {exception}"))
-                    .unwrap_or_else(|| err.to_string());
-                return Err(Error::Connection(format!("{}: {detail}", $ctx)));
-            }
-        }
+        jni!($env, $call, $ctx, Error::Connection)
     };
-}
-
-/// Like [`jni!`] but returns `Error::InitError`, for the connection-setup path.
-macro_rules! jni_init {
-    ($env:expr, $call:expr, $ctx:expr) => {
+    ($env:expr, $call:expr, $ctx:expr, $map_error:expr) => {
         match $call {
             Ok(value) => value,
             Err(err) => {
@@ -124,7 +112,7 @@ macro_rules! jni_init {
                 let detail = java_exception
                     .map(|exception| format!("{err}: {exception}"))
                     .unwrap_or_else(|| err.to_string());
-                return Err(Error::InitError(format!("{}: {detail}", $ctx)));
+                return Err($map_error(format!("{}: {detail}", $ctx)));
             }
         }
     };
@@ -256,6 +244,10 @@ pub struct JdbcSourceConfig {
     #[serde(default = "default_true")]
     pub include_metadata: bool,
 
+    /// Log per-poll row and column counts at info instead of debug.
+    #[serde(default)]
+    pub verbose_logging: Option<bool>,
+
     /// JVM options (e.g., ["-Xmx512m", "-Xms128m"])
     #[serde(default)]
     pub jvm_options: Vec<String>,
@@ -316,6 +308,7 @@ impl std::fmt::Debug for JdbcSourceConfig {
             .field("mode", &self.mode)
             .field("snake_case_columns", &self.snake_case_columns)
             .field("include_metadata", &self.include_metadata)
+            .field("verbose_logging", &self.verbose_logging)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
             .field("login_timeout_ms", &self.login_timeout_ms)
             .finish()
@@ -337,6 +330,13 @@ struct ColumnMetadata {
     output_name: String,
     sql_type: i32,
     is_tracking: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PreparedQuery {
+    sql: String,
+    offset: Option<String>,
+    offset_parameter_count: usize,
 }
 
 /// Database record structure for output messages
@@ -366,6 +366,8 @@ pub struct JdbcSource {
     pending_state: Mutex<Option<State>>,
     // Poll interval parsed once from `config.poll_interval` at construction.
     poll_interval: Duration,
+    // Whether per-poll details should be promoted from debug to info.
+    verbose: bool,
     // Scheduled start of the next poll, used to pace polls at a fixed cadence
     // that does not drift with per-poll work time. `None` until the first poll.
     next_poll_at: Mutex<Option<Instant>>,
@@ -411,6 +413,7 @@ impl JdbcSource {
             });
 
         let poll_interval = parse_poll_interval(config.poll_interval.as_deref());
+        let verbose = config.verbose_logging.unwrap_or(false);
         Self {
             id,
             config,
@@ -419,6 +422,7 @@ impl JdbcSource {
             state: Mutex::new(state),
             pending_state: Mutex::new(None),
             poll_interval,
+            verbose,
             next_poll_at: Mutex::new(None),
         }
     }
@@ -459,10 +463,11 @@ impl JdbcSource {
     /// accumulate on the caller's frame. The returned handle is a `GlobalRef`, so
     /// it survives the frame pop.
     fn create_direct_connection_internal(&self, env: &mut JNIEnv) -> Result<GlobalRef, Error> {
-        jni_init!(
+        jni!(
             env,
             env.push_local_frame(24),
-            "Failed to push connection local frame"
+            "Failed to push connection local frame",
+            Error::InitError
         );
         let result = self
             .create_direct_connection_inner(env)
@@ -479,13 +484,14 @@ impl JdbcSource {
         // Use the system loader explicitly for both driver initialization and the
         // thread context. This keeps DriverManager's view of the driver aligned
         // with the JVM classpath even when invoked from an attached native thread.
-        let current_thread_class = jni_init!(
+        let current_thread_class = jni!(
             env,
             env.find_class("java/lang/Thread"),
-            "Failed to find Thread class"
+            "Failed to find Thread class",
+            Error::InitError
         );
 
-        let current_thread = jni_init!(
+        let current_thread = jni!(
             env,
             env.call_static_method(
                 current_thread_class,
@@ -494,16 +500,18 @@ impl JdbcSource {
                 &[],
             )
             .and_then(|v| v.l()),
-            "Failed to get current thread"
+            "Failed to get current thread",
+            Error::InitError
         );
 
-        let class_loader_class = jni_init!(
+        let class_loader_class = jni!(
             env,
             env.find_class("java/lang/ClassLoader"),
-            "Failed to find ClassLoader"
+            "Failed to find ClassLoader",
+            Error::InitError
         );
 
-        let system_class_loader = jni_init!(
+        let system_class_loader = jni!(
             env,
             env.call_static_method(
                 class_loader_class,
@@ -512,10 +520,11 @@ impl JdbcSource {
                 &[],
             )
             .and_then(|v| v.l()),
-            "Failed to get system class loader"
+            "Failed to get system class loader",
+            Error::InitError
         );
 
-        jni_init!(
+        jni!(
             env,
             env.call_method(
                 &current_thread,
@@ -523,7 +532,8 @@ impl JdbcSource {
                 "(Ljava/lang/ClassLoader;)V",
                 &[JValue::Object(&system_class_loader)],
             ),
-            "Failed to set context class loader"
+            "Failed to set context class loader",
+            Error::InitError
         );
 
         info!(
@@ -531,17 +541,19 @@ impl JdbcSource {
             self.config.driver_class
         );
 
-        let class_class = jni_init!(
+        let class_class = jni!(
             env,
             env.find_class("java/lang/Class"),
-            "Failed to find Class"
+            "Failed to find Class",
+            Error::InitError
         );
-        let driver_class_name = jni_init!(
+        let driver_class_name = jni!(
             env,
             env.new_string(&self.config.driver_class),
-            "Failed to create class name string"
+            "Failed to create class name string",
+            Error::InitError
         );
-        jni_init!(
+        jni!(
             env,
             env.call_static_method(
                 class_class,
@@ -553,22 +565,25 @@ impl JdbcSource {
                     JValue::Object(&system_class_loader),
                 ],
             ),
-            format!("Failed to load driver class '{}'", self.config.driver_class)
+            format!("Failed to load driver class '{}'", self.config.driver_class),
+            Error::InitError
         );
 
         info!("JDBC driver loaded and registered successfully");
 
         // Get connection from DriverManager
-        let driver_manager = jni_init!(
+        let driver_manager = jni!(
             env,
             env.find_class("java/sql/DriverManager"),
-            "Failed to find DriverManager"
+            "Failed to find DriverManager",
+            Error::InitError
         );
 
-        let jdbc_url = jni_init!(
+        let jdbc_url = jni!(
             env,
             env.new_string(self.config.jdbc_url.expose_secret()),
-            "Failed to create JDBC URL string"
+            "Failed to create JDBC URL string",
+            Error::InitError
         );
 
         // Bound connection establishment so an unreachable or slow-DNS database
@@ -580,7 +595,7 @@ impl JdbcSource {
             .login_timeout_ms
             .div_ceil(1000)
             .clamp(1, i32::MAX as u64) as i32;
-        jni_init!(
+        jni!(
             env,
             env.call_static_method(
                 &driver_manager,
@@ -589,7 +604,8 @@ impl JdbcSource {
                 &[JValue::Int(login_timeout_secs)],
             )
             .and_then(|v| v.v()),
-            "Failed to set JDBC login timeout"
+            "Failed to set JDBC login timeout",
+            Error::InitError
         );
 
         // If username/password are provided separately, use 3-arg getConnection
@@ -597,18 +613,20 @@ impl JdbcSource {
             (&self.config.username, &self.config.password)
         {
             info!("Using separate username/password authentication");
-            let username_jstring = jni_init!(
+            let username_jstring = jni!(
                 env,
                 env.new_string(username),
-                "Failed to create username string"
+                "Failed to create username string",
+                Error::InitError
             );
-            let password_jstring = jni_init!(
+            let password_jstring = jni!(
                 env,
                 env.new_string(password.expose_secret()),
-                "Failed to create password string"
+                "Failed to create password string",
+                Error::InitError
             );
 
-            jni_init!(
+            jni!(
                 env,
                 env.call_static_method(
                     driver_manager,
@@ -621,11 +639,12 @@ impl JdbcSource {
                     ],
                 )
                 .and_then(|v| v.l()),
-                "Failed to create JDBC connection with credentials"
+                "Failed to create JDBC connection with credentials",
+                Error::InitError
             )
         } else {
             info!("Using connection string with embedded credentials");
-            jni_init!(
+            jni!(
                 env,
                 env.call_static_method(
                     driver_manager,
@@ -634,14 +653,16 @@ impl JdbcSource {
                     &[JValue::Object(&jdbc_url.into())],
                 )
                 .and_then(|v| v.l()),
-                "Failed to create JDBC connection from URL"
+                "Failed to create JDBC connection from URL",
+                Error::InitError
             )
         };
 
-        let global_ref = jni_init!(
+        let global_ref = jni!(
             env,
             env.new_global_ref(connection_obj),
-            "Failed to create global reference"
+            "Failed to create global reference",
+            Error::InitError
         );
 
         info!("Direct database connection established successfully");
@@ -728,7 +749,7 @@ impl JdbcSource {
             self.build_query(&state)
         }?;
         // Logged at debug: the built query embeds the substituted offset value.
-        debug!("Executing query: {}", query);
+        debug!("Executing query: {}", query.sql);
 
         let (messages, row_count, max_offset) =
             self.execute_statement_and_fetch_rows(env, &connection, &query)?;
@@ -764,10 +785,17 @@ impl JdbcSource {
                 processed_rows: state.processed_rows.saturating_add(row_count),
             }
         };
-        info!(
-            "Fetched {} rows, {} processed once this batch is acknowledged",
-            row_count, candidate.processed_rows
-        );
+        if self.verbose {
+            info!(
+                "JDBC source connector [{}] fetched {} rows, {} processed once this batch is acknowledged",
+                self.id, row_count, candidate.processed_rows
+            );
+        } else {
+            debug!(
+                "JDBC source connector [{}] fetched {} rows, {} processed once this batch is acknowledged",
+                self.id, row_count, candidate.processed_rows
+            );
+        }
 
         Ok((messages, Some(candidate)))
     }
@@ -777,9 +805,13 @@ impl JdbcSource {
         &self,
         env: &mut JNIEnv,
         connection: &JObject,
-        query: &str,
+        query: &PreparedQuery,
     ) -> Result<(Vec<ProducedMessage>, u64, Option<String>), Error> {
-        let query_jstring = jni!(env, env.new_string(query), "Failed to create query string");
+        let query_jstring = jni!(
+            env,
+            env.new_string(&query.sql),
+            "Failed to create query string"
+        );
 
         let statement = match env
             .call_method(
@@ -793,6 +825,11 @@ impl JdbcSource {
             Ok(s) => s,
             Err(_) => return Err(classify_query_failure(env, "prepare statement")),
         };
+
+        if let Err(error) = bind_offset_parameters(env, &statement, query) {
+            best_effort_close(env, &statement);
+            return Err(error);
+        }
 
         // Use setMaxRows for database-agnostic row limiting instead of SQL LIMIT.
         // Both modes fetch one probe row beyond the batch. Bulk mode uses it to
@@ -895,14 +932,24 @@ impl JdbcSource {
             "Failed to get column count"
         );
 
-        info!("Query returned {} columns", column_count);
+        if self.verbose {
+            info!(
+                "JDBC source connector [{}] query returned {} columns",
+                self.id, column_count
+            );
+        } else {
+            debug!(
+                "JDBC source connector [{}] query returned {} columns",
+                self.id, column_count
+            );
+        }
 
         // Clamp a driver-supplied count before using it as an allocation size: a
         // negative i32 would sign-extend to an enormous usize and abort on alloc.
         let mut raw_columns = Vec::with_capacity((column_count.max(0) as usize).min(8192));
         for i in 1..=column_count {
-            let source_name = self.get_column_label(env, &metadata, i)?;
-            let sql_type = self.get_column_type(env, &metadata, i)?;
+            let source_name = get_column_label(env, &metadata, i)?;
+            let sql_type = get_column_type(env, &metadata, i)?;
             raw_columns.push((source_name, sql_type));
         }
 
@@ -1051,13 +1098,13 @@ impl JdbcSource {
 
         for (idx, column) in columns.iter().enumerate() {
             let col_idx = (idx + 1) as i32;
-            let value = self.extract_column_value(env, result_set, col_idx, &column.sql_type)?;
+            let value = extract_column_value(env, result_set, col_idx, &column.sql_type)?;
             row_data.insert(column.output_name.clone(), value);
 
             if column.is_tracking
                 && let Some(ref tracking_column) = self.config.tracking_column
             {
-                let value = self.extract_offset_value(&row_data, &column.output_name);
+                let value = extract_offset_value(&row_data, &column.output_name);
                 offset = self.tracking_offset_or_error(value, tracking_column)?;
             }
         }
@@ -1108,7 +1155,7 @@ impl JdbcSource {
 
         let now_ms = now.timestamp_millis() as u64;
         Ok(ProducedMessage {
-            id: Some(Uuid::new_v4().as_u128()),
+            id: None,
             payload,
             headers: None,
             checksum: None,
@@ -1117,14 +1164,18 @@ impl JdbcSource {
         })
     }
 
-    /// Build the query for this poll by substituting the `{tracking_column}` and
-    /// `{last_offset}` placeholders. Row limiting is handled via JDBC setMaxRows
-    /// rather than SQL LIMIT to ensure cross-database compatibility.
-    fn build_query(&self, state: &State) -> Result<String, Error> {
+    /// Build the query for this poll by substituting `{tracking_column}` and
+    /// converting each `{last_offset}` into a bound JDBC parameter. Row limiting
+    /// is handled via JDBC setMaxRows rather than SQL LIMIT.
+    fn build_query(&self, state: &State) -> Result<PreparedQuery, Error> {
         let mut query = self.config.query.clone();
 
         if self.config.mode != Mode::Incremental {
-            return finalize_query(query);
+            return Ok(PreparedQuery {
+                sql: finalize_query(query)?,
+                offset: None,
+                offset_parameter_count: 0,
+            });
         }
 
         let offset = state
@@ -1154,258 +1205,249 @@ impl JdbcSource {
             query = query.replace("{tracking_column}", column);
         }
 
-        // Substitute the offset value (quoted and escaped) when we have one.
-        if let Some(offset) = offset {
-            query = query.replace("{last_offset}", &quote_sql_literal(offset));
+        let offset_parameter_count = query.matches("{last_offset}").count();
+        if offset.is_some() {
+            query = query.replace("{last_offset}", "?");
         }
 
-        finalize_query(query)
-    }
-
-    /// Get the column label from ResultSetMetaData. Uses `getColumnLabel` (not
-    /// `getColumnName`) so a `SELECT expr AS alias` yields the alias the caller
-    /// asked for; `getColumnName` returns the underlying base-table column (or
-    /// empty for computed columns), which would not match a configured
-    /// `tracking_column` alias and can be blank.
-    fn get_column_label(
-        &self,
-        env: &mut JNIEnv,
-        metadata: &JObject,
-        column_index: i32,
-    ) -> Result<String, Error> {
-        let col_name_obj = jni!(
-            env,
-            env.call_method(
-                metadata,
-                "getColumnLabel",
-                "(I)Ljava/lang/String;",
-                &[JValue::Int(column_index)],
-            )
-            .and_then(|v| v.l()),
-            "Failed to get column label"
-        );
-
-        let col_name: String = jni!(
-            env,
-            env.get_string(&JString::from(col_name_obj)),
-            "Failed to convert column name"
-        )
-        .into();
-
-        Ok(col_name)
-    }
-
-    /// Get column type from ResultSetMetaData
-    fn get_column_type(
-        &self,
-        env: &mut JNIEnv,
-        metadata: &JObject,
-        column_index: i32,
-    ) -> Result<i32, Error> {
-        let col_type = jni!(
-            env,
-            env.call_method(
-                metadata,
-                "getColumnType",
-                "(I)I",
-                &[JValue::Int(column_index)],
-            )
-            .and_then(|v| v.i()),
-            "Failed to get column type"
-        );
-
-        Ok(col_type)
-    }
-
-    /// Return `value`, or JSON `null` when the last primitive getter read a SQL
-    /// NULL (detected via `ResultSet.wasNull()`).
-    fn null_or(
-        &self,
-        env: &mut JNIEnv,
-        result_set: &JObject,
-        value: serde_json::Value,
-    ) -> Result<serde_json::Value, Error> {
-        let was_null = jni!(
-            env,
-            env.call_method(result_set, "wasNull", "()Z", &[])
-                .and_then(|v| v.z()),
-            "Failed to check wasNull"
-        );
-        Ok(if was_null {
-            serde_json::Value::Null
-        } else {
-            value
+        Ok(PreparedQuery {
+            sql: finalize_query(query)?,
+            offset: offset.map(str::to_owned),
+            offset_parameter_count,
         })
     }
+}
 
-    /// Extract column value based on JDBC type
-    fn extract_column_value(
-        &self,
-        env: &mut JNIEnv,
-        result_set: &JObject,
-        column_index: i32,
-        sql_type: &i32,
-    ) -> Result<serde_json::Value, Error> {
-        use java::sql::Types;
+/// Get the column label from ResultSetMetaData. Uses `getColumnLabel` (not
+/// `getColumnName`) so a `SELECT expr AS alias` yields the alias the caller
+/// asked for; `getColumnName` returns the underlying base-table column (or
+/// empty for computed columns), which would not match a configured
+/// `tracking_column` alias and can be blank.
+fn get_column_label(
+    env: &mut JNIEnv,
+    metadata: &JObject,
+    column_index: i32,
+) -> Result<String, Error> {
+    let col_name_obj = jni!(
+        env,
+        env.call_method(
+            metadata,
+            "getColumnLabel",
+            "(I)Ljava/lang/String;",
+            &[JValue::Int(column_index)],
+        )
+        .and_then(|v| v.l()),
+        "Failed to get column label"
+    );
 
-        // Primitive getters (getInt/getBoolean/...) return 0/false for SQL NULL,
-        // so `null_or` consults ResultSet.wasNull() after the getter to tell an
-        // actual NULL from a zero value. Object getters (getString/getBytes)
-        // return a null reference for SQL NULL and are null-checked directly, so
-        // there is no separate getObject probe (one JNI call per column, not two).
-        match *sql_type {
-            Types::BIT | Types::BOOLEAN => {
-                let value = jni!(
-                    env,
-                    env.call_method(
-                        result_set,
-                        "getBoolean",
-                        "(I)Z",
-                        &[JValue::Int(column_index)]
-                    )
-                    .and_then(|v| v.z()),
-                    "Failed to get boolean"
-                );
-                self.null_or(env, result_set, serde_json::Value::Bool(value))
-            }
-            Types::TINYINT | Types::SMALLINT | Types::INTEGER => {
-                let value = jni!(
-                    env,
-                    env.call_method(result_set, "getInt", "(I)I", &[JValue::Int(column_index)])
-                        .and_then(|v| v.i()),
-                    "Failed to get int"
-                );
-                self.null_or(env, result_set, serde_json::json!(value))
-            }
-            // BIGINT is emitted as a string (like NUMERIC/DECIMAL below) so a
-            // value above 2^53 is not silently rounded by a JSON consumer that
-            // parses numbers as f64.
-            Types::BIGINT => {
-                let value = jni!(
-                    env,
-                    env.call_method(result_set, "getLong", "(I)J", &[JValue::Int(column_index)])
-                        .and_then(|v| v.j()),
-                    "Failed to get long"
-                );
-                self.null_or(env, result_set, serde_json::json!(value.to_string()))
-            }
-            Types::FLOAT | Types::REAL => {
-                let value = jni!(
-                    env,
-                    env.call_method(result_set, "getFloat", "(I)F", &[JValue::Int(column_index)])
-                        .and_then(|v| v.f()),
-                    "Failed to get float"
-                );
-                self.null_or(env, result_set, serde_json::json!(value))
-            }
-            Types::DOUBLE => {
-                let value = jni!(
-                    env,
-                    env.call_method(
-                        result_set,
-                        "getDouble",
-                        "(I)D",
-                        &[JValue::Int(column_index)]
-                    )
-                    .and_then(|v| v.d()),
-                    "Failed to get double"
-                );
-                self.null_or(env, result_set, serde_json::json!(value))
-            }
-            // NUMERIC/DECIMAL can carry more precision than an f64 can represent
-            // (e.g. money/large decimals), so emit them as strings to avoid
-            // silent precision loss.
-            Types::NUMERIC | Types::DECIMAL => {
-                self.get_column_as_string(env, result_set, column_index)
-            }
-            // Binary columns are base64-encoded so arbitrary bytes survive the
-            // round-trip through JSON.
-            Types::BINARY | Types::VARBINARY | Types::LONGVARBINARY => {
-                let bytes_obj = jni!(
-                    env,
-                    env.call_method(
-                        result_set,
-                        "getBytes",
-                        "(I)[B",
-                        &[JValue::Int(column_index)]
-                    )
-                    .and_then(|v| v.l()),
-                    "Failed to get bytes"
-                );
-                if bytes_obj.is_null() {
-                    return Ok(serde_json::Value::Null);
-                }
-                let buf = jni!(
-                    env,
-                    env.convert_byte_array(JByteArray::from(bytes_obj)),
-                    "Failed to convert bytes"
-                );
-                use base64::Engine;
-                Ok(serde_json::Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(&buf),
-                ))
-            }
-            // Date/time types are read via their driver string form. Route
-            // through the null-safe getString path so a NULL date/time yields
-            // JSON null instead of failing the whole poll on get_string(null).
-            Types::TIMESTAMP | Types::DATE | Types::TIME => {
-                self.get_column_as_string(env, result_set, column_index)
-            }
-            // Default: getString for all other types (CHAR, VARCHAR, etc.)
-            _ => self.get_column_as_string(env, result_set, column_index),
-        }
-    }
+    let col_name: String = jni!(
+        env,
+        env.get_string(&JString::from(col_name_obj)),
+        "Failed to convert column name"
+    )
+    .into();
 
-    /// Read a column via `ResultSet.getString`, returning JSON `null` when the
-    /// value is SQL NULL.
-    fn get_column_as_string(
-        &self,
-        env: &mut JNIEnv,
-        result_set: &JObject,
-        column_index: i32,
-    ) -> Result<serde_json::Value, Error> {
-        let value = jni!(
-            env,
-            env.call_method(
-                result_set,
-                "getString",
-                "(I)Ljava/lang/String;",
-                &[JValue::Int(column_index)],
-            )
-            .and_then(|v| v.l()),
-            "Failed to get string"
-        );
+    Ok(col_name)
+}
 
-        if value.is_null() {
-            Ok(serde_json::Value::Null)
-        } else {
-            let str_value: String = jni!(
+/// Get column type from ResultSetMetaData.
+fn get_column_type(env: &mut JNIEnv, metadata: &JObject, column_index: i32) -> Result<i32, Error> {
+    let col_type = jni!(
+        env,
+        env.call_method(
+            metadata,
+            "getColumnType",
+            "(I)I",
+            &[JValue::Int(column_index)],
+        )
+        .and_then(|v| v.i()),
+        "Failed to get column type"
+    );
+
+    Ok(col_type)
+}
+
+/// Return `value`, or JSON `null` when the last primitive getter read a SQL
+/// NULL (detected via `ResultSet.wasNull()`).
+fn null_or(
+    env: &mut JNIEnv,
+    result_set: &JObject,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let was_null = jni!(
+        env,
+        env.call_method(result_set, "wasNull", "()Z", &[])
+            .and_then(|v| v.z()),
+        "Failed to check wasNull"
+    );
+    Ok(if was_null {
+        serde_json::Value::Null
+    } else {
+        value
+    })
+}
+
+/// Extract column value based on JDBC type.
+fn extract_column_value(
+    env: &mut JNIEnv,
+    result_set: &JObject,
+    column_index: i32,
+    sql_type: &i32,
+) -> Result<serde_json::Value, Error> {
+    // Primitive getters (getInt/getBoolean/...) return 0/false for SQL NULL,
+    // so `null_or` consults ResultSet.wasNull() after the getter to tell an
+    // actual NULL from a zero value. Object getters (getString/getBytes)
+    // return a null reference for SQL NULL and are null-checked directly, so
+    // there is no separate getObject probe (one JNI call per column, not two).
+    match *sql_type {
+        Types::BIT | Types::BOOLEAN => {
+            let value = jni!(
                 env,
-                env.get_string(&JString::from(value)),
-                "Failed to convert string"
-            )
-            .into();
-            Ok(serde_json::Value::String(str_value))
+                env.call_method(
+                    result_set,
+                    "getBoolean",
+                    "(I)Z",
+                    &[JValue::Int(column_index)]
+                )
+                .and_then(|v| v.z()),
+                "Failed to get boolean"
+            );
+            null_or(env, result_set, serde_json::Value::Bool(value))
         }
-    }
-
-    /// Extract the tracking-column value as a string offset, or `None` when it is
-    /// SQL NULL / empty / not comparable. In incremental mode a `None` here is
-    /// turned into a hard error by [`Self::tracking_offset_or_error`] (a NULL
-    /// tracking value cannot be watermarked), so the tracking column must be
-    /// NOT NULL; see the README.
-    fn extract_offset_value(
-        &self,
-        row_data: &serde_json::Map<String, serde_json::Value>,
-        col_name: &str,
-    ) -> Option<String> {
-        match row_data.get(col_name) {
-            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            _ => None,
+        Types::TINYINT | Types::SMALLINT | Types::INTEGER => {
+            let value = jni!(
+                env,
+                env.call_method(result_set, "getInt", "(I)I", &[JValue::Int(column_index)])
+                    .and_then(|v| v.i()),
+                "Failed to get int"
+            );
+            null_or(env, result_set, serde_json::json!(value))
         }
+        // BIGINT is emitted as a string (like NUMERIC/DECIMAL below) so a
+        // value above 2^53 is not silently rounded by a JSON consumer that
+        // parses numbers as f64.
+        Types::BIGINT => {
+            let value = jni!(
+                env,
+                env.call_method(result_set, "getLong", "(I)J", &[JValue::Int(column_index)])
+                    .and_then(|v| v.j()),
+                "Failed to get long"
+            );
+            null_or(env, result_set, serde_json::json!(value.to_string()))
+        }
+        Types::FLOAT | Types::REAL => {
+            let value = jni!(
+                env,
+                env.call_method(result_set, "getFloat", "(I)F", &[JValue::Int(column_index)])
+                    .and_then(|v| v.f()),
+                "Failed to get float"
+            );
+            null_or(env, result_set, serde_json::json!(value))
+        }
+        Types::DOUBLE => {
+            let value = jni!(
+                env,
+                env.call_method(
+                    result_set,
+                    "getDouble",
+                    "(I)D",
+                    &[JValue::Int(column_index)]
+                )
+                .and_then(|v| v.d()),
+                "Failed to get double"
+            );
+            null_or(env, result_set, serde_json::json!(value))
+        }
+        // NUMERIC/DECIMAL can carry more precision than an f64 can represent
+        // (e.g. money/large decimals), so emit them as strings to avoid
+        // silent precision loss.
+        Types::NUMERIC | Types::DECIMAL => get_column_as_string(env, result_set, column_index),
+        // Binary columns are base64-encoded so arbitrary bytes survive the
+        // round-trip through JSON.
+        Types::BINARY | Types::VARBINARY | Types::LONGVARBINARY => {
+            let bytes_obj = jni!(
+                env,
+                env.call_method(
+                    result_set,
+                    "getBytes",
+                    "(I)[B",
+                    &[JValue::Int(column_index)]
+                )
+                .and_then(|v| v.l()),
+                "Failed to get bytes"
+            );
+            if bytes_obj.is_null() {
+                return Ok(serde_json::Value::Null);
+            }
+            let buf = jni!(
+                env,
+                env.convert_byte_array(JByteArray::from(bytes_obj)),
+                "Failed to convert bytes"
+            );
+            Ok(serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&buf),
+            ))
+        }
+        // Date/time types are read via their driver string form. Route
+        // through the null-safe getString path so a NULL date/time yields
+        // JSON null instead of failing the whole poll on get_string(null).
+        Types::TIMESTAMP | Types::DATE | Types::TIME => {
+            get_column_as_string(env, result_set, column_index)
+        }
+        // Default: getString for all other types (CHAR, VARCHAR, etc.)
+        _ => get_column_as_string(env, result_set, column_index),
     }
+}
 
+/// Read a column via `ResultSet.getString`, returning JSON `null` when the
+/// value is SQL NULL.
+fn get_column_as_string(
+    env: &mut JNIEnv,
+    result_set: &JObject,
+    column_index: i32,
+) -> Result<serde_json::Value, Error> {
+    let value = jni!(
+        env,
+        env.call_method(
+            result_set,
+            "getString",
+            "(I)Ljava/lang/String;",
+            &[JValue::Int(column_index)],
+        )
+        .and_then(|v| v.l()),
+        "Failed to get string"
+    );
+
+    if value.is_null() {
+        Ok(serde_json::Value::Null)
+    } else {
+        let str_value: String = jni!(
+            env,
+            env.get_string(&JString::from(value)),
+            "Failed to convert string"
+        )
+        .into();
+        Ok(serde_json::Value::String(str_value))
+    }
+}
+
+/// Extract the tracking-column value as a string offset, or `None` when it is
+/// SQL NULL / empty / not comparable. In incremental mode a `None` here is
+/// turned into a hard error by [`JdbcSource::tracking_offset_or_error`] (a NULL
+/// tracking value cannot be watermarked), so the tracking column must be
+/// NOT NULL; see the README.
+fn extract_offset_value(
+    row_data: &serde_json::Map<String, serde_json::Value>,
+    col_name: &str,
+) -> Option<String> {
+    match row_data.get(col_name) {
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+impl JdbcSource {
     /// Validate configuration before touching the JVM or the database, so bad
     /// config surfaces immediately at `open()` with an actionable message rather
     /// than as an opaque wrapped JVM error or only after the first poll sleep.
@@ -1676,13 +1718,10 @@ impl Source for JdbcSource {
     async fn close(&mut self) -> Result<(), Error> {
         info!("Closing JDBC source connector [{}]", self.id);
 
-        if self.jvm.is_some() {
+        if let Some(jvm) = self.jvm.as_ref() {
             // Closing the JDBC connection is blocking JNI work; run it off the
             // async worker like the poll path.
             tokio::task::block_in_place(|| -> Result<(), Error> {
-                let Some(jvm) = self.jvm.as_ref() else {
-                    return Ok(());
-                };
                 let Ok(mut env) = jvm.attach_current_thread() else {
                     return Ok(());
                 };
@@ -1806,17 +1845,82 @@ fn get_or_create_jvm(driver_jar_path: &str, jvm_options: &[String]) -> Result<Ar
     Ok(arc)
 }
 
-/// Quote a value as a SQL string literal for substituting the incremental
-/// `{last_offset}` value, which originates from a (DB-controlled) tracking-column
-/// value. Backslashes are escaped before single quotes are doubled: doubling
-/// quotes alone is insufficient under MySQL's default `sql_mode`, where a
-/// backslash is an escape character and a trailing `\` could otherwise consume
-/// the closing quote and break out of the literal. Binding the offset as a
-/// `PreparedStatement` parameter is the DB-agnostic long-term fix (tracked as a
-/// follow-up); this keeps the string-substitution path safe in the meantime.
-fn quote_sql_literal(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('\'', "''");
-    format!("'{escaped}'")
+/// Bind each incremental offset placeholder using the SQL type the driver
+/// reports for that parameter. Passing the explicit target type lets JDBC
+/// convert the persisted string representation back to an integer, timestamp,
+/// decimal, or text value without embedding dialect-specific literals in SQL.
+fn bind_offset_parameters(
+    env: &mut JNIEnv,
+    statement: &JObject,
+    query: &PreparedQuery,
+) -> Result<(), Error> {
+    if query.offset_parameter_count == 0 {
+        return Ok(());
+    }
+    let offset = query.offset.as_deref().ok_or(Error::InvalidState)?;
+    let expected_count = i32::try_from(query.offset_parameter_count).map_err(|_| {
+        Error::InvalidConfigValue("query contains too many {last_offset} placeholders".to_string())
+    })?;
+
+    let metadata = jni!(
+        env,
+        env.call_method(
+            statement,
+            "getParameterMetaData",
+            "()Ljava/sql/ParameterMetaData;",
+            &[],
+        )
+        .and_then(|value| value.l()),
+        "Failed to get JDBC parameter metadata"
+    );
+    let actual_count = jni!(
+        env,
+        env.call_method(&metadata, "getParameterCount", "()I", &[])
+            .and_then(|value| value.i()),
+        "Failed to get JDBC parameter count"
+    );
+    if actual_count != expected_count {
+        return Err(Error::InvalidConfigValue(format!(
+            "query contains {actual_count} JDBC parameters but {expected_count} came from \
+             {{last_offset}}; raw '?' parameters are not supported"
+        )));
+    }
+
+    let offset_string = jni!(
+        env,
+        env.new_string(offset),
+        "Failed to create offset parameter string"
+    );
+    let offset_object = JObject::from(offset_string);
+    for parameter_index in 1..=expected_count {
+        let sql_type = jni!(
+            env,
+            env.call_method(
+                &metadata,
+                "getParameterType",
+                "(I)I",
+                &[JValue::Int(parameter_index)],
+            )
+            .and_then(|value| value.i()),
+            "Failed to get JDBC parameter type"
+        );
+        if env
+            .call_method(
+                statement,
+                "setObject",
+                "(ILjava/lang/Object;I)V",
+                &[
+                    JValue::Int(parameter_index),
+                    JValue::Object(&offset_object),
+                    JValue::Int(sql_type),
+                ],
+            )
+            .is_err()
+        {
+            return Err(classify_query_failure(env, "bind offset parameter"));
+        }
+    }
+    Ok(())
 }
 
 /// Reject a query that still contains an unresolved placeholder, so an invalid
@@ -2156,6 +2260,7 @@ mod tests {
             mode: Mode::Bulk,
             snake_case_columns: false,
             include_metadata: true,
+            verbose_logging: None,
             jvm_options: vec![],
             connection_timeout_ms: 30000,
             login_timeout_ms: 30000,
@@ -2210,15 +2315,6 @@ mod tests {
     }
 
     #[test]
-    fn test_quote_sql_literal_escapes_backslash() {
-        // Backslash is doubled before quotes so a trailing backslash cannot
-        // consume the closing quote under MySQL's default sql_mode.
-        assert_eq!(quote_sql_literal(r"a\b"), r"'a\\b'");
-        assert_eq!(quote_sql_literal(r"end\"), r"'end\\'");
-        assert_eq!(quote_sql_literal(r"\'"), r"'\\'''");
-    }
-
-    #[test]
     fn test_build_query_removes_predicate_case_and_whitespace_insensitive() {
         for query in [
             "select * from t where {tracking_column} > {last_offset} order by id",
@@ -2233,10 +2329,11 @@ mod tests {
             let state = State::default();
             let built = source.build_query(&state).expect("build query");
             assert!(
-                !built.contains("{last_offset}") && !built.contains("{tracking_column}"),
-                "predicate not removed for query variant: {query} -> {built}"
+                !built.sql.contains("{last_offset}") && !built.sql.contains("{tracking_column}"),
+                "predicate not removed for query variant: {query} -> {}",
+                built.sql
             );
-            assert!(built.to_lowercase().contains("order by id"));
+            assert!(built.sql.to_lowercase().contains("order by id"));
         }
     }
 
@@ -2275,11 +2372,14 @@ mod tests {
         let source = JdbcSource::new(1, config, None);
         // Cold start: no persisted offset, no initial_offset.
         let built = source.build_query(&State::default()).expect("build query");
-        assert_eq!(built, "SELECT * FROM t WHERE id IS NOT NULL ORDER BY id");
-        assert!(!built.contains("{last_offset}") && !built.contains("{tracking_column}"));
+        assert_eq!(
+            built.sql,
+            "SELECT * FROM t WHERE id IS NOT NULL ORDER BY id"
+        );
+        assert!(!built.sql.contains("{last_offset}") && !built.sql.contains("{tracking_column}"));
         // No dangling AND / empty WHERE.
-        assert!(!built.to_uppercase().contains("WHERE AND"));
-        assert!(!built.to_uppercase().contains("AND ORDER"));
+        assert!(!built.sql.to_uppercase().contains("WHERE AND"));
+        assert!(!built.sql.to_uppercase().contains("AND ORDER"));
     }
 
     #[test]
@@ -2807,22 +2907,11 @@ mod tests {
     #[test]
     fn test_build_query_incremental_with_offset() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM users WHERE id > {last_offset} ORDER BY id".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: Some("0".to_string()),
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
 
@@ -2832,7 +2921,9 @@ mod tests {
             processed_rows: 0,
         };
         let query = source.build_query(&state).expect("build query");
-        assert_eq!(query, "SELECT * FROM users WHERE id > '0' ORDER BY id");
+        assert_eq!(query.sql, "SELECT * FROM users WHERE id > ? ORDER BY id");
+        assert_eq!(query.offset.as_deref(), Some("0"));
+        assert_eq!(query.offset_parameter_count, 1);
 
         // With tracked offset
         let state = State {
@@ -2840,30 +2931,45 @@ mod tests {
             processed_rows: 42,
         };
         let query = source.build_query(&state).expect("build query");
-        assert_eq!(query, "SELECT * FROM users WHERE id > '42' ORDER BY id");
+        assert_eq!(query.sql, "SELECT * FROM users WHERE id > ? ORDER BY id");
+        assert_eq!(query.offset.as_deref(), Some("42"));
+        assert_eq!(query.offset_parameter_count, 1);
+    }
+
+    #[test]
+    fn given_repeated_offset_placeholder_when_query_is_built_should_bind_each_parameter() {
+        let config = JdbcSourceConfig {
+            query: "SELECT * FROM users WHERE id > {last_offset} OR parent_id > {last_offset} ORDER BY id"
+                .to_string(),
+            tracking_column: Some("id".to_string()),
+            initial_offset: Some(r"a\b".to_string()),
+            mode: Mode::Incremental,
+            ..base_config()
+        };
+        let source = JdbcSource::new(1, config, None);
+
+        let query = source
+            .build_query(&State::default())
+            .expect("build prepared query");
+
+        assert_eq!(
+            query.sql,
+            "SELECT * FROM users WHERE id > ? OR parent_id > ? ORDER BY id"
+        );
+        assert_eq!(query.offset.as_deref(), Some(r"a\b"));
+        assert_eq!(query.offset_parameter_count, 2);
     }
 
     #[test]
     fn test_build_query_substitutes_tracking_column() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query:
                 "SELECT * FROM orders WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
                     .to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("updated_at".to_string()),
             initial_offset: Some("2024-01-01".to_string()),
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         let state = State {
@@ -2872,32 +2978,21 @@ mod tests {
         };
         let query = source.build_query(&state).expect("build query");
         assert_eq!(
-            query,
-            "SELECT * FROM orders WHERE updated_at > '2024-06-15' ORDER BY updated_at"
+            query.sql,
+            "SELECT * FROM orders WHERE updated_at > ? ORDER BY updated_at"
         );
+        assert_eq!(query.offset.as_deref(), Some("2024-06-15"));
     }
 
     #[test]
     fn test_build_query_no_offset_substitutes_tracking_column_in_order_by() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query:
                 "SELECT * FROM orders WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
                     .to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("updated_at".to_string()),
-            initial_offset: None,
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         // No last_offset and no initial_offset: the WHERE predicate is dropped,
@@ -2908,30 +3003,28 @@ mod tests {
                 processed_rows: 0,
             })
             .expect("build query");
-        assert!(!query.contains("{tracking_column}"), "got: {query}");
-        assert!(!query.contains("{last_offset}"), "got: {query}");
-        assert!(query.contains("ORDER BY updated_at"), "got: {query}");
+        assert!(
+            !query.sql.contains("{tracking_column}"),
+            "got: {}",
+            query.sql
+        );
+        assert!(!query.sql.contains("{last_offset}"), "got: {}", query.sql);
+        assert!(
+            query.sql.contains("ORDER BY updated_at"),
+            "got: {}",
+            query.sql
+        );
+        assert!(query.offset.is_none());
     }
 
     #[test]
     fn test_build_query_rejects_injection_in_tracking_column() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM t WHERE {tracking_column} > {last_offset}".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("id; DROP TABLE t".to_string()),
             initial_offset: Some("0".to_string()),
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         assert!(source.build_query(&State::default()).is_err());
@@ -2940,29 +3033,18 @@ mod tests {
     #[test]
     fn test_build_query_bulk_mode_no_limit_appended() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM products".to_string(),
             poll_interval: Some("60s".to_string()),
             batch_size: 5000,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
             include_metadata: false,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         let state = State::default();
         let query = source.build_query(&state).expect("build query");
         // build_query should NOT append LIMIT; row limiting is done via setMaxRows
-        assert_eq!(query, "SELECT * FROM products");
-        assert!(!query.to_uppercase().contains("LIMIT"));
+        assert_eq!(query.sql, "SELECT * FROM products");
+        assert!(!query.sql.to_uppercase().contains("LIMIT"));
     }
 
     #[test]
@@ -2975,41 +3057,18 @@ mod tests {
             .expect("Failed to serialize state");
 
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM orders WHERE updated_at > {last_offset}".to_string(),
             poll_interval: Some("30s".to_string()),
             batch_size: 1000,
             tracking_column: Some("updated_at".to_string()),
             initial_offset: Some("2024-01-01 00:00:00".to_string()),
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, Some(connector_state));
         let state = source.state.lock().unwrap();
         assert_eq!(state.last_offset, Some("2024-06-15 12:00:00".to_string()));
         assert_eq!(state.processed_rows, 1500);
-    }
-
-    #[test]
-    fn test_quote_sql_literal_escapes_single_quotes() {
-        assert_eq!(quote_sql_literal("42"), "'42'");
-        assert_eq!(
-            quote_sql_literal("2024-01-01 00:00:00"),
-            "'2024-01-01 00:00:00'"
-        );
-        assert_eq!(quote_sql_literal("o'brien"), "'o''brien'");
-        assert_eq!(
-            quote_sql_literal("x'; DROP TABLE t; --"),
-            "'x''; DROP TABLE t; --'"
-        );
     }
 
     #[test]
@@ -3073,6 +3132,7 @@ mod tests {
         assert_eq!(config.batch_size, 1000);
         assert!(config.include_metadata);
         assert!(!config.snake_case_columns);
+        assert_eq!(config.verbose_logging, None);
         assert_eq!(config.connection_timeout_ms, 5000);
         assert!(config.username.is_none());
         assert!(config.password.is_none());
@@ -3097,6 +3157,7 @@ mod tests {
             mode = "incremental"
             snake_case_columns = true
             include_metadata = false
+            verbose_logging = true
             jvm_options = ["-Xmx512m", "-Xms128m"]
             connection_timeout_ms = 60000
         "#;
@@ -3111,6 +3172,7 @@ mod tests {
         assert_eq!(config.mode, Mode::Incremental);
         assert!(config.snake_case_columns);
         assert!(!config.include_metadata);
+        assert_eq!(config.verbose_logging, Some(true));
         assert_eq!(config.jvm_options, vec!["-Xmx512m", "-Xms128m"]);
         assert_eq!(config.connection_timeout_ms, 60000);
         assert_eq!(
@@ -3156,6 +3218,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_shipped_examples_should_parse_each_plugin_config() {
+        let examples = [
+            (
+                "bulk",
+                include_str!("../../../runtime/example_config/connectors/jdbc_bulk_mode.toml"),
+            ),
+            (
+                "h2",
+                include_str!("../../../runtime/example_config/connectors/jdbc_h2.toml"),
+            ),
+            (
+                "mysql",
+                include_str!("../../../runtime/example_config/connectors/jdbc_mysql.toml"),
+            ),
+            (
+                "oracle",
+                include_str!("../../../runtime/example_config/connectors/jdbc_oracle.toml"),
+            ),
+            (
+                "sqlserver",
+                include_str!("../../../runtime/example_config/connectors/jdbc_sqlserver.toml"),
+            ),
+        ];
+
+        for (name, example) in examples {
+            let document: toml::Value = toml::from_str(example).unwrap_or_else(|error| {
+                panic!("shipped {name} example must be valid TOML: {error}")
+            });
+            let plugin_config = document
+                .get("plugin_config")
+                .cloned()
+                .unwrap_or_else(|| panic!("shipped {name} example must contain plugin_config"));
+            let config: JdbcSourceConfig = plugin_config.try_into().unwrap_or_else(|error| {
+                panic!("shipped {name} plugin_config must deserialize: {error}")
+            });
+
+            if name == "h2" {
+                assert_eq!(config.mode, Mode::Incremental);
+                assert!(
+                    config
+                        .jdbc_url
+                        .expose_secret()
+                        .contains(r"\;INSERT INTO users"),
+                    "H2 INIT statements must be separated with an escaped semicolon"
+                );
+            }
+        }
+    }
+
     // =========================================================================
     // State restoration tests
     // =========================================================================
@@ -3164,25 +3276,7 @@ mod tests {
     fn test_state_restoration_with_malformed_bytes_falls_back_to_default() {
         let connector_state = ConnectorState(vec![0xFF, 0xFE, 0xFD, 0x00]);
 
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, Some(connector_state));
+        let source = JdbcSource::new(1, base_config(), Some(connector_state));
         let state = source.state.lock().unwrap();
         // Should fall back to default state
         assert!(state.last_offset.is_none());
@@ -3193,25 +3287,7 @@ mod tests {
     fn test_state_restoration_with_empty_bytes_falls_back_to_default() {
         let connector_state = ConnectorState(vec![]);
 
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, Some(connector_state));
+        let source = JdbcSource::new(1, base_config(), Some(connector_state));
         let state = source.state.lock().unwrap();
         assert!(state.last_offset.is_none());
         assert_eq!(state.processed_rows, 0);
@@ -3220,22 +3296,11 @@ mod tests {
     #[test]
     fn test_state_restoration_none_uses_initial_offset() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM orders WHERE id > {last_offset}".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: Some("100".to_string()),
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         let state = source.state.lock().unwrap();
@@ -3246,22 +3311,9 @@ mod tests {
     #[test]
     fn test_state_restoration_none_without_initial_offset() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM products".to_string(),
             poll_interval: Some("60s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         let state = source.state.lock().unwrap();
@@ -3275,149 +3327,46 @@ mod tests {
 
     #[test]
     fn test_extract_offset_value_with_integer() {
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, None);
-
         let mut row = serde_json::Map::new();
         row.insert("id".to_string(), serde_json::json!(42));
-        assert_eq!(
-            source.extract_offset_value(&row, "id"),
-            Some("42".to_string())
-        );
+        assert_eq!(extract_offset_value(&row, "id"), Some("42".to_string()));
     }
 
     #[test]
     fn test_extract_offset_value_with_string() {
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, None);
-
         let mut row = serde_json::Map::new();
         row.insert(
             "updated_at".to_string(),
             serde_json::json!("2024-06-15 12:00:00"),
         );
         assert_eq!(
-            source.extract_offset_value(&row, "updated_at"),
+            extract_offset_value(&row, "updated_at"),
             Some("2024-06-15 12:00:00".to_string())
         );
     }
 
     #[test]
     fn test_extract_offset_value_with_float() {
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, None);
-
         let mut row = serde_json::Map::new();
         row.insert("version".to_string(), serde_json::json!(3.5));
         assert_eq!(
-            source.extract_offset_value(&row, "version"),
+            extract_offset_value(&row, "version"),
             Some("3.5".to_string())
         );
     }
 
     #[test]
     fn test_extract_offset_value_with_null() {
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, None);
-
         let mut row = serde_json::Map::new();
         row.insert("id".to_string(), serde_json::Value::Null);
         // A SQL NULL tracking value must not become the persisted offset.
-        assert_eq!(source.extract_offset_value(&row, "id"), None);
+        assert_eq!(extract_offset_value(&row, "id"), None);
     }
 
     #[test]
     fn test_extract_offset_value_missing_column() {
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-        let source = JdbcSource::new(1, config, None);
-
         let row = serde_json::Map::new();
-        assert_eq!(source.extract_offset_value(&row, "nonexistent"), None);
+        assert_eq!(extract_offset_value(&row, "nonexistent"), None);
     }
 
     // =========================================================================
@@ -3427,23 +3376,11 @@ mod tests {
     #[test]
     fn test_build_query_incremental_no_offset_no_initial_removes_where_clause() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM users WHERE {tracking_column} > {last_offset} ORDER BY id"
                 .to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("id".to_string()),
-            initial_offset: None,
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         let state = State {
@@ -3453,9 +3390,9 @@ mod tests {
         let query = source.build_query(&state).expect("build query");
         // The WHERE clause placeholder should be removed
         assert!(
-            !query.contains("{last_offset}"),
+            !query.sql.contains("{last_offset}"),
             "Query should not contain unresolved placeholder: {}",
-            query
+            query.sql
         );
     }
 
@@ -3465,22 +3402,9 @@ mod tests {
         // auto-remove does not match: the unresolved {last_offset} must produce
         // an error rather than being shipped to the driver as invalid SQL.
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM t WHERE id >= {last_offset}".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
             mode: Mode::Incremental,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         assert!(source.build_query(&State::default()).is_err());
@@ -3489,22 +3413,10 @@ mod tests {
     #[test]
     fn test_build_query_bulk_mode_ignores_offset() {
         let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
             query: "SELECT * FROM users ORDER BY id".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: Some("0".to_string()),
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
         let source = JdbcSource::new(1, config, None);
         let state = State {
@@ -3513,7 +3425,7 @@ mod tests {
         };
         // In bulk mode the query is used verbatim; the tracked offset is ignored.
         let query = source.build_query(&state).expect("build query");
-        assert_eq!(query, "SELECT * FROM users ORDER BY id");
+        assert_eq!(query.sql, "SELECT * FROM users ORDER BY id");
     }
 
     // =========================================================================
@@ -3556,17 +3468,7 @@ mod tests {
             driver_jar_path: "/tmp/mysql.jar".to_string(),
             username: Some("admin".to_string()),
             password: Some(SecretString::from("MyP@ssw0rd")),
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
+            ..base_config()
         };
 
         let debug_output = format!("{:?}", config);
@@ -3660,7 +3562,8 @@ mod tests {
         // rebuild the next query from '42' and permanently skip rows 11..=42.
         let state = source.state.lock().expect("state lock");
         let query = source.build_query(&state).expect("build query");
-        assert_eq!(query, "SELECT id FROM t WHERE id > '10' ORDER BY id");
+        assert_eq!(query.sql, "SELECT id FROM t WHERE id > ? ORDER BY id");
+        assert_eq!(query.offset.as_deref(), Some("10"));
     }
 
     #[test]
@@ -3676,26 +3579,7 @@ mod tests {
 
     #[test]
     fn test_config_debug_without_password() {
-        let config = JdbcSourceConfig {
-            jdbc_url: SecretString::from("jdbc:h2:mem:test"),
-            driver_class: "org.h2.Driver".to_string(),
-            driver_jar_path: "/tmp/h2.jar".to_string(),
-            username: None,
-            password: None,
-            query: "SELECT 1".to_string(),
-            poll_interval: Some("10s".to_string()),
-            batch_size: 100,
-            tracking_column: None,
-            initial_offset: None,
-            mode: Mode::Bulk,
-            snake_case_columns: false,
-            include_metadata: true,
-            jvm_options: vec![],
-            connection_timeout_ms: 30000,
-            login_timeout_ms: 30000,
-        };
-
-        let debug_output = format!("{:?}", config);
+        let debug_output = format!("{:?}", base_config());
         // Should not panic and should contain the struct name
         assert!(debug_output.contains("JdbcSourceConfig"));
     }

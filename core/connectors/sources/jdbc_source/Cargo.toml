@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_jdbc_source"
-version = "0.4.1-edge.1"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "jdbc", "source"]
@@ -59,7 +59,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 toml = { workspace = true }
