@@ -61,12 +61,13 @@ cd gateways/kafka
 docker compose up --build
 ```
 
-`iggy-server` pulls the prebuilt `apache/iggy:edge` image (CI-refreshed on every master merge),
+`iggy-server` pulls the prebuilt `apache/iggy:edge` image (refreshed on a master push only when `server` or `iggy-cli` is affected, or `web` or `core/server/Dockerfile` changes),
 so only `iggy-gateway-kafka` compiles from source. Its Dockerfile mounts a cargo registry/target
 cache, so a first run costs one real compile and every run after reuses it, even across a source
 change elsewhere in the workspace. Testing a local `iggy-server` change: comment out `image:` and
-uncomment `build:` in `docker-compose.yml` first - that path has no cache mount and is a full
-from-scratch release build, several minutes on its own.
+uncomment `build:` in `docker-compose.yml` first. That build mounts cargo registry, git, and
+target caches, so the first run is still a full release build of several minutes and later runs
+reuse those mounts.
 
 This starts `iggy-server` (the real Iggy broker) and `iggy-gateway-kafka` (bridge enabled,
 pointed at that server) on a shared Docker network, with the gateway waiting for the server's

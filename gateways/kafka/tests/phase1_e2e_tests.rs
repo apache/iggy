@@ -100,18 +100,6 @@ fn decode_create_topics_response(body: Bytes) -> (i16, Option<String>, i32) {
     (error_code, error_message, num_partitions)
 }
 
-fn build_metadata_request(topic: &str) -> Bytes {
-    let mut enc = Encoder::with_capacity(64);
-    enc.write_varint(2); // one requested topic
-    enc.write_compact_nullable_string(Some(topic));
-    enc.write_empty_tagged_fields(); // per-topic tagged fields
-    enc.write_bool(false); // allow_auto_topic_creation
-    enc.write_bool(false); // include_cluster_authorized_operations
-    enc.write_bool(false); // include_topic_authorized_operations
-    enc.write_empty_tagged_fields();
-    enc.freeze()
-}
-
 /// `(topic error_code, partition error_code, leader_id of partition 0, node_ids in the brokers
 /// array, controller_id, first broker's host, first broker's port)` for the single requested
 /// topic.
@@ -298,7 +286,7 @@ async fn phase1_produce_flow_through_real_gateway_process_and_real_iggy_server()
         API_KEY_METADATA,
         METADATA_VERSION,
         2,
-        &build_metadata_request(TOPIC),
+        &wire::build_metadata_flexible_request(&[TOPIC]),
     )
     .await;
     assert_eq!(corr, 2, "correlation id must echo the request");

@@ -20,7 +20,8 @@
 
 services:
   iggy-server:
-    # Prebuilt, CI-refreshed on every master merge - avoids a full from-scratch workspace
+    # Prebuilt. :edge refreshes on a master push only when `server` or `iggy-cli` is
+    # affected, or `web` or `core/server/Dockerfile` changes - avoids a full from-scratch workspace
     # release build on first `up --build`. Testing a local server change: comment this out
     # and uncomment `build:` below instead - `core/server/Dockerfile`'s `runtime` target is
     # the same Dockerfile and target `apache/iggy:edge` itself is published from
