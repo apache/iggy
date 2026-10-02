@@ -221,6 +221,80 @@ async fn mongodb_source_produces_bulk_messages(
     server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
     seed = seeds::connector_stream
 )]
+async fn mongodb_source_reads_shared_timestamp_split_across_batches(
+    harness: &TestHarness,
+    fixture: MongoDbSourcePreCreatedFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    // The fixture configures batch_size = 100, so one millisecond spanning
+    // 150 documents can only be drained through the `_id` tie-break.
+    let doc_count = 150;
+
+    fixture
+        .insert_documents_sharing_timestamp(
+            doc_count,
+            mongodb::bson::DateTime::now().timestamp_millis(),
+        )
+        .await
+        .expect("Failed to insert documents");
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received_ids: Vec<i64> = Vec::new();
+    let mut idle_polls = 0;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                100,
+                true,
+            )
+            .await
+        {
+            if polled.messages.is_empty() {
+                idle_polls += 1;
+            } else {
+                idle_polls = 0;
+            }
+            for msg in polled.messages {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&msg.payload).expect("payload should be JSON");
+                received_ids.push(json.get("id").and_then(|v| v.as_i64()).unwrap_or(0));
+            }
+            // Keep polling a little past the expected count so a `$gte`
+            // fallback re-delivering the boundary millisecond would show up.
+            if received_ids.len() >= doc_count && idle_polls >= 10 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let mut unique_ids = received_ids.clone();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    assert_eq!(
+        unique_ids,
+        (1..=doc_count as i64).collect::<Vec<_>>(),
+        "every document sharing the millisecond should be produced once"
+    );
+    assert_eq!(
+        received_ids.len(),
+        doc_count,
+        "documents sharing the millisecond should not be re-delivered"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mongodb/source.toml")),
+    seed = seeds::connector_stream
+)]
 async fn state_persists_across_connector_restart(
     harness: &mut TestHarness,
     fixture: MongoDbSourcePreCreatedFixture,

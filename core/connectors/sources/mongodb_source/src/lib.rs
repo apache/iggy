@@ -213,12 +213,14 @@ impl MongoDbSource {
                 latest_position = Some((timestamp.timestamp_millis(), doc.get("_id").cloned()));
             }
 
-            let payload = serde_json::to_vec(&doc).map_err(|e| {
-                Error::Serialization(format!("Failed to serialize document: {}", e))
-            })?;
+            let id = doc.get("_id").and_then(message_id);
+            let payload =
+                serde_json::to_vec(&Bson::Document(doc).into_relaxed_extjson()).map_err(|e| {
+                    Error::Serialization(format!("Failed to serialize document: {}", e))
+                })?;
 
             let message = ProducedMessage {
-                id: doc.get("_id").and_then(message_id),
+                id,
                 headers: None,
                 checksum: None,
                 timestamp: None,
@@ -360,7 +362,10 @@ fn cursor_filter(timestamp_field: &str, state: &State) -> Document {
         Some(last_id) => doc! {
             "$or": [
                 { timestamp_field: { "$gt": last_timestamp } },
-                { timestamp_field: last_timestamp, "_id": { "$gt": last_id } },
+                {
+                    timestamp_field: last_timestamp,
+                    "$expr": { "$gt": ["$_id", { "$literal": last_id }] },
+                },
             ]
         },
         // The boundary document had no `_id` (views can project it away), so there
@@ -373,7 +378,7 @@ fn cursor_filter(timestamp_field: &str, state: &State) -> Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::oid::ObjectId;
+    use mongodb::bson::{Binary, oid::ObjectId, spec::BinarySubtype};
 
     fn test_config() -> MongoDbSourceConfig {
         MongoDbSourceConfig {
@@ -498,7 +503,11 @@ mod tests {
 
     #[test]
     fn given_last_id_when_building_filter_should_break_timestamp_ties_on_id() {
-        let state = staged_state();
+        let last_id = Bson::ObjectId(ObjectId::parse_str("65a4f0c2e1b2c3d4e5f60718").unwrap());
+        let state = State {
+            last_id: Some(last_id_extjson(last_id.clone())),
+            ..staged_state()
+        };
         let filter = cursor_filter("timestamp", &state);
         let last_timestamp = mongodb::bson::DateTime::from_millis(1_700_000_000_000);
 
@@ -507,10 +516,29 @@ mod tests {
             doc! {
                 "$or": [
                     { "timestamp": { "$gt": last_timestamp } },
-                    { "timestamp": last_timestamp, "_id": { "$gt": parse_last_id(&state.last_id.unwrap()).unwrap() } },
+                    {
+                        "timestamp": last_timestamp,
+                        "$expr": { "$gt": ["$_id", { "$literal": last_id }] },
+                    },
                 ]
             }
         );
+    }
+
+    #[test]
+    fn given_last_id_when_round_tripping_should_restore_original_bson() {
+        let generic_binary = Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![0x01, 0x02, 0x03],
+        });
+        for id in [
+            Bson::ObjectId(ObjectId::new()),
+            Bson::Int64(42),
+            Bson::String("doc-1".to_string()),
+            generic_binary,
+        ] {
+            assert_eq!(parse_last_id(&last_id_extjson(id.clone())), Some(id));
+        }
     }
 
     #[test]

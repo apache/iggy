@@ -156,7 +156,18 @@ State is serialized with MessagePack, so the file is binary. Its content is equi
 }
 ```
 
-Messages themselves are the documents serialized with `serde_json`, so BSON types such as `ObjectId` and `Date` appear in extended JSON form, for example `{"_id": {"$oid": "65a4f0c2e1b2c3d4e5f60718"}}`.
+## Message Format
+
+Each document is emitted as MongoDB relaxed extended JSON, so no BSON type is lost: `ObjectId` becomes `{"$oid": ...}`, `Date` becomes an RFC 3339 string under `$date`, binary data keeps its subtype under `$binary`, and `NaN` or `Infinity` doubles are preserved as `{"$numberDouble": ...}`. Plain numbers, strings, booleans, arrays and nested documents appear as regular JSON values.
+
+```json
+{
+  "_id": { "$oid": "65a4f0c2e1b2c3d4e5f60718" },
+  "name": "doc_1",
+  "value": 10,
+  "timestamp": { "$date": "2024-01-15T10:30:00Z" }
+}
+```
 
 ## Best Practices
 
@@ -174,7 +185,7 @@ Messages themselves are the documents serialized with `serde_json`, so BSON type
 1. **Duplicate Messages on Every Poll**: Without `timestamp_field`, each poll reads every document that matches `query`. Set `timestamp_field` for incremental ingestion
 2. **Unbounded Polls Without `timestamp_field`**: Without `timestamp_field`, every poll runs without `batch_size` or sort and reads the whole matching collection into one batch
 3. **State Not Advancing**: `timestamp_field` values that are strings or numbers are ignored. Only BSON `Date` values update `last_poll_timestamp`
-4. **Shared Timestamps**: Batches are sorted by `(timestamp_field, _id)`, and the next poll reads documents with a later timestamp, or the same timestamp and a greater `_id`. Documents sharing a timestamp across a `batch_size` boundary are read on the next poll
+4. **Shared Timestamps**: Batches are sorted by `(timestamp_field, _id)`, and the next poll reads documents with a later timestamp, or the same timestamp and a greater `_id`. The `_id` comparison uses `$expr`, so it follows BSON sort order even when `_id` types are mixed. Documents sharing a timestamp across a `batch_size` boundary are read on the next poll
 5. **Connection Failures**: Invalid URIs or unreachable hosts fail in `open()` with an init error. Check `connection_uri` and credentials
 6. **Starting Fresh**: Delete `source_<key>.state` to reset progress
 

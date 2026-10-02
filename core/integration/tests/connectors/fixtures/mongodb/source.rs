@@ -79,6 +79,31 @@ impl MongoDbSourceFixture {
         Ok(())
     }
 
+    pub async fn insert_documents_sharing_timestamp(
+        &self,
+        count: usize,
+        timestamp_millis: i64,
+    ) -> Result<(), TestBinaryError> {
+        let client = self.create_client().await?;
+        let coll = client
+            .database(DEFAULT_SOURCE_DATABASE)
+            .collection::<Document>(DEFAULT_SOURCE_COLLECTION);
+        let docs = (1..=count).map(|i| {
+            doc! {
+                "id": i as i32,
+                "name": format!("doc_{i}"),
+                "value": (i * 10) as i32,
+                "timestamp": BsonDateTime::from_millis(timestamp_millis),
+            }
+        });
+        coll.insert_many(docs)
+            .await
+            .map(|_| ())
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to insert documents: {e}"),
+            })
+    }
+
     pub async fn get_document_count(&self) -> Result<usize, TestBinaryError> {
         let client = self.create_client().await?;
         let coll = client
