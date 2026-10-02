@@ -4,7 +4,7 @@ This MongoDB source connector polls a MongoDB collection, produces each document
 
 ## Features
 
-- **Incremental Data Processing**: Track the last processed timestamp (`timestamp_field`) to avoid reprocessing documents
+- **Incremental Data Processing**: Resume from the last acknowledged `timestamp_field` position; retries can duplicate documents
 - **Timestamp-ordered Batches**: Incremental polls filter with `$gt`, sort ascending on the timestamp field, and cap each batch with `batch_size`
 - **Custom Filters**: Restrict the documents read with a MongoDB `query` filter
 - **Connection Pooling**: Configurable driver pool size via `max_pool_size`
@@ -53,7 +53,7 @@ query = { status = "active" }
 | `batch_size`       | no       | `100`           | Maximum documents per incremental poll. Must be greater than 0              |
 | `polling_interval` | no       | `"10s"`         | Delay before each poll (humantime format). Invalid values fall back to 10s  |
 
-### State Management Configuration
+#### State Management Configuration
 
 The plugin has no state settings of its own. State is configured once for the whole connectors runtime, in the runtime `config.toml`:
 
@@ -63,16 +63,22 @@ path = "local_state"  # used by storage = "file"
 storage = "file"      # "file" | "http"
 ```
 
+## Delivery Guarantees
+
+Each batch is delivered at least once, so consumers must tolerate duplicates. The candidate cursor is returned with the batch and committed in memory only after the runtime sends the messages, saves the state and returns `Ack`. A `Nack`, or a crash between sending and saving, replays the whole batch on the next poll. Replayed documents keep the same `_id`, so messages with an `ObjectId`, `Int32` or `Int64` `_id` carry a stable Iggy message ID; other `_id` types do not.
+
+Documents that commit with a `timestamp_field` at or below the cursor after it has advanced, and updates to documents already read, are never produced. This is not a complete change-data-capture feed.
+
 ## State Information
 
 The connector tracks the following state information:
 
 ### Processing State
 
-- `last_poll_timestamp`: Highest `timestamp_field` value seen so far
+- `last_poll_timestamp`: Highest `timestamp_field` value acknowledged so far, as milliseconds since the Unix epoch
 - `total_documents_fetched`: Total number of documents produced
 - `poll_count`: Number of polling cycles executed
-- `last_id`: `_id` of the document at `last_poll_timestamp`, stored as extended JSON and used to break timestamp ties
+- `last_id`: `_id` of the document at `last_poll_timestamp`, stored as canonical extended JSON and used to break timestamp ties
 
 ### Error Tracking
 
@@ -143,7 +149,7 @@ State is serialized with MessagePack, so the file is binary. Its content is equi
 
 ```json
 {
-  "last_poll_timestamp": "2024-01-15T10:30:00Z",
+  "last_poll_timestamp": 1705314600000,
   "total_documents_fetched": 15000,
   "poll_count": 150,
   "last_id": "{\"$oid\":\"65a4f0c2e1b2c3d4e5f60718\"}"
@@ -155,7 +161,7 @@ Messages themselves are the documents serialized with `serde_json`, so BSON type
 ## Best Practices
 
 1. **Key Uniqueness**: Use a unique connector `key` per instance, since the state file is named after it
-2. **Index the Timestamp Field**: Create an index on `timestamp_field` so the sorted `$gt` query stays fast
+2. **Index the Sort**: Polls sort on `(timestamp_field, _id)`, which a single-field index cannot serve, so MongoDB sorts every document past the cursor in memory. Create a compound index `{ <timestamp_field>: 1, _id: 1 }`, with any equality fields from `query` placed before it
 3. **Use BSON Dates**: Store `timestamp_field` as a BSON `Date`. Other types do not advance the state
 4. **Storage Location**: Point `[state].path` at persistent storage in production
 5. **Batch Tuning**: Balance `batch_size` and `polling_interval` against your write rate

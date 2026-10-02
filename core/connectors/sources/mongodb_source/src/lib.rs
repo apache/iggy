@@ -17,7 +17,6 @@
 
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
-use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     source::SourceBatchResult, source_connector,
@@ -39,7 +38,7 @@ source_connector!(MongoDbSource);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
-    last_poll_timestamp: Option<DateTime<Utc>>,
+    last_poll_timestamp: Option<i64>,
     total_documents_fetched: usize,
     poll_count: usize,
     // `_id` of the document at `last_poll_timestamp`, so documents sharing that
@@ -158,10 +157,12 @@ impl MongoDbSource {
         let read_sample = |e: mongodb::error::Error| {
             Error::InitError(format!("Failed to read a sample document: {e}"))
         };
-        if coll.find_one(dated).await.map_err(read_sample)?.is_some() {
-            return Ok(());
-        }
-        match coll.find_one(query).await.map_err(read_sample)? {
+
+        let sample = match coll.find_one(dated).await.map_err(read_sample)? {
+            Some(doc) => Some(doc),
+            None => coll.find_one(query).await.map_err(read_sample)?,
+        };
+        match sample {
             Some(doc) => validate_timestamp_field(&doc, timestamp_field),
             None => Ok(()),
         }
@@ -205,17 +206,11 @@ impl MongoDbSource {
             .map_err(|e| Error::Storage(format!("Failed to move cursor {e}")))?
         {
             if let Some(timestamp_field) = &self.config.timestamp_field
-                && let Some(timestamp_dt) = doc.get(timestamp_field).and_then(|v| v.as_datetime())
                 && let Some(timestamp) =
-                    iggy_common::DateTime::<iggy_common::Utc>::from_timestamp_millis(
-                        timestamp_dt.timestamp_millis(),
-                    )
+                    field_value(&doc, timestamp_field).and_then(|v| v.as_datetime())
             {
                 // Results are sorted by (timestamp, _id), so the last one seen is the newest.
-                latest_position = Some((
-                    timestamp,
-                    doc.get("_id").and_then(|id| serde_json::to_string(id).ok()),
-                ));
+                latest_position = Some((timestamp.timestamp_millis(), doc.get("_id").cloned()));
             }
 
             let payload = serde_json::to_vec(&doc).map_err(|e| {
@@ -233,7 +228,7 @@ impl MongoDbSource {
             messages.push(message);
         }
         let (last_poll_timestamp, last_id) = match latest_position {
-            Some((timestamp, id)) => (Some(timestamp), id),
+            Some((timestamp, id)) => (Some(timestamp), id.map(last_id_extjson)),
             None => (state.last_poll_timestamp, state.last_id),
         };
         let candidate_state = State {
@@ -312,8 +307,17 @@ impl Source for MongoDbSource {
     }
 }
 
+fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
+    let mut segments = path.split('.');
+    let mut value = doc.get(segments.next()?)?;
+    for segment in segments {
+        value = value.as_document()?.get(segment)?;
+    }
+    Some(value)
+}
+
 fn validate_timestamp_field(doc: &Document, timestamp_field: &str) -> Result<(), Error> {
-    match doc.get(timestamp_field) {
+    match field_value(doc, timestamp_field) {
         Some(Bson::DateTime(_)) => Ok(()),
         Some(value) => Err(Error::InvalidConfigValue(format!(
             "timestamp_field '{timestamp_field}' must hold a BSON Date, found {:?}",
@@ -338,24 +342,30 @@ fn message_id(id: &Bson) -> Option<u128> {
     }
 }
 
+fn last_id_extjson(id: Bson) -> String {
+    id.into_canonical_extjson().to_string()
+}
+
+fn parse_last_id(last_id: &str) -> Option<Bson> {
+    let value = serde_json::from_str::<serde_json::Value>(last_id).ok()?;
+    Bson::try_from(value).ok()
+}
+
 fn cursor_filter(timestamp_field: &str, state: &State) -> Document {
     let Some(last_timestamp) = state.last_poll_timestamp else {
         return doc! { timestamp_field: { "$type": "date" } };
     };
-    let last_timestamp = mongodb::bson::DateTime::from_millis(last_timestamp.timestamp_millis());
-    match state
-        .last_id
-        .as_deref()
-        .and_then(|id| serde_json::from_str::<Bson>(id).ok())
-    {
+    let last_timestamp = mongodb::bson::DateTime::from_millis(last_timestamp);
+    match state.last_id.as_deref().and_then(parse_last_id) {
         Some(last_id) => doc! {
             "$or": [
                 { timestamp_field: { "$gt": last_timestamp } },
                 { timestamp_field: last_timestamp, "_id": { "$gt": last_id } },
             ]
         },
-        // State saved before `last_id` existed. `$gte` re-delivers the boundary
-        // documents once instead of risking skipping them.
+        // The boundary document had no `_id` (views can project it away), so there
+        // is nothing to break ties on. `$gte` re-delivers that millisecond rather
+        // than skipping documents that share it.
         None => doc! { timestamp_field: { "$gte": last_timestamp } },
     }
 }
@@ -380,10 +390,10 @@ mod tests {
 
     fn staged_state() -> State {
         State {
-            last_poll_timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000),
+            last_poll_timestamp: Some(1_700_000_000_000),
             total_documents_fetched: 10,
             poll_count: 1,
-            last_id: Some(serde_json::to_string(&Bson::ObjectId(ObjectId::new())).unwrap()),
+            last_id: Some(last_id_extjson(Bson::ObjectId(ObjectId::new()))),
         }
     }
 
@@ -465,12 +475,12 @@ mod tests {
     fn given_state_saved_without_last_id_should_restore_with_none() {
         #[derive(Serialize)]
         struct StateWithoutLastId {
-            last_poll_timestamp: Option<DateTime<Utc>>,
+            last_poll_timestamp: Option<i64>,
             total_documents_fetched: usize,
             poll_count: usize,
         }
         let legacy = StateWithoutLastId {
-            last_poll_timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000),
+            last_poll_timestamp: Some(1_700_000_000_000),
             total_documents_fetched: 10,
             poll_count: 1,
         };
@@ -497,7 +507,7 @@ mod tests {
             doc! {
                 "$or": [
                     { "timestamp": { "$gt": last_timestamp } },
-                    { "timestamp": last_timestamp, "_id": { "$gt": serde_json::from_str::<Bson>(&state.last_id.unwrap()).unwrap() } },
+                    { "timestamp": last_timestamp, "_id": { "$gt": parse_last_id(&state.last_id.unwrap()).unwrap() } },
                 ]
             }
         );
