@@ -1221,7 +1221,7 @@ class IggyClient:
         self, token: builtins.str
     ) -> collections.abc.Awaitable[IdentityInfo]:
         r"""
-        Logs in with a personal access token minted out of band.
+        Logs in with a personal access token created separately.
 
         Args:
             token: Raw PAT string.
