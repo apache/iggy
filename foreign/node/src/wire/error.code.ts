@@ -270,6 +270,7 @@ export const translateErrorCode = (code: number): string => {
     case '14000': return "VSR session already bound; reset before re-binding";
     case '14001': return "VSR session value {0} is invalid (must be non-zero)";
     case '14003': return "Incompatible binary protocol version: client {}, server accepts [{}, {}]";
+    case '14004': return "VSR session mismatch: requested {0}, server bound {1}";
 
     default: return 'error';
   }

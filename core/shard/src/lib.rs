@@ -218,15 +218,16 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 pub enum MetadataSubmit {
     /// Replica-link liveness report routed to shard 0; no proposal or reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
-    AttachConsumerSession {
+    BindSession {
         vsr_client_id: u128,
         session: u64,
-        user_id: u32,
-        reply: Sender<Result<consensus::client_table::SessionAttachment, IggyError>>,
+        secret: iggy_binary_protocol::requests::users::login_register::BindSecret,
+        reply: Sender<Result<(u32, u64, consensus::client_table::SessionAttachment), IggyError>>,
     },
     Register {
         vsr_client_id: u128,
         user_id: u32,
+        verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
         /// The committed bind, or the submit error verbatim. The error must
         /// survive the hop: the ownership refusal is TERMINAL, and flattening it
         /// into "no reply" makes the login look transient, which costs the
@@ -245,6 +246,7 @@ pub enum MetadataSubmit {
     ForwardedRegister {
         vsr_client_id: u128,
         user_id: u32,
+        verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
         /// Correlation the origin minted; echoed verbatim in the result.
         nonce: u128,
         /// Replica the result frame goes back to.
@@ -338,6 +340,9 @@ pub struct GatheredClients<T = ConnectedClientInfo> {
 #[derive(Debug)]
 pub enum PartitionRead {
     Primary,
+    SessionRetired {
+        identity: iggy_binary_protocol::requests::system::SessionIdentity,
+    },
     PollOnPrimary {
         consumer: PollingConsumer,
         args: PollingArgs,
@@ -378,6 +383,7 @@ pub enum PartitionRead {
 #[derive(Debug)]
 pub enum PartitionReadReply {
     Primary(u8),
+    SessionRetired(bool),
     Poll {
         fragments: PollFragments,
         current_offset: u64,
@@ -2870,6 +2876,8 @@ struct ParkedFrame {
     /// (expiry, teardown, shutdown) drops this, which wakes the awaiting
     /// dispatch with a receive error it maps to silence.
     reply: Option<Sender<Option<Message<GenericHeader>>>>,
+    /// Revalidated at admission after the partition materializes.
+    attachment: Option<ConsumerAttachment>,
 }
 
 impl ParkedFrame {
@@ -2892,6 +2900,7 @@ struct RedispatchedFrame {
     message: MessageBag,
     provenance: ParkProvenance,
     reply: Option<Sender<Option<Message<GenericHeader>>>>,
+    attachment: Option<ConsumerAttachment>,
 }
 
 /// What a frame keeps if it parks again after the pump re-delivers it.
@@ -3048,6 +3057,7 @@ where
                 passes,
                 message,
                 reply,
+                attachment,
             } = self.redispatch_queue.borrow_mut().pop_front()?;
             let provenance = ParkProvenance { epoch, passes };
             // Parked frames are stored generic (the buffer holds every variant
@@ -3060,6 +3070,7 @@ where
                         message,
                         provenance,
                         reply,
+                        attachment,
                     });
                 }
                 Err(error) => {
@@ -3097,10 +3108,11 @@ where
             message,
             provenance,
             reply,
+            attachment,
         } = frame;
         match (reply, message) {
             (Some(reply), MessageBag::Request(request)) => {
-                self.dispatch_partition_submit(request, reply, Some(provenance))
+                self.dispatch_partition_submit(request, reply, Some(provenance), attachment)
                     .await;
             }
             (Some(_), _) => {
@@ -3182,9 +3194,9 @@ where
                     self.deny_unroutable_request(request.header()).await;
                     return;
                 }
-                match self
-                    .park_if_unmaterialised(request, routing.0, routing.1, provenance, &mut None)
-                {
+                match self.park_if_unmaterialised(
+                    request, routing.0, routing.1, provenance, &mut None, &mut None,
+                ) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
                     // the replicas, so replicated frames are never fenced.
@@ -3224,9 +3236,9 @@ where
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
-                match self
-                    .park_if_unmaterialised(prepare, routing.0, routing.1, provenance, &mut None)
-                {
+                match self.park_if_unmaterialised(
+                    prepare, routing.0, routing.1, provenance, &mut None, &mut None,
+                ) {
                     ParkOutcome::Deliver(prepare) | ParkOutcome::Tombstoned(prepare) => {
                         self.on_replicate(prepare).await;
                         // A follower learns the cluster commit point from the
@@ -3295,7 +3307,7 @@ where
             MessageBag::StateChunk(ref msg) => self.on_state_chunk(msg).await,
             // A forwarded proposal must leave the pump because its commit is
             // driven by this same pump. The metadata-submit handler spawns it.
-            MessageBag::ForwardRegister(ref msg) => self.on_forward_register(*msg.header()),
+            MessageBag::ForwardRegister(ref msg) => self.on_forward_register(msg),
             MessageBag::ForwardRegisterResult(ref msg) => {
                 self.on_forward_register_result(*msg.header());
             }
@@ -3314,10 +3326,17 @@ where
         }
     }
 
-    fn on_forward_register(&self, header: ForwardRegisterHeader) {
+    fn on_forward_register(&self, message: &Message<ForwardRegisterHeader>) {
+        let header = message.header();
         if !self.peer_is_known(header.replica, "ForwardRegister") {
             return;
         }
+        let Some(body) = control_suffix_body_verified(message, header.checksum_body) else {
+            return;
+        };
+        let Ok(verifier) = body.try_into() else {
+            return;
+        };
         debug_assert_eq!(
             self.id, 0,
             "ForwardRegister routes to the metadata consensus owner"
@@ -3326,6 +3345,7 @@ where
             .on_metadata_submit(MetadataSubmit::ForwardedRegister {
                 vsr_client_id: header.client,
                 user_id: header.user_id,
+                verifier,
                 nonce: header.nonce,
                 origin_replica: header.replica,
             });
@@ -3697,7 +3717,11 @@ where
         // id and addresses no connection. Its own channel reaches the shard
         // holding the socket.
         if reply.is_some() {
-            return Self::answer_partition_submit_transient(request.header(), reply);
+            return Self::answer_partition_submit_deny(
+                request.header(),
+                reply,
+                &IggyError::TransientNotAccepted,
+            );
         }
         self.stage_transient_deny(request.header())
     }
@@ -3770,6 +3794,7 @@ where
         namespace_raw: u64,
         provenance: Option<ParkProvenance>,
         reply: &mut Option<Sender<Option<Message<GenericHeader>>>>,
+        attachment: &mut Option<ConsumerAttachment>,
     ) -> ParkOutcome<H>
     where
         H: iggy_binary_protocol::ConsensusHeader,
@@ -3899,6 +3924,7 @@ where
             passes,
             message: message.into_generic(),
             reply: reply.take(),
+            attachment: attachment.take(),
         });
         drop(pending);
         self.parked_partition_bytes
@@ -4068,18 +4094,20 @@ where
         M: RestorableMetadataStm,
         T: ShardsTable,
     {
-        self.dispatch_partition_submit(request, reply, None).await;
+        self.dispatch_partition_submit(request, reply, None, None)
+            .await;
     }
 
-    /// [`Self::on_partition_submit`] carrying the park provenance of a submit
-    /// the pump is re-delivering, for the same reason
-    /// [`Self::dispatch_message`] carries it.
+    /// Single entry point for first and re-delivered partition submits.
+    /// Session and operation checks precede parking. Partition readiness and
+    /// metadata fences are rechecked when the owning partition materializes.
     #[allow(clippy::future_not_send)]
     async fn dispatch_partition_submit(
         &self,
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
         provenance: Option<ParkProvenance>,
+        mut attachment: Option<ConsumerAttachment>,
     ) where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -4088,6 +4116,12 @@ where
         M: RestorableMetadataStm,
         T: ShardsTable,
     {
+        if let Some(attachment) = &attachment
+            && let Err(error) = attachment.validate_write(request.header().operation)
+        {
+            Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
+            return;
+        }
         let routing = {
             let header = request.header();
             (header.operation, header.group)
@@ -4102,13 +4136,24 @@ where
             routing.1,
             provenance,
             &mut Some(reply.clone()),
+            &mut attachment,
         ) {
             ParkOutcome::Deliver(request)
                 if !self.serves_committed_incarnation(routing.0, routing.1) =>
             {
-                Self::answer_partition_submit_transient(request.header(), Some(reply));
+                Self::answer_partition_submit_deny(
+                    request.header(),
+                    Some(reply),
+                    &IggyError::TransientNotAccepted,
+                );
             }
             ParkOutcome::Deliver(request) => {
+                if let Some(attachment) = attachment
+                    && let Err(error) = self.validate_partition_attachment(&request, &attachment)
+                {
+                    Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
+                    return;
+                }
                 let (sender, receiver) = consensus::oneshot_channel();
                 self.plane
                     .partitions()
@@ -4127,7 +4172,11 @@ where
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
-                Self::answer_partition_submit_transient(request.header(), Some(reply));
+                Self::answer_partition_submit_deny(
+                    request.header(),
+                    Some(reply),
+                    &IggyError::TransientNotAccepted,
+                );
             }
             // The clone travelled with the parked frame; it answers on drain
             // or wakes the awaiter with a receive error when the frame expires.
@@ -4135,18 +4184,15 @@ where
         }
     }
 
-    /// Answer a refused `PartitionSubmit` with the same transient deny the bus
-    /// path sends, over the submit's own channel. `false` = nobody was
-    /// answered, so the frame still counts as dropped.
-    fn answer_partition_submit_transient(
+    /// Answer a refused `PartitionSubmit` over its own channel. A failed send
+    /// still counts as a dropped frame.
+    fn answer_partition_submit_deny(
         request_header: &RoutedRequestHeader,
         reply: Option<Sender<Option<Message<GenericHeader>>>>,
+        error: &IggyError,
     ) -> bool {
         let Some(reply) = reply else { return false };
-        let deny = build_deny_reply_from_request_header(
-            request_header,
-            IggyError::TransientNotAccepted.as_code(),
-        );
+        let deny = build_deny_reply_from_request_header(request_header, error.as_code());
         reply.try_send(Some(deny.into_generic())).is_ok()
     }
 
@@ -4317,8 +4363,8 @@ where
     // while `partitions` builds as a plain dependency, so `RetainedPartitionLog`
     // and `adopt_retained_log` are configured out and the crate does not compile.
     // The feature forwards to `partitions/simulator` instead.
-    /// # Panics
-    /// Rejects persisted policies because this in-memory materializer has no durable backend.
+    /// Persisted policies use ideal storage here: journal and receipts survive
+    /// together. Filesystem barriers and torn writes belong to storage fault tests.
     #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
@@ -4326,7 +4372,6 @@ where
         superblock: Option<Rc<SB>>,
         recovered_state: Option<consensus::VsrState>,
         retained: Option<partitions::RetainedPartitionState>,
-        restore_frontier: bool,
         materialisation: PartitionMaterialisation,
     ) where
         B: MessageBus + Clone + 'static,
@@ -4361,7 +4406,18 @@ where
         let durable_view = recovered_state
             .as_ref()
             .map(|state| (state.view, state.log_view));
-        let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
+        let recovered_metadata = self
+            .plane
+            .metadata()
+            .applied_frontier()
+            .recovered_revision();
+        // Synthetic seed helpers create revision-zero groups in an explicitly
+        // fresh simulator. A restart always supplies retained state.
+        let allow_bootstrap = epoch > recovered_metadata
+            || (epoch == 0 && recovered_metadata == 0 && retained.is_none());
+        consensus.set_recovery_election_allowed(allow_bootstrap || retained.is_some());
+        let restarted =
+            (retained.is_some() || !allow_bootstrap) && self.partition_consensus.replica_count > 1;
         let consensus::FreshGroupStart {
             join,
             view_fallback,
@@ -4390,6 +4446,7 @@ where
             consensus,
             partitions.config().segment_size,
         );
+        partition.enable_ideal_storage();
         let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
             inner
                 .items
@@ -4400,11 +4457,6 @@ where
                 })
                 .unwrap_or_default()
         });
-        assert!(
-            !runtime_options.durability.is_persisted()
-                && !runtime_options.consumer_offset_durability.is_persisted(),
-            "the in-memory partition simulator does not implement persisted topics. Use storage fault-model tests or the real-server harness"
-        );
         partition.set_runtime_options(runtime_options);
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
@@ -4417,30 +4469,14 @@ where
         // adopted first, or those maxes are taken against the zeroes of a
         // partition that has not got its offsets back yet.
         if let Some(state) = retained {
+            let head_op = state.head_op;
+            let applied_op = state.applied_op;
+            let prepare_checksum = state.prepare_checksum;
             partition.adopt_retained_log(state);
-            // OPT-IN, off by default: it models durability Iggy does not have.
-            // Production's `load_partition` restores the view alone, joins as a
-            // backup and probes, so a harness handing the frontier back cannot
-            // reproduce the empty-frontier restart that is the real hazard. With it
-            // off a restarted replica rebuilds at op 0 while holding a log full of
-            // ops and ADVERTISES that empty frontier in its `DoViewChange`, which
-            // trips the sequential-advance assert in `advance_commit_min`. A
-            // scenario turns this on only to look past that at something later in
-            // the run.
-            //
-            // `max_commit_watermark` is a lower bound: a prepare records the
-            // primary's commit point at send time, so the true point may be one
-            // higher and re-commits on rejoin.
-            let journal = &partition.log.journal().inner;
-            if restore_frontier && let Some(head) = journal.last_op() {
-                let watermark = journal.max_commit_watermark();
-                let consensus = partition.consensus();
-                consensus.sequencer().set_sequence(head);
-                consensus.restore_commit_state(watermark, watermark);
-                if let Some(header) = journal.header_by_op(head) {
-                    consensus.set_last_prepare_checksum(header.checksum);
-                }
-            }
+            let consensus = partition.consensus();
+            consensus.sequencer().set_sequence(head_op);
+            consensus.restore_commit_state(applied_op, applied_op);
+            consensus.set_last_prepare_checksum(prepare_checksum);
         }
         // The SAME call the boot paths make, not a copy of it: this restore is
         // a max against what the segments already proved, and a harness running
@@ -6964,6 +7000,7 @@ where
             }
             session.target_accepted = true;
             session.commit_op = header.commit_op;
+            session.generation = generation;
             // Under ARTIFACT_LEN_MAX (checked above), so the casts hold.
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -7478,19 +7515,11 @@ where
         let decoded = if damaged {
             None
         } else if let (Some(snapshot), Some((table_bytes, table_frontier))) = (snapshot, table) {
-            // The live table's capacity is only the floor: `decode` grows to
-            // the received entry count (bounded by the slot ceiling), because
-            // the serving primary can legitimately hold more sessions than
-            // this node's cap and a cold-boot receiver sits at exactly the raw
-            // config value -- rejecting on the local figure made a join under
-            // cap reduction fail deterministically.
-            let capacity = planes.0.client_table_capacity();
-            match consensus::ClientTable::decode(&table_bytes, capacity) {
+            match consensus::ClientTable::decode(&table_bytes) {
                 Ok(table) => Some((snapshot, table, table_frontier)),
                 Err(error) => {
                     tracing::error!(
                         shard = self.id,
-                        capacity,
                         %error,
                         "transferred client table undecodable"
                     );

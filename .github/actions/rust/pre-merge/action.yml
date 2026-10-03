@@ -505,8 +505,8 @@ runs:
     - name: Install nightly Rust + miri component
       if: inputs.task == 'miri'
       run: |
-        rustup toolchain install nightly-2026-04-21 --component miri --profile minimal --no-self-update
-        cargo +nightly-2026-04-21 miri setup
+        rustup toolchain install nightly-2026-10-02 --component miri --profile minimal --no-self-update
+        cargo +nightly-2026-10-02 miri setup
       shell: bash
 
     - name: Run miri
@@ -514,7 +514,7 @@ runs:
       env:
         MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance"
       run: |
-        cargo +nightly-2026-04-21 miri test --locked \
+        cargo +nightly-2026-10-02 miri test --locked \
           -p iggy_binary_protocol \
           -p consensus
       shell: bash

@@ -22,10 +22,12 @@
 //! frame carrying `IncompatibleProtocol` plus the accepted window; a body
 //! without a decodable prefix with `MalformedLogin` and a zero window.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireName,
 };
@@ -53,6 +55,7 @@ async fn given_incompatible_protocol_version_when_logging_in_should_receive_evic
         username: WireName::new(DEFAULT_ROOT_USERNAME).unwrap(),
         password: SecretString::from(DEFAULT_ROOT_PASSWORD),
         client_context: None,
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
     }
     .to_bytes();
 

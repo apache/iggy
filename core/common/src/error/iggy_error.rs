@@ -573,6 +573,10 @@ pub enum IggyError {
         iggy_binary_protocol::ProtocolVersion(*.2)
     )]
     IncompatibleProtocolVersion(u32, u32, u32) = 14003,
+    #[error("VSR session mismatch: requested {0}, server bound {1}")]
+    SessionMismatch(u64, u64) = 14004,
+    #[error("VSR request IDs exhausted; start a new logical session")]
+    RequestIdExhausted = 14005,
 }
 
 impl IggyError {

@@ -58,6 +58,23 @@ pub struct ConsumerAttachment {
     pub metadata: PollMetadata,
 }
 
+impl ConsumerAttachment {
+    pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
+        if !matches!(
+            operation,
+            Operation::SendMessages
+                | Operation::StoreConsumerOffset
+                | Operation::DeleteConsumerOffset
+        ) {
+            return Err(IggyError::InvalidCommand);
+        }
+        if !self.session.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        Ok(())
+    }
+}
+
 /// A read result awaiting acceptance by its partition owner.
 /// Disk tasks send it through the reserved completion lane. Resident reads
 /// pass it directly to the same completion handler.
@@ -86,20 +103,12 @@ where
     M: StreamsFrontend,
     SB: SuperblockStore,
 {
-    pub(crate) fn validate_offset_attachment(
+    pub(crate) fn validate_partition_attachment(
         &self,
         request: &Message<RoutedRequestHeader>,
         attachment: &ConsumerAttachment,
     ) -> Result<(), IggyError> {
-        if !matches!(
-            request.header().operation,
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-        ) {
-            return Err(IggyError::InvalidCommand);
-        }
-        if !attachment.session.is_valid() {
-            return Err(IggyError::StaleClient);
-        }
+        attachment.validate_write(request.header().operation)?;
         let namespace = IggyNamespace::from_raw(request.header().group);
         if !attachment
             .metadata
@@ -172,6 +181,11 @@ where
             read => (read, None),
         };
         let result = match read {
+            PartitionRead::SessionRetired { identity } => partitions
+                .with_partition(&namespace, |partition| {
+                    PartitionReadReply::SessionRetired(partition.session_retired(identity))
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();

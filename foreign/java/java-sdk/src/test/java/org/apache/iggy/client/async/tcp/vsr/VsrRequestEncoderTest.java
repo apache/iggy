@@ -176,6 +176,7 @@ class VsrRequestEncoderTest {
         long firstLow = session.clientIdLow();
         long firstHigh = session.clientIdHigh();
         session.bind(7);
+        long firstGeneration = session.generation();
 
         ByteBuf secondLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, secondLogin).release();
@@ -184,6 +185,23 @@ class VsrRequestEncoderTest {
         assertThat(session.isBound()).isFalse();
         assertThat(session.clientIdLow() != firstLow || session.clientIdHigh() != firstHigh)
                 .isTrue();
+        assertThat(session.generation()).isGreaterThan(firstGeneration);
+        session.bind(7);
+        assertThatThrownBy(() -> session.bindSecret(firstLow, firstHigh, 7))
+                .isInstanceOf(IggyNotConnectedException.class);
+    }
+
+    @Test
+    void shouldKeepUnsignedSharedEpochInEncodedRequest() {
+        byte[] secret = session.bindSecret();
+        session.bindShared(1, 2, Long.MIN_VALUE, secret);
+        ByteBuf frame = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(Long.MIN_VALUE);
+            assertThat(session.bindSecret(1, 2, Long.MIN_VALUE)).isEqualTo(secret);
+        } finally {
+            frame.release();
+        }
     }
 
     private static ByteBuf loginUserPayload() {

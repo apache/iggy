@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod attach_consumer_session;
+pub mod bind_session;
 pub mod describe_options;
 pub mod get_client;
 pub mod get_clients;
@@ -25,7 +25,7 @@ pub mod get_snapshot;
 pub mod get_stats;
 pub mod ping;
 
-pub use attach_consumer_session::AttachConsumerSessionRequest;
+pub use bind_session::{BindSessionRequest, SessionIdentity};
 pub use describe_options::{
     DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
 };

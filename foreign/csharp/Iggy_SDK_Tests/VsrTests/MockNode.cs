@@ -82,7 +82,7 @@ internal static class MockFrames
         var payload = body.AsSpan(4);
         BinaryPrimitives.WriteUInt32LittleEndian(payload[..4], 7);
         BinaryPrimitives.WriteUInt64LittleEndian(payload[4..12], session);
-        BinaryPrimitives.WriteUInt32LittleEndian(payload[12..16], 11 << 10);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload[12..16], Apache.Iggy.Vsr.LoginRegister.PROTOCOL_VERSION);
         payload[16] = (byte)serverVersion.Length;
         serverVersion.CopyTo(payload[17..]);
 

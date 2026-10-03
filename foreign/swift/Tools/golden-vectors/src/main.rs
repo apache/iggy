@@ -52,10 +52,12 @@ use iggy_binary_protocol::requests::personal_access_tokens::*;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
     UpdateTopicRequest,
 };
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::*;
 use iggy_binary_protocol::responses::clients::{
     ClientDetailsResponse, ClientResponse, ConsumerGroupInfoResponse, GetClientsResponse,
@@ -720,6 +722,7 @@ fn main() {
             username: name("iggy"),
             password: SecretString::from("iggy"),
             client_context: None,
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );
     add(
@@ -729,6 +732,20 @@ fn main() {
             version_info: version_info(),
             token: SecretString::from("pat-abc123def456"),
             client_context: None,
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
+        },
+    );
+    add(
+        &mut vectors,
+        "request.bind_session",
+        &BindSessionRequest {
+            version_info: version_info(),
+            identity: SessionIdentity {
+                client_id: 1,
+                session: 100,
+                metadata_watermark: 120,
+            },
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );
     add(&mut vectors, "request.logout_user", &LogoutUserRequest);

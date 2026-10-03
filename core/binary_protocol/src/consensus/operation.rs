@@ -62,6 +62,7 @@ pub enum Operation {
     /// and submits this through metadata consensus, so every replica applies
     /// the same offset deterministically. No client wire code.
     TruncatePartition = 68,
+    FinalizeSession = 70,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -95,6 +96,8 @@ pub enum Operation {
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
+    // 163 is reserved; 164 and 165 are retired offset operations.
+    RetireSession = 166,
 }
 
 impl Operation {
@@ -113,18 +116,31 @@ impl Operation {
     pub const METADATA_START: u8 = Self::CreateStream as u8;
     pub const PARTITION_START: u8 = Self::SendMessages as u8;
 
+    /// Preparation rewrites some client opcodes. Retry identity must survive
+    /// that projection, including when only the committed reply remains.
+    #[must_use]
+    pub const fn request_operation(&self) -> Self {
+        match self {
+            Self::CreateTopicWithAssignments => Self::CreateTopic,
+            Self::CreatePartitionsWithAssignments => Self::CreatePartitions,
+            Self::TruncatePartition => Self::DeleteSegments,
+            operation => *operation,
+        }
+    }
+
     /// Internal-only operations reserved for replica / journal use.
     #[must_use]
     #[inline]
     pub const fn is_internal(&self) -> bool {
-        (*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START
+        ((*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START)
+            || matches!(self, Self::RetireSession)
     }
 
     /// Metadata / control-plane operations handled by shard 0.
     #[must_use]
     #[inline]
     pub const fn is_metadata(&self) -> bool {
-        if self.is_internal() {
+        if self.is_internal() && !self.is_partition() {
             return true;
         }
 
@@ -232,7 +248,9 @@ impl Operation {
             | Self::CreatePartitionsWithAssignments
             | Self::RemoveConsumerGroupMember
             | Self::CompleteConsumerGroupRevocation
-            | Self::TruncatePartition => None,
+            | Self::TruncatePartition
+            | Self::FinalizeSession
+            | Self::RetireSession => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream

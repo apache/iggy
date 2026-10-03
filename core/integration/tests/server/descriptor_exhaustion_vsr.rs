@@ -17,19 +17,20 @@
 
 //! A partition write that finds no free file descriptor stops the server with
 //! exit status 4, after the shutdown flush. The tests run the server under a
-//! small `RLIMIT_NOFILE`, keep a few messages in memory only, fill the
+//! small `RLIMIT_NOFILE`, leave a few messages outside the durable WAL frontier, fill the
 //! descriptor table with idle HTTP sockets, and write consumer offsets until
 //! an offset file cannot be opened. A restart under the normal limit then
-//! serves the messages that only the flush could have written.
+//! serves the messages that only the flush could have published durably.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{ServerHandle, TestBinary, TestHarness};
 use integration::iggy_harness;
+use journal::partition_journal::{FRONTIER_FILE_NAME, PARTITION_WAL_BLOCK_SIZE};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
@@ -40,7 +41,7 @@ const PARTITION_ID: u32 = 0;
 /// the rest quickly. More sockets than this cannot fit, so opening this many
 /// fills the table whatever the boot used.
 const OPEN_FILES_LIMIT: u64 = 128;
-/// Far below `messages_required_to_save`, so only a flush writes them.
+/// Far below `messages_required_to_save`, so their acknowledgement does not flush.
 const PAYLOADS: [&str; 3] = ["first", "second", "third"];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Each attempt uses a new consumer, so each one opens a new offset file.
@@ -50,6 +51,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// that frees up goes to a waiting socket between two writes.
 const WRITE_PAUSE: Duration = Duration::from_millis(500);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The head field of a frontier slot in `journal::partition_journal::JournalState`.
+const WAL_HEAD_OFFSET: usize = 72;
 
 /// How a test writes the offset of a new consumer.
 #[derive(Clone, Copy)]
@@ -132,11 +135,22 @@ async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, writ
         )
         .await
         .expect("send messages");
-    let segment = segment_log(harness.server(), stream.id, topic.id);
-    assert_eq!(
-        file_len(&segment),
-        0,
-        "the messages must be in memory only before the fault"
+    let frontier = partition_frontier(harness.server(), stream.id, topic.id);
+    let before = std::fs::read(&frontier).expect("read the WAL frontier after sending");
+    assert_eq!(before.len(), 2 * PARTITION_WAL_BLOCK_SIZE);
+    assert!(
+        before
+            .as_chunks::<PARTITION_WAL_BLOCK_SIZE>()
+            .0
+            .iter()
+            .all(|slot| {
+                u64::from_le_bytes(
+                    slot[WAL_HEAD_OFFSET..WAL_HEAD_OFFSET + size_of::<u64>()]
+                        .try_into()
+                        .expect("WAL head field"),
+                ) == 0
+            }),
+        "Replicated acknowledgements must leave the messages outside the durable WAL frontier"
     );
 
     let held = fill_descriptor_table(harness.server().http_addr().expect("HTTP listener")).await;
@@ -187,8 +201,8 @@ async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, writ
         "a write that ran out of descriptors must stop the server with exit status 4, got {status}"
     );
     assert!(
-        file_len(&segment) > 0,
-        "the shutdown flush must write the messages to their segment before the exit"
+        std::fs::read(&frontier).expect("read the WAL frontier after shutdown") != before,
+        "the shutdown flush must publish the buffered messages before the exit"
     );
     assert_first_exhaustion_opened_an_offset_file(harness.server());
 
@@ -258,14 +272,20 @@ fn assert_first_exhaustion_opened_an_offset_file(server: &ServerHandle) {
     );
 }
 
-fn segment_log(server: &ServerHandle, stream_id: u32, topic_id: u32) -> PathBuf {
-    server.data_path().join(format!(
-        "streams/{stream_id}/topics/{topic_id}/partitions/{PARTITION_ID}/00000000000000000000.log"
-    ))
-}
-
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-        .len()
+fn partition_frontier(server: &ServerHandle, stream_id: u32, topic_id: u32) -> PathBuf {
+    let partition = server.data_path().join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/{PARTITION_ID}"
+    ));
+    let directories: Vec<PathBuf> = std::fs::read_dir(&partition)
+        .expect("read the partition directory")
+        .map(|entry| entry.expect("read a partition entry").path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("prepares-"))
+        })
+        .collect();
+    assert_eq!(directories.len(), 1, "one current partition incarnation");
+    directories[0].join(FRONTIER_FILE_NAME)
 }

@@ -2676,6 +2676,20 @@ func (e IncompatibleProtocolVersion) Is(target error) bool {
 	return ok
 }
 
+type SessionMismatch struct {
+	Requested uint64
+	Bound     uint64
+}
+
+func (e SessionMismatch) Error() string {
+	return fmt.Sprintf("vsr session mismatch: requested %d, server bound %d", e.Requested, e.Bound)
+}
+func (e SessionMismatch) Code() Code { return 14004 }
+func (e SessionMismatch) Is(target error) bool {
+	_, ok := target.(SessionMismatch)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2918,6 +2932,7 @@ var (
 	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
+	ErrSessionMismatch                            = SessionMismatch{}
 )
 
 type Code uint32
@@ -3164,6 +3179,7 @@ const (
 	AlreadyAuthenticatedCode                       Code = 14000
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
+	SessionMismatchCode                            Code = 14004
 )
 
 func (c Code) String() string {
@@ -3650,6 +3666,8 @@ func (c Code) String() string {
 		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
+	case SessionMismatchCode:
+		return "SessionMismatch"
 	default:
 		return "Unknown error code"
 	}
@@ -4139,6 +4157,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
+	case SessionMismatchCode:
+		return ErrSessionMismatch
 	default:
 		return ErrError
 	}

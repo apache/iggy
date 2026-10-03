@@ -39,7 +39,7 @@ use server_common::Message;
 use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -72,6 +72,18 @@ impl ConsensusClock {
 
     fn realtime(&self) -> IggyTimestamp {
         self.0.realtime()
+    }
+}
+
+#[cfg(test)]
+pub struct FixedClock(pub u64);
+
+#[cfg(test)]
+impl Clock for FixedClock {
+    type Realtime = IggyTimestamp;
+
+    fn realtime(&self) -> Self::Realtime {
+        IggyTimestamp::from(self.0)
     }
 }
 
@@ -416,6 +428,51 @@ where
     pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
         entry.received_at = self.clock_realtime_micros();
         self.pipeline.borrow_mut().push_request(entry)
+    }
+}
+
+impl<B, P> VsrConsensus<B, P>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    #[must_use]
+    pub fn retry_capacity(&self, table: &crate::ClientTable) -> usize {
+        if table.capacity_committed() {
+            return table.capacity();
+        }
+        self.pipeline
+            .borrow()
+            .head()
+            .filter(|entry| entry.header.retry_capacity != 0)
+            .map_or_else(
+                || table.capacity(),
+                |entry| entry.header.retry_capacity as usize,
+            )
+    }
+
+    /// Both queues own reservations. Clearing or refusing an entry releases it
+    /// automatically, and a commit replaces its reservation with live protection.
+    #[must_use]
+    pub fn has_retry_capacity(&self, table: &crate::ClientTable, client: u128) -> bool {
+        if table.contains(client) || message_bus::is_auto_commit_client(client) {
+            return true;
+        }
+        let capacity = self.retry_capacity(table);
+        let pipeline = self.pipeline.borrow();
+        // Queue lengths bound distinct reservations without scanning either queue.
+        if pipeline.len() + pipeline.request_queue_len() < capacity.saturating_sub(table.count()) {
+            return true;
+        }
+        let pending: HashSet<_> = pipeline
+            .pending_client_ids()
+            .filter(|candidate| {
+                *candidate != 0
+                    && !message_bus::is_auto_commit_client(*candidate)
+                    && !table.contains(*candidate)
+            })
+            .collect();
+        pending.contains(&client) || table.count() + pending.len() < capacity
     }
 }
 
@@ -807,8 +864,43 @@ impl LocalPipeline {
 }
 
 impl Pipeline for LocalPipeline {
+    fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)> {
+        self.prepare_queue
+            .iter()
+            .find(|entry| entry.header.client == client_id)
+            .map(|entry| {
+                (
+                    entry.header.session,
+                    entry.header.request,
+                    entry.header.operation,
+                )
+            })
+            .or_else(|| {
+                self.request_queue
+                    .iter()
+                    .find(|entry| entry.message.header().client == client_id)
+                    .map(|entry| {
+                        let header = entry.message.header();
+                        (header.session, header.request, header.operation)
+                    })
+            })
+    }
     type Entry = PipelineEntry;
     type Request = RequestEntry;
+
+    fn pending_client_ids(&self) -> impl Iterator<Item = u128> {
+        self.prepare_queue
+            .iter()
+            .map(|entry| entry.header.client)
+            .chain(
+                self.request_queue
+                    .iter()
+                    .map(|entry| entry.message.header().client),
+            )
+    }
 
     fn push(&mut self, entry: Self::Entry) {
         Self::push(self, entry);
@@ -1169,6 +1261,7 @@ where
     /// `[cluster] view_probe_attempts_max`. The simulator and tests keep the
     /// built-in default.
     probe_attempts_max: Cell<u32>,
+    recovery_election_allowed: Cell<bool>,
 
     /// This replica's own uncommitted suffix, with the head, commit point and
     /// mutation count the journal was at when it was read.
@@ -1558,6 +1651,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
+            recovery_election_allowed: Cell::new(true),
             local_dvc_suffix: RefCell::new(None),
             journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
@@ -1632,6 +1726,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// run before `init` / `init_as_backup`.
     pub fn set_probe_attempts_max(&self, max: u32) {
         self.probe_attempts_max.set(max);
+    }
+
+    pub fn set_recovery_election_allowed(&self, allowed: bool) {
+        self.recovery_election_allowed.set(allowed);
+    }
+
+    #[must_use]
+    pub const fn recovery_election_allowed(&self) -> bool {
+        self.recovery_election_allowed.get()
     }
 
     pub fn init(&self) {
@@ -1969,6 +2072,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub fn pipeline_has_message_from_client(&self, client_id: u128) -> bool {
         self.pipeline.borrow().has_message_from_client(client_id)
+    }
+
+    #[must_use]
+    pub fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)> {
+        self.pipeline.borrow().pending_request(client_id)
     }
 
     /// True iff this exact `(client, request)` is already in flight. The
@@ -2549,9 +2660,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     // rejoined journal-less elects on equal terms and stands
                     // on its recovered durable state. Any still-live settled
                     // primary answers well before the fallback fires.
-                    let attempts = self.probe_attempts.get() + 1;
+                    let attempts = self.probe_attempts.get().saturating_add(1);
                     self.probe_attempts.set(attempts);
-                    if attempts >= self.probe_attempts_max.get() {
+                    if attempts >= self.probe_attempts_max.get()
+                        && self.recovery_election_allowed.get()
+                    {
                         // Nobody answered: full-cluster bootstrap, so there
                         // is no live primary to fetch state from. Local
                         // recovery is authoritative; abandon the transfer
@@ -4223,6 +4336,7 @@ where
                 parent: consensus.last_prepare_checksum(),
                 request_checksum: old.request_checksum,
                 request: old.request,
+                session: old.session,
                 commit: consensus.commit_max.get(),
                 op,
                 timestamp,
@@ -4399,7 +4513,9 @@ mod fresh_group_start_tests {
 
 #[cfg(test)]
 mod request_queue_tests {
+    use super::test_bus::NoopBus;
     use super::*;
+    use crate::client_table::{ClientTable, ClientTableMode};
     use iggy_binary_protocol::{Command, Operation};
     use iggy_common::ConsumerKind;
     use server_common::poll::AutoCommitReservationToken;
@@ -4422,6 +4538,59 @@ mod request_queue_tests {
             ..RoutedRequestHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_pending_clients_when_checking_capacity_should_reserve_distinct_unprotected_clients() {
+        const CAPACITY: usize = 3;
+        let mut table = ClientTable::with_mode(CAPACITY, ClientTableMode::PartitionSlice);
+        table.commit_capacity(CAPACITY).unwrap();
+        table.commit_request(1, 1, 1, 1).unwrap();
+        let consensus = VsrConsensus::new(1, 0, 1, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        assert!(consensus.has_retry_capacity(&table, 2));
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(PrepareHeader {
+                client: 2,
+                op: 1,
+                ..PrepareHeader::default()
+            }));
+            for client in [0, message_bus::AUTO_COMMIT_CLIENT_ID, 1, 2] {
+                pipeline
+                    .push_request(RequestEntry::new(make_request(client, 1)))
+                    .unwrap();
+            }
+        });
+        assert!(
+            consensus.has_retry_capacity(&table, 3),
+            "only client 2 reserves a new slot"
+        );
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline
+                .push_request(RequestEntry::new(make_request(3, 1)))
+                .unwrap();
+        });
+        assert!(
+            !consensus.has_retry_capacity(&table, 4),
+            "both queues must reserve capacity"
+        );
+        assert!(
+            consensus.has_retry_capacity(&table, 1),
+            "committed protection is reusable"
+        );
+        assert!(
+            consensus.has_retry_capacity(&table, 2),
+            "a pending client already owns its reservation"
+        );
+        consensus.with_pipeline_mut(LocalPipeline::clear_request_queue);
+        assert!(
+            consensus.has_retry_capacity(&table, 3),
+            "queue reset must release its reservations"
+        );
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the prepare reservation must survive queue reset"
+        );
     }
 
     #[test]
@@ -4817,18 +4986,6 @@ mod timestamp_clamp_tests {
 
     use super::*;
     use crate::LocalPipeline;
-
-    /// Clock frozen at a fixed instant, standing in for a lagging wall
-    /// clock on a freshly elected primary.
-    struct FixedClock(u64);
-
-    impl clock::Clock for FixedClock {
-        type Realtime = IggyTimestamp;
-
-        fn realtime(&self) -> Self::Realtime {
-            IggyTimestamp::from(self.0)
-        }
-    }
 
     use crate::test_bus::{NoopBus, make_start_view};
 

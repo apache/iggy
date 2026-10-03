@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -40,19 +41,74 @@ namespace Apache.Iggy.Tests.VsrTests;
 public sealed class EndpointFailoverTests
 {
     [Fact]
-    public async Task ResumesOnASurvivorAfterTheSignedInNodeDies()
+    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite()
+    {
+        const int RefusalCount = 50;
+        using var node = new MockNode();
+        var attempts = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePartitions)
+            {
+                attempts.Enqueue(request);
+                var status = attempts.Count switch
+                {
+                    1 => VsrError.TRANSIENT_NOT_COMMITTED,
+                    <= RefusalCount => VsrError.TRANSIENT_NOT_ACCEPTED,
+                    _ => 0
+                };
+                return Reply(request.Operation, status == 0 ? new byte[4] : [], (uint)status);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1)
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RefusalCount + 1, attempts.Count);
+        var original = attempts.First();
+        Assert.All(attempts, replay =>
+        {
+            Assert.Equal(original.ClientId, replay.ClientId);
+            Assert.Equal(original.Session, replay.Session);
+            Assert.Equal(original.RequestId, replay.RequestId);
+            Assert.Equal(original.Body, replay.Body);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ResumesOnASurvivorAfterTheSignedInNodeDies(bool changeCredentials)
     {
         using var primary = new MockNode();
         using var survivor = new MockNode();
+        var survivorRegistrations = new ConcurrentQueue<MockRequest>();
 
         // The primary leads, so the sign-in settles there and the roster is only remembered - not acted on -
         // until the node dies.
         primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
             ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
             : Answer(request));
-        survivor.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
-            ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, survivor.Port))
-            : Answer(request));
+        survivor.Serve(request =>
+        {
+            if (request.Operation == OPERATION_REGISTER)
+            {
+                survivorRegistrations.Enqueue(request);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, survivor.Port))
+                : Answer(request);
+        });
 
         var configuration = new IggyClientConfigurator
         {
@@ -71,6 +127,12 @@ public sealed class EndpointFailoverTests
         // No auto login: the credentials come from the caller's own sign-in, which is the shape that could not
         // reconnect at all before.
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        if (changeCredentials)
+        {
+            await client.UpdateUserAsync(Identifier.Numeric(7), "renamed", token: TestContext.Current.CancellationToken);
+            await client.ChangePasswordAsync(Identifier.String("renamed"), "iggy", "new-secret",
+                TestContext.Current.CancellationToken);
+        }
         await client.PingAsync(TestContext.Current.CancellationToken);
         Assert.Equal(1, primary.Pings);
 
@@ -84,6 +146,10 @@ public sealed class EndpointFailoverTests
             $"{survivor.Registrations} registrations and {survivor.Pings} pings)");
         Assert.True(survivor.Registrations >= 1, "the remembered credentials signed in again on the survivor");
         Assert.True(survivor.Pings >= 1, "the request landed on the survivor");
+        Assert.NotEmpty(survivorRegistrations);
+        Assert.All(survivorRegistrations, request => Assert.Equal(
+            LoginRegister.Serialize(changeCredentials ? "renamed" : "iggy", changeCredentials ? "new-secret" : "iggy",
+                LoginRegister.ReadBindSecret(request.Body)), request.Body));
     }
 
     [Fact]
@@ -291,6 +357,71 @@ public sealed class EndpointFailoverTests
         await client.PingAsync(TestContext.Current.CancellationToken);
         Assert.True(node.Registrations > registrationsBeforeEviction,
             "the reconnect signed in again with the remembered credentials");
+    }
+
+    [Fact]
+    public async Task LostOffsetReplyDoesNotReplayOverAnotherClientsProgress()
+    {
+        const long FirstOffset = 10;
+        const long AdvancedOffset = 20;
+        const int OffsetAndAckSize = sizeof(long) + sizeof(byte);
+        using var node = new MockNode();
+        using var advanced = new ManualResetEventSlim();
+        var committed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writes = 0;
+        long storedOffset = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+            {
+                var attempt = Interlocked.Increment(ref writes);
+                var offset = BinaryPrimitives.ReadInt64LittleEndian(
+                    request.Body.AsSpan(request.Body.Length - OffsetAndAckSize, sizeof(long)));
+                Interlocked.Exchange(ref storedOffset, offset);
+                if (attempt == 1)
+                {
+                    committed.SetResult();
+                    if (!advanced.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        throw new TimeoutException("The second client did not advance the offset.");
+                    }
+                    return [];
+                }
+                advanced.Set();
+                return Reply(request.Operation, new byte[4]);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.Zero,
+                WaitAfterReconnect = TimeSpan.Zero
+            }
+        };
+        using var first = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+        using var second = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+        await first.ConnectAsync(TestContext.Current.CancellationToken);
+        await first.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await second.ConnectAsync(TestContext.Current.CancellationToken);
+        await second.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        var pending = first.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
+            FirstOffset, 0, TestContext.Current.CancellationToken);
+        await committed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(FirstOffset, Volatile.Read(ref storedOffset));
+        await second.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
+            AdvancedOffset, 0, TestContext.Current.CancellationToken);
+        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => pending);
+        Assert.Equal(2, Volatile.Read(ref writes));
+        Assert.Equal(AdvancedOffset, Volatile.Read(ref storedOffset));
     }
 
     /// <summary>

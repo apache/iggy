@@ -25,15 +25,17 @@ use crate::leader_aware::{node_address, transport_port};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
-    ATTACH_CONSUMER_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
+    BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
     GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
-use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
+use iggy_common::ClientState;
 use iggy_common::{
     BinaryClient, ClusterNode, Credentials, IdKind, Identifier, IggyError, TransportProtocol,
 };
@@ -56,7 +58,7 @@ pub(crate) const ROSTER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const fn is_poll_routing_code(code: u32) -> bool {
     matches!(
         code,
-        ATTACH_CONSUMER_SESSION_CODE
+        BIND_SESSION_CODE
             | GET_POLL_ROUTING_CODE
             | POLL_MESSAGES_ON_PRIMARY_CODE
             | GET_CONSUMER_OFFSET_ROUTING_CODE
@@ -87,13 +89,13 @@ pub(crate) trait PollTransport: BinaryClient + Send + Sync + Sized {
 struct PollRoute {
     generation: u64,
     endpoint: String,
-    consumer_session: AttachConsumerSessionRequest,
+    consumer_session: SessionIdentity,
 }
 
 #[derive(Debug)]
 struct PollConnection<T> {
     client: T,
-    consumer_session: Option<AttachConsumerSessionRequest>,
+    consumer_session: Option<SessionIdentity>,
     usable: bool,
 }
 
@@ -160,7 +162,7 @@ impl<T> PollRouter<T> {
             .take();
     }
 
-    pub(crate) fn credentials(&self) -> Option<Credentials> {
+    pub(crate) fn remembered_credentials(&self) -> Option<Credentials> {
         self.credentials
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -372,14 +374,33 @@ impl<T: PollTransport> PollRouter<T> {
                 || session.session != route.consumer_session.session
                 || session.metadata_watermark < route.consumer_session.metadata_watermark
         }) {
-            connection
+            let response = connection
                 .client
                 .send_poll_request(
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    route.consumer_session.to_bytes(),
+                    BIND_SESSION_CODE,
+                    BindSessionRequest {
+                        version_info: iggy_common::rust_sdk_version_info(
+                            coordinator.sdk_version(),
+                        )?,
+                        identity: route.consumer_session,
+                        bind_secret: coordinator.session_bind_secret().await?,
+                    }
+                    .to_bytes(),
                 )
                 .await
                 .map_err(unaccepted_data_error)?;
+            let bound = LoginRegisterResponse::decode_from(&response)
+                .map_err(|_| IggyError::InvalidFormat)?;
+            if bound.session != route.consumer_session.session {
+                return Err(IggyError::SessionMismatch(
+                    route.consumer_session.session,
+                    bound.session,
+                ));
+            }
+            connection
+                .client
+                .set_state(ClientState::Authenticated)
+                .await;
             connection.consumer_session = Some(route.consumer_session);
         }
         self.validate_route(&route)?;
@@ -520,7 +541,7 @@ mod tests {
     };
     use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterNodeResponse;
     use iggy_binary_protocol::{
-        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier,
+        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier, WireName,
         WirePollingStrategy,
     };
     use iggy_common::{
@@ -558,7 +579,7 @@ mod tests {
     struct Script {
         exchanges: Mutex<VecDeque<Exchange>>,
         route_queries: AtomicUsize,
-        attachments: Mutex<Vec<AttachConsumerSessionRequest>>,
+        attachments: Mutex<Vec<SessionIdentity>>,
         connections: AtomicUsize,
         pause: Mutex<Option<Arc<Pause>>>,
     }
@@ -607,12 +628,22 @@ mod tests {
             ) {
                 self.script.route_queries.fetch_add(1, Ordering::Relaxed);
             }
-            if code == ATTACH_CONSUMER_SESSION_CODE {
-                self.script
-                    .attachments
-                    .lock()
-                    .unwrap()
-                    .push(AttachConsumerSessionRequest::decode_from(payload).unwrap());
+            if code == BIND_SESSION_CODE {
+                let identity = BindSessionRequest::decode_from(payload).unwrap().identity;
+                self.script.attachments.lock().unwrap().push(identity);
+                return result.map(|bytes| {
+                    assert!(
+                        bytes.is_empty(),
+                        "scripted binding supplies its typed result"
+                    );
+                    iggy_binary_protocol::responses::users::LoginRegisterResponse {
+                        user_id: 1,
+                        session: identity.session,
+                        server_protocol_version: iggy_binary_protocol::IGGY_PROTOCOL_VERSION,
+                        server_version: WireName::new("0.11.0").unwrap(),
+                    }
+                    .to_bytes()
+                });
             }
             result
         }
@@ -639,6 +670,23 @@ mod tests {
 
     #[async_trait]
     impl VsrSessionControl for Transport {
+        async fn session_bind_secret(
+            &self,
+        ) -> Result<iggy_binary_protocol::requests::users::login_register::BindSecret, IggyError>
+        {
+            Ok(
+                iggy_binary_protocol::requests::users::login_register::BindSecret::new(Box::new(
+                    [0x5a; 32],
+                )),
+            )
+        }
+        async fn session_identity(&self) -> Result<SessionIdentity, IggyError> {
+            Ok(SessionIdentity {
+                client_id: 7,
+                session: 11,
+                metadata_watermark: 11,
+            })
+        }
         async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
             Ok(())
         }
@@ -705,17 +753,13 @@ mod tests {
             for point in [
                 PausePoint::Reply(routing_code),
                 PausePoint::Connect,
-                PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE),
+                PausePoint::Reply(BIND_SESSION_CODE),
             ] {
                 let mut replacement = PollRoutingResponse::decode_from(&routing()).unwrap();
                 replacement.consumer_session.session = 2;
                 let mut exchanges = vec![(Channel::Coordinator, routing_code, Ok(routing()))];
-                if point == PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE) {
-                    exchanges.push((
-                        Channel::Data,
-                        ATTACH_CONSUMER_SESSION_CODE,
-                        Ok(Bytes::new()),
-                    ));
+                if point == PausePoint::Reply(BIND_SESSION_CODE) {
+                    exchanges.push((Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())));
                 }
                 exchanges.extend([
                     (
@@ -723,11 +767,7 @@ mod tests {
                         routing_code,
                         Ok(replacement.to_bytes()),
                     ),
-                    (
-                        Channel::Data,
-                        ATTACH_CONSUMER_SESSION_CODE,
-                        Ok(Bytes::new()),
-                    ),
+                    (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                     (Channel::Data, code, Ok(Bytes::from_static(b"resumed"))),
                     (Channel::Data, code, Ok(Bytes::from_static(b"warm"))),
                 ]);
@@ -764,7 +804,7 @@ mod tests {
                 replacement.consumer_session.metadata_watermark = 11;
                 assert_eq!(
                     *coordinator.script.attachments.lock().unwrap(),
-                    if point == PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE) {
+                    if point == PausePoint::Reply(BIND_SESSION_CODE) {
                         vec![
                             PollRoutingResponse::decode_from(&routing())
                                 .unwrap()
@@ -804,22 +844,14 @@ mod tests {
             replacement.consumer_session.session = 2;
             let (router, coordinator, request) = fixture([
                 (Channel::Coordinator, routing_code, Ok(routing())),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, code, Ok(Bytes::from_static(b"in flight"))),
                 (
                     Channel::Coordinator,
                     routing_code,
                     Ok(replacement.to_bytes()),
                 ),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, code, Ok(Bytes::from_static(b"queued"))),
             ]);
             let pause = Arc::new(Pause {
@@ -857,11 +889,7 @@ mod tests {
     async fn offset_writes_reuse_the_data_session_with_their_own_route_fence() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -882,11 +910,7 @@ mod tests {
                 GET_CONSUMER_OFFSET_ROUTING_CODE,
                 Ok(routing()),
             ),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (Channel::Data, STORE_CONSUMER_OFFSET_CODE, Ok(Bytes::new())),
             (Channel::Data, DELETE_CONSUMER_OFFSET_CODE, Ok(Bytes::new())),
         ]);
@@ -930,11 +954,7 @@ mod tests {
                     GET_CONSUMER_OFFSET_ROUTING_CODE,
                     Ok(routing()),
                 ),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, STORE_CONSUMER_OFFSET_CODE, Err(error)),
             ]);
             let store = StoreConsumerOffsetRequest {
@@ -973,11 +993,7 @@ mod tests {
                     GET_CONSUMER_OFFSET_ROUTING_CODE,
                     Ok(routing()),
                 ),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, code, Err(error)),
             ]);
             let error = routed_request(&router, &coordinator, &request, code)
@@ -993,22 +1009,14 @@ mod tests {
     async fn acknowledged_metadata_changes_refresh_cached_routes_and_attachments() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
                 Ok(Bytes::from_static(b"first")),
             ),
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1114,11 +1122,7 @@ mod tests {
                 }
                 vec![
                     (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-                    (
-                        Channel::Data,
-                        ATTACH_CONSUMER_SESSION_CODE,
-                        Ok(Bytes::new()),
-                    ),
+                    (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                     (
                         Channel::Data,
                         POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1150,11 +1154,7 @@ mod tests {
     async fn complete_error_replies_preserve_the_attached_connection() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1200,22 +1200,14 @@ mod tests {
             ),
             (Channel::Recovery, PING_CODE, Ok(Bytes::new())),
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
                 Err(IggyError::Disconnected),
             ),
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1295,7 +1287,7 @@ mod tests {
 
     fn routing() -> Bytes {
         PollRoutingResponse {
-            consumer_session: AttachConsumerSessionRequest {
+            consumer_session: SessionIdentity {
                 client_id: 7,
                 session: 1,
                 metadata_watermark: 1,

@@ -1303,3 +1303,11 @@
       type: uint32
     - name: ServerVersionMax
       type: uint32
+- name: SessionMismatch
+  code: 14004
+  format: "vsr session mismatch: requested %d, server bound %d"
+  fields:
+    - name: Requested
+      type: uint64
+    - name: Bound
+      type: uint64

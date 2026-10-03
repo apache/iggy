@@ -121,6 +121,7 @@ public class AsyncTcpConnection {
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
     private final ConsensusSession consensusSession;
+    private volatile boolean sharedSession;
     private final TransientFailoverHandler transientFailoverHandler;
     private final IntConsumer sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
@@ -340,8 +341,21 @@ public class AsyncTcpConnection {
         return consensusSession.metadataWatermark();
     }
 
+    byte[] bindSecret() {
+        return consensusSession.bindSecret();
+    }
+
+    byte[] bindSecret(long clientLow, long clientHigh, long epoch) {
+        return consensusSession.bindSecret(clientLow, clientHigh, epoch);
+    }
+
     long sessionGeneration() {
         return consensusSession.generation();
+    }
+
+    void bindSharedSession(long clientLow, long clientHigh, long epoch, byte[] secret) {
+        consensusSession.bindShared(clientLow, clientHigh, epoch, secret);
+        sharedSession = true;
     }
 
     boolean isAuthenticated() {
@@ -585,7 +599,7 @@ public class AsyncTcpConnection {
                 return;
             }
             if (requiredSessionGeneration != 0 && requiredSessionGeneration != sessionGeneration()) {
-                // Reauthentication replaces the data session and loses its parent attachment.
+                // A replacement channel or eviction reset invalidates the parent attachment.
                 payload.release();
                 responseFuture.completeExceptionally(
                         IggyServerException.fromTcpResponse(TRANSIENT_NOT_ACCEPTED, new byte[0]));
@@ -762,7 +776,7 @@ public class AsyncTcpConnection {
 
     private static boolean isPollRoutingCode(int commandCode) {
         return commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()
-                || commandCode == CommandCode.System.ATTACH_CONSUMER_SESSION.getValue()
+                || commandCode == CommandCode.System.BIND_SESSION.getValue()
                 || commandCode == CommandCode.Messages.GET_POLL_ROUTING.getValue()
                 || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue();
     }
@@ -772,17 +786,18 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Ping is the only command the server answers without a bound session. The
-     * cluster roster is auth-gated as well, so an unauthenticated caller cannot
-     * enumerate the topology and leader selection can only run on a bound
-     * session.
+     * BindSession authenticates with the parent's proof. Primary polls use that
+     * binding, so neither command sends a password login on auxiliary channels.
      */
-    private static boolean requiresAuthentication(int commandCode) {
+    private boolean requiresAuthentication(int commandCode) {
         return !isAllowedBeforeAuthentication(commandCode);
     }
 
-    private static boolean isAllowedBeforeAuthentication(int commandCode) {
-        return commandCode == CommandCode.System.PING.getValue();
+    private boolean isAllowedBeforeAuthentication(int commandCode) {
+        return commandCode == CommandCode.System.PING.getValue()
+                || (sharedSession
+                        && (commandCode == CommandCode.System.BIND_SESSION.getValue()
+                                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue()));
     }
 
     private void sendFrame(

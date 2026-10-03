@@ -376,6 +376,8 @@ async fn seed_topic(client: &IggyClient, segment_size: Option<u64>) {
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 messages_required_to_save: Some(1),
                 segment_size: segment_size.map(IggyByteSize::from),
+                durability: Durability::Persisted,
+                consumer_offset_durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

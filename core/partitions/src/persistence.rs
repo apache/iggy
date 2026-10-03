@@ -166,6 +166,7 @@ impl CheckpointBarrier {
 pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     group: u64,
     instance: u64,
+    recovered_frontier: bool,
     lease: Option<Arc<WriterLease>>,
     epoch: Cell<u64>,
     journal: RefCell<Option<PartitionPrepareJournal<S>>>,
@@ -439,6 +440,10 @@ enum Mutation<S: DurableStorage> {
         initial: SegmentPosition,
         max_size: u64,
     },
+    ReanchorSegments {
+        epoch: u64,
+        next_offset: u64,
+    },
     CertifyView {
         epoch: u64,
         view: u32,
@@ -455,6 +460,9 @@ enum Mutation<S: DurableStorage> {
         prepare: Frozen<4096>,
         durable: bool,
         retained_bytes: u64,
+    },
+    Sync {
+        epoch: u64,
     },
     Truncate {
         epoch: u64,
@@ -488,6 +496,23 @@ struct AppendBatchBytes {
 }
 
 impl PartitionPersistence {
+    /// Persist the recovery fence before a replacement WAL can publish an
+    /// empty frontier that a later process could mistake for intact history.
+    ///
+    /// # Errors
+    /// Returns an error if the prior frontier or recovery fence cannot be read or written.
+    pub async fn fence_missing_history(directory: &Path, incarnation: u64) -> io::Result<()> {
+        if !PartitionPrepareJournal::has_published_frontier(directory).await? {
+            let partition_directory =
+                directory.parent().and_then(Path::to_str).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid partition path")
+                })?;
+            crate::state_transfer::mark_materialization_missing(partition_directory, incarnation)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// # Errors
     /// Returns an error if the partition WAL cannot be recovered.
     pub async fn open(
@@ -563,6 +588,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         let persistence = Rc::new(Self {
             group,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            recovered_frontier: journal.recovered_frontier(),
             lease,
             epoch: Cell::new(0),
             accepted_head: Cell::new(journal.head()),
@@ -608,6 +634,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             failed_writes: Cell::new(0),
         });
         Ok((persistence, prepares))
+    }
+
+    #[must_use]
+    pub const fn recovered_frontier(&self) -> bool {
+        self.recovered_frontier
     }
 
     #[cfg(test)]
@@ -684,6 +715,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
         self.segment_checkpoint.get()
+    }
+
+    /// Queue a reserved offset boundary after checkpointing the preceding chain.
+    pub fn reanchor_segments(&self, next_offset: u64) {
+        self.queue
+            .borrow_mut()
+            .push_back(Mutation::ReanchorSegments {
+                epoch: self.epoch.get(),
+                next_offset,
+            });
     }
 
     pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
@@ -1127,6 +1168,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "partition WAL drain timed out"))?
     }
 
+    /// Queue a barrier for preceding buffered writes; drain before claiming durability.
+    pub fn sync(&self) {
+        self.queue.borrow_mut().push_back(Mutation::Sync {
+            epoch: self.epoch.get(),
+        });
+    }
+
     pub fn start(&self) -> bool {
         let start = !self.retired.get()
             && self.failure.borrow().is_none()
@@ -1184,7 +1232,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     ..
                 } => (*epoch, *retained_bytes),
                 Mutation::CertifyView { epoch, .. }
+                | Mutation::Sync { epoch }
                 | Mutation::EnableSegments { epoch, .. }
+                | Mutation::ReanchorSegments { epoch, .. }
                 | Mutation::Purge { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
@@ -1196,6 +1246,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             let rebuild_references = matches!(
                 mutation,
                 Mutation::EnableSegments { .. }
+                    | Mutation::ReanchorSegments { .. }
                     | Mutation::Purge { .. }
                     | Mutation::Truncate { .. }
                     | Mutation::Checkpoint { .. }
@@ -1286,6 +1337,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             Mutation::EnableSegments {
                 initial, max_size, ..
             } => journal.enable_segment_storage(initial, max_size).await,
+            Mutation::ReanchorSegments { next_offset, .. } => {
+                journal.reanchor_segment_storage(next_offset).await
+            }
             Mutation::CertifyView {
                 view, op, checksum, ..
             } => journal.certify_log_view(view, op, checksum).await,
@@ -1298,6 +1352,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 self.append_batch(journal, prepare, durable, epoch, retained_bytes)
                     .await
             }
+            Mutation::Sync { .. } => journal.sync().await,
             Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
             Mutation::Checkpoint {
                 through_op,

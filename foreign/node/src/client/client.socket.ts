@@ -637,6 +637,7 @@ export class CommandResponseStream extends EventEmitter {
               reconnect: { enabled: false, interval: 0, maxRetries: 0 }
             })
           };
+          entry.client.vsrSession = new VsrSession(this.vsrSession.clientId);
           this.pollConnections.set(endpoint, entry);
         }
         while (entry.busy)
@@ -655,17 +656,10 @@ export class CommandResponseStream extends EventEmitter {
             entry.attachment = undefined;
             await withinDeadline(entry.client.connection.connect(true), deadline,
               () => entry.client.destroy());
-            const credentials = this._signInCredentials();
-            const login = 'token' in credentials ? LOGIN_WITH_TOKEN : LOGIN;
-            const loginPayload = 'token' in credentials
-              ? LOGIN_WITH_TOKEN.serialize(credentials)
-              : LOGIN.serialize(credentials);
-            await entry.client._queueCommand(login.code, loginPayload,
-              true, true, false, deadline);
           }
           if (!entry.attachment?.equals(route.attachment)) {
-            await entry.client._queueCommand(COMMAND_CODE.AttachConsumerSession,
-              route.attachment, true, true, false, deadline);
+            await entry.client._queueCommand(COMMAND_CODE.BindSession,
+              this.vsrSession.bindPayload(route.attachment), true, true, false, deadline);
             entry.attachment = route.attachment;
           }
           if (generation !== this.routingGeneration ||
@@ -861,7 +855,7 @@ export class CommandResponseStream extends EventEmitter {
     handleResp = true,
     deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS
   ): Promise<CommandResponse> {
-    if (isLoginCommand(command) && this.isAuthenticated)
+    if (isLoginCommand(command))
       return this._processVsrLogin(command, payload, handleResp, deadline);
     return this._processVsr(command, payload, handleResp, deadline);
   }
@@ -872,7 +866,27 @@ export class CommandResponseStream extends EventEmitter {
     handleResp: boolean,
     deadline: number
   ): Promise<CommandResponse> {
-    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true, deadline);
+    if (this.isAuthenticated) {
+      await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true, deadline);
+    } else {
+      const resume = this.vsrSession.resumePayload(this.metadataWatermark);
+      if (resume) {
+        const remembered = this.rememberedCredentials;
+        const sameCredentials = remembered && ('token' in remembered
+          ? command === LOGIN_WITH_TOKEN.code && payload.equals(LOGIN_WITH_TOKEN.serialize(remembered))
+          : command === LOGIN.code && payload.equals(LOGIN.serialize(remembered)));
+        if (sameCredentials) {
+          try {
+            return await this._processVsr(COMMAND_CODE.BindSession, resume, handleResp, deadline);
+          } catch (error) {
+            if (!(error instanceof ResponseError) ||
+                (error.errorCode !== UNAUTHENTICATED && error.errorCode !== STALE_CLIENT))
+              throw error;
+          }
+        }
+        this._resetSession(true);
+      }
+    }
     return this._processVsr(command, payload, handleResp, deadline);
   }
 
@@ -884,7 +898,7 @@ export class CommandResponseStream extends EventEmitter {
   ): Promise<CommandResponse> {
     let requestWritten = false;
     try {
-      const prepared = prepareVsrCommand(command, payload);
+      const prepared = prepareVsrCommand(command, payload, this.vsrSession.bindSecret);
       // A transient retry must preserve all request identity fields.
       const frame = this.vsrSession.encode(prepared.command, prepared.payload);
       // Derived from the request's own budget rather than read off the clock,
@@ -929,31 +943,28 @@ export class CommandResponseStream extends EventEmitter {
             throw error;
           if (command === COMMAND_CODE.PollMessagesOnPrimary ||
               command === COMMAND_CODE.GetPollRouting ||
-              command === COMMAND_CODE.AttachConsumerSession)
+              command === COMMAND_CODE.BindSession)
             throw error;
-          lastTransientError = error;
-          // A not-admitted refusal is a statement about who leads, not about
-          // load: a node that stopped being primary refuses forever, so
-          // replaying on this connection never recovers. Hand it back for a
-          // roster re-read once the window is spent. Not-committed (57) stays
-          // here: the request is in flight on this very node, and its outcome
-          // is unknown anywhere else.
-          if (error.errorCode === TRANSIENT_NOT_ACCEPTED &&
+          // A later refusal cannot resolve an earlier uncertain attempt.
+          lastTransientError = lastTransientError?.errorCode === TRANSIENT_NOT_COMMITTED
+            ? lastTransientError : error;
+          if (lastTransientError.errorCode === TRANSIENT_NOT_ACCEPTED &&
               !isLoginCommand(command) &&
               Date.now() >= notAcceptedDeadline)
-            throw new LeaderMovedError(error);
+            throw new LeaderMovedError(lastTransientError);
           const retryDelay = Math.min(
             VSR_RETRY_INTERVAL_MS,
             Math.max(0, deadline - Date.now())
           );
           if (retryDelay === 0)
-            throw error;
+            throw lastTransientError;
           await delay(retryDelay);
         }
       }
 
       if (prepared.command === COMMAND_CODE.LoginRegister ||
-          prepared.command === COMMAND_CODE.LoginRegisterWithAccessToken) {
+          prepared.command === COMMAND_CODE.LoginRegisterWithAccessToken ||
+          prepared.command === COMMAND_CODE.BindSession) {
         this.vsrSession.bind(readRegisteredSession(parsed));
         this.isAuthenticated = true;
         this.userId = parsed.data.readUInt32LE(0);
@@ -961,7 +972,7 @@ export class CommandResponseStream extends EventEmitter {
       this._rememberCredentials(command, payload);
       if (prepared.command === COMMAND_CODE.LogoutUser) {
         this.rememberedCredentials = undefined;
-        this._resetSession();
+        this._resetSession(true);
       }
       // Every roster read feeds the redial candidates, whoever asked for it
       // and whatever it says: a node dies together with its address, the
@@ -976,8 +987,8 @@ export class CommandResponseStream extends EventEmitter {
       if (error instanceof LeaderMovedError)
         throw error;
       // Once bytes were handed to the socket, a local transport or decode
-      // failure leaves the request outcome ambiguous. Register a fresh session
-      // rather than replaying that request under a different client identity.
+      // failure leaves the request outcome ambiguous. Drop the transport while
+      // retaining the logical session and its bind proof.
       if (!(error instanceof ResponseError) && requestWritten)
         this._resetSession();
       if (error instanceof VsrEvictionError)
@@ -1150,7 +1161,7 @@ export class CommandResponseStream extends EventEmitter {
     this._execQueue = [];
   }
 
-  private _resetSession(): void {
+  private _resetSession(forget = false): void {
     this._clearPollRouting();
     this.clustered = undefined;
     if (!this.isAuthenticated &&
@@ -1159,7 +1170,8 @@ export class CommandResponseStream extends EventEmitter {
       return;
     this.isAuthenticated = false;
     this.userId = undefined;
-    this.vsrSession.reset();
+    if (forget)
+      this.vsrSession.reset();
     this.emit('sessionReset');
   }
 

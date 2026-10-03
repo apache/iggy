@@ -59,19 +59,25 @@ use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::wire::verify_request_checksum;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
+use consensus::MetadataHandle;
+use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
 };
+use iggy_binary_protocol::requests::system::SessionIdentity;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     EvictionReason, GenericHeader, Operation, RequestHeader, RoutedRequestHeader,
 };
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -376,7 +382,11 @@ pub(in crate::dispatch) fn classify(header: &RoutedRequestHeader, bound: bool) -
         ) {
             return RequestClass::LegacyLogin;
         }
-        if nr_code != PING_CODE && !bound {
+        if !matches!(
+            nr_code,
+            PING_CODE | iggy_binary_protocol::codes::BIND_SESSION_CODE
+        ) && !bound
+        {
             return RequestClass::UnauthenticatedRead;
         }
         return RequestClass::NonReplicatedRead;
@@ -604,10 +614,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `bound` is Some here: `classify` sends unbound transports to
             // `UnboundReplicated`.
             let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
-            let consumer_session = if matches!(
-                request.header().operation,
-                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) {
+            let consumer_session = {
                 let attachment = sessions
                     .borrow()
                     .attached_consumer_session(transport_client_id);
@@ -624,8 +631,6 @@ async fn handle_client_request<B, MJ, S, SB>(
                         return;
                     }
                 }
-            } else {
-                None
             };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
@@ -786,6 +791,60 @@ where
         .borrow()
         .as_ref()
         .and_then(std::rc::Weak::upgrade)
+}
+
+#[allow(clippy::future_not_send)]
+async fn complete_session_binding<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    identity: SessionIdentity,
+    secret: BindSecret,
+) -> Result<(u32, u64), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let watermark = identity.metadata_watermark.max(identity.session);
+    reads::await_metadata_read_frontier(shard, watermark).await?;
+    let (user_id, session, attachment) = if shard.id == 0 {
+        shard
+            .plane
+            .metadata()
+            .client_table
+            .borrow_mut()
+            .bind_session(identity.client_id, identity.session, secret.expose_secret())?
+    } else {
+        let (reply, receiver) = shard::channel(1);
+        shard.forward_metadata_submit(shard::MetadataSubmit::BindSession {
+            vsr_client_id: identity.client_id,
+            session: identity.session,
+            secret,
+            reply,
+        });
+        let outcome = pin!(receiver.recv());
+        let deadline = pin!(
+            shard
+                .bus
+                .sleep(shard.plane.metadata().applied_frontier().read_budget())
+        );
+        match select(outcome, deadline).await {
+            Either::Left((result, _)) => result.map_err(|_| IggyError::TransientNotAccepted)??,
+            Either::Right(_) => return Err(IggyError::TransientNotAccepted),
+        }
+    };
+    sessions.borrow_mut().bind_authenticated_connection(
+        transport_client_id,
+        identity.client_id,
+        session,
+        user_id,
+        attachment,
+        watermark,
+    )?;
+    Ok((user_id, session))
 }
 
 #[cfg(test)]
