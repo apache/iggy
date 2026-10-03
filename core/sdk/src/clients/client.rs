@@ -122,8 +122,8 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
 ///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
 ///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
-///    client that has been shut down cannot reconnect. Note, if `auto-login` is configured, the client
-///    will reconnect automatically and undo the disconnect.
+///    client that has been shut down cannot reconnect. The disconnect holds until the next
+///    [`connect()`]: requests fail and nothing reconnects in the background, even with `auto-login`.
 ///
 /// # Examples
 ///
@@ -934,9 +934,15 @@ impl IggyClient {
 
 impl Drop for IggyClient {
     fn drop(&mut self) {
+        self.stop_heartbeat();
+    }
+}
+
+impl IggyClient {
+    fn stop_heartbeat(&self) {
         let heartbeat_handle = self
             .heartbeat_handle
-            .get_mut()
+            .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
         if let Some(handle) = heartbeat_handle {
@@ -994,6 +1000,10 @@ impl Client for IggyClient {
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // A heartbeat ping on a disconnected client only logs errors, and on
+        // QUIC a redial it starts during the disconnect blocks the call.
+        // `connect` starts the heartbeat again.
+        self.stop_heartbeat();
         self.client.read().await.disconnect().await
     }
 
