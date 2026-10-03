@@ -27,6 +27,7 @@ use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, Pr
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
+use metadata::stm::stream::PartitionIdentity;
 use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
@@ -936,14 +937,30 @@ where
                     }
                 }
             }
-            LifecycleFrame::TruncatePartition {
-                namespace,
-                up_to_offset,
-            } => {
-                // Pump-side enforcement of a committed delete watermark. The
-                // committed offset is identical on every replica, so the local
-                // deletion converges; idempotent if already trimmed past it.
+            LifecycleFrame::TruncatePartition { namespace } => {
+                let Some((identity, up_to_offset)) = self
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .with_committed_partition(namespace, |partition| {
+                        (
+                            PartitionIdentity::from(partition),
+                            partition.deleted_up_to_offset,
+                        )
+                    })
+                else {
+                    return;
+                };
+                if up_to_offset == 0
+                    || Some(identity.created_revision) != self.shards_table.epoch_for(namespace)
+                {
+                    return;
+                }
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    if identity.purge_generation != partition.applied_purge_generation() {
+                        return;
+                    }
                     let removal = partition.remove_sealed_segments_up_to(up_to_offset).await;
                     if removal.segments > 0 {
                         // See the cleaner arm: a truncate commits on the
@@ -966,98 +983,8 @@ where
                 namespace,
                 generation,
             } => {
-                // Pump-side enforcement of a committed `PurgeTopic`: reset the
-                // partition to empty at offset 0 and clear consumer offsets.
-                // Idempotent per generation -- skip if already applied so a
-                // redundant reconcile pass does not wipe messages sent since.
-                let config = self.plane.partitions().config().clone();
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace)
-                    && partition.applied_purge_generation() < generation
-                {
-                    match partition.purge(&config, generation).await {
-                        Ok(()) => {
-                            // The purge unlinked the very bytes this shard is
-                            // serving: the cached offer still advertises the
-                            // pre-purge manifest and the payload cache can
-                            // answer chunk requests for it without touching
-                            // disk, so a puller would install purged data. Both
-                            // are keyed on pre-purge content, so neither can
-                            // notice on its own.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            tracing::debug!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                "purge-partition reset partition to empty"
-                            );
-                        }
-                        Err(partitions::PurgeError::FrontierNotRecorded) => {
-                            // NOT fenced: nothing was mutated, so the chain is
-                            // whole and `applied_purge_generation` is unmoved,
-                            // which means the reconciler's `committed > applied`
-                            // gate still sees this purge as outstanding.
-                            // Fencing here would quarantine live data, and the
-                            // fence's own frontier write would first stamp the
-                            // pre-purge counter the purge was about to reset.
-                            //
-                            // NOT woken: staging a purge counts as work in the
-                            // pass, which keeps the fast-skip disarmed, so the
-                            // ordinary periodic pass re-issues until one lands
-                            // and stops once `applied` catches `committed`. An
-                            // eager wake here closes a loop with no pacing in
-                            // it at all -- pass, stage, defer, wake -- and on a
-                            // disk that refuses instantly that is a full O(N)
-                            // reconcile scan and a real `atomic_replace`
-                            // attempt per turn, holding the partition write
-                            // lock each time.
-                            tracing::warn!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                "purge-partition deferred: could not record the frontier reset; \
-                                 the reconciler re-issues it while the generation stays unapplied"
-                            );
-                        }
-                        Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
-                            // NOT fenced: the wipe ran and a fresh chain is
-                            // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
-                            // Same pacing argument as the frontier deferral
-                            // above; the caches already describe wiped bytes.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            tracing::warn!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition deferred: reset applied but the generation \
-                                 record failed; the reconciler re-issues it"
-                            );
-                        }
-                        Err(error @ partitions::PurgeError::Unserviceable(_)) => {
-                            // Past the drain, so this group has no serviceable
-                            // chain and the next append panics on
-                            // `active_segment()`. Fence it for rebuild, exactly
-                            // as a failed state-transfer convergence does. The
-                            // counters were already reset to 0 before the
-                            // fallible plant, so the fence's advancing write
-                            // records the post-purge frontier.
-                            tracing::error!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                generation,
-                                %error,
-                                "purge-partition failed to reset partition; fencing it for rebuild"
-                            );
-                            // Fenced, but the caches still describe the
-                            // pre-purge bytes until the rebuild lands.
-                            self.drop_partition_transfer_state(namespace, partition);
-                            self.fence_partition_for_rebuild(namespace, partition, None)
-                                .await;
-                        }
-                    }
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    partition.request_purge(generation).await;
                 }
             }
         }

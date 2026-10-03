@@ -4094,49 +4094,9 @@ pub fn build_truncate_partition_client_message(
     template: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
-    stream_id: u32,
-    topic_id: u32,
-    partition_id: u32,
-    up_to_offset: u64,
+    request: &TruncatePartitionRequest,
 ) -> Message<RoutedRequestHeader> {
-    build_truncate_partition_client_message_with_identifiers(
-        template,
-        client_id,
-        session,
-        WireIdentifier::numeric(stream_id),
-        WireIdentifier::numeric(topic_id),
-        partition_id,
-        up_to_offset,
-    )
-}
-
-/// [`build_truncate_partition_client_message`] with the client's raw wire
-/// identifiers (name or id) instead of resolved numeric ids.
-///
-/// Used when the target does not resolve on the handling node: the truncate
-/// still commits, and the apply rejects it as a committed result, keeping the
-/// client's request sequence contiguous while surfacing the typed error.
-///
-/// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few small fields, so this cannot happen in practice.
-#[must_use]
-pub fn build_truncate_partition_client_message_with_identifiers(
-    template: &RoutedRequestHeader,
-    client_id: u128,
-    session: u64,
-    stream_id: WireIdentifier,
-    topic_id: WireIdentifier,
-    partition_id: u32,
-    up_to_offset: u64,
-) -> Message<RoutedRequestHeader> {
-    let body = TruncatePartitionRequest {
-        stream_id,
-        topic_id,
-        partition_id,
-        up_to_offset,
-    }
-    .to_bytes();
+    let body = request.to_bytes();
     let header_size = size_of::<RoutedRequestHeader>();
     let total = header_size + body.len();
     let mut msg = Message::<RoutedRequestHeader>::new(total);

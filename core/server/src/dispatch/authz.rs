@@ -100,6 +100,7 @@ where
                 | Operation::RemoveConsumerGroupMember
                 | Operation::CompleteConsumerGroupRevocation
                 | Operation::TruncatePartition
+                | Operation::PurgePartition
                 | Operation::CreateStream
                 | Operation::UpdateStream
                 | Operation::DeleteStream

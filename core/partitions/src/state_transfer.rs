@@ -64,7 +64,8 @@ use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 1;
+const LEGACY_CONSUMER_OFFSETS_VERSION: u8 = 1;
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 2;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -294,6 +295,8 @@ impl StagedSegmentMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ConsumerOffsetsWire {
     pub purge_generation: u64,
+    /// Zero for artifacts produced before purges had a replicated boundary.
+    pub purge_floor_op: u64,
     /// Checksum of the prepare at the offer's committed operation.
     pub prepare_checksum: Option<u128>,
     pub checkpoint_prepare: Vec<u8>,
@@ -320,7 +323,7 @@ impl ConsumerOffsetsWire {
     /// {id u32, offset u64}xN | {id u32, offset u64}xM |
     /// {client u128, watermark u64, latest_commit u64, user_id u32,
     /// committed_window u128}xD | checksum_present u8 | prepare_checksum u128 |
-    /// prepare_length u32 | checkpoint_prepare bytes | XxHash3_64 trailer`. Little-endian throughout.
+    /// prepare_length u32 | checkpoint_prepare bytes | purge_floor_op u64 | XxHash3_64 trailer`. Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         // Size exactly rather than guess; the reservation assert keeps the
@@ -335,7 +338,7 @@ impl ConsumerOffsetsWire {
             + size_of::<u128>()
             + size_of::<u32>()
             + self.checkpoint_prepare.len()
-            + size_of::<u64>();
+            + 2 * size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
         out.push(CONSUMER_OFFSETS_VERSION);
@@ -366,6 +369,7 @@ impl ConsumerOffsetsWire {
                 .to_le_bytes(),
         );
         out.extend_from_slice(&self.checkpoint_prepare);
+        out.extend_from_slice(&self.purge_floor_op.to_le_bytes());
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -396,7 +400,7 @@ impl ConsumerOffsetsWire {
         if magic != CONSUMER_OFFSETS_MAGIC {
             return Err(ConsumerOffsetsWireError::BadMagic);
         }
-        if version != CONSUMER_OFFSETS_VERSION {
+        if version != CONSUMER_OFFSETS_VERSION && version != LEGACY_CONSUMER_OFFSETS_VERSION {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
         let purge_generation = cursor.u64()?;
@@ -419,6 +423,11 @@ impl ConsumerOffsetsWire {
             return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum);
         }
         let checkpoint_prepare = cursor.take(prepare_length)?.to_vec();
+        let purge_floor_op = if version == CONSUMER_OFFSETS_VERSION {
+            cursor.u64()?
+        } else {
+            0
+        };
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
             // encoder, and telling the operator the artifact is short would
@@ -429,6 +438,7 @@ impl ConsumerOffsetsWire {
         }
         Ok(Self {
             purge_generation,
+            purge_floor_op,
             prepare_checksum,
             checkpoint_prepare,
             next_offset,
@@ -714,6 +724,7 @@ mod tests {
 
     fn table() -> ConsumerOffsetsWire {
         ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 3,
@@ -747,6 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn given_legacy_offset_artifact_when_decoded_should_preserve_state_without_a_purge_floor() {
+        let expected = table();
+        let mut bytes = expected.encode();
+        bytes[CONSUMER_OFFSETS_MAGIC.len()] = LEGACY_CONSUMER_OFFSETS_VERSION;
+        bytes.truncate(bytes.len() - 2 * size_of::<u64>());
+        let checksum = state_artifact_checksum(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        assert_eq!(ConsumerOffsetsWire::decode(&bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn given_replicated_purge_floor_when_transferred_should_preserve_the_boundary() {
+        let mut expected = table();
+        expected.purge_floor_op = 7;
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&expected.encode()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn transferred_prepare_checksum_is_covered_by_the_artifact() {
         let mut table = table();
         table.prepare_checksum = Some(u128::MAX - 7);
@@ -769,6 +801,7 @@ mod tests {
     #[test]
     fn given_empty_table_when_encoded_should_round_trip() {
         let empty = ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -838,6 +871,7 @@ mod tests {
     #[test]
     fn given_unordered_dedup_clients_when_decoded_should_reject() {
         let unordered = ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -855,6 +889,7 @@ mod tests {
     #[test]
     fn given_reserved_client_in_dedup_when_decoded_should_reject() {
         let reserved = ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -951,6 +986,7 @@ mod tests {
     #[test]
     fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
         let duplicate = ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -967,6 +1003,7 @@ mod tests {
             })
         );
         let unordered = ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -1230,6 +1267,7 @@ pub enum PartitionArtifactSource<'a> {
 pub struct PartitionStateTransferOffer {
     /// `== commit_min == commit_max` at build (caught-up primary gate).
     pub commit_op: u64,
+    pub purge_generation: u64,
     /// Ascending base offset; one artifact per non-empty retained segment.
     pub segments: Vec<SegmentArtifactSource>,
     /// Resident consumer offsets, dedup state, and an optional checkpoint prepare.
@@ -1435,6 +1473,15 @@ pub enum PartitionInstallError {
         commit_op: u64,
         commit_min: u64,
     },
+    InvalidPurgeFloor {
+        floor_op: u64,
+        commit_op: u64,
+    },
+    /// The installed offset space cannot be used without its durable boundary.
+    PurgeNotDurable {
+        source: iggy_common::IggyError,
+        frontier: u64,
+    },
     /// The incoming frontier could not be made durable before the swap, so the
     /// install refuses rather than enter a window whose only durable witness
     /// would be the segments the failure path quarantines away.
@@ -1515,6 +1562,17 @@ impl fmt::Display for PartitionInstallError {
             Self::FrontierNotDurable { frontier } => write!(
                 f,
                 "could not record the incoming offset frontier {frontier} before the swap"
+            ),
+            Self::InvalidPurgeFloor {
+                floor_op,
+                commit_op,
+            } => write!(
+                f,
+                "purge floor {floor_op} is not valid for transfer commit {commit_op}"
+            ),
+            Self::PurgeNotDurable { source, frontier } => write!(
+                f,
+                "could not persist the purge boundary at frontier {frontier}: {source}"
             ),
             Self::OfferRewindsDurableData {
                 offer_next_offset,
@@ -2111,6 +2169,7 @@ where
         );
         let offer = Rc::new(PartitionStateTransferOffer {
             commit_op,
+            purge_generation: offsets_wire.purge_generation,
             segments,
             offsets: (offsets_entry, offsets_bytes),
         });
@@ -2327,6 +2386,7 @@ where
             checkpoint_prepare,
             prepare_checksum,
             purge_generation: self.applied_purge_generation,
+            purge_floor_op: self.purge_barrier_op,
             next_offset,
             consumers,
             groups,
@@ -2613,6 +2673,14 @@ where
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
+        if offsets_wire.purge_floor_op > commit_op
+            || (offsets_wire.purge_floor_op > 0 && offsets_wire.purge_generation == 0)
+        {
+            return Err(PartitionInstallError::InvalidPurgeFloor {
+                floor_op: offsets_wire.purge_floor_op,
+                commit_op,
+            });
+        }
         if self.persistence.is_some()
             && (offsets_wire.prepare_checksum.is_none()
                 || (commit_op > 0 && offsets_wire.checkpoint_prepare.is_empty()))
@@ -2658,22 +2726,13 @@ where
         // replica than on the rest of the group. A purge is the one
         // legitimate rewind, and the artifact carries the generation that
         // proves one happened.
-        // Against the METADATA plane's committed generation, which the caller
-        // reads off durable state, NOT against `self.applied_purge_generation`:
-        // that one hydrates from `purge.gen`, which a kill before the purge's
-        // record step leaves absent or stale, so a post-restart rejoin of an
-        // ever-purged topic could see `offered > applied` and call it an
-        // advancing purge. That is the canonical rejoin, and treating it as a
-        // purge disables the `OfferRewindsDurableData` refusal below -- the
-        // one guard standing between an offer that rewinds this replica's
-        // offset space and its durable data.
-        // Second disjunct: this replica has NOT applied the committed purge, so
-        // its frontier still measures the pre-purge offset space and cannot be
-        // compared against a post-purge offer. Restricted to `next_offset == 0`
-        // -- the state a purge leaves before anything is appended -- so an
-        // origin that merely lags within the same purge era still fails the
-        // fence rather than rewinding this replica's durable post-purge data.
-        let purge_advances = offsets_wire.purge_generation > committed_purge_generation
+        // A replicated boundary proves that a newer applied generation starts
+        // a new offset space, even when the offer includes post-purge messages.
+        // Legacy artifacts lack that proof: compare their generation against
+        // metadata, or accept an empty offer for an unapplied committed purge.
+        let purge_advances = (offsets_wire.purge_floor_op > 0
+            && offsets_wire.purge_generation > self.applied_purge_generation)
+            || offsets_wire.purge_generation > committed_purge_generation
             || (self.applied_purge_generation < committed_purge_generation
                 && offsets_wire.next_offset == 0);
         // The COMMITTED frontier, which is what an offer is comparable against:
@@ -3379,16 +3438,13 @@ where
         );
         self.stats.set_current_offset(end);
 
-        // A receiver that missed a purge must not be re-wiped by the
-        // reconciler right after installing post-purge data. Recorded durably
-        // for the same reason the purge itself records it: the reconciler
-        // gate hydrates from `purge.gen` at boot, so a memory-only stamp
-        // would make a restart re-purge the just-installed data and pull it
-        // all over again. A write failure only re-opens that restart window
-        // (the wipe-then-retransfer is self-healing, peers keep the data),
-        // so it is reported separately from the mandatory offset writes.
+        // Persist the boundary before installing the WAL checkpoint, otherwise
+        // restart could apply the purge again and erase transferred messages.
+        // Legacy artifacts have no canonical boundary and retain the previous
+        // advisory generation-write behavior.
         let mut purge_generation_recorded = true;
-        if offsets_wire.purge_generation > self.applied_purge_generation
+        if (offsets_wire.purge_generation > self.applied_purge_generation
+            || offsets_wire.purge_floor_op > self.purge_barrier_op)
             && let Some(dir) = self.partition_dir.clone()
         {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
@@ -3396,9 +3452,16 @@ where
                 &path,
                 offsets_wire.purge_generation,
                 self.created_revision,
+                offsets_wire.purge_floor_op,
             )
             .await
             {
+                if offsets_wire.purge_floor_op > 0 {
+                    return Err(PartitionInstallError::PurgeNotDurable {
+                        source: error,
+                        frontier: next_offset,
+                    });
+                }
                 tracing::warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
@@ -3415,6 +3478,8 @@ where
         self.applied_purge_generation = self
             .applied_purge_generation
             .max(offsets_wire.purge_generation);
+        self.purge_floor_op = self.purge_floor_op.max(offsets_wire.purge_floor_op);
+        self.purge_barrier_op = self.purge_barrier_op.max(offsets_wire.purge_floor_op);
         // Releasing the deferred-purge fence with it. Satisfying the generation
         // here is what stops the reconciler re-issuing the purge that armed the
         // fence, so leaving the flag set strands the replica quorum-invisible on

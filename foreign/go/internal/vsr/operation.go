@@ -63,12 +63,14 @@ const (
 	OperationSendMessages         Operation = 160
 	OperationStoreConsumerOffset  Operation = 161
 	OperationDeleteConsumerOffset Operation = 162
+	OperationPurgePartition       Operation = 163
 )
 
 // Band boundaries. The internal band is never client-sent.
 const (
-	internalBandStart = OperationCreateTopicWithAssignments
-	metadataBandStart = OperationCreateStream
+	internalBandStart  = OperationCreateTopicWithAssignments
+	metadataBandStart  = OperationCreateStream
+	partitionBandStart = OperationSendMessages
 )
 
 // allOperations lists every declared discriminant in wire order. It backs both
@@ -108,6 +110,7 @@ var allOperations = []Operation{
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
+	OperationPurgePartition,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -185,10 +188,10 @@ func IsKnownOperation(operation Operation) bool {
 	return ok
 }
 
-// IsInternal reports whether the operation belongs to the replica-internal
-// band, which a client never sends.
+// IsInternal reports whether the operation is reserved for replicas.
 func IsInternal(operation Operation) bool {
-	return operation >= internalBandStart && operation < metadataBandStart
+	return operation >= internalBandStart && operation < metadataBandStart ||
+		operation == OperationPurgePartition
 }
 
 // IsMetadata reports whether the operation replicates through the metadata
@@ -196,7 +199,7 @@ func IsInternal(operation Operation) bool {
 // DeleteSegments sits inside the metadata band but resolves to a partition
 // truncation server-side.
 func IsMetadata(operation Operation) bool {
-	if IsInternal(operation) {
+	if IsInternal(operation) && operation < partitionBandStart {
 		return true
 	}
 	if operation == OperationDeleteSegments {

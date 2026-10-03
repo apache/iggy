@@ -341,7 +341,8 @@ pub(crate) fn authorize(
         | Operation::DeletePersonalAccessToken
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
-        | Operation::DeleteConsumerOffset => None,
+        | Operation::DeleteConsumerOffset
+        | Operation::PurgePartition => None,
     }
 }
 

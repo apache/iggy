@@ -122,6 +122,7 @@ impl PurgeStorageHarness {
             &format!("{}/purge.gen", harness.partition_directory()),
             OLD_GENERATION,
             CREATED_REVISION,
+            0,
         )
         .await
         .unwrap();
@@ -404,7 +405,11 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
 
             // Check the purge's effects on the live partition before discarding it.
             partition
-                .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(
+                    &harness.storage,
+                    NEW_GENERATION,
+                    partition.consensus().sequencer().current_sequence(),
+                )
                 .await
                 .expect("complete purge cleanup");
             assert_eq!(

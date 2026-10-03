@@ -112,15 +112,16 @@ func TestIsKnownOperation_RejectsUndeclaredDiscriminants(t *testing.T) {
 		assert.True(t, IsKnownOperation(operation), "operation %d", operation)
 	}
 
-	undeclared := []Operation{4, 63, 69, 127, 150, 159, 163, 164, 165, 255}
+	undeclared := []Operation{4, 63, 69, 127, 150, 159, 164, 165, 255}
 	for _, operation := range undeclared {
 		assert.False(t, IsKnownOperation(operation), "operation %d", operation)
 	}
 }
 
-func TestIsInternal_CoversTheInternalBandOnly(t *testing.T) {
+func TestIsInternal_CoversTheInternalBandAndPartitionPurge(t *testing.T) {
 	assert.True(t, IsInternal(OperationCreateTopicWithAssignments))
 	assert.True(t, IsInternal(OperationTruncatePartition))
+	assert.True(t, IsInternal(OperationPurgePartition))
 	assert.False(t, IsInternal(OperationLogout))
 	assert.False(t, IsInternal(OperationCreateStream))
 	assert.False(t, IsInternal(OperationSendMessages))
@@ -152,6 +153,7 @@ func TestIsMetadata_ExcludesDeleteSegments(t *testing.T) {
 		OperationSendMessages,
 		OperationStoreConsumerOffset,
 		OperationDeleteConsumerOffset,
+		OperationPurgePartition,
 	}
 	for _, operation := range nonMetadata {
 		assert.False(t, IsMetadata(operation), "operation %d", operation)
@@ -177,6 +179,7 @@ func TestIsResultFramed_ExcludesSendMessages(t *testing.T) {
 		OperationNonReplicated,
 		OperationLogout,
 		OperationDeleteSegments,
+		OperationPurgePartition,
 	}
 	for _, operation := range unframed {
 		assert.False(t, IsResultFramed(operation), "operation %d", operation)

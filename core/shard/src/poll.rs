@@ -20,8 +20,8 @@
 //! 1. The owner snapshots the history identity and read resources.
 //! 2. Resident reads complete inline. Disk reads reserve completion capacity
 //!    before detached I/O and return through the owner's completion lane.
-//! 3. The owner checks the reply connection, history, and recovery state, admits
-//!    any automatic commit, and updates progress before releasing the reply.
+//! 3. The owner checks the reply connection, history, committed purge generation,
+//!    and recovery state before admitting progress and releasing the reply.
 //!
 //! A disk read can yield while purge or state transfer replaces the history,
 //! even on the same shard thread. The detached task therefore cannot advance
@@ -37,7 +37,7 @@ use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::PollMetadata;
+use metadata::stm::stream::{PartitionIdentity, PollMetadata};
 use partitions::{PollCompletion, PollPlan, PollReadResult};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -139,10 +139,34 @@ where
         reply: Sender<PartitionReadReply>,
     ) {
         let partitions = self.plane.partitions();
+        let committed_identity = if matches!(
+            read,
+            PartitionRead::ConsumerOffset { .. }
+                | PartitionRead::GroupOffsetState { .. }
+                | PartitionRead::ResolveSegmentDeleteOffset { .. }
+        ) {
+            self.plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .with_committed_partition(namespace, |partition| PartitionIdentity::from(partition))
+        } else {
+            None
+        };
         let rejected = partitions
             .with_partition(&namespace, |partition| {
-                if partition.requires_state_transfer() {
+                if partition.requires_state_transfer()
+                    || committed_identity.is_some_and(|identity| {
+                        identity.purge_generation > partition.applied_purge_generation()
+                    })
+                {
                     return true;
+                }
+                if matches!(read, PartitionRead::ResolveSegmentDeleteOffset { .. }) {
+                    return committed_identity.is_none_or(|identity| {
+                        Some(identity.created_revision) != self.shards_table.epoch_for(namespace)
+                            || identity.purge_generation != partition.applied_purge_generation()
+                    });
                 }
                 if let PartitionRead::PollOnPrimary { attachment, .. } = &read {
                     let consensus = partition.consensus();
@@ -261,14 +285,17 @@ where
             PartitionRead::ClearGroupLastPolled { group_id } => partitions
                 .clear_group_last_polled(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |()| PartitionReadReply::Ack),
-            PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
-                .segment_delete_resolution(&namespace, count)
-                .map_or(PartitionReadReply::NotFound, |(up_to_offset, lagging)| {
-                    PartitionReadReply::SegmentDeleteOffset {
-                        up_to_offset,
-                        lagging,
-                    }
-                }),
+            PartitionRead::ResolveSegmentDeleteOffset { count } => committed_identity
+                .and_then(|identity| {
+                    partitions.segment_delete_resolution(&namespace, count).map(
+                        |(up_to_offset, lagging)| PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
+                            identity,
+                        },
+                    )
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
         };
         let _ = reply.try_send(result);
     }
@@ -302,18 +329,35 @@ where
         if reply.is_disconnected() {
             return;
         }
-        if attachment.is_some_and(|attachment| {
-            !attachment.session.is_valid()
-                || !attachment
-                    .metadata
-                    .is_valid(self.plane.metadata().mux_stm.streams(), namespace)
-        }) {
+        let partitions = self.plane.partitions();
+        // Purge is acknowledged before the reconciler replaces local history.
+        let committed_purge = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_purge_generation(
+                namespace.stream_id(),
+                namespace.topic_id(),
+                namespace.partition_id(),
+            );
+        if partitions
+            .with_partition(&namespace, |partition| {
+                committed_purge > partition.applied_purge_generation()
+            })
+            .unwrap_or(false)
+            || attachment.is_some_and(|attachment| {
+                !attachment.session.is_valid()
+                    || !attachment
+                        .metadata
+                        .is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+            })
+        {
             let _ = reply.try_send(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted,
             ));
             return;
         }
-        let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();
         match partitions.complete_poll(&namespace, result) {
             Ok(PollCompletion {

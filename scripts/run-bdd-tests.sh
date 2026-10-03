@@ -36,7 +36,7 @@ usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | raw_command | stream_crud | all  (default: all)"
+  log "  feature: basic_messaging | leader_redirection | raw_command | stream_crud | stream_topic_purge | all  (default: all)"
   log ""
   log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
   log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
@@ -49,7 +49,7 @@ usage(){
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|stream_crud|all) ;;
+  basic_messaging|leader_redirection|raw_command|stream_crud|stream_topic_purge|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -69,7 +69,7 @@ ALL_COMPOSE_FILES=(
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|stream_crud|all)
+  basic_messaging|leader_redirection|raw_command|stream_crud|stream_topic_purge|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
@@ -119,6 +119,15 @@ run_suite(){
   if [ "$FEATURE" = "stream_crud" ]; then
     case "$svc" in
       rust-bdd|java-bdd) ;;
+      *)
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
+    esac
+  fi
+
+  if [ "$FEATURE" = "stream_topic_purge" ]; then
+    case "$svc" in
+      rust-bdd|go-bdd) ;;
       *)
         unsupported "$FEATURE" "$svc" || return 1
         return 0 ;;

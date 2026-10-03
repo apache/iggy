@@ -65,6 +65,7 @@ use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfi
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
+use metadata::stm::stream::PartitionIdentity;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::state_transfer::TransferArtifact;
 use partitions::{
@@ -413,6 +414,7 @@ pub enum PartitionReadReply {
     SegmentDeleteOffset {
         up_to_offset: Option<u64>,
         lagging: bool,
+        identity: PartitionIdentity,
     },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
@@ -830,12 +832,10 @@ pub enum LifecycleFrame {
         max_bytes: Option<u64>,
     },
     /// Reconciler-staged enforcement of a committed `TruncatePartition`
-    /// watermark: delete sealed segments up to `up_to_offset` on the pump,
-    /// serialized with reads. Each replica applies the committed offset
-    /// locally and idempotently.
+    /// watermark. The pump reads the current metadata so queued work cannot
+    /// carry an old offset past a purge or partition recreation.
     TruncatePartition {
         namespace: IggyNamespace,
-        up_to_offset: u64,
     },
     /// Reconciler-staged enforcement of a committed `PurgeTopic`: reset the
     /// partition to a single empty segment at offset 0 and clear consumer
@@ -2537,23 +2537,18 @@ where
         }
     }
 
-    /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
-    /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
-    /// this after observing a committed delete watermark for an owned partition.
-    pub fn request_truncate_partition(&self, namespace: IggyNamespace, up_to_offset: u64) {
+    /// Ask this shard's pump to enforce the namespace's current delete watermark.
+    pub fn request_truncate_partition(&self, namespace: IggyNamespace) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
         };
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::TruncatePartition {
             namespace,
-            up_to_offset,
         }));
     }
 
-    /// Stage a `PurgePartition` enforcement for `namespace` on this shard's
-    /// pump: reset the partition to empty at offset 0 and clear consumer
-    /// offsets. The reconciler calls this after observing a committed purge
-    /// generation newer than the partition's locally applied one.
+    /// Ask the partition primary to propose a purge barrier. The reconciler
+    /// retries while the committed metadata generation is not locally applied.
     pub fn request_purge_partition(&self, namespace: IggyNamespace, generation: u64) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
@@ -3398,6 +3393,8 @@ where
     /// plane or vanish entirely, but it never runs ahead, so an unverifiable
     /// pairing means the reconciler has yet to converge. Non-partition
     /// operations address no incarnation and always pass.
+    /// A matching incarnation also fences new requests until its committed
+    /// purge generation has applied, so they cannot precede the purge barrier.
     #[must_use]
     pub fn serves_committed_incarnation(&self, operation: Operation, namespace_raw: u64) -> bool
     where
@@ -3413,16 +3410,24 @@ where
             .metadata()
             .mux_stm
             .streams()
-            .created_revision_for_namespace(namespace);
+            .with_committed_partition(namespace, |partition| {
+                (partition.created_revision, partition.purge_generation)
+            });
         let row = self.shards_table.epoch_for(namespace);
-        if committed.is_some() && committed == row {
-            return true;
+        if let Some((created_revision, purge_generation)) = committed
+            && Some(created_revision) == row
+        {
+            return self
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_none_or(|partition| partition.applied_purge_generation() >= purge_generation);
         }
         tracing::debug!(
             shard = self.id,
             namespace_raw,
             operation = ?operation,
-            committed_revision = ?committed,
+            committed_revision = ?committed.map(|(revision, _)| revision),
             row_epoch = ?row,
             "denying partition request against an unverified incarnation"
         );
@@ -5056,6 +5061,7 @@ where
                     header.nonce,
                     from_op,
                     header.group,
+                    None,
                 )
                 .await;
                 self.send_repair_range_reply(
@@ -5066,6 +5072,7 @@ where
                     header.nonce,
                     header.from_op.saturating_sub(1),
                     header.group,
+                    None,
                 )
                 .await;
                 return;
@@ -5079,6 +5086,7 @@ where
                     header.nonce,
                     from_op,
                     header.group,
+                    None,
                 )
                 .await;
             }
@@ -5108,6 +5116,7 @@ where
                 header.nonce,
                 served_through,
                 header.group,
+                None,
             )
             .await;
             return;
@@ -5116,39 +5125,17 @@ where
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
-        if !partition.consensus().is_normal() {
+        // A primary-elect may need this prefix to reach a purge barrier before
+        // it can install the new view, while its peers are also in view change.
+        if !matches!(
+            partition.consensus().status(),
+            Status::Normal | Status::ViewChange
+        ) || partition.consensus().is_transferring()
+        {
             return;
         }
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
-        // Purge convergence gate: while a committed purge is not yet locally
-        // applied, this journal still holds pre-purge entries with NO floor
-        // to fence them (the floor is installed by the purge itself), so
-        // serving now would hand a rejoiner batches the cluster purged.
-        // Defer instead: no RepairDone is sent, the rejoiner's stall retry
-        // re-asks, and the local purge (one reconciler wake away) installs
-        // the floor the fence below serves behind.
-        let committed_purge = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_purge_generation(
-                namespace.stream_id(),
-                namespace.topic_id(),
-                namespace.partition_id(),
-            );
-        if committed_purge > partition.applied_purge_generation() {
-            self.metrics.record_partition_repair_serve_deferred();
-            tracing::debug!(
-                shard = self.id,
-                namespace_raw = header.group,
-                committed_purge,
-                applied_purge = partition.applied_purge_generation(),
-                "deferring repair serve until the committed purge applies locally"
-            );
-            return;
-        }
         // The frontier bounds the serve, not `commit_max` alone, mirroring the
         // metadata twin: a rejoining backup needs the BODIES of the adopted
         // suffix above the commit point. Its ack for those ops is withheld
@@ -5171,22 +5158,20 @@ where
         // journal instead reports eviction from the commit frontier, which
         // refuses the floor into a transfer (the empty window passes the
         // completeness check) and heals in one round.
-        //
-        // Purge fence on top: never serve entries at or below this replica's
-        // purge floor. The journal keeps them (own commit walk), but a
-        // rejoiner's floor died with its process, so served pre-purge batches
-        // would flush right back into its freshly reset segments. Reporting
-        // the floor as the retention start rides the normal `RangeEvicted`
-        // path: the rejoiner moves its commit floor to the purge point
-        // instead.
-        let purge_floor = partition.purge_floor_op();
+        // Legacy purges have no log barrier to erase repaired history. Their
+        // deleted prefix must be recovered through a snapshot instead.
+        let legacy_purge_floor = if partition.purge_barrier_op() == 0 {
+            partition.purge_floor_op()
+        } else {
+            0
+        };
         let retained_from = partition
             .log
             .journal()
             .inner
             .repair_retained_from()
             .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1))
-            .max(purge_floor.saturating_add(1));
+            .max(legacy_purge_floor.saturating_add(1));
         let mut from_op = header.from_op;
         if retained_from > from_op {
             self.send_repair_range_reply(
@@ -5197,6 +5182,7 @@ where
                 header.nonce,
                 retained_from,
                 header.group,
+                Some(partition.applied_purge_generation()),
             )
             .await;
             from_op = retained_from;
@@ -5220,6 +5206,7 @@ where
             header.nonce,
             served_through,
             header.group,
+            None,
         )
         .await;
         tracing::info!(
@@ -5658,47 +5645,29 @@ where
             partition.repair = None;
             return;
         }
-        // Receiver half of the serve-side purge gate: while a committed purge
-        // is not yet locally applied, this replica's `recovered_durable_offset`
-        // still describes the PRE-purge segments, so a floor from a peer that
-        // did purge reads as connected against state the purge is about to
-        // delete -- and the post-purge batches (offsets restarting at 0) then
-        // flush-skip below that stale durable line and are silently lost.
-        // Defer the whole reply: the purge is one reconciler wake away and
-        // resets the line to `None`, and the stall retry re-asks, so the peer
-        // re-emits both `RangeEvicted` and `RepairDone` for the same window.
-        // Pinned by `repair_completion_defers_until_committed_purge_applies`
-        // (server crate, partition_reconciler tests), driven through the pub
-        // `on_message` entry; the serve-side twin has its own pin there.
-        let committed_purge = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_purge_generation(
-                namespace.stream_id(),
-                namespace.topic_id(),
-                namespace.partition_id(),
-            );
-        if committed_purge > partition.applied_purge_generation() {
-            self.metrics.record_partition_repair_serve_deferred();
-            tracing::debug!(
-                shard = self.id,
-                namespace_raw = header.group,
-                committed_purge,
-                applied_purge = partition.applied_purge_generation(),
-                command = ?header.command,
-                "deferring repair completion until the committed purge applies locally"
-            );
-            return;
-        }
         match header.command {
-            Command::RangeEvicted => {
-                if let Some(repair) = partition.repair.as_mut() {
-                    repair.floor = Some(header.op.saturating_sub(1));
+            Command::RangeEvicted | Command::RepairDone => {
+                if header.command == Command::RangeEvicted
+                    && let Some(repair) = partition.repair.as_mut()
+                {
+                    let body = &msg.as_slice()[size_of::<RepairRangeReplyHeader>()..];
+                    if control_body_checksum(body) != header.checksum_body {
+                        return;
+                    }
+                    let Ok(generation) = body.try_into().map(u64::from_le_bytes) else {
+                        return;
+                    };
+                    let floor = header.op.saturating_sub(1);
+                    if repair.floor != Some(floor) {
+                        // Earlier chunks may anchor offsets below the new
+                        // retention floor, which no longer prove continuity.
+                        repair.first_batch_offset = None;
+                    }
+                    repair.floor = Some(floor);
+                    repair.purge_generation = Some(generation);
                 }
-            }
-            Command::RepairDone => {
+                // The eviction notice may arrive after RepairDone. Reevaluate
+                // the window on either frame so an empty range can recover.
                 // `complete_repair` walks the window and clears the session
                 // only when the LOCAL commit frontier reached the requested
                 // op (the peer's served-through claim proves nothing about
@@ -5870,6 +5839,8 @@ where
             .is_ok()
     }
 
+    /// Partition eviction replies carry a checksummed purge generation so a
+    /// receiver cannot connect offsets across a missing purge barrier.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     async fn send_repair_range_reply(
@@ -5881,20 +5852,28 @@ where
         nonce: u128,
         op: u64,
         namespace: u64,
+        generation: Option<u64>,
     ) where
         B: MessageBus,
     {
-        let msg = Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
-            .transmute_header(|_, h: &mut RepairRangeReplyHeader| {
-                h.command = command;
-                h.cluster = cluster;
-                h.replica = self_id;
-                h.nonce = nonce;
-                h.op = op;
-                h.group = namespace;
-                h.size = size_of::<RepairRangeReplyHeader>() as u32;
-                h.seal();
-            });
+        let header_size = size_of::<RepairRangeReplyHeader>();
+        let size = header_size + generation.map_or(0, |_| size_of::<u64>());
+        let mut msg = Message::<RepairRangeReplyHeader>::new(size);
+        if let Some(generation) = generation {
+            msg.as_mut_slice()[header_size..].copy_from_slice(&generation.to_le_bytes());
+        }
+        let body_checksum = control_body_checksum(&msg.as_slice()[header_size..]);
+        let msg = msg.transmute_header(|_, h: &mut RepairRangeReplyHeader| {
+            h.command = command;
+            h.cluster = cluster;
+            h.replica = self_id;
+            h.nonce = nonce;
+            h.op = op;
+            h.group = namespace;
+            h.size = size as u32;
+            h.checksum_body = body_checksum;
+            h.seal();
+        });
         let _ = self
             .bus
             .send_to_replica(target, msg.into_generic().into_frozen())
@@ -8417,6 +8396,9 @@ where
                 let ServedOffer::Partition(offer) = &served.offer else {
                     return None;
                 };
+                if offer.purge_generation != partition.applied_purge_generation() {
+                    return None;
+                }
                 served.idle_ticks = 0;
                 Some(Rc::clone(offer))
             });
@@ -8619,6 +8601,11 @@ where
                         transient: true,
                     }));
                 };
+                if offer.purge_generation != partition.applied_purge_generation() {
+                    break 'attempt ChunkAttempt::Reply(Some(ChunkReply::Unavailable {
+                        transient: true,
+                    }));
+                }
                 let last_artifact = offer.artifact_count().saturating_sub(1);
                 let artifact = header.artifact as usize;
                 // Keeps a segment payload alive past the cache borrow below.
@@ -9152,6 +9139,8 @@ where
             commit_to_op,
             fetch_to_op,
             floor: None,
+            next_op: from_op,
+            purge_generation: None,
             peer,
             first_batch_offset: None,
             idle_ticks: 0,
@@ -9238,6 +9227,8 @@ where
             commit_to_op: pending_commit_max(consensus),
             fetch_to_op: to_op,
             floor: None,
+            next_op: from_op,
+            purge_generation: None,
             peer,
             first_batch_offset: None,
             idle_ticks: 0,
@@ -9697,16 +9688,6 @@ where
                 .await;
             return;
         };
-        // A peer that has NOT yet applied a committed purge offers pre-purge
-        // segments under the stale generation. The install's own generation
-        // handling only widens permission (`max`), so it would resurrect the
-        // purged data durably: the local applied value stays at the newer
-        // generation, and the reconciler's `committed > applied` gate never
-        // re-fires. Compared against the METADATA plane's committed value, not
-        // this partition's applied one -- the latter hydrates from `purge.gen`,
-        // which a kill before the purge's record step leaves absent or stale.
-        // Routed through the ordinary failure arm, which rotates the peer;
-        // worst case is one wasted pull.
         let committed_purge_generation = self
             .plane
             .metadata()
@@ -9719,14 +9700,14 @@ where
             );
         let offered_purge_generation =
             partitions::state_transfer::offered_purge_generation(&offsets_bytes);
-        if offered_purge_generation < committed_purge_generation {
+        if offered_purge_generation < partition.applied_purge_generation() {
             tracing::warn!(
                 shard = self.id,
                 namespace_raw = namespace,
                 peer,
                 offered_purge_generation,
-                committed_purge_generation,
-                "refusing a partition transfer offer built before a committed purge;                  installing it would resurrect purged data"
+                applied_purge_generation = partition.applied_purge_generation(),
+                "refusing a partition transfer that would undo an applied purge"
             );
             self.abandon_or_rearm_partition_transfer(partition, peer)
                 .await;
@@ -9775,19 +9756,17 @@ where
                 self.maybe_request_partition_repair(partition, peer).await;
             }
             Err(
-                error @ partitions::state_transfer::PartitionInstallError::ConvergeFailed {
+                error @ (partitions::state_transfer::PartitionInstallError::ConvergeFailed {
                     frontier,
                     ..
-                },
+                }
+                | partitions::state_transfer::PartitionInstallError::PurgeNotDurable {
+                    frontier,
+                    ..
+                }),
             ) => {
-                // The partition holds no serviceable segment chain and its
-                // next append or poll would panic the shard. Fence exactly
-                // this group (a failed converge sweep can leave strays that
-                // `build_partition_fresh` would never clear and the boot
-                // contiguity guard would then trip on). The reconciler
-                // re-materialises a fresh partition from committed metadata;
-                // its first repair floor refusal re-arms a transfer, which
-                // re-seeds the offset frontier from the offsets artifact.
+                // The installed chain or its durable purge boundary is missing.
+                // Rebuild this group before serving the new offset space.
                 tracing::error!(
                     shard = self.id,
                     namespace_raw = namespace,

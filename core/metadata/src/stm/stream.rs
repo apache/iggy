@@ -31,7 +31,7 @@ use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u64_le};
 // Only `seed_namespace` (sim/test-gated) uses this at module scope, so keep the
 // import under the same gate. The test module re-imports it independently.
 #[cfg(any(test, feature = "simulator"))]
@@ -869,6 +869,22 @@ define_state! {
     }
 }
 
+/// Identifies a partition incarnation and its offset space within a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionIdentity {
+    pub created_revision: u64,
+    pub purge_generation: u64,
+}
+
+impl From<&Partition> for PartitionIdentity {
+    fn from(partition: &Partition) -> Self {
+        Self {
+            created_revision: partition.created_revision,
+            purge_generation: partition.purge_generation,
+        }
+    }
+}
+
 /// Server-originated request that advances a partition's delete watermark.
 ///
 /// `up_to_offset` is resolved on the owning shard from a client
@@ -880,11 +896,17 @@ pub struct TruncatePartitionRequest {
     pub topic_id: WireIdentifier,
     pub partition_id: u32,
     pub up_to_offset: u64,
+    /// Absent in legacy log entries and unresolved, zero-offset requests.
+    pub identity: Option<PartitionIdentity>,
 }
 
 impl WireEncode for TruncatePartitionRequest {
     fn encoded_size(&self) -> usize {
-        self.stream_id.encoded_size() + self.topic_id.encoded_size() + 4 + 8
+        self.stream_id.encoded_size()
+            + self.topic_id.encoded_size()
+            + 4
+            + 8
+            + self.identity.map_or(0, |_| 2 * size_of::<u64>())
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -892,6 +914,10 @@ impl WireEncode for TruncatePartitionRequest {
         self.topic_id.encode(buf);
         buf.put_u32_le(self.partition_id);
         buf.put_u64_le(self.up_to_offset);
+        if let Some(identity) = self.identity {
+            buf.put_u64_le(identity.created_revision);
+            buf.put_u64_le(identity.purge_generation);
+        }
     }
 }
 
@@ -918,12 +944,25 @@ impl WireDecode for TruncatePartitionRequest {
         })?;
         let up_to_offset = u64::from_le_bytes(offset_slice.try_into().expect("8 bytes"));
         pos += 8;
+        let identity = if pos == buf.len() {
+            None
+        } else {
+            let created_revision = read_u64_le(buf, pos)?;
+            pos += size_of::<u64>();
+            let purge_generation = read_u64_le(buf, pos)?;
+            pos += size_of::<u64>();
+            Some(PartitionIdentity {
+                created_revision,
+                purge_generation,
+            })
+        };
         Ok((
             Self {
                 stream_id,
                 topic_id,
                 partition_id,
                 up_to_offset,
+                identity,
             },
             pos,
         ))
@@ -957,6 +996,14 @@ impl StateHandler for TruncatePartitionRequest {
             else {
                 return ApplyReply::err(TruncatePartitionResult::PartitionNotFound);
             };
+            // Purge or recreation already removed the history this delete resolved.
+            // Commit a no-op so the client's request remains deduplicated.
+            if self
+                .identity
+                .is_some_and(|identity| identity != PartitionIdentity::from(&*partition))
+            {
+                return ApplyReply::ok(Bytes::new());
+            }
             // Monotonic: a stale or duplicate replay never rewinds the watermark.
             if self.up_to_offset > partition.deleted_up_to_offset {
                 partition.deleted_up_to_offset = self.up_to_offset;
@@ -1238,7 +1285,7 @@ impl Streams {
                 .items
                 .get(stream_id)
                 .and_then(|stream| stream.topics.get(topic_id))
-                .and_then(|topic| topic.partitions.iter().find(|p| p.id == partition_id))
+                .and_then(|topic| find_partition(&topic.partitions, partition_id))
                 .map_or(0, |partition| partition.purge_generation)
         })
     }
@@ -1805,7 +1852,8 @@ impl Streams {
         self.with_committed_partition(namespace, |partition| partition.created_view)
     }
 
-    fn with_committed_partition<T>(
+    /// Read fields from the same committed partition snapshot.
+    pub fn with_committed_partition<T>(
         &self,
         namespace: IggyNamespace,
         read: impl FnOnce(&Partition) -> T,
@@ -2948,19 +2996,147 @@ mod tests {
 
     #[test]
     fn truncate_partition_request_round_trips() {
-        let request = TruncatePartitionRequest {
-            stream_id: WireIdentifier::numeric(7),
-            topic_id: WireIdentifier::numeric(3),
-            partition_id: 5,
-            up_to_offset: 1234,
-        };
-        let bytes = request.to_bytes();
-        let (decoded, consumed) = TruncatePartitionRequest::decode(&bytes).expect("decode");
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded.stream_id, request.stream_id);
-        assert_eq!(decoded.topic_id, request.topic_id);
-        assert_eq!(decoded.partition_id, request.partition_id);
-        assert_eq!(decoded.up_to_offset, request.up_to_offset);
+        for identity in [
+            None,
+            Some(PartitionIdentity {
+                created_revision: 41,
+                purge_generation: 3,
+            }),
+        ] {
+            let request = TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(7),
+                topic_id: WireIdentifier::numeric(3),
+                partition_id: 5,
+                up_to_offset: 1234,
+                identity,
+            };
+            let bytes = request.to_bytes();
+            let (decoded, consumed) = TruncatePartitionRequest::decode(&bytes).expect("decode");
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(decoded.stream_id, request.stream_id);
+            assert_eq!(decoded.topic_id, request.topic_id);
+            assert_eq!(decoded.partition_id, request.partition_id);
+            assert_eq!(decoded.up_to_offset, request.up_to_offset);
+            assert_eq!(decoded.identity, identity);
+            if identity.is_some() {
+                let legacy_size = bytes.len() - 2 * size_of::<u64>();
+                assert_eq!(
+                    TruncatePartitionRequest::decode_from(&bytes[..legacy_size])
+                        .unwrap()
+                        .identity,
+                    None
+                );
+                for truncated_size in legacy_size + 1..bytes.len() {
+                    assert!(
+                        TruncatePartitionRequest::decode_from(&bytes[..truncated_size]).is_err(),
+                        "partial identity must not decode as a legacy request: {truncated_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_resolved_truncate_when_history_changes_should_preserve_new_watermark() {
+        enum Change {
+            PurgeTopic,
+            PurgeStream,
+            RecreatePartition,
+        }
+        const OLD_END: u64 = 500;
+        const NEW_END: u64 = 7;
+
+        for change in [
+            Change::PurgeTopic,
+            Change::PurgeStream,
+            Change::RecreatePartition,
+        ] {
+            let mut inner = inner_with_registered_partition();
+            let identity = PartitionIdentity::from(&inner.items[0].topics[0].partitions[0]);
+            let truncate = TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: OLD_END,
+                identity: Some(identity),
+            };
+            let delayed = truncate.to_bytes();
+            match change {
+                Change::PurgeTopic => {
+                    let purge = PurgeTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                    };
+                    assert_eq!(
+                        StateHandler::apply(&purge, &mut inner, IggyTimestamp::now()).code,
+                        0
+                    );
+                }
+                Change::PurgeStream => {
+                    let purge = PurgeStreamRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                    };
+                    assert_eq!(
+                        StateHandler::apply(&purge, &mut inner, IggyTimestamp::now()).code,
+                        0
+                    );
+                }
+                Change::RecreatePartition => {
+                    let delete = DeletePartitionsRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                        partitions_count: 1,
+                    };
+                    assert_eq!(
+                        StateHandler::apply(&delete, &mut inner, IggyTimestamp::now()).code,
+                        0
+                    );
+                    let create = CreatePartitionsWithAssignmentsRequest {
+                        created_view: 0,
+                        request: CreatePartitionsRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                            topic_id: WireIdentifier::numeric(0),
+                            partitions_count: 1,
+                        },
+                        partitions: vec![CreatedPartitionAssignment {
+                            partition_id: 0,
+                            consensus_group_id: 2,
+                        }],
+                    };
+                    assert_eq!(
+                        StateHandler::apply(&create, &mut inner, IggyTimestamp::now()).code,
+                        0
+                    );
+                }
+            }
+            let new_identity = PartitionIdentity::from(&inner.items[0].topics[0].partitions[0]);
+            assert_ne!(new_identity, identity);
+            let delayed = TruncatePartitionRequest::decode_from(&delayed).unwrap();
+            assert_eq!(
+                StateHandler::apply(&delayed, &mut inner, IggyTimestamp::now()).code,
+                0
+            );
+            assert_eq!(
+                inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
+                0
+            );
+
+            let fresh = TruncatePartitionRequest {
+                identity: Some(new_identity),
+                up_to_offset: NEW_END,
+                ..truncate
+            };
+            for request in [&fresh, &delayed, &fresh] {
+                assert_eq!(
+                    StateHandler::apply(request, &mut inner, IggyTimestamp::now()).code,
+                    0
+                );
+                assert_eq!(
+                    inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
+                    NEW_END
+                );
+            }
+        }
     }
 
     fn create_stream(inner: &mut StreamsInner, name: &str) {
@@ -3659,6 +3835,7 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partition_id: 0,
             up_to_offset: 500,
+            identity: None,
         };
         let apply = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
         assert_eq!(apply.code, 0);

@@ -296,6 +296,7 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation
         | Operation::TruncatePartition
+        | Operation::PurgePartition
         | Operation::Reserved
         | Operation::Register
         | Operation::Logout

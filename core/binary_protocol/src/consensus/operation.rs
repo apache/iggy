@@ -95,6 +95,10 @@ pub enum Operation {
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
+    /// Server-only partition barrier. `request` carries the metadata purge
+    /// generation, `client` is the auto-commit sentinel, and the body is empty.
+    /// Committing it deletes the prefix through its own operation number.
+    PurgePartition = 163,
 }
 
 impl Operation {
@@ -117,14 +121,15 @@ impl Operation {
     #[must_use]
     #[inline]
     pub const fn is_internal(&self) -> bool {
-        (*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START
+        ((*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START)
+            || matches!(self, Self::PurgePartition)
     }
 
     /// Metadata / control-plane operations handled by shard 0.
     #[must_use]
     #[inline]
     pub const fn is_metadata(&self) -> bool {
-        if self.is_internal() {
+        if self.is_internal() && !self.is_partition() {
             return true;
         }
 
@@ -232,7 +237,8 @@ impl Operation {
             | Self::CreatePartitionsWithAssignments
             | Self::RemoveConsumerGroupMember
             | Self::CompleteConsumerGroupRevocation
-            | Self::TruncatePartition => None,
+            | Self::TruncatePartition
+            | Self::PurgePartition => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -375,6 +381,11 @@ mod tests {
         assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
+        assert!(Operation::PurgePartition.is_partition());
+        assert!(!Operation::PurgePartition.is_metadata());
+        assert!(Operation::PurgePartition.is_internal());
+        assert!(!Operation::PurgePartition.is_client_allowed());
+        assert_eq!(Operation::PurgePartition.to_command_code(), None);
     }
 
     /// Every operation belongs to exactly one plane, or to the short list

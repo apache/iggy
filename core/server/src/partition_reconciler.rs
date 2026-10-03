@@ -426,11 +426,9 @@ struct PassCounters {
     /// destroys prepares.
     parked_reclaimed: usize,
     /// Purges staged this pass. Counted so the pass does not arm the
-    /// fast-skip: the pump can DEFER a purge it could not record
-    /// (`PurgeError::FrontierNotRecorded` / `GenerationNotRecorded`), which
-    /// leaves `applied_purge_generation` unmoved and bumps no revision, so an
-    /// armed skip would swallow the only re-issue and drop a committed
-    /// `PurgeTopic` on this replica for good.
+    /// fast-skip: the pump may defer proposing the barrier until earlier
+    /// operations commit or primaryship settles. Neither changes metadata's
+    /// revision, so the proposal must be retried until the generation applies.
     purges_staged: usize,
     /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
     /// so the pass does not arm the fast-skip: the pump's drop clears the
@@ -1409,7 +1407,7 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounter
         if watermark == 0 {
             continue;
         }
-        ctx.shard.request_truncate_partition(namespace, watermark);
+        ctx.shard.request_truncate_partition(namespace);
         let trimmed = partitions
             .get_by_ns(&namespace)
             .and_then(|partition| partition.log.segments().first())
@@ -1427,13 +1425,6 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounter
 /// that the full pump inbox drops needs no upgrade here: the staged counter
 /// keeps passes running and the next one restages, and the pump's generation
 /// guard makes redundant frames free.
-// TODO(hubcio): purge lands per replica on reconciler timing, while StartView
-// journal repair re-materializes pre-purge ops byte-identical from a peer, so
-// a replica can purge and then repair purged batches back in (or the reverse).
-// The purge floor skews the same way even without repair: each replica reads
-// it off its LOCAL sequencer at purge-apply time, so replicas fence different
-// sets of in-flight sends (live divergence, not only the StartView case).
-// Ordering these needs a partition-plane checkpoint barrier; deferred.
 fn reconcile_partition_purges(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let partitions = ctx.shard.plane.partitions();
     let namespaces: Vec<_> = partitions.namespaces().copied().collect();
@@ -1630,26 +1621,33 @@ mod tests {
         MessageBag::Request(msg)
     }
 
-    /// Build a partition-plane `RepairRangeReply` as the serving peer would
-    /// send it. Only the fields the receive path reads are stamped: routing
-    /// (`group`), session (`nonce`), and the verdict (`command`, `op`).
     fn build_repair_range_reply(
         namespace: IggyNamespace,
         command: Command,
         nonce: u128,
         op: u64,
+        purge_generation: u64,
     ) -> MessageBag {
         let header_size = size_of::<RepairRangeReplyHeader>();
-        let mut msg = Message::<RepairRangeReplyHeader>::new(header_size);
+        let body = (command == Command::RangeEvicted).then(|| purge_generation.to_le_bytes());
+        let size = header_size + body.as_ref().map_or(0, |bytes| bytes.len());
+        let mut msg = Message::<RepairRangeReplyHeader>::new(size);
+        if let Some(body) = body {
+            msg.as_mut_slice()[header_size..].copy_from_slice(&body);
+        }
+        let checksum_body = body.map_or(0, |bytes| {
+            u128::from(iggy_common::calculate_checksum(&bytes))
+        });
         let header = bytemuck::checked::try_from_bytes_mut::<RepairRangeReplyHeader>(
             &mut msg.as_mut_slice()[..header_size],
         )
-        .expect("zeroed bytes form a valid RepairRangeReplyHeader");
+        .expect("valid repair header");
         header.command = command;
-        header.size = u32::try_from(header_size).expect("header size fits u32");
+        header.size = u32::try_from(size).expect("repair reply fits u32");
         header.nonce = nonce;
         header.op = op;
         header.group = namespace.inner();
+        header.checksum_body = checksum_body;
         MessageBag::RepairRangeReply(msg)
     }
 
@@ -2899,7 +2897,7 @@ mod tests {
             .partitions()
             .get_mut_by_ns(&ns)
             .expect("purged partition is materialised")
-            .purge(&partitions_config, 1)
+            .purge(&partitions_config, 1, 0)
             .await
             .expect("apply staged purge");
 
@@ -3037,42 +3035,30 @@ mod tests {
         );
     }
 
-    /// Receive half of the purge gate in `on_repair_range_reply`: while a
-    /// committed purge has not applied locally, a repair verdict must be
-    /// deferred wholesale -- installing the peer's floor against pre-purge
-    /// segments silently loses the post-purge batches (offsets restarting at
-    /// 0 flush-skip below the stale durable line).
     #[compio::test]
-    async fn repair_completion_defers_until_committed_purge_applies() {
+    async fn given_evicted_purge_barrier_when_repair_completes_should_require_state_transfer() {
         const NONCE: u128 = 7;
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let mux = TestMux::default();
         seed_stream(&mux, 1, "stream-repair-gate");
         seed_topic(&mux, 2, 0, "topic-repair-gate", vec![assignment(0, 1)]);
-
         let shard = build_test_shard(0, &config, mux);
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
         reconcile_pass(&ctx).await;
-
         let ns = IggyNamespace::new(0, 0, 0);
-        shard
-            .plane
-            .partitions()
-            .get_mut_by_ns(&ns)
-            .expect("partition is materialised")
-            .repair = Some(RepairSession {
+        shard.plane.partitions().get_mut_by_ns(&ns).unwrap().repair = Some(RepairSession {
             nonce: NONCE,
             view: 0,
             commit_to_op: 5,
             fetch_to_op: 5,
             floor: None,
+            next_op: 1,
+            purge_generation: None,
             peer: 1,
             first_batch_offset: None,
             idle_ticks: 0,
         });
-
-        // Committed purge: generation 1 > applied 0.
         let purge = PurgeTopicRequest {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
@@ -3084,73 +3070,22 @@ mod tests {
             .update(build_prepare(3, Operation::PurgeTopic, &purge))
             .expect("PurgeTopic apply succeeds");
 
-        let deferred_before = shard
-            .metrics()
-            .partition_repair_serves_deferred_purge_value();
         shard
             .on_message(build_repair_range_reply(
                 ns,
                 Command::RangeEvicted,
                 NONCE,
                 4,
+                1,
             ))
             .await;
-        let session = shard
-            .plane
-            .partitions()
-            .get_mut_by_ns(&ns)
-            .expect("partition survives the deferral")
-            .repair
-            .expect("deferral must leave the repair session armed");
-        assert_eq!(
-            session.floor, None,
-            "a deferred RangeEvicted must not install the peer's floor"
+        let partition = shard.plane.partitions().get_mut_by_ns(&ns).unwrap();
+        assert!(
+            partition.repair.is_none(),
+            "a newer purge generation must refuse the floor without waiting for RepairDone"
         );
-        assert_eq!(
-            shard
-                .metrics()
-                .partition_repair_serves_deferred_purge_value(),
-            deferred_before + 1,
-            "the deferral must be visible on the purge-deferred counter"
-        );
-
-        // Apply the purge; the same frame now lands.
-        let partitions_config = shard.plane.partitions().config().clone();
-        shard
-            .plane
-            .partitions()
-            .get_mut_by_ns(&ns)
-            .expect("purged partition is materialised")
-            .purge(&partitions_config, 1)
-            .await
-            .expect("apply staged purge");
-        shard
-            .on_message(build_repair_range_reply(
-                ns,
-                Command::RangeEvicted,
-                NONCE,
-                4,
-            ))
-            .await;
-        let session = shard
-            .plane
-            .partitions()
-            .get_mut_by_ns(&ns)
-            .expect("partition survives the retry")
-            .repair
-            .expect("RangeEvicted records the floor but keeps the session");
-        assert_eq!(
-            session.floor,
-            Some(3),
-            "after the purge applies, the retried frame must install the floor"
-        );
-        assert_eq!(
-            shard
-                .metrics()
-                .partition_repair_serves_deferred_purge_value(),
-            deferred_before + 1,
-            "the retried frame must pass the gate without another deferral"
-        );
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert_eq!(partition.applied_purge_generation(), 0);
     }
 
     /// Receive half of the inverted-range fix: a `RepairDone` landing on a
@@ -3198,6 +3133,8 @@ mod tests {
                 commit_to_op: 8,
                 fetch_to_op: 8,
                 floor: Some(5),
+                next_op: 6,
+                purge_generation: None,
                 peer: 1,
                 first_batch_offset: Some(20),
                 idle_ticks: 0,
@@ -3205,7 +3142,13 @@ mod tests {
         }
 
         shard
-            .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+            .on_message(build_repair_range_reply(
+                ns,
+                Command::RepairDone,
+                NONCE,
+                8,
+                0,
+            ))
             .await;
 
         let partitions = shard.plane.partitions();
@@ -3219,12 +3162,8 @@ mod tests {
         );
     }
 
-    /// Serve half of the purge gate in `on_request_prepares`: while a
-    /// committed purge has not applied locally, the journal still holds
-    /// pre-purge entries with no floor to fence them, so serving a rejoiner
-    /// must be deferred (no reply; the requester's stall retry re-asks).
     #[compio::test]
-    async fn repair_serve_defers_until_committed_purge_applies() {
+    async fn given_pending_purge_when_repair_is_requested_should_keep_recovery_available() {
         const NONCE: u128 = 11;
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
@@ -3258,19 +3197,21 @@ mod tests {
             shard
                 .metrics()
                 .partition_repair_serves_deferred_purge_value(),
-            deferred_before + 1,
-            "an unapplied purge must defer the serve"
+            deferred_before,
+            "repair must remain available to deliver the purge barrier"
         );
 
+        assert!(!shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()));
         let partitions_config = shard.plane.partitions().config().clone();
         shard
             .plane
             .partitions()
             .get_mut_by_ns(&ns)
             .expect("purged partition is materialised")
-            .purge(&partitions_config, 1)
+            .purge(&partitions_config, 1, 0)
             .await
             .expect("apply staged purge");
+        assert!(shard.serves_committed_incarnation(Operation::SendMessages, ns.inner()));
         shard
             .on_message(build_request_prepares(ns, 1, NONCE, 1, 5))
             .await;
@@ -3278,7 +3219,7 @@ mod tests {
             shard
                 .metrics()
                 .partition_repair_serves_deferred_purge_value(),
-            deferred_before + 1,
+            deferred_before,
             "once the purge applies, the retried request must be served, not deferred"
         );
     }

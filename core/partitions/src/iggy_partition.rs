@@ -25,8 +25,7 @@ use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
     PURGE_GENERATION_FILE, delete_persisted_offset, delete_persisted_offset_with_storage,
-    persist_offset, persist_offset_max, persist_purge_generation_with_storage,
-    read_purge_generation,
+    persist_offset, persist_offset_max, persist_purge_generation_with_storage, read_purge_marker,
 };
 use crate::persistence::{
     CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
@@ -259,15 +258,17 @@ where
     /// the dead incarnation's record must not hydrate. `0` for partitions built
     /// without a metadata row (tests, in-memory storage).
     pub(crate) created_revision: u64,
-    /// Highest consensus op assigned when the last purge ran. INVARIANT: every
+    /// Local purge boundary, including legacy replica-local WAL markers. Every
     /// journal-apply path must no-op entries with `op <= purge_floor_op`. The
     /// purge keeps journal entries resident (consensus history for backups,
     /// repair and retransmission) while wiping the segments, so without the
     /// floor a pre-purge op committing after the purge would flush purged
-    /// bytes back into a fresh segment or re-advance the reset offset. Not
-    /// persisted: the in-memory journal dies with the process, so no resident
-    /// pre-purge entry survives a restart.
-    purge_floor_op: u64,
+    /// bytes back into a fresh segment or re-advance the reset offset.
+    pub(crate) purge_floor_op: u64,
+    /// The canonical floor, excluding legacy WAL markers chosen independently
+    /// by each replica. Only this boundary proves a transferred offset reset.
+    pub(crate) purge_barrier_op: u64,
+    pending_purge_op: Option<u64>,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -432,51 +433,20 @@ enum Disposition {
     },
 }
 
-/// Why a purge did not complete, split by whether it had already mutated.
-///
-/// The two need opposite handling, and conflating them is a data-loss bug:
-/// fencing a partition whose purge failed before it touched anything
-/// quarantines a complete healthy chain while the live counter still names the
-/// pre-purge offset space, and the fence's own frontier write then stamps that
-/// stale counter as durable truth.
+/// The stage at which a committed purge failed. The commit path must stop
+/// before applying any later operation in the partition's new offset space.
 #[derive(Debug)]
 pub enum PurgeError {
-    /// The frontier reset could not be recorded. NOTHING was mutated: the
-    /// segments, the counters and `applied_purge_generation` are all untouched,
-    /// so the reconciler's `committed > applied` gate re-issues this purge on
-    /// its next pass. Retry, do not fence.
-    ///
-    /// Sets `purge_deferred`, which withholds `PrepareOk` for this
-    /// group until the purge lands, so the replica goes quorum-invisible THERE
-    /// while every other partition on the node keeps serving. Without that
-    /// fence the counter would still name the pre-purge offset space and every
-    /// op this replica acked would be stamped from a `base_offset` its purged
-    /// peers do not share. The superblock persist gate does not cover it: that
-    /// fires on `(view, log_view)` changes, and a stable view attempts no write
-    /// and so observes no failure.
-    ///
-    /// Fencing the SEND rather than the whole partition is the point. The
-    /// alternative was fencing a partition whose chain is still whole, which
-    /// quarantines live data and rebuilds it at the pre-purge frontier.
-    ///
-    /// Carries no cause: the write path reports `bool`, and the underlying
-    /// `ENOSPC` / `EIO` is logged by the superblock writer on the first failure
-    /// and at every power-of-two thereafter.
+    /// The WAL marker or frontier reset could not be recorded. Message files,
+    /// counters and the applied generation remain untouched. The persistence
+    /// layer logs the underlying error.
     FrontierNotRecorded,
     /// The wipe ran and the fresh chain is planted, but the applied purge
-    /// generation could not be recorded durably (`purge.gen`), so
-    /// `applied_purge_generation` stays at its pre-purge value and the
-    /// reconciler re-issues the purge. Retry, do not fence: the partition is
-    /// serviceable and re-purging an already-empty chain is cheap.
-    ///
-    /// Sets `purge_deferred` for the same reason as
-    /// [`Self::FrontierNotRecorded`]: an op acked between this failure and the
-    /// retry would be wiped by that retry while every peer that recorded the
-    /// generation keeps it.
+    /// generation and boundary could not be recorded durably (`purge.gen`).
+    /// The applied generation stays unchanged, so recovery retries the barrier.
     GenerationNotRecorded(IggyError),
-    /// A step after the drain failed, so the partition holds no serviceable
-    /// segment chain and its next append would panic on `active_segment()`.
-    /// The caller must fence this group for rebuild.
+    /// A step after the drain failed, leaving no serviceable segment chain.
+    /// The caller must stop using the partition until recovery rebuilds it.
     Unserviceable(IggyError),
 }
 
@@ -490,7 +460,7 @@ impl fmt::Display for PurgeError {
             Self::GenerationNotRecorded(source) => write!(
                 f,
                 "purge reset the partition but could not record its applied generation; \
-                 the purge will be re-issued: {source}"
+                 the committed purge cannot advance: {source}"
             ),
             Self::Unserviceable(source) => write!(
                 f,
@@ -642,6 +612,8 @@ where
             applied_purge_generation: 0,
             created_revision: 0,
             purge_floor_op: 0,
+            purge_barrier_op: 0,
+            pending_purge_op: None,
             superblock: None,
             superblock_lock: LocalGate::new(),
             superblock_write_failures: Cell::new(0),
@@ -671,12 +643,17 @@ where
         self.applied_purge_generation
     }
 
-    /// See [`Self::purge_floor_op` field docs](#structfield.purge_floor_op).
-    /// Exposed for the repair-serving path: a peer must not serve entries at
-    /// or below this replica's floor.
+    /// Local replay boundary. Legacy purges without a replicated barrier also
+    /// exclude this prefix from repair serving.
     #[must_use]
     pub const fn purge_floor_op(&self) -> u64 {
         self.purge_floor_op
+    }
+
+    /// Common boundary of the latest replicated purge, or zero for legacy purges.
+    #[must_use]
+    pub const fn purge_barrier_op(&self) -> u64 {
+        self.purge_barrier_op
     }
 
     /// Record the metadata incarnation this partition was built for. Must run
@@ -693,7 +670,7 @@ where
     /// reconciler re-applies the purge; a crash AFTER a purge's durable
     /// generation write correctly skips the re-wipe, keeping messages
     /// appended since. A record left by a PREVIOUS incarnation of this
-    /// namespace reads 0 as well (see [`read_purge_generation`]). No-op
+    /// namespace reads 0 as well (see [`read_purge_marker`]). No-op
     /// without a partition dir (in-memory storage).
     ///
     /// # Errors
@@ -719,8 +696,9 @@ where
     ) -> Result<(), IggyError> {
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
-            self.applied_purge_generation =
-                read_purge_generation(storage, &path, self.created_revision).await?;
+            (self.applied_purge_generation, self.purge_barrier_op) =
+                read_purge_marker(storage, &path, self.created_revision).await?;
+            self.purge_floor_op = self.purge_barrier_op;
         }
         Ok(())
     }
@@ -827,6 +805,14 @@ where
             || !(self.durability().is_persisted()
                 || self.consumer_offset_durability().is_persisted())
         {
+            // Without a WAL, the durable purge record is the checkpoint for
+            // the discarded prefix. Reusing its op numbers would discard new
+            // messages behind the recovered purge floor.
+            if self.purge_floor_op > self.consensus.sequencer().current_sequence() {
+                self.consensus.sequencer().set_sequence(self.purge_floor_op);
+                self.consensus.advance_commit_max(self.purge_floor_op);
+                self.consensus.set_commit_floor(self.purge_floor_op);
+            }
             return Ok(());
         }
         let directory = self
@@ -892,7 +878,7 @@ where
         }
         let checkpoint = persistence.checkpoint_op();
         let head = persistence.head();
-        let mut commit = checkpoint;
+        let mut commit = checkpoint.max(self.purge_barrier_op);
         for message in prepares {
             let header = *message.header();
             if header.op == checkpoint {
@@ -1209,6 +1195,9 @@ where
 
     const fn requires_persistence(&self, operation: Operation) -> bool {
         match operation {
+            Operation::PurgePartition => {
+                self.durability().is_persisted() || self.consumer_offset_durability().is_persisted()
+            }
             Operation::SendMessages => self.durability().is_persisted(),
             Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.consumer_offset_durability().is_persisted()
@@ -4305,6 +4294,7 @@ where
             // Reject it first with the only response that proves the request
             // was never admitted, so the caller may safely retry elsewhere.
             if self.materialization_missing
+                || self.pending_purge_op().is_some()
                 || consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
@@ -4673,6 +4663,9 @@ where
     /// is bypassed at view-change reset.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
+        if self.pending_purge_op().is_some() {
+            return;
+        }
         self.resynchronize_consumer_offset_reservations();
         let mut promoted = 0;
         // Denials do not consume a slot, so without a budget one drain could
@@ -4834,11 +4827,65 @@ where
     #[must_use]
     pub fn queued_requests_ready(&self) -> bool {
         self.fatal.is_none()
+            && self.pending_purge_op().is_none()
             && self.consensus.is_primary()
             && self.consensus.is_normal()
             && !self.consensus.is_transferring()
             && !self.consensus.pipeline_is_full()
             && self.consensus.request_queue_len() > 0
+    }
+
+    /// Propose a purge only after the existing prefix has committed. The
+    /// barrier's operation number, rather than each replica's local head,
+    /// defines the deleted prefix.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn request_purge(&mut self, generation: u64) {
+        if generation <= self.applied_purge_generation
+            || self.fatal.is_some()
+            || self.materialization_missing
+            || self.pending_purge_op().is_some()
+            || !self.consensus.is_primary()
+            || !self.consensus.is_normal()
+            || self.consensus.is_transferring()
+            || self.consensus.commit_min() != self.consensus.sequencer().current_sequence()
+            || self.consensus.request_queue_len() != 0
+        {
+            return;
+        }
+        let size = size_of::<RoutedRequestHeader>();
+        let message = Message::<RoutedRequestHeader>::new(size).transmute_header(
+            |_, header: &mut RoutedRequestHeader| {
+                *header = RoutedRequestHeader {
+                    command: Command::Request,
+                    operation: Operation::PurgePartition,
+                    size: size as u32,
+                    client: AUTO_COMMIT_CLIENT_ID,
+                    session: 1,
+                    request: generation,
+                    group: self.namespace().inner(),
+                    ..Default::default()
+                };
+            },
+        );
+        let prepare = message.project(self.consensus());
+        self.consensus
+            .pipeline_message(PlaneKind::Partitions, &prepare);
+        self.on_replicate(prepare).await;
+    }
+
+    fn pending_purge_op(&self) -> Option<u64> {
+        self.pending_purge_op.filter(|&op| {
+            op > self.consensus.commit_min()
+                && self
+                    .log
+                    .journal()
+                    .inner
+                    .header_by_op(op)
+                    .is_some_and(|header| {
+                        header.operation == Operation::PurgePartition
+                            && header.request > self.applied_purge_generation
+                    })
+        })
     }
 
     /// Resume a bounded promotion turn without waiting for another commit.
@@ -4927,6 +4974,9 @@ where
         }
 
         let journal_holds_op = self.log.journal().inner.holds_op(header.op);
+        if self.pending_purge_op().is_some_and(|op| header.op > op) {
+            return;
+        }
         if journal_holds_op {
             // Retransmit after downstream flap: durable here but commit
             // hasn't caught up. Re-forward + re-ACK so primary's view of
@@ -5465,6 +5515,20 @@ where
         let namespace_raw = self.consensus.group();
 
         match header.operation {
+            Operation::PurgePartition => {
+                if header.request == 0
+                    || !is_auto_commit_client(header.client)
+                    || message.as_slice().len() != size_of::<PrepareHeader>()
+                {
+                    return Err(IggyError::InvalidCommand);
+                }
+                let frozen = message.into_frozen();
+                self.journal_append(frozen.clone()).await?;
+                if header.request > self.applied_purge_generation {
+                    self.pending_purge_op = Some(header.op);
+                }
+                Ok(frozen)
+            }
             Operation::SendMessages => {
                 let frozen = self.append_send_messages_to_journal(message).await?;
                 debug!(
@@ -6607,6 +6671,20 @@ where
         through_op: u64,
     ) -> bool {
         match prepare_header.operation {
+            Operation::PurgePartition => {
+                if prepare_header.request <= self.applied_purge_generation {
+                    return true;
+                }
+                if let Err(error) = self
+                    .purge(config, prepare_header.request, prepare_header.op)
+                    .await
+                {
+                    warn!(%error, op = prepare_header.op, "cannot apply committed partition purge");
+                    *failed_commit = true;
+                    return false;
+                }
+                true
+            }
             Operation::SendMessages => {
                 if !*messages_committed {
                     if self
@@ -7711,8 +7789,8 @@ where
     /// [`PurgeError::FrontierNotRecorded`]. Refused rather than logged: nothing
     /// has been mutated yet, and a purge that cannot record its reset must not
     /// be the one that erases the data proving the old frontier. The caller
-    /// RETRIES; it must not fence, since the chain is still whole and the live
-    /// counter still names the pre-purge space.
+    /// stops the commit walk, since later operations belong to the new offset
+    /// space. Recovery retries the same committed barrier.
     #[allow(clippy::future_not_send)]
     async fn record_purge_frontier_reset(&mut self, generation: u64) -> Result<(), PurgeError> {
         if self.reset_offset_frontier_at(0).await {
@@ -7720,31 +7798,21 @@ where
             return Ok(());
         }
         self.purge_deferred = true;
-        // The ONLY operator-visible signal for the withhold: `send_prepare_ok`
-        // returns silently, correctly, since it runs per prepare. So this line
-        // has to say that the replica is now out of quorum for this group, or
-        // the symptom reads as a network fault. The consecutive count
-        // correlates it with the superblock writer's own error log, which
-        // carries the `ENOSPC` / `EIO` cause but is rate-limited to
-        // power-of-two failures, while this deferral repeats per reconciler
-        // pass.
         warn!(
             target: "iggy.partitions.diag",
             plane = "partitions",
             namespace_raw = self.namespace().inner(),
             generation,
             superblock_write_failures = self.superblock_write_failures.get(),
-            "cannot record the purge's offset-frontier reset; deferring the purge so the \
-             durable frontier cannot outlive the data it describes. This replica now \
-             withholds PrepareOk for this partition until the purge lands, so it is \
-             quorum-invisible there; its other partitions are unaffected"
+            "cannot record the committed purge's offset-frontier reset; \
+             leaving message data intact and stopping the commit walk for recovery"
         );
         Err(PurgeError::FrontierNotRecorded)
     }
 
     /// Reset the partition to a single empty segment at offset 0 and clear all
     /// consumer / consumer-group offsets (memory + disk). This is the local
-    /// effect of a committed `PurgeTopic`: it wipes message data and offsets but
+    /// effect of a committed `PurgePartition`: it wipes message data and offsets but
     /// preserves the partition and its consumer-group membership. Mirrors the
     /// legacy server's `purge_all_segments` + offset-file deletion.
     ///
@@ -7753,19 +7821,14 @@ where
     /// `PurgeTopic` advances the committed generation and triggers a fresh pass).
     ///
     /// # Errors
-    /// [`PurgeError::FrontierNotRecorded`] before anything is mutated, which
-    /// the caller RETRIES: the reconciler re-issues the purge while
-    /// `committed > applied`, and fencing a partition that still holds its whole
-    /// chain would quarantine live data behind a counter that still names the
-    /// pre-purge offset space. [`PurgeError::Unserviceable`] once the drain has
-    /// run, which the caller FENCES (quarantine + retire for the reconciler to
-    /// rebuild), exactly as the state-transfer install's `ConvergeFailed` arm
-    /// does, or the next append panics on `active_segment()`.
+    /// Returns the failed persistence or reset stage. The commit caller must
+    /// stop applying operations on failure; recovery retries the same barrier.
     #[allow(clippy::too_many_lines)]
     pub async fn purge(
         &mut self,
         config: &PartitionsConfig,
         generation: u64,
+        floor_op: u64,
     ) -> Result<(), PurgeError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
@@ -7773,7 +7836,7 @@ where
         let namespace = self.namespace();
 
         if let Some(persistence) = &self.persistence {
-            persistence.mark_purge(generation, self.consensus.sequencer().current_sequence());
+            persistence.mark_purge(generation, floor_op);
             self.start_persistence();
             if let Err(error) = persistence.drain_with_timeout().await {
                 warn!(%error, "cannot persist partition purge marker");
@@ -7865,8 +7928,8 @@ where
         let start_offset = 0u64;
         // Counters reset BEFORE the fallible plant, not after: `?` on
         // `install_empty_segment` would otherwise leave the live counter at the
-        // pre-purge value, which is what the router's purge-failure fence then
-        // records and what a restart would re-seed. Safe to reorder --
+        // pre-purge value, which a recovery frontier write would then record.
+        // Safe to reorder --
         // `install_empty_segment` takes `start_offset` as a parameter and never
         // reads the counter, and the partition write lock is held across this
         // whole body.
@@ -7907,7 +7970,7 @@ where
         self.installed_frontier = None;
         self.segment_checksum_cache.borrow_mut().clear();
 
-        self.complete_purge_with_storage(&DiskStorage, generation)
+        self.complete_purge_with_storage(&DiskStorage, generation, floor_op)
             .await
     }
 
@@ -7923,8 +7986,7 @@ where
     ///
     /// Message history must already be reset, as [`Self::purge`] does before
     /// entering this phase. The caller must exclude concurrent writes throughout.
-    /// Retry behavior remains in [`Self::purge`], including its deferral and
-    /// message reset decisions. Storage controls the offset files and completion
+    /// Storage controls the offset files and completion
     /// marker; journal and superblock operations still use the implementations
     /// attached to this partition.
     ///
@@ -7938,12 +8000,13 @@ where
     /// Returns [`PurgeError::GenerationNotRecorded`] if the completion marker
     /// cannot be persisted. Cleanup is not rolled back, the applied generation
     /// remains unchanged, and the flag that defers prepare acknowledgements is
-    /// set. The normal purge path manages that flag when retrying.
+    /// set until recovery applies the barrier successfully.
     #[allow(clippy::too_many_lines)]
     pub async fn complete_purge_with_storage<S: DurableStorage>(
         &mut self,
         storage: &S,
         generation: u64,
+        floor_op: u64,
     ) -> Result<(), PurgeError> {
         let namespace = self.namespace();
 
@@ -8068,10 +8131,10 @@ where
         // Fence the resident journal instead of clearing it: entries are
         // consensus history (backup commit walks, repair, retransmission), so
         // they stay, but every journal-apply path no-ops ops at or below this
-        // floor (see `purge_floor_op`). The write lock held here is the same
-        // one appends take, and the pump is single-threaded, so no op can be
-        // assigned between reading the sequence and installing the floor.
-        self.purge_floor_op = self.consensus.sequencer().current_sequence();
+        // floor (see `purge_floor_op`). The replicated barrier supplies the
+        // same boundary even when a replica's sequencer announced a newer head.
+        self.purge_floor_op = floor_op;
+        self.purge_barrier_op = floor_op;
         // The journal's flush accounting and resident poll indexes describe
         // pre-purge bytes; reset them so the flush threshold counts only
         // post-purge appends and polls fall back to the (fresh, empty)
@@ -8087,8 +8150,7 @@ where
         // which the reset above just zeroed, so with no post-purge traffic the
         // entries never leave. Repair semantics are unchanged -- `evict_prefix`
         // moves them into the evicted ring, still op-addressable by
-        // `repair_entry`, and the serve path clamps `retained_from` above the
-        // floor anyway. Bounded at `commit_min`, NOT `commit_max`: an op the
+        // `repair_entry`. Bounded at `commit_min`, NOT `commit_max`: an op the
         // commit walk has not reached yet still needs its header resident, or
         // `committed_headers_from` stops at the hole and wedges `commit_min`.
         let fenced_prefix = self
@@ -8101,13 +8163,8 @@ where
 
         // Last durable step: record the applied generation before the
         // in-memory marker advances. On a write failure the marker stays old,
-        // the error propagates, and the reconciler retries the whole purge
-        // (idempotent, the chain is already empty). The reverse order would
-        // ack a purge that a crash then silently undoes: restart would
-        // hydrate the old generation, yet the reconciler believes the purge
-        // applied. Deferring PrepareOk mirrors the frontier-record failure:
-        // an op acked now would be wiped by the retry purge while peers that
-        // recorded the generation keep it.
+        // the commit stops, and recovery retries the same barrier. Advancing
+        // first would let a restart erase messages accepted after this purge.
         if let Some(dir) = self.partition_dir() {
             let path = format!("{dir}/{PURGE_GENERATION_FILE}");
             if let Err(error) = persist_purge_generation_with_storage(
@@ -8115,6 +8172,7 @@ where
                 &path,
                 generation,
                 self.created_revision,
+                floor_op,
             )
             .await
             {
@@ -8126,12 +8184,13 @@ where
                     generation,
                     %error,
                     "purge reset the partition but could not record its applied generation; \
-                     deferring PrepareOk until the re-issued purge records it"
+                     deferring PrepareOk until recovery records the committed purge"
                 );
                 return Err(PurgeError::GenerationNotRecorded(error));
             }
         }
         self.applied_purge_generation = generation;
+        self.pending_purge_op = None;
         // Same commit frontier, different (now empty) bytes: a cached offer
         // built pre-purge would advertise files the purge just unlinked.
         self.transfer_offer_cache.borrow_mut().take();
@@ -8163,9 +8222,10 @@ where
     }
 
     /// Ingest one repaired prepare: journal + stage it exactly like a live
-    /// replicated op, minus the view fence, the gap check, and the ack (the
-    /// op is already committed cluster-wide; there is nobody to ack to). The
-    /// commit walk runs at `RepairDone`, after the floor is known.
+    /// replicated op, without a live-view fence or acknowledgement. Repair may
+    /// carry an adopted suffix above the commit point. Bodies are materialized
+    /// in order, and the commit walk runs after the repair floor is known.
+    #[allow(clippy::too_many_lines)]
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
         if self.materialization_missing {
             return;
@@ -8184,6 +8244,12 @@ where
             return;
         }
         if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
+            return;
+        }
+        if session
+            .purge_generation
+            .is_some_and(|generation| generation > self.applied_purge_generation)
+        {
             return;
         }
         let canonical_checksum = consensus
@@ -8207,6 +8273,25 @@ where
             self.repair_attempts = 0;
         }
         if self.log.journal().inner.holds_op(header.op) {
+            return;
+        }
+        // A missing prefix may contain a purge. Materializing its suffix first
+        // would mix two offset spaces and let the purge erase newer messages.
+        let floor = session
+            .floor
+            .unwrap_or(0)
+            .max(self.consensus().commit_min());
+        if self.pending_purge_op().is_some_and(|op| header.op > op) {
+            return;
+        }
+        let mut next_op = session.next_op.max(floor.saturating_add(1));
+        while next_op < header.op && self.log.journal().inner.holds_repair_op(next_op) {
+            next_op += 1;
+        }
+        if let Some(session) = self.repair.as_mut() {
+            session.next_op = next_op;
+        }
+        if header.op > next_op {
             return;
         }
         let applied = if header.operation == Operation::SendMessages {
@@ -8240,14 +8325,16 @@ where
             );
             return;
         }
+        if let Some(session) = self.repair.as_mut() {
+            session.next_op = session.next_op.max(header.op.saturating_add(1));
+        }
         self.persist_repaired_prefix();
         // Advance the sequencer only along the CONTIGUOUS journaled
         // frontier. DVC advertises `op = sequencer.current_sequence()` and
         // elections pick the max, so bumping straight to a repaired op that
         // sits above an unfilled hole would let this replica win a view it
         // cannot walk. A dropped frame stalls the frontier here; the stall
-        // retry refills the hole and the next apply resumes the advance
-        // (walking over ops that were journaled out of order meanwhile).
+        // retry refills the hole and the next apply resumes the advance.
         // The checksum moves only with the frontier and is read from the
         // journal header at the new head: a lower backfill must not rewind
         // the parent the next prepare chains onto.
@@ -8267,13 +8354,39 @@ where
     /// peer's eviction point (everything below it is represented by this
     /// replica's recovered segments + offset files) and walk the repaired
     /// window through the normal commit path.
+    #[allow(clippy::too_many_lines)]
     pub async fn complete_repair(&mut self, config: &PartitionsConfig) -> RepairConclusion {
         let Some(session) = self.repair else {
             return RepairConclusion::Done;
         };
-        if !self.consensus().is_normal() || self.consensus().view() != session.view {
+        if !repair_session_live(self.consensus()) || self.consensus().view() != session.view {
             self.repair = None;
             return RepairConclusion::Done;
+        }
+        if !self.consensus().is_normal() {
+            if session
+                .floor
+                .is_some_and(|floor| floor > self.consensus().commit_min())
+                || session
+                    .purge_generation
+                    .is_some_and(|generation| generation > self.applied_purge_generation)
+            {
+                return RepairConclusion::InProgress;
+            }
+            // The elected log proves this prefix committed. Applying its purge
+            // lets repair fetch the suffix needed to finish installing the view.
+            self.consensus().advance_commit_max(session.commit_to_op);
+        }
+        if session
+            .purge_generation
+            .is_some_and(|generation| generation > self.applied_purge_generation)
+            && let Some(floor) = session.floor
+        {
+            self.repair = None;
+            return RepairConclusion::FloorRefused {
+                floor,
+                to_op: session.commit_to_op,
+            };
         }
         // A floor at or below the live commit point is moot: it cannot move
         // `commit_min`, so nothing below it is skipped and the connection
@@ -8285,10 +8398,11 @@ where
             .floor
             .filter(|&floor| floor > self.consensus().commit_min())
         {
-            // A peer may have evicted past this replica's commit frontier;
-            // an unclamped floor would drive commit_min above commit_max and
-            // panic the next advance.
-            let floor = floor.min(self.consensus().commit_max());
+            // The peer may have evicted beyond this session's committed window.
+            // Its floor cannot advance us past that window or commit_max.
+            let floor = floor
+                .min(session.commit_to_op)
+                .min(self.consensus().commit_max());
             // The floor claims "recovered durable state stands in below me".
             // Verify it: the served window must connect to the recovered
             // segments. A window starting above the durable end means ops
@@ -8363,6 +8477,15 @@ where
             }
         }
         if let Some(conclusion) = self.repair_persistence_pending(session) {
+            if conclusion == RepairConclusion::InProgress
+                && self
+                    .persistence
+                    .as_ref()
+                    .is_some_and(|persistence| persistence.is_durable_through(persistence.head()))
+            {
+                // A committed purge must apply before repair can admit its suffix.
+                self.commit_journal(config).await;
+            }
             return conclusion;
         }
         let before = self.consensus().commit_min();
@@ -8978,7 +9101,10 @@ mod tests {
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
-    use iggy_binary_protocol::{Command, ReplyHeader, StartViewHeader, WireConsumer, WireEncode};
+    use iggy_binary_protocol::{
+        Command, DoViewChangeHeader, ReplyHeader, StartViewChangeHeader, StartViewHeader,
+        WireConsumer, WireEncode,
+    };
     use journal::DurableAppend;
     use message_bus::{BusMessage, SendError};
     use server_common::MESSAGE_ALIGN;
@@ -9176,6 +9302,7 @@ mod tests {
                     );
                 }
                 let offsets = crate::state_transfer::ConsumerOffsetsWire {
+                    purge_floor_op: 0,
                     prepare_checksum: Some(prepare.header().checksum),
                     checkpoint_prepare: prepare.as_slice().to_vec(),
                     purge_generation: 0,
@@ -9289,6 +9416,7 @@ mod tests {
         prepare.as_mut_slice()
             [size_of::<PrepareHeader>() + COMMAND_HEADER_SIZE + BATCH_MESSAGE_HEADER_SIZE] ^= 1;
         let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: Some(checksum),
             checkpoint_prepare: prepare.as_slice().to_vec(),
             purge_generation: 0,
@@ -9963,7 +10091,14 @@ mod tests {
         let after_purge =
             checksummed_segment_prepare(2, before_purge.header().checksum, 0, b"after-purge");
         partition.consensus().sequencer().set_sequence(1);
-        partition.purge(&repair_config(), 1).await.unwrap();
+        partition
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
+            .await
+            .unwrap();
         partition.on_replicate(before_purge).await;
         assert!(!partition.log.journal().inner.holds_op(1));
         assert_eq!(partition.mint_frontier(), 0);
@@ -10097,6 +10232,287 @@ mod tests {
         let ack = bytemuck::checked::from_bytes::<PrepareOkHeader>(acknowledgments[0].as_slice());
         assert_eq!(ack.op, header.op);
         assert_eq!(ack.prepare_checksum, header.checksum);
+    }
+
+    #[compio::test]
+    async fn given_replicated_partition_when_purged_should_commit_through_replica_acknowledgments()
+    {
+        const REPLICA_COUNT: u8 = 3;
+        const PURGE_GENERATION: u64 = 1;
+        for (durability, offset_durability) in [
+            (
+                iggy_common::Durability::Replicated,
+                iggy_common::Durability::Replicated,
+            ),
+            (
+                iggy_common::Durability::Persisted,
+                iggy_common::Durability::Replicated,
+            ),
+            (
+                iggy_common::Durability::Replicated,
+                iggy_common::Durability::Persisted,
+            ),
+        ] {
+            let directories: Vec<_> = (0..REPLICA_COUNT)
+                .map(|_| tempfile::tempdir().unwrap())
+                .collect();
+            let mut replicas = Vec::with_capacity(usize::from(REPLICA_COUNT));
+            for replica in 0..REPLICA_COUNT {
+                let (mut partition, _) = recording_partition_at(replica, REPLICA_COUNT);
+                partition.set_partition_dir(
+                    directories[usize::from(replica)]
+                        .path()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                partition.runtime_options.durability = durability;
+                partition.runtime_options.consumer_offset_durability = offset_durability;
+                partition.open_persistence().await.unwrap();
+                assert_eq!(
+                    partition.persistence.is_some(),
+                    durability.is_persisted() || offset_durability.is_persisted(),
+                );
+                replicas.push(partition);
+            }
+
+            replicas[0].request_purge(PURGE_GENERATION).await;
+            let purge_op = replicas[0].consensus().sequencer().current_sequence();
+            let prepare = replicas[0]
+                .log
+                .journal()
+                .inner
+                .repair_entry(purge_op)
+                .unwrap();
+            for replica in replicas.iter_mut().skip(1) {
+                let mut message = Message::<PrepareHeader>::new(prepare.len());
+                message.as_mut_slice().copy_from_slice(prepare.as_slice());
+                replica.on_replicate(message).await;
+            }
+
+            let mut acknowledgments = Vec::with_capacity(usize::from(REPLICA_COUNT));
+            for replica in &mut replicas {
+                if let Some(persistence) = &replica.persistence {
+                    persistence.drain_with_timeout().await.unwrap();
+                }
+                replica.drive_persistence().await;
+                let mut loopback = Vec::new();
+                replica.consensus().drain_loopback_into(&mut loopback);
+                acknowledgments.extend(loopback.into_iter().map(Message::into_frozen));
+                acknowledgments.extend(
+                    replica
+                        .consensus()
+                        .message_bus()
+                        .sent_to_replicas
+                        .borrow()
+                        .iter()
+                        .filter_map(|(_, frame)| {
+                            bytemuck::checked::try_from_bytes::<PrepareOkHeader>(frame.as_slice())
+                                .ok()
+                                .filter(|header| header.command == Command::PrepareOk)
+                                .map(|_| frame.clone())
+                        }),
+                );
+            }
+            assert_eq!(
+                acknowledgments.len(),
+                usize::from(REPLICA_COUNT),
+                "every replica must acknowledge the purge under {durability:?}/{offset_durability:?}",
+            );
+            let config = repair_config();
+            for acknowledgment in acknowledgments {
+                let mut message = Message::<PrepareOkHeader>::new(acknowledgment.len());
+                message
+                    .as_mut_slice()
+                    .copy_from_slice(acknowledgment.as_slice());
+                replicas[0].on_ack(message, &config).await;
+            }
+            assert_eq!(replicas[0].applied_purge_generation(), PURGE_GENERATION);
+            assert_eq!(replicas[0].consensus().commit_min(), purge_op);
+            assert!(replicas[0].fatal.is_none());
+        }
+    }
+
+    #[compio::test]
+    async fn given_durable_purge_when_reopened_should_recover_its_committed_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        partition.request_purge(1).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence.drain_with_timeout().await.unwrap();
+        partition.consensus().advance_commit_max(1);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(partition.applied_purge_generation(), 1);
+        assert_eq!(persistence.purge_marker(), (1, 1));
+        persistence.drain_with_timeout().await.unwrap();
+        drop(partition);
+        drop(persistence);
+
+        let (mut recovered, _) = recording_partition_at(0, 3);
+        recovered.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        recovered.runtime_options.durability = iggy_common::Durability::Persisted;
+        recovered.hydrate_applied_purge_generation().await.unwrap();
+        recovered.open_persistence().await.unwrap();
+        assert_eq!(recovered.purge_floor_op(), 1);
+        assert_eq!(recovered.consensus().commit_max(), 1);
+        recovered.commit_journal(&repair_config()).await;
+        assert_eq!(recovered.consensus().commit_min(), 1);
+        assert_eq!(recovered.applied_purge_generation(), 1);
+        assert!(recovered.fatal.is_none());
+    }
+
+    #[compio::test]
+    async fn given_primary_elect_missing_a_purge_when_repairing_should_apply_it_before_the_suffix()
+    {
+        const ELECTED_VIEW: u32 = 3;
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            let config = repair_config();
+            let source_directory = tempfile::tempdir().unwrap();
+            let receiver_directory = tempfile::tempdir().unwrap();
+            let (mut source, _) = recording_partition_at(0, 3);
+            source.set_partition_dir(source_directory.path().to_string_lossy().into_owned());
+            let old = source
+                .apply_replicated_operation(checksummed_segment_prepare(1, 0, 0, b"old"))
+                .await
+                .unwrap();
+            let old_header = *bytemuck::checked::from_bytes::<PrepareHeader>(
+                &old.as_slice()[..size_of::<PrepareHeader>()],
+            );
+            source.consensus().sequencer().set_sequence(1);
+            source
+                .consensus()
+                .set_last_prepare_checksum(old_header.checksum);
+            source.consensus().advance_commit_max(1);
+            source.commit_journal(&config).await;
+            source.request_purge(1).await;
+            let barrier = source.log.journal().inner.repair_entry(2).unwrap();
+            let barrier_header = *bytemuck::checked::from_bytes::<PrepareHeader>(
+                &barrier.as_slice()[..size_of::<PrepareHeader>()],
+            );
+            source.consensus().advance_commit_max(2);
+            source.commit_journal(&config).await;
+            let fresh = source
+                .apply_replicated_operation(checksummed_segment_prepare(
+                    3,
+                    barrier_header.checksum,
+                    0,
+                    b"new",
+                ))
+                .await
+                .unwrap();
+            let fresh_header = *bytemuck::checked::from_bytes::<PrepareHeader>(
+                &fresh.as_slice()[..size_of::<PrepareHeader>()],
+            );
+
+            let (mut receiver, _) = recording_partition_at(0, 3);
+            receiver.set_partition_dir(receiver_directory.path().to_string_lossy().into_owned());
+            receiver.runtime_options.durability = durability;
+            receiver.log.retire_front().unwrap();
+            receiver.install_empty_segment(&config, 0).await.unwrap();
+            receiver.open_persistence().await.unwrap();
+            let group = receiver.namespace().inner();
+            let svc = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                    header.command = Command::StartViewChange;
+                    header.cluster = TEST_CLUSTER;
+                    header.group = group;
+                    header.view = ELECTED_VIEW;
+                    header.replica = 1;
+                    header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                });
+            receiver
+                .consensus()
+                .handle_start_view_change(PlaneKind::Partitions, svc.header());
+            let header_size = size_of::<DoViewChangeHeader>();
+            let size = header_size + size_of::<PrepareHeader>();
+            let mut dvc = Message::<DoViewChangeHeader>::new(size);
+            dvc.as_mut_slice()[header_size..].copy_from_slice(bytemuck::bytes_of(&fresh_header));
+            let dvc = dvc.transmute_header(|_, header: &mut DoViewChangeHeader| {
+                header.command = Command::DoViewChange;
+                header.cluster = TEST_CLUSTER;
+                header.group = group;
+                header.view = ELECTED_VIEW;
+                header.replica = 2;
+                header.op = 3;
+                header.commit = 3;
+                header.present_bitset = 1;
+                header.size = u32::try_from(size).unwrap();
+            });
+            receiver.consensus().handle_do_view_change(
+                PlaneKind::Partitions,
+                dvc.header(),
+                &dvc.as_slice()[header_size..],
+            );
+            assert!(receiver.consensus().view_log_is_pending());
+            assert!(!receiver.consensus().is_normal());
+            let mut session = armed_session(3, 0, None);
+            session.view = ELECTED_VIEW;
+            receiver.repair = Some(session);
+            for entry in [old, barrier] {
+                let mut message = Message::<PrepareHeader>::new(entry.len());
+                message.as_mut_slice().copy_from_slice(entry.as_slice());
+                receiver.apply_repaired_prepare(message).await;
+            }
+            if receiver.persistence.is_some() {
+                assert_eq!(
+                    receiver.complete_repair(&config).await,
+                    RepairConclusion::InProgress
+                );
+                receiver
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .drain_with_timeout()
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                receiver.complete_repair(&config).await,
+                RepairConclusion::InProgress
+            );
+            assert!(
+                receiver.fatal.is_none(),
+                "repair failed under {durability:?}: {:?}",
+                receiver.fatal,
+            );
+            assert_eq!(
+                receiver.applied_purge_generation(),
+                1,
+                "durability={durability:?}"
+            );
+            assert_eq!(receiver.consensus().commit_min(), 2);
+            let mut message = Message::<PrepareHeader>::new(fresh.len());
+            message.as_mut_slice().copy_from_slice(fresh.as_slice());
+            receiver.apply_repaired_prepare(message).await;
+            if receiver.persistence.is_some() {
+                assert_eq!(
+                    receiver.complete_repair(&config).await,
+                    RepairConclusion::InProgress
+                );
+                receiver
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .drain_with_timeout()
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                receiver.complete_repair(&config).await,
+                RepairConclusion::Done
+            );
+            receiver
+                .consensus()
+                .start_pending_view(PlaneKind::Partitions);
+            assert!(receiver.consensus().is_normal());
+            assert_eq!(receiver.stats.messages_count_inconsistent(), 1);
+            assert_eq!(receiver.offset.load(Ordering::Acquire), 0);
+        }
     }
 
     #[compio::test]
@@ -10991,6 +11407,7 @@ mod tests {
         );
 
         let offer = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -11585,6 +12002,7 @@ mod tests {
         partition.consumer_offsets_path = Some(consumers.to_string_lossy().into_owned());
         partition.consumer_group_offsets_path = Some(groups.to_string_lossy().into_owned());
         let wire = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -12133,6 +12551,7 @@ mod tests {
                 .unwrap();
         }
         let wire = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 1,
@@ -13134,6 +13553,7 @@ mod tests {
         // Offset 4 is below the new frontier, so its value alone cannot establish
         // that either result still belongs to the installed history.
         let installed_state = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             purge_generation: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
@@ -13210,6 +13630,7 @@ mod tests {
             index_staging: directory.path().join("00000000000000000000.index.staging"),
         };
         let offered_state = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             purge_generation: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
@@ -15235,7 +15656,11 @@ mod tests {
         );
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -15316,7 +15741,9 @@ mod tests {
             view: 0,
             commit_to_op: to_op,
             fetch_to_op,
+            next_op: floor.saturating_add(1),
             floor: Some(floor),
+            purge_generation: None,
             peer: 0,
             first_batch_offset,
             idle_ticks: 0,
@@ -15539,11 +15966,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_gap_closure_when_applying_repaired_prepare_should_adopt_new_head_checksum() {
-        // The frame that closes a gap is not the new head: the frontier walks
-        // to the highest contiguous op and the checksum must come from THAT
-        // journal entry, not from the repair frame that happened to arrive
-        // last.
+    async fn given_gap_closure_when_repair_is_retried_should_adopt_new_head_checksum() {
         const CHECKSUM_1: u128 = 0x11;
         const CHECKSUM_2: u128 = 0x22;
         const CHECKSUM_3: u128 = 0x33;
@@ -15563,6 +15986,11 @@ mod tests {
             .apply_repaired_prepare(repaired_send_prepare(2, CHECKSUM_1, CHECKSUM_2))
             .await;
 
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 2);
+        assert!(!partition.log.journal().inner.holds_op(3));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(3, CHECKSUM_2, CHECKSUM_3))
+            .await;
         assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
         assert_eq!(
             partition.consensus().last_prepare_checksum(),
@@ -15962,7 +16390,11 @@ mod tests {
         partition.consensus().begin_state_transfer_await();
 
         partition
-            .purge(&repair_config(), 3)
+            .purge(
+                &repair_config(),
+                3,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -16003,6 +16435,7 @@ mod tests {
         }
 
         let behind = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -16033,6 +16466,7 @@ mod tests {
         // off the metadata plane (0 here), not past this replica's applied
         // value, whose `purge.gen` hydration a kill-before-record leaves stale.
         let purged = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 1,
@@ -16077,6 +16511,7 @@ mod tests {
         );
 
         let stale = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -16131,6 +16566,7 @@ mod tests {
         );
 
         let offer = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 1,
@@ -16160,6 +16596,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&partition_dir);
     }
 
+    #[compio::test]
+    async fn given_post_purge_snapshot_when_it_proves_a_new_boundary_should_install_the_new_offset_space()
+     {
+        let directory = transfer_fence_dir("canonical-purge-transfer").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.clone());
+        let consumers = format!("{directory}/consumers");
+        let groups = format!("{directory}/groups");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::create_dir_all(&groups).unwrap();
+        partition.consumer_offsets_path = Some(consumers);
+        partition.consumer_group_offsets_path = Some(groups);
+        partition.set_offset_space_used(true);
+        partition.offset.store(99, Ordering::Release);
+        partition.log.journal_mut().info.messages_count = 100;
+        partition.log.journal_mut().info.current_offset = 99;
+        let offer = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 1,
+            purge_floor_op: 7,
+            next_offset: 50,
+            ..Default::default()
+        };
+        let outcome = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode(), 1)
+            .await
+            .expect("a canonical purge starts a new offset space");
+        assert!(outcome.purge_generation_recorded);
+        assert_eq!(partition.applied_purge_generation(), 1);
+        assert_eq!(partition.purge_floor_op(), 7);
+        assert_eq!(partition.offset_frontier(), 50);
+        assert_eq!(partition.consensus().commit_min(), 12);
+        let mut recovered = test_partition();
+        recovered.set_partition_dir(directory.clone());
+        recovered.hydrate_applied_purge_generation().await.unwrap();
+        assert_eq!(recovered.applied_purge_generation(), 1);
+        assert_eq!(recovered.purge_floor_op(), 7);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[compio::test]
+    async fn given_purge_snapshot_when_boundary_cannot_be_persisted_should_refuse_completion() {
+        let directory = transfer_fence_dir("purge-transfer-marker-failure").await;
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.clone());
+        let consumers = format!("{directory}/consumers");
+        let groups = format!("{directory}/groups");
+        std::fs::create_dir_all(&consumers).unwrap();
+        std::fs::create_dir_all(&groups).unwrap();
+        partition.consumer_offsets_path = Some(consumers);
+        partition.consumer_group_offsets_path = Some(groups);
+        std::fs::create_dir(Path::new(&directory).join(PURGE_GENERATION_FILE)).unwrap();
+        let offer = crate::state_transfer::ConsumerOffsetsWire {
+            purge_generation: 1,
+            purge_floor_op: 7,
+            ..Default::default()
+        };
+        let result = partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode(), 1)
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::state_transfer::PartitionInstallError::PurgeNotDurable { .. })
+        ));
+        assert_eq!(partition.applied_purge_generation(), 0);
+        assert_eq!(partition.consensus().commit_min(), 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     /// A replica that missed the purge entirely: the metadata plane has it
     /// committed, this replica never applied it, so its frontier still measures
     /// the PRE-purge offset space. The reset offer is the only thing that can
@@ -16183,6 +16687,7 @@ mod tests {
         );
 
         let reset = crate::state_transfer::ConsumerOffsetsWire {
+            purge_floor_op: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             purge_generation: 1,
@@ -17102,7 +17607,11 @@ mod purge_poll_tests {
         // 3. Purge removes the messages and clears both kinds of group progress.
         let purge_generation = 1;
         partition
-            .purge(&config, purge_generation)
+            .purge(
+                &config,
+                purge_generation,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), purge_generation);
@@ -17221,7 +17730,11 @@ mod purge_poll_tests {
         // The underlying I/O may finish, but its result has not been accepted.
         let purge_generation = 1;
         partition
-            .purge(&config, purge_generation)
+            .purge(
+                &config,
+                purge_generation,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), purge_generation);
@@ -17496,7 +18009,11 @@ mod purge_floor_tests {
         );
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17533,7 +18050,11 @@ mod purge_floor_tests {
         journal_send_batch(&mut partition, 2).await;
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17566,7 +18087,11 @@ mod purge_floor_tests {
         journal_send_batch(&mut partition, 1).await;
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17608,7 +18133,11 @@ mod purge_floor_tests {
         journal_store_offset(&mut partition, 1, 7, 42).await;
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17658,7 +18187,11 @@ mod purge_floor_tests {
         partition.consensus().advance_commit_max(1);
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17693,7 +18226,11 @@ mod purge_floor_tests {
         journal_send_batch(&mut partition, 2).await;
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17755,7 +18292,11 @@ mod purge_floor_tests {
         partition.consensus().set_commit_floor(2);
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
 
@@ -17783,7 +18324,11 @@ mod purge_floor_tests {
         let (mut partition, dir) = purge_test_partition("repaired-fenced");
         journal_send_batch(&mut partition, 1).await;
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         assert_eq!(partition.purge_floor_op(), 1, "the floor fences op 1");
@@ -17837,11 +18382,211 @@ mod purge_floor_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Why the shard defers repair COMPLETION while a committed purge is
-    /// unapplied: until the purge lands, `recovered_durable_offset` still names
-    /// the pre-purge segments, and every repaired post-purge batch (offsets
-    /// restart at 0) silently vanishes in the flush skip. The purge clears the
-    /// line, and the same batch persists.
+    #[compio::test]
+    async fn given_lagging_replica_when_repair_arrives_after_purge_should_not_restore_messages() {
+        const PRE_PURGE_OP: u64 = 1;
+        const PURGE_GENERATION: u64 = 1;
+        let config = repair_config();
+        let (mut source, source_dir) = purge_test_partition("repair-source");
+        let (mut replica, replica_dir) = purge_test_partition("repair-lagging");
+
+        journal_send_batch(&mut source, PRE_PURGE_OP).await;
+        source.consensus().advance_commit_max(PRE_PURGE_OP);
+        let entry = source
+            .log
+            .journal()
+            .inner
+            .repair_entry(PRE_PURGE_OP)
+            .expect("source retains the pre-purge batch");
+        let mut delayed_prepare = Message::<PrepareHeader>::new(entry.len());
+        delayed_prepare
+            .as_mut_slice()
+            .copy_from_slice(entry.as_slice());
+        source.commit_journal(&config).await;
+
+        source.request_purge(PURGE_GENERATION).await;
+        let purge_op = source.consensus().sequencer().current_sequence();
+        assert_eq!(purge_op, PRE_PURGE_OP + 1);
+        let entry = source
+            .log
+            .journal()
+            .inner
+            .repair_entry(purge_op)
+            .expect("source retains the purge barrier");
+        let mut purge_prepare = Message::<PrepareHeader>::new(entry.len());
+        purge_prepare
+            .as_mut_slice()
+            .copy_from_slice(entry.as_slice());
+        source.consensus().advance_commit_max(purge_op);
+        source.commit_journal(&config).await;
+        assert_eq!(source.applied_purge_generation(), PURGE_GENERATION);
+
+        replica.repair = Some(armed_session(purge_op, 0, None));
+        replica.consensus().advance_commit_max(purge_op);
+        replica.apply_repaired_prepare(delayed_prepare).await;
+        replica.apply_repaired_prepare(purge_prepare).await;
+        assert_eq!(
+            replica.complete_repair(&config).await,
+            RepairConclusion::Done
+        );
+        assert_eq!(replica.consensus().commit_min(), purge_op);
+        assert_eq!(replica.purge_floor_op(), source.purge_floor_op());
+        assert_eq!(replica.applied_purge_generation(), PURGE_GENERATION);
+        assert_eq!(
+            replica.log.active_segment().size.as_bytes_u64(),
+            0,
+            "repair must consume the purge barrier before exposing repaired history"
+        );
+
+        journal_send_batch(&mut replica, purge_op + 1).await;
+        replica.consensus().advance_commit_max(purge_op + 1);
+        replica.commit_journal(&config).await;
+        assert_eq!(replica.offset.load(Ordering::Acquire), 0);
+        assert!(replica.log.active_segment().size.as_bytes_u64() > 0);
+
+        let _ = std::fs::remove_dir_all(&source_dir);
+        let _ = std::fs::remove_dir_all(&replica_dir);
+    }
+
+    #[compio::test]
+    async fn given_reordered_repair_when_a_purge_separates_batches_should_preserve_the_suffix() {
+        let config = repair_config();
+        let (mut source, source_dir) = purge_test_partition("ordered-source");
+        let (mut replica, replica_dir) = purge_test_partition("ordered-replica");
+        let copy_prepare = |entry: Frozen<4096>| {
+            let mut message = Message::<PrepareHeader>::new(entry.len());
+            message.as_mut_slice().copy_from_slice(entry.as_slice());
+            message
+        };
+        journal_send_batch(&mut source, 1).await;
+        let old = source.log.journal().inner.repair_entry(1).unwrap();
+        source.consensus().advance_commit_max(1);
+        source.commit_journal(&config).await;
+        source.request_purge(1).await;
+        let barrier = source.log.journal().inner.repair_entry(2).unwrap();
+        source.consensus().advance_commit_max(2);
+        source.commit_journal(&config).await;
+        journal_send_batch(&mut source, 3).await;
+        let fresh = source.log.journal().inner.repair_entry(3).unwrap();
+
+        replica.repair = Some(armed_session(3, 0, None));
+        replica.consensus().advance_commit_max(3);
+        replica
+            .apply_repaired_prepare(copy_prepare(fresh.clone()))
+            .await;
+        assert!(!replica.log.journal().inner.holds_op(3));
+        replica.apply_repaired_prepare(copy_prepare(old)).await;
+        replica.apply_repaired_prepare(copy_prepare(barrier)).await;
+        replica
+            .apply_repaired_prepare(copy_prepare(fresh.clone()))
+            .await;
+        assert!(!replica.log.journal().inner.holds_op(3));
+        assert_eq!(
+            replica.complete_repair(&config).await,
+            RepairConclusion::InProgress
+        );
+        assert_eq!(replica.applied_purge_generation(), 1);
+        assert_eq!(replica.log.active_segment().size.as_bytes_u64(), 0);
+
+        replica.apply_repaired_prepare(copy_prepare(fresh)).await;
+        assert_eq!(
+            replica.complete_repair(&config).await,
+            RepairConclusion::Done
+        );
+        assert_eq!(replica.stats.messages_count_inconsistent(), 1);
+        assert_eq!(replica.offset.load(Ordering::Acquire), 0);
+        let _ = std::fs::remove_dir_all(source_dir);
+        let _ = std::fs::remove_dir_all(replica_dir);
+    }
+
+    #[compio::test]
+    async fn given_completed_purge_when_restarted_should_not_materialize_old_repairs() {
+        let config = repair_config();
+        let (mut source, directory) = purge_test_partition("restart-boundary");
+        journal_send_batch(&mut source, 1).await;
+        let old = source.log.journal().inner.repair_entry(1).unwrap();
+        source.consensus().advance_commit_max(1);
+        source.commit_journal(&config).await;
+        source.request_purge(1).await;
+        let barrier = source.log.journal().inner.repair_entry(2).unwrap();
+        source.consensus().advance_commit_max(2);
+        source.commit_journal(&config).await;
+        drop(source);
+
+        let mut restarted = test_partition();
+        restarted.set_partition_dir(directory.to_string_lossy().into_owned());
+        restarted.hydrate_applied_purge_generation().await.unwrap();
+        assert_eq!(restarted.applied_purge_generation(), 1);
+        assert_eq!(restarted.purge_floor_op(), 2);
+        restarted.repair = Some(armed_session(2, 0, None));
+        restarted.consensus().advance_commit_max(2);
+        for entry in [old, barrier] {
+            let mut message = Message::<PrepareHeader>::new(entry.len());
+            message.as_mut_slice().copy_from_slice(entry.as_slice());
+            restarted.apply_repaired_prepare(message).await;
+        }
+        assert_eq!(
+            restarted.complete_repair(&config).await,
+            RepairConclusion::Done
+        );
+        assert_eq!(restarted.log.active_segment().size.as_bytes_u64(), 0);
+        assert_eq!(restarted.stats.messages_count_inconsistent(), 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[compio::test]
+    async fn given_purge_checkpoint_when_booting_without_a_wal_should_not_reuse_deleted_ops() {
+        let config = repair_config();
+        let (mut partition, directory) = purge_test_partition("restart-sequence");
+        partition.request_purge(1).await;
+        partition.consensus().advance_commit_max(1);
+        partition.commit_journal(&config).await;
+        drop(partition);
+
+        let mut restarted = test_partition();
+        restarted.set_partition_dir(directory.to_string_lossy().into_owned());
+        restarted.hydrate_applied_purge_generation().await.unwrap();
+        restarted.open_persistence().await.unwrap();
+        restarted.request_purge(2).await;
+        assert_eq!(restarted.consensus().sequencer().current_sequence(), 2);
+        restarted.consensus().advance_commit_max(2);
+        restarted.commit_journal(&config).await;
+        assert_eq!(restarted.applied_purge_generation(), 2);
+        assert_eq!(restarted.purge_floor_op(), 2);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[compio::test]
+    async fn given_pending_prefix_when_purge_is_retried_should_propose_one_barrier_after_commit() {
+        let config = repair_config();
+        let (mut partition, directory) = purge_test_partition("barrier-retry");
+        journal_send_batch(&mut partition, 1).await;
+        partition.request_purge(1).await;
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
+        partition.consensus().advance_commit_max(1);
+        partition.commit_journal(&config).await;
+        partition.request_purge(1).await;
+        partition.request_purge(1).await;
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 2);
+        partition.consensus().advance_commit_max(2);
+        partition.commit_journal(&config).await;
+        journal_send_batch(&mut partition, 3).await;
+        partition.consensus().advance_commit_max(3);
+        partition.commit_journal(&config).await;
+        partition.request_purge(1).await;
+        assert_eq!(partition.stats.messages_count_inconsistent(), 1);
+        partition.request_purge(2).await;
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 4);
+        partition.consensus().advance_commit_max(4);
+        partition.commit_journal(&config).await;
+        assert_eq!(partition.applied_purge_generation(), 2);
+        assert_eq!(partition.purge_floor_op(), 4);
+        assert_eq!(partition.stats.messages_count_inconsistent(), 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// The purge must clear the recovered durable offset before materializing
+    /// its suffix, or fresh batches at reset offsets look already persisted.
     #[compio::test]
     async fn given_stale_recovered_durable_offset_when_committing_should_drop_until_purge_applies()
     {
@@ -17860,7 +18605,11 @@ mod purge_floor_tests {
         );
 
         partition
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         assert_eq!(
@@ -17963,7 +18712,11 @@ mod purge_floor_tests {
         let (mut partition, dir) = purge_test_partition("stale-incarnation");
         partition.set_created_revision(7);
         partition
-            .purge(&repair_config(), 4)
+            .purge(
+                &repair_config(),
+                4,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), 4);
@@ -18002,7 +18755,11 @@ mod purge_floor_tests {
         // So the new topic's first purge (generation 1) passes the reconciler's
         // `committed > applied` gate and re-keys the record.
         recreated
-            .purge(&repair_config(), 1)
+            .purge(
+                &repair_config(),
+                1,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         let mut after = rebuild(8);
@@ -18028,7 +18785,11 @@ mod purge_floor_tests {
     async fn purge_persists_generation_and_hydrates_it_back() {
         let (mut partition, dir) = purge_test_partition("generation");
         partition
-            .purge(&repair_config(), 3)
+            .purge(
+                &repair_config(),
+                3,
+                partition.consensus().sequencer().current_sequence(),
+            )
             .await
             .expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), 3);

@@ -296,10 +296,16 @@ pub struct RepairSession {
     /// [`Self::commit_to_op`] only for the canonical suffix carried by the
     /// adopted `StartView`.
     pub fetch_to_op: u64,
+    /// First unverified body in this session's contiguous prefix. A missing
+    /// operation may be a purge, so later bodies cannot be materialized yet.
+    pub next_op: u64,
     /// Commit floor learned from `RangeEvicted { retained_from }`:
     /// `retained_from - 1`. `None` until (unless) the serving peer reports a
     /// truncated prefix.
     pub floor: Option<u64>,
+    /// Purge generation of the peer's state below `floor`. A newer generation
+    /// requires a snapshot because the evicted prefix may contain its barrier.
+    pub purge_generation: Option<u64>,
     /// The peer serving this stream (re-request target on stall).
     pub peer: u8,
     /// Lowest `base_offset` among the repaired `SendMessages` batches:

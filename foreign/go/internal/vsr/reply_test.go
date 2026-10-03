@@ -130,7 +130,7 @@ func TestDecodeReply_RejectsABodyShorterThanDeclared(t *testing.T) {
 }
 
 func TestDecodeReply_RejectsAnUndeclaredReplyOperation(t *testing.T) {
-	for _, operation := range []Operation{4, 63, 150, 163, 255} {
+	for _, operation := range []Operation{4, 63, 150, 164, 255} {
 		header := replyHeader(operation, 0, 0)
 		_, err := DecodeReply(header, nil)
 		assert.ErrorIs(t, err, ierror.ErrInvalidCommand, "operation %d", operation)

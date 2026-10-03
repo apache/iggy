@@ -393,6 +393,15 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         ring.get(&op).cloned()
     }
 
+    /// Check resident and retained repair coverage without scanning headers.
+    pub(crate) fn holds_repair_op(&self, op: u64) -> bool {
+        if self.holds_op(op) {
+            return true;
+        }
+        let ring = unsafe { &*self.evicted_ring.get() };
+        ring.contains_key(&op)
+    }
+
     /// The header at `op`, over exactly the range [`Self::repair_entry`] serves.
     ///
     /// NOT [`Self::header_by_op`], which reads the resident headers alone. The
@@ -1546,20 +1555,24 @@ mod tests {
         const CAPACITY: usize = 4;
         let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
         journal.set_ring_caps(CAPACITY, u64::MAX);
+        assert!(!journal.holds_repair_op(1));
         for op in [4, 2, 8, 6, 3, 1, 7, 5] {
             journal
                 .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
                 .await
                 .unwrap();
+            assert!(journal.holds_repair_op(op));
         }
         journal.evict_prefix(8).await;
         assert_eq!(journal.evicted_ring_occupancy().0, CAPACITY);
         assert_eq!(journal.repair_retained_from(), Some(5));
         for op in 1..=4 {
+            assert!(!journal.holds_repair_op(op));
             assert!(journal.repair_entry(op).is_none());
             assert!(journal.repair_header(op).is_none());
         }
         for op in 5..=8 {
+            assert!(journal.holds_repair_op(op));
             assert_eq!(journal.repair_header(op).unwrap().op, op);
             assert_eq!(
                 journal.repair_entry(op).unwrap().as_slice(),
@@ -1588,6 +1601,7 @@ mod tests {
         journal.clear_all();
         assert_eq!(journal.evicted_ring_occupancy(), (0, 0));
         assert!(journal.repair_entry(8).is_none());
+        assert!(!journal.holds_repair_op(8));
     }
 
     #[compio::test]
