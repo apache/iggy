@@ -4120,23 +4120,11 @@ where
         M: RestorableMetadataStm,
         T: ShardsTable,
     {
-        if let Some(attachment) = &attachment {
-            let error = if !matches!(
-                request.header().operation,
-                Operation::SendMessages
-                    | Operation::StoreConsumerOffset
-                    | Operation::DeleteConsumerOffset
-            ) {
-                Some(IggyError::InvalidCommand)
-            } else if !attachment.session.is_valid() {
-                Some(IggyError::StaleClient)
-            } else {
-                None
-            };
-            if let Some(error) = error {
-                Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
-                return;
-            }
+        if let Some(attachment) = &attachment
+            && let Err(error) = attachment.validate_write(request.header().operation)
+        {
+            Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
+            return;
         }
         let routing = {
             let header = request.header();

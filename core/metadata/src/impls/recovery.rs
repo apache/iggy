@@ -494,14 +494,14 @@ where
 
     // The scan replays entries no producer sealed rather than rejecting them, so
     // report the count: an operator gets no other signal that these bodies were
-    // replayed on trust. Goes away once every node in the cluster seals.
+    // replayed on trust. Storage-format admission remains a separate prerequisite.
     let unsealed_entries = journal.unsealed_entry_count();
     if unsealed_entries > 0 {
         tracing::warn!(
             unsealed_entries,
             path = %journal_path.display(),
             "metadata WAL holds entries without a body checksum; replayed unverified \
-             (written before body sealing, or replicated from a primary that predates it)"
+             (the writer did not seal the frame)"
         );
     }
 
@@ -676,18 +676,13 @@ where
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
         let reply = mux_stm.gated_update(entry)?;
-        // Re-cache the reply exactly like the commit paths: same prepare
-        // header + deterministic apply output = the original bytes. Skipped
-        // when the session is absent (server-originated ops, or the client
-        // was evicted).
-        if header.client != 0 && header.operation != Operation::CompleteConsumerGroupRevocation {
+        // Every client commit must restore its original receipt before admission.
+        if header.client != consensus::client_table::RESERVED_CLIENT_ID
+            && header.operation != Operation::CompleteConsumerGroupRevocation
+        {
             let cached = build_reply_message_with(header, reply.reply_body_len(), |dst| {
                 reply.write_reply_body(dst);
             });
-            // Skips (never panics) on a stale-request replay: capacity
-            // eviction is replica-local and unlogged, so a WAL can legitimately
-            // replay a lower request id onto a preserved watermark. Recovery
-            // must boot from such a WAL, not refuse it.
             if client_table.commit_reply(header.client, header.user_id, cached)
                 != consensus::client_table::CommitReply::Cached
             {

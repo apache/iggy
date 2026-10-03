@@ -46,6 +46,7 @@
 //! expose. The builders here are parameterized by client id, which is why the
 //! restart tests' fixed-identity helpers are not reused directly.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use bytes::{Bytes, BytesMut};
 use consensus::client_table::REPLY_RING_CAPACITY;
 use iggy::prelude::*;
@@ -74,8 +75,6 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
 
 /// The client whose dedup state each test puts under pressure.
-const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
-
 const CLIENT_A: u128 = 0xA11CE0001;
 
 /// New identities refused while every registry slot is protected.

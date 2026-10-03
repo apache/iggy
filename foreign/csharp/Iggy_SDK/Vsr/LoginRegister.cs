@@ -31,11 +31,11 @@ internal static class LoginRegister
 {
     internal const string SDK_NAME = "csharp-sdk";
 
-    /// <summary>Semver of the <c>iggy_binary_protocol</c> crate this SDK is built against.</summary>
+    /// <summary>Explicit wire version from <c>core/binary_protocol/src/version.rs</c>.</summary>
     internal const int PROTOCOL_VERSION_MAJOR = 0;
 
     internal const int PROTOCOL_VERSION_MINOR = 11;
-    internal const int PROTOCOL_VERSION_PATCH = 0;
+    internal const int PROTOCOL_VERSION_PATCH = 1;
 
     /// <summary>Packed protocol version: <c>major &lt;&lt; 20 | minor &lt;&lt; 10 | patch</c>, 10 bits each.</summary>
     internal const uint PROTOCOL_VERSION =

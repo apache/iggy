@@ -1563,7 +1563,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         body.writeIntLE(0);
         body.writeIntLE(1);
         body.writeLongLE(session);
-        body.writeIntLE(11 << 10);
+        body.writeIntLE((11 << 10) | 1);
         body.writeByte(0);
         return body;
     }

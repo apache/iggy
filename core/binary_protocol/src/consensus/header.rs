@@ -1113,8 +1113,8 @@ impl ConsensusHeader for PrepareHeader {
 
 /// `checksum` of a prepare no producer sealed.
 ///
-/// Written by a build predating the identity seal. Verification skips such
-/// entries so an older build's WAL still replays.
+/// Used by in-process producers that do not seal frames. A zero checksum does
+/// not grant storage-format compatibility; boot validates that separately.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
 /// The frame's body, bounded by `size`. What `checksum_body` covers.

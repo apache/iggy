@@ -34,7 +34,6 @@ use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
 use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::ClientState;
 use iggy_common::{
@@ -380,13 +379,9 @@ impl<T: PollTransport> PollRouter<T> {
                 .send_poll_request(
                     BIND_SESSION_CODE,
                     BindSessionRequest {
-                        version_info: ClientVersionInfo {
-                            protocol_version: IGGY_PROTOCOL_VERSION,
-                            sdk_name: WireName::new("rust-sdk")
-                                .map_err(|_| IggyError::InvalidConfiguration)?,
-                            sdk_version: WireName::new(coordinator.sdk_version())
-                                .map_err(|_| IggyError::InvalidConfiguration)?,
-                        },
+                        version_info: iggy_common::rust_sdk_version_info(
+                            coordinator.sdk_version(),
+                        )?,
                         identity: route.consumer_session,
                         bind_secret: coordinator.session_bind_secret().await?,
                     }
@@ -397,7 +392,10 @@ impl<T: PollTransport> PollRouter<T> {
             let bound = LoginRegisterResponse::decode_from(&response)
                 .map_err(|_| IggyError::InvalidFormat)?;
             if bound.session != route.consumer_session.session {
-                return Err(IggyError::InvalidSession(bound.session));
+                return Err(IggyError::SessionMismatch(
+                    route.consumer_session.session,
+                    bound.session,
+                ));
             }
             connection
                 .client
@@ -543,7 +541,7 @@ mod tests {
     };
     use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterNodeResponse;
     use iggy_binary_protocol::{
-        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier,
+        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier, WireName,
         WirePollingStrategy,
     };
     use iggy_common::{

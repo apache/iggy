@@ -110,9 +110,10 @@ const KNOWN_OPERATIONS: ReadonlySet<number> =
 export const isKnownOperation = (operation: number): boolean =>
   KNOWN_OPERATIONS.has(operation);
 
-/** Internal band, never client-sent. */
+/** Replica-only operations, never client-sent. */
 export const isInternal = (operation: number): boolean =>
-  operation >= INTERNAL_START && operation < METADATA_START;
+  (operation >= INTERNAL_START && operation < METADATA_START) ||
+    operation === Operation.RetireSession;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:
@@ -121,7 +122,7 @@ export const isInternal = (operation: number): boolean =>
  * `Operation::is_metadata`.
  */
 export const isMetadata = (operation: number): boolean => {
-  if (isInternal(operation)) return true;
+  if (isInternal(operation) && operation < Operation.SendMessages) return true;
   if (operation === Operation.DeleteSegments) return false;
   return operation >= METADATA_START &&
     operation <= Operation.LeaveConsumerGroup;

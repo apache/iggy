@@ -252,6 +252,13 @@ const operationModule = await import(
 );
 const internalStart = rustOperations.get('CreateTopicWithAssignments');
 const metadataStart = rustOperations.get('CreateStream');
+const partitionStart = rustOperations.get('SendMessages');
+const rustInternalNames = new Set(
+  [...(rustOperation.match(
+    /fn is_internal[\s\S]*?matches!\(\s*self,([\s\S]*?)\)\s*\n\s*\}/
+  )?.[1] ?? '').matchAll(/Self::([A-Za-z0-9]+)/g)].map((match) => match[1])
+);
+assert.ok(rustInternalNames.size > 0, 'Rust is_internal allowlist not found');
 const rustMetadataNames = new Set(
   [...(rustOperation.match(
     /fn is_metadata[\s\S]*?matches!\(\s*self,([\s\S]*?)\)\s*\n\s*\}/
@@ -268,8 +275,13 @@ assert.ok(
   'Rust is_result_framed allowlist not found'
 );
 for (const [name, value] of rustOperations) {
-  const internal = value >= internalStart && value < metadataStart;
-  const metadata = internal || rustMetadataNames.has(name);
+  const internal = (value >= internalStart && value < metadataStart) || rustInternalNames.has(name);
+  const metadata = (internal && value < partitionStart) || rustMetadataNames.has(name);
+  assert.equal(
+    operationModule.isInternal(value),
+    internal,
+    `Node isInternal(${name}) differs from Rust is_internal`
+  );
   assert.equal(
     operationModule.isMetadata(value),
     metadata,

@@ -240,6 +240,34 @@ func TestExchange_GivesUpOnNotCommittedWhenTheBudgetExpires(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
+func TestExchange_PreservesUncertaintyAfterALaterRefusal(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(index int, _ request) []byte {
+		switch index {
+		case 0:
+			return statusReplyFrame(vsr.OperationCreatePartitions, uint32(ierror.TransientNotCommittedCode), nil)
+		case 1:
+			return statusReplyFrame(vsr.OperationCreatePartitions, uint32(ierror.TransientNotAcceptedCode), nil)
+		default:
+			return replyFrame(vsr.OperationCreatePartitions, resultSection())
+		}
+	})
+	request := &command.CreatePartitions{
+		StreamId: numericIdentifier(t, 1), TopicId: numericIdentifier(t, 1), PartitionsCount: 1,
+	}
+	frame, err := appendCommandFrame(nil, request)
+	require.NoError(t, err)
+	_, _, _, err = client.attempt(context.Background(), uint32(request.Code()), frame, false,
+		time.Now(), time.Now().Add(time.Second))
+	require.NoError(t, err, "a later refusal must not escape as permission to register a fresh identity")
+	recorded := server.recorded()
+	require.Len(t, recorded, 3)
+	for _, replay := range recorded[1:] {
+		assert.Equal(t, recorded[0].header, replay.header)
+		assert.Equal(t, recorded[0].payload, replay.payload)
+	}
+}
+
 func TestExchange_EscalatesNotAcceptedToALeaderRecheck(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	// A single-node roster short-circuits the redirect, so the request keeps

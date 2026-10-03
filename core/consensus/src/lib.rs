@@ -86,7 +86,7 @@ pub trait Pipeline {
         false
     }
 
-    fn pending_client_ids(&self) -> Vec<u128>;
+    fn pending_client_ids(&self) -> impl Iterator<Item = u128>;
     /// The unresolved session, request number, and operation.
     fn pending_request(
         &self,

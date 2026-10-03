@@ -40,6 +40,51 @@ namespace Apache.Iggy.Tests.VsrTests;
 /// </summary>
 public sealed class EndpointFailoverTests
 {
+    [Fact]
+    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite()
+    {
+        const int RefusalCount = 50;
+        using var node = new MockNode();
+        var attempts = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePartitions)
+            {
+                attempts.Enqueue(request);
+                var status = attempts.Count switch
+                {
+                    1 => VsrError.TRANSIENT_NOT_COMMITTED,
+                    <= RefusalCount => VsrError.TRANSIENT_NOT_ACCEPTED,
+                    _ => 0
+                };
+                return Reply(request.Operation, status == 0 ? new byte[4] : [], (uint)status);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1)
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RefusalCount + 1, attempts.Count);
+        var original = attempts.First();
+        Assert.All(attempts, replay =>
+        {
+            Assert.Equal(original.ClientId, replay.ClientId);
+            Assert.Equal(original.Session, replay.Session);
+            Assert.Equal(original.RequestId, replay.RequestId);
+            Assert.Equal(original.Body, replay.Body);
+        });
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

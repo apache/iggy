@@ -200,7 +200,7 @@ impl IggyProducerBuilder {
     /// An ambiguous outcome or terminal refusal stops producer retries. The
     /// transport may replay the exact request within its original session.
     /// Defaults to 3 retries with a one-second interval. See the
-    /// [retry contract](super::producer::IggyProducer#retry-contract).
+    /// [retry contract](super::producer::IggyProducer#retrying-and-what-a-failure-means).
     pub fn send_retries(self, retries: Option<u32>, interval: Option<NonZeroIggyDuration>) -> Self {
         Self {
             send_retries_count: retries,

@@ -72,7 +72,6 @@ public enum IggyErrorCode {
      * resending can duplicate the write.
      */
     REQUEST_TOO_OLD(85),
-    DURABILITY_REQUIRED(86),
 
     // Client errors
     CLIENT_NOT_FOUND(100),
@@ -127,6 +126,7 @@ public enum IggyErrorCode {
 
     // VSR protocol errors
     INCOMPATIBLE_PROTOCOL_VERSION(14003),
+    SESSION_MISMATCH(14004),
 
     // Unknown error code
     UNKNOWN(-1);

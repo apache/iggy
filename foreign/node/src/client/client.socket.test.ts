@@ -134,12 +134,12 @@ const assertSharedBinding = (register: Buffer, binding: Buffer): void => {
     register.subarray(sdkVersion.next, sdkVersion.next + BIND_SECRET_BYTES));
 };
 
-const registerReplyBody = (): Buffer => {
+const registerReplyBody = (session = TEST_SESSION): Buffer => {
   const serverVersion = Buffer.from('0.0.0');
   const body = Buffer.alloc(4 + 17 + serverVersion.length);
   body.writeUInt32LE(0, 0);
   body.writeUInt32LE(7, 4);
-  body.writeBigUInt64LE(TEST_SESSION, 8);
+  body.writeBigUInt64LE(session, 8);
   body.writeUInt32LE(0, 16);
   body.writeUInt8(serverVersion.length, 20);
   serverVersion.copy(body, 21);
@@ -775,9 +775,10 @@ describe('primary auto-commit polling', () => {
       const registered = new Set<Socket>();
       let routes = 0;
       const cluster = await startPollCluster(undefined, (frame, socket) => {
-        if (frame[REQUEST_OFFSET.operation] === Operation.Register) {
+        if (frame[REQUEST_OFFSET.operation] === Operation.Register ||
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
           assert.equal(registered.has(socket), false,
-            'a fresh VSR identity cannot register on the old bound transport');
+            'session recovery must replace the rejected control transport');
           registered.add(socket);
         }
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPollRouting || ++routes > 1)
@@ -944,6 +945,60 @@ describe('primary auto-commit polling', () => {
 });
 
 describe('VSR client socket', () => {
+  for (const refusal of [0, 30, 58]) {
+    it(`resumes or replaces a lost connection only after bind verdict ${refusal}`, async () => {
+      let registrations = 0;
+      let sends = 0;
+      let bindStatus = refusal;
+      const server = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (operation === Operation.Register) {
+          registrations += 1;
+          socket.write(replyFrame(operation, registerReplyBody(TEST_SESSION + BigInt(registrations - 1))));
+        } else if (code === COMMAND_CODE.BindSession) {
+          socket.write(replyFrame(operation, bindStatus === 0 ? registerReplyBody().subarray(4) : undefined, bindStatus));
+        } else if (code === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(operation, singleNodeMetadataBody(server.port)));
+        } else if (operation === Operation.SendMessages) {
+          sends += 1;
+          if (sends === 1)
+            socket.destroy();
+          else
+            socket.write(replyFrame(operation, Buffer.alloc(4)));
+        }
+      });
+      const config = vsrConfig(server.port);
+      const client = new CommandResponseStream(config);
+      try {
+        await client.authenticate(config.credentials);
+        await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, Buffer.from('lost-reply')));
+        if (refusal === 58) {
+          await assert.rejects(client.authenticate(config.credentials), (error: unknown) =>
+            error instanceof ResponseError && error.errorCode === 58);
+          assert.equal(registrations, 1, 'lagging metadata must not replace the logical session');
+          bindStatus = 0;
+        }
+        await client.authenticate(config.credentials);
+        assert.equal(sends, 1, 'authentication must not replay the uncertain mutation');
+        assert.equal(registrations, refusal === 30 ? 2 : 1);
+        const binding = server.frames.find((frame) =>
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession)!;
+        assertSharedBinding(server.frames[0], binding);
+        await client.sendCommand(COMMAND_CODE.SendMessages, Buffer.from('explicit-new-write'));
+        const writes = server.frames.filter((frame) => frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages);
+        assert.equal(writes.length, 2);
+        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.session), refusal === 30 ? TEST_SESSION + 1n : TEST_SESSION);
+        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.request), refusal === 30 ? 1n : 2n);
+        assert.equal(writes[0].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)
+          .equals(writes[1].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)), refusal !== 30);
+      } finally {
+        client.destroy();
+        await server.close();
+      }
+    });
+  }
+
   it('exchanges VSR frames over TLS', async () => {
     const server = await startVsrServer(
       (frame, socket) => singleNodeHandler(server.port)(frame, socket),
@@ -1179,8 +1234,9 @@ describe('VSR client socket', () => {
     );
     const intermediate = await startVsrServer((frame, socket) => {
       const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-      if (operation === Operation.Register) {
-        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+      if (operation === Operation.Register ||
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
+        singleNodeHandler(intermediate.port)(frame, socket);
         return;
       }
       socket.write(replyFrame(
@@ -1212,8 +1268,9 @@ describe('VSR client socket', () => {
         intermediate.frames.map(
           (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
         ),
-        [Operation.Register, Operation.NonReplicated]
+        [Operation.NonReplicated, Operation.NonReplicated]
       );
+      assertSharedBinding(follower.frames[0], intermediate.frames[0]);
       assert.equal(
         leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
         60_019
@@ -1236,8 +1293,9 @@ describe('VSR client socket', () => {
 
       const survivor = await startVsrServer((frame, socket) => {
         const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        if (operation === Operation.Register ||
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
+          singleNodeHandler(survivor.port)(frame, socket);
           return;
         }
         const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
@@ -1312,13 +1370,8 @@ describe('VSR client socket', () => {
         }
         assert.ok(resumed, `the client never resumed: ${String(lastError)}`);
 
-        const operations = survivor.frames.map(
-          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-        );
-        assert.ok(
-          operations.includes(Operation.Register),
-          'the client signed in again on the survivor'
-        );
+        assert.equal(countCommand(survivor, COMMAND_CODE.BindSession), 1);
+        assertSharedBinding(primary.frames[0], survivor.frames[0]);
         assert.ok(
           survivor.frames.some(
             (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_021
@@ -1388,9 +1441,10 @@ describe('VSR client socket', () => {
           (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
         );
         assert.deepEqual(leaderOperations, [
-          Operation.Register,
+          Operation.NonReplicated,
           Operation.NonReplicated
         ]);
+        assertSharedBinding(follower.frames[0], leader.frames[0]);
         assert.equal(client.isAuthenticated, true);
       } finally {
         client.destroy();
@@ -1770,8 +1824,9 @@ describe('VSR client socket', () => {
       });
       const second = await startVsrServer((frame, socket) => {
         const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        if (operation === Operation.Register ||
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
+          singleNodeHandler(second.port)(frame, socket);
           return;
         }
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040) {

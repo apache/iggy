@@ -176,7 +176,7 @@ impl HandshakeStatus {
 
 /// Decode the `status` byte of a `ReplicaChallenge` response frame.
 ///
-/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=5` map to their reason; any
+/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=6` map to their reason; any
 /// other (garbage) byte is treated as [`HandshakeStatus::UnknownCommand`] so the
 /// dialer rejects rather than mistaking it for success. Discriminants must stay
 /// in sync with [`HandshakeStatus`]; the `status_round_trips` test enforces it.
@@ -522,13 +522,14 @@ mod tests {
 
     #[test]
     fn status_round_trips() {
-        const ALL: [HandshakeStatus; 6] = [
+        const ALL: [HandshakeStatus; 7] = [
             HandshakeStatus::Ok,
             HandshakeStatus::UnknownCommand,
             HandshakeStatus::ClusterMismatch,
             HandshakeStatus::DirectionalRule,
             HandshakeStatus::AuthRequired,
             HandshakeStatus::MacMismatch,
+            HandshakeStatus::IncompatibleBuild,
         ];
         for status in ALL {
             let mut reserved = [0u8; RESERVED_COMMAND_LEN];

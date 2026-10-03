@@ -52,6 +52,18 @@ async fn given_persisted_auto_creation_when_producer_sends_should_confirm_and_po
     let response = producer.send_one(message).await.unwrap();
     assert_eq!(response.confirmations.len(), 1);
     assert_eq!(response.confirmations[0].base_offset, 0);
+    let details = client
+        .get_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        TopicCreateOptions::from_resource_options(&details.options).durability,
+        Durability::Persisted
+    );
     let polled = client
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),

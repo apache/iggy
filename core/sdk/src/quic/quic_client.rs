@@ -315,10 +315,7 @@ impl BinaryTransport for QuicClient {
                 }
                 retain_replay_header(
                     &mut header,
-                    &*self
-                        .consensus_session
-                        .lock()
-                        .map_err(|_| IggyError::InvalidConfiguration)?,
+                    &self.consensus_session,
                     code,
                     &IggyError::TransientNotAccepted,
                 )?;
@@ -392,15 +389,7 @@ impl BinaryTransport for QuicClient {
             self.connect()
                 .await
                 .map_err(|error| retry_outcome.observe(error))?;
-            retain_replay_header(
-                &mut header,
-                &*self
-                    .consensus_session
-                    .lock()
-                    .map_err(|_| IggyError::InvalidConfiguration)?,
-                code,
-                &error,
-            )?;
+            retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
             drop(_routing_guard);
             return self
                 .send_raw_retaining_header(code, payload, &mut header)
@@ -428,15 +417,7 @@ impl BinaryTransport for QuicClient {
             *self.skip_auto_login_once.lock().await = false;
         }
         reconnect.map_err(|error| retry_outcome.observe(error))?;
-        retain_replay_header(
-            &mut header,
-            &*self
-                .consensus_session
-                .lock()
-                .map_err(|_| IggyError::InvalidConfiguration)?,
-            code,
-            &error,
-        )?;
+        retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
         drop(_routing_guard);
         self.send_raw_retaining_header(code, payload, &mut header)
             .await

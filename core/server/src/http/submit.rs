@@ -91,7 +91,7 @@ pub(in crate::http) async fn submit_committed(
     state: &HttpInner,
     session: &Rc<HttpSession>,
     operation: Operation,
-    body: &[u8],
+    body: Bytes,
 ) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     // Control writes are authorized in-apply on the metadata STM: a denial
     // comes back as `Unauthorized` in the committed result section, which
@@ -103,7 +103,6 @@ pub(in crate::http) async fn submit_committed(
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
     let watermarks = Rc::clone(&state.metadata_watermarks);
-    let body = body.to_vec();
     let max_tokens_per_user = state.max_tokens_per_user;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
     // the write runs to completion regardless of handler liveness.
@@ -301,7 +300,7 @@ pub(in crate::http) async fn submit_write(
     state: &HttpInner,
     session: &Rc<HttpSession>,
     operation: Operation,
-    body: &[u8],
+    body: Bytes,
 ) -> Result<Bytes, WriteError> {
     let (_request_header, reply, _raw_token) =
         submit_committed(state, session, operation, body).await?;
@@ -445,11 +444,10 @@ async fn partition_write(
 pub(in crate::http) async fn produce_unacked(
     state: &Rc<HttpInner>,
     session: &Rc<HttpSession>,
-    body: &[u8],
+    body: Bytes,
 ) -> Result<(), PartitionWriteError> {
     let state = Rc::clone(state);
     let session = Rc::clone(session);
-    let body = body.to_vec();
     let (sent, dispatched) = oneshot::channel();
     compio::runtime::spawn(async move {
         let mut sent = Some(sent);

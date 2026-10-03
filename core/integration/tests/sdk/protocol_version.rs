@@ -22,6 +22,7 @@
 //! frame carrying `IncompatibleProtocol` plus the accepted window; a body
 //! without a decodable prefix with `MalformedLogin` and a zero window.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
@@ -38,8 +39,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 // Wire bytes pinned to `EvictionReason` discriminants in `consensus::header`.
-const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
-
 const EVICTION_REASON_INCOMPATIBLE_PROTOCOL: u8 = 14;
 const EVICTION_REASON_MALFORMED_LOGIN: u8 = 15;
 

@@ -858,6 +858,7 @@ func (c *IggyTcpClient) exchangeLocked(
 	transientDeadline, readDeadline time.Time,
 ) ([]byte, error) {
 	pollState, _ := ctx.Value(singlePollExchange{}).(*pollExchangeState)
+	uncertain := false
 	for {
 		if pollState != nil {
 			if err := ctx.Err(); err != nil {
@@ -905,6 +906,18 @@ func (c *IggyTcpClient) exchangeLocked(
 			pollState.reusable = c.conn != nil && vsr.PeekCommand(&c.respHeader) == vsr.FrameReply &&
 				(err == nil || !isReconnectable(err))
 			return response, err
+		}
+		if errors.Is(err, ierror.ErrTransientNotCommitted) {
+			uncertain = true
+		}
+		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) ||
+			errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) ||
+			errors.Is(err, ierror.ErrUnauthorized)) {
+			c.handleReplyFailureLocked(err)
+			if c.conn == nil {
+				return nil, ierror.ErrTransientNotCommitted
+			}
+			err = ierror.ErrTransientNotCommitted
 		}
 		switch {
 		case errors.Is(err, ierror.ErrTransientNotCommitted) && time.Now().Before(readDeadline):

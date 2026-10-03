@@ -152,9 +152,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let header = msg.header();
     let peer_id = header.replica;
     let has_nonce = auth::has_nonce(&header.reserved_command);
-    // Only a peer that sent a nonce speaks the authenticated protocol and is
-    // waiting to read our response; a legacy (no-nonce) dialer delegates its
-    // fd without reading, so a reject frame would land in its VSR reader instead.
+    // Both authenticated and unauthenticated peers read the build-gate response.
     let nackable = true;
 
     if header.command != Command::ReplicaHello {

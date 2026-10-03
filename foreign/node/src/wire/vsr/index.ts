@@ -26,6 +26,7 @@ import {
   serializeBindSession,
   serializeLoginRegister,
   serializeLoginRegisterWithPat,
+  SESSION_IDENTITY_BYTES,
 } from './register.js';
 import { decodeResponse } from './reply.js';
 import { ConsensusSession } from './session.js';
@@ -35,6 +36,7 @@ const packageMetadata = createRequire(import.meta.url)(
 ) as { version: string };
 const SDK_VERSION = packageMetadata.version;
 const MAX_U32 = 0xFFFF_FFFF;
+const SESSION_IDENTITY_OFFSET = { clientLow: 0, clientHigh: 8, session: 16, metadataWatermark: 24 };
 /** `IggyError::Unauthenticated`, matching the Rust SDK's unbound-session error. */
 const UNAUTHENTICATED = 40;
 
@@ -67,6 +69,17 @@ export class VsrSession {
 
   bindPayload(identity: Buffer): Buffer {
     return serializeBindSession(identity, SDK_VERSION, this.state.bindSecret);
+  }
+
+  resumePayload(metadataWatermark: bigint): Buffer | undefined {
+    if (this.state.session === null)
+      return undefined;
+    const identity = Buffer.alloc(SESSION_IDENTITY_BYTES);
+    identity.writeBigUInt64LE(BigInt.asUintN(64, this.state.clientId), SESSION_IDENTITY_OFFSET.clientLow);
+    identity.writeBigUInt64LE(this.state.clientId >> 64n, SESSION_IDENTITY_OFFSET.clientHigh);
+    identity.writeBigUInt64LE(this.state.session, SESSION_IDENTITY_OFFSET.session);
+    identity.writeBigUInt64LE(metadataWatermark, SESSION_IDENTITY_OFFSET.metadataWatermark);
+    return this.bindPayload(identity);
   }
 
   encode(command: number, payload: Buffer): Buffer {

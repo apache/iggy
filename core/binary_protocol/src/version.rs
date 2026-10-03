@@ -69,10 +69,9 @@
 //!
 //! The server accepts a client when its packed version is
 //! `>= IGGY_PROTOCOL_VERSION_MIN` and its `major.minor` is `<=` the
-//! server's. Patch releases never change the wire, so the upper bound
-//! ignores patch. `IGGY_PROTOCOL_VERSION_MIN` defaults to the current
-//! version with patch zeroed and is widened deliberately when a minor
-//! bump stays wire-compatible.
+//! server's. The explicit minimum excludes older wire layouts, including
+//! patches that predate a required field. The upper bound ignores patch;
+//! newer patches of the same minor must preserve this layout.
 //!
 //! ## Rejection frame
 //!
@@ -97,11 +96,11 @@ const COMPONENT_MAX: u32 = (1 << COMPONENT_BITS) - 1;
 const PATCH_MASK: u32 = COMPONENT_MAX;
 
 /// Current binary protocol version, independent of the crate's release version.
-pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 0);
+/// Version 0.11.1 requires the session-binding secret in login requests.
+pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 1);
 
-/// Oldest protocol version this build still accepts at login: the current
-/// version with patch zeroed (patch releases never change the wire).
-/// Widen deliberately when a minor bump stays wire-compatible.
+/// Oldest protocol version this build accepts at login.
+/// Version 0.11.0 has no session-binding secret and is incompatible.
 ///
 /// Under 0.x this makes a server minor bump a client flag-day: every
 /// prior-minor client is rejected at login until MIN is widened. A rolling
@@ -111,17 +110,15 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 0);
 // minor/patch = compatible, so MIN derives from the current major instead
 // of the current minor. Under 0.x a minor bump may break the wire, so the
 // minor-scoped window is correct.
-pub const IGGY_PROTOCOL_VERSION_MIN: u32 = IGGY_PROTOCOL_VERSION & !PATCH_MASK;
-// A 0.0.x crate version would pack MIN to 0, which `EvictionHeader::validate`
-// rejects (window requires min >= 1) -- the server would emit eviction frames
-// that fail its own validation.
-const _: () = assert!(IGGY_PROTOCOL_VERSION_MIN > 0);
+pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 11, 1);
+const _: () =
+    assert!(IGGY_PROTOCOL_VERSION_MIN > 0 && IGGY_PROTOCOL_VERSION_MIN <= IGGY_PROTOCOL_VERSION);
 
 /// Range check used by the server-side login gate.
 ///
 /// Packed component order preserves semver ordering, so plain integer
-/// comparisons work. The upper bound ignores patch: patch releases never
-/// change the wire, so a newer patch of an accepted minor is compatible.
+/// comparisons work. The upper bound ignores patch: newer patches of an
+/// accepted minor must preserve its wire layout.
 #[must_use]
 pub const fn is_protocol_compatible(client: u32) -> bool {
     client >= IGGY_PROTOCOL_VERSION_MIN
@@ -155,45 +152,6 @@ impl std::fmt::Display for ProtocolVersion {
             self.0 & PATCH_MASK
         )
     }
-}
-
-/// Const-parse `major.minor.patch[-pre]` into a packed `u32`.
-/// Malformed input is a compile error in const context.
-#[cfg(test)]
-const fn parse_packed_semver(version: &str) -> u32 {
-    let bytes = version.as_bytes();
-    let (major, i) = parse_component(bytes, 0);
-    assert!(
-        i < bytes.len() && bytes[i] == b'.',
-        "expected '.' after major"
-    );
-    let (minor, j) = parse_component(bytes, i + 1);
-    assert!(
-        j < bytes.len() && bytes[j] == b'.',
-        "expected '.' after minor"
-    );
-    let (patch, k) = parse_component(bytes, j + 1);
-    assert!(
-        k == bytes.len() || bytes[k] == b'-' || bytes[k] == b'+',
-        "unexpected trailing bytes after patch"
-    );
-    pack_protocol_version(major, minor, patch)
-}
-
-/// Parse a decimal run starting at `start`; returns (value, index past digits).
-#[cfg(test)]
-const fn parse_component(bytes: &[u8], start: usize) -> (u32, usize) {
-    assert!(
-        start < bytes.len() && bytes[start].is_ascii_digit(),
-        "expected digit"
-    );
-    let mut value: u32 = 0;
-    let mut i = start;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value * 10 + (bytes[i] - b'0') as u32;
-        i += 1;
-    }
-    (value, i)
 }
 
 /// Client identity sent as the prefix of every login-register request body.
@@ -297,16 +255,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_crate_version_with_prerelease() {
-        assert_eq!(
-            parse_packed_semver("0.10.1-edge.2"),
-            pack_protocol_version(0, 10, 1)
-        );
-        assert_eq!(parse_packed_semver("1.2.3"), pack_protocol_version(1, 2, 3));
-        assert_eq!(
-            parse_packed_semver("10.0.0+build.5"),
-            pack_protocol_version(10, 0, 0)
-        );
+    fn login_without_binding_secret_is_outside_the_compatible_window() {
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 0)));
+        assert!(is_protocol_compatible(pack_protocol_version(0, 11, 1)));
+        assert!(is_protocol_compatible(pack_protocol_version(0, 11, 1023)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 0)));
     }
 
     #[test]
@@ -316,19 +269,15 @@ mod tests {
     }
 
     #[test]
-    fn min_is_current_with_patch_zeroed() {
-        assert_eq!(IGGY_PROTOCOL_VERSION_MIN & PATCH_MASK, 0);
-        assert_eq!(
-            IGGY_PROTOCOL_VERSION >> COMPONENT_BITS,
-            IGGY_PROTOCOL_VERSION_MIN >> COMPONENT_BITS
-        );
+    fn min_requires_the_session_binding_wire_layout() {
+        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 11, 1));
     }
 
     #[test]
     fn compatibility_range_boundaries() {
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN));
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION));
-        // Patch never changes the wire: any patch of the current minor passes.
+        // Newer patches of the current minor preserve the wire layout.
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION | PATCH_MASK));
         // Next minor is outside the window.
         assert!(!is_protocol_compatible(

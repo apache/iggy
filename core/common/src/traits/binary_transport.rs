@@ -20,13 +20,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireName};
 use std::sync::Arc;
 
 #[async_trait]
@@ -87,12 +87,7 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     {
         let identity = self.session_identity().await?;
         let request = BindSessionRequest {
-            version_info: ClientVersionInfo {
-                protocol_version: IGGY_PROTOCOL_VERSION,
-                sdk_name: WireName::new("rust-sdk").map_err(|_| IggyError::InvalidConfiguration)?,
-                sdk_version: WireName::new(self.sdk_version())
-                    .map_err(|_| IggyError::InvalidConfiguration)?,
-            },
+            version_info: crate::rust_sdk_version_info(self.sdk_version())?,
             identity,
             bind_secret: self.session_bind_secret().await?,
         };

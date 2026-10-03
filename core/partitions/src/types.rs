@@ -36,7 +36,8 @@ use std::sync::Arc;
 pub struct FatalCommit {
     pub namespace_raw: u64,
     pub op: u64,
-    pub operation: Operation,
+    /// None for a checkpoint failure covering multiple operation kinds.
+    pub operation: Option<Operation>,
 }
 
 #[derive(Debug, Clone)]

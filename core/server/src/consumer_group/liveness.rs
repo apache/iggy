@@ -414,6 +414,13 @@ async fn retire_sessions<B, MJ, S, SB>(
             return;
         }
     }
+    if consensus.view() != view
+        || !consensus.is_normal()
+        || consensus.is_transferring()
+        || metadata.mux_stm.streams().read(|inner| inner.revision) != revision
+    {
+        return;
+    }
     if consensus.is_primary() {
         let ready = {
             let mut tracker = liveness.borrow_mut();
@@ -458,6 +465,7 @@ async fn retire_sessions<B, MJ, S, SB>(
         .transmute_header(|old, header| {
             *header = old;
             header.command = Command::SessionRetirementProgress;
+            header.namespace_revision = revision;
             header.seal();
         });
         if let Err(error) = shard
@@ -1264,6 +1272,45 @@ mod tests {
             tracker.receive(CLUSTER, Some(VIEW), &message, now + TIMEOUT, TIMEOUT);
         }
         assert!(tracker.expired(VIEW, CLIENT, Some(SESSION), now + TIMEOUT, TIMEOUT));
+    }
+
+    #[test]
+    fn retirement_quorum_discards_reports_from_an_older_namespace_revision() {
+        let identity = iggy_binary_protocol::requests::system::SessionIdentity {
+            client_id: CLIENT,
+            session: SESSION,
+            metadata_watermark: 3,
+        };
+        let report = |revision| {
+            heartbeat_message(
+                CLUSTER,
+                VIEW,
+                1,
+                &[ConsumerSession {
+                    client_id: CLIENT,
+                    session: SESSION,
+                }],
+                false,
+            )
+            .transmute_header(|old, header| {
+                *header = old;
+                header.command = Command::SessionRetirementProgress;
+                header.namespace_revision = revision;
+                header.seal();
+            })
+        };
+        let mut tracker = ConsumerGroupLiveness::default();
+        tracker.observe_view(Some(VIEW));
+        tracker.reconcile_retirement(Some(identity), 1);
+        tracker.receive(CLUSTER, Some(VIEW), &report(1), Instant::now(), TIMEOUT);
+        assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
+
+        tracker.reconcile_retirement(Some(identity), 2);
+        assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
+        tracker.receive(CLUSTER, Some(VIEW), &report(1), Instant::now(), TIMEOUT);
+        assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
+        tracker.receive(CLUSTER, Some(VIEW), &report(2), Instant::now(), TIMEOUT);
+        assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
     }
 
     #[test]

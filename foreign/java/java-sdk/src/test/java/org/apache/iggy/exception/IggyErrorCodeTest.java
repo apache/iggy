@@ -189,7 +189,6 @@ class IggyErrorCodeTest {
         "83, INVALID_BOOLEAN_VALUE",
         "84, INVALID_NUMBER_VALUE",
         "85, REQUEST_TOO_OLD",
-        "86, DURABILITY_REQUIRED",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",
@@ -242,6 +241,7 @@ class IggyErrorCodeTest {
 
         // VSR protocol errors
         "14003, INCOMPATIBLE_PROTOCOL_VERSION",
+        "14004, SESSION_MISMATCH",
     })
     void fromCodeReturnsExpectedIggyErrorCodeWhenCodeIsValid(int code, IggyErrorCode expected) {
         var iggyErrorCode = IggyErrorCode.fromCode(code);

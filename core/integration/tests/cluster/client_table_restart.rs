@@ -49,6 +49,7 @@
 //! work later settles on an explicit resume handshake, adjust `resume_request`
 //! to speak it -- but it must stay credential-bearing.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
@@ -83,8 +84,6 @@ use tokio::time::{Instant, sleep, timeout};
 
 /// Fixed wire identity so the post-restart frames are byte-identical to the
 /// pre-restart ones; the SDK would randomize this on reconnect.
-const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
-
 const CLIENT_ID: u128 = 0x1337_C0FFEE;
 
 /// Budget for one committed round-trip (covers transient replays while the

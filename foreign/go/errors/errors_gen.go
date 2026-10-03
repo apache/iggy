@@ -733,17 +733,6 @@ func (e RequestTooOld) Is(target error) bool {
 	return ok
 }
 
-type DurabilityRequired struct{}
-
-func (e DurabilityRequired) Error() string {
-	return "durable retries require persisted durability and quorum offset acknowledgments"
-}
-func (e DurabilityRequired) Code() Code { return 86 }
-func (e DurabilityRequired) Is(target error) bool {
-	_, ok := target.(DurabilityRequired)
-	return ok
-}
-
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2687,6 +2676,20 @@ func (e IncompatibleProtocolVersion) Is(target error) bool {
 	return ok
 }
 
+type SessionMismatch struct {
+	Requested uint64
+	Bound     uint64
+}
+
+func (e SessionMismatch) Error() string {
+	return fmt.Sprintf("vsr session mismatch: requested %d, server bound %d", e.Requested, e.Bound)
+}
+func (e SessionMismatch) Code() Code { return 14004 }
+func (e SessionMismatch) Is(target error) bool {
+	_, ok := target.(SessionMismatch)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2757,7 +2760,6 @@ var (
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
 	ErrRequestTooOld                              = RequestTooOld{}
-	ErrDurabilityRequired                         = DurabilityRequired{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2930,6 +2932,7 @@ var (
 	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
+	ErrSessionMismatch                            = SessionMismatch{}
 )
 
 type Code uint32
@@ -3004,7 +3007,6 @@ const (
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
 	RequestTooOldCode                              Code = 85
-	DurabilityRequiredCode                         Code = 86
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3177,6 +3179,7 @@ const (
 	AlreadyAuthenticatedCode                       Code = 14000
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
+	SessionMismatchCode                            Code = 14004
 )
 
 func (c Code) String() string {
@@ -3319,8 +3322,6 @@ func (c Code) String() string {
 		return "InvalidNumberValue"
 	case RequestTooOldCode:
 		return "RequestTooOld"
-	case DurabilityRequiredCode:
-		return "DurabilityRequired"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3665,6 +3666,8 @@ func (c Code) String() string {
 		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
+	case SessionMismatchCode:
+		return "SessionMismatch"
 	default:
 		return "Unknown error code"
 	}
@@ -3810,8 +3813,6 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidNumberValue
 	case RequestTooOldCode:
 		return ErrRequestTooOld
-	case DurabilityRequiredCode:
-		return ErrDurabilityRequired
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -4156,6 +4157,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
+	case SessionMismatchCode:
+		return ErrSessionMismatch
 	default:
 		return ErrError
 	}

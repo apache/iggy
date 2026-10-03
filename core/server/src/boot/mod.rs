@@ -89,6 +89,7 @@ use std::thread;
 use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
+const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
 const STORAGE_FORMAT: &[u8] = b"IGGY-DURABLE-SESSIONS-2\n";
 
 /// Load the server configuration from the active config provider.
@@ -126,6 +127,9 @@ pub async fn prepare_runtime_dirs(
     if fresh {
         wipe_system_path(config).await?;
     }
+    if !format_present {
+        publish_storage_format(&system_path)?;
+    }
     create_directories(config).await.map_err(|source| {
         error!(
             system_path = %config.get_system_path(),
@@ -134,9 +138,6 @@ pub async fn prepare_runtime_dirs(
         );
         source
     })?;
-    if !format_present {
-        publish_storage_format(&system_path)?;
-    }
     logging
         .late_init(
             config.get_system_path(),
@@ -171,12 +172,23 @@ fn validate_storage_format(system_path: &Path) -> Result<bool, ServerError> {
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::read_dir(system_path) {
-                Ok(mut entries) => {
-                    if let Some(entry) = entries.next() {
-                        entry.map_err(|source| ServerError::StorageFormatIo {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(|source| ServerError::StorageFormatIo {
                             path: system_path.to_owned(),
                             source,
                         })?;
+                        if entry.file_name() == STORAGE_FORMAT_TEMP_FILE
+                            && entry
+                                .file_type()
+                                .map_err(|source| ServerError::StorageFormatIo {
+                                    path: entry.path(),
+                                    source,
+                                })?
+                                .is_file()
+                        {
+                            continue;
+                        }
                         return Err(ServerError::UnsupportedStorage {
                             path: system_path.to_owned(),
                         });
@@ -199,7 +211,8 @@ fn validate_storage_format(system_path: &Path) -> Result<bool, ServerError> {
 fn publish_storage_format(system_path: &Path) -> Result<(), ServerError> {
     let path = system_path.join(STORAGE_FORMAT_FILE);
     (|| -> std::io::Result<()> {
-        let temporary = path.with_extension("tmp");
+        std::fs::create_dir_all(system_path)?;
+        let temporary = system_path.join(STORAGE_FORMAT_TEMP_FILE);
         let mut file = std::fs::File::create(&temporary)?;
         file.write_all(STORAGE_FORMAT)?;
         file.sync_all()?;
@@ -1156,11 +1169,14 @@ mod tests {
      {
         let mut logging = Logging::new(crate::VERSION);
         logging.early_init();
-        for exists in [false, true] {
+        for (exists, interrupted) in [(false, false), (true, false), (true, true)] {
             let directory = tempfile::tempdir().unwrap();
             let data_path = directory.path().join("data");
             if exists {
                 std::fs::create_dir(&data_path).unwrap();
+            }
+            if interrupted {
+                std::fs::write(data_path.join(STORAGE_FORMAT_TEMP_FILE), b"IGGY-").unwrap();
             }
             let mut config = ServerConfig {
                 path: data_path.to_string_lossy().into_owned(),

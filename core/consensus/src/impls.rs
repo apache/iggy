@@ -462,7 +462,6 @@ where
         let pipeline = self.pipeline.borrow();
         let pending: HashSet<_> = pipeline
             .pending_client_ids()
-            .into_iter()
             .filter(|candidate| {
                 *candidate != 0
                     && !message_bus::is_auto_commit_client(*candidate)
@@ -888,7 +887,7 @@ impl Pipeline for LocalPipeline {
     type Entry = PipelineEntry;
     type Request = RequestEntry;
 
-    fn pending_client_ids(&self) -> Vec<u128> {
+    fn pending_client_ids(&self) -> impl Iterator<Item = u128> {
         self.prepare_queue
             .iter()
             .map(|entry| entry.header.client)
@@ -897,7 +896,6 @@ impl Pipeline for LocalPipeline {
                     .iter()
                     .map(|entry| entry.message.header().client),
             )
-            .collect()
     }
 
     fn push(&mut self, entry: Self::Entry) {

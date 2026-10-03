@@ -70,6 +70,8 @@ pub(in crate::http) const FRESH_ENTRY_WATERMARK: u64 = 0;
 /// are 1-based and strictly increasing within a session.
 pub(in crate::http) const FIRST_REQUEST_ID: u64 = 1;
 
+const PARTITION_GATE_SWEEP_THRESHOLD: usize = 64;
+
 /// One VSR session established for a single login credential (a JWT `jti` or a
 /// PAT). Shared via `Rc` by every concurrent request bearing that credential,
 /// so the session granularity is per-login.
@@ -121,9 +123,11 @@ pub(in crate::http) struct HttpSession {
 impl HttpSession {
     pub(in crate::http) fn partition_gate(&self, namespace: u64) -> Rc<Mutex<()>> {
         let mut gates = self.partition_gates.borrow_mut();
-        gates.retain(|_, gate| gate.strong_count() != 0);
         if let Some(gate) = gates.get(&namespace).and_then(Weak::upgrade) {
             return gate;
+        }
+        if gates.len() >= PARTITION_GATE_SWEEP_THRESHOLD {
+            gates.retain(|_, gate| gate.strong_count() != 0);
         }
         let gate = Rc::new(Mutex::new(()));
         gates.insert(namespace, Rc::downgrade(&gate));
@@ -313,7 +317,7 @@ mod tests {
         for namespace in 3..100 {
             let gate = session.partition_gate(namespace);
             assert!(gate.try_lock().is_ok());
-            assert_eq!(session.partition_gates.borrow().len(), 2);
+            assert!(session.partition_gates.borrow().len() <= PARTITION_GATE_SWEEP_THRESHOLD);
         }
     }
 

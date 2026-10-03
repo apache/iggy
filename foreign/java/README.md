@@ -77,9 +77,9 @@ dependencies {
 </dependencies>
 ```
 
-### Unreleased 0.11.0 protocol
+### Unreleased 0.11.1 protocol
 
-The source checkout uses protocol 0.11.0. Build it with a matching server.
+The source checkout uses protocol 0.11.1. Build it with a matching server.
 `CommandCode.System.ATTACH_CONSUMER_SESSION` (code 14) was removed. Use
 `CommandCode.System.BIND_SESSION` (code 15), which requires the registered
 session's private bind secret. Auxiliary poll connections reuse that session

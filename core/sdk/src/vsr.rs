@@ -23,6 +23,7 @@ use iggy_binary_protocol::consensus::{
     RequestHeader, operation_for_code, read_size_field, result_code, result_section_len,
 };
 use iggy_common::{IggyError, eviction_reason_to_error};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A later refusal cannot establish whether an earlier attempt committed.
@@ -46,6 +47,7 @@ impl RetryOutcome {
             && matches!(
                 error,
                 IggyError::TransientNotAccepted
+                    | IggyError::Unauthorized
                     | IggyError::Unauthenticated
                     | IggyError::StaleClient
                     | IggyError::NotConnected
@@ -165,10 +167,13 @@ pub(crate) fn resume_error_is_retryable(error: &IggyError) -> bool {
 /// replay only an operation whose outcome proves it was never admitted.
 pub(crate) fn retain_replay_header(
     header: &mut Option<RequestHeader>,
-    session: &ConsensusSession,
+    session: &Mutex<ConsensusSession>,
     code: u32,
     error: &IggyError,
 ) -> Result<(), IggyError> {
+    let session = session
+        .lock()
+        .map_err(|_| IggyError::InvalidConfiguration)?;
     if header.as_ref().is_some_and(|header| {
         header.client == session.client_id()
             && (header.session == session.session().unwrap_or(0)
@@ -388,6 +393,21 @@ mod tests {
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
         *bytemuck::checked::try_from_bytes::<RequestHeader>(&bytes[..HEADER_SIZE]).unwrap()
+    }
+
+    #[test]
+    fn an_authorization_denial_preserves_an_earlier_uncertain_outcome() {
+        for initial in [IggyError::TransientNotCommitted, IggyError::Disconnected] {
+            let mut outcome = RetryOutcome::for_reconnect(SEND_MESSAGES_CODE, &initial);
+            assert_eq!(
+                outcome.observe(IggyError::Unauthorized),
+                IggyError::TransientNotCommitted
+            );
+        }
+        assert_eq!(
+            RetryOutcome::default().observe(IggyError::Unauthorized),
+            IggyError::Unauthorized
+        );
     }
 
     #[test]

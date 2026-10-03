@@ -46,7 +46,7 @@ var rustSources = map[string]string{
 	"header":    "core/binary_protocol/src/consensus/header.rs",
 	"command":   "core/binary_protocol/src/consensus/command.rs",
 	"operation": "core/binary_protocol/src/consensus/operation.rs",
-	"cargo":     "core/binary_protocol/Cargo.toml",
+	"version":   "core/binary_protocol/src/version.rs",
 	"eviction":  "core/common/src/error/eviction.rs",
 }
 
@@ -529,15 +529,18 @@ func TestProtocolParity_ClientHeadersCarryNoNamespace(t *testing.T) {
 
 func TestProtocolParity_PackedProtocolVersion(t *testing.T) {
 	sources := loadRustSources(t)
-	pattern := regexp.MustCompile(`(?m)^version = "([0-9]+)\.([0-9]+)\.([0-9]+)`)
-	match := pattern.FindStringSubmatch(sources["cargo"])
-	require.NotNil(t, match, "the binary protocol crate version was not found")
+	pattern := regexp.MustCompile(`IGGY_PROTOCOL_VERSION:\s*u32\s*=\s*pack_protocol_version\((\d+),\s*(\d+),\s*(\d+)\)`)
+	match := pattern.FindStringSubmatch(sources["version"])
+	require.NotNil(t, match, "the explicit binary protocol version was not found")
 
 	major, err := strconv.ParseUint(match[1], 10, 32)
 	require.NoError(t, err)
 	minor, err := strconv.ParseUint(match[2], 10, 32)
 	require.NoError(t, err)
+	patch, err := strconv.ParseUint(match[3], 10, 32)
+	require.NoError(t, err)
 
 	assert.Equal(t, uint32(major), ProtocolVersion>>20, "protocol major")
 	assert.Equal(t, uint32(minor), (ProtocolVersion>>10)&0x3FF, "protocol minor")
+	assert.Equal(t, uint32(patch), ProtocolVersion&0x3FF, "protocol patch")
 }

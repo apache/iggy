@@ -339,10 +339,6 @@
   code: 85
   format: "request is below the deduplication window; outcome unknown, resending may duplicate the write"
   fields: []
-- name: DurabilityRequired
-  code: 86
-  format: "durable retries require persisted durability and quorum offset acknowledgments"
-  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -1307,3 +1303,11 @@
       type: uint32
     - name: ServerVersionMax
       type: uint32
+- name: SessionMismatch
+  code: 14004
+  format: "vsr session mismatch: requested %d, server bound %d"
+  fields:
+    - name: Requested
+      type: uint64
+    - name: Bound
+      type: uint64

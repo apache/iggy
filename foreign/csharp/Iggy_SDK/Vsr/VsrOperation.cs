@@ -202,7 +202,8 @@ internal static class VsrOperations
     /// <summary>Replica / journal only; never emitted by a client.</summary>
     internal static bool IsInternal(this VsrOperation operation)
     {
-        return (byte)operation >= InternalStart && (byte)operation < MetadataStart;
+        return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
+            || operation == VsrOperation.RetireSession;
     }
 
     /// <summary>
@@ -214,7 +215,8 @@ internal static class VsrOperations
     /// </summary>
     internal static bool IsMetadata(this VsrOperation operation)
     {
-        return operation.IsInternal() || operation is VsrOperation.CreateStream
+        return (operation.IsInternal() && (byte)operation < (byte)VsrOperation.SendMessages)
+            || operation is VsrOperation.CreateStream
             or VsrOperation.UpdateStream
             or VsrOperation.DeleteStream
             or VsrOperation.PurgeStream
