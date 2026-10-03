@@ -51,7 +51,7 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
-Protocol 0.11 uses client-owned registration proofs and `BindSession` (15) to
+Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
 share a logical session across connections. Command 14 is retired. Primary
 polling uses commands 103 and 104; offset routing uses 123. Disconnecting a
 connection does not log out its logical session. Server-observed activity renews

@@ -293,15 +293,7 @@ impl BinaryTransport for TcpClient {
             self.connect()
                 .await
                 .map_err(|error| retry_outcome.observe(error))?;
-            retain_replay_header(
-                &mut header,
-                &*self
-                    .consensus_session
-                    .lock()
-                    .map_err(|_| IggyError::InvalidConfiguration)?,
-                code,
-                &error,
-            )?;
+            retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
             drop(_routing_guard);
             return self
                 .send_raw_retaining_header(code, payload, &mut header, &error)
@@ -336,15 +328,7 @@ impl BinaryTransport for TcpClient {
         }
         reconnect.map_err(|error| retry_outcome.observe(error))?;
 
-        retain_replay_header(
-            &mut header,
-            &*self
-                .consensus_session
-                .lock()
-                .map_err(|_| IggyError::InvalidConfiguration)?,
-            code,
-            &error,
-        )?;
+        retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
 
         drop(_routing_guard);
         self.send_raw_retaining_header(code, payload, &mut header, &error)
@@ -1423,15 +1407,7 @@ impl TcpClient {
                 overall_deadline
                     .min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
             };
-            retain_replay_header(
-                header,
-                &*self
-                    .consensus_session
-                    .lock()
-                    .map_err(|_| IggyError::InvalidConfiguration)?,
-                code,
-                previous_error,
-            )?;
+            retain_replay_header(header, &self.consensus_session, code, previous_error)?;
             let (encoded, result) = self
                 .send_raw_vsr_attempt(
                     code,
@@ -1603,7 +1579,18 @@ impl TcpClient {
             // request on the SAME connection with no reconnect and the session
             // intact.
             let request_header = match preencoded {
-                Some(header) => header,
+                Some(header) => {
+                    let Ok(session) = consensus_session.lock() else {
+                        return (Some(header), Err(IggyError::InvalidConfiguration));
+                    };
+                    if header.client != session.client_id()
+                        || (header.operation != iggy_binary_protocol::Operation::Register
+                            && header.session != session.session().unwrap_or(0))
+                    {
+                        return (Some(header), Err(IggyError::TransientNotCommitted));
+                    }
+                    header
+                }
                 None => {
                     let encoded = {
                         let mut consensus_session = consensus_session
@@ -1982,6 +1969,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retained_write_waiting_for_the_stream_must_recheck_its_session() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let (listener, address) = live_endpoint().await;
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let payload = Bytes::from_static(b"uncertain-send");
+        let retained = crate::vsr::encode_request_header(
+            &mut client.consensus_session.lock().unwrap(),
+            SEND_MESSAGES_CODE,
+            &payload,
+        )
+        .unwrap()
+        .0;
+        let (peer, _) = listener.accept().await.unwrap();
+        let stream_guard = client.stream.lock().await;
+        let deadline = tokio::time::Instant::now() + TEST_BUDGET;
+        let attempt = client.send_raw_vsr_attempt(
+            SEND_MESSAGES_CODE,
+            payload,
+            Some(retained),
+            deadline,
+            deadline,
+            false,
+        );
+        tokio::pin!(attempt);
+        tokio::select! {
+            biased;
+            _ = &mut attempt => panic!("the exchange must wait for the stream lock"),
+            () = tokio::task::yield_now() => {}
+        }
+        client.reset_vsr_session().await.unwrap();
+        client.bind_vsr_session(2).await.unwrap();
+        drop(stream_guard);
+        let (_, result) = tokio::time::timeout(TEST_BUDGET, &mut attempt)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err(), IggyError::TransientNotCommitted);
+        let mut byte = [0];
+        assert_eq!(
+            peer.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_later_session_reset_does_not_replay_an_uncertain_write() {
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         let (listener, address) = live_endpoint().await;
@@ -2061,6 +2095,7 @@ mod tests {
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
         for later_refusal in [
             IggyError::TransientNotAccepted,
+            IggyError::Unauthorized,
             IggyError::Unauthenticated,
             IggyError::StaleClient,
         ] {

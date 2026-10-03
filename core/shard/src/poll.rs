@@ -58,6 +58,23 @@ pub struct ConsumerAttachment {
     pub metadata: PollMetadata,
 }
 
+impl ConsumerAttachment {
+    pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
+        if !matches!(
+            operation,
+            Operation::SendMessages
+                | Operation::StoreConsumerOffset
+                | Operation::DeleteConsumerOffset
+        ) {
+            return Err(IggyError::InvalidCommand);
+        }
+        if !self.session.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        Ok(())
+    }
+}
+
 /// A read result awaiting acceptance by its partition owner.
 /// Disk tasks send it through the reserved completion lane. Resident reads
 /// pass it directly to the same completion handler.
@@ -91,17 +108,7 @@ where
         request: &Message<RoutedRequestHeader>,
         attachment: &ConsumerAttachment,
     ) -> Result<(), IggyError> {
-        if !matches!(
-            request.header().operation,
-            Operation::SendMessages
-                | Operation::StoreConsumerOffset
-                | Operation::DeleteConsumerOffset
-        ) {
-            return Err(IggyError::InvalidCommand);
-        }
-        if !attachment.session.is_valid() {
-            return Err(IggyError::StaleClient);
-        }
+        attachment.validate_write(request.header().operation)?;
         let namespace = IggyNamespace::from_raw(request.header().group);
         if !attachment
             .metadata

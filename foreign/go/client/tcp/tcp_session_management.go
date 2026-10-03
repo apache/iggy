@@ -29,7 +29,8 @@ import (
 )
 
 func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password string) (*iggcon.IdentityInfo, error) {
-	body, err := vsr.SerializeLoginRegister(username, password, iggcon.Version, vsr.NewBindSecret())
+	secret := vsr.NewBindSecret()
+	body, err := vsr.SerializeLoginRegister(username, password, iggcon.Version, secret)
 	if err != nil {
 		return nil, err
 	}
@@ -37,12 +38,14 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 		ctx,
 		uint32(command.LoginRegisterCode),
 		body,
+		secret,
 		NewUsernamePasswordCredentials(username, password),
 	)
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
-	body, err := vsr.SerializeLoginRegisterWithToken(token, iggcon.Version, vsr.NewBindSecret())
+	secret := vsr.NewBindSecret()
+	body, err := vsr.SerializeLoginRegisterWithToken(token, iggcon.Version, secret)
 	if err != nil {
 		return nil, err
 	}
@@ -50,6 +53,7 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 		ctx,
 		uint32(command.LoginRegisterWithPATCode),
 		body,
+		secret,
 		NewPersonalAccessTokenCredentials(token),
 	)
 }
@@ -66,6 +70,7 @@ func (c *IggyTcpClient) register(
 	ctx context.Context,
 	code uint32,
 	body []byte,
+	secret [vsr.BindSecretBytes]byte,
 	credentials Credentials,
 ) (*iggcon.IdentityInfo, error) {
 	// One sign-in at a time. BeginRegister runs inside the exchange lock but
@@ -85,12 +90,12 @@ func (c *IggyTcpClient) register(
 		return nil, err
 	}
 
-	identity, err := c.signIn(ctx, code, body)
+	identity, err := c.signIn(ctx, code, body, secret)
 	if err != nil {
 		return nil, err
 	}
 
-	settled, err := c.settleOnLeader(ctx, code, body)
+	settled, err := c.settleOnLeader(ctx, code, body, secret)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +112,7 @@ func (c *IggyTcpClient) register(
 // A failed sign-in never writes the session state: a server-side reject leaves
 // the existing session untouched, and a connection that dies mid-attempt is
 // already reset by invalidateConnLocked.
-func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte, secret [vsr.BindSecretBytes]byte) (*iggcon.IdentityInfo, error) {
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 	frame := append(reserveHeader(*bp), body...)
@@ -126,12 +131,6 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 	c.mtx.Lock()
 	err = c.session.Bind(registered.Session)
 	if err == nil {
-		secret, secretErr := vsr.RegisterBindSecret(body)
-		if secretErr != nil {
-			c.invalidateConnLocked()
-			c.mtx.Unlock()
-			return nil, secretErr
-		}
 		c.session.SetBindSecret(secret)
 		c.sessionState = iggcon.SessionStateAuthenticated
 		c.sessionUserID = registered.UserID
@@ -170,7 +169,7 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 // under the shared redirect budget.
 //
 // Returns nil when the client stays where it is.
-func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte, secret [vsr.BindSecretBytes]byte) (*iggcon.IdentityInfo, error) {
 	// A roster walk stays on the endpoint it dialed: the settlement below
 	// would put the connection straight back on the node whose partition
 	// replica keeps refusing the walked request. The marker is scoped to the
@@ -199,7 +198,7 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
 			return nil, err
 		}
-		settled, err = c.signIn(ctx, code, body)
+		settled, err = c.signIn(ctx, code, body, secret)
 		if err != nil {
 			return nil, err
 		}

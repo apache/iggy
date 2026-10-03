@@ -39,7 +39,7 @@ pub const CONFIRMATION_SIZE: usize = 20;
 ///
 /// `base_offset` identifies the first message in this partition. Retrying the
 /// unresolved request under the same live session returns the original receipt.
-/// Explicit sessions require persisted topic durability.
+/// Replicated topics accept these writes; Persisted adds crash-safe receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessagesConfirmationResponse {
     pub stream_id: u32,

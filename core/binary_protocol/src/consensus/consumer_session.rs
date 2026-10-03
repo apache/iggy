@@ -77,7 +77,9 @@ pub struct ConsumerSessionHeartbeatHeader {
     pub reserved_frame: [u8; 66],
     /// 1 if any local shard failed to report its clients, otherwise 0.
     pub incomplete: u8,
-    pub reserved: [u8; 127],
+    pub reserved: [u8; 119],
+    /// Namespace revision swept by retirement reports; zero for heartbeats.
+    pub namespace_revision: u64,
 }
 
 const _: () = assert!(size_of::<ConsumerSessionHeartbeatHeader>() == HEADER_SIZE);
@@ -146,7 +148,12 @@ impl ConsensusHeader for ConsumerSessionHeartbeatHeader {
                 "consumer session heartbeat release must be zero".into(),
             ));
         }
-        if self.reserved_frame != [0; 66] || self.reserved != [0; 127] {
+        if self.command == Command::ConsumerSessionHeartbeat && self.namespace_revision != 0 {
+            return Err(ConsensusError::InvalidField(
+                "consumer session heartbeat namespace revision must be zero".into(),
+            ));
+        }
+        if self.reserved_frame != [0; 66] || self.reserved != [0; 119] {
             return Err(ConsensusError::InvalidField(
                 "consumer session heartbeat reserved bytes must be zero".into(),
             ));
@@ -190,7 +197,8 @@ mod tests {
             replica: 0,
             reserved_frame: [0; 66],
             incomplete: 0,
-            reserved: [0; 127],
+            reserved: [0; 119],
+            namespace_revision: 0,
         };
         for count in [0, 1, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT] {
             header.size =
@@ -221,5 +229,14 @@ mod tests {
         header.reserved[0] = 0;
         header.reserved_frame[0] = 1;
         assert!(header.validate().is_err());
+        header.reserved_frame[0] = 0;
+        header.namespace_revision = 1;
+        assert!(header.validate().is_err());
+        header.command = Command::SessionRetirementProgress;
+        assert!(header.validate().is_ok());
+        header.seal();
+        assert!(header.verify_frame().is_ok());
+        header.namespace_revision += 1;
+        assert!(header.verify_frame().is_err());
     }
 }

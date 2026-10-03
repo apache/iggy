@@ -42,10 +42,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
 
+pub(crate) const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
+
 /// Per-frame reply wait. A server that drops the frame answers nothing at
 /// all, so an unanswered read is a verdict, not a reason to wait longer.
-const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
-
 const REPLY_WAIT: Duration = Duration::from_secs(5);
 
 /// Budget for the register to commit: right after boot the single node may

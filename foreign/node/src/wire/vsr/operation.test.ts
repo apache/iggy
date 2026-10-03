@@ -82,6 +82,9 @@ describe('VSR operation classification', () => {
     assert.equal(isInternal(64), true);
     assert.equal(isInternal(63), false);
     assert.equal(isInternal(Operation.CreateStream), false);
+    assert.equal(isInternal(Operation.RetireSession), true);
+    assert.equal(isMetadata(Operation.RetireSession), false);
+    assert.equal(isResultFramed(Operation.RetireSession), false);
     assert.equal(isMetadata(Operation.CreateStream), true);
     assert.equal(isMetadata(Operation.LeaveConsumerGroup), true);
     assert.equal(isMetadata(Operation.DeleteSegments), false);

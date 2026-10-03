@@ -43,7 +43,7 @@ final class VsrLoginCodec {
      * Keep in sync with {@code core/binary_protocol/Cargo.toml}; the server
      * accepts any client whose major.minor is not newer than its own.
      */
-    static final int PROTOCOL_VERSION = (11 << 10); // 0.11.0
+    static final int PROTOCOL_VERSION = (11 << 10) | 1; // 0.11.1
 
     static final String SDK_NAME = "java-sdk";
 
@@ -96,14 +96,6 @@ final class VsrLoginCodec {
         writeShortField(body, token);
         body.writeIntLE(0);
         return body;
-    }
-
-    /**
-     * Register reply body after result-section stripping:
-     * {@code [user_id:u32][session:u64][server_protocol_version:u32][server_version:u8-len]}.
-     */
-    static long readSessionEpoch(ByteBuf registerBody) {
-        return registerBody.getLongLE(registerBody.readerIndex() + 4);
     }
 
     static ByteBuf bindSession(

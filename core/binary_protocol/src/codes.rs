@@ -113,7 +113,7 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
-    const RETIRED_CODES: &[u32] = &[102];
+    const RETIRED_CODES: &[u32] = &[14, 102];
 
     const ALL_CODES: &[u32] = &[
         PING_CODE,

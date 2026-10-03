@@ -36,7 +36,8 @@ pub struct IggyProducerConfig {
     topic_name: String,
     /// Sets the number of partitions to create for the topic
     topic_partitions_count: u32,
-    /// Message durability for topic creation. Producer sends require Persisted.
+    /// Message durability for topic creation. Persisted provides crash-safe retry receipts;
+    /// Replicated accepts sends without that crash-recovery guarantee.
     #[builder(default)]
     topic_durability: Durability,
     /// Maximum messages per direct-send request. Zero uses the SDK's maximum batch length.

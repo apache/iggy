@@ -181,6 +181,7 @@ impl ConsumerGroupLiveness {
             progress.complete = true;
             progress.reported = false;
             progress.last_report = None;
+            progress.reporters.clear();
         }
     }
 
@@ -239,7 +240,9 @@ impl ConsumerGroupLiveness {
             if header.incomplete != 0 {
                 return;
             }
-            if let Some(progress) = &mut self.retirement {
+            if let Some(progress) = &mut self.retirement
+                && header.namespace_revision == progress.revision
+            {
                 for bytes in sessions {
                     if let Ok((session, _)) = ConsumerSession::decode(bytes)
                         && session.client_id == progress.identity.client_id

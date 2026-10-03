@@ -18,6 +18,15 @@
 //! A logical session keeps its identity, bind secret, and request counter
 //! across transport reconnects. Registration retries recover the original
 //! committed session. Explicit logout starts a new logical session.
+//!
+//! # Lifecycle
+//!
+//! Create one session per logical login. `begin_register` preserves its client
+//! identity and secret when registration is retried. `bind` accepts only a
+//! nonzero epoch matching any previous binding. Application request IDs are
+//! available only after binding; exhaustion fails instead of wrapping.
+//! Both `bind` and `next_request_id` return `Result` and callers must handle
+//! failure. Explicit disconnect clears sign-in and requires a new login.
 
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_common::IggyError;
@@ -77,6 +86,7 @@ impl ConsensusSession {
         self.session.is_some()
     }
 
+    /// Registration proof retained across reconnects and session bindings.
     pub fn bind_secret(&self) -> BindSecret {
         self.bind_secret.clone()
     }
@@ -96,6 +106,7 @@ impl ConsensusSession {
         0
     }
 
+    /// Start or retry registration without resetting the identity or counter.
     pub const fn begin_register(&self) -> u64 {
         self.register_request_id()
     }

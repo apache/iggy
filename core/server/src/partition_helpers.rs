@@ -604,6 +604,16 @@ async fn load_partition(
                 source,
             },
         };
+        if replica_count == 1
+            && !journal::PartitionPrepareJournal::has_published_frontier(&directory)
+                .await
+                .map_err(&wal_error)?
+        {
+            return Err(wal_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "existing singleton partition is missing its prepare WAL frontier",
+            )));
+        }
         if replica_count > 1 && !allow_bootstrap {
             PartitionPersistence::fence_missing_history(
                 &directory,
@@ -634,11 +644,9 @@ async fn load_partition(
                 created_view: partition_metadata.created_view,
             });
         }
-        Some((persistence, prepares))
+        (persistence, prepares)
     };
-    let segment_checkpoint = recovered_persistence
-        .as_ref()
-        .and_then(|(persistence, _)| persistence.segment_checkpoint());
+    let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
@@ -656,16 +664,14 @@ async fn load_partition(
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
     partition.set_created_revision(partition_metadata.created_revision);
-    if let Some((persistence, _)) = &recovered_persistence {
-        partition
-            .restore_retry_checkpoint(persistence.checkpoint_op())
-            .await
-            .map_err(|source| ServerError::PartitionPrepareWalIo {
-                dir: Path::new(&partition_dir)
-                    .join(format!("prepares-{}", partition_metadata.created_revision)),
-                source,
-            })?;
-    }
+    partition
+        .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
+        .await
+        .map_err(|source| ServerError::PartitionPrepareWalIo {
+            dir: Path::new(&partition_dir)
+                .join(format!("prepares-{}", partition_metadata.created_revision)),
+            source,
+        })?;
     let recovered_segments = recover_partition_segments(
         partitions_config,
         namespace,
@@ -701,7 +707,7 @@ async fn load_partition(
         .await?;
     }
 
-    open_partition_persistence(&mut partition, config, recovered_persistence).await?;
+    open_partition_persistence(&mut partition, config, Some(recovered_persistence)).await?;
     ensure_initial_segment(&mut partition, partitions_config, namespace, true).await?;
     if replica_count == 1 && !partition.durability().is_persisted() {
         partition
@@ -1701,6 +1707,53 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_solo_segments_without_wal_when_reloaded_should_refuse_and_preserve_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        drop(build_solo_partition(&config).await.unwrap());
+        let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+        let log_path = directory.join("00000000000000000000.log");
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader::default(),
+            payload: Bytes::from_static(b"retained-without-retry-history"),
+            user_headers: None,
+        });
+        let batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
+        let mut bytes = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut bytes);
+        bytes[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        std::fs::write(&log_path, &bytes).unwrap();
+        std::fs::remove_dir_all(directory.join("prepares-0")).unwrap();
+
+        for _ in 0..2 {
+            let partitions = solo_partitions(&config);
+            let recovered = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                1,
+                false,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap();
+            assert!(
+                recovered.is_none(),
+                "missing retry history must fence the partition"
+            );
+            assert_eq!(std::fs::read(&log_path).unwrap(), bytes);
+            assert!(!directory.join("prepares-0").exists());
+        }
+    }
+
+    #[compio::test]
     async fn loading_after_retention_preserves_the_wal_owned_tail_when_the_logical_chain_is_empty()
     {
         let root = tempfile::tempdir().unwrap();
@@ -2199,6 +2252,15 @@ mod tests {
         // replace and nothing else: the slot reads still find the store empty,
         // and the quarantine moves segment files only.
         std::fs::create_dir(Path::new(&dir).join("superblock.a.tmp")).expect("block slot A");
+        drop(
+            journal::PartitionPrepareJournal::open(
+                &Path::new(&dir).join("prepares-0"),
+                namespace.inner(),
+                0,
+            )
+            .await
+            .unwrap(),
+        );
 
         let stats = Arc::new(PartitionStats::default());
         let partitions = solo_partitions(&config);

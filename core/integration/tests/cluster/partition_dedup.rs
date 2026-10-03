@@ -27,6 +27,7 @@
 //! which is precisely the input under test. The SDK is still used for setup and
 //! for reading the log back, where it is the more honest observer.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use bytes::{Bytes, BytesMut};
 use consensus::client_table::COMMITTED_WINDOW_BITS;
 use futures::future::join_all;
@@ -48,6 +49,7 @@ use iggy_binary_protocol::{
 };
 use integration::harness::TestHarness;
 use integration::iggy_harness;
+use journal::partition_journal::PARTITION_WAL_BLOCK_SIZE;
 use secrecy::SecretString;
 use std::mem::offset_of;
 use std::net::SocketAddr;
@@ -55,8 +57,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
-
-const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
 
 const STREAM_NAME: &str = "partition-dedup-stream";
 const TOPIC_NAME: &str = "partition-dedup-topic";
@@ -202,6 +202,46 @@ async fn given_lost_send_reply_when_singleton_restarts_should_return_the_origina
     verify_lost_reply_restart(harness).await;
 }
 
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
+async fn given_committed_send_when_purged_and_restarted_should_preserve_its_receipt(
+    harness: &mut TestHarness,
+) {
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    seed_topic(&observer).await;
+    let (mut connection, session) = register(harness.node(0).tcp_addr().unwrap()).await;
+    let body = send_messages_body(b"purged-but-still-acknowledged");
+    let header = request_header(Operation::SendMessages, session, 1, body.len());
+    let expected = receipt_until_committed(&mut connection, &header, &body).await;
+    assert_eq!(poll_all(&observer).await, 1);
+    observer
+        .purge_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    while poll_all(&observer).await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "purge must remove visible messages"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+    drop(connection);
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+
+    let actual = replay_on_nodes(harness, &[0], session, &header, &body).await;
+    assert_eq!(actual, expected, "purge must preserve the original receipt");
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    assert_eq!(
+        poll_all(&observer).await,
+        0,
+        "retry must not resurrect messages"
+    );
+}
+
 #[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_lost_send_reply_when_whole_cluster_restarts_should_return_the_original_receipt(
     harness: &mut TestHarness,
@@ -279,7 +319,8 @@ async fn given_reclaimed_wal_when_recovered_quorum_replays_should_return_the_ori
     const CHECKPOINT_OP: u64 = 2;
     const MESSAGES_PER_BATCH: u32 = 33;
     const PAYLOAD_BYTES: usize = 1024 * 1024;
-    const FRONTIER_SLOT_BYTES: usize = 4096;
+    const WAL_CHECKPOINT_OFFSET: usize = 48;
+    const WAL_HEAD_OFFSET: usize = 72;
     let observer = harness.root_client_for_node(0).await.unwrap();
     seed_topic(&observer).await;
     let (mut connection, session) = register(harness.node(0).tcp_addr().unwrap()).await;
@@ -308,12 +349,20 @@ async fn given_reclaimed_wal_when_recovered_quorum_replays_should_return_the_ori
                 .join("streams/0/topics/0/partitions/0/prepares-1");
             std::fs::read(directory.join("frontier")).is_ok_and(|bytes| {
                 bytes
-                    .as_chunks::<FRONTIER_SLOT_BYTES>()
+                    .as_chunks::<PARTITION_WAL_BLOCK_SIZE>()
                     .0
                     .iter()
                     .any(|slot| {
-                        u64::from_le_bytes(slot[48..56].try_into().unwrap()) == CHECKPOINT_OP
-                            && u64::from_le_bytes(slot[72..80].try_into().unwrap()) == CHECKPOINT_OP
+                        u64::from_le_bytes(
+                            slot[WAL_CHECKPOINT_OFFSET..WAL_CHECKPOINT_OFFSET + size_of::<u64>()]
+                                .try_into()
+                                .unwrap(),
+                        ) == CHECKPOINT_OP
+                            && u64::from_le_bytes(
+                                slot[WAL_HEAD_OFFSET..WAL_HEAD_OFFSET + size_of::<u64>()]
+                                    .try_into()
+                                    .unwrap(),
+                            ) == CHECKPOINT_OP
                     })
             }) && directory.join("receipts-2.checkpoint").exists()
         });
@@ -987,6 +1036,10 @@ async fn exchange_receipt(
             .unwrap(),
     );
     let total_size = read_size_field(&reply_header).expect("reply size field") as usize;
+    assert!(
+        total_size >= HEADER_SIZE,
+        "reply frame is shorter than its header"
+    );
     let mut receipt = vec![0u8; total_size - HEADER_SIZE];
     if !receipt.is_empty() {
         match timeout(REPLY_WAIT, stream.read_exact(&mut receipt)).await {
@@ -1127,6 +1180,10 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
             .unwrap(),
     );
     let total_size = read_size_field(&reply_header).expect("login reply size") as usize;
+    assert!(
+        total_size >= HEADER_SIZE,
+        "reply frame is shorter than its header"
+    );
     let mut reply_body = vec![0u8; total_size - HEADER_SIZE];
     let Ok(Ok(_)) = timeout(REPLY_WAIT, stream.read_exact(&mut reply_body)).await else {
         return None;

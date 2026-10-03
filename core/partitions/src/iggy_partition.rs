@@ -170,6 +170,7 @@ where
     /// no resolved options at all).
     pub(crate) runtime_options: TopicRuntimeOptions,
     pub(crate) persistence: Option<Rc<PartitionPersistence>>,
+    pending_retry_checkpoint: Option<u64>,
     pub(crate) materialization_missing: bool,
     recovered_log_view: Option<u32>,
     pending_persisted_acks: RefCell<BTreeMap<u64, PrepareHeader>>,
@@ -612,6 +613,7 @@ where
             segment_names_dirty: Cell::new(true),
             runtime_options: TopicRuntimeOptions::default(),
             persistence: None,
+            pending_retry_checkpoint: None,
             materialization_missing: false,
             recovered_log_view: None,
             pending_persisted_acks: RefCell::new(BTreeMap::new()),
@@ -834,6 +836,9 @@ where
             .await
     }
 
+    /// A supplied WAL has already had its receipt checkpoint restored before
+    /// segment recovery; opening it again must not repeat that disk scan.
+    ///
     /// # Errors
     /// Returns an error if durable history cannot be opened, migrated, or replayed.
     #[allow(clippy::too_many_lines)]
@@ -860,15 +865,14 @@ where
                     IggyError::CannotSyncFile
                 })?;
         }
-        if self.consensus.replica_count() > 1
-            && let Some(directory) = &self.partition_dir
-        {
+        if let Some(directory) = &self.partition_dir {
             self.materialization_missing =
                 crate::state_transfer::materialization_is_missing(directory, self.created_revision)
                     .await
                     .map_err(|_| IggyError::CannotReadFile)?;
             self.ensure_materialization_recovery();
         }
+        let restore_receipts = recovered.is_none();
         let (persistence, prepares) = if let Some(recovered) = recovered {
             recovered
         } else {
@@ -889,10 +893,14 @@ where
             })?
         };
         persistence.set_group_commit_delay(group_commit_delay);
-        self.restore_retry_checkpoint(persistence.checkpoint_op()).await.map_err(|error| {
-            warn!(%error, checkpoint_op = persistence.checkpoint_op(), "cannot restore partition retry protection");
-            IggyError::StateFileCorrupted
-        })?;
+        if restore_receipts {
+            self.restore_retry_checkpoint(persistence.checkpoint_op())
+                .await
+                .map_err(|error| {
+                    warn!(%error, checkpoint_op = persistence.checkpoint_op(), "cannot restore partition retry protection");
+                    IggyError::StateFileCorrupted
+                })?;
+        }
         if !self.materialization_missing {
             let segment = self.log.active_segment();
             let length = segment.size.as_bytes_u64();
@@ -1043,6 +1051,18 @@ where
             return;
         }
         self.drive_persistence().await;
+        if self.fatal.is_none()
+            && let Some(through_op) = self.pending_retry_checkpoint
+            && self
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| persistence.checkpoint_op() >= through_op)
+        {
+            self.pending_retry_checkpoint = None;
+            if let Err(error) = self.reclaim_retry_checkpoints(through_op).await {
+                warn!(%error, namespace_raw = self.namespace().inner(), "cannot reclaim obsolete receipt checkpoints");
+            }
+        }
     }
 
     pub fn needs_persistence_checkpoint(&self) -> bool {
@@ -1077,7 +1097,7 @@ where
                 self.fatal = Some(FatalCommit {
                     namespace_raw: self.namespace().inner(),
                     op: through_op,
-                    operation: Operation::SendMessages,
+                    operation: None,
                 });
                 return;
             }
@@ -1089,43 +1109,26 @@ where
                 self.fatal = Some(FatalCommit {
                     namespace_raw: self.namespace().inner(),
                     op: through_op,
-                    operation: Operation::SendMessages,
+                    operation: None,
                 });
                 return;
             }
             barriers.push(CheckpointBarrier::already_synced(writer.path()));
         }
-        let receipt_path = match self.persist_retry_checkpoint(through_op).await {
-            Ok(path) => path,
-            Err(error) => {
-                error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
-                self.fatal = Some(FatalCommit {
-                    namespace_raw: self.namespace().inner(),
-                    op: through_op,
-                    operation: Operation::SendMessages,
-                });
-                return;
-            }
-        };
-        let (mut files, mut directories) = self.persistence_checkpoint_files(config);
-        if let Some(parent) = receipt_path.parent() {
-            directories.push(parent.to_path_buf());
-        }
-        files.push(receipt_path);
-        persistence.checkpoint_files(through_op, files, directories, barriers);
-        self.start_persistence();
-        if let Err(error) = persistence.drain_with_timeout().await {
-            error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint publication failed");
+        if let Err(error) = self.persist_retry_checkpoint(through_op).await {
+            error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
             self.fatal = Some(FatalCommit {
                 namespace_raw: self.namespace().inner(),
                 op: through_op,
-                operation: Operation::SendMessages,
+                operation: None,
             });
             return;
         }
-        if let Err(error) = self.reclaim_retry_checkpoints(through_op).await {
-            warn!(%error, namespace_raw = self.namespace().inner(), "cannot reclaim obsolete receipt checkpoints");
-        }
+        // Receipt publication already syncs the file and its directory.
+        let (files, directories) = self.persistence_checkpoint_files(config);
+        persistence.checkpoint_files(through_op, files, directories, barriers);
+        self.pending_retry_checkpoint = Some(through_op);
+        self.start_persistence();
     }
 
     fn persistence_checkpoint_files(
@@ -1234,7 +1237,7 @@ where
                 self.fatal = Some(FatalCommit {
                     namespace_raw: self.namespace().inner(),
                     op: persistence.head(),
-                    operation: persistence.failure_operation(),
+                    operation: Some(persistence.failure_operation()),
                 });
             }
             return;
@@ -4219,7 +4222,7 @@ where
             self.fatal = Some(FatalCommit {
                 namespace_raw: self.namespace().inner(),
                 op: self.consensus.commit_min(),
-                operation: Operation::SendMessages,
+                operation: Some(Operation::SendMessages),
             });
         }
     }
@@ -4229,7 +4232,7 @@ where
             self.fatal = Some(FatalCommit {
                 namespace_raw: self.consensus.group(),
                 op,
-                operation: Operation::SendMessages,
+                operation: Some(Operation::SendMessages),
             });
         }
     }
@@ -5365,7 +5368,7 @@ where
                     self.fatal = Some(FatalCommit {
                         namespace_raw: self.namespace().inner(),
                         op: header.op,
-                        operation: header.operation,
+                        operation: Some(header.operation),
                     });
                 }
                 return;
@@ -6434,7 +6437,7 @@ where
         // repair ring - and not even there on a single replica, which keeps no
         // ring at all. A miss degrades to a successful send carrying no
         // confirmation, a legal answer no client can tell from a real one.
-        let committed_batch_stats = self.resolve_committed_visible_offsets(&drained);
+        let committed_batch_stats = self.resolve_committed_batch_stats(&drained);
         let retirements: Vec<_> = drained
             .iter()
             .map(|entry| {
@@ -6457,9 +6460,7 @@ where
                 .dedup
                 .commit_capacity(entry.header.retry_capacity as usize)
                 .is_err()
-                || (entry.header.operation == Operation::SendMessages
-                    && entry.header.op > self.purge_floor_op
-                    && batch_stats.is_none())
+                || (entry.header.operation == Operation::SendMessages && batch_stats.is_none())
                 || (entry.header.operation == Operation::RetireSession && retirement.is_none())
             {
                 error!(
@@ -6470,7 +6471,7 @@ where
                 self.fatal = Some(FatalCommit {
                     namespace_raw,
                     op: entry.header.op,
-                    operation: entry.header.operation,
+                    operation: Some(entry.header.operation),
                 });
                 return;
             }
@@ -6499,7 +6500,7 @@ where
                 .commit_partition_entry(
                     prepare_header,
                     &mut messages_committed,
-                    *batch_stats,
+                    batch_stats.filter(|_| prepare_header.op > self.purge_floor_op),
                     &mut failed_commit,
                     config,
                     through_op,
@@ -6540,7 +6541,7 @@ where
                 self.fatal = Some(FatalCommit {
                     namespace_raw,
                     op: prepare_header.op,
-                    operation: prepare_header.operation,
+                    operation: Some(prepare_header.operation),
                 });
                 return;
             }
@@ -6559,7 +6560,7 @@ where
                     op: drained
                         .last()
                         .map_or_else(|| self.consensus.commit_min(), |entry| entry.header.op),
-                    operation: Operation::SendMessages,
+                    operation: Some(Operation::SendMessages),
                 });
                 return;
             }
@@ -6600,7 +6601,7 @@ where
                 self.fatal = Some(FatalCommit {
                     namespace_raw,
                     op,
-                    operation,
+                    operation: Some(operation),
                 });
                 return;
             }
@@ -6619,37 +6620,42 @@ where
                     .required_metadata_frontier
                     .max(identity.metadata_watermark);
             }
-            let body = match prepare_header.operation {
-                Operation::SendMessages => {
-                    send_messages_reply_body(prepare_header.group, batch_stats)
-                }
-                operation => committed_reply_body(operation),
-            };
-            let reply = build_reply_message(&prepare_header, &body);
-
             // Fold the committed request into this group's dedup slice. Runs on
             // EVERY replica, not just the one that replies, so a promoted
             // primary can absorb a replay of what its predecessor committed.
             // Auto-commit ops carry the reserved sentinel client and no client
             // ever replays them.
-            let reply = if is_auto_commit_client(prepare_header.client) {
-                Some(reply)
+            let reply_sender = entry.take_reply_sender();
+            let auto_commit = is_auto_commit_client(prepare_header.client);
+            let reply = if auto_commit && reply_sender.is_none() {
+                None
             } else {
-                let recipient_reply = send_client_replies.then(|| reply.clone());
-                if let Err(error) = self.dedup.commit_partition_reply(
-                    prepare_header.user_id,
-                    prepare_header.session,
-                    reply,
-                ) {
-                    error!(namespace_raw, op = prepare_header.op, %error, "cannot retain committed partition receipt");
-                    self.fatal = Some(FatalCommit {
-                        namespace_raw,
-                        op: prepare_header.op,
-                        operation: prepare_header.operation,
-                    });
-                    return;
+                let body = match prepare_header.operation {
+                    Operation::SendMessages => {
+                        send_messages_reply_body(prepare_header.group, batch_stats)
+                    }
+                    operation => committed_reply_body(operation),
+                };
+                let reply = build_reply_message(&prepare_header, &body);
+                if auto_commit {
+                    Some(reply)
+                } else {
+                    let recipient_reply = send_client_replies.then(|| reply.clone());
+                    if let Err(error) = self.dedup.commit_partition_reply(
+                        prepare_header.user_id,
+                        prepare_header.session,
+                        reply,
+                    ) {
+                        error!(namespace_raw, op = prepare_header.op, %error, "cannot retain committed partition receipt");
+                        self.fatal = Some(FatalCommit {
+                            namespace_raw,
+                            op: prepare_header.op,
+                            operation: Some(prepare_header.operation),
+                        });
+                        return;
+                    }
+                    recipient_reply
                 }
-                recipient_reply
             };
             self.consensus.advance_commit_min(prepare_header.op);
 
@@ -6678,8 +6684,8 @@ where
             // `AUTO_COMMIT_CLIENT_ID`: no client ever waits on it, so skip the
             // reply. Emitting it would push an unrequested frame onto a real
             // client's lockstep reply stream if the sentinel ever routed there.
-            if is_auto_commit_client(prepare_header.client) {
-                if let Some(sender) = entry.take_reply_sender() {
+            if auto_commit {
+                if let Some(sender) = reply_sender {
                     let _ = sender.send(reply);
                 }
             } else {
@@ -6697,7 +6703,7 @@ where
                 // entries carry no sender), so it logs at debug: the original
                 // waiter was cancelled by the view change and the client is
                 // already on its read-timeout.
-                if let Some(sender) = entry.take_reply_sender() {
+                if let Some(sender) = reply_sender {
                     let _ = sender.send(reply);
                 } else if let Err(error) = self
                     .consensus
@@ -6812,7 +6818,7 @@ where
     /// carry no batch), which is what makes the pairing correct by
     /// construction; keying on `op` instead would let a lookup miss attribute
     /// one batch's offsets to another entry's reply.
-    fn resolve_committed_visible_offsets(
+    fn resolve_committed_batch_stats(
         &self,
         drained: &[PipelineEntry],
     ) -> Vec<Option<CommittedBatchStats>> {
@@ -6822,25 +6828,8 @@ where
                 if entry.header.operation != Operation::SendMessages {
                     return None;
                 }
-                // Purge floor: a pre-purge send committing after the purge is
-                // DELIBERATELY degraded to ZERO confirmations rather than
-                // failed. Its messages are genuinely gone (the purge deleted
-                // the segment they would have landed in) and no offset is left
-                // to report, so the reply carries the established "committed,
-                // no offsets to report" shape (`send_messages_reply_body`'s
-                // empty confirmation list, byte-identical to what a send
-                // without confirmation returns): the client sees success with
-                // an empty confirmations list and re-sends if it needs the
-                // offset. A typed transient status was the alternative and is
-                // wrong here -- the op DID commit cluster-wide, so telling the
-                // client to retry duplicates a committed send into the
-                // post-purge offset space. `None` is also what keeps
-                // `commit_partition_entry` from re-advancing the reset offset
-                // and stats with pre-purge values.
-                if entry.header.op <= self.purge_floor_op {
-                    return None;
-                }
-
+                // Receipts describe the original append even after purge removes
+                // its messages. Only the state-apply path filters purged offsets.
                 match self.committed_batch_stats_for_prepare(&entry.header) {
                     Ok(batch_stats) => batch_stats,
                     Err(error) => {
@@ -7791,6 +7780,10 @@ where
             self.flush_committed_messages(config).await?;
             persistence.request_checkpoint();
             self.checkpoint_persistence(config).await;
+            persistence
+                .drain_with_timeout()
+                .await
+                .map_err(|_| IggyError::CannotSyncFile)?;
             if self.fatal.is_some() || persistence.checkpoint_op() != persistence.head() {
                 return Err(IggyError::CannotSyncFile);
             }
@@ -8824,7 +8817,9 @@ where
         // commit in, losing a committed op. Mirrors the view-change dispatch
         // gate; withhold on persist failure and let the primary's prepare
         // retransmit re-drive the ack once a later persist succeeds.
-        if self.consensus.replica_count() > 1 && !self.register_rebuilt_ack(header) {
+        if (self.consensus.replica_count() > 1 || self.persistence.is_some())
+            && !self.register_rebuilt_ack(header)
+        {
             self.ensure_wal_view();
             return false;
         }
@@ -10607,7 +10602,7 @@ mod tests {
         partition.fatal = Some(FatalCommit {
             namespace_raw: partition.namespace().inner(),
             op: header.op,
-            operation: Operation::StoreConsumerOffset,
+            operation: Some(Operation::StoreConsumerOffset),
         });
         partition.persistence.as_ref().unwrap().request_checkpoint();
         partition
@@ -10627,8 +10622,69 @@ mod tests {
         assert_eq!(partition.pending_persisted_acks.borrow().len(), 1);
         assert_eq!(
             partition.fatal().unwrap().operation,
-            Operation::StoreConsumerOffset
+            Some(Operation::StoreConsumerOffset)
         );
+    }
+
+    #[compio::test]
+    async fn checkpoint_submission_does_not_wait_for_publication_or_reclaim_early() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = repair_config();
+        config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+        let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut partition = partition_at_view(0, 0);
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"checkpoint");
+        let header = *prepare.header();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence
+            .append(prepare.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition
+            .append_repaired_send_messages(prepare)
+            .await
+            .unwrap();
+        partition.consensus.restore_commit_state(0, header.op);
+        partition.commit_journal(&config).await;
+        assert!(partition.fatal().is_none());
+        assert_eq!(partition.consensus.commit_min(), header.op);
+        let completion = Rc::new(std::cell::Cell::new(None));
+        let captured = Rc::clone(&completion);
+        persistence.set_notifier(Rc::new(move |value| captured.set(Some(value))));
+        let previous = directory.join("prepares-0/receipts-0.checkpoint");
+        std::fs::write(&previous, b"obsolete receipt").unwrap();
+        persistence.mark_purge(0, 0);
+        assert!(persistence.start());
+        persistence.request_checkpoint();
+
+        partition.checkpoint_persistence(&config).await;
+
+        assert!(partition.fatal().is_none());
+        assert_eq!(persistence.checkpoint_op(), 0);
+        assert!(
+            previous.exists(),
+            "unpublished checkpoints cannot reclaim receipts"
+        );
+        assert!(directory.join("prepares-0/receipts-1.checkpoint").exists());
+        Rc::clone(&persistence).run().await;
+        assert!(
+            persistence.failure().is_none(),
+            "{:?}",
+            persistence.failure()
+        );
+        assert_eq!(persistence.checkpoint_op(), header.op);
+        partition
+            .on_persistence_completed(completion.get().unwrap())
+            .await;
+        assert!(!previous.exists());
+        assert!(directory.join("prepares-0/receipts-1.checkpoint").exists());
     }
 
     #[compio::test]
@@ -10771,7 +10827,7 @@ mod tests {
         );
         assert_eq!(
             partition.fatal.as_ref().unwrap().operation,
-            Operation::StoreConsumerOffset
+            Some(Operation::StoreConsumerOffset)
         );
     }
 
@@ -12957,7 +13013,7 @@ mod tests {
             .fatal
             .as_ref()
             .expect("committed persistence failure fences partition");
-        assert_eq!(fatal.operation, Operation::StoreConsumerOffset);
+        assert_eq!(fatal.operation, Some(Operation::StoreConsumerOffset));
         assert_eq!(fatal.op, 1);
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::Consumer),
@@ -13096,7 +13152,7 @@ mod tests {
         assert_eq!(partition.fatal.as_ref().unwrap().op, 1);
         assert_eq!(
             partition.fatal.as_ref().unwrap().operation,
-            Operation::StoreConsumerOffset
+            Some(Operation::StoreConsumerOffset)
         );
         assert_eq!(partition.consensus.commit_min(), 0);
         assert!(sent.borrow().is_empty());
@@ -14393,6 +14449,54 @@ mod tests {
             1
         );
         assert_eq!(partition.consumer_offsets.pin().len(), 1);
+    }
+
+    #[compio::test]
+    async fn given_solo_persisted_offset_when_wal_is_pending_should_withhold_reply() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies) = recording_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.consumer_offsets_path = Some(
+            directory
+                .path()
+                .join("consumers")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        partition.stats.increment_messages_count(1);
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence.set_group_commit_delay(std::time::Duration::from_millis(1));
+        // Hold the worker until the self-ack path has had a chance to commit.
+        persistence.mark_purge(0, 0);
+        assert!(persistence.start());
+
+        partition
+            .on_request(
+                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum),
+                None,
+            )
+            .await;
+        commit_recorded_loopback(&mut partition).await;
+
+        assert_eq!(persistence.head(), 1);
+        assert_eq!(persistence.durable_op(), 0);
+        assert!(
+            replies.borrow().is_empty(),
+            "reply preceded the WAL barrier"
+        );
+        assert_eq!(partition.consensus().commit_min(), 0);
+
+        Rc::clone(&persistence).run().await;
+        commit_recorded_loopback(&mut partition).await;
+
+        assert_eq!(persistence.durable_op(), 1);
+        assert_eq!(partition.consensus().commit_min(), 1);
+        assert_eq!(replies.borrow().len(), 1);
+        assert_eq!(
+            partition.get_consumer_offset(PollingConsumer::Consumer(7, 0)),
+            Some(0)
+        );
     }
 
     #[compio::test]
@@ -17420,7 +17524,7 @@ mod tests {
             .fatal()
             .expect("a failed commit of a cluster-committed op must fence the partition");
         assert_eq!(fault.op, 1);
-        assert_eq!(fault.operation, Operation::SendMessages);
+        assert_eq!(fault.operation, Some(Operation::SendMessages));
 
         // The fence holds: a fenced partition must not advance again, or the
         // pump's tail drain walks it into the `advance_commit_min` assert.
@@ -17445,20 +17549,20 @@ mod tests {
             .fatal()
             .expect("a failed shutdown flush must fence the partition");
         assert_eq!(fault.op, partition.consensus().commit_min());
-        assert_eq!(fault.operation, Operation::SendMessages);
+        assert_eq!(fault.operation, Some(Operation::SendMessages));
 
         // A partition the commit path already fenced keeps that fault: it
         // names the op that first diverged.
         let commit_fault = FatalCommit {
             namespace_raw: fault.namespace_raw,
             op: 42,
-            operation: Operation::StoreConsumerOffset,
+            operation: Some(Operation::StoreConsumerOffset),
         };
         partition.fatal = Some(commit_fault);
         partition.fence_flush_failure();
         let kept = partition.fatal().expect("the fence must hold");
         assert_eq!(kept.op, 42);
-        assert_eq!(kept.operation, Operation::StoreConsumerOffset);
+        assert_eq!(kept.operation, Some(Operation::StoreConsumerOffset));
     }
 
     /// A half that failed never advanced its cursor, so the retry rewrites

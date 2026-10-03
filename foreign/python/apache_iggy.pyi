@@ -1857,8 +1857,9 @@ class IggyClient:
         producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
         `None` selects direct mode. `BackgroundProducerConfig` starts background
         workers and makes successful sends mean queue acceptance rather than a
-        server commit. Set `topic_durability=Durability.PERSISTED` for an
-        automatically created topic; Replicated defaults reject producer writes.
+        server commit. Replicated topics accept producer writes. Set
+        `topic_durability=Durability.PERSISTED` for an automatically created topic
+        when sends require crash-safe retry receipts.
 
         Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
         when stream/topic initialization fails.

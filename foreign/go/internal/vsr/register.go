@@ -25,9 +25,9 @@ import (
 )
 
 // ProtocolVersion is the packed semver of the wire contract this codec
-// implements, 0.11.0 per core/binary_protocol/src/version.rs. Bump it together
+// implements, 0.11.1 per core/binary_protocol/src/version.rs. Bump it together
 // with the Rust constant on any wire-incompatible change.
-var ProtocolVersion = packProtocolVersion(0, 11, 0)
+var ProtocolVersion = packProtocolVersion(0, 11, 1)
 
 // packProtocolVersion packs a semver into the ten-bits-per-field layout the
 // register handshake carries.
@@ -60,8 +60,6 @@ var (
 	// ErrTruncatedRegisterReply is returned when a register reply is shorter
 	// than its declared layout requires.
 	ErrTruncatedRegisterReply = errors.New("vsr: register reply is truncated")
-	// ErrTruncatedRegisterRequest reports a missing register identity or proof.
-	ErrTruncatedRegisterRequest = errors.New("vsr: register request is truncated")
 )
 
 // SerializeLoginRegister builds the LoginRegister body:
@@ -107,23 +105,6 @@ func NewBindSecret() [BindSecretBytes]byte {
 	var secret [BindSecretBytes]byte
 	_, _ = rand.Read(secret[:])
 	return secret
-}
-
-// RegisterBindSecret extracts the proof from a register request.
-func RegisterBindSecret(body []byte) ([BindSecretBytes]byte, error) {
-	var secret [BindSecretBytes]byte
-	offset := 4
-	for range 2 {
-		if offset >= len(body) || int(body[offset])+1 > len(body)-offset {
-			return secret, ErrTruncatedRegisterRequest
-		}
-		offset += 1 + int(body[offset])
-	}
-	if len(body)-offset < BindSecretBytes {
-		return secret, ErrTruncatedRegisterRequest
-	}
-	copy(secret[:], body[offset:offset+BindSecretBytes])
-	return secret, nil
 }
 
 // SerializeBindSession encodes a logical session identity and its proof.

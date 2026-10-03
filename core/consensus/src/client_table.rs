@@ -1137,18 +1137,10 @@ impl ClientTable {
             return SliceRequestStatus::New;
         };
         let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
-        if entry.user_id != user_id || request > entry.watermark {
+        if entry.user_id != user_id {
             return SliceRequestStatus::New;
         }
-        let below = entry.watermark - request;
-        if below >= COMMITTED_WINDOW_BITS {
-            return SliceRequestStatus::AgedOut;
-        }
-        if entry.committed_window & (1 << below) == 0 {
-            SliceRequestStatus::New
-        } else {
-            SliceRequestStatus::Committed
-        }
+        entry.check_slice_request(request)
     }
 
     #[must_use]
@@ -1172,7 +1164,7 @@ impl ClientTable {
                 received: session,
             };
         }
-        match self.check_slice_request(client_id, user_id, request) {
+        match entry.check_slice_request(request) {
             SliceRequestStatus::New => RequestStatus::New,
             SliceRequestStatus::Committed => match entry.find_cached(request) {
                 Some(reply) if reply.header().operation != operation => {
@@ -1827,6 +1819,21 @@ impl ClientEntry {
             ring: VecDeque::new(),
             client_id,
             latest_commit: commit_op,
+        }
+    }
+
+    const fn check_slice_request(&self, request: u64) -> SliceRequestStatus {
+        if request > self.watermark {
+            return SliceRequestStatus::New;
+        }
+        let below = self.watermark - request;
+        if below >= COMMITTED_WINDOW_BITS {
+            return SliceRequestStatus::AgedOut;
+        }
+        if self.committed_window & (1 << below) == 0 {
+            SliceRequestStatus::New
+        } else {
+            SliceRequestStatus::Committed
         }
     }
 

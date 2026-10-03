@@ -178,8 +178,6 @@ pub enum IggyError {
         "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
     )]
     RequestTooOld = 85,
-    #[error("Durable retries require persisted durability and quorum offset acknowledgments")]
-    DurabilityRequired = 86,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -575,6 +573,8 @@ pub enum IggyError {
         iggy_binary_protocol::ProtocolVersion(*.2)
     )]
     IncompatibleProtocolVersion(u32, u32, u32) = 14003,
+    #[error("VSR session mismatch: requested {0}, server bound {1}")]
+    SessionMismatch(u64, u64) = 14004,
 }
 
 impl IggyError {

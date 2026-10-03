@@ -3171,7 +3171,10 @@ where
             // A server-originated op has no socket either. Its entry loses the
             // in-process sender after a view change or a boot re-pipeline, and
             // a send to the reserved id only fails with a false error.
-            if !had_in_process_subscriber && prepare_header.client != RESERVED_CLIENT_ID {
+            if !had_in_process_subscriber
+                && prepare_header.client != RESERVED_CLIENT_ID
+                && !message_bus::is_auto_commit_client(prepare_header.client)
+            {
                 wire_replies.push((event, reply));
             }
         }

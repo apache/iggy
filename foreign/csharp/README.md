@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10; repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.11.0. Servers and applicable SDKs must deploy together; mixed versions and
+This checkout uses binary protocol 0.11.1. Servers and applicable SDKs must deploy together; mixed versions and
 rolling upgrades are unsupported. Existing old-format data requires a separately verified migration or restore;
 a binary replacement cannot upgrade it. See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
 Register creates a shared logical session; other TCP connections authenticate with BindSession (15), using the

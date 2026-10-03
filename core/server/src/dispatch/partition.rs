@@ -1322,7 +1322,7 @@ mod tests {
             .expect("the checkpoint fault must be returned in its originating sweep");
         assert_eq!(fault.namespace_raw, namespace.inner());
         assert_eq!(fault.op, 1);
-        assert_eq!(fault.operation, Operation::SendMessages);
+        assert_eq!(fault.operation, None);
         assert_eq!(persistence.checkpoint_op(), 0);
     }
 

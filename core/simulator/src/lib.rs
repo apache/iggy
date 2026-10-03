@@ -8345,11 +8345,9 @@ mod metadata_read_frontier_tests {
         if let Some(reply) = early {
             panic!(
                 "the backup answered a metadata read while its applied frontier \
-                 ({}) was below the client's committed epoch ({deleted}): status={}, \
-                 stream={:?}",
+                 ({}) was below the client's committed epoch ({deleted}): status={}",
                 metadata_commit(&sim, usize::from(LAGGING)),
                 reply.header().status,
-                read_stream_name(&reply),
             );
         }
 

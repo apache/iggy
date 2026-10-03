@@ -292,6 +292,9 @@ impl HttpInner {
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
             let now = IggyTimestamp::now().to_secs();
+            if let Some(session) = self.live_session(&key, now) {
+                return Ok(session);
+            }
             {
                 let metadata = self.shard.plane.metadata();
                 let mut registry = metadata.client_table.borrow_mut();

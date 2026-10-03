@@ -855,7 +855,7 @@ export class CommandResponseStream extends EventEmitter {
     handleResp = true,
     deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS
   ): Promise<CommandResponse> {
-    if (isLoginCommand(command) && this.isAuthenticated)
+    if (isLoginCommand(command))
       return this._processVsrLogin(command, payload, handleResp, deadline);
     return this._processVsr(command, payload, handleResp, deadline);
   }
@@ -866,7 +866,27 @@ export class CommandResponseStream extends EventEmitter {
     handleResp: boolean,
     deadline: number
   ): Promise<CommandResponse> {
-    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true, deadline);
+    if (this.isAuthenticated) {
+      await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true, deadline);
+    } else {
+      const resume = this.vsrSession.resumePayload(this.metadataWatermark);
+      if (resume) {
+        const remembered = this.rememberedCredentials;
+        const sameCredentials = remembered && ('token' in remembered
+          ? command === LOGIN_WITH_TOKEN.code && payload.equals(LOGIN_WITH_TOKEN.serialize(remembered))
+          : command === LOGIN.code && payload.equals(LOGIN.serialize(remembered)));
+        if (sameCredentials) {
+          try {
+            return await this._processVsr(COMMAND_CODE.BindSession, resume, handleResp, deadline);
+          } catch (error) {
+            if (!(error instanceof ResponseError) ||
+                (error.errorCode !== UNAUTHENTICATED && error.errorCode !== STALE_CLIENT))
+              throw error;
+          }
+        }
+        this._resetSession(true);
+      }
+    }
     return this._processVsr(command, payload, handleResp, deadline);
   }
 

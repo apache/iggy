@@ -309,10 +309,7 @@ impl BinaryTransport for WebSocketClient {
                 }
                 retain_replay_header(
                     &mut header,
-                    &*self
-                        .consensus_session
-                        .lock()
-                        .map_err(|_| IggyError::InvalidConfiguration)?,
+                    &self.consensus_session,
                     code,
                     &IggyError::TransientNotAccepted,
                 )?;
@@ -1154,15 +1151,7 @@ impl WebSocketClient {
         let roster = self.roster_endpoints.lock().await.clone();
         let mut walk = RosterWalk::new(&current, &roster);
         'replay: loop {
-            retain_replay_header(
-                header,
-                &*self
-                    .consensus_session
-                    .lock()
-                    .map_err(|_| IggyError::InvalidConfiguration)?,
-                code,
-                original_error,
-            )?;
+            retain_replay_header(header, &self.consensus_session, code, original_error)?;
             let result = tokio::time::timeout_at(
                 deadline,
                 self.send_raw_retaining_header(code, payload.clone(), header),

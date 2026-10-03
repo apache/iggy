@@ -36,10 +36,10 @@ func registerReplyBody(userID uint32, session uint64, protocol uint32, version s
 }
 
 func TestProtocolVersion_PacksTheWireContractSemver(t *testing.T) {
-	assert.Equal(t, uint32(11264), ProtocolVersion)
+	assert.Equal(t, uint32(11265), ProtocolVersion)
 	assert.Equal(t, uint32(0), ProtocolVersion>>20)
 	assert.Equal(t, uint32(11), (ProtocolVersion>>10)&0x3FF)
-	assert.Equal(t, uint32(0), ProtocolVersion&0x3FF)
+	assert.Equal(t, uint32(1), ProtocolVersion&0x3FF)
 }
 
 func TestSerializeLoginRegister_EncodesTheDeclaredLayout(t *testing.T) {
@@ -168,21 +168,13 @@ func TestBindSession_CarriesTheRegisteredProofAfterVersionAndIdentity(t *testing
 	for index := range secret {
 		secret[index] = byte(index + 1)
 	}
-	login, err := SerializeLoginRegister("iggy", "secret", "1", secret)
-	require.NoError(t, err)
-	recovered, err := RegisterBindSecret(login)
-	require.NoError(t, err)
-	require.Equal(t, secret, recovered)
 	identity := make([]byte, SessionIdentityBytes)
 	binary.LittleEndian.PutUint64(identity, 7)
 	binary.LittleEndian.PutUint64(identity[16:], 11)
-	bound, err := SerializeBindSession(identity, "1", recovered)
+	bound, err := SerializeBindSession(identity, "1", secret)
 	require.NoError(t, err)
 	offset := 4 + 1 + len(SDKName) + 1 + 1
 	assert.Equal(t, identity, bound[offset:offset+SessionIdentityBytes])
 	assert.Equal(t, secret[:], bound[offset+SessionIdentityBytes:])
-	for length := range offset + BindSecretBytes {
-		_, err := RegisterBindSecret(login[:length])
-		assert.ErrorIs(t, err, ErrTruncatedRegisterRequest, "truncated at %d", length)
-	}
+
 }
