@@ -16,5 +16,7 @@
 // under the License.
 
 mod fixture;
+mod source;
 
 pub use fixture::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
+pub use source::{DATA_KEY, RESTART_RECORD_COUNT, S3SourceFixture, S3SourceRestartFixture};
