@@ -124,4 +124,10 @@ public interface TopicsClient {
     }
 
     void deleteTopic(StreamId streamId, TopicId topicId);
+
+    default void purgeTopic(Long streamId, Long topicId) {
+        purgeTopic(StreamId.of(streamId), TopicId.of(topicId));
+    }
+
+    void purgeTopic(StreamId streamId, TopicId topicId);
 }

@@ -209,4 +209,13 @@ public class TopicsTcpClient implements TopicsClient {
                 .send(CommandCode.Topic.DELETE.getValue(), payload)
                 .thenAccept(response -> response.release());
     }
+
+    @Override
+    public CompletableFuture<Void> purgeTopic(StreamId streamId, TopicId topicId) {
+        var payload = Unpooled.buffer();
+        payload.writeBytes(toBytes(streamId));
+        payload.writeBytes(toBytes(topicId));
+
+        return connection().sendAndRelease(CommandCode.Topic.PURGE, payload);
+    }
 }
