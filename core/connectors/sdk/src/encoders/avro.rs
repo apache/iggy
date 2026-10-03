@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder, convert::owned_value_to_serde_json};
+use crate::{Error, Payload, Schema, StreamEncoder, convert::owned_value_into_serde_json};
 use apache_avro::Schema as AvroSchema;
 use apache_avro::writer::datum::GenericDatumWriter;
 use base64::Engine;
@@ -156,7 +156,7 @@ impl AvroStreamEncoder {
             Error::InvalidConfigValue("Avro schema is required for encoding".to_string())
         })?;
 
-        let serde_value = owned_value_to_serde_json(&json_value);
+        let serde_value = owned_value_into_serde_json(json_value);
         let avro_value = Self::serde_json_to_avro_value(serde_value, schema)?;
 
         GenericDatumWriter::builder(schema)

@@ -20,6 +20,7 @@ use base64::{Engine as _, engine::general_purpose};
 use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    convert::owned_value_into_serde_json,
     retry::{parse_duration, retry_backoff},
     sink_connector,
 };
@@ -933,33 +934,6 @@ fn upsert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Va
         debug!(
             "Document already contains Meilisearch metadata field '{field}', overwriting with connector provenance"
         );
-    }
-}
-
-fn owned_value_into_serde_json(value: simd_json::OwnedValue) -> Value {
-    match value {
-        simd_json::OwnedValue::Static(node) => match node {
-            simd_json::StaticNode::Null => Value::Null,
-            simd_json::StaticNode::Bool(value) => Value::Bool(value),
-            simd_json::StaticNode::I64(value) => Value::Number(value.into()),
-            simd_json::StaticNode::U64(value) => Value::Number(value.into()),
-            simd_json::StaticNode::F64(value) => serde_json::Number::from_f64(value)
-                .map(Value::Number)
-                .unwrap_or(Value::Null),
-        },
-        simd_json::OwnedValue::String(value) => Value::String(value),
-        simd_json::OwnedValue::Array(values) => Value::Array(
-            values
-                .into_iter()
-                .map(owned_value_into_serde_json)
-                .collect(),
-        ),
-        simd_json::OwnedValue::Object(values) => Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, owned_value_into_serde_json(value)))
-                .collect(),
-        ),
     }
 }
 

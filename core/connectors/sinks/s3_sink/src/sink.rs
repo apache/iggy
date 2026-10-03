@@ -100,7 +100,7 @@ impl Sink for S3Sink {
                 &buffer_arc,
                 topic_metadata,
                 &messages_metadata,
-                &messages,
+                messages,
                 &mut processed,
             )
             .await;
@@ -250,11 +250,12 @@ impl S3Sink {
         buffer_arc: &Arc<tokio::sync::Mutex<FileBuffer>>,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        messages: &[ConsumedMessage],
+        messages: Vec<ConsumedMessage>,
         processed: &mut u64,
     ) -> Result<(), Error> {
         for message in messages {
             let resolved = self.resolved();
+            let (offset, timestamp) = (message.offset, message.timestamp);
             let formatted = formatter::format_message(
                 message,
                 topic_metadata,
@@ -266,7 +267,7 @@ impl S3Sink {
 
             let flush_payload = {
                 let mut buffer = buffer_arc.lock().await;
-                buffer.append(&formatted, message.offset, message.timestamp);
+                buffer.append(&formatted, offset, timestamp);
 
                 if buffer.should_rotate(
                     self.config.file_rotation,
@@ -616,6 +617,157 @@ mod tests {
             let state = sink.state.lock().await;
             assert_eq!(state.messages_uploaded, 1);
             assert_eq!(state.messages_lost, 0);
+        });
+    }
+
+    // FileBuffer only ever records the first message's timestamp, so that's all this can observe.
+    #[test]
+    fn given_multiple_messages_should_write_in_offset_order_with_batch_key() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            mock_write_probe(&server, "allowed/events/.iggy-sink-probe").await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let config = S3SinkConfig {
+                prefix: Some("/allowed/events/".to_string()),
+                endpoint: Some(server.uri()),
+                access_key_id: Some("test-access-key".into()),
+                secret_access_key: Some("test-secret-key".into()),
+                path_template: "{topic}/{timestamp}".to_string(),
+                output_format: "raw".to_string(),
+                ..test_config()
+            };
+            let mut sink = S3Sink::new(1, config);
+            sink.open().await.expect("Sink should initialize");
+
+            let message = |offset, timestamp, data: &[u8]| ConsumedMessage {
+                id: u128::from(offset) + 1,
+                offset,
+                checksum: 0,
+                timestamp,
+                origin_timestamp: 0,
+                headers: None,
+                payload: Payload::Raw(data.to_vec()),
+            };
+            sink.consume(
+                &TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "messages".to_string(),
+                },
+                MessagesMetadata {
+                    partition_id: 0,
+                    current_offset: 10,
+                    schema: Schema::Raw,
+                },
+                vec![
+                    message(10, 1_000_000, b"a"),
+                    message(11, 2_000_000, b"b"),
+                    message(12, 3_000_000, b"c"),
+                ],
+            )
+            .await
+            .expect("Batch should upload");
+            sink.close().await.expect("Sink should close");
+
+            let requests = server.received_requests().await.expect("record requests");
+            assert_eq!(
+                requests.len(),
+                3,
+                "Probe POST + DELETE, then one data PUT: {requests:?}"
+            );
+            assert_eq!(requests[2].method, "PUT");
+            assert_eq!(
+                requests[2].body, b"abc",
+                "Each message's own bytes must land in its own offset's position"
+            );
+            assert_eq!(
+                requests[2].url.path(),
+                "/test-bucket/allowed/events/messages/1000/00000-00000000000000000010-00000000000000000012.bin",
+                "Key must reflect the batch's offset range and the first message's own timestamp, not a shared or stale one"
+            );
+        });
+    }
+
+    // Rotation exposes the middle offset and last timestamp a single flush hides.
+    #[test]
+    fn given_rotation_mid_batch_should_use_each_segments_own_offset_and_timestamp() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            mock_write_probe(&server, "allowed/events/.iggy-sink-probe").await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let config = S3SinkConfig {
+                prefix: Some("/allowed/events/".to_string()),
+                endpoint: Some(server.uri()),
+                access_key_id: Some("test-access-key".into()),
+                secret_access_key: Some("test-secret-key".into()),
+                path_template: "{topic}/{timestamp}".to_string(),
+                output_format: "raw".to_string(),
+                file_rotation: FileRotation::Messages,
+                max_messages_per_file: Some(2),
+                ..test_config()
+            };
+            let mut sink = S3Sink::new(1, config);
+            sink.open().await.expect("Sink should initialize");
+
+            let message = |offset, timestamp, data: &[u8]| ConsumedMessage {
+                id: u128::from(offset) + 1,
+                offset,
+                checksum: 0,
+                timestamp,
+                origin_timestamp: 0,
+                headers: None,
+                payload: Payload::Raw(data.to_vec()),
+            };
+            sink.consume(
+                &TopicMetadata {
+                    stream: "events".to_string(),
+                    topic: "messages".to_string(),
+                },
+                MessagesMetadata {
+                    partition_id: 0,
+                    current_offset: 10,
+                    schema: Schema::Raw,
+                },
+                vec![
+                    message(10, 1_000_000, b"a"),
+                    message(11, 2_000_000, b"b"),
+                    message(12, 3_000_000, b"c"),
+                ],
+            )
+            .await
+            .expect("Batch should upload");
+            sink.close().await.expect("Sink should close");
+
+            let requests = server.received_requests().await.expect("record requests");
+            assert_eq!(
+                requests.len(),
+                4,
+                "Probe POST + DELETE, then one PUT per rotated segment: {requests:?}"
+            );
+            assert_eq!(requests[2].method, "PUT");
+            assert_eq!(
+                requests[2].body, b"ab",
+                "First segment holds messages 1-2"
+            );
+            assert_eq!(
+                requests[2].url.path(),
+                "/test-bucket/allowed/events/messages/1000/00000-00000000000000000010-00000000000000000011.bin",
+                "First segment's key must reflect message 2's own offset as last_offset"
+            );
+            assert_eq!(requests[3].method, "PUT");
+            assert_eq!(requests[3].body, b"c", "Second segment holds message 3 alone");
+            assert_eq!(
+                requests[3].url.path(),
+                "/test-bucket/allowed/events/messages/3000/00000-00000000000000000012-00000000000000000012.bin",
+                "Second segment's key must reflect message 3's own timestamp, not message 1's"
+            );
         });
     }
 

@@ -22,7 +22,7 @@ use bytes::Bytes;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    convert::owned_value_to_serde_json, sink_connector,
+    convert::owned_value_into_serde_json, sink_connector,
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{
@@ -380,11 +380,7 @@ impl HttpSink {
     fn payload_to_json(&self, payload: Payload) -> Result<serde_json::Value, Error> {
         let payload = payload.into_json_document();
         match payload {
-            Payload::Json(value) => {
-                // Direct structural conversion (not serialization roundtrip).
-                // Follows the Elasticsearch sink pattern. NaN/Infinity f64 → null.
-                Ok(owned_value_to_serde_json(&value))
-            }
+            Payload::Json(value) => Ok(owned_value_into_serde_json(value)),
             Payload::Text(text) | Payload::Proto(text) => Ok(serde_json::Value::String(text)),
             Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => {
                 let encoded = EncodedPayload {
@@ -1704,56 +1700,6 @@ mod tests {
             envelope[FIELD_METADATA].get(FIELD_HEADERS).is_none(),
             "Expected no iggy_headers when message has no headers"
         );
-    }
-
-    #[test]
-    fn given_null_value_should_convert_to_null() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Null);
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn given_bool_value_should_convert_correctly() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Bool(true));
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Bool(true));
-    }
-
-    #[test]
-    fn given_integer_values_should_convert_correctly() {
-        let i64_val = simd_json::OwnedValue::Static(simd_json::StaticNode::I64(-42));
-        assert_eq!(owned_value_to_serde_json(&i64_val), serde_json::json!(-42));
-
-        let u64_val = simd_json::OwnedValue::Static(simd_json::StaticNode::U64(42));
-        assert_eq!(owned_value_to_serde_json(&u64_val), serde_json::json!(42));
-    }
-
-    #[test]
-    fn given_f64_value_should_convert_correctly() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(3.54));
-        let result = owned_value_to_serde_json(&v);
-        assert_eq!(result.as_f64().unwrap(), 3.54);
-    }
-
-    #[test]
-    fn given_nan_f64_should_convert_to_null() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(f64::NAN));
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn given_infinity_f64_should_convert_to_null() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(f64::INFINITY));
-        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn given_nested_object_should_convert_recursively() {
-        let v = simd_json_from_str(r#"{"nested":{"key":"val"},"arr":[1,2]}"#);
-
-        let result = owned_value_to_serde_json(&v);
-        assert_eq!(result["nested"]["key"], "val");
-        assert_eq!(result["arr"][0], 1);
-        assert_eq!(result["arr"][1], 2);
     }
 
     #[test]
