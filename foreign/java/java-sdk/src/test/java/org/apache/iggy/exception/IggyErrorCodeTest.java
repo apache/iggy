@@ -188,6 +188,7 @@ class IggyErrorCodeTest {
         "82, INVALID_NUMBER_ENCODING",
         "83, INVALID_BOOLEAN_VALUE",
         "84, INVALID_NUMBER_VALUE",
+        "85, REQUEST_TOO_OLD",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",

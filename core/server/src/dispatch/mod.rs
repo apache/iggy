@@ -114,9 +114,10 @@ type ActiveClientRequests = Rc<RefCell<AHashSet<u128>>>;
 //     (`resolve_acting_user_id`) and for partition ops from the session
 //     manager, so BOTH planes ran as the original registrant;
 //   - the pair carries far less entropy than "client-generated random
-//     u128" implies: HTTP mints `client_id` from the shard-0 sequential
-//     counter (`mint_shard_zero_client_id`) and the epoch is a metadata commit
-//     position, so neither value is an authentication secret;
+//     u128" implies: HTTP mints `client_id` from a per-boot nonce and the
+//     shard-0 sequential counter (`mint_shard_zero_client_id`) and the epoch
+//     is a metadata commit position, so neither value is an authentication
+//     secret;
 //   - `ClientEntry` carries no transport or plane tag, so a raw TCP peer
 //     could bind an HTTP-originated session;
 //   - `bind_session` demotes the evicted holder to `Connected`, the one

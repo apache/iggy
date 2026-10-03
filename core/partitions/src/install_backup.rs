@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::CREATED_REVISION_FILE;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
@@ -50,7 +51,9 @@ pub async fn recover_with_storage<S: DurableStorage>(
         return Ok(());
     }
     for entry in storage.entries(directory).await? {
-        if entry.name == BACKUP {
+        // The marker stays: a delete cut short can leave a backup without a
+        // copy of it, and restoring that backup alone would unmark old files.
+        if entry.name == BACKUP || entry.name == CREATED_REVISION_FILE {
             continue;
         }
         storage.remove_tree(&directory.join(&entry.name)).await?;
@@ -127,7 +130,11 @@ async fn link_tree<S: DurableStorage>(
         directories.push(target.clone());
         for entry in storage.entries(&source).await? {
             let name = entry.name;
-            if skip_scratch && is_scratch(&name.to_string_lossy()) {
+            // The incarnation marker belongs to the directory, not to one
+            // materialization, so no install freezes or restores it.
+            if name == CREATED_REVISION_FILE
+                || (skip_scratch && is_scratch(&name.to_string_lossy()))
+            {
                 continue;
             }
             let destination = target.join(&name);
@@ -239,5 +246,36 @@ mod tests {
         finish(root).await.unwrap();
         recover(root).await.unwrap();
         assert_eq!(std::fs::read(root.join("0.log")).unwrap(), b"new");
+    }
+
+    #[compio::test]
+    async fn recovery_never_unmarks_a_directory_whose_delete_was_cut_short() {
+        const CREATED_REVISION: u64 = 7;
+        const SURVIVING_SEGMENT: &str = "0.log";
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let partition_dir = root.to_str().unwrap();
+        std::fs::write(root.join(SURVIVING_SEGMENT), b"old").unwrap();
+        crate::write_created_revision(partition_dir, CREATED_REVISION)
+            .await
+            .unwrap();
+        begin(root).await.unwrap();
+        // The delete walk removes the backup's files in no fixed order, the
+        // marker last only at the top level.
+        for entry in std::fs::read_dir(root.join(BACKUP)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name() != Some(SURVIVING_SEGMENT.as_ref()) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        recover(root).await.unwrap();
+
+        assert_eq!(
+            crate::read_created_revision(partition_dir).await.unwrap(),
+            Some(CREATED_REVISION),
+            "the loader must still see the dead incarnation and delete it"
+        );
+        assert_eq!(std::fs::read(root.join(SURVIVING_SEGMENT)).unwrap(), b"old");
     }
 }

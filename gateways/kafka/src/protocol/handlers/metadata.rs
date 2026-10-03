@@ -18,7 +18,6 @@
 //! Metadata (API key 3).
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use bytes::Bytes;
 use kafka_protocol::messages::metadata_response::{
@@ -31,8 +30,8 @@ use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, is_supported_version,
-    supported_max_version,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, REQUEST_DEADLINE,
+    is_supported_version, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
@@ -42,15 +41,6 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     min_version: 0,
     max_version: 9,
 };
-
-/// Wall-clock ceiling for a named-lookup request's aggregate bridge work.
-///
-/// `Metadata` carries no `timeout_ms` field in any version (unlike `CreateTopics`), so this is a
-/// fixed ceiling, not a client-honored one - sized well above one `get_topics` call's own
-/// `REQUEST_TIMEOUT` (15s, bridge-internal) so a single slow-but-alive stream lookup is not the
-/// common trigger, while still bounding the sum across every distinct stream
-/// [`IggyBridge::get_kafka_topics`] ends up calling for this request.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Above this many total partitions in an all-topics response, `encode_real_response` runs on a
 /// blocking-pool thread instead of inline (see the call site). Conservative relative to the one

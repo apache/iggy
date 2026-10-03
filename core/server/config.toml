@@ -380,6 +380,8 @@ path = "logs"
 # Log filtering directive using the same syntax as the RUST_LOG environment variable.
 # Supports simple levels ("trace", "debug", "info", "warn", "error", "off" or "none")
 # as well as complex directives like "warn,server=debug,iggy=trace".
+# A bare word must be a level: write "target=level" to filter one target.
+# An invalid value fails the boot.
 # Note: RUST_LOG environment variable always takes precedence over this setting.
 level = "info"
 
@@ -397,14 +399,17 @@ max_file_size = "500 MB"
 
 # Maximum total size of all log files.  When this size is reached,
 # the oldest log files will be deleted first. Set it to 0 to allow
-# an unlimited number of archived logs. This does not disable time
-# based log rotation or per-log-file size limits.
+# an unlimited number of archived logs. This does not disable
+# retention or per-log-file size limits.
 max_total_size = "4 GB"
 
-# Time interval for checking log rotation status. Avoid less than 1s.
+# Time interval for checking log rotation status. Must be at least 1 s.
 rotation_check_interval = "1 h"
 
-# Time to retain log files before deletion. Avoid less than 1s, too.
+# Time to keep a rotated log file after its last write. Must be at least
+# 1 s, or 0 to turn off deletion by age (max_total_size still deletes the
+# oldest files). The log file in use is never deleted, so a line can stay
+# on disk for up to the time to fill one file plus the retention.
 retention = "7 days"
 
 # Interval for printing process and host usage (CPU, memory, disk, clients,

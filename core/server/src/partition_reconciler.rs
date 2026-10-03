@@ -178,7 +178,7 @@ use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Partition, StatsRegistry};
-use partitions::delete_partitions_from_disk;
+use partitions::{delete_partitions_from_disk, read_created_revision};
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -752,12 +752,16 @@ async fn reconcile_additions(
                 "additions: recreate committed mid-pass; deferring the build to the next pass"
             );
             counters.deferred += 1;
-            // Skipping alone only settles it when nothing is on disk. With a
-            // directory there, the next pass takes the loader arm below and
-            // hydrates the NEW incarnation out of the OLD segments, so the
-            // prior life has to go first. Teardown tombstones until its
-            // `ConfirmRemove` lands, which is what holds that pass off.
-            if prior_life_on_disk {
+            // Skipping alone settles it unless the directory is unmarked. The
+            // loader deletes a directory marked by an older incarnation and
+            // keeps one marked by the committed or a newer one, which can hold
+            // data this replica served. An unmarked directory, from an older
+            // server, it would adopt as the NEW incarnation, so that prior life
+            // has to go first. Teardown tombstones until its `ConfirmRemove`
+            // lands, which is what holds the next pass off. A marker that
+            // cannot be read is left to that pass's loader.
+            if prior_life_on_disk && matches!(read_created_revision(&partition_dir).await, Ok(None))
+            {
                 tear_down_owned_partition(ctx, ns, counters).await;
             }
             continue;
@@ -805,7 +809,10 @@ async fn reconcile_additions(
                 counters.materialised += 1;
             }
             // Tombstoned by the loader over damaged files; the gate above keeps
-            // every later pass from rebuilding over them.
+            // every later pass from rebuilding over them. Or deferred, because
+            // the directory belongs to a newer incarnation than local metadata
+            // knows: nothing is counted, so the pass may fast-skip, and the
+            // commit that moves metadata on bumps the revision and retries it.
             Ok(None) => {}
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
@@ -1467,9 +1474,10 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, PassCounters, ReconcilerCtx, build_partition_fresh,
-        current_revision, delete_partitions_from_disk, fetch_partition_build_inputs,
-        reconcile_consumer_group_offsets, reconcile_once,
+        FailureCause, FailureRecord, PassCounters, ReconcilerCtx, TargetPartition,
+        build_partition_fresh, current_revision, delete_partitions_from_disk,
+        fetch_partition_build_inputs, reconcile_additions, reconcile_consumer_group_offsets,
+        reconcile_once,
     };
     use configs::server::ServerConfig;
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -2008,6 +2016,60 @@ mod tests {
             3,
             "second pass over an unchanged target must be a no-op"
         );
+    }
+
+    /// A delete and a recreate of the same ids can commit while a pass runs,
+    /// so the pass holds an older epoch than the committed partition. The
+    /// directory of the committed incarnation must survive that deferral,
+    /// while an unmarked one, which the next pass would adopt, must go.
+    #[compio::test]
+    async fn mid_pass_recreate_tears_down_only_an_unmarked_directory() {
+        for marked in [true, false] {
+            let tmp = TempDir::new().expect("tempdir for system path");
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "stream-a");
+            seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+            let shard = build_test_shard(0, &config, mux);
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ns = IggyNamespace::new(0, 0, 0);
+            let (_, _, partition) =
+                fetch_partition_build_inputs(&ctx, ns).expect("committed namespace resolves");
+            let snapshot_epoch = partition
+                .created_revision
+                .checked_sub(1)
+                .expect("the topic create follows the stream create");
+            let directory =
+                ctx.config
+                    .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
+            std::fs::create_dir_all(&directory).unwrap();
+            if marked {
+                partitions::write_created_revision(&directory, partition.created_revision)
+                    .await
+                    .unwrap();
+            }
+
+            reconcile_additions(
+                &ctx,
+                vec![TargetPartition {
+                    ns,
+                    epoch: snapshot_epoch,
+                }],
+                &mut PassCounters::default(),
+            )
+            .await;
+
+            assert_eq!(
+                std::path::Path::new(&directory).exists(),
+                marked,
+                "marked: {marked}"
+            );
+            assert_eq!(
+                shard.plane.partitions().is_tombstoned(&ns),
+                !marked,
+                "marked: {marked}"
+            );
+        }
     }
 
     /// A pass captures its targets once and then awaits disk work per

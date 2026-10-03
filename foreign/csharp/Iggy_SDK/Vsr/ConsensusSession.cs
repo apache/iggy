@@ -203,8 +203,8 @@ internal sealed class ConsensusSession
         var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
             "A replicated request requires a bound consensus session.");
 
-        // Partition ops consume an id too, even though no partition-plane dedup exists yet: dedup needs
-        // each send to carry a distinct number, and the metadata watermark tolerates the gaps.
+        // Partition ops consume an id too: dedup needs each send to carry a distinct number, and the
+        // metadata watermark tolerates the gaps.
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 

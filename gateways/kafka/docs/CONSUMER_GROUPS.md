@@ -177,8 +177,8 @@ Once Metadata reports partitions, the next wall is `OffsetFetch` (9), which a co
 `SyncGroup` for a non-empty assignment and which is not in scope
 ([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so
 that consumer would loop: coordinator connection closes, client marks the coordinator unknown,
-re-runs FindCoordinator, retries OffsetFetch, closes again. Fetch is a stub in any case, so nothing
-can be consumed until [#3535](https://github.com/apache/iggy/issues/3535)/#3542 land.
+re-runs FindCoordinator, retries OffsetFetch, closes again. Fetch reads records with a bridge, so a
+consumer that uses `assign()` outside a group can consume. A group member cannot until #3542 lands.
 
 A dynamic consumer releases its partitions on close through `LeaveGroup`. A static one does not
 send it (see [Static membership](#static-membership-is-accepted-not-honoured)), so a static
