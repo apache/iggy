@@ -154,7 +154,6 @@ public sealed class ConnectionStringTests
     [InlineData("0", "5", true, 5)]
     [InlineData("3", "unlimited", true, 0)]
     [InlineData("3", "0", false, 0)]
-    [InlineData("3", "4294967295", true, 0)]
     public void FromConnectionString_WithRepeatedRetries_UsesTheLastValue(string first, string last, bool enabled,
         int maxRetries)
     {
@@ -166,16 +165,16 @@ public sealed class ConnectionStringTests
     }
 
     [Theory]
-    [InlineData("2147483647", int.MaxValue)]
-    [InlineData("2147483648", 0)]
-    [InlineData("4294967295", 0)]
-    public void FromConnectionString_WithRetriesUpToU32Max_Accepts(string retries, int expected)
+    [InlineData("2147483647")]
+    [InlineData("2147483648")]
+    [InlineData("4294967295")]
+    public void FromConnectionString_WithRetriesAboveInt32Max_CapsAtInt32Max(string retries)
     {
         var config = IggyClientConfigurator.FromConnectionString(
             $"iggy://iggy:secret@localhost:8090?reconnection_retries={retries}");
 
         Assert.True(config.ReconnectionSettings.Enabled);
-        Assert.Equal(expected, config.ReconnectionSettings.MaxRetries);
+        Assert.Equal(int.MaxValue, config.ReconnectionSettings.MaxRetries);
     }
 
     [Theory]

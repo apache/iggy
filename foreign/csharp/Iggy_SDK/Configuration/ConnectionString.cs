@@ -207,7 +207,7 @@ internal static class ConnectionString
 
         // MaxRetries treats 0 as unlimited, so zero retries means reconnection off.
         settings.Enabled = unlimited || retries != 0;
-        settings.MaxRetries = retries <= int.MaxValue ? (int)retries : 0;
+        settings.MaxRetries = (int)Math.Min(retries, int.MaxValue);
     }
 
     private static T ParseDuration<T>(string name, string value, Func<string, T> parse)

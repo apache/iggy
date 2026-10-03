@@ -183,7 +183,8 @@ sockets with `NoDelay`, so `nodelay=false` does not turn Nagle back on even thou
 Nagle on by default.
 
 `reconnection_retries=0` differs from the Rust SDK. After a lost connection, Rust still makes one reconnect
-attempt, but this client fails the request at once.
+attempt, but this client fails the request at once. It also differs from `ReconnectionSettings.MaxRetries`,
+where `0` means unlimited, so the parser maps `reconnection_retries=0` to `Enabled = false` instead.
 
 Reconnection uses no exponential backoff, and after each reconnect the client waits
 `ReconnectionSettings.WaitAfterReconnect` (1 second by default). Credentials are taken literally: they are

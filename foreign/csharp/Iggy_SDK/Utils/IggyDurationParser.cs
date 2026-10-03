@@ -264,20 +264,15 @@ internal static class IggyDurationParser
         {
             ulong numerator = 0;
             ulong denominator = 1;
-            var zeros = true;
             while (Next() is { } c)
             {
                 if (c == '0')
                 {
                     denominator = Mul(denominator, 10);
-                    if (!zeros)
-                    {
-                        numerator = Mul(numerator, 10);
-                    }
+                    numerator = Mul(numerator, 10);
                 }
                 else if (IsDigit(c))
                 {
-                    zeros = false;
                     denominator = Mul(denominator, 10);
                     numerator = Add(Mul(numerator, 10), Digit(c));
                 }
