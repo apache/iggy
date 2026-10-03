@@ -23,9 +23,9 @@ use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMod
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
 
+use crate::CREATED_REVISION_FILE;
 #[cfg(feature = "simulator")]
 use crate::persistence::FileSyncBarrier;
-use crate::CREATED_REVISION_FILE;
 
 const BACKUP: &str = ".install-backup";
 const BUILDING: &str = ".install-building";
@@ -74,7 +74,8 @@ pub async fn recover_with_storage<S: DurableStorage>(
 /// Returns an error if the rollback state cannot be made durable.
 /// After any failure the caller must stop serving until recovery.
 pub async fn begin(directory: &Path, synced_files: BTreeSet<PathBuf>) -> io::Result<()> {
-    begin_with_synced_files(directory, synced_files, &DiskStorage).await
+    begin_with_synced_files(directory, synced_files, &DiskStorage)
+        .await
         .note_descriptor_exhaustion(|| format!("starting an install in {}", directory.display()))
 }
 
