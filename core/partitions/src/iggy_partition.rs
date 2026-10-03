@@ -46,7 +46,7 @@ use consensus::Pipeline;
 use consensus::{
     AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus,
     PartitionDiagEvent, PipelineEntry, PlaneKind, Project, ReplicaLogContext, RequestLogEvent,
-    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    Sequencer, SimEventKind, SliceRequestStatus, VsrConsensus, ack_preflight, ack_quorum_reached,
     build_deny_reply_from_request, build_reply_from_request, build_reply_message,
     drain_committable_prefix, emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
     fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
@@ -940,9 +940,11 @@ where
         &mut self,
         persistence: &Rc<PartitionPersistence>,
     ) -> Result<(), IggyError> {
+        // New empty WALs carry view zero; positive certificates belong to recovered history.
         if !self.materialization_missing
             && self.recovered_log_view.is_none()
             && persistence.head() == 0
+            && matches!(persistence.certified_log_view(), None | Some(0))
         {
             persistence.certify_log_view(self.consensus.log_view(), 0, 0);
             if persistence.start() {
@@ -4409,24 +4411,48 @@ where
                 // carried: the offset confirmations are not retained (no reply
                 // ring in this mode), so a retried produce learns it committed
                 // but not where.
-                if self
+                match self
                     .dedup
-                    .is_duplicate(client_id, message.header().user_id, request)
+                    .check_slice_request(client_id, message.header().user_id, request)
                 {
-                    let committed = build_reply_from_request(
-                        &self.consensus,
-                        message.header(),
-                        committed_reply_body(message.header().operation),
-                    );
-                    Self::deliver_reply_or_log(
-                        &self.consensus,
-                        message.header(),
-                        committed,
-                        reply.take(),
-                        "duplicate reply send failed",
-                    )
-                    .await;
-                    return;
+                    SliceRequestStatus::New => {}
+                    SliceRequestStatus::Committed => {
+                        let committed = build_reply_from_request(
+                            &self.consensus,
+                            message.header(),
+                            committed_reply_body(message.header().operation),
+                        );
+                        Self::deliver_reply_or_log(
+                            &self.consensus,
+                            message.header(),
+                            committed,
+                            reply.take(),
+                            "duplicate reply send failed",
+                        )
+                        .await;
+                        return;
+                    }
+                    SliceRequestStatus::AgedOut => {
+                        emit_partition_diag(
+                            tracing::Level::DEBUG,
+                            &PartitionDiagEvent::new(
+                                ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                                "rejecting client request aged out of the dedup window",
+                            )
+                            .with_operation(message.header().operation)
+                            .with_client(client_id)
+                            .with_request(request),
+                        );
+                        Self::send_partition_deny_or_log(
+                            consensus,
+                            message.header(),
+                            IggyError::RequestTooOld.as_code(),
+                            "aged-out request rejection failed",
+                            reply.take(),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
 
@@ -9761,6 +9787,35 @@ mod tests {
     }
 
     #[compio::test]
+    async fn certified_empty_wal_without_superblock_preserves_its_log_view() {
+        const CREATED_VIEW: u32 = 2;
+        const LOG_VIEW: u32 = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(CREATED_VIEW, 0);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        let wal = directory.path().join("prepares-0");
+        let mut journal =
+            journal::PartitionPrepareJournal::open(&wal, partition.consensus().group(), 0)
+                .await
+                .unwrap();
+        journal.certify_log_view(LOG_VIEW, 0, 0).await.unwrap();
+        drop(journal);
+
+        partition.open_persistence().await.unwrap();
+
+        assert_eq!(partition.consensus().view(), LOG_VIEW);
+        assert_eq!(partition.consensus().log_view(), LOG_VIEW);
+        assert!(!partition.requires_state_transfer());
+        drop(partition);
+        let journal =
+            journal::PartitionPrepareJournal::open(&wal, IggyNamespace::new(1, 1, 0).inner(), 0)
+                .await
+                .unwrap();
+        assert_eq!(journal.certified_log_view(), Some(LOG_VIEW));
+    }
+
+    #[compio::test]
     async fn uncertified_log_view_requires_transfer_before_voting() {
         let directory = tempfile::tempdir().unwrap();
         let mut partition = partition_at_view(2, 2);
@@ -10299,30 +10354,42 @@ mod tests {
 
     #[compio::test]
     async fn given_advanced_view_when_persist_gate_runs_should_write_vsr_state_once() {
-        let mut partition = partition_at_view(3, 2);
-        let store = Rc::new(RecordingSuperblock::default());
-        partition.set_superblock(store.clone(), None);
+        for (view, log_view) in [(3, 2), (2, 0)] {
+            let case = format!("view {view}, log_view {log_view}");
+            let mut partition = partition_at_view(view, log_view);
+            let store = Rc::new(RecordingSuperblock::default());
+            partition.set_superblock(store.clone(), None);
 
-        assert!(partition.persist_superblock_if_needed().await);
+            assert!(
+                partition.persist_superblock_if_needed().await,
+                "{case}: the first gate run must persist the view"
+            );
 
-        let state = consensus::VsrState::try_from(store.writes.borrow()[0].as_slice())
-            .expect("recorded payload decodes as a VsrState");
-        assert_eq!(state.cluster, TEST_CLUSTER);
-        assert_eq!(state.view, 3);
-        assert_eq!(state.log_view, 2);
-        assert_eq!(
-            (state.checkpoint_op, state.checkpoint_checksum),
-            (0, 0),
-            "no partition checkpoint exists yet, so the pairing fields stay zero"
-        );
-        assert!(!partition.consensus().needs_superblock_persist());
+            let state = consensus::VsrState::try_from(store.writes.borrow()[0].as_slice())
+                .expect("recorded payload decodes as a VsrState");
+            assert_eq!(state.cluster, TEST_CLUSTER, "{case}");
+            assert_eq!(state.view, view, "{case}");
+            assert_eq!(state.log_view, log_view, "{case}");
+            assert_eq!(
+                (state.checkpoint_op, state.checkpoint_checksum),
+                (0, 0),
+                "{case}"
+            );
+            assert!(
+                !partition.consensus().needs_superblock_persist(),
+                "{case}: a landed write must make the view durable"
+            );
 
-        assert!(partition.persist_superblock_if_needed().await);
-        assert_eq!(
-            store.attempts.get(),
-            1,
-            "an unchanged view must take the lock-free fast path, not rewrite"
-        );
+            assert!(
+                partition.persist_superblock_if_needed().await,
+                "{case}: a durable view must pass the gate"
+            );
+            assert_eq!(
+                store.attempts.get(),
+                1,
+                "{case}: an unchanged view must not rewrite"
+            );
+        }
     }
 
     /// The `offset_frontier` of the most recent recorded write.
@@ -11278,30 +11345,28 @@ mod tests {
 
     #[compio::test]
     async fn given_failing_superblock_when_persist_gate_runs_should_withhold_and_back_off() {
-        let mut partition = partition_at_view(1, 1);
-        let store = Rc::new(RecordingSuperblock::default());
-        store.fail_writes.set(true);
-        partition.set_superblock(store.clone(), None);
+        for (view, log_view) in [(1, 1), (2, 0)] {
+            let case = format!("view {view}, log_view {log_view}");
+            let mut partition = partition_at_view(view, log_view);
+            let store = Rc::new(RecordingSuperblock::default());
+            store.fail_writes.set(true);
+            partition.set_superblock(store.clone(), None);
 
-        assert!(
-            !partition.persist_superblock_if_needed().await,
-            "a failed write must withhold the send"
-        );
-        assert_eq!(store.attempts.get(), 1);
-
-        assert!(
-            !partition.persist_superblock_if_needed().await,
-            "the backoff window must withhold without retrying the write"
-        );
-        assert_eq!(
-            store.attempts.get(),
-            1,
-            "a call inside the backoff window must not touch the store"
-        );
-        assert!(
-            partition.consensus().needs_superblock_persist(),
-            "the view stays undurable until a write lands"
-        );
+            assert!(
+                !partition.persist_superblock_if_needed().await,
+                "{case}: a failed write must withhold the send"
+            );
+            assert_eq!(store.attempts.get(), 1, "{case}");
+            assert!(
+                !partition.persist_superblock_if_needed().await,
+                "{case}: the backoff window must withhold without retrying the write"
+            );
+            assert_eq!(store.attempts.get(), 1, "{case}");
+            assert!(
+                partition.consensus().needs_superblock_persist(),
+                "{case}: the view stays undurable until a write lands"
+            );
+        }
     }
 
     /// Client-facing bus that records every `send_to_client` frame so tests

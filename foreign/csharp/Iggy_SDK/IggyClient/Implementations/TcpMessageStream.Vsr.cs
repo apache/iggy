@@ -697,11 +697,6 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Whether the failure carries the server's verdict on this request. A lost connection, a reply frame
-    ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
-    ///     outcome of a request the server may still commit unknowable.
-    /// </summary>
-    /// <summary>
     ///     Whether the reply body may carry a credential - a raw personal access token, a session secret - and
     ///     therefore must be zeroed before its pooled buffer is handed back for reuse.
     /// </summary>
@@ -714,12 +709,18 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             or CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE;
     }
 
+    /// <summary>
+    ///     Whether the failure carries the server's verdict on this request. A lost connection, a reply frame
+    ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
+    ///     outcome of a request the server may still commit unknowable. REQUEST_TOO_OLD does too: the server
+    ///     refuses the request because it no longer holds the evidence that tells whether it committed.
+    /// </summary>
     private static bool IsDefinitiveVerdict(Exception error)
     {
         return error is IggyInvalidStatusCodeException
         {
             FromServer: true,
-            StatusCode: not VsrError.TRANSIENT_NOT_COMMITTED
+            StatusCode: not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.REQUEST_TOO_OLD)
         };
     }
 

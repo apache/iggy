@@ -92,6 +92,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidNumberEncoding = 82
     case invalidBooleanValue = 83
     case invalidNumberValue = 84
+    case requestTooOld = 85
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -339,6 +340,7 @@ extension IggyErrorCode {
         case .invalidNumberEncoding: "invalid_number_encoding"
         case .invalidBooleanValue: "invalid_boolean_value"
         case .invalidNumberValue: "invalid_number_value"
+        case .requestTooOld: "request_too_old"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
