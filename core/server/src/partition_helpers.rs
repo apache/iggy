@@ -686,42 +686,43 @@ async fn load_partition(
     .await?;
 
     partition.created_at = partition_metadata.created_at;
-    restore_partition_offsets(
-        &mut partition,
-        partitions_config,
-        recovered_state.as_ref(),
-        segment_checkpoint,
-    )
-    .await?;
+    restore_partition_offsets(&mut partition, recovered_state.as_ref(), segment_checkpoint);
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, partitions_config, namespace, current_offset)
         .await?;
-    ensure_initial_segment(
-        &mut partition,
-        partitions_config,
-        namespace,
-        segment_checkpoint.is_some(),
-    )
-    .await?;
+    if !partition.log.has_segments() {
+        ensure_initial_segment(
+            &mut partition,
+            partitions_config,
+            namespace,
+            segment_checkpoint.is_some(),
+        )
+        .await?;
+    }
 
     open_partition_persistence(&mut partition, config, recovered_persistence).await?;
+    ensure_initial_segment(&mut partition, partitions_config, namespace, true).await?;
+    if replica_count == 1 && !partition.durability().is_persisted() {
+        partition
+            .reanchor_to_offset_frontier(partitions_config)
+            .await
+            .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+    }
     Ok(partition)
 }
 
 /// Restore the offset counter of a recovered partition from what boot could
-/// prove about its offset space, then put the next append point where the
-/// recovery walk can read it back.
+/// prove about its offset space.
 ///
 /// Three carriers, weakest last: the sized segments' end offset, an empty
 /// chain's file name (a state-transfer install at the group frontier), and the
 /// superblock's durable frontier as a lower bound over both.
-async fn restore_partition_offsets(
+fn restore_partition_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    partitions_config: &PartitionsConfig,
     recovered_state: Option<&VsrState>,
     segment_checkpoint: Option<SegmentPosition>,
-) -> Result<(), ServerError> {
+) {
     let sized_end = partition
         .log
         .segments()
@@ -778,21 +779,6 @@ async fn restore_partition_offsets(
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
     // taking the max means real recovered data always wins.
     partition.restore_offset_frontier(recovered_state);
-    // Minting from the reservation leaves a hole between the recovered chain
-    // and the new append point, and the recovery walk REFUSES a hole inside a
-    // segment (tombstoning the partition on the solo arm), so put it on a
-    // segment boundary instead.
-    //
-    // Solo only, in step with the reservation itself: a replicated group's
-    // segment boundaries must be a function of the batches alone or the
-    // reconciler's offset-keyed segment GC never converges.
-    if partition.consensus().replica_count() == 1 && !partition.durability().is_persisted() {
-        partition
-            .reanchor_to_offset_frontier(partitions_config)
-            .await
-            .map_err(|error| ServerError::Iggy(Box::new(error)))?;
-    }
-    Ok(())
 }
 
 /// Recover this partition's persisted segment chain, stamping each segment

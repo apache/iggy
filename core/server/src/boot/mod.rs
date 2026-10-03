@@ -123,9 +123,6 @@ pub async fn prepare_runtime_dirs(
     } else {
         validate_storage_format(&system_path)?
     };
-    if !fresh && !format_present && !config.cluster.enabled {
-        return Err(ServerError::UnsupportedStorage { path: system_path });
-    }
     if fresh {
         wipe_system_path(config).await?;
     }
@@ -222,9 +219,9 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
     if config.cluster.enabled {
         warn!(
             path = %resolved.display(),
-            "--fresh wipes only this replica, which then refills from the cluster by \
-             state transfer; wiping a quorum at once destroys committed data, and a \
-             service unit file carrying --fresh re-transfers everything on every restart"
+            "--fresh wipes only this replica; recovery after erasing its entire metadata \
+             directory is outside the automatic recovery guarantee. Wiping a quorum \
+             destroys committed data. Do not keep --fresh in a restart service command"
         );
     }
 
@@ -276,7 +273,6 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 pub fn bootstrap(
     config: ServerConfig,
     current_replica_id: Option<u8>,
-    fresh: bool,
 ) -> Result<ShardHandles, ServerError> {
     // One process-wide rustls provider, installed before any shard thread
     // exists. rustls is compiled with both `ring` and `aws-lc-rs`, so a
@@ -422,7 +418,6 @@ pub fn bootstrap(
                     shard_id,
                     total_shards,
                     current_replica_id,
-                    fresh,
                     assignment,
                     senders_for_shard,
                     inbox,
@@ -498,7 +493,6 @@ async fn shard_main(
     shard_id: u16,
     total_shards: u16,
     replica_id: Option<u8>,
-    fresh: bool,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     reply_inbox: ShardReceiver<ShardFrame>,
@@ -662,8 +656,7 @@ async fn shard_main(
         // it. Reuse that superblock rather than re-opening it, which would fork the
         // ping-pong sequence counter. Consensus recovers its true (view, log_view)
         // from `recovered_state` instead of inferring a stale view from the WAL.
-        let consensus =
-            restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus), fresh);
+        let consensus = restore_metadata_consensus(&owner, &topology, config, Rc::clone(&bus));
         let superblock = Rc::new(owner.superblock);
         (
             Some(consensus),
@@ -1157,6 +1150,40 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    async fn given_missing_or_empty_storage_when_booting_should_initialize_without_wiping_on_restart()
+     {
+        let mut logging = Logging::new(crate::VERSION);
+        logging.early_init();
+        for exists in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let data_path = directory.path().join("data");
+            if exists {
+                std::fs::create_dir(&data_path).unwrap();
+            }
+            let mut config = ServerConfig {
+                path: data_path.to_string_lossy().into_owned(),
+                ..ServerConfig::default()
+            };
+            config.logging.file_enabled = false;
+            config.telemetry.enabled = false;
+            prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(data_path.join(STORAGE_FORMAT_FILE)).unwrap(),
+                STORAGE_FORMAT
+            );
+            let sentinel = data_path.join("existing-data");
+            let bytes = b"preserve existing data";
+            std::fs::write(&sentinel, bytes).unwrap();
+            prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(sentinel).unwrap(), bytes);
+        }
+    }
 
     #[test]
     fn incompatible_storage_is_refused_without_changing_existing_files() {

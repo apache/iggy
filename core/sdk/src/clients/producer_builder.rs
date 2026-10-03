@@ -179,8 +179,8 @@ impl IggyProducerBuilder {
     }
 
     /// Sets message durability for an automatically created topic.
-    /// Defaults to Replicated. Producer sends require `Durability::Persisted`
-    /// and otherwise fail with `IggyError::DurabilityRequired`.
+    /// Defaults to Replicated. `Durability::Persisted` also provides stable
+    /// storage and crash-safe retry receipts.
     pub fn topic_durability(self, durability: Durability) -> Self {
         Self {
             topic_durability: durability,

@@ -1420,8 +1420,9 @@ impl IggyClient {
         >,
         send_retries: Option<i64>,
         send_retry_interval: RetryInterval,
-        #[gen_stub(override_type(type_repr = "Durability | None"))]
-        topic_durability: Option<&Bound<'_, PyAny>>,
+        #[gen_stub(override_type(type_repr = "Durability | None"))] topic_durability: Option<
+            &Bound<'_, PyAny>,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mode = mode.unwrap_or_default();
 

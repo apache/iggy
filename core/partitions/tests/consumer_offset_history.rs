@@ -226,11 +226,11 @@ async fn given_many_obsolete_offsets_when_purged_should_finish_rejections_and_re
         .on_request(append(2, b"old pending prepare"), None)
         .await;
     let mut receivers = Vec::new();
-    for request_id in 1..=6 {
+    for request_id in 1_u64..=6 {
         let (sender, receiver) = oneshot_channel();
         partition
             .on_request(
-                store(42, request_id, ConsumerKind::Consumer, 0),
+                store(42 + u128::from(request_id), 1, ConsumerKind::Consumer, 0),
                 Some(sender),
             )
             .await;
@@ -284,10 +284,10 @@ async fn given_queued_delete_when_replacement_checkpoint_commits_should_preserve
         .await;
     partition.on_request(append(3, REPLACEMENT), None).await;
     let mut obsolete_stores = Vec::new();
-    for request_id in 2..=5 {
+    for request_id in 2_u64..=5 {
         let (sender, receiver) = oneshot_channel();
         partition
-            .on_request(store(42, request_id, kind, 0), Some(sender))
+            .on_request(store(42 + u128::from(request_id), 1, kind, 0), Some(sender))
             .await;
         obsolete_stores.push(receiver);
     }
@@ -452,7 +452,7 @@ fn append(request: u64, payload: &[u8]) -> Message<RoutedRequestHeader> {
         .encode_request(RoutedRequestHeader {
             command: Command::Request,
             operation: Operation::SendMessages,
-            client: 1,
+            client: u128::from(request),
             session: 1,
             request,
             group: namespace().inner(),

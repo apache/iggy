@@ -3144,6 +3144,76 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_checkpointed_history_when_reanchoring_a_reserved_gap_should_preserve_repair_bodies()
+     {
+        const BODY_BYTES: usize = 4096;
+        const RESERVED_OFFSET: u64 = 8;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let frontier = std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap();
+        assert!(
+            journal
+                .reanchor_segment_storage(RESERVED_OFFSET)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap(),
+            frontier,
+            "uncheckpointed history must not be replaced by an empty append point"
+        );
+        journal.checkpoint(1).await.unwrap();
+        assert!(journal.reanchor_segment_storage(0).await.is_err());
+        journal
+            .reanchor_segment_storage(RESERVED_OFFSET)
+            .await
+            .unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 1);
+        assert_eq!(journal.checkpoint_op(), 1);
+        assert_eq!(
+            journal.segment_checkpoint(),
+            Some(SegmentPosition {
+                start_offset: RESERVED_OFFSET,
+                length: 0,
+                next_offset: RESERVED_OFFSET,
+            })
+        );
+        assert_eq!(
+            journal.prepares().await.unwrap()[0].as_slice(),
+            first.as_slice()
+        );
+        let second = segment_prepare(2, first.header().checksum, RESERVED_OFFSET, BODY_BYTES);
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), second.as_slice());
+        assert_eq!(
+            std::fs::read(partition.path().join(format!("{RESERVED_OFFSET:020}.log"))).unwrap(),
+            second.as_slice()[size_of::<PrepareHeader>()..]
+        );
+    }
+
+    #[compio::test]
     async fn owned_segments_rollback_physical_tails_without_advancing_the_checkpoint() {
         const BODY_BYTES: usize = 8192;
         let partition = tempdir().unwrap();

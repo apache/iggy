@@ -440,6 +440,10 @@ enum Mutation<S: DurableStorage> {
         initial: SegmentPosition,
         max_size: u64,
     },
+    ReanchorSegments {
+        epoch: u64,
+        next_offset: u64,
+    },
     CertifyView {
         epoch: u64,
         view: u32,
@@ -456,6 +460,9 @@ enum Mutation<S: DurableStorage> {
         prepare: Frozen<4096>,
         durable: bool,
         retained_bytes: u64,
+    },
+    Sync {
+        epoch: u64,
     },
     Truncate {
         epoch: u64,
@@ -708,6 +715,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub const fn segment_checkpoint(&self) -> Option<SegmentPosition> {
         self.segment_checkpoint.get()
+    }
+
+    /// Queue a reserved offset boundary after checkpointing the preceding chain.
+    pub fn reanchor_segments(&self, next_offset: u64) {
+        self.queue
+            .borrow_mut()
+            .push_back(Mutation::ReanchorSegments {
+                epoch: self.epoch.get(),
+                next_offset,
+            });
     }
 
     pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
@@ -1151,6 +1168,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "partition WAL drain timed out"))?
     }
 
+    /// Queue a barrier for preceding buffered writes; drain before claiming durability.
+    pub fn sync(&self) {
+        self.queue.borrow_mut().push_back(Mutation::Sync {
+            epoch: self.epoch.get(),
+        });
+    }
+
     pub fn start(&self) -> bool {
         let start = !self.retired.get()
             && self.failure.borrow().is_none()
@@ -1208,7 +1232,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     ..
                 } => (*epoch, *retained_bytes),
                 Mutation::CertifyView { epoch, .. }
+                | Mutation::Sync { epoch }
                 | Mutation::EnableSegments { epoch, .. }
+                | Mutation::ReanchorSegments { epoch, .. }
                 | Mutation::Purge { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
@@ -1220,6 +1246,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             let rebuild_references = matches!(
                 mutation,
                 Mutation::EnableSegments { .. }
+                    | Mutation::ReanchorSegments { .. }
                     | Mutation::Purge { .. }
                     | Mutation::Truncate { .. }
                     | Mutation::Checkpoint { .. }
@@ -1310,6 +1337,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             Mutation::EnableSegments {
                 initial, max_size, ..
             } => journal.enable_segment_storage(initial, max_size).await,
+            Mutation::ReanchorSegments { next_offset, .. } => {
+                journal.reanchor_segment_storage(next_offset).await
+            }
             Mutation::CertifyView {
                 view, op, checksum, ..
             } => journal.certify_log_view(view, op, checksum).await,
@@ -1322,6 +1352,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 self.append_batch(journal, prepare, durable, epoch, retained_bytes)
                     .await
             }
+            Mutation::Sync { .. } => journal.sync().await,
             Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
             Mutation::Checkpoint {
                 through_op,

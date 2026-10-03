@@ -45,6 +45,7 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 const DURABILITY_HEADER: &str = "iggy-durability";
+const DURABILITY_REPLICATED: &str = "replicated";
 const DURABILITY_PERSISTED: &str = "persisted";
 const DURABILITY_NONE: &str = "none";
 
@@ -1108,7 +1109,8 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
         let policies = iggy_common::TopicRuntimeOptions::from_resource_options(&details.options);
         assert_eq!(policies.durability, message_policy);
         assert_eq!(policies.consumer_offset_durability, offset_policy);
-        for query in ["", "?ack=replicated", "?ack=none"] {
+        let queries = ["", "?ack=replicated", "?ack=none"];
+        for query in queries {
             let message = IggyMessage::builder()
                 .payload("policy".into())
                 .build()
@@ -1125,14 +1127,44 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
             if query == "?ack=none" {
                 assert_eq!(response.status(), StatusCode::ACCEPTED);
                 assert_eq!(durability(&response), DURABILITY_NONE);
-            } else if message_policy.is_persisted() {
-                assert_eq!(response.status(), StatusCode::CREATED);
-                assert_eq!(durability(&response), DURABILITY_PERSISTED);
             } else {
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                let error: serde_json::Value = response.json().await.unwrap();
-                assert_eq!(error["id"], IggyError::DurabilityRequired.as_code());
+                assert_eq!(response.status(), StatusCode::CREATED);
+                assert_eq!(
+                    durability(&response),
+                    if message_policy.is_persisted() {
+                        DURABILITY_PERSISTED
+                    } else {
+                        DURABILITY_REPLICATED
+                    }
+                );
             }
+        }
+        let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
+        loop {
+            if let Some(polled) = http
+                .try_poll(
+                    "durability-http",
+                    &topic,
+                    PARTITION_ID,
+                    0,
+                    queries.len() as u32,
+                )
+                .await
+                && polled.messages.len() == queries.len()
+            {
+                assert!(
+                    polled
+                        .messages
+                        .iter()
+                        .all(|message| message.payload == "policy")
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "writes with {message_policy}/{offset_policy} did not become pollable"
+            );
+            sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
         }
     }
 }

@@ -2790,11 +2790,11 @@ mod tests {
         // together remap every stream; and partition ops drawing from the one shared
         // request counter instead of a separate sequence based at `1<<63`, which
         // renumbers every partition request id and so every reply header in the trace.
-        // Multi-replica consumer-offset requests carrying `NoAck` now enter
-        // VSR, so their scheduling and committed replies contribute to the
-        // deterministic trace instead of taking the primary-local fast path.
+        // NoAck explicit offsets use the primary-local path. Ordinary Replicated
+        // writes remain admitted, so their policy-scoped replies contribute to
+        // the deterministic trace.
         assert_eq!(
-            h1, 0x8DAA_C1BA_2EE3_F490,
+            h1, 0x31C2_ADA9_9411_FCD4,
             "workload reply hash drifted from locked baseline"
         );
     }
