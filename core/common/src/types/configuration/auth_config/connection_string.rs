@@ -158,9 +158,212 @@ impl ConnectionStringUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NonZeroIggyDuration;
-    use crate::TcpConnectionStringOptions;
+    use crate::{
+        IggyDuration, NonZeroIggyDuration, QuicClientConfig, QuicConnectionStringOptions,
+        TcpClientConfig, TcpConnectionStringOptions, WebSocketClientConfig,
+        WebSocketConnectionStringOptions,
+    };
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn should_parse_tcp_canonical_options_and_legacy_aliases() {
+        for (case, query, expected) in [
+            (
+                "canonical keys",
+                "reconnection_max_retries=3&reestablish_after=7s&tls_validate_certificate=true",
+                Some(3),
+            ),
+            (
+                "deprecated aliases",
+                "reconnection_retries=3&reestablish_after=7s&tls_validate_certificate=true",
+                Some(3),
+            ),
+        ] {
+            let value = format!("iggy+tcp://user:secret@localhost:8090?{query}");
+            let config = TcpClientConfig::from(
+                ConnectionString::<TcpConnectionStringOptions>::new(&value)
+                    .unwrap_or_else(|error| panic!("{case}: {error}")),
+            );
+            assert_eq!(config.reconnection.max_retries, expected, "{case}");
+            assert_eq!(
+                config.reconnection.reestablish_after,
+                IggyDuration::from_str("7s").unwrap(),
+                "{case}"
+            );
+            assert!(config.tls_validate_certificate, "{case}");
+        }
+    }
+
+    #[test]
+    fn should_use_tcp_defaults_without_options() {
+        let value = "iggy+tcp://user:secret@localhost:8090";
+        let config = TcpClientConfig::from(
+            ConnectionString::<TcpConnectionStringOptions>::new(value).unwrap(),
+        );
+        assert_eq!(config.reconnection.max_retries, None);
+        assert_eq!(
+            config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
+        assert!(config.tls_validate_certificate);
+    }
+
+    #[test]
+    fn should_parse_tcp_disabled_certificate_validation() {
+        let value = "iggy+tcp://user:secret@localhost:8090?tls_validate_certificate=false";
+        let config = TcpClientConfig::from(
+            ConnectionString::<TcpConnectionStringOptions>::new(value).unwrap(),
+        );
+        assert!(!config.tls_validate_certificate);
+    }
+
+    #[test]
+    fn should_parse_quic_canonical_options_and_legacy_aliases() {
+        for (case, query, expected) in [
+            (
+                "canonical keys",
+                "reconnection_max_retries=3&reestablish_after=7s&tls_validate_certificate=true",
+                Some(3),
+            ),
+            (
+                "deprecated aliases",
+                "reconnection_max_retries=3&reconnection_reestablish_after=7s&validate_certificate=true",
+                Some(3),
+            ),
+        ] {
+            let value = format!("iggy+quic://user:secret@localhost:8090?{query}");
+            let config = QuicClientConfig::from(
+                ConnectionString::<QuicConnectionStringOptions>::new(&value)
+                    .unwrap_or_else(|error| panic!("{case}: {error}")),
+            );
+            assert_eq!(config.reconnection.max_retries, expected, "{case}");
+            assert_eq!(
+                config.reconnection.reestablish_after,
+                IggyDuration::from_str("7s").unwrap(),
+                "{case}"
+            );
+            assert!(config.validate_certificate, "{case}");
+        }
+    }
+
+    #[test]
+    fn should_parse_websocket_canonical_options_and_legacy_aliases() {
+        for (case, query, expected) in [
+            (
+                "canonical keys",
+                "reconnection_max_retries=3&reestablish_after=7s&tls_validate_certificate=true",
+                Some(3),
+            ),
+            (
+                "deprecated aliases",
+                "reconnection_retries=3&reestablish_after=7s&tls_validate_certificate=true",
+                Some(3),
+            ),
+        ] {
+            let value = format!("iggy+ws://user:secret@localhost:8090?{query}");
+            let config = WebSocketClientConfig::from(
+                ConnectionString::<WebSocketConnectionStringOptions>::new(&value)
+                    .unwrap_or_else(|error| panic!("{case}: {error}")),
+            );
+            assert_eq!(config.reconnection.max_retries, expected, "{case}");
+            assert_eq!(
+                config.reconnection.reestablish_after,
+                IggyDuration::from_str("7s").unwrap(),
+                "{case}"
+            );
+            assert!(config.tls_validate_certificate, "{case}");
+        }
+    }
+
+    #[test]
+    fn should_use_last_connection_option_including_aliases() {
+        for (case, query, expected) in [
+            (
+                "canonical retries last",
+                "reconnection_retries=2&reconnection_max_retries=3",
+                Some(3),
+            ),
+            (
+                "deprecated retries last",
+                "reconnection_max_retries=3&reconnection_retries=2",
+                Some(2),
+            ),
+            (
+                "canonical unlimited retries last",
+                "reconnection_retries=3&reconnection_max_retries=unlimited",
+                None,
+            ),
+            (
+                "deprecated unlimited retries last",
+                "reconnection_max_retries=3&reconnection_retries=unlimited",
+                None,
+            ),
+        ] {
+            assert_eq!(
+                TcpConnectionStringOptions::parse_options(query)
+                    .unwrap_or_else(|error| panic!("{case}: {error}"))
+                    .retries(),
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                WebSocketConnectionStringOptions::parse_options(query)
+                    .unwrap_or_else(|error| panic!("{case}: {error}"))
+                    .retries(),
+                expected,
+                "{case}"
+            );
+        }
+        for (case, query, expected) in [
+            (
+                "canonical cooldown last",
+                "reconnection_reestablish_after=2s&reestablish_after=3s",
+                "3s",
+            ),
+            (
+                "deprecated cooldown last",
+                "reestablish_after=3s&reconnection_reestablish_after=2s",
+                "2s",
+            ),
+        ] {
+            let options = QuicConnectionStringOptions::parse_options(query)
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+            assert_eq!(
+                options.reconnection().reestablish_after,
+                IggyDuration::from_str(expected).unwrap(),
+                "{case}"
+            );
+        }
+        for (case, query, expected) in [
+            (
+                "canonical certificate validation last",
+                "validate_certificate=false&tls_validate_certificate=true",
+                true,
+            ),
+            (
+                "deprecated certificate validation last",
+                "tls_validate_certificate=true&validate_certificate=false",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                QuicConnectionStringOptions::parse_options(query)
+                    .unwrap_or_else(|error| panic!("{case}: {error}"))
+                    .validate_certificate(),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_tcp_certificate_validation() {
+        assert_eq!(
+            TcpConnectionStringOptions::parse_options("tls_validate_certificate=invalid")
+                .unwrap_err(),
+            IggyError::InvalidConnectionString
+        );
+    }
 
     #[test]
     fn should_fail_without_username() {

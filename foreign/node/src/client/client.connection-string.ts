@@ -114,14 +114,23 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
         tls: false,
         reconnect: { ...CONNECTION_STRING_RECONNECT }
       };
-  const { tls, reconnect, heartbeatInterval, ...transportOptions } = options;
+  const {
+    tls,
+    tlsValidateCertificate,
+    reconnect,
+    heartbeatInterval,
+    ...transportOptions
+  } = options;
 
   const config: ClientConfig = {
     transport: tls ? 'TLS' : 'TCP',
     options: {
       host,
       port: Number(port),
-      ...transportOptions
+      ...transportOptions,
+      ...(tlsValidateCertificate === undefined
+        ? {}
+        : { rejectUnauthorized: tlsValidateCertificate })
     },
     credentials: tokenCredentials
       ? { token: username }
@@ -139,6 +148,7 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
 type ParsedConnectionOptions = {
   tls: boolean,
   noDelay?: boolean,
+  tlsValidateCertificate?: boolean,
   servername?: string,
   /** Path stored for connect-time reading, match Rust SDK. */
   caFile?: string,
@@ -162,6 +172,9 @@ const parseConnectionOptions = (
       case 'tls':
         parsed.tls = parseBoolean(name, value);
         break;
+      case 'tls_validate_certificate':
+        parsed.tlsValidateCertificate = parseBoolean(name, value);
+        break;
       case 'nodelay':
         parsed.noDelay = parseBoolean(name, value);
         break;
@@ -175,7 +188,14 @@ const parseConnectionOptions = (
         parsed.caFile = value;
         break;
 
+      case 'reconnection_max_retries':
+      // TODO: Remove the deprecated `reconnection_retries` alias after the compatibility release.
       case 'reconnection_retries': {
+        if (name === 'reconnection_retries')
+          process.emitWarning(
+            "Connection string option 'reconnection_retries' is deprecated; use 'reconnection_max_retries'",
+            'DeprecationWarning'
+          );
         // Values above u32::MAX are rejected like the Rust SDK's u32
         // overflow; otherwise they would act as a second, undocumented
         // spelling of "unlimited".

@@ -121,9 +121,11 @@ const stats = await client.system.getStats();
 
 Supported schemes are `iggy://` (TCP, default) and `iggy+tcp://`. Credentials
 are `username:password` or a single personal access token. Options mirror the
-other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
+other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `tls_validate_certificate`, `reconnection_max_retries`,
 `reconnection_interval`, `heartbeat_interval` and `nodelay`. `reestablish_after`
 is accepted for format compatibility but has no Node equivalent.
+
+When options repeat, including through a deprecated alias, the last occurrence is chosen.
 
 note: `SimpleClient` does not accept a connection string: it wraps an existing
 `RawClient` instance rather than building one from configuration. Pass the
@@ -134,7 +136,9 @@ resulting raw client to `SimpleClient` if needed.
 
 | option | limit |
 | --- | --- |
-| `reconnection_retries` | integer up to `4294967295` (u32 max); larger values are rejected like Rust's u32 overflow, and `unlimited` maps to this ceiling. Defaults to unlimited |
+| `reconnection_max_retries` | integer up to `4294967295` (u32 max); larger values are rejected like Rust's u32 overflow, and `unlimited` maps to this ceiling. Defaults to unlimited |
+| `reconnection_retries` (deprecated) | Alias for `reconnection_max_retries`; emits a deprecation warning |
+| `tls_validate_certificate` | `true` or `false`; controls server certificate verification when TLS is enabled. Defaults to `true` |
 | `heartbeat_interval` | duration up to `2147483647ms` (Node's largest timer delay); `0` disables heartbeats |
 | `reconnection_interval` | positive duration (`ms`, `s`, `m`, `h`) up to `2147483647ms` (Node's largest timer delay); zero spellings are rejected. Defaults to `1s` |
 | port in the authority | decimal up to `65535` |

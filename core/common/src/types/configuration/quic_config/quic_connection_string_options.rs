@@ -175,7 +175,13 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                         return Err(IggyError::InvalidConnectionString);
                     }
                 },
-                "validate_certificate" => {
+                "tls_validate_certificate" | "validate_certificate" => {
+                    // TODO: Remove the deprecated `validate_certificate` alias after the compatibility release.
+                    if option_parts[0] == "validate_certificate" {
+                        tracing::warn!(
+                            "Connection string option 'validate_certificate' is deprecated; use 'tls_validate_certificate'"
+                        );
+                    }
                     validate_certificate = option_parts[1] == "true";
                 }
                 "heartbeat_interval" => {
@@ -187,7 +193,13 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                 "reconnection_interval" => {
                     reconnection_interval = option_parts[1].to_string();
                 }
-                "reconnection_reestablish_after" => {
+                "reestablish_after" | "reconnection_reestablish_after" => {
+                    // TODO: Remove the deprecated `reconnection_reestablish_after` alias after the compatibility release.
+                    if option_parts[0] == "reconnection_reestablish_after" {
+                        tracing::warn!(
+                            "Connection string option 'reconnection_reestablish_after' is deprecated; use 'reestablish_after'"
+                        );
+                    }
                     reconnection_reestablish_after = option_parts[1].to_string();
                 }
                 _ => {

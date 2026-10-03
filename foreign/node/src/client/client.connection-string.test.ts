@@ -18,6 +18,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { MAX_U32 } from '../constant.js';
+import type { TlsOption } from './client.type.js';
 import {
   parseConnectionString,
   parseDuration
@@ -74,7 +75,7 @@ describe('parseConnectionString', () => {
     assert.deepEqual(
       parseConnectionString(
         'iggy+tcp://iggy:secret@localhost:8090' +
-        '?reconnection_retries=3&reconnection_interval=5s&heartbeat_interval=10s'
+        '?reconnection_max_retries=3&reconnection_interval=5s&heartbeat_interval=10s'
       ),
       {
         transport: 'TCP',
@@ -94,7 +95,7 @@ describe('parseConnectionString', () => {
     // retries alone keep the 1s interval; interval alone keeps unlimited.
     assert.deepEqual(
       parseConnectionString(
-        'iggy://iggy:secret@localhost:8090?reconnection_retries=3'
+        'iggy://iggy:secret@localhost:8090?reconnection_max_retries=3'
       ).reconnect,
       { enabled: true, interval: 1000, maxRetries: 3 }
     );
@@ -104,6 +105,63 @@ describe('parseConnectionString', () => {
       ).reconnect,
       { enabled: true, interval: 5000, maxRetries: MAX_U32 }
     );
+  });
+
+  it('preserves the deprecated retry alias and uses the last occurrence', (context) => {
+    const warning = context.mock.method(process, 'emitWarning', () => undefined);
+    for (const [query, expected] of [
+      ['reconnection_retries=3', 3],
+      ['reconnection_retries=unlimited', MAX_U32],
+      ['reconnection_retries=2&reconnection_max_retries=3', 3],
+      ['reconnection_max_retries=3&reconnection_retries=2', 2],
+      ['reconnection_retries=3&reconnection_max_retries=unlimited', MAX_U32],
+      ['reconnection_max_retries=3&reconnection_retries=unlimited', MAX_U32]
+    ] as const)
+      assert.equal(
+        parseConnectionString(`iggy://iggy:secret@localhost:8090?${query}`)
+          .reconnect?.maxRetries,
+        expected,
+        `Unexpected retry count for query: ${query}`
+      );
+    assert.equal(warning.mock.callCount(), 6);
+    for (const call of warning.mock.calls)
+      assert.deepEqual(call.arguments, [
+        "Connection string option 'reconnection_retries' is deprecated; use 'reconnection_max_retries'",
+        'DeprecationWarning'
+      ]);
+  });
+
+  it('does not warn for the canonical retry key', (context) => {
+    const warning = context.mock.method(process, 'emitWarning', () => undefined);
+    parseConnectionString(
+      'iggy://iggy:secret@localhost:8090?reconnection_max_retries=3'
+    );
+    assert.equal(warning.mock.callCount(), 0);
+  });
+
+  it('passes certificate validation through normalization to TLS options', () => {
+    for (const [query, expected] of [
+      ['tls_validate_certificate=true', true],
+      ['tls_validate_certificate=false', false],
+      ['tls_validate_certificate=false&tls_validate_certificate=true', true],
+      ['tls_validate_certificate=true&tls_validate_certificate=false', false]
+    ] as const) {
+      const config = normalizeClientConfig(
+        `iggy://iggy:secret@localhost:8090?tls=true&${query}`
+      );
+      assert.equal(config.transport, 'TLS');
+      assert.equal((config.options as TlsOption).rejectUnauthorized, expected);
+    }
+  });
+
+  it('rejects invalid certificate validation values', () => {
+    for (const value of ['', 'invalid', 'TRUE', '1'])
+      assert.throws(
+        () => parseConnectionString(
+          `iggy://iggy:secret@localhost:8090?tls_validate_certificate=${value}`
+        ),
+        /must be true or false/
+      );
   });
 
   it('maps nodelay to the socket option', () => {
@@ -117,7 +175,7 @@ describe('parseConnectionString', () => {
   it('maps unlimited retries to the u32 ceiling', () => {
     assert.equal(
       parseConnectionString(
-        'iggy://iggy:secret@localhost:8090?reconnection_retries=unlimited'
+        'iggy://iggy:secret@localhost:8090?reconnection_max_retries=unlimited'
       ).reconnect?.maxRetries,
       MAX_U32
     );
@@ -126,13 +184,13 @@ describe('parseConnectionString', () => {
   it('accepts retry counts up to u32::MAX and rejects overflow', () => {
     assert.equal(
       parseConnectionString(
-        `iggy://iggy:secret@localhost:8090?reconnection_retries=${MAX_U32}`
+        `iggy://iggy:secret@localhost:8090?reconnection_max_retries=${MAX_U32}`
       ).reconnect?.maxRetries,
       MAX_U32
     );
     for (const value of [
-      'iggy://iggy:secret@localhost:8090?reconnection_retries=4294967296',
-      'iggy://iggy:secret@localhost:8090?reconnection_retries=99999999999999'
+      'iggy://iggy:secret@localhost:8090?reconnection_max_retries=4294967296',
+      'iggy://iggy:secret@localhost:8090?reconnection_max_retries=99999999999999'
     ])
       assert.throws(() => parseConnectionString(value), TypeError);
   });
@@ -195,7 +253,7 @@ describe('parseConnectionString', () => {
       'iggy://iggy:secret@localhost:70000',
       'iggy://iggy:secret@localhost:8090?unknown=value',
       'iggy://iggy:secret@localhost:8090?tls=maybe',
-      'iggy://iggy:secret@localhost:8090?reconnection_retries=three',
+      'iggy://iggy:secret@localhost:8090?reconnection_max_retries=three',
       'iggy://iggy:secret@[::1:8090',
       'iggy://iggy:secret@[]:8090',
       'iggy://iggy:secret@[::1]x:8090',
@@ -215,7 +273,7 @@ describe('parseConnectionString', () => {
       `iggy+tcp://iggypat-1234567890abcdef@localhost`,
       'iggy://iggy:hunter2@localhost:8090?unknown=value',
       'iggy://iggy:hunter2@localhost:8090?tls=maybe',
-      'iggy://iggy:hunter2@localhost:8090?reconnection_retries=three',
+      'iggy://iggy:hunter2@localhost:8090?reconnection_max_retries=three',
       'iggy://iggy:hunter2@localhost:70000'
     ]) {
       try {

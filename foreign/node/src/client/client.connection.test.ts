@@ -31,6 +31,7 @@ import {
 import { describe, it, before, after } from 'node:test';
 import { ProtocolFrameError } from './client.frame.js';
 import { IggyConnection } from './client.connection.js';
+import { parseConnectionString } from './client.connection-string.js';
 import type { ClientConfig } from './client.type.js';
 import { Command, HEADER_SIZE, REPLY_OFFSET } from '../wire/vsr/header.js';
 
@@ -926,6 +927,22 @@ describe('IggyConnection', () => {
       }
     }
   );
+
+  it('disables certificate validation through the connection string', async () => {
+    const server = await startTlsServer();
+    const port = (server.address() as AddressInfo).port;
+    const config = parseConnectionString(
+      `iggy://iggy:iggy@127.0.0.1:${port}?tls=true&tls_validate_certificate=false`
+    );
+    config.reconnect = { enabled: false, interval: 0, maxRetries: 0 };
+    const connection = new IggyConnection(config);
+    try {
+      await connection.connect();
+      assert.equal(connection.connected, true);
+    } finally {
+      await closeConnection(connection, server);
+    }
+  });
 
   it('omits SNI for IP literal hosts', async () => {
     const server = await startTlsServer();

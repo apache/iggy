@@ -139,7 +139,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// // Auto-logs in from the credentials in the string and retries forever on disconnect.
 /// let client = IggyClient::builder_from_connection_string(
 ///     "iggy+tcp://user:secret@localhost:8090\
-///      ?reconnection_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
+///      ?reconnection_max_retries=unlimited&reconnection_interval=1s&heartbeat_interval=5s&nodelay=true",
 /// )?
 /// .build()?;
 /// client.connect().await?;
@@ -281,6 +281,9 @@ impl IggyClient {
     /// - a bool use the literal `true` or `false`.
     /// - bytes and millisecond options provide a number such as `1024`.
     ///
+    /// When an option is repeated, including through a deprecated alias, the
+    /// last occurrence takes effect.
+    ///
     /// ## TCP
     ///
     /// The same options apply for `iggy://` and `iggy+tcp://`.
@@ -288,7 +291,9 @@ impl IggyClient {
     /// - `tls`: bool. Enable/disable TLS. Default: `false`.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
-    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `tls_validate_certificate`: bool. Verify the server certificate. Default: `true`.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_retries`: Deprecated alias for `reconnection_max_retries`. Will be removed in a later release.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between retry passes. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
@@ -301,7 +306,7 @@ impl IggyClient {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+tcp://user:secret@localhost:8090\
     ///      ?tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem\
-    ///      &reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
+    ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
     ///      &heartbeat_interval=5s&nodelay=true",
     /// )?
     /// .build()?;
@@ -311,11 +316,13 @@ impl IggyClient {
     ///
     /// ## QUIC
     ///
-    /// - `validate_certificate`: bool. Verify the server certificate. Default: `false`.
+    /// - `tls_validate_certificate`: bool. Verify the server certificate. Default: `false`.
+    /// - `validate_certificate`: Deprecated alias for `tls_validate_certificate`. Will be removed in a later release.
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_max_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
-    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
+    /// - `reconnection_reestablish_after`: Deprecated alias for `reestablish_after`. Will be removed in a later release.
     /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer. Default: `10000000`.
     /// - `max_concurrent_bidi_streams`: u64. Number of concurrent bidirectional streams. Default: `10000`.
     /// - `datagram_send_buffer_size`: u64. Number of bytes in the datagram send buffer. Default: `100000`.
@@ -331,8 +338,8 @@ impl IggyClient {
     /// # fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+quic://user:secret@localhost:8080\
-    ///      ?validate_certificate=true&heartbeat_interval=5s\
-    ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reconnection_reestablish_after=5s\
+    ///      ?tls_validate_certificate=true&heartbeat_interval=5s\
+    ///      &reconnection_max_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
     ///      &response_buffer_size=10000000&max_concurrent_bidi_streams=10000\
     ///      &datagram_send_buffer_size=100000&initial_mtu=1200\
     ///      &send_window=100000&receive_window=100000\
@@ -368,7 +375,8 @@ impl IggyClient {
     /// ## WebSocket
     ///
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
-    /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
+    /// - `reconnection_retries`: Deprecated alias for `reconnection_max_retries`. Will be removed in a later release.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
     /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: `131072`.
@@ -388,7 +396,7 @@ impl IggyClient {
     /// # fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+ws://user:secret@localhost:8092\
-    ///      ?heartbeat_interval=5s&reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
+    ///      ?heartbeat_interval=5s&reconnection_max_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
     ///      &read_buffer_size=131072&write_buffer_size=131072\
     ///      &max_message_size=67108864&max_frame_size=16777216&accept_unmasked_frames=false\
     ///      &tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem&tls_validate_certificate=true",
