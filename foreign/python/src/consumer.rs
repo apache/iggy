@@ -209,6 +209,24 @@ impl IggyConsumer {
             Ok(())
         })
     }
+
+    /// Drains in-flight offset commits and leaves the consumer group, if this
+    /// consumer is a group member, so the server can hand its partitions to another
+    /// member right away instead of waiting for the connection to time out.
+    /// Repeated calls succeed: shutdown only runs once.
+    /// Raises `RuntimeError` if the operation fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .lock()
+                .await
+                .shutdown()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+    }
 }
 
 async fn wait_for_shutdown(shutdown_event: Py<PyAny>, shutdown_tx: Sender<()>) -> PyResult<()> {
