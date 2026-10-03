@@ -151,20 +151,23 @@ fn main() -> Result<(), RuntimeError> {
 }
 
 fn print_config_env_vars() -> std::io::Result<()> {
-    let prefix = ConnectorsRuntimeConfig::ENV_PREFIX;
     let sink_source_templates: Vec<String> = [
         ("SINK", SinkConfig::env_templates()),
         ("SOURCE", SourceConfig::env_templates()),
     ]
     .iter()
     .flat_map(|(kind, templates)| {
+        // "<KEY>" stands in for the real, per-connector key `local_provider`
+        // uppercases at runtime - same prefix rule, so the listing can't
+        // drift from the names the runtime actually reads.
+        let prefix =
+            crate::configs::connectors::local_provider::connector_env_prefix(kind, "<KEY>");
+        let enabled = format!("{prefix}ENABLED");
+        let plugin_config = format!("{prefix}PLUGIN_CONFIG_<FIELD>");
         templates
             .iter()
-            .map(move |template| format!("{prefix}{kind}_<KEY>_{}", template.env_name))
-            .chain([
-                format!("{prefix}{kind}_<KEY>_ENABLED"),
-                format!("{prefix}{kind}_<KEY>_PLUGIN_CONFIG_<FIELD>"),
-            ])
+            .map(move |template| format!("{prefix}{}", template.env_name))
+            .chain([enabled, plugin_config])
     })
     .collect();
 

@@ -47,20 +47,10 @@ pub use crate::common::server::{
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
-/// Vars safe to advertise to end users via `--list-config-env-vars`.
-pub const SERVER_RUNTIME_ENV_VARS: &[&str] = &[
-    "IGGY_CONFIG_PATH",
-    "IGGY_DISPLAY_CONFIG",
-    "IGGY_ENV_PATH",
-    "IGGY_ROOT_PASSWORD",
-    "IGGY_ROOT_USERNAME",
-    "IGGY_SHARD_EVENT_INTERVAL",
-    "IGGY_SHARD_RUNTIME_CAPACITY",
-];
-
-/// Vars used by sibling binaries (iggy CLI) or test/CI-only: never advertised,
-/// but still non-config. Included in `SERVER_PROCESS_ENV_VARS` to suppress
-/// "unknown env var" warnings during config scanning.
+/// Vars used by sibling binaries (iggy CLI) or test/CI-only: never advertised
+/// via `--list-config-env-vars`, but still non-config. Included in
+/// `SERVER_PROCESS_ENV_VARS` to suppress "unknown env var" warnings during
+/// config scanning.
 pub const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_TEST_VERBOSE",
     "IGGY_TEST_CLUSTER_NODES",
@@ -71,10 +61,7 @@ pub const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_PASSWORD",
 ];
 
-/// All non-config env vars — the union of `SERVER_RUNTIME_ENV_VARS` and
-/// `SERVER_SCAN_ONLY_ENV_VARS`. Kept as one list (rather than requiring every
-/// call site to chain both) so existing consumers are unaffected; a test below
-/// pins its contents to the split so the two views can't silently diverge.
+/// All non-config env vars the server process scans for.
 pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_CONFIG_PATH",
     "IGGY_ENV_PATH",
@@ -92,24 +79,15 @@ pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_PASSWORD",
 ];
 
-#[cfg(test)]
-mod server_process_env_vars_tests {
-    use super::*;
-    use std::collections::HashSet;
-
-    #[test]
-    fn runtime_and_scan_only_lists_cover_process_env_vars_exactly() {
-        let split: HashSet<&str> = SERVER_RUNTIME_ENV_VARS
-            .iter()
-            .chain(SERVER_SCAN_ONLY_ENV_VARS.iter())
-            .copied()
-            .collect();
-        let whole: HashSet<&str> = SERVER_PROCESS_ENV_VARS.iter().copied().collect();
-        assert_eq!(
-            split, whole,
-            "SERVER_RUNTIME_ENV_VARS + SERVER_SCAN_ONLY_ENV_VARS must equal SERVER_PROCESS_ENV_VARS"
-        );
-    }
+/// Vars safe to advertise to end users via `--list-config-env-vars` — every
+/// entry in `SERVER_PROCESS_ENV_VARS` except the sibling-binary/test-only
+/// ones in `SERVER_SCAN_ONLY_ENV_VARS`. Computed rather than retyped, so the
+/// two views cannot drift apart.
+pub fn server_runtime_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_PROCESS_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name))
 }
 
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =

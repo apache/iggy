@@ -99,39 +99,33 @@ impl EnvVarTemplate {
 #[cfg(test)]
 mod consistency_tests {
     use super::*;
-    use crate::cluster::ClusterConfig;
     use crate::server::ServerConfig;
     use std::collections::HashSet;
 
-    #[test]
-    fn server_config_templates_and_mappings_align() {
-        let expanded: HashSet<String> = ServerConfig::env_templates()
+    /// Asserts that `T::env_templates()`, expanded, names exactly the same
+    /// set as `T::env_mappings()`. One generic body for every `ConfigEnv`
+    /// type, so adding a type to check is one call, not one copy-pasted test.
+    fn assert_templates_and_mappings_align<T: ConfigEnvMappings>(type_name: &str) {
+        let expanded: HashSet<String> = T::env_templates()
             .iter()
             .flat_map(|t| t.expand_names())
             .collect();
-        let mapped: HashSet<String> = ServerConfig::env_mappings()
+        let mapped: HashSet<String> = T::env_mappings()
             .iter()
             .map(|m| m.env_name.to_string())
             .collect();
         assert_eq!(
             expanded, mapped,
-            "ServerConfig env_templates and env_mappings must align"
+            "{type_name} env_templates and env_mappings must align"
         );
     }
 
     #[test]
-    fn cluster_config_templates_and_mappings_align() {
-        let expanded: HashSet<String> = ClusterConfig::env_templates()
-            .iter()
-            .flat_map(|t| t.expand_names())
-            .collect();
-        let mapped: HashSet<String> = ClusterConfig::env_mappings()
-            .iter()
-            .map(|m| m.env_name.to_string())
-            .collect();
-        assert_eq!(
-            expanded, mapped,
-            "ClusterConfig env_templates and env_mappings must align"
-        );
+    fn server_config_templates_and_mappings_align() {
+        // ClusterConfig is only ever embedded as a field of ServerConfig
+        // (never derived or called standalone in production code), so this
+        // single check already covers its templates and mappings too -
+        // a separate ClusterConfig-only test would just repeat it.
+        assert_templates_and_mappings_align::<ServerConfig>("ServerConfig");
     }
 }

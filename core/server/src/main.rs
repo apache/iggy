@@ -143,7 +143,7 @@ fn print_config_env_vars() -> std::io::Result<()> {
         ServerConfig::env_templates()
             .iter()
             .map(|t| t.env_name)
-            .chain(configs::server::SERVER_RUNTIME_ENV_VARS.iter().copied()),
+            .chain(configs::server::server_runtime_env_vars()),
         &mut stdout,
     )
 }
