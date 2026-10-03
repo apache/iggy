@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::request_budget::RequestBudget;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
 use crate::{
@@ -182,59 +183,62 @@ impl<B: BinaryClient> UserClient for B {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        super::validate_username(username)?;
-        super::validate_password(password)?;
-        super::logout_before_relogin(self).await?;
-        let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
-        let response = match self
-            .send_raw_with_response(
-                LOGIN_REGISTER_CODE,
-                LoginRegisterRequest {
-                    version_info: super::rust_sdk_version_info(self.sdk_version())?,
-                    username: wire_name,
-                    password: SecretString::from(password.to_string()),
-                    client_context: None,
+        RequestBudget::run(self.request_timeout(), || self.expire_request(), async {
+            super::validate_username(username)?;
+            super::validate_password(password)?;
+            super::logout_before_relogin(self).await?;
+            let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
+            let response = match self
+                .send_raw_with_response(
+                    LOGIN_REGISTER_CODE,
+                    LoginRegisterRequest {
+                        version_info: super::rust_sdk_version_info(self.sdk_version())?,
+                        username: wire_name,
+                        password: SecretString::from(password.to_string()),
+                        client_context: None,
+                    }
+                    .to_bytes(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    self.reset_vsr_session().await?;
+                    return Err(error);
                 }
-                .to_bytes(),
+            };
+            let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
+                Ok(wire_resp) => wire_resp,
+                Err(error) => {
+                    self.reset_vsr_session().await?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
+                self.reset_vsr_session().await?;
+                return Err(error);
+            }
+            tracing::debug!(
+                server_version = %wire_resp.server_version,
+                server_protocol_version = wire_resp.server_protocol_version,
+                "authenticated against iggy server"
+            );
+            self.set_state(ClientState::Authenticated).await;
+            self.remember_session_credentials(
+                Credentials::UsernamePassword(
+                    username.to_owned(),
+                    SecretString::from(password.to_string()),
+                ),
+                wire_resp.user_id,
             )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
-            Ok(wire_resp) => wire_resp,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
-            self.reset_vsr_session().await?;
-            return Err(error);
-        }
-        tracing::debug!(
-            server_version = %wire_resp.server_version,
-            server_protocol_version = wire_resp.server_protocol_version,
-            "authenticated against iggy server"
-        );
-        self.set_state(ClientState::Authenticated).await;
-        self.remember_session_credentials(
-            Credentials::UsernamePassword(
-                username.to_owned(),
-                SecretString::from(password.to_string()),
-            ),
-            wire_resp.user_id,
-        )
-        .await;
-        self.publish_event(DiagnosticEvent::SignedIn).await;
-        Ok(IdentityInfo {
-            user_id: wire_resp.user_id,
-            access_token: None,
+            .await;
+            self.publish_event(DiagnosticEvent::SignedIn).await;
+            Ok(IdentityInfo {
+                user_id: wire_resp.user_id,
+                access_token: None,
+            })
         })
+        .await
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {

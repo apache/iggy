@@ -95,6 +95,9 @@ pub struct Args {
     #[arg(long, default_value = "5s")]
     pub tcp_heartbeat_interval: String,
 
+    #[arg(long, default_value = "30s")]
+    pub tcp_request_timeout: String,
+
     #[arg(long, default_value = "127.0.0.1:8090")]
     pub tcp_server_address: String,
 
@@ -230,6 +233,7 @@ impl Default for Args {
             tcp_reconnection_interval: "1s".to_string(),
             tcp_reconnection_reestablish_after: "5s".to_string(),
             tcp_heartbeat_interval: "5s".to_string(),
+            tcp_request_timeout: "30s".to_string(),
             tcp_server_address: "127.0.0.1:8090".to_string(),
             tcp_tls_enabled: false,
             tcp_tls_domain: "localhost".to_string(),
@@ -336,6 +340,7 @@ impl Args {
             tcp_reconnection_interval: self.tcp_reconnection_interval.clone(),
             tcp_reconnection_reestablish_after: self.tcp_reconnection_reestablish_after.clone(),
             tcp_heartbeat_interval: self.tcp_heartbeat_interval.clone(),
+            tcp_request_timeout: self.tcp_request_timeout.clone(),
             tcp_tls_enabled: self.tcp_tls_enabled,
             tcp_tls_domain: self.tcp_tls_domain.clone(),
             tcp_tls_ca_file: if self.tcp_tls_ca_file.is_empty() {
