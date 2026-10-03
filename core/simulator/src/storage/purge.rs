@@ -25,7 +25,9 @@
 //! The two controls make that distinction observable. Without a purge, recovery
 //! must preserve bookmark 2 and return messages 3 and 4. After a completed purge,
 //! recovery must find no bookmarks and return all five messages, 0 through 4.
-//! Both controls cover individual consumers and groups under both offset policies.
+//! Both controls cover individual consumers, groups, and external groups under
+//! both offset policies. An external group is never polled, so its bookmark is
+//! read directly. Boot never clamps it, so a resurrected one would survive.
 //!
 //! The harness enters after message history has been reset. It uses production
 //! purge completion and consumer recovery with `SimStorage`, then polls through
@@ -81,7 +83,7 @@ struct PurgeStorageHarness {
 }
 
 impl PurgeStorageHarness {
-    /// Store bookmark 2 for a consumer and a group, plus the earlier purge marker.
+    /// Store bookmark 2 for every kind, plus the earlier purge marker.
     /// All files and their directory entries are durable before the test starts,
     /// including when the selected offset policy does not require an immediate sync.
     async fn with_stored_progress(policy: Durability) -> Self {
@@ -100,7 +102,7 @@ impl PurgeStorageHarness {
             namespace: IggyNamespace::new(0, 0, 42),
             policy,
         };
-        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+        for kind in ConsumerKind::ALL {
             let directory = harness.offset_directory(kind);
             harness
                 .storage
@@ -116,6 +118,10 @@ impl PurgeStorageHarness {
             .await;
         harness
             .persist_bookmark(ConsumerKind::ConsumerGroup, GROUP_ID)
+            .await;
+        // Kept under the same Iggy group as the group bookmark, as the gateway keys it.
+        harness
+            .persist_bookmark(ConsumerKind::ExternalGroup, GROUP_ID)
             .await;
         persist_purge_generation_with_storage(
             &harness.storage,
@@ -320,8 +326,29 @@ impl PurgeStorageHarness {
             ConsumerKind::ConsumerGroup => {
                 self.config.get_consumer_group_offsets_path(0, 0, 42).into()
             }
+            ConsumerKind::ExternalGroup => {
+                self.config.get_external_group_offsets_path(0, 0, 42).into()
+            }
         }
     }
+}
+
+/// Assert the bookmark of every kind. The external group is never polled, so its
+/// bookmark is read directly rather than through a polling consumer.
+fn assert_bookmarks(partition: &TestPartition, expected: Option<u64>, context: &str) {
+    for consumer in consumers() {
+        assert_eq!(
+            partition.get_consumer_offset(consumer),
+            expected,
+            "{context}: {consumer:?}"
+        );
+    }
+    let group_id = u32::try_from(GROUP_ID).expect("group id fits u32");
+    assert_eq!(
+        partition.external_group_offset(group_id),
+        expected,
+        "{context}: external group {group_id}"
+    );
 }
 
 fn consumers() -> [PollingConsumer; 2] {
@@ -357,9 +384,7 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
             let recovered = harness.recover_partition().await;
 
             assert_eq!(recovered.applied_purge_generation(), OLD_GENERATION);
-            for consumer in consumers() {
-                assert_eq!(recovered.get_consumer_offset(consumer), Some(STORED_OFFSET));
-            }
+            assert_bookmarks(&recovered, Some(STORED_OFFSET), "recovery must keep it");
             // Bookmark 2 means the first three messages were already consumed.
             harness
                 .poll_next_and_assert_messages(recovered, &[3, 4])
@@ -388,17 +413,15 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
                 OLD_GENERATION,
                 "{policy:?}: setup must load the earlier purge marker"
             );
-            for consumer in consumers() {
-                assert_eq!(
-                    partition.get_consumer_offset(consumer),
-                    Some(STORED_OFFSET),
-                    "{policy:?}, {consumer:?}: setup must load the old bookmark"
-                );
-            }
+            assert_bookmarks(
+                &partition,
+                Some(STORED_OFFSET),
+                &format!("{policy:?}: setup must load the old bookmark"),
+            );
 
             // These files arrive after recovery, so only the production directory
-            // sweep can discover them. Both directories must be cleaned durably.
-            for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            // sweep can discover them. Every directory must be cleaned durably.
+            for kind in ConsumerKind::ALL {
                 harness.persist_bookmark(kind, STRAY_ID).await;
             }
 
@@ -412,14 +435,12 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
                 NEW_GENERATION,
                 "{policy:?}: purge must advance the applied generation"
             );
-            for consumer in consumers() {
-                assert_eq!(
-                    partition.get_consumer_offset(consumer),
-                    None,
-                    "{policy:?}, {consumer:?}: purge must clear the live bookmark"
-                );
-            }
-            for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            assert_bookmarks(
+                &partition,
+                None,
+                &format!("{policy:?}: purge must clear the live bookmark"),
+            );
+            for kind in ConsumerKind::ALL {
                 assert_eq!(
                     partition.durable_consumer_offset_count(kind),
                     0,
@@ -452,14 +473,12 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
                 NEW_GENERATION,
                 "{policy:?}: the completed purge marker must survive power loss"
             );
-            for consumer in consumers() {
-                assert_eq!(
-                    recovered.get_consumer_offset(consumer),
-                    None,
-                    "{policy:?}, {consumer:?}: a deleted bookmark must not return after power loss"
-                );
-            }
-            for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            assert_bookmarks(
+                &recovered,
+                None,
+                &format!("{policy:?}: a deleted bookmark must not return after power loss"),
+            );
+            for kind in ConsumerKind::ALL {
                 assert_eq!(
                     recovered.durable_consumer_offset_count(kind),
                     0,

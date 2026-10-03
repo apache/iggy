@@ -17,6 +17,7 @@
 
 use futures::TryStreamExt;
 use iggy_binary_protocol::{Operation, PrepareHeader};
+use iggy_common::ConsumerKind;
 use journal::PartitionPrepareJournal;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage};
 use journal::partition_journal::{PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference};
@@ -186,7 +187,7 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     checkpoint_running: Cell<bool>,
     checkpoint_needed: Cell<bool>,
     dirty_segments: RefCell<BTreeSet<u64>>,
-    dirty_offsets: [RefCell<BTreeSet<u32>>; 2],
+    dirty_offsets: [RefCell<BTreeSet<u32>>; ConsumerKind::COUNT],
     purge_generation: Cell<u64>,
     purge_floor: Cell<u64>,
     capacity: u64,
@@ -859,7 +860,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             .extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
     }
 
-    pub fn take_dirty_files(&self) -> (BTreeSet<u64>, [BTreeSet<u32>; 2]) {
+    pub fn take_dirty_files(&self) -> (BTreeSet<u64>, [BTreeSet<u32>; ConsumerKind::COUNT]) {
         (
             std::mem::take(&mut *self.dirty_segments.borrow_mut()),
             std::array::from_fn(|index| {

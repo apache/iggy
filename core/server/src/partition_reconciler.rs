@@ -173,7 +173,7 @@ use iggy_binary_protocol::{
     AckLevel, Command, Operation, ReplyHeader, RoutedRequestHeader, WireConsumer, WireEncode,
     WireIdentifier,
 };
-use iggy_common::{ConsumerGroupId, IggyTimestamp};
+use iggy_common::{ConsumerGroupId, ConsumerKind, IggyTimestamp};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -1081,9 +1081,9 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
         };
         let dead = partitions
             .with_partition(&namespace, |partition| {
-                partition.dead_consumer_group_offset_ids(|group_id| {
-                    // A lagging metadata replica cannot prove a group deleted
-                    // until it has applied the allocation of that group's id.
+                // A lagging metadata replica cannot prove a group deleted
+                // until it has applied the allocation of that group's id.
+                partition.dead_group_offset_keys(|group_id| {
                     group_id >= *next_group_id || live.contains(&group_id)
                 })
             })
@@ -1091,8 +1091,8 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
         // Bound work per pass so a historical directory cannot monopolize the
         // reconciler. Unprocessed keys keep the partition's dirty flag armed.
         let mut tickets = Vec::with_capacity(dead.len().min(GROUP_OFFSET_DELETES_PER_PASS));
-        for consumer_id in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
-            let request = group_offset_delete_request(namespace, consumer_id);
+        for (kind, consumer_id) in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
+            let request = group_offset_delete_request(namespace, kind, consumer_id);
             if let Ok(ticket) = ctx.shard.partition_submit(namespace, request) {
                 counters.cg_offsets_submitted += 1;
                 tickets.push(ticket);
@@ -1141,10 +1141,14 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
 
 fn group_offset_delete_request(
     namespace: IggyNamespace,
+    kind: ConsumerKind,
     consumer_id: u32,
 ) -> Message<RoutedRequestHeader> {
     let body = DeleteConsumerOffsetRequest {
-        consumer: WireConsumer::consumer_group(WireIdentifier::Numeric(consumer_id)),
+        consumer: WireConsumer {
+            kind: kind.as_code(),
+            id: WireIdentifier::Numeric(consumer_id),
+        },
         stream_id: WireIdentifier::Numeric(
             u32::try_from(namespace.stream_id()).expect("stream id fits u32"),
         ),
@@ -3863,8 +3867,8 @@ mod tests {
             "failed submission must not unlink or remove either offset"
         );
         assert_eq!(
-            partition.dead_consumer_group_offset_ids(|id| id == u64::from(live_key)),
-            vec![dead_key]
+            partition.dead_group_offset_keys(|id| id == u64::from(live_key)),
+            vec![(ConsumerKind::ConsumerGroup, dead_key)]
         );
         assert!(!ctx.last_pass_noop.get(), "failed cleanup must be retried");
     }

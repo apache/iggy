@@ -41,7 +41,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireIdentifier};
+use iggy_binary_protocol::{
+    KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, RoutedRequestHeader, WireIdentifier,
+};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -204,8 +206,8 @@ where
     Ok(in_flight)
 }
 
-/// Rewrite a group consumer-offset op so its consumer id is the group's
-/// monotonic id rather than the wire name. The partition plane keys group
+/// Rewrite a group or external-group consumer-offset op so its consumer id is
+/// the group's monotonic id rather than the wire name. The partition plane keys group
 /// offsets by that numeric id (decoded from `WireIdentifier::Numeric`), so the
 /// read path -- which resolves the same id from metadata -- and the reconciler
 /// purge agree, and a re-created group (new id) never inherits a stale offset.
@@ -238,7 +240,10 @@ where
     macro_rules! rewrite_group_offset {
         ($ty:ty) => {{
             let mut wire = <$ty>::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            if wire.consumer.kind != KIND_CONSUMER_GROUP {
+            if !matches!(
+                wire.consumer.kind,
+                KIND_CONSUMER_GROUP | KIND_EXTERNAL_GROUP
+            ) {
                 return Ok(request);
             }
             let group_id = resolve_offset_group_id(
@@ -828,12 +833,13 @@ mod tests {
         );
         let consumers = directory.join("offsets/consumers");
         let groups = directory.join("offsets/groups");
-        std::fs::create_dir_all(&consumers).unwrap();
-        std::fs::create_dir_all(&groups).unwrap();
+        let external_groups = directory.join("offsets/external_groups");
+        for path in [&consumers, &groups, &external_groups] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         partition.set_partition_dir(directory.to_string_lossy().into_owned());
         partition.configure_consumer_offset_storage(
-            consumers.to_string_lossy().into_owned(),
-            groups.to_string_lossy().into_owned(),
+            [&consumers, &groups, &external_groups].map(|path| path.to_string_lossy().into_owned()),
             ConsumerOffsets::with_capacity(0),
             ConsumerGroupOffsets::with_capacity(1),
         );

@@ -143,6 +143,7 @@ fn history_reload_trace(seed: u64) -> u64 {
     let retained = RetainedPartitionState {
         consumer_offsets: partition.retained_consumer_offsets(ConsumerKind::Consumer),
         consumer_group_offsets: partition.retained_consumer_offsets(ConsumerKind::ConsumerGroup),
+        external_group_offsets: partition.retained_consumer_offsets(ConsumerKind::ExternalGroup),
         durable_offset: offsets.commit_offset,
         write_offset: offsets.write_offset,
         offset_space_used: partition.offset_space_used(),
