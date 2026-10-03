@@ -888,6 +888,96 @@ fn given_a_failed_offset_writeback_when_barriering_install_files_should_refuse_p
 }
 
 #[test]
+fn given_a_truncated_install_barrier_when_rebarriering_should_report_retained_offset_writeback_failure()
+ {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+
+        let path = Path::new("/partition/offsets/consumers/1");
+        storage
+            .create_directories(path.parent().unwrap())
+            .await
+            .unwrap();
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"pending".to_vec()).await.unwrap();
+        storage
+            .sync_directory(path.parent().unwrap())
+            .await
+            .unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), writer)
+            .await
+            .unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        persistence.barrier_files(Vec::new());
+        persistence.truncate_from(2);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+        assert!(persistence.failure().is_none());
+
+        persistence.barrier_files(Vec::new());
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let error = persistence.drain().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("writeback failed before this handle synced"),
+            "unexpected barrier failure: {error}"
+        );
+        assert!(persistence.failure().is_some());
+    });
+}
+
+#[test]
+fn given_a_truncated_install_barrier_when_rebarriering_should_make_retained_offset_durable() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+
+        let path = Path::new("/partition/offset");
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"retained".to_vec()).await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), writer)
+            .await
+            .unwrap();
+
+        persistence.barrier_files(Vec::new());
+        persistence.truncate_from(2);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+
+        persistence.barrier_files(Vec::new());
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+        storage.crash(Crash::PowerLoss);
+        let file = storage.open(path, OpenMode::Read).await.unwrap();
+        assert_eq!(file.read(0, 8).await.unwrap(), b"retained");
+    });
+}
+
+#[test]
 fn lost_frontier_cannot_turn_a_durable_journal_into_an_empty_one() {
     block_on(async {
         let (storage, journal) = baseline().await;
