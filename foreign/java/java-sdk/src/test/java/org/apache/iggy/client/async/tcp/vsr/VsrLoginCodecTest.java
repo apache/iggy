@@ -30,13 +30,36 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EmptySource;
 import org.junit.jupiter.params.provider.NullSource;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class VsrLoginCodecTest {
+
+    @Test
+    void protocolVersionMatchesRustWireVersion() throws IOException {
+        Path versionPath = Path.of("core/binary_protocol/src/version.rs");
+        Path root = Path.of("").toAbsolutePath();
+        while (root != null && !Files.isRegularFile(root.resolve(versionPath))) {
+            root = root.getParent();
+        }
+        assertThat(root).as("repository containing %s", versionPath).isNotNull();
+        Matcher version = Pattern.compile(
+                        "pub const IGGY_PROTOCOL_VERSION:\\s*u32\\s*=\\s*pack_protocol_version\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)")
+                .matcher(Files.readString(root.resolve(versionPath)));
+        assertThat(version.find()).as("Rust wire protocol version declaration").isTrue();
+        int major = Integer.parseInt(version.group(1));
+        int minor = Integer.parseInt(version.group(2));
+        int patch = Integer.parseInt(version.group(3));
+        assertThat(VsrLoginCodec.PROTOCOL_VERSION).isEqualTo((major << 20) | (minor << 10) | patch);
+    }
 
     @Test
     void sdkVersionFieldEncodesVersionAsUtf8() {
