@@ -164,10 +164,15 @@ impl MessagesWriter {
     ///
     /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
-        self.file
-            .sync_data()
-            .await
-            .map_err(|_| IggyError::CannotWriteToFile)?;
+        self.file.sync_data().await.map_err(|err| {
+            error!(
+                target: "iggy.partitions.storage",
+                file = self.file_path.as_str(),
+                %err,
+                "failed to sync segment file"
+            );
+            IggyError::CannotWriteToFile
+        })?;
         Ok(())
     }
 }
