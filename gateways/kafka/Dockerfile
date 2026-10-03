@@ -18,7 +18,11 @@
 # Build context is the repository root (a Cargo workspace member cannot build standalone) -
 # `docker-compose.yml` in this directory sets `context: ../..` accordingly.
 
-ARG RUST_VERSION=1.98
+# Pinned to the exact patch rust-toolchain.toml declares - a floating `1.98` tag drifts to
+# whatever patch Docker Hub ships (1.98.1 as of writing), which no longer matches the
+# workspace's pinned 1.98.0 and makes every build install a second ~636 MB toolchain on top of
+# the image's own.
+ARG RUST_VERSION=1.98.0
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build
@@ -28,6 +32,14 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+COPY rust-toolchain.toml rust-toolchain.toml
+# Resolves/installs the toolchain now, in a layer keyed only on rust-toolchain.toml - matching
+# RUST_VERSION above means this is a no-op resolution, not a download, but isolates the cost
+# from the full COPY . . below, which invalidates on any source change in the workspace.
+# Same ordering core/server/Dockerfile uses for the same reason.
+RUN cargo --version
+
 COPY . .
 # Cache mounts persist across builds but not into the image layer, so the binary is copied out
 # to a plain path before the mount unmounts. --locked matches CI (scripts never resolve a
@@ -47,10 +59,10 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /iggy-gateway-kafka .
 
 ENV IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
-# Wildcard bind means the gateway cannot derive its own advertised host (server.rs's
-# BrokerAdvertise::from_server_config refuses to start without one) - default to localhost so
-# `docker run <image>` works standalone, not just via this directory's docker-compose.yml.
-# Override when the host reachable from a client is not actually localhost.
-ENV IGGY_KAFKA_ADVERTISED_HOST=localhost
+# No baked IGGY_KAFKA_ADVERTISED_HOST default: wildcard bind means the gateway cannot derive
+# its own advertised host (server.rs's BrokerAdvertise::from_server_config refuses to start
+# without one), and that refusal is deliberate - it forces whoever runs this image to say what
+# host a client can actually reach it on, rather than silently advertising "localhost" to a
+# client on a different machine. docker-compose.yml sets it explicitly for this quick start.
 
 CMD ["/iggy-gateway-kafka"]

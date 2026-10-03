@@ -28,6 +28,10 @@ services:
     # (.github/config/publish.yml), so the healthcheck/volume/listener-address settings below
     # stay correct either way.
     image: apache/iggy:edge
+    # :edge is a rolling tag - without this, compose reuses whatever was pulled last time it
+    # happened to not be cached locally, and a stale server can reject a newer gateway's login
+    # once the wire protocol moves. Always check for a newer edge instead of trusting the cache.
+    pull_policy: always
     # build:
     #   context: ../..
     #   dockerfile: core/server/Dockerfile
@@ -104,7 +108,11 @@ services:
       # same requirement root docker-compose.yml's IGGY_NODE_ADVERTISED_ADDRESS already carries
       # for iggy-server, for the same reason: the value a Kafka client's Metadata response
       # points it back at has to be reachable from outside the container.
-      - IGGY_KAFKA_ADVERTISED_HOST=localhost
+      #
+      # Literal 127.0.0.1, not "localhost": the port below is published on 127.0.0.1 only, and
+      # a client resolving "localhost" to ::1 first (common default on many systems) would get
+      # a Metadata response pointing it at an address nothing is actually listening on.
+      - IGGY_KAFKA_ADVERTISED_HOST=127.0.0.1
       - IGGY_KAFKA_BRIDGE_ENABLED=true
       - IGGY_KAFKA_IGGY_ADDR=iggy-server:8090
       - IGGY_KAFKA_IGGY_USERNAME=iggy

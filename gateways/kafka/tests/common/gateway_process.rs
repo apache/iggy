@@ -61,10 +61,9 @@ impl TestGateway {
         // IGGY_KAFKA_ADVERTISED_HOST, which this crate's own README/docker-compose.yml teach a
         // contributor to export) silently changes the spawned gateway's behavior out from under
         // this harness's assertions.
-        command
-            .env_clear();
+        command.env_clear();
         if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
-               command.env("LLVM_PROFILE_FILE", llvm_profile_file);
+            command.env("LLVM_PROFILE_FILE", llvm_profile_file);
         }
         command
             .env("IGGY_KAFKA_BIND_ADDR", &address)
