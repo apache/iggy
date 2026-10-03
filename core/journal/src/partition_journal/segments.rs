@@ -143,6 +143,53 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
     }
 
+    /// Move the physical append point over a reserved offset gap.
+    /// The complete preceding chain must already be durably checkpointed.
+    ///
+    /// # Errors
+    /// Returns an error for an uncheckpointed tail, a regressing offset, or a failed barrier.
+    pub async fn reanchor_segment_storage(&mut self, next_offset: u64) -> io::Result<()> {
+        self.ensure_healthy()?;
+        let mut segments = self
+            .state
+            .segment_storage
+            .ok_or_else(|| invalid("segment storage is not enabled"))?;
+        if self.state.checkpoint != self.state.head || self.durable_head != self.state.head {
+            return Err(invalid("cannot reanchor an uncheckpointed segment tail"));
+        }
+        if next_offset < segments.tail.position.next_offset {
+            return Err(invalid(
+                "reserved segment offset regresses the physical tail",
+            ));
+        }
+        if next_offset == segments.tail.position.next_offset {
+            return Ok(());
+        }
+        segments.reset_position(SegmentPosition {
+            start_offset: next_offset,
+            length: 0,
+            next_offset,
+        })?;
+        let state = JournalState {
+            segment_storage: Some(segments),
+            ..self.state
+        };
+        self.poisoned = true;
+        self.open_segment_file(
+            segments.tail.generation,
+            next_offset,
+            0,
+            self.preallocate_segments.then_some(segments.max_size),
+        )
+        .await?;
+        self.sync_segment_files().await?;
+        self.publish(state).await?;
+        self.state = state;
+        self.retain_active_segment_file();
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub fn segment_reference(&self, header: &PrepareHeader) -> Option<SegmentReference> {
         if !self.contains(header) {
             return None;
@@ -541,6 +588,14 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 ));
             }
             if length > cursor.position.length {
+                tracing::warn!(
+                    group = self.state.group,
+                    incarnation = self.state.incarnation,
+                    start_offset = cursor.position.start_offset,
+                    durable_bytes = cursor.position.length,
+                    discarded_bytes = length - cursor.position.length,
+                    "discarding unpublished segment bytes beyond the durable WAL frontier"
+                );
                 file.truncate(cursor.position.length).await?;
                 if self.preallocate_segments {
                     file.preallocate(&cursor.path(&self.directory), segments.max_size);
@@ -666,6 +721,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.segment_files_dirty = true;
         self.segment_links_dirty = true;
         self.segment_files.insert(key, file);
+        // Establish the inode and links before buffered appends can be acknowledged.
+        // A later shutdown barrier must not need a new directory descriptor.
+        self.sync_segment_files().await?;
         Ok(())
     }
 

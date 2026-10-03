@@ -31,8 +31,6 @@ use iggy_binary_protocol::batch::{
     BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, calculate_batch_checksum,
 };
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
-use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
@@ -54,10 +52,12 @@ use iggy_binary_protocol::requests::personal_access_tokens::*;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
     UpdateTopicRequest,
 };
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::*;
 use iggy_binary_protocol::responses::clients::{
     ClientDetailsResponse, ClientResponse, ConsumerGroupInfoResponse, GetClientsResponse,
@@ -740,7 +740,11 @@ fn main() {
         "request.bind_session",
         &BindSessionRequest {
             version_info: version_info(),
-            identity: SessionIdentity { client_id: 1, session: 100, metadata_watermark: 120 },
+            identity: SessionIdentity {
+                client_id: 1,
+                session: 100,
+                metadata_watermark: 120,
+            },
             bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );

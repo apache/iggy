@@ -10,10 +10,15 @@ Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP 
 cargo run --bin iggy-server --release
 ```
 
-Initialize a new data directory once with `--fresh`. This deletes any existing
-data in the configured system path, so omit it on subsequent starts. An empty
-replacement disk in cluster mode must recover through a live quorum. It cannot
-initialize a new history merely because its peers are unreachable.
+Missing or empty storage is initialized automatically. Existing incompatible
+storage is refused without modification. `--fresh` deletes existing data in
+the configured system path and must be an explicit reset, never a restart
+default. A new cluster starts automatically when its metadata WAL and
+superblock are absent. A node with retained metadata rejoins through recovery.
+Loss of a replica's entire metadata directory is outside the automatic recovery
+guarantee, including loss on every replica. Empty metadata cannot distinguish a
+new cluster from a previously used one. Restore a verified consistent backup
+through a validated recovery procedure before restarting erased metadata disks.
 
 The Docker image `apache/iggy:latest` ships the server together with the CLI; the `edge` tag tracks the latest development build.
 
@@ -32,8 +37,7 @@ To run one node of a cluster, pass its replica ID from the `cluster.nodes` roste
 cargo run --bin iggy-server --release -- --replica-id 0
 ```
 
-`--replica-id` selects the configured replica. `--fresh` explicitly initializes
-its storage. Other settings come from configuration.
+`--replica-id` selects the configured replica. Other settings come from configuration.
 
 ## Configuration
 
@@ -58,10 +62,13 @@ External group offsets belong to groups managed outside Iggy, such as a Kafka
 gateway. They require no Iggy group membership and can exceed the partition's
 message-offset range.
 
-Durability defaults remain `Replicated`. Explicit sends require `Persisted`;
-explicit offset writes require `Persisted` and `Quorum`. Weaker settings return
-`DurabilityRequired` (86) before mutation. Internal auto-commit polls keep their
-existing durability policy.
+Durability defaults remain `Replicated`, and ordinary SDK sends and explicit
+offset writes support the configured policy. Crash-safe send retries require
+`Persisted`; crash-safe explicit offset retries require `Persisted` and
+`Quorum`. Weaker policies can lose data and receipts on a crash. A retained
+receipt still replays its original result, but a lost receipt cannot prevent
+another execution. NoAck and internal auto-commit polls retain their weaker
+completion contracts.
 
 ## Upgrade recovery
 

@@ -4605,25 +4605,6 @@ where
                         return;
                     }
                 }
-                let durable = match message.header().operation {
-                    Operation::SendMessages => self.durability().is_persisted(),
-                    Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
-                        self.consumer_offset_durability().is_persisted()
-                            && consumer_offset.is_some_and(|(_, _, _, ack)| ack == AckLevel::Quorum)
-                    }
-                    _ => false,
-                };
-                if !durable {
-                    Self::send_partition_deny_or_log(
-                        consensus,
-                        message.header(),
-                        IggyError::DurabilityRequired.as_code(),
-                        "durable retry contract unavailable",
-                        reply.take(),
-                    )
-                    .await;
-                    return;
-                }
                 if !consensus.has_retry_capacity(&self.dedup, client_id) {
                     Self::send_partition_deny_or_log(
                         consensus,
@@ -6031,6 +6012,8 @@ where
             .as_ref()
             .filter(|persistence| persistence.segment_checkpoint().is_some())
         {
+            // Recovery only keeps segment bytes covered by the published WAL frontier.
+            persistence.sync();
             self.start_persistence();
             // Shutdown and transfer must finish the flush, but never drain while
             // holding the lock used to append new messages.
@@ -7437,7 +7420,10 @@ where
         Ok(())
     }
 
-    async fn rotate_segment(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
+    pub(crate) async fn rotate_segment(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<(), IggyError> {
         let start_offset = self.log.active_segment().end_offset + 1;
         self.rotate_segment_at(config, start_offset).await
     }
@@ -7811,6 +7797,23 @@ where
         &mut self,
         config: &PartitionsConfig,
     ) -> Result<(), IggyError> {
+        if let Some(persistence) = self.persistence.as_ref().map(Rc::clone) {
+            // Retained WAL bodies still belong to the old chain. Materialize
+            // and checkpoint them before moving the append point past it.
+            while self.consensus.commit_min() < self.consensus.commit_max() {
+                let before = self.consensus.commit_min();
+                self.commit_journal(config).await;
+                if self.consensus.commit_min() == before {
+                    return Err(IggyError::CannotSyncFile);
+                }
+            }
+            self.flush_committed_messages(config).await?;
+            persistence.request_checkpoint();
+            self.checkpoint_persistence(config).await;
+            if self.fatal.is_some() || persistence.checkpoint_op() != persistence.head() {
+                return Err(IggyError::CannotSyncFile);
+            }
+        }
         // Where the next append will land: the counter, or an armed mint floor
         // above it. The floor is the whole reason a hole can appear, so
         // anchoring to the counter alone would leave the chain as unprepared.
@@ -7943,6 +7946,18 @@ where
                 );
             }
             Some(_) => {}
+        }
+        if let Some(persistence) = self.persistence.as_ref().map(Rc::clone)
+            && persistence.segment_checkpoint().is_some_and(|checkpoint| {
+                checkpoint.next_offset < self.log.active_segment().start_offset
+            })
+        {
+            persistence.reanchor_segments(self.log.active_segment().start_offset);
+            self.start_persistence();
+            persistence.drain_with_timeout().await.map_err(|error| {
+                warn!(%error, "cannot reanchor the partition WAL at its reserved offset");
+                IggyError::CannotSyncFile
+            })?;
         }
         Ok(())
     }
@@ -12524,6 +12539,12 @@ mod tests {
                                 assert_eq!(partition.log.journal().info.messages_count, 0);
                             }
                         }
+                        if let Some(persistence) = &persistence {
+                            assert_eq!(
+                                persistence.durable_op(),
+                                if durability.is_persisted() { 3 } else { 0 }
+                            );
+                        }
                         partition.flush_committed_messages(&config).await.unwrap();
                         let mut actual = Vec::new();
                         for segment in partition.log.segments() {
@@ -12555,10 +12576,7 @@ mod tests {
                         assert_eq!(partition.log.journal().info.messages_count, 0);
                         if let Some(persistence) = persistence {
                             assert!(persistence.segment_checkpoint().is_some());
-                            assert_eq!(
-                                persistence.durable_op(),
-                                if durability.is_persisted() { 3 } else { 0 }
-                            );
+                            assert_eq!(persistence.durable_op(), 3);
                         }
                     }
                 }
@@ -15528,7 +15546,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_no_ack_explicit_store_when_submitted_should_refuse_without_mutation() {
+    async fn given_no_ack_explicit_store_when_submitted_should_apply_without_replication() {
         let dir = tempfile::tempdir().unwrap();
         let (mut partition, sent) = recording_partition();
         partition.set_partition_dir(dir.path().to_string_lossy().into_owned());
@@ -15540,10 +15558,13 @@ mod tests {
                 None,
             )
             .await;
-        assert!(partition.consumer_offsets.pin().is_empty());
+        assert_eq!(
+            partition.get_consumer_offset(PollingConsumer::Consumer(7, 0)),
+            Some(0)
+        );
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::Consumer),
-            0
+            1
         );
         assert_eq!(partition.consensus().pipeline_len(), 0);
         assert_eq!(partition.persistence.as_ref().unwrap().head(), 0);
@@ -15551,7 +15572,7 @@ mod tests {
         let header = bytemuck::checked::from_bytes::<ReplyHeader>(
             &sent[0].1.as_slice()[..size_of::<ReplyHeader>()],
         );
-        assert_eq!(header.status, IggyError::DurabilityRequired.as_code());
+        assert_eq!(header.status, 0);
         assert_eq!(header.op, 0);
     }
 

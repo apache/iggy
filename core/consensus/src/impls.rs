@@ -75,6 +75,18 @@ impl ConsensusClock {
     }
 }
 
+#[cfg(test)]
+pub struct FixedClock(pub u64);
+
+#[cfg(test)]
+impl Clock for FixedClock {
+    type Realtime = IggyTimestamp;
+
+    fn realtime(&self) -> Self::Realtime {
+        IggyTimestamp::from(self.0)
+    }
+}
+
 impl std::fmt::Debug for ConsensusClock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ConsensusClock")
@@ -4917,18 +4929,6 @@ mod timestamp_clamp_tests {
 
     use super::*;
     use crate::LocalPipeline;
-
-    /// Clock frozen at a fixed instant, standing in for a lagging wall
-    /// clock on a freshly elected primary.
-    struct FixedClock(u64);
-
-    impl clock::Clock for FixedClock {
-        type Realtime = IggyTimestamp;
-
-        fn realtime(&self) -> Self::Realtime {
-            IggyTimestamp::from(self.0)
-        }
-    }
 
     use crate::test_bus::{NoopBus, make_start_view};
 

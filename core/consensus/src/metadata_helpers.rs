@@ -445,8 +445,11 @@ pub async fn send_eviction_to_client<B, P>(
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::client_table::{REGISTER_REQUEST_ID, REPLY_RING_RETENTION_BYTES};
+    use crate::impls::{ConsensusClock, FixedClock};
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline, RequestEntry};
     use iggy_binary_protocol::{
         Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader,
@@ -585,7 +588,16 @@ mod tests {
         const SESSION: u64 = 10;
         const REQUEST: u64 = 1;
         const REQUEST_CHECKSUM: u128 = 0xAA;
-        let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        const CLOCK_MICROS: u64 = 1_000;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            0,
+            ClientSpyBus::new(),
+            LocalPipeline::new(),
+            ConsensusClock::new(Rc::new(FixedClock(CLOCK_MICROS))),
+        );
         consensus.init();
         let client_table = fresh_client_table();
         let mut message = Message::<RoutedRequestHeader>::new(HEADER_SIZE);
@@ -643,13 +655,9 @@ mod tests {
             ));
         }
         assert_eq!(consensus.request_queue_len(), 1);
+        let queued_request = consensus.pop_queued_request().unwrap();
         assert_eq!(
-            consensus
-                .pop_queued_request()
-                .unwrap()
-                .message
-                .header()
-                .request_checksum,
+            queued_request.message.header().request_checksum,
             REQUEST_CHECKSUM
         );
         consensus.with_pipeline_mut(|pipeline| {

@@ -428,9 +428,8 @@ fn seed_recovered_offset<B: MessageBus>(
 
 /// Provision an initial segment + writers for a partition that has none.
 ///
-/// No-op when `partition.log.has_segments()` already returns `true`
-/// (recovery hydrated existing segments), so callers can invoke this
-/// unconditionally.
+/// With WAL-owned messages, restore the deterministic empty tail when the
+/// recovered last segment already reached its size limit.
 ///
 /// # Errors
 ///
@@ -443,6 +442,11 @@ pub async fn ensure_initial_segment<B: MessageBus>(
     wal_owned_messages: bool,
 ) -> Result<(), PartitionRecoveryError> {
     if partition.log.has_segments() {
+        if wal_owned_messages
+            && partition.log.active_segment().size >= partition.log.active_segment().max_size
+        {
+            partition.rotate_segment(config).await?;
+        }
         return Ok(());
     }
     let stream_id = namespace.stream_id();

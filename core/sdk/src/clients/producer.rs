@@ -653,8 +653,8 @@ unsafe impl Sync for IggyProducer {}
 /// `base_offset` assigned to the first message in that chunk. The list can be empty when the
 /// server supplies no offsets, and a background producer always returns an empty list.
 ///
-/// Confirmed sends require persisted durability and recoverable storage on a quorum.
-/// A weaker topic policy returns [`IggyError::DurabilityRequired`] before admission.
+/// Confirmed sends follow the topic's durability policy. Persisted durability also
+/// provides recoverable storage and crash-safe retry receipts on a quorum.
 ///
 /// # Retrying and what a failure means
 ///
@@ -728,7 +728,7 @@ unsafe impl Sync for IggyProducer {}
 /// | [`partitioning()`] | [`Partitioning::balanced()`] | which partition a batch lands in |
 /// | [`partitioner()`] | none | computing the partition on the client instead |
 /// | [`send_retries()`] | three retries, one-second interval after the immediate first retry | retrying a failed request |
-/// | [`topic_durability()`](crate::clients::producer_builder::IggyProducerBuilder::topic_durability) | `Durability::Replicated` | producer sends require `Durability::Persisted` |
+/// | [`topic_durability()`](crate::clients::producer_builder::IggyProducerBuilder::topic_durability) | `Durability::Replicated` | crash-safe retry receipts require `Durability::Persisted` |
 /// | [`create_stream_if_not_exists()`] | on | creating the stream during [`init()`](Self::init) |
 /// | [`create_topic_if_not_exists()`] | on, one partition, server defaults for expiry and max size | creating the topic during [`init()`](Self::init) |
 /// | [`encryptor()`] | inherited from the client | encrypting payloads and user headers |
@@ -883,8 +883,7 @@ impl IggyProducer {
     ///   [`IggyProducerBuilder::create_topic_if_not_exists`](crate::clients::producer_builder::IggyProducerBuilder::create_topic_if_not_exists).
     ///   Message durability comes from
     ///   [`IggyProducerBuilder::topic_durability`](crate::clients::producer_builder::IggyProducerBuilder::topic_durability).
-    ///   This producer's sends require `Durability::Persisted`; weaker settings
-    ///   return `IggyError::DurabilityRequired`. Other settings come from
+    ///   `Durability::Persisted` also provides crash-safe retry receipts. Other settings come from
     ///   [`TopicCreateOptions::default`].
     ///
     /// # Errors
@@ -917,7 +916,8 @@ impl IggyProducer {
     /// An offset is a position, not an identity. An application resend may
     /// commit the same messages at another offset, see
     /// [Retrying and what a failure means](IggyProducer#retrying-and-what-a-failure-means).
-    /// Confirmed sends require persisted durability and recoverable storage on a quorum.
+    /// Confirmed sends follow the topic's durability policy; Persisted also waits
+    /// for recoverable storage on a quorum.
     ///
     /// # How long the call takes
     ///

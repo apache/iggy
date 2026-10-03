@@ -50,6 +50,7 @@ use shard::{ListClientsReply, MetadataSubmit, ShardHost};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The shard host the server runs; see the module docs.
 ///
@@ -187,12 +188,14 @@ where
                 let _ = reply.try_send(
                     self.sessions
                         .borrow()
-                        .iter_consumer_sessions(
+                        .iter_consumer_sessions(if self.server_config.heartbeat.enabled {
                             self.server_config
                                 .consumer_group
                                 .session_timeout
-                                .get_duration(),
-                        )
+                                .get_duration()
+                        } else {
+                            Duration::MAX
+                        })
                         .collect(),
                 );
             }

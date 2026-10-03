@@ -34,9 +34,10 @@ a binary replacement cannot upgrade it. See the [server recovery guide](../../co
 Register creates a shared logical session; other TCP connections authenticate with BindSession (15), using the
 parent's identity and proof. A disconnect removes its binding without ending the session. Logout or committed expiry
 ends it; a new session must not replay an unresolved mutation from the old one. Command 14 is retired.
-Explicit sends require Persisted message durability; explicit offset mutations require Persisted offset durability
-and Quorum acknowledgement. Defaults remain Replicated; acknowledged weaker explicit mutations return
-DurabilityRequired (86). HTTP NoAck's 202 confirms dispatch, not partition admission or commit, and can hide that refusal.
+Ordinary SDK sends and explicit offset mutations support the configured durability, including the Replicated default.
+Crash-safe send retries require Persisted message durability; crash-safe explicit offset retries require Persisted
+offset durability and Quorum acknowledgement. Weaker policies can lose data and receipts on a crash. HTTP NoAck's
+202 confirms dispatch, not partition admission or commit, and supplies no recoverable caller receipt.
 
 The following upgrade guidance describes the 0.9.0 protocol, not source builds of this checkout.
 Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator

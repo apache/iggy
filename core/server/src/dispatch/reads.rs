@@ -27,6 +27,7 @@
 
 use crate::cluster_meta::ClusterRoster;
 use crate::dispatch::authz::{authorize_default_read, authorize_partition_read, authorize_uid};
+use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
     FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
 };
@@ -62,7 +63,6 @@ use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
-use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
@@ -78,7 +78,6 @@ use message_bus::framing::MAX_MESSAGE_SIZE;
 use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
-use secrecy::ExposeSecret;
 use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
 use std::cell::RefCell;
@@ -291,7 +290,7 @@ pub async fn hold_for_frontier(
 /// The wait ends on the commit that closes the gap, not on a poll: the budget
 /// timer is the only timer armed, so a read that resumes costs one wake.
 #[allow(clippy::future_not_send)]
-async fn await_metadata_read_frontier<B, MJ, S, SB>(
+pub(super) async fn await_metadata_read_frontier<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     watermark: u64,
 ) -> Result<FrontierWait, IggyError>
@@ -647,60 +646,6 @@ where
             .map_err(|_| IggyError::InvalidConfiguration)?,
     }
     .to_bytes())
-}
-
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn complete_session_binding<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    identity: SessionIdentity,
-    secret: BindSecret,
-) -> Result<(u32, u64), IggyError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let watermark = identity.metadata_watermark.max(identity.session);
-    await_metadata_read_frontier(shard, watermark).await?;
-    let (user_id, session, attachment) = if shard.id == 0 {
-        shard
-            .plane
-            .metadata()
-            .client_table
-            .borrow_mut()
-            .bind_session(identity.client_id, identity.session, secret.expose_secret())?
-    } else {
-        let (reply, receiver) = shard::channel(1);
-        shard.forward_metadata_submit(shard::MetadataSubmit::BindSession {
-            vsr_client_id: identity.client_id,
-            session: identity.session,
-            secret,
-            reply,
-        });
-        let outcome = pin!(receiver.recv());
-        let deadline = pin!(
-            shard
-                .bus
-                .sleep(shard.plane.metadata().applied_frontier().read_budget())
-        );
-        match select(outcome, deadline).await {
-            Either::Left((result, _)) => result.map_err(|_| IggyError::TransientNotAccepted)??,
-            Either::Right(_) => return Err(IggyError::TransientNotAccepted),
-        }
-    };
-    sessions.borrow_mut().bind_authenticated_connection(
-        transport_client_id,
-        identity.client_id,
-        session,
-        user_id,
-        attachment,
-        watermark,
-    )?;
-    Ok((user_id, session))
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]

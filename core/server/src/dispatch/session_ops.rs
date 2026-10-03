@@ -25,18 +25,17 @@
 //! of that replica protocol on this page. Terminal failures surface as typed
 //! `Eviction` frames, transient ones as result-framed replay hints.
 //!
-//! Deliberate asymmetry (the two session stores): the per-shard
-//! `SessionManager` owns transport sessions (connection -> user binding,
-//! heartbeats, SDK info) and is never replicated; the consensus `ClientTable`
-//! owns replicated VSR sessions and their dedup watermarks. Login binds the
-//! two together, so logout and eviction must release BOTH -- every teardown
-//! path below pairs `remove_connection` with a replicated `Logout`.
+//! The per-shard `SessionManager` owns local connection bindings, heartbeats,
+//! and SDK info; the consensus `ClientTable` owns replicated logical sessions
+//! and retry protection. Disconnect and heartbeat eviction remove only the
+//! local binding. Explicit logout or committed lease expiry retires the shared
+//! session and its consumer-group membership.
 
+use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
     FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
-use crate::dispatch::reads::complete_session_binding;
 use crate::reply_frame::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
 };
@@ -366,9 +365,9 @@ const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
 
 /// Per-shard heartbeat verifier: evict connections that have not pinged within
 /// `1.2 x interval`. Mirrors the legacy `verify_heartbeats` periodic task.
-/// Eviction reuses the disconnect path (drops the client from its consumer
-/// groups + rebalances via the replicated `Logout`) and sends a session-
-/// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
+/// Eviction removes the connection binding and sends `Eviction(StaleClient)`.
+/// The shared logical session and its group membership remain until committed
+/// lease expiry or explicit logout.
 #[allow(clippy::future_not_send)]
 pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
@@ -403,14 +402,8 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
             .borrow()
             .collect_stale(max_age, std::time::Instant::now());
         for transport_client_id in stale {
-            // The heartbeat verifier exists to release a dead client's
-            // consumer-group membership (so the group rebalances off it). A
-            // connection that holds no membership has nothing for the eviction
-            // to clean up; reaping it would only drop a still-usable session
-            // (e.g. an idle admin connection that polls between long gaps),
-            // which the legacy server tolerates. The real transport-disconnect
-            // path still reaps it on socket close. So only evict a stale
-            // connection that is actually a group member.
+            // Preserve idle admin connections. Group-member connections get an
+            // eviction notice; membership ends through committed lease expiry.
             let is_group_member = sessions
                 .borrow()
                 .bound_client_id(transport_client_id)
@@ -430,9 +423,7 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     }
 }
 
-/// Evict one stale connection: drop its session (releasing consumer-group
-/// membership through a replicated `Logout`) and notify the client with a
-/// session-terminal `Eviction(StaleClient)`.
+/// Remove one stale connection binding and notify it with `Eviction(StaleClient)`.
 #[allow(clippy::future_not_send)]
 async fn evict_stale_client<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
