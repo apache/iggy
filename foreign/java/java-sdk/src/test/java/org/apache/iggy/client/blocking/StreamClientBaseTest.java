@@ -19,18 +19,23 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollingKind;
+import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public abstract class StreamClientBaseTest extends IntegrationTest {
 
@@ -97,7 +102,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void shouldPurgeStream() {
+    void shouldPurgeStream() throws InterruptedException {
         // given
         var streamDetails = streamsClient.createStream("test-stream");
         trackStream(streamDetails.id());
@@ -116,8 +121,27 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
                 streamId, secondTopicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
 
         // The sends are acknowledged before this runs, so the messages must already be visible.
-        assertThat(pollMessages(messagesClient, streamId, topicId).messages()).hasSize(1);
-        assertThat(pollMessages(messagesClient, streamId, secondTopicId).messages())
+        assertThat(messagesClient
+                        .pollMessages(
+                                streamId,
+                                topicId,
+                                Optional.empty(),
+                                Consumer.of(0L),
+                                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                                10L,
+                                false)
+                        .messages())
+                .hasSize(1);
+        assertThat(messagesClient
+                        .pollMessages(
+                                streamId,
+                                secondTopicId,
+                                Optional.empty(),
+                                Consumer.of(0L),
+                                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                                10L,
+                                false)
+                        .messages())
                 .hasSize(1);
 
         // when
@@ -128,11 +152,43 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
         assertThat(streamOptional).isPresent();
         assertThat(topicsClient.getTopic(streamId, topicId)).isPresent();
         assertThat(topicsClient.getTopic(streamId, secondTopicId)).isPresent();
-        assertThat(pollUntilEmpty(messagesClient, streamId, topicId))
-                .as("messages are purged from the stream")
-                .isTrue();
-        assertThat(pollUntilEmpty(messagesClient, streamId, secondTopicId))
-                .as("messages are purged from the stream")
-                .isTrue();
+        // The purge is acknowledged once the server accepts it, but the messages can still
+        // be visible to a poll issued right after, so poll until both topics read empty.
+        var deadline = System.currentTimeMillis() + 10_000;
+        var purged = false;
+        while (System.currentTimeMillis() < deadline) {
+            if (messagesClient
+                            .pollMessages(
+                                    streamId,
+                                    topicId,
+                                    Optional.empty(),
+                                    Consumer.of(0L),
+                                    new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                                    10L,
+                                    false)
+                            .messages()
+                            .isEmpty()
+                    && messagesClient
+                            .pollMessages(
+                                    streamId,
+                                    secondTopicId,
+                                    Optional.empty(),
+                                    Consumer.of(0L),
+                                    new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                                    10L,
+                                    false)
+                            .messages()
+                            .isEmpty()) {
+                purged = true;
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(purged).as("messages are purged from the stream").isTrue();
+    }
+
+    @Test
+    void shouldFailPurgeForNonExistingStream() {
+        assertThatThrownBy(() -> streamsClient.purgeStream(999L)).isInstanceOf(RuntimeException.class);
     }
 }

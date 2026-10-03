@@ -19,10 +19,13 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollingKind;
+import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -30,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -68,7 +72,7 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void shouldPurgeTopic() {
+    void shouldPurgeTopic() throws InterruptedException {
         // given
         var topicDetails = topicsClient.createTopic(
                 STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic");
@@ -78,7 +82,16 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
                 STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(Message.of("message to purge")));
 
         // The send is acknowledged before this runs, so the message must already be visible.
-        assertThat(pollMessages(messagesClient, STREAM_NAME, topicId).messages())
+        assertThat(messagesClient
+                        .pollMessages(
+                                STREAM_NAME,
+                                topicId,
+                                Optional.empty(),
+                                Consumer.of(0L),
+                                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                                10L,
+                                false)
+                        .messages())
                 .hasSize(1);
 
         // when
@@ -86,18 +99,50 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(topicsClient.getTopic(STREAM_NAME, topicId)).isPresent();
-        assertThat(pollUntilEmpty(messagesClient, STREAM_NAME, topicId))
-                .as("messages are purged from the topic")
-                .isTrue();
+        // The purge is acknowledged once the server accepts it, but the message can still
+        // be visible to a poll issued right after, so poll until the topic reads empty.
+        var deadline = System.currentTimeMillis() + 10_000;
+        var purged = false;
+        while (System.currentTimeMillis() < deadline) {
+            if (messagesClient
+                    .pollMessages(
+                            STREAM_NAME,
+                            topicId,
+                            Optional.empty(),
+                            Consumer.of(0L),
+                            new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                            10L,
+                            false)
+                    .messages()
+                    .isEmpty()) {
+                purged = true;
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(purged).as("messages are purged from the topic").isTrue();
 
         // when — a message is sent after the purge
         messagesClient.sendMessages(
                 STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(Message.of("message after purge")));
 
         // then — it is stored as the first message, at offset 0
-        var polled = pollMessages(messagesClient, STREAM_NAME, topicId);
+        var polled = messagesClient.pollMessages(
+                STREAM_NAME,
+                topicId,
+                Optional.empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
         assertThat(polled.messages()).hasSize(1);
         assertThat(polled.messages().get(0).header().offset()).isEqualTo(BigInteger.ZERO);
+    }
+
+    @Test
+    void shouldFailPurgeForNonExistingTopic() {
+        assertThatThrownBy(() -> topicsClient.purgeTopic(STREAM_NAME, TopicId.of(404L)))
+                .isInstanceOf(RuntimeException.class);
     }
 
     @Test

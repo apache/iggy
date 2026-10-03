@@ -20,12 +20,6 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.client.BaseIntegrationTest;
-import org.apache.iggy.consumergroup.Consumer;
-import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.PolledMessages;
-import org.apache.iggy.message.PollingKind;
-import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
@@ -34,7 +28,6 @@ import org.junit.jupiter.api.BeforeEach;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
@@ -123,37 +116,5 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
         if (!createdUserIds.contains(userId)) {
             createdUserIds.add(userId);
         }
-    }
-
-    protected static PolledMessages pollMessages(MessagesClient messagesClient, StreamId streamId, TopicId topicId) {
-        return messagesClient.pollMessages(
-                streamId,
-                topicId,
-                Optional.empty(),
-                Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
-                10L,
-                false);
-    }
-
-    /**
-     * Polls until no messages remain or the timeout elapses. A purge is acknowledged once the
-     * server accepts it, but the messages can still be visible to a poll issued right after, so a
-     * single poll is not a reliable assertion that the purge took effect.
-     */
-    protected static boolean pollUntilEmpty(MessagesClient messagesClient, StreamId streamId, TopicId topicId) {
-        var deadline = System.currentTimeMillis() + 10_000;
-        do {
-            if (pollMessages(messagesClient, streamId, topicId).messages().isEmpty()) {
-                return true;
-            }
-            try {
-                Thread.sleep(200);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        } while (System.currentTimeMillis() < deadline);
-        return false;
     }
 }
