@@ -123,6 +123,7 @@ impl Client for QuicClient {
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.forget_session_credentials().await;
         QuicClient::disconnect_transport(self).await?;
         self.reset_vsr_session().await
     }

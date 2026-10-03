@@ -2599,9 +2599,8 @@ class SendMessagesConfirmation:
         r"""
         Gets the offset assigned to the first message of the batch in this partition.
 
-        The offset locates the batch, it does not identify it. Delivery is
-        at-least-once, so an earlier retry may already have committed these
-        messages at a lower offset.
+        The offset locates the batch, it does not identify it. An application
+        resend creates another request and can duplicate the messages.
 
         Confirmation follows VSR quorum commit. A topic with persisted message
         durability also waits for recoverable stable-storage copies on the quorum.
@@ -2620,10 +2619,10 @@ class SendMessagesResponse:
         The list is empty when the server reports no offsets, so check whether
         it is empty before indexing into it.
 
-        A reported `base_offset` never implies uniqueness, because delivery is
-        at-least-once and an earlier retry may already have committed the same
-        messages at a lower offset. Confirmation follows the topic's message
-        durability policy: quorum commit, plus stable storage for persisted topics.
+        A reported `base_offset` never implies uniqueness: an application resend
+        can commit the same messages at another offset. Confirmation follows the
+        topic's policy: quorum commit, plus stable storage and crash-safe retry
+        receipts for persisted topics.
         """
 
 @typing.final
