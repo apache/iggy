@@ -886,7 +886,8 @@
     "14000": "already_authenticated",
     "14001": "invalid_session",
     "14003": "incompatible_protocol_version",
-    "14004": "session_mismatch"
+    "14004": "session_mismatch",
+    "14005": "request_id_exhausted"
   },
   "vectors": {
     "consumer.numeric.42": "0101042a000000",
