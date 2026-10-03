@@ -25,8 +25,6 @@ use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
 
 use crate::CREATED_REVISION_FILE;
-#[cfg(feature = "simulator")]
-use crate::persistence::FileSyncBarrier;
 
 const BACKUP: &str = ".install-backup";
 const BUILDING: &str = ".install-building";
@@ -69,51 +67,28 @@ pub async fn recover_with_storage<S: DurableStorage>(
 }
 
 /// Freeze the old materialization and WAL together before a destructive install.
+///
 /// The caller drains persistence and holds the partition write lock until finish.
+/// Each path in `synced_files` must still name the inode synced by its original
+/// writer, with no further writes to that inode before `begin` returns. These
+/// paths skip a fresh sync of the backup hard link.
 ///
 /// # Errors
 /// Returns an error if the rollback state cannot be made durable.
 /// After any failure the caller must stop serving until recovery.
-pub async fn begin(directory: &Path, synced_files: BTreeSet<PathBuf>) -> io::Result<()> {
-    begin_with_synced_files(directory, synced_files, &DiskStorage)
+pub async fn begin(directory: &Path, synced_files: &BTreeSet<PathBuf>) -> io::Result<()> {
+    begin_with_storage(directory, synced_files, &DiskStorage)
         .await
         .note_descriptor_exhaustion(|| format!("starting an install in {}", directory.display()))
 }
 
-/// Storage-generic form of [`begin`] used by deterministic storage tests.
+/// Storage-generic install entry point with the same `synced_files` contract as [`begin`].
 ///
 /// # Errors
 /// Returns an error when the install transaction cannot complete durably.
 pub async fn begin_with_storage<S: DurableStorage>(
     directory: &Path,
-    storage: &S,
-) -> io::Result<()> {
-    begin_with_synced_files(directory, BTreeSet::new(), storage).await
-}
-
-/// Simulator form of [`begin_with_storage`] that retains original writers in
-/// [`FileSyncBarrier`] values until their durability barriers complete.
-///
-/// # Errors
-/// Returns an error when an original-writer barrier fails or the install
-/// transaction cannot complete durably.
-#[cfg(feature = "simulator")]
-pub async fn begin_with_storage_and_barriers<S: DurableStorage>(
-    directory: &Path,
-    barriers: Vec<FileSyncBarrier>,
-    storage: &S,
-) -> io::Result<()> {
-    let synced_files =
-        futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run))
-            .await?
-            .into_iter()
-            .collect();
-    begin_with_synced_files(directory, synced_files, storage).await
-}
-
-async fn begin_with_synced_files<S: DurableStorage>(
-    directory: &Path,
-    synced_files: BTreeSet<PathBuf>,
+    synced_files: &BTreeSet<PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     if storage.exists(&directory.join(BACKUP)).await? {
@@ -123,7 +98,7 @@ async fn begin_with_synced_files<S: DurableStorage>(
     storage.remove_tree(&building).await?;
     storage.remove_tree(&directory.join(RETIRED)).await?;
     storage.create_directories(&building).await?;
-    link_tree(directory, &building, true, &synced_files, storage).await?;
+    link_tree(directory, &building, true, synced_files, storage).await?;
     storage.rename(&building, &directory.join(BACKUP)).await?;
     storage.sync_directory(directory).await
 }
@@ -253,9 +228,7 @@ mod tests {
         ] {
             std::fs::write(root.join(name), name.as_bytes()).unwrap();
         }
-        // These std writes are closed before [`begin`], so no original writer
-        // remains to synchronize.
-        begin(root, BTreeSet::new()).await.unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
         // Model the install's unlink and atomic replacement operations.
         for name in ["0.log", "offsets/1", "prepares-1/frontier"] {
             std::fs::remove_file(root.join(name)).unwrap();
@@ -282,8 +255,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::write(root.join("0.log"), b"old").unwrap();
-        // The fixture has no live writer outside [`begin`].
-        begin(root, BTreeSet::new()).await.unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
         std::fs::remove_file(root.join("0.log")).unwrap();
         std::fs::write(root.join("0.log"), b"new").unwrap();
         File::open(root.join("0.log"))
@@ -308,7 +280,7 @@ mod tests {
         crate::write_created_revision(partition_dir, CREATED_REVISION)
             .await
             .unwrap();
-        begin(root, BTreeSet::new()).await.unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
         // The delete walk removes the backup's files in no fixed order, the
         // marker last only at the top level.
         for entry in std::fs::read_dir(root.join(BACKUP)).unwrap() {

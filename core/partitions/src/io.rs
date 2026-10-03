@@ -884,7 +884,7 @@ impl TransferFileJob {
             } => {
                 let path = std::path::Path::new(&directory);
                 let outcome = if begin {
-                    crate::install_backup::begin(path, synced_files).await
+                    crate::install_backup::begin(path, &synced_files).await
                 } else {
                     crate::install_backup::finish(path).await
                 };
