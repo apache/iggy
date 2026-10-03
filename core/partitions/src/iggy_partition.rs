@@ -1072,20 +1072,14 @@ where
             let path = writer.path();
             let writer = Rc::clone(writer);
             barriers.push(FileSyncBarrier::from_future(path, async move {
-                writer
-                    .fsync()
-                    .await
-                    .map_err(|error| std::io::Error::other(error.to_string()))
+                writer.fsync().await.map_err(std::io::Error::other)
             }));
         }
         if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref) {
             let path = writer.path().to_owned();
             let writer = Rc::clone(writer);
             barriers.push(FileSyncBarrier::from_future(path, async move {
-                writer
-                    .fsync()
-                    .await
-                    .map_err(|error| std::io::Error::other(error.to_string()))
+                writer.fsync().await.map_err(std::io::Error::other)
             }));
         }
         let synced_files = persistence.barrier_files(barriers);
