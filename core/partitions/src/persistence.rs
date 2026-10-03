@@ -157,7 +157,7 @@ impl FileSyncBarrier {
         Self::from_future(path, async { Ok(()) })
     }
 
-    pub(crate) async fn run(self) -> io::Result<PathBuf> {
+    async fn run(self) -> io::Result<PathBuf> {
         self.sync.await.map_err(|error| {
             io::Error::new(error.kind(), format!("{}: {error}", self.path.display()))
         })?;
@@ -899,8 +899,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             .keys()
             .map(PathBuf::from)
             .collect();
-        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
-        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
+        let offset_files = self.drain_offset_files();
         self.queue.borrow_mut().push_back(Mutation::Checkpoint {
             epoch: self.epoch.get(),
             through_op,
@@ -912,10 +911,10 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         });
     }
 
-    /// Queue a durability barrier through every retained original writer,
-    /// including offset files restored from the backup, without advancing
-    /// [`PartitionPersistence::checkpoint_op`].
-    pub(crate) fn barrier_files(&self, barriers: Vec<FileSyncBarrier>) -> BTreeSet<PathBuf> {
+    /// Queue a durability barrier through retained original writers without
+    /// advancing [`PartitionPersistence::checkpoint_op`]. The returned paths
+    /// count as synced only after the queued barrier succeeds.
+    pub fn barrier_files(&self, barriers: Vec<FileSyncBarrier>) -> BTreeSet<PathBuf> {
         let synced_files = self
             .offset_files
             .borrow()
@@ -923,8 +922,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             .map(PathBuf::from)
             .chain(barriers.iter().map(|barrier| barrier.path.clone()))
             .collect();
-        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
-        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
+        let offset_files = self.drain_offset_files();
         self.queue.borrow_mut().push_back(Mutation::Barrier {
             epoch: self.epoch.get(),
             barriers,
@@ -1390,6 +1388,12 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             .try_for_each_concurrent(16, |retained| retained.file.sync())
             .await?;
         futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run)).await
+    }
+
+    fn drain_offset_files(&self) -> Vec<RetainedOffsetFile<S::File>> {
+        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
+        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
+        offset_files
     }
 
     async fn append_batch(

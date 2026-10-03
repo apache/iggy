@@ -787,9 +787,7 @@ fn synchronized_corruption_in_any_record_block_is_refused() {
 
 async fn interrupted_install() -> SimStorage {
     let (storage, mut journal) = baseline().await;
-    // `baseline` completed its original-writer syncs before this test-only
-    // [`install_backup::begin_with_storage`] call.
-    install_backup::begin_with_storage(Path::new(DIRECTORY), &storage)
+    install_backup::begin_with_storage(Path::new(DIRECTORY), &BTreeSet::new(), &storage)
         .await
         .unwrap();
     replace(&storage, Path::new("/partition/state"), b"new")
@@ -808,6 +806,10 @@ async fn interrupted_install() -> SimStorage {
 fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publication() {
     block_on(async {
         let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
         let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
         writer.write(0, b"pending".to_vec()).await.unwrap();
@@ -815,11 +817,14 @@ fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publi
 
         storage.fail_writeback(path).unwrap();
         let barrier = FileSyncBarrier::from_file(path, writer);
-        let result = install_backup::begin_with_storage_and_barriers(
-            Path::new(DIRECTORY),
-            vec![barrier],
-            &storage,
-        )
+        let synced_files = persistence.barrier_files(vec![barrier]);
+        assert!(synced_files.contains(path));
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let result = async {
+            persistence.drain().await?;
+            install_backup::begin_with_storage(Path::new(DIRECTORY), &synced_files, &storage).await
+        }
         .await;
 
         assert!(
@@ -832,6 +837,55 @@ fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publi
                 .await
                 .unwrap(),
             "a failed backup was published"
+        );
+    });
+}
+
+#[test]
+fn given_a_failed_offset_writeback_when_barriering_install_files_should_refuse_publication() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let path = Path::new("/partition/offsets/consumers/1");
+        storage
+            .create_directories(path.parent().unwrap())
+            .await
+            .unwrap();
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"pending".to_vec()).await.unwrap();
+        storage
+            .sync_directory(path.parent().unwrap())
+            .await
+            .unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), writer)
+            .await
+            .unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        let synced_files = persistence.barrier_files(Vec::new());
+        assert!(synced_files.contains(path));
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let result = async {
+            persistence.drain().await?;
+            install_backup::begin_with_storage(Path::new(DIRECTORY), &synced_files, &storage).await
+        }
+        .await;
+
+        assert!(
+            result.is_err(),
+            "install backup published after offset writeback failed"
+        );
+        assert!(persistence.failure().is_some());
+        assert!(
+            !storage
+                .exists(Path::new("/partition/.install-backup"))
+                .await
+                .unwrap()
         );
     });
 }
@@ -2540,9 +2594,7 @@ async fn install(
     storage: &SimStorage,
     journal: &mut PartitionPrepareJournal<SimStorage>,
 ) -> io::Result<()> {
-    // Fault-matrix setup injects no background writeback error before this
-    // test-only [`install_backup::begin_with_storage`] call.
-    install_backup::begin_with_storage(Path::new(DIRECTORY), storage).await?;
+    install_backup::begin_with_storage(Path::new(DIRECTORY), &BTreeSet::new(), storage).await?;
     replace(storage, Path::new("/partition/state"), b"new").await?;
     for path in MATERIALIZED_FILES {
         replace(storage, Path::new(path), b"new").await?;

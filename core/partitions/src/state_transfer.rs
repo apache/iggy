@@ -1466,11 +1466,13 @@ pub enum PartitionInstallError {
         previous_end: u64,
         next_start: u64,
     },
-    /// Filesystem failure at/after the swap; disk holds a contiguous prefix
-    /// of the new state and a crash-restart recovers it (see the module
-    /// crash-window notes). The IN-MEMORY partition is converged to an
-    /// empty, honestly-lagging state before this returns, so the live
-    /// process stays serviceable and the normal triggers re-transfer.
+    /// A writer sync or backup preparation failure returns before the swap;
+    /// the old in-memory partition remains in place and may be fenced.
+    /// At/after the swap, disk holds a contiguous prefix of the new state
+    /// and a crash-restart recovers it (see the module crash-window notes).
+    /// On the storeless post-swap failure path, the IN-MEMORY partition is
+    /// converged to an empty, honestly-lagging state before this returns,
+    /// so the live process stays serviceable and the normal triggers re-transfer.
     SwapIo {
         path: String,
         source: std::io::Error,
@@ -2718,17 +2720,13 @@ where
 
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
-        if self.persistence.is_some() {
-            // [`IggyPartition::barrier_install_files_locked`] covers original
+        if let Some(persistence) = self.persistence.as_ref() {
+            // [`IggyPartition::sync_install_writers`] covers original
             // writers even when no [`crate::PartitionPersistence`] checkpoint can advance.
-            let synced_files = match self.barrier_install_files_locked().await {
+            let synced_files = match self.sync_install_writers(persistence).await {
                 Ok(synced_files) => synced_files,
                 Err(source) => {
-                    if self
-                        .persistence
-                        .as_ref()
-                        .is_some_and(|persistence| persistence.failure().is_some())
-                    {
+                    if persistence.failure().is_some() {
                         self.fence_install_failure(commit_op);
                     }
                     return Err(PartitionInstallError::SwapIo {
@@ -2738,7 +2736,7 @@ where
                 }
             };
             if let Err(source) =
-                crate::install_backup::begin(Path::new(&partition_dir), synced_files).await
+                crate::install_backup::begin(Path::new(&partition_dir), &synced_files).await
             {
                 // The backup rename may have landed before its directory barrier failed.
                 // Further commits could then be erased by rollback on the next boot.

@@ -1063,10 +1063,10 @@ where
     ///
     /// Unlike [`IggyPartition::checkpoint_persistence`], this barrier runs even
     /// when the checkpoint frontier cannot advance.
-    pub(crate) async fn barrier_install_files_locked(&self) -> std::io::Result<BTreeSet<PathBuf>> {
-        let Some(persistence) = &self.persistence else {
-            return Ok(BTreeSet::new());
-        };
+    pub(crate) async fn sync_install_writers(
+        &self,
+        persistence: &PartitionPersistence,
+    ) -> std::io::Result<BTreeSet<PathBuf>> {
         let mut barriers = Vec::with_capacity(2);
         if let Some(writer) = self.log.messages_writers().last().and_then(Option::as_ref) {
             let path = writer.path();
@@ -16388,6 +16388,38 @@ mod tests {
     /// without any production-side plumbing.
     #[cfg(target_os = "linux")]
     const DEV_FULL: &str = "/dev/full";
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_an_unsyncable_messages_writer_when_installing_should_refuse_the_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("wal");
+        let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+        let messages_writer =
+            MessagesWriter::new(DEV_FULL, Rc::new(AtomicU64::new(0)), false, false, None)
+                .await
+                .unwrap();
+        let index_path = directory.path().join("segment.index");
+        let index_writer = IggyIndexWriter::new(
+            index_path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut partition = test_partition();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+            SegmentStorage::default(),
+            Some(Rc::new(messages_writer)),
+            Some(Rc::new(index_writer)),
+        );
+        partition.persistence = Some(Rc::clone(&persistence));
+
+        assert!(partition.sync_install_writers(&persistence).await.is_err());
+        assert!(persistence.failure().is_some());
+    }
 
     const FIRST_PAYLOAD: &[u8] = b"first-chunk";
     const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";
