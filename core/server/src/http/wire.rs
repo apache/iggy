@@ -34,8 +34,7 @@ use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::wire_conversions::{consumer_to_wire, identifier_to_wire, partitioning_to_wire};
 use iggy_common::{
-    Consumer, Identifier, IggyError, IggyMessageView, PollMessages, PolledMessages,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, SendMessages,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessageView, PollMessages, SendMessages,
 };
 use server_common::Message;
 
@@ -96,14 +95,15 @@ pub(in crate::http) fn encode_send_messages(
 
 /// Map a validated HTTP poll query onto the wire `PollMessagesRequest` the
 /// shared TCP resolver consumes, so both transports resolve one request shape.
-/// The query's consumer kind is structurally always `Consumer`
-/// (`Consumer::kind` is `#[serde(skip)]` - the flattened `kind` param names
-/// the polling strategy), matching the legacy HTTP server.
+/// Rejects `consumer_kind=consumer_group` since HTTP has no persistent connection.
 pub(in crate::http) fn poll_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     query: &PollMessages,
 ) -> Result<PollMessagesRequest, IggyError> {
+    if query.consumer.kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
     Ok(PollMessagesRequest {
         consumer: WireConsumer {
             kind: query.consumer.kind.as_code(),
@@ -143,15 +143,18 @@ pub(in crate::http) fn consumer_offset_wire_request(
 
 /// Map a validated HTTP store-offset body onto the wire request
 /// (`StoreConsumerOffsetRequest`), `ack` pinned to `Quorum` so the route can
-/// await the committed reply. The body's consumer kind is structurally always
-/// `Consumer` (`Consumer::kind` is `#[serde(skip)]`), matching the legacy HTTP
-/// server; `partition_id` passes through as the wire `Option` (flag byte +
-/// u32) for the server-side resolvers to ground.
+/// await the committed reply. `partition_id` passes through as the wire
+/// `Option` (flag byte + u32) for the server-side resolvers to ground.
+/// Rejects `consumer_kind=consumer_group` since HTTP has no persistent
+/// connection to hold group membership, so the write would always be fenced.
 pub(in crate::http) fn store_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     command: &StoreConsumerOffset,
 ) -> Result<StoreConsumerOffsetRequest, IggyError> {
+    if command.consumer.kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
     Ok(StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(&command.consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
@@ -164,13 +167,17 @@ pub(in crate::http) fn store_offset_wire_request(
 
 /// Map a validated HTTP delete-offset request onto the wire request
 /// (`DeleteConsumerOffsetRequest`), `ack` pinned to `Quorum` like
-/// [`store_offset_wire_request`].
+/// [`store_offset_wire_request`]. Rejects `consumer_kind=consumer_group` for
+/// the same reason [`store_offset_wire_request`] does.
 pub(in crate::http) fn delete_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     consumer: &Consumer,
     partition_id: Option<u32>,
 ) -> Result<DeleteConsumerOffsetRequest, IggyError> {
+    if consumer.kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
     Ok(DeleteConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
@@ -178,18 +185,6 @@ pub(in crate::http) fn delete_offset_wire_request(
         partition_id,
         ack: AckLevel::Quorum,
     })
-}
-
-/// The empty `PolledMessages` a fenced consumer-group poll answers, carrying
-/// the re-sync sentinel in `partition_id` exactly as the TCP dispatch replies
-/// it, so an SDK re-syncs its assignment instead of reading end-of-partition.
-pub(in crate::http) const fn resync_required_polled_messages() -> PolledMessages {
-    PolledMessages {
-        partition_id: RESYNC_REQUIRED_PARTITION_SENTINEL,
-        current_offset: 0,
-        count: 0,
-        messages: Vec::new(),
-    }
 }
 
 /// Build a `Message<RoutedRequestHeader>` for a control-plane write by filling a zeroed
@@ -229,7 +224,7 @@ mod tests {
     use iggy_binary_protocol::WireEncode;
     use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
     use iggy_common::{
-        Consumer, ConsumerKind, IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind,
+        IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind, PolledMessages,
         PollingKind, PollingStrategy, Validatable,
     };
     use partitions::{Fragment, PollFragments};
@@ -425,6 +420,18 @@ mod tests {
     }
 
     #[test]
+    fn poll_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::from_str_value("orders").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("1").expect("valid topic id");
+        let query = PollMessages {
+            consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
+            ..Default::default()
+        };
+        let error = poll_wire_request(&stream_id, &topic_id, &query).expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
     fn consumer_offset_wire_request_defaults_omitted_partition_to_zero() {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::numeric(1).expect("valid topic id");
@@ -435,6 +442,54 @@ mod tests {
         let wire = consumer_offset_wire_request(&stream_id, &topic_id, &query).expect("maps");
         assert_eq!(wire.partition_id, Some(DEFAULT_PARTITION_ID));
         assert_eq!(wire.consumer.kind, 1);
+    }
+
+    #[test]
+    fn consumer_offset_wire_request_maps_consumer_group_kind() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::numeric(1).expect("valid topic id");
+        let query = GetConsumerOffset {
+            consumer: Consumer::group(Identifier::numeric(7).expect("valid id")),
+            partition_id: Some(2),
+        };
+        let wire = consumer_offset_wire_request(&stream_id, &topic_id, &query).expect("maps");
+        assert_eq!(wire.consumer.kind, 2);
+        assert_eq!(wire.partition_id, Some(2));
+    }
+
+    #[test]
+    fn get_consumer_offset_query_parses_consumer_kind_param() {
+        let uri: Uri = "/streams/1/topics/1/consumer-offsets?consumer_id=my-group&consumer_kind=consumer_group&partition_id=0"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<GetConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::ConsumerGroup);
+        assert_eq!(
+            query.consumer.id,
+            Identifier::named("my-group").expect("valid id")
+        );
+    }
+
+    #[test]
+    fn get_consumer_offset_query_defaults_consumer_kind_when_omitted() {
+        let uri: Uri = "/streams/1/topics/1/consumer-offsets?consumer_id=42"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<GetConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::Consumer);
+    }
+
+    #[test]
+    fn store_consumer_offset_json_body_round_trips_consumer_group_kind() {
+        let json = serde_json::json!({
+            "consumer_id": "my-group",
+            "consumer_kind": "consumer_group",
+            "partition_id": 0,
+            "offset": 42,
+        });
+        let command: StoreConsumerOffset =
+            serde_json::from_value(json).expect("valid StoreConsumerOffset body");
+        assert_eq!(command.consumer.kind, ConsumerKind::ConsumerGroup);
     }
 
     #[test]
@@ -512,6 +567,46 @@ mod tests {
         assert_eq!(query.partition_id, None);
     }
 
+    #[test]
+    fn delete_offset_query_parses_consumer_kind_param() {
+        let uri: Uri = "/x?consumer_kind=consumer_group&partition_id=3"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer_kind, ConsumerKind::ConsumerGroup);
+        let bare: Uri = "/x".parse().expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&bare).expect("parses");
+        assert_eq!(query.consumer_kind, ConsumerKind::Consumer);
+    }
+
+    #[test]
+    fn store_offset_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::named("orders").expect("valid topic id");
+        let command = StoreConsumerOffset {
+            consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
+            partition_id: Some(1),
+            offset: 42,
+        };
+        let error =
+            store_offset_wire_request(&stream_id, &topic_id, &command).expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
+    fn delete_offset_wire_request_rejects_consumer_group_kind() {
+        let stream_id = Identifier::named("stream-1").expect("valid stream id");
+        let topic_id = Identifier::numeric(2).expect("valid topic id");
+        let error = delete_offset_wire_request(
+            &stream_id,
+            &topic_id,
+            &Consumer::group(Identifier::numeric(9).expect("valid id")),
+            Some(1),
+        )
+        .expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
     /// Wrap one stored `SendMessages` batch (`[256B header][blob]`) as the
     /// poll fragment the owning shard replies, the shape
     /// `build_polled_messages_body` consumes.
@@ -584,13 +679,5 @@ mod tests {
             polled.messages[1].user_headers.as_deref(),
             Some(b"raw-header-bytes".as_ref())
         );
-    }
-
-    #[test]
-    fn resync_required_polled_messages_carries_sentinel_partition() {
-        let polled = resync_required_polled_messages();
-        assert_eq!(polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL);
-        assert_eq!(polled.count, 0);
-        assert!(polled.messages.is_empty());
     }
 }

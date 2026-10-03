@@ -23,11 +23,167 @@ use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
 use integration::iggy_harness;
 use tokio::time::{Duration, timeout};
 
-const STREAM_NAME: &str = "delete-offset-stream";
-const TOPIC_NAME: &str = "delete-offset-topic";
-const CONSUMER_NAME: &str = "delete-offset-consumer";
+const STREAM_NAME: &str = "test-offset-stream";
+const TOPIC_NAME: &str = "test-offset-topic";
+const CONSUMER_NAME: &str = "test-offset-consumer";
+const CONSUMER_GROUP_NAME: &str = "test-offset-group";
+const OFFSET_PARTITION_ID: u32 = 0;
 const ASSIGNED_PARTITION_ID: u32 = 3;
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[iggy_harness(test_client_transport = [Http, Tcp, Quic, WebSocket])]
+async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should_store_read_and_delete(
+    harness: &TestHarness,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+
+    // A consumer-group member needs a persistent connection. Required
+    // for offset test cases using a consumer group.
+    let seed_client = harness
+        .tcp_root_client()
+        .await
+        .expect("Failed to get tcp seed client");
+
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(&stream_id, TOPIC_NAME, &TopicCreateOptions::default())
+        .await
+        .unwrap();
+
+    let mut messages = vec![
+        IggyMessage::from_str("message_1").unwrap(),
+        IggyMessage::from_str("message_2").unwrap(),
+        IggyMessage::from_str("message_3").unwrap(),
+        IggyMessage::from_str("message_4").unwrap(),
+        IggyMessage::from_str("message_5").unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(OFFSET_PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    // Setup a consumer that joins a group in order to store, read and delete
+    // offsets from a group member.
+    seed_client
+        .create_consumer_group(&stream_id, &topic_id, CONSUMER_GROUP_NAME)
+        .await
+        .unwrap();
+
+    seed_client
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .unwrap();
+
+    let standalone_consumer = Consumer::new(Identifier::named(CONSUMER_NAME).unwrap());
+    let group_consumer = Consumer::group(group_id.clone());
+
+    // The group consumer must commit and delete through `seed_client`, the
+    // connection that actually joined the group: the server fences a
+    // group-offset write to the calling connection's own membership.
+    for (consumer, offset, owner) in [
+        (&standalone_consumer, 2_u64, &client),
+        (&group_consumer, 4_u64, &seed_client),
+    ] {
+        owner
+            .store_consumer_offset(
+                consumer,
+                &stream_id,
+                &topic_id,
+                Some(OFFSET_PARTITION_ID),
+                offset,
+            )
+            .await
+            .unwrap();
+
+        let stored_offset = client
+            .get_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap()
+            .map(|info| info.stored_offset);
+
+        assert_eq!(
+            stored_offset,
+            Some(offset),
+            "{consumer:?} stored offset should be readable over every transport"
+        );
+
+        owner
+            .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap();
+
+        let stored_offset_after_delete = client
+            .get_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+            .await
+            .unwrap()
+            .map(|info| info.stored_offset);
+
+        assert_eq!(
+            stored_offset_after_delete, None,
+            "{consumer:?} stored offset should be gone after delete over every transport"
+        );
+
+        // HTTP has no persistent connection to fence a group-offset write to,
+        // so store/delete/poll should reject consumer_kind=consumer_group.
+        if consumer.kind == ConsumerKind::ConsumerGroup
+            && harness.transport().expect("harness transport") == TransportProtocol::Http
+        {
+            let store_error = client
+                .store_consumer_offset(
+                    consumer,
+                    &stream_id,
+                    &topic_id,
+                    Some(OFFSET_PARTITION_ID),
+                    offset,
+                )
+                .await
+                .expect_err("HTTP store must reject a consumer-group kind");
+            assert!(
+                matches!(store_error, IggyError::HttpResponseError(400, _)),
+                "expected a 400 rejection for HTTP store with consumer_kind=consumer_group, got {store_error:?}"
+            );
+
+            let delete_error = client
+                .delete_consumer_offset(consumer, &stream_id, &topic_id, Some(OFFSET_PARTITION_ID))
+                .await
+                .expect_err("HTTP delete must reject a consumer-group kind");
+            assert!(
+                matches!(delete_error, IggyError::HttpResponseError(400, _)),
+                "expected a 400 rejection for HTTP delete with consumer_kind=consumer_group, got {delete_error:?}"
+            );
+
+            let poll_error = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    Some(OFFSET_PARTITION_ID),
+                    consumer,
+                    &PollingStrategy::first(),
+                    1,
+                    false,
+                )
+                .await
+                .expect_err("HTTP poll must reject a consumer-group kind");
+            assert!(
+                matches!(poll_error, IggyError::HttpResponseError(400, _)),
+                "expected a 400 rejection for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
+            );
+        }
+    }
+}
 
 #[iggy_harness]
 async fn standalone_consumer_deletes_partition_zero_on_none_in_delete_offset(

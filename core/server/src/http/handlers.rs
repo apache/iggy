@@ -141,7 +141,7 @@ use crate::http::submit::{
 };
 use crate::http::wire::{
     consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
-    poll_wire_request, resync_required_polled_messages, store_offset_wire_request,
+    poll_wire_request, store_offset_wire_request,
 };
 use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
 use crate::responses::connected_client_to_response;
@@ -156,11 +156,11 @@ const PONG: &str = "pong";
 
 /// VSR client id stamped on HTTP data-plane reads (poll / consumer-offset).
 /// HTTP reads never Register a VSR client, and shard-0 client ids are minted
-/// from 1, so 0 can never name a live consumer-group member: a group-kind
-/// poll fences closed with `ConsumerGroupPartitionNotOwned` and answers the
-/// re-sync sentinel empty poll - the same failure a stale TCP member sees.
-/// Legacy HTTP polls with client id 0 for the same reason (no persistent
-/// sessions, so no group membership).
+/// from 1, so 0 can never collide with a live client. `resolve_poll_request`
+/// takes a client id only for its consumer-group fencing branch, and HTTP
+/// never reaches it: `poll_wire_request` rejects `consumer_kind=consumer_group`
+/// up front. Legacy HTTP polls with client id 0 for the same reason (no
+/// persistent sessions, so no group membership).
 const HTTP_READ_CLIENT_ID: u128 = 0;
 
 /// Response header attesting what durability a produce response proves:
@@ -1242,7 +1242,10 @@ pub(in crate::http) async fn delete_segments(
 /// messages as the same `PolledMessages` JSON the legacy server returns. The
 /// query is the same flattened `PollMessages` shape the legacy server accepts
 /// (`consumer_id`, `partition_id`, strategy `kind`+`value`, `count`,
-/// `auto_commit`); stream and topic come from the path.
+/// `auto_commit`); stream and topic come from the path. `consumer_kind`
+/// defaults to `consumer` and `consumer_group` is rejected (see
+/// [`poll_wire_request`]) since HTTP has no persistent connection and cannot observe
+/// group's partition assignment (that can be subject to change).
 ///
 /// A non-replicated read served in band: the same resolution the TCP dispatch
 /// runs ([`resolve_poll_request`]), then a mesh read on the owning shard and a
@@ -1276,11 +1279,6 @@ pub(in crate::http) async fn poll_messages(
     let (namespace, partition_id, consumer, args) =
         match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
             Ok(decoded) => decoded,
-            // TCP parity: a fenced group poll answers 200 with the re-sync
-            // sentinel partition, not an error (see [`HTTP_READ_CLIENT_ID`]).
-            Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
-                return Ok(Json(resync_required_polled_messages()));
-            }
             // A partition id the topic does not have is a client addressing
             // error with its own code; collapsing it into the generic 404 body
             // told an SDK "no such stream/topic" for a request whose stream and
@@ -1324,14 +1322,18 @@ pub(in crate::http) async fn poll_messages(
 
 /// `GET /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: fetch a
 /// consumer's stored offset as the same `ConsumerOffsetInfo` JSON the legacy
-/// server returns. The query is the same flattened `GetConsumerOffset` shape
-/// the legacy server accepts (`consumer_id`, optional `partition_id`).
+/// server returns. The query is the flattened `GetConsumerOffset` shape
+/// (`consumer_id`, optional `consumer_kind` defaulting to `consumer`,
+/// optional `partition_id`).
 ///
 /// A non-replicated read served in band, mirroring [`poll_messages`]. A
 /// missing offset (never stored, or the partition unknown to its owner) is
 /// the legacy 404: the TCP path replies an empty body the SDK decodes as
 /// `None`, and the legacy HTTP server renders that `None` as
-/// `CustomError::ResourceNotFound`.
+/// `CustomError::ResourceNotFound`. Unlike poll/store/delete,
+/// `consumer_kind=consumer_group` is allowed, because a group offset read needs
+/// no held connection, so it is not member-fenced
+/// ([`resolve_consumer_offset_request`]).
 pub(in crate::http) async fn get_consumer_offset(
     State(state): State<HttpState>,
     identity: Identity,
@@ -1464,9 +1466,11 @@ pub(in crate::http) async fn send_messages(
 
 /// `PUT /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: store a
 /// consumer's offset. The JSON body is the same `StoreConsumerOffset` shape the
-/// legacy server accepts (flattened `consumer_id`, optional `partition_id`,
-/// `offset`); stream and topic come from the path. Returns 204 on commit,
-/// matching the legacy server.
+/// legacy server accepts (flattened `consumer_id`, optional `consumer_kind`,
+/// `partition_id`, `offset`); stream and topic come from the path. Returns
+/// 204 on commit, matching the legacy server. `consumer_kind=consumer_group`
+/// is rejected ([`store_offset_wire_request`]) since HTTP has no persistent
+/// connection and group memberships can change.
 ///
 /// Data plane like a produce: the offset write is a replicated op on the
 /// partition group's own consensus, awaited through the session's in-process
@@ -1519,12 +1523,14 @@ pub(in crate::http) async fn store_consumer_offset(
 }
 
 /// `DELETE /streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}`:
-/// delete a consumer's stored offset. The consumer comes from the path and the
-/// optional `partition_id` from the query, the same `DeleteConsumerOffset`
-/// shape the legacy server accepts. Returns 204 on commit, matching the legacy
-/// server; a delete of a never-stored offset is denied by the partition
-/// primary (`ReplyHeader.status`) and renders the legacy typed 404. Same
-/// replicated partition write as [`store_consumer_offset`].
+/// delete a consumer's stored offset. The consumer id comes from the path and the
+/// optional `consumer_kind` (defaulting to `consumer`) and `partition_id` come
+/// from the query, the same `DeleteConsumerOffset` shape the legacy server
+/// accepts. Returns 204 on commit, matching the legacy server; a delete of a
+/// never-stored offset is denied by the partition primary
+/// (`ReplyHeader.status`) and renders the legacy typed 404. Same replicated
+/// partition write as [`store_consumer_offset`]. `consumer_kind=consumer_group`
+/// is rejected because HTTP does not persist a connection and group memberships can change.
 pub(in crate::http) async fn delete_consumer_offset(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1543,11 +1549,10 @@ pub(in crate::http) async fn delete_consumer_offset(
         Permissioner::delete_consumer_offset,
     )
     .map_err(PartitionWriteError::Rejected)?;
-    // `Consumer::new` fixes the kind to `Consumer`, exactly as the legacy
-    // handler does; HTTP cannot express a group-kind offset op.
-    let consumer = Consumer::new(
-        Identifier::from_str_value(&consumer_id).map_err(PartitionWriteError::Rejected)?,
-    );
+    let consumer = Consumer {
+        kind: query.consumer_kind,
+        id: Identifier::from_str_value(&consumer_id).map_err(PartitionWriteError::Rejected)?,
+    };
     let request = delete_offset_wire_request(&stream_id, &topic_id, &consumer, query.partition_id)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();

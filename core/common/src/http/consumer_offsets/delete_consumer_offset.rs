@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::ConsumerKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteConsumerOffset {
     #[serde(default)]
+    pub consumer_kind: ConsumerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_id: Option<u32>,
 }

@@ -31,7 +31,7 @@ use std::str::FromStr;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct Consumer {
     /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`.
-    #[serde(skip)]
+    #[serde(rename = "consumer_kind", default)]
     pub kind: ConsumerKind,
     /// The unique identifier of the consumer.
     #[serde(rename = "consumer_id")]

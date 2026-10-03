@@ -21,9 +21,18 @@ use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerOffsetInfo};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// RFC 3986 unreserved characters (`-`, `.`, `_`, `~`).
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
@@ -85,15 +94,19 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        let partition_id = partition_id
-            .map(|id| format!("?partition_id={id}"))
-            .unwrap_or_default();
         let path = format!(
-            "{}/{}{partition_id}",
+            "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            consumer.id
+            utf8_percent_encode(&consumer.id.as_cow_str(), PATH_SEGMENT)
         );
-        self.delete(&path).await?;
+        self.delete_with_query(
+            &path,
+            &DeleteConsumerOffset {
+                consumer_kind: consumer.kind,
+                partition_id,
+            },
+        )
+        .await?;
         Ok(())
     }
 }
