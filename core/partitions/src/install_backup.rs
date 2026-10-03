@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use futures::TryStreamExt;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
@@ -162,6 +163,7 @@ async fn link_tree<S: DurableStorage>(
 ) -> io::Result<()> {
     let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
     let mut directories = Vec::new();
+    let mut files_to_sync = Vec::new();
     while let Some((source, target)) = pending.pop() {
         directories.push(target.clone());
         for entry in storage.entries(&source).await? {
@@ -189,15 +191,20 @@ async fn link_tree<S: DurableStorage>(
                 let source_file = source.join(&name);
                 storage.hard_link(&source_file, &destination).await?;
                 if !synced_files.contains(&source_file) {
-                    storage
-                        .open(&destination, OpenMode::Read)
-                        .await?
-                        .sync()
-                        .await?;
+                    files_to_sync.push(destination);
                 }
             }
         }
     }
+    futures::stream::iter(files_to_sync.into_iter().map(Ok::<_, io::Error>))
+        .try_for_each_concurrent(16, |destination| async move {
+            storage
+                .open(&destination, OpenMode::Read)
+                .await?
+                .sync()
+                .await
+        })
+        .await?;
     for directory in directories.into_iter().rev() {
         storage.sync_directory(&directory).await?;
     }
