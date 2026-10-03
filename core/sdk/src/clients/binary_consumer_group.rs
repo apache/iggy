@@ -18,10 +18,44 @@
 use crate::prelude::IggyClient;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
+use iggy_binary_protocol::{
+    WireDecode, WireEncode, codes::SYNC_CONSUMER_GROUP_CODE,
+    requests::consumer_groups::SyncConsumerGroupRequest,
+    responses::consumer_groups::SyncConsumerGroupResponse,
+};
 use iggy_common::{
     ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError, locking::IggyRwLockFn,
+    wire_conversions::identifier_to_wire,
 };
 use iggy_common::{ConsumerGroupClient, UserClient};
+
+impl IggyClient {
+    /// Reads this connection's partition assignment from the group coordinator.
+    /// Returns `None` if the connection is not a member, and an empty vector if it owns
+    /// no partitions. The snapshot can change during a rebalance. HTTP does not support
+    /// consumer-group membership and returns [`IggyError::FeatureUnavailable`].
+    pub async fn get_consumer_group_assignment(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<Option<Vec<u32>>, IggyError> {
+        let request = SyncConsumerGroupRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            group_id: identifier_to_wire(group_id)?,
+        };
+        let response = self
+            .send_binary_request(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
+            .await?;
+        if response.is_empty() {
+            return Ok(None);
+        }
+        let (assignment, _) =
+            SyncConsumerGroupResponse::decode(&response).map_err(|_| IggyError::InvalidCommand)?;
+        Ok(Some(assignment.partitions))
+    }
+}
 
 #[async_trait]
 impl ConsumerGroupClient for IggyClient {

@@ -34,5 +34,59 @@ pub struct BenchmarkConsumerConfig {
 
 pub trait ConsumerClient: Send + Sync {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError>;
+
+    /// Rewinds the stored offsets of this client's partitions to the start, so the measured
+    /// phase does not read on from where the warmup left off.
+    async fn reset_offsets(&mut self) -> Result<(), IggyError>;
 }
 pub trait BenchmarkConsumerClient: ConsumerClient + BenchmarkInit + ApiLabel + Send + Sync {}
+
+/// Deletes this group member's offsets. Offset-strategy consumers rewind their local cursors.
+pub async fn clear_consumer_offsets(
+    client: &IggyClient,
+    consumer: &Consumer,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+) -> Result<(), IggyError> {
+    let partitions = client
+        .get_consumer_group_assignment(stream_id, topic_id, &consumer.id)
+        .await?
+        .unwrap_or_default();
+
+    for partition_id in &partitions {
+        delete_offset(client, consumer, stream_id, topic_id, *partition_id).await?;
+    }
+
+    // A high-level consumer can be dropped with an in-flight poll that auto-commits.
+    for partition_id in &partitions {
+        let stored = client
+            .get_consumer_offset(consumer, stream_id, topic_id, Some(*partition_id))
+            .await?;
+        if stored.is_some() {
+            delete_offset(client, consumer, stream_id, topic_id, *partition_id).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// A rebalance can transfer ownership after the assignment was read. Missing offsets are
+/// already reset, even when a replica still serves a stale offset read.
+async fn delete_offset(
+    client: &IggyClient,
+    consumer: &Consumer,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: u32,
+) -> Result<(), IggyError> {
+    match client
+        .delete_consumer_offset(consumer, stream_id, topic_id, Some(partition_id))
+        .await
+    {
+        Ok(())
+        | Err(
+            IggyError::ConsumerGroupPartitionNotOwned(..) | IggyError::ConsumerOffsetNotFound(_),
+        ) => Ok(()),
+        Err(error) => Err(error),
+    }
+}

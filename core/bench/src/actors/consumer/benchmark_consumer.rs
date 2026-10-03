@@ -35,6 +35,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
 
+const CONSUMER_CATCH_UP_WINDOW: Duration = Duration::from_secs(1);
+
 pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
     pub client: C,
     pub benchmark_kind: BenchmarkKind,
@@ -71,14 +73,37 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
     pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         self.client.setup().await?;
 
+        let make_rate_limiter = || {
+            self.limit_bytes_per_second.map(|rate| {
+                if self.config.origin_timestamp_latency_calculation {
+                    BenchmarkRateLimiter::with_burst_window(rate, CONSUMER_CATCH_UP_WINDOW)
+                } else {
+                    BenchmarkRateLimiter::new(rate)
+                }
+            })
+        };
+
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
+            let rate_limiter = make_rate_limiter();
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
             while Instant::now() < warmup_end {
-                let _ = self.client.consume_batch().await?;
+                if let Some(batch) = self.client.consume_batch().await?
+                    && let Some(rate_limiter) = &rate_limiter
+                {
+                    rate_limiter
+                        .wait_until_necessary(batch.user_data_bytes)
+                        .await;
+                }
+            }
+            // Consumer-only runs replay the warmup data. Paired producers keep writing,
+            // and replay would also inflate message age in the low-level client.
+            if !self.config.origin_timestamp_latency_calculation {
+                self.client.reset_offsets().await?;
             }
         }
 
+        let rate_limiter = make_rate_limiter();
         self.log_setup_info();
 
         let max_capacity = self.finish_condition.max_capacity();
@@ -88,7 +113,6 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         let mut bytes_processed = 0;
         let mut user_data_bytes_processed = 0;
         let start_timestamp = Instant::now();
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
         while !self.finish_condition.is_done() {
             let batch_opt = self.client.consume_batch().await?;

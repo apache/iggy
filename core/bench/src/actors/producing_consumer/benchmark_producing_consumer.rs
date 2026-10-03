@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::{
     actors::{
@@ -108,16 +114,29 @@ where
             self.producer_config.messages_per_batch,
         );
         let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+        let is_producer = self.send_finish_condition.total() > 0;
+        let is_consumer = self.poll_finish_condition.total() > 0;
         if self.producer_config.warmup_time.get_duration() != Duration::from_millis(0) {
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.producer_config.warmup_time.get_duration();
 
+            // Warmup sends under the same limiter as the measured phase, so the phase boundary
+            // is a step rather than a burst far above the rate being measured.
             while Instant::now() < warmup_end {
-                let _ = self.producer.produce_batch(&mut batch_generator).await;
-                let _ = self.consumer.consume_batch().await;
+                if is_producer
+                    && let Ok(Some(batch)) = self.producer.produce_batch(&mut batch_generator).await
+                    && let Some(limiter) = &rate_limiter
+                {
+                    limiter.wait_until_necessary(batch.user_data_bytes).await;
+                }
+                if is_consumer {
+                    let _ = self.consumer.consume_batch().await;
+                }
             }
         }
 
+        // No offset reset here, unlike the standalone consumer: this kind reports the age of
+        // the message, so re-reading warmup messages would report the whole warmup as latency.
         self.log_setup_info();
         let max_capacity = self
             .send_finish_condition
@@ -125,7 +144,7 @@ where
             .max(self.poll_finish_condition.max_capacity());
         let mut records = Vec::with_capacity(max_capacity);
 
-        let mut rl_value = 0;
+        let mut uncharged_send_bytes = 0;
         let mut sent_user_bytes = 0;
         let mut sent_total_bytes = 0;
         let mut sent_messages = 0;
@@ -135,9 +154,6 @@ where
         let mut recv_total_bytes = 0;
         let mut recv_messages = 0;
         let mut recv_batches = 0;
-
-        let is_producer = self.send_finish_condition.total() > 0;
-        let is_consumer = self.poll_finish_condition.total() > 0;
 
         let require_reply =
             is_producer && is_consumer && self.consumer_config.consumer_group_id.is_none();
@@ -151,7 +167,7 @@ where
                 && (!require_reply || !awaiting_reply)
                 && let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
             {
-                rl_value += batch.user_data_bytes;
+                uncharged_send_bytes += batch.user_data_bytes;
                 sent_user_bytes += batch.user_data_bytes;
                 sent_total_bytes += batch.total_bytes;
                 sent_messages += u64::from(batch.messages);
@@ -175,38 +191,68 @@ where
                 }
             }
 
-            if is_consumer
-                && !self.poll_finish_condition.is_done()
-                && let Some(batch) = self.consumer.consume_batch().await?
+            let pacing_finished = AtomicBool::new(false);
+            let pace_group = async {
+                if !require_reply
+                    && uncharged_send_bytes > 0
+                    && let Some(limiter) = &rate_limiter
+                {
+                    limiter.wait_until_necessary(uncharged_send_bytes).await;
+                }
+                pacing_finished.store(true, Ordering::Relaxed);
+                Ok::<(), IggyError>(())
+            };
+            let consume = async {
+                loop {
+                    if !is_consumer || self.poll_finish_condition.is_done() {
+                        break;
+                    }
+                    if let Some(batch) = self.consumer.consume_batch().await? {
+                        recv_user_bytes += batch.user_data_bytes;
+                        recv_total_bytes += batch.total_bytes;
+                        recv_messages += u64::from(batch.messages);
+                        recv_batches += 1;
+
+                        let elapsed =
+                            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        let latency = u64::try_from(batch.latency.as_micros()).unwrap_or(u64::MAX);
+
+                        records.push(BenchmarkRecord {
+                            elapsed_time_us: elapsed,
+                            latency_us: latency,
+                            messages: sent_messages + recv_messages,
+                            message_batches: sent_batches + recv_batches,
+                            user_data_bytes: sent_user_bytes + recv_user_bytes,
+                            total_bytes: sent_total_bytes + recv_total_bytes,
+                        });
+
+                        self.poll_finish_condition
+                            .account_and_check(batch.user_data_bytes);
+                        if require_reply {
+                            awaiting_reply = false;
+                        }
+                    }
+                    if require_reply || pacing_finished.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Ok::<(), IggyError>(())
+            };
+            // Group members keep polling while producer quota replenishes. Joining the
+            // futures lets an in-flight poll finish before the next send.
+            tokio::try_join!(pace_group, consume)?;
+            if !require_reply {
+                uncharged_send_bytes = 0;
+            }
+
+            // Pinned pairs wait after their reply, so pacing is excluded from its latency.
+            if require_reply
+                && uncharged_send_bytes > 0
+                && !awaiting_reply
+                && let Some(limiter) = &rate_limiter
             {
-                rl_value += batch.user_data_bytes;
-                recv_user_bytes += batch.user_data_bytes;
-                recv_total_bytes += batch.total_bytes;
-                recv_messages += u64::from(batch.messages);
-                recv_batches += 1;
-
-                let elapsed = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let latency = u64::try_from(batch.latency.as_micros()).unwrap_or(u64::MAX);
-
-                records.push(BenchmarkRecord {
-                    elapsed_time_us: elapsed,
-                    latency_us: latency,
-                    messages: sent_messages + recv_messages,
-                    message_batches: sent_batches + recv_batches,
-                    user_data_bytes: sent_user_bytes + recv_user_bytes,
-                    total_bytes: sent_total_bytes + recv_total_bytes,
-                });
-
-                if let Some(limiter) = &rate_limiter {
-                    limiter.wait_until_necessary(rl_value).await;
-                    rl_value = 0;
-                }
-
-                self.poll_finish_condition
-                    .account_and_check(batch.user_data_bytes);
-                if require_reply {
-                    awaiting_reply = false;
-                }
+                limiter.wait_until_necessary(uncharged_send_bytes).await;
+                uncharged_send_bytes = 0;
             }
         }
 
@@ -474,5 +520,200 @@ where
         ]);
 
         println!("\n{table}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actors::{
+        ApiLabel, BatchMetrics, BenchmarkInit,
+        consumer::{benchmark_consumer::BenchmarkConsumer, client::interface::ConsumerClient},
+        producer::client::interface::ProducerClient,
+    };
+    use crate::args::common::IggyBenchArgs;
+    use crate::utils::finish_condition::BenchmarkFinishConditionMode;
+    use clap::Parser;
+    use std::{future::ready, sync::atomic::AtomicUsize};
+    use tokio::{task::yield_now, time::timeout};
+
+    const POLLS_PER_SEND: usize = 4;
+    const PRODUCED_BYTES: u64 = 128;
+    const CONSUMED_BYTES: u64 = PRODUCED_BYTES / POLLS_PER_SEND as u64;
+    const POLLING_DEADLINE: Duration = Duration::from_millis(300);
+    const WARMUP: Duration = Duration::from_millis(10);
+
+    #[tokio::test]
+    async fn given_paced_group_when_waiting_for_quota_should_keep_polling() {
+        let actor = actor();
+        let calls = actor.consumer.calls.clone();
+        let poll_backlog = async {
+            timeout(POLLING_DEADLINE, async {
+                while calls.load(Ordering::Relaxed) < POLLS_PER_SEND {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("all queued batches must be read during the one-second producer wait");
+        };
+
+        let (result, ()) = tokio::join!(actor.run(), poll_backlog);
+        assert_eq!(
+            result.unwrap().summary.total_user_data_bytes,
+            PRODUCED_BYTES * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn given_single_role_actor_when_warming_up_should_only_run_that_role() {
+        for producer_only in [false, true] {
+            let mut actor = actor();
+            actor.producer_config.warmup_time = WARMUP.into();
+            actor.limit_bytes_per_second = None;
+            let inactive_calls = if producer_only {
+                actor.poll_finish_condition = BenchmarkFinishCondition::new_empty();
+                actor.consumer.calls.clone()
+            } else {
+                actor.send_finish_condition = BenchmarkFinishCondition::new_empty();
+                actor.producer.calls.clone()
+            };
+
+            actor.run().await.unwrap();
+            assert_eq!(
+                inactive_calls.load(Ordering::Relaxed),
+                0,
+                "warmup must respect the actor's producer_only={producer_only} role"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_no_warmup_when_consuming_should_preserve_committed_offsets() {
+        let actor = actor();
+        let resets = actor.consumer.resets.clone();
+        let consumer = BenchmarkConsumer::new(
+            actor.consumer,
+            BenchmarkKind::BalancedConsumerGroup,
+            actor.poll_finish_condition,
+            actor.sampling_time,
+            actor.moving_average_window,
+            None,
+            actor.consumer_config,
+        );
+
+        consumer.run().await.unwrap();
+        assert_eq!(resets.load(Ordering::Relaxed), 0);
+    }
+
+    struct RecordingClient {
+        calls: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+        bytes: u64,
+    }
+
+    impl RecordingClient {
+        fn new(bytes: u64) -> Self {
+            Self {
+                calls: Arc::default(),
+                resets: Arc::default(),
+                bytes,
+            }
+        }
+
+        fn record_batch(&self) -> BatchMetrics {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            BatchMetrics {
+                messages: 1,
+                user_data_bytes: self.bytes,
+                total_bytes: self.bytes,
+                latency: Duration::ZERO,
+            }
+        }
+    }
+
+    impl ProducerClient for RecordingClient {
+        async fn produce_batch(
+            &mut self,
+            _: &mut BenchmarkBatchGenerator,
+        ) -> Result<Option<BatchMetrics>, IggyError> {
+            yield_now().await;
+            Ok(Some(self.record_batch()))
+        }
+    }
+
+    impl ConsumerClient for RecordingClient {
+        async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
+            yield_now().await;
+            Ok(Some(self.record_batch()))
+        }
+
+        fn reset_offsets(&mut self) -> impl Future<Output = Result<(), IggyError>> {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            ready(Ok(()))
+        }
+    }
+
+    impl BenchmarkInit for RecordingClient {
+        fn setup(&mut self) -> impl Future<Output = Result<(), IggyError>> {
+            ready(Ok(()))
+        }
+    }
+
+    impl ApiLabel for RecordingClient {
+        const API_LABEL: &'static str = "recording";
+    }
+
+    impl BenchmarkProducerClient for RecordingClient {}
+    impl BenchmarkConsumerClient for RecordingClient {}
+
+    fn actor() -> BenchmarkProducingConsumer<RecordingClient, RecordingClient> {
+        let args = IggyBenchArgs::parse_from([
+            "iggy-bench",
+            "--total-data",
+            "256B",
+            "--messages-per-batch",
+            "1",
+            "--message-size",
+            "32",
+            "end-to-end-producing-consumer-group",
+            "--producers",
+            "1",
+            "--consumers",
+            "1",
+            "--streams",
+            "1",
+            "--consumer-groups",
+            "1",
+            "tcp",
+        ]);
+        BenchmarkProducingConsumer::new(
+            RecordingClient::new(PRODUCED_BYTES),
+            RecordingClient::new(CONSUMED_BYTES),
+            args.kind(),
+            BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf),
+            BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf),
+            args.sampling_time(),
+            args.moving_average_window(),
+            Some(PRODUCED_BYTES.into()),
+            BenchmarkProducerConfig {
+                producer_id: 1,
+                stream_id: "bench-stream-1".to_owned(),
+                partitions: 1,
+                messages_per_batch: args.messages_per_batch(),
+                message_size: args.message_size(),
+                warmup_time: args.warmup_time(),
+                pretty: false,
+            },
+            BenchmarkConsumerConfig {
+                consumer_id: 1,
+                consumer_group_id: Some(1),
+                stream_id: "bench-stream-1".to_owned(),
+                messages_per_batch: args.messages_per_batch(),
+                warmup_time: args.warmup_time(),
+                polling_kind: PollingKind::Next,
+                origin_timestamp_latency_calculation: false,
+                pretty: false,
+            },
+        )
     }
 }
