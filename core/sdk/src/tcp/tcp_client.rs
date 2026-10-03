@@ -1804,6 +1804,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mismatched_resume_reply_should_preserve_the_original_session() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let (listener, address) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: address,
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let original = client.session_identity().await.unwrap();
+        let state = client.get_state().await;
+        let mut events = client.subscribe_events().await;
+        let peer = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let (header, body) = read_test_request(&mut connection).await;
+            assert_eq!(
+                BindSessionRequest::decode_from(&body).unwrap().identity,
+                original
+            );
+            let response = LoginRegisterResponse {
+                user_id: SESSION_USER_ID,
+                session: original.session + 1,
+                server_protocol_version: IGGY_PROTOCOL_VERSION,
+                server_version: WireName::new("test").unwrap(),
+            }
+            .to_bytes();
+            answer_test_request(&mut connection, &header, 0, &response).await;
+        });
+        let result = tokio::time::timeout(TEST_BUDGET, client.resume_vsr_session())
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            Err(IggyError::SessionMismatch(
+                original.session,
+                original.session + 1
+            ))
+        );
+        assert_eq!(client.session_identity().await.unwrap(), original);
+        assert_eq!(client.get_state().await, state);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, DiagnosticEvent::SignedIn));
+        }
+        tokio::time::timeout(TEST_BUDGET, peer)
+            .await
+            .unwrap()
+            .unwrap();
+        Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_lost_reply_resumes_and_replays_only_the_original_session() {
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         for refusal in [

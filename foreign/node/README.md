@@ -58,11 +58,12 @@ partition at admission.
 VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 
 VSR authentication translates the existing password and personal-access-token
-login APIs into the register handshake required by the consensus protocol. A
-disconnect or eviction invalidates the session, and later work must register a
-new session. Transient not-committed responses retry the exact encoded request
-within one bounded deadline. A disconnected mutation is never replayed under a
-new session.
+login APIs into the register handshake required by the consensus protocol.
+Transport loss clears local authentication but retains the logical session and
+its bind proof. Login with the same credentials first tries to bind that session;
+a confirmed ended session requires a new registration. Logout forgets the local
+session. Transient not-committed responses retry the exact encoded request within
+one bounded deadline. A disconnected mutation is never replayed under a new session.
 
 The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
@@ -89,7 +90,7 @@ try {
 }
 ```
 
-The client includes its npm package version and the binary protocol crate
+The client includes its npm package version and the binary wire protocol
 version in VSR registration. An incompatible server rejects registration with
 a protocol-version error instead of accepting a mismatched wire contract.
 
@@ -148,7 +149,7 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 
 Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
 and uses separate connections to partition primaries. It requires server support
-for binary commands 14, 103 and 104. Pause binary auto-commit consumers for the
+for binary commands 15 (`BindSession`), 103 and 104. Pause binary auto-commit consumers for the
 whole upgrade: upgrade every server first, then the SDKs, and restart consumers
 so they rejoin their groups. Older SDKs can lose membership when a backup refuses
 an offset commit; the new SDK does not fall back to legacy polling.

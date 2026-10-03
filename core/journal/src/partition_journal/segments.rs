@@ -182,7 +182,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             self.preallocate_segments.then_some(segments.max_size),
         )
         .await?;
-        self.sync_segment_files().await?;
         self.publish(state).await?;
         self.state = state;
         self.retain_active_segment_file();
