@@ -18,11 +18,7 @@
 # Build context is the repository root (a Cargo workspace member cannot build standalone) -
 # `docker-compose.yml` in this directory sets `context: ../..` accordingly.
 
-# Pinned to the exact patch rust-toolchain.toml declares - a floating `1.98` tag drifts to
-# whatever patch Docker Hub ships (1.98.1 as of writing), which no longer matches the
-# workspace's pinned 1.98.0 and makes every build install a second ~636 MB toolchain on top of
-# the image's own.
-ARG RUST_VERSION=1.98.0
+ARG RUST_VERSION=1.98
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build
