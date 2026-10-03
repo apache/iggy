@@ -93,8 +93,13 @@ impl ConsensusSession {
 
     /// Accept the original registration, including its replay after reconnect.
     pub fn bind(&mut self, session: u64) -> Result<(), IggyError> {
-        if session == 0 || self.session.is_some_and(|bound| bound != session) {
+        if session == 0 {
             return Err(IggyError::InvalidSession(session));
+        }
+        if let Some(bound) = self.session
+            && bound != session
+        {
+            return Err(IggyError::SessionMismatch(bound, session));
         }
         self.session = Some(session);
         Ok(())
@@ -123,7 +128,7 @@ impl ConsensusSession {
         self.request_counter = self
             .request_counter
             .checked_add(1)
-            .ok_or(IggyError::InvalidSession(self.session.unwrap_or(0)))?;
+            .ok_or(IggyError::RequestIdExhausted)?;
         Ok(id)
     }
 
@@ -196,7 +201,10 @@ mod tests {
         let mut session = ConsensusSession::with_client_id(7);
         assert_eq!(session.bind(0), Err(IggyError::InvalidSession(0)));
         session.bind(42).unwrap();
-        assert_eq!(session.bind(43), Err(IggyError::InvalidSession(43)));
+        assert!(matches!(
+            session.bind(43),
+            Err(IggyError::SessionMismatch(42, 43))
+        ));
         assert_eq!(session.session(), Some(42));
     }
 
@@ -214,7 +222,7 @@ mod tests {
         session.request_counter = u64::MAX;
         assert_eq!(
             session.next_request_id(),
-            Err(IggyError::InvalidSession(42))
+            Err(IggyError::RequestIdExhausted)
         );
         assert_eq!(session.current_request_id(), u64::MAX);
     }

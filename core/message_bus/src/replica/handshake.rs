@@ -153,7 +153,6 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let peer_id = header.replica;
     let has_nonce = auth::has_nonce(&header.reserved_command);
     // Both authenticated and unauthenticated peers read the build-gate response.
-    let nackable = true;
 
     if header.command != Command::ReplicaHello {
         return reject(
@@ -162,7 +161,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::UnknownCommand,
-            nackable,
+            true,
         )
         .await;
     }
@@ -173,7 +172,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::ClusterMismatch,
-            nackable,
+            true,
         )
         .await;
     }
@@ -186,7 +185,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::IncompatibleBuild,
-            nackable,
+            true,
         )
         .await;
     }
@@ -200,7 +199,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::DirectionalRule,
-            nackable,
+            true,
         )
         .await;
     }

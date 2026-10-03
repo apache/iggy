@@ -73,19 +73,16 @@ impl CachedReply {
     }
 }
 
-impl CachedReply {
-    /// Freeze owned buffer in place; no alloc. Subsequent `Clone`s are Arc bumps.
-    ///
-    /// `pub(crate)` so [`Self::header`]'s validity invariant cannot be
-    /// bypassed by an unvalidated buffer from outside the crate.
-    pub(crate) fn from_message(msg: Message<ReplyHeader>) -> Self {
+impl From<Message<ReplyHeader>> for CachedReply {
+    fn from(message: Message<ReplyHeader>) -> Self {
         Self {
-            bytes: msg.into_generic().into_frozen(),
+            bytes: message.into_generic().into_frozen(),
         }
     }
+}
 
-    /// Raw reply bytes for checkpoint serialization, round-tripped through
-    /// [`Self::from_message`] on decode.
+impl CachedReply {
+    /// Raw reply bytes for checkpoint serialization, validated on decode.
     fn as_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
@@ -856,7 +853,7 @@ impl ClientTable {
             }
             let latest_commit = reply.header().commit;
             let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
-            ring.push_back(CachedReply::from_message(reply));
+            ring.push_back(CachedReply::from(reply));
             // Two entries claiming one slot would silently drop the first, leaving it
             // indexed but pointing at another client's state.
             if slots[slot_idx].is_some() {
@@ -1023,7 +1020,7 @@ impl ClientTable {
             })?;
         let epoch = reply.header().commit;
         let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
-        ring.push_back(CachedReply::from_message(reply));
+        ring.push_back(CachedReply::from(reply));
         self.slots[slot] = Some(ClientEntry {
             bind_verifier,
             ended_op: None,
@@ -1091,7 +1088,7 @@ impl ClientTable {
         }
 
         // Freeze once; later dedup-hit clones Arc-bump.
-        let cached = CachedReply::from_message(reply);
+        let cached = CachedReply::from(reply);
         if new_request == entry.watermark {
             // Same request re-committed (WAL replay shape): replace in
             // place, never push a stale twin - two cached replies for one
@@ -1183,7 +1180,7 @@ impl ClientTable {
         }
     }
 
-    /// Retain a partition receipt with its session and immutable request identity.
+    /// Retain a partition receipt and return a shared handle to its first committed result.
     ///
     /// # Errors
     /// Refuses invalid or inconsistent receipts and exhausted protection capacity.
@@ -1195,7 +1192,7 @@ impl ClientTable {
         user_id: u32,
         session: u64,
         reply: Message<ReplyHeader>,
-    ) -> Result<(), ClientTableWireError> {
+    ) -> Result<CachedReply, ClientTableWireError> {
         let header = *reply.header();
         if header.client == 0
             || session == 0
@@ -1222,10 +1219,12 @@ impl ClientTable {
         let slot = self.index[&header.client];
         let entry = self.slots[slot].as_mut().expect("index/slot mismatch");
         entry.epoch = session;
-        if entry.find_cached(header.request).is_none() {
-            entry.push_latest(CachedReply::from_message(reply));
+        if let Some(cached) = entry.find_cached(header.request) {
+            return Ok(cached.clone());
         }
-        Ok(())
+        let cached = CachedReply::from(reply);
+        entry.push_latest(cached.clone());
+        Ok(cached)
     }
 
     /// Fold an AUTO offset request into the partition watermark without a receipt.
@@ -1374,7 +1373,7 @@ impl ClientTable {
                 {
                     return Err(ClientTableWireError::InvalidReply);
                 }
-                restored.ring.push_back(CachedReply::from_message(reply));
+                restored.ring.push_back(CachedReply::from(reply));
             }
             replacement.slots.push(Some(restored));
         }
@@ -1746,7 +1745,7 @@ impl ClientTable {
                     .map_err(|_| ClientTableWireError::InvalidReply)?
                     .try_into_typed::<ReplyHeader>()
                     .map_err(|_| ClientTableWireError::InvalidReply)?;
-                ring.push_back(CachedReply::from_message(message));
+                ring.push_back(CachedReply::from(message));
             }
             let latest_commit = ring
                 .back()
@@ -3157,9 +3156,19 @@ mod tests {
         let watermark = receipt_watermark(7, 5, 11);
         let reply =
             Message::<ReplyHeader>::try_from(Owned::copy_from_slice(&watermark.reply)).unwrap();
-        table
+        let committed = table
             .commit_partition_reply(TEST_USER_ID, watermark.session, reply.clone())
             .unwrap();
+        let mut changed = reply.clone();
+        changed.as_mut_slice()[size_of::<ReplyHeader>()] ^= 1;
+        let replayed = table
+            .commit_partition_reply(TEST_USER_ID, watermark.session, changed)
+            .unwrap();
+        assert!(
+            committed
+                .into_wire_bytes()
+                .shares_allocation(&replayed.into_wire_bytes())
+        );
         assert!(
             table
                 .commit_partition_reply(TEST_USER_ID + 1, watermark.session, reply.clone())

@@ -1784,6 +1784,55 @@ async fn owned_segment_baseline(
 }
 
 #[test]
+fn reopening_retained_segments_syncs_only_recovery_mutations() {
+    block_on(async {
+        for buffered_tail in [false, true] {
+            let (storage, mut journal) = owned_segment_baseline(buffered_tail).await;
+            journal.cleanup_obsolete().await;
+            drop(journal);
+            storage.clear_trace();
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            let trace = storage.trace();
+            let file_syncs = trace
+                .iter()
+                .filter(|operation| **operation == StorageOperation::FileSync)
+                .count();
+            assert_eq!(file_syncs, 1 + usize::from(buffered_tail), "{trace:?}");
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|operation| **operation == StorageOperation::DirectorySync)
+                    .count(),
+                3,
+                "retained names need no new publication barrier: {trace:?}"
+            );
+            let expected_head = if buffered_tail { 1 } else { 2 };
+            assert_eq!(recovered.head(), expected_head);
+            drop(recovered);
+            storage.crash(Crash::PowerLoss);
+            let public = Path::new("/partition/00000000000000000000.log");
+            let file = storage.open(public, OpenMode::Read).await.unwrap();
+            assert_eq!(
+                file.length().await.unwrap(),
+                expected_head * OWNED_BATCH_BYTES as u64
+            );
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.head(), expected_head);
+            assert_eq!(
+                recovered.prepares().await.unwrap().len() as u64,
+                expected_head
+            );
+        }
+    });
+}
+
+#[test]
 fn sealed_tail_recovery_preserves_the_public_name_at_every_crash_boundary() {
     block_on(async {
         let (storage, mut journal) = owned_segment_baseline(false).await;

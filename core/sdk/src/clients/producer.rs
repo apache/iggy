@@ -682,7 +682,8 @@ unsafe impl Sync for IggyProducer {}
 /// | Situation | Retried | What the caller ends up with |
 /// | --- | --- | --- |
 /// | the client is not signed in, so nothing may be sent yet | yes | the send goes ahead as soon as the client is signed in, or fails with [`IggyError::CannotSendMessagesDueToClientDisconnection`] once the retry budget is spent |
-/// | the server explicitly refused admission ([`IggyError::TransientNotAccepted`]) | yes, as a new request | the confirmation of the admitted attempt, or the final refusal |
+/// | the binary transport reports that the server refused admission ([`IggyError::TransientNotAccepted`]) | yes, as a new request | the confirmation of the admitted attempt, or the final refusal |
+/// | an HTTP request fails, including a server admission refusal | no producer retry | the HTTP error; HTTP transport retries are configured separately below |
 /// | another request error or an ambiguous failure | no | the cause and unconfirmed batch; the caller decides whether to resend |
 /// | the batch committed, but its confirmation could not be read ([`IggyError::InvalidBytesResponse`] or [`IggyError::InvalidJsonResponse`], raised on the HTTP transport only) | no | the write did happen and retrying would duplicate it on purpose |
 /// | the request aged out of the dedup window ([`IggyError::RequestTooOld`]) | no | its outcome is unknown, and the server refuses the resend while it retains the client entry |
@@ -697,8 +698,9 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// The HTTP transport also resends a failed POST on its own, up to [`HttpClientConfig::retries`]
 /// times (3 by default), when the server answers with a 5xx, 408 or 429 status or the connection
-/// fails. Each resend is a new write, so these retries multiply the producer attempts, even with
-/// `send_retries(None)`. A 504 or a connection lost mid-request leaves the outcome unknown, so such
+/// fails. HTTP admission refusals remain [`IggyError::HttpResponseError`] and do not trigger
+/// producer retries. Each transport resend is a new write, even with `send_retries(None)`.
+/// A 504 or a connection lost mid-request leaves the outcome unknown, so such
 /// a resend can duplicate the batch.
 ///
 /// Where a failure surfaces is the main difference between the two modes. Either way it names the

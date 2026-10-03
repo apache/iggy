@@ -596,6 +596,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     "discarding unpublished segment bytes beyond the durable WAL frontier"
                 );
                 file.truncate(cursor.position.length).await?;
+                self.segment_files_dirty = true;
                 if self.preallocate_segments {
                     file.preallocate(&cursor.path(&self.directory), segments.max_size);
                 }
@@ -682,41 +683,41 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if self.segment_files.contains_key(&key) {
             return Ok(());
         }
-        let parent = self.segment_directory()?.to_path_buf();
         let retained = segment_path(&self.directory, generation, start_offset);
+        if self.storage.exists(&retained).await? {
+            let file = self.storage.open(&retained, OpenMode::ReadWrite).await?;
+            self.segment_files.insert(key, file);
+            return Ok(());
+        }
+        let parent = self.segment_directory()?.to_path_buf();
         let public = parent.join(format!("{start_offset:020}.log"));
-        let file = if self.storage.exists(&retained).await? {
-            self.storage.open(&retained, OpenMode::ReadWrite).await?
+        if length == 0
+            && self.storage.exists(&public).await?
+            && self
+                .storage
+                .open(&public, OpenMode::Read)
+                .await?
+                .length()
+                .await?
+                > 0
+        {
+            // A purged inode can still be retained by older prepares.
+            self.remove_segment_name(&public).await?;
+        }
+        // Segment roll can create the public name during any await. Both
+        // creators must open that inode without truncation, then retain it.
+        let mode = if length == 0 {
+            OpenMode::CreateOrOpen
         } else {
-            if length == 0
-                && self.storage.exists(&public).await?
-                && self
-                    .storage
-                    .open(&public, OpenMode::Read)
-                    .await?
-                    .length()
-                    .await?
-                    > 0
-            {
-                // A purged inode can still be retained by older prepares.
-                self.remove_segment_name(&public).await?;
-            }
-            // Segment roll can create the public name during any await. Both
-            // creators must open that inode without truncation, then retain it.
-            let mode = if length == 0 {
-                OpenMode::CreateOrOpen
-            } else {
-                OpenMode::ReadWrite
-            };
-            let file = self.storage.open(&public, mode).await?;
-            self.storage.hard_link(&public, &retained).await?;
-            if length == 0
-                && let Some(size) = preallocate_size
-            {
-                file.preallocate(&retained, size);
-            }
-            file
+            OpenMode::ReadWrite
         };
+        let file = self.storage.open(&public, mode).await?;
+        self.storage.hard_link(&public, &retained).await?;
+        if length == 0
+            && let Some(size) = preallocate_size
+        {
+            file.preallocate(&retained, size);
+        }
         self.segment_files_dirty = true;
         self.segment_links_dirty = true;
         self.segment_files.insert(key, file);
