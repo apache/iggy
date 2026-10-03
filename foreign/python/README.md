@@ -267,12 +267,18 @@ strategy for one call, or `send_to(stream, topic, messages, partitioning)` to
 send to another existing destination. `send_to()` does not create or initialize
 that destination.
 
-Direct sends use at-least-once delivery. A request can commit even when its
-response is lost, so any retry can write the same batch again. `send_retries`
-counts retries after the initial attempt. The first retry runs immediately, and
-`send_retry_interval` delays only later retries. Set `send_retries` to `None` or
-`0` to disable producer retries. Set `send_retry_interval` to `None` to run all
-enabled retries without a delay. A zero interval raises `ValueError`.
+Binary transports retain the original request identity after an uncertain
+exchange. Persisted sends also provide crash-safe retry receipts; weaker topic
+policies can lose data and receipts on a crash. HTTP NoAck confirms dispatch
+only. An application resend creates a new request and can duplicate messages.
+
+Producer retries start a new attempt only after an explicit
+`TransientNotAccepted` refusal. Missing destinations and other terminal errors
+stop immediately. `send_retries` counts retries after the initial attempt. The
+first permitted retry runs immediately, and `send_retry_interval` delays only
+later retries. Set `send_retries` to `None` or `0` to disable producer retries.
+Set `send_retry_interval` to `None` to run permitted retries without a delay.
+A zero interval raises `ValueError`.
 
 Transport retries are separate from producer retries. For example, the default
 `HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
