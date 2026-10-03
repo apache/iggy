@@ -21,12 +21,19 @@
 //! stream - see [`IggyBridge::delete_kafka_topic`]'s own doc comment for why: the shared
 //! `default_stream` can hold other Kafka topics' data, and this bridge has no way to tell
 //! whether the stream it just emptied is actually abandoned or just temporarily topic-less.
+//!
+//! `DeletableTopicResult.error_message` is only encoded on the wire at v5+ (`kafka_protocol`'s
+//! own gate) - a client negotiating v1-v4 gets `error_code` only, with any text this module sets
+//! silently dropped. Unlike `CreateTopics`, whose equivalent field is encoded at every version it
+//! supports.
 
 use std::time::Duration;
 
 use bytes::Bytes;
+use iggy::prelude::IggyError;
 use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
 use kafka_protocol::messages::{DeleteTopicsRequest, DeleteTopicsResponse, TopicName};
+use kafka_protocol::protocol::StrBytes;
 
 use tokio::time::Instant;
 
@@ -53,10 +60,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 5,
 };
 
-/// Cap on distinct topic names one `DeleteTopics` request may address through the bridge.
+/// Cap on topic names one `DeleteTopics` request may address through the bridge.
 ///
-/// Same rationale as `create_topics::MAX_BRIDGE_BACKED_TOPICS`: each name costs a bridge round
-/// trip against the single lockstep `IggyClient` every Kafka connection on this gateway shares.
+/// Same rationale as `create_topics::MAX_BRIDGE_BACKED_TOPICS`, but counted differently: every
+/// name here costs its own bridge round trip against the single lockstep `IggyClient` every
+/// Kafka connection on this gateway shares, duplicates included, so this charges the raw count
+/// rather than the distinct one `CreateTopics` charges.
 const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
 /// Same bounds as `create_topics::clamp_request_timeout` - this request carries the identical
@@ -111,12 +120,12 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // the only populated field at any version this bridge advertises.
     if req.topic_names.len() > MAX_BRIDGE_BACKED_TOPICS {
         tracing::warn!(
-            distinct_topics = req.topic_names.len(),
+            requested_topics = req.topic_names.len(),
             max = MAX_BRIDGE_BACKED_TOPICS,
             "DeleteTopics request addresses too many topics; rejecting"
         );
-        let message = kafka_protocol::protocol::StrBytes::from(format!(
-            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} distinct topics per DeleteTopics request"
+        let message = StrBytes::from(format!(
+            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} topic names per DeleteTopics request"
         ));
         let results = req
             .topic_names
@@ -181,7 +190,12 @@ async fn delete_one_topic(bridge: &IggyBridge, name: &TopicName) -> DeletableTop
         .with_name(Some(name.clone()))
         .with_error_message(None);
     match bridge.delete_kafka_topic(name.as_str()).await {
-        Ok(()) => result.with_error_code(ERROR_NONE),
+        // The second arm: the write committed on its first attempt, the SDK's own reconnect path
+        // replayed it, and the server's client-table dedup caught the replay - not a fault. Same
+        // reasoning as `create_topics::create_one_topic`'s identical arm.
+        Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
+            result.with_error_code(ERROR_NONE)
+        }
         Err(err) => bridge_error_result(result, name.as_str(), &err),
     }
 }
@@ -204,17 +218,17 @@ fn bridge_error_result(
                 reason,
                 "DeleteTopics rejected an invalid topic name"
             );
-            result.with_error_code(error_code).with_error_message(Some(
-                kafka_protocol::protocol::StrBytes::from(reason.clone()),
-            ))
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(reason.clone())))
         }
         other => {
             tracing::error!(kafka_topic, %other, "DeleteTopics failed against the Iggy bridge");
-            result.with_error_code(error_code).with_error_message(Some(
-                kafka_protocol::protocol::StrBytes::from(
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
                     "internal error deleting this topic".to_string(),
-                ),
-            ))
+                )))
         }
     }
 }
