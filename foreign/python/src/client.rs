@@ -277,7 +277,7 @@ impl IggyClient {
         })
     }
 
-    /// Logs in with a personal access token minted out of band.
+    /// Logs in with a personal access token created separately.
     ///
     /// Args:
     ///     token: Raw PAT string.
