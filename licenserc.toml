@@ -99,6 +99,7 @@ extensions = [
     "mjs",
     "php",
     "rs",
+    "qnt",
     "js",
     "swift",
     "ts",
