@@ -238,7 +238,7 @@ jobs:
         uses: ./.github/actions/swift/pre-merge
         with:
           task: ${{ inputs.task }}
-          
+
       - name: Upload C++ coverage to Codecov
         if: inputs.component == 'sdk-cpp' && inputs.task == 'test'
         uses: codecov/codecov-action@v7.0.0
