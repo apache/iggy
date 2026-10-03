@@ -29,7 +29,7 @@ use crate::offset_storage::{
     read_purge_generation,
 };
 use crate::persistence::{
-    CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
+    FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
@@ -89,11 +89,11 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1048,11 +1048,44 @@ where
                 });
                 return;
             }
-            barriers.push(CheckpointBarrier::already_synced(writer.path()));
+            // [`IggyIndexWriter::fsync`] used the original descriptor above.
+            // The marker tells [`PartitionPersistence::checkpoint_files`] not
+            // to replace that proof with a fresh-handle sync.
+            barriers.push(FileSyncBarrier::already_synced(writer.path()));
         }
         let (files, directories) = self.persistence_checkpoint_files(config);
         persistence.checkpoint_files(through_op, files, directories, barriers);
         self.start_persistence();
+    }
+
+    /// Synchronize every live original writer while the caller holds
+    /// [`IggyPartition::write_lock`].
+    ///
+    /// Unlike [`IggyPartition::checkpoint_persistence`], this barrier runs even
+    /// when the checkpoint frontier cannot advance.
+    pub(crate) async fn sync_install_writers(
+        &self,
+        persistence: &PartitionPersistence,
+    ) -> std::io::Result<BTreeSet<PathBuf>> {
+        let mut barriers = Vec::with_capacity(2);
+        if let Some(writer) = self.log.messages_writers().last().and_then(Option::as_ref) {
+            let path = writer.path();
+            let writer = Rc::clone(writer);
+            barriers.push(FileSyncBarrier::from_future(path, async move {
+                writer.fsync().await.map_err(std::io::Error::other)
+            }));
+        }
+        if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref) {
+            let path = writer.path().to_owned();
+            let writer = Rc::clone(writer);
+            barriers.push(FileSyncBarrier::from_future(path, async move {
+                writer.fsync().await.map_err(std::io::Error::other)
+            }));
+        }
+        let synced_files = persistence.barrier_files(barriers);
+        self.start_persistence();
+        persistence.drain_with_timeout().await?;
+        Ok(synced_files)
     }
 
     fn persistence_checkpoint_files(
@@ -9337,6 +9370,62 @@ mod tests {
         assert!(persistence.is_durable_through(1));
     }
 
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_an_index_sync_failure_when_installing_state_transfer_should_refuse_backup_publication()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        for kind in ["consumers", "groups"] {
+            std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
+        }
+        partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
+        partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"durable");
+        persistence
+            .append(prepare.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition.consensus.restore_commit_state(1, 1);
+        persistence.checkpoint(1);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert_eq!(persistence.checkpoint_op(), 1);
+
+        let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        assert_eq!(writer.save_indexes_buffered(vec![1; 32]).await.unwrap(), 32);
+        let active = partition.log.index_writers().len() - 1;
+        partition.log.index_writers_mut()[active] = Some(Rc::new(writer));
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            prepare_checksum: Some(prepare.header().checksum),
+            checkpoint_prepare: prepare.as_slice().to_vec(),
+            purge_generation: 0,
+            next_offset: 1,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            dedup: Vec::new(),
+        };
+
+        let result = partition
+            .install_state_transfer(&repair_config(), 1, Vec::new(), &offsets.encode(), 0)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::state_transfer::PartitionInstallError::SwapIo { .. })
+        ));
+        assert!(partition.fatal().is_some());
+        assert!(!directory.path().join(".install-backup").exists());
+    }
+
     #[compio::test]
     async fn pending_wal_prefix_keeps_pipeline_replies_and_does_not_partially_flush() {
         for durability in [
@@ -16299,6 +16388,38 @@ mod tests {
     /// without any production-side plumbing.
     #[cfg(target_os = "linux")]
     const DEV_FULL: &str = "/dev/full";
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_an_unsyncable_messages_writer_when_installing_should_refuse_the_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("wal");
+        let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+        let messages_writer =
+            MessagesWriter::new(DEV_FULL, Rc::new(AtomicU64::new(0)), false, false, None)
+                .await
+                .unwrap();
+        let index_path = directory.path().join("segment.index");
+        let index_writer = IggyIndexWriter::new(
+            index_path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut partition = test_partition();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+            SegmentStorage::default(),
+            Some(Rc::new(messages_writer)),
+            Some(Rc::new(index_writer)),
+        );
+        partition.persistence = Some(Rc::clone(&persistence));
+
+        assert!(partition.sync_install_writers(&persistence).await.is_err());
+        assert!(persistence.failure().is_some());
+    }
 
     const FIRST_PAYLOAD: &[u8] = b"first-chunk";
     const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";

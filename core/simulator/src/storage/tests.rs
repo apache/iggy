@@ -27,7 +27,7 @@ use journal::partition_journal::{
     PARTITION_WAL_BLOCK_SIZE, SegmentPosition, SegmentReference, record_length,
 };
 use journal::{DurableAppend, PartitionPrepareJournal};
-use partitions::{CheckpointBarrier, PartitionPersistence, PersistenceMetrics, install_backup};
+use partitions::{FileSyncBarrier, PartitionPersistence, PersistenceMetrics, install_backup};
 use server_common::send_messages::{
     BATCH_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
@@ -787,7 +787,7 @@ fn synchronized_corruption_in_any_record_block_is_refused() {
 
 async fn interrupted_install() -> SimStorage {
     let (storage, mut journal) = baseline().await;
-    install_backup::begin_with_storage(Path::new(DIRECTORY), &storage)
+    install_backup::begin_with_storage(Path::new(DIRECTORY), &BTreeSet::new(), &storage)
         .await
         .unwrap();
     replace(&storage, Path::new("/partition/state"), b"new")
@@ -800,24 +800,33 @@ async fn interrupted_install() -> SimStorage {
 }
 
 /// A hard link preserves the inode, not the writer's error cursor. Opening the
-/// backup name after writeback failed must not authorize destructive install.
+/// backup name after writeback failed must not authorize destructive install;
+/// [`FileSyncBarrier::from_file`] must retain the original error cursor.
 #[test]
-#[ignore = "`install_backup::link_tree` synchronizes hard links through handles opened after the writeback failure"]
 fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publication() {
     block_on(async {
         let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
         let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
         writer.write(0, b"pending".to_vec()).await.unwrap();
         storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
 
         storage.fail_writeback(path).unwrap();
-        let result = install_backup::begin_with_storage(Path::new(DIRECTORY), &storage).await;
+        let barrier = FileSyncBarrier::from_file(path, writer);
+        let synced_files = persistence.barrier_files(vec![barrier]);
+        assert!(synced_files.contains(path));
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let result = async {
+            persistence.drain().await?;
+            install_backup::begin_with_storage(Path::new(DIRECTORY), &synced_files, &storage).await
+        }
+        .await;
 
-        assert!(
-            writer.sync().await.is_err(),
-            "the original writer did not observe the injected writeback failure"
-        );
         assert!(
             result.is_err(),
             "install backup published after synchronizing a fresh hard-link handle past the writeback error"
@@ -829,6 +838,145 @@ fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publi
                 .unwrap(),
             "a failed backup was published"
         );
+    });
+}
+
+#[test]
+fn given_a_failed_offset_writeback_when_barriering_install_files_should_refuse_publication() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let path = Path::new("/partition/offsets/consumers/1");
+        storage
+            .create_directories(path.parent().unwrap())
+            .await
+            .unwrap();
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"pending".to_vec()).await.unwrap();
+        storage
+            .sync_directory(path.parent().unwrap())
+            .await
+            .unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), writer)
+            .await
+            .unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        let synced_files = persistence.barrier_files(Vec::new());
+        assert!(synced_files.contains(path));
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let result = async {
+            persistence.drain().await?;
+            install_backup::begin_with_storage(Path::new(DIRECTORY), &synced_files, &storage).await
+        }
+        .await;
+
+        assert!(
+            result.is_err(),
+            "install backup published after offset writeback failed"
+        );
+        assert!(persistence.failure().is_some());
+        assert!(
+            !storage
+                .exists(Path::new("/partition/.install-backup"))
+                .await
+                .unwrap()
+        );
+    });
+}
+
+#[test]
+fn given_a_truncated_install_barrier_when_rebarriering_should_report_retained_offset_writeback_failure()
+ {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+
+        let path = Path::new("/partition/offsets/consumers/1");
+        storage
+            .create_directories(path.parent().unwrap())
+            .await
+            .unwrap();
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"pending".to_vec()).await.unwrap();
+        storage
+            .sync_directory(path.parent().unwrap())
+            .await
+            .unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), writer)
+            .await
+            .unwrap();
+
+        storage.fail_writeback(path).unwrap();
+        persistence.barrier_files(Vec::new());
+        persistence.truncate_from(2);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+        assert!(persistence.failure().is_none());
+
+        persistence.barrier_files(Vec::new());
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let error = persistence.drain().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("writeback failed before this handle synced"),
+            "unexpected barrier failure: {error}"
+        );
+        assert!(persistence.failure().is_some());
+    });
+}
+
+#[test]
+fn given_a_truncated_install_barrier_when_rebarriering_should_make_retained_offset_durable() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        persistence.append(first.into_frozen(), true).unwrap();
+        persistence.append(second.into_frozen(), true).unwrap();
+
+        let path = Path::new("/partition/offset");
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"retained".to_vec()).await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+        persistence
+            .retain_offset_file(path.to_str().unwrap().to_owned(), writer)
+            .await
+            .unwrap();
+
+        persistence.barrier_files(Vec::new());
+        persistence.truncate_from(2);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+
+        persistence.barrier_files(Vec::new());
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        persistence.drain().await.unwrap();
+        storage.crash(Crash::PowerLoss);
+        let file = storage.open(path, OpenMode::Read).await.unwrap();
+        assert_eq!(file.read(0, 8).await.unwrap(), b"retained");
     });
 }
 
@@ -1182,7 +1330,7 @@ fn checkpoint_barriers_complete_before_wal_reclamation() {
             .unwrap();
         let mut file = storage.open(path, OpenMode::Create).await.unwrap();
         file.write(0, b"committed".to_vec()).await.unwrap();
-        let barrier = CheckpointBarrier::from_file(path, file);
+        let barrier = FileSyncBarrier::from_file(path, file);
         persistence.checkpoint_files(
             4,
             vec![path.to_path_buf()],
@@ -2536,7 +2684,7 @@ async fn install(
     storage: &SimStorage,
     journal: &mut PartitionPrepareJournal<SimStorage>,
 ) -> io::Result<()> {
-    install_backup::begin_with_storage(Path::new(DIRECTORY), storage).await?;
+    install_backup::begin_with_storage(Path::new(DIRECTORY), &BTreeSet::new(), storage).await?;
     replace(storage, Path::new("/partition/state"), b"new").await?;
     for path in MATERIALIZED_FILES {
         replace(storage, Path::new(path), b"new").await?;
@@ -2808,7 +2956,7 @@ fn given_a_failed_writeback_when_checkpointing_then_wal_history_should_not_be_re
         let path = Path::new("/partition/materialized");
         let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
         writer.write(0, b"committed".to_vec()).await.unwrap();
-        let barrier = CheckpointBarrier::from_file(path, writer);
+        let barrier = FileSyncBarrier::from_file(path, writer);
 
         // The device drops the dirty pages before the checkpoint's barrier. The
         // writer that issued them is the only handle told; the descriptor
@@ -2861,8 +3009,8 @@ fn given_multiple_writers_for_one_checkpoint_file_when_one_has_not_observed_the_
         // checkpoint skip another writer that still has the error pending.
         assert!(first_writer.sync().await.is_err());
         let barriers = vec![
-            CheckpointBarrier::from_file(path, first_writer),
-            CheckpointBarrier::from_file(path, second_writer),
+            FileSyncBarrier::from_file(path, first_writer),
+            FileSyncBarrier::from_file(path, second_writer),
         ];
         persistence.checkpoint_files(
             4,
