@@ -722,6 +722,17 @@ func (e InvalidNumberValue) Is(target error) bool {
 	return ok
 }
 
+type RequestTooOld struct{}
+
+func (e RequestTooOld) Error() string {
+	return "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+}
+func (e RequestTooOld) Code() Code { return 85 }
+func (e RequestTooOld) Is(target error) bool {
+	_, ok := target.(RequestTooOld)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2734,6 +2745,7 @@ var (
 	ErrInvalidNumberEncoding                      = InvalidNumberEncoding{}
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
+	ErrRequestTooOld                              = RequestTooOld{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2979,6 +2991,7 @@ const (
 	InvalidNumberEncodingCode                      Code = 82
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
+	RequestTooOldCode                              Code = 85
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3291,6 +3304,8 @@ func (c Code) String() string {
 		return "InvalidBooleanValue"
 	case InvalidNumberValueCode:
 		return "InvalidNumberValue"
+	case RequestTooOldCode:
+		return "RequestTooOld"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3778,6 +3793,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidBooleanValue
 	case InvalidNumberValueCode:
 		return ErrInvalidNumberValue
+	case RequestTooOldCode:
+		return ErrRequestTooOld
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:

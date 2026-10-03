@@ -65,6 +65,12 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			message:  "request transiently not accepted; retry, on any replica",
 		},
 		{
+			err:      RequestTooOld{},
+			sentinel: ErrRequestTooOld,
+			code:     RequestTooOldCode,
+			message:  "request is below the deduplication window; outcome unknown, resending may duplicate the write",
+		},
+		{
 			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
 			sentinel: ErrConsumerGroupPartitionNotOwned,
 			code:     ConsumerGroupPartitionNotOwnedCode,
