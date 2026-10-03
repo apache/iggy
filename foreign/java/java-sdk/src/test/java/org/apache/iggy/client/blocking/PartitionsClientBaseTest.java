@@ -19,9 +19,11 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,6 +37,12 @@ import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class PartitionsClientBaseTest extends IntegrationTest {
+
+    // 5 messages of ~220KB exceed the 1MB segment, so they seal one segment and leave the
+    // second one active; 4 messages (~880KB) would fit in a single segment.
+    private static final int SEGMENT_SIZE_BYTES = 1024 * 1024;
+    private static final int MESSAGE_SIZE_BYTES = 220_000;
+    private static final int MESSAGES_PER_SEGMENT = 5;
 
     TopicsClient topicsClient;
     PartitionsClient partitionsClient;
@@ -69,22 +77,22 @@ public abstract class PartitionsClientBaseTest extends IntegrationTest {
     }
 
     @Test
-    void shouldDeleteSegments() {
+    void shouldDeleteSegments() throws InterruptedException {
         // given
         var topicId = TopicId.of("segments-topic");
         topicsClient.createTopic(
                 STREAM_NAME,
                 1L,
-                org.apache.iggy.topic.CompressionAlgorithm.None,
+                CompressionAlgorithm.None,
                 BigInteger.ZERO,
                 BigInteger.ZERO,
-                "segments-topic",
+                topicId.getName(),
                 TopicOptions.builder()
-                        .segmentSize(BigInteger.valueOf(1024 * 1024))
+                        .segmentSize(BigInteger.valueOf(SEGMENT_SIZE_BYTES))
                         .messagesRequiredToSave(1)
                         .build());
-        var message = Message.of("a".repeat(220_000));
-        for (int count = 0; count < 5; count++) {
+        var message = Message.of("a".repeat(MESSAGE_SIZE_BYTES));
+        for (int count = 0; count < MESSAGES_PER_SEGMENT; count++) {
             client.messages().sendMessages(STREAM_NAME, topicId, Partitioning.partitionId(0L), List.of(message));
         }
 
@@ -94,8 +102,21 @@ public abstract class PartitionsClientBaseTest extends IntegrationTest {
         // when
         partitionsClient.deleteSegments(STREAM_NAME, topicId, 0L, 1L);
 
-        // then
-        topic = topicsClient.getTopic(STREAM_NAME, topicId).orElseThrow();
+        // then: the server acks the metadata commit before the reconciler removes the segment,
+        // so poll until the count drops
+        topic = awaitSegmentsCount(STREAM_NAME, topicId, 1L);
         assertThat(topic.partitions().get(0).segmentsCount()).isEqualTo(1L);
+    }
+
+    private TopicDetails awaitSegmentsCount(StreamId streamId, TopicId topicId, long expected)
+            throws InterruptedException {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            var details = topicsClient.getTopic(streamId, topicId).orElseThrow();
+            if (details.partitions().get(0).segmentsCount() == expected) {
+                return details;
+            }
+            Thread.sleep(200);
+        }
+        return topicsClient.getTopic(streamId, topicId).orElseThrow();
     }
 }

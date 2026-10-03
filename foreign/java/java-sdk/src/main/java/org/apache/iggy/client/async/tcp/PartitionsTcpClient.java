@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.client.async.PartitionsClient;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.serde.BytesSerializer;
@@ -79,6 +80,12 @@ public class PartitionsTcpClient implements PartitionsClient {
     @Override
     public CompletableFuture<Void> deleteSegments(
             StreamId streamId, TopicId topicId, Long partitionId, Long segmentsCount) {
+        if (partitionId < 0 || partitionId > 4294967295L) {
+            throw new IggyInvalidArgumentException("Partition ID must be between 0 and 4294967295");
+        }
+        if (segmentsCount < 0 || segmentsCount > 4294967295L) {
+            throw new IggyInvalidArgumentException("Segments count must be between 0 and 4294967295");
+        }
         var payload = BytesSerializer.toBytes(streamId);
         payload.writeBytes(BytesSerializer.toBytes(topicId));
         payload.writeIntLE(partitionId.intValue());
@@ -91,8 +98,6 @@ public class PartitionsTcpClient implements PartitionsClient {
                 streamId,
                 topicId);
 
-        return connection().send(CommandCode.Segment.DELETE.getValue(), payload).thenAccept(response -> {
-            response.release();
-        });
+        return connection().sendAndRelease(CommandCode.Segment.DELETE, payload);
     }
 }
