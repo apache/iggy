@@ -100,7 +100,7 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
         let bound =
             LoginRegisterResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
         if bound.session != identity.session {
-            return Err(IggyError::InvalidSession(bound.session));
+            return Err(IggyError::SessionMismatch(identity.session, bound.session));
         }
         self.bind_vsr_session(bound.session).await?;
         self.set_state(ClientState::Authenticated).await;

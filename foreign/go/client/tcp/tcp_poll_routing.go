@@ -298,7 +298,8 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 		if err != nil {
 			return nil, err
 		}
-		if _, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.BindSessionCode), binding); err != nil {
+		response, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.BindSessionCode), binding)
+		if err != nil {
 			// An attach cannot advance an offset, even if its reply is lost.
 			state.written = false
 			err = slot.exchangeError(ctx, state, err)
@@ -306,6 +307,15 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 				c.polls.dropConnection(route.endpoint, slot)
 			}
 			return nil, err
+		}
+		bound, err := vsr.DecodeLoginRegister(response)
+		if err != nil {
+			c.polls.dropConnection(route.endpoint, slot)
+			return nil, err
+		}
+		if bound.Session != route.parent.session {
+			c.polls.dropConnection(route.endpoint, slot)
+			return nil, ierror.SessionMismatch{Requested: route.parent.session, Bound: bound.Session}
 		}
 		slot.parent = route.parent
 		slot.attached = true

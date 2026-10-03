@@ -38,10 +38,11 @@ import java.util.Arrays;
 final class VsrLoginCodec {
 
     /**
-     * Packed semver of the {@code iggy_binary_protocol} crate this codec
-     * targets: {@code major << 20 | minor << 10 | patch}, 10 bits per field.
-     * Keep in sync with {@code core/binary_protocol/Cargo.toml}; the server
-     * accepts any client whose major.minor is not newer than its own.
+     * Packed wire protocol version this codec targets:
+     * {@code major << 20 | minor << 10 | patch}, 10 bits per field.
+     * Keep in sync with {@code core/binary_protocol/src/version.rs}, independently
+     * of the crate release. The server enforces its minimum wire version and rejects
+     * newer major.minor versions.
      */
     static final int PROTOCOL_VERSION = (11 << 10) | 1; // 0.11.1
 

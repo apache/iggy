@@ -6432,30 +6432,23 @@ where
         }
 
         let mut failed_commit = false;
-        // Must run BEFORE the commit loop: `commit_messages` evicts the
-        // committed prefix, after which an entry survives only in the bounded
-        // repair ring - and not even there on a single replica, which keeps no
-        // ring at all. A miss degrades to a successful send carrying no
-        // confirmation, a legal answer no client can tell from a real one.
+        // Capture receipt and retirement data before commit_messages evicts the
+        // journal prefix. Missing data must fence the partition before apply;
+        // an incomplete receipt cannot safely answer a retry.
         let committed_batch_stats = self.resolve_committed_batch_stats(&drained);
-        let retirements: Vec<_> = drained
-            .iter()
-            .map(|entry| {
-                if entry.header.operation != Operation::RetireSession {
-                    return None;
-                }
-                let prepare = self.log.journal().inner.repair_entry(entry.header.op)?;
-                SessionIdentity::decode_from(
-                    prepare
-                        .as_slice()
-                        .get(iggy_binary_protocol::HEADER_SIZE..)?,
-                )
-                .ok()
-            })
-            .collect();
-        for ((entry, batch_stats), retirement) in
-            drained.iter().zip(&committed_batch_stats).zip(&retirements)
-        {
+        let mut retirements = Vec::new();
+        for (entry, batch_stats) in drained.iter().zip(&committed_batch_stats) {
+            let retirement = (entry.header.operation == Operation::RetireSession)
+                .then(|| {
+                    let prepare = self.log.journal().inner.repair_entry(entry.header.op)?;
+                    SessionIdentity::decode_from(
+                        prepare
+                            .as_slice()
+                            .get(iggy_binary_protocol::HEADER_SIZE..)?,
+                    )
+                    .ok()
+                })
+                .flatten();
             if self
                 .dedup
                 .commit_capacity(entry.header.retry_capacity as usize)
@@ -6474,6 +6467,9 @@ where
                     operation: Some(entry.header.operation),
                 });
                 return;
+            }
+            if let Some(identity) = retirement {
+                retirements.push((entry.header.op, identity));
             }
         }
         // Keep the threshold decision used before draining. An append during an
@@ -6607,13 +6603,10 @@ where
             }
         }
 
-        for ((mut entry, batch_stats), retirement) in drained
-            .into_iter()
-            .zip(committed_batch_stats)
-            .zip(retirements)
-        {
+        let mut retirements = retirements.into_iter().peekable();
+        for (mut entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
             let prepare_header = entry.header;
-            if let Some(identity) = retirement {
+            if let Some((_, identity)) = retirements.next_if(|(op, _)| *op == prepare_header.op) {
                 self.dedup
                     .forget_session(identity.client_id, identity.session);
                 self.required_metadata_frontier = self
@@ -10257,6 +10250,69 @@ mod tests {
         assert_eq!(partition.consensus.commit_min(), 2);
         assert_eq!(partition.dedup.count(), 2);
         assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+    }
+
+    #[compio::test]
+    async fn given_interleaved_sends_and_retirements_when_committing_should_preserve_live_receipts()
+    {
+        const CLIENTS: u128 = 3;
+        const ENDING_FRONTIER: u64 = 10;
+        let (mut partition, replies) = recording_partition_at(0, 3);
+        for client_id in 1..=CLIENTS {
+            let mut send = checksumless_send_request(partition.namespace(), 1).transmute_header(
+                |header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.client = client_id;
+                },
+            );
+            send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+            partition.on_request(send, None).await;
+            if client_id == CLIENTS {
+                continue;
+            }
+            let identity = SessionIdentity {
+                client_id,
+                session: 1,
+                metadata_watermark: ENDING_FRONTIER + u64::try_from(client_id).unwrap(),
+            };
+            let body = identity.to_bytes();
+            let size = size_of::<RoutedRequestHeader>() + body.len();
+            let mut retire = Message::<RoutedRequestHeader>::new(size).transmute_header(
+                |_, header: &mut RoutedRequestHeader| {
+                    header.command = Command::Request;
+                    header.operation = Operation::RetireSession;
+                    header.cluster = TEST_CLUSTER;
+                    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                    header.session = 1;
+                    header.request = identity.metadata_watermark;
+                    header.metadata_watermark = identity.metadata_watermark;
+                    header.group = partition.consensus.group();
+                    header.size = u32::try_from(size).unwrap();
+                },
+            );
+            retire.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+            partition.on_request(retire, None).await;
+        }
+        let committed_op = u64::try_from(CLIENTS * 2 - 1).unwrap();
+        assert_eq!(
+            partition.consensus.pipeline_len(),
+            usize::try_from(committed_op).unwrap()
+        );
+        partition.consensus.advance_commit_max(committed_op);
+        partition.commit_journal(&repair_config()).await;
+        assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
+        assert_eq!(partition.consensus.commit_min(), committed_op);
+        assert_eq!(partition.dedup.count(), 1);
+        assert!(partition.dedup.contains(CLIENTS));
+        assert_eq!(replies.borrow().len(), usize::try_from(CLIENTS).unwrap());
+        for client_id in 1..CLIENTS {
+            assert!(partition.session_retired(SessionIdentity {
+                client_id,
+                session: 1,
+                metadata_watermark: ENDING_FRONTIER + u64::try_from(client_id).unwrap(),
+            }));
+        }
     }
 
     #[compio::test]

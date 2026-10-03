@@ -375,6 +375,8 @@ async fn partition_write(
     )
     .map_err(PartitionWriteError::Rejected)?;
     let gate = session.partition_gate(namespace);
+    // The group retains one receipt per session. Keep its lane occupied through
+    // the reply wait, including when NoAck has already returned after dispatch.
     let _partition_guard = compio::time::timeout(
         deadline.saturating_duration_since(Instant::now()),
         gate.lock(),

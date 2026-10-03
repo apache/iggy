@@ -302,9 +302,9 @@ const nodePackedVersion = nodeRegister.match(
 );
 assert.ok(nodePackedVersion, 'Node packed protocol version source changed');
 assert.deepEqual(
-  [Number(nodePackedVersion[1]), Number(nodePackedVersion[2])],
-  [Number(protocolVersion[1]), Number(protocolVersion[2])],
-  'Node protocol major.minor differs from the Rust wire version'
+  [Number(nodePackedVersion[1]), Number(nodePackedVersion[2]), Number(nodePackedVersion[3])],
+  [Number(protocolVersion[1]), Number(protocolVersion[2]), Number(protocolVersion[3])],
+  'Node protocol major.minor.patch differs from the Rust wire version'
 );
 
 console.log('Node VSR protocol mirror matches Rust sources');

@@ -61,7 +61,7 @@ func newPrimaryPollFixture(t *testing.T,
 				t.Error("an auxiliary connection must bind the parent session without Register")
 				return statusReplyFrame(vsr.OperationRegister, uint32(ierror.ErrUnauthenticated.Code()), nil)
 			case read.code() == uint32(command.BindSessionCode):
-				return replyFrame(vsr.OperationNonReplicated, nil)
+				return bindReplyFrame(7, read.sessionID())
 			case read.code() == uint32(command.PollMessagesOnPrimaryCode):
 				partition := routedPollPartition(t, read)
 				require.Equal(t, primary, int(partition), "poll must reach its own partition primary")
@@ -488,7 +488,7 @@ func TestPrimaryPoll_InternalBudgetDoesNotReturnCallerDeadline(t *testing.T) {
 				polls := 0
 				serve(primaryConn, func(_ int, read request) []byte {
 					if read.code() == uint32(command.BindSessionCode) {
-						return replyFrame(vsr.OperationNonReplicated, nil)
+						return bindReplyFrame(7, read.sessionID())
 					}
 					polls++
 					if outcome == "refused" {
@@ -692,6 +692,46 @@ func TestPrimaryPoll_StaleAttachmentReconnectsDataWithoutRejoining(t *testing.T)
 	assert.Equal(t, 1, fixture.coordinator.connections())
 	assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.PollMessagesOnPrimaryCode),
 		"attachment failure is retried before any auto-commit poll is admitted")
+}
+
+func TestPrimaryPoll_InvalidBindingDoesNotPollAndRetiresConnection(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		reply func(request) []byte
+		err   error
+	}{
+		{
+			name: "mismatched session",
+			reply: func(read request) []byte {
+				return bindReplyFrame(7, read.sessionID()+1)
+			},
+			err: ierror.ErrSessionMismatch,
+		},
+		{
+			name: "missing response body",
+			reply: func(request) []byte {
+				return replyFrame(vsr.OperationNonReplicated, nil)
+			},
+			err: vsr.ErrTruncatedRegisterReply,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newPrimaryPollFixture(t, func(_, connection int, read request) ([]byte, bool) {
+				if connection == 0 && read.code() == uint32(command.BindSessionCode) {
+					return test.reply(read), true
+				}
+				return nil, false
+			}, nil)
+			_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.ErrorIs(t, err, test.err)
+			assert.Zero(t, requestCount(fixture.primaries[0].recorded(), command.PollMessagesOnPrimaryCode),
+				"an invalid binding must not admit an auto-commit poll")
+			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
+			require.NoError(t, err)
+			assert.Equal(t, 2, fixture.primaries[0].connections(), "the invalid binding must close its connection")
+			assert.Equal(t, 1, fixture.coordinator.connections(), "the coordinator session must survive")
+		})
+	}
 }
 
 func TestPrimaryPoll_PlainConsumerRoutesAndNonAutoCommitStaysOnCoordinator(t *testing.T) {

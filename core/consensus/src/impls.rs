@@ -460,6 +460,10 @@ where
         }
         let capacity = self.retry_capacity(table);
         let pipeline = self.pipeline.borrow();
+        // Queue lengths bound distinct reservations without scanning either queue.
+        if pipeline.len() + pipeline.request_queue_len() < capacity.saturating_sub(table.count()) {
+            return true;
+        }
         let pending: HashSet<_> = pipeline
             .pending_client_ids()
             .filter(|candidate| {
@@ -4509,7 +4513,9 @@ mod fresh_group_start_tests {
 
 #[cfg(test)]
 mod request_queue_tests {
+    use super::test_bus::NoopBus;
     use super::*;
+    use crate::client_table::{ClientTable, ClientTableMode};
     use iggy_binary_protocol::{Command, Operation};
     use iggy_common::ConsumerKind;
     use server_common::poll::AutoCommitReservationToken;
@@ -4532,6 +4538,59 @@ mod request_queue_tests {
             ..RoutedRequestHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_pending_clients_when_checking_capacity_should_reserve_distinct_unprotected_clients() {
+        const CAPACITY: usize = 3;
+        let mut table = ClientTable::with_mode(CAPACITY, ClientTableMode::PartitionSlice);
+        table.commit_capacity(CAPACITY).unwrap();
+        table.commit_request(1, 1, 1, 1).unwrap();
+        let consensus = VsrConsensus::new(1, 0, 1, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        assert!(consensus.has_retry_capacity(&table, 2));
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(PrepareHeader {
+                client: 2,
+                op: 1,
+                ..PrepareHeader::default()
+            }));
+            for client in [0, message_bus::AUTO_COMMIT_CLIENT_ID, 1, 2] {
+                pipeline
+                    .push_request(RequestEntry::new(make_request(client, 1)))
+                    .unwrap();
+            }
+        });
+        assert!(
+            consensus.has_retry_capacity(&table, 3),
+            "only client 2 reserves a new slot"
+        );
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline
+                .push_request(RequestEntry::new(make_request(3, 1)))
+                .unwrap();
+        });
+        assert!(
+            !consensus.has_retry_capacity(&table, 4),
+            "both queues must reserve capacity"
+        );
+        assert!(
+            consensus.has_retry_capacity(&table, 1),
+            "committed protection is reusable"
+        );
+        assert!(
+            consensus.has_retry_capacity(&table, 2),
+            "a pending client already owns its reservation"
+        );
+        consensus.with_pipeline_mut(LocalPipeline::clear_request_queue);
+        assert!(
+            consensus.has_retry_capacity(&table, 3),
+            "queue reset must release its reservations"
+        );
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the prepare reservation must survive queue reset"
+        );
     }
 
     #[test]
