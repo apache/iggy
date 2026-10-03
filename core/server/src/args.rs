@@ -89,6 +89,7 @@ For more information, visit: https://iggy.apache.org/docs/introduction/getting-s
 pub struct Args {
     #[arg(
         long,
+        help = "Print supported configuration environment variables and exit",
         long_help = r#"Print supported configuration environment variables and exit.
 
 Lists all supported IGGY_* environment variable names and templates,

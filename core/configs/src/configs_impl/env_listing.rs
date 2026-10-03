@@ -43,16 +43,17 @@ where
 
 /// Env vars `iggy-mcp --list-config-env-vars` advertises beyond the derived
 /// `McpServerConfig` templates.
-pub const MCP_RUNTIME_ENV_VARS: &[&str] = &[
-    "IGGY_DISPLAY_CONFIG",
-    "IGGY_MCP_CONFIG_PATH",
-    "IGGY_MCP_ENV_PATH",
-];
+pub const MCP_CONFIG_PATH_ENV: &str = "IGGY_MCP_CONFIG_PATH";
+pub const MCP_ENV_PATH_ENV: &str = "IGGY_MCP_ENV_PATH";
+pub const MCP_RUNTIME_ENV_VARS: &[&str] =
+    &["IGGY_DISPLAY_CONFIG", MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV];
 
 /// Env vars `iggy-connectors --list-config-env-vars` advertises beyond the
 /// derived `ConnectorsRuntimeConfig` templates.
+pub const CONNECTORS_CONFIG_PATH_ENV: &str = "IGGY_CONNECTORS_CONFIG_PATH";
+pub const CONNECTORS_ENV_PATH_ENV: &str = "IGGY_CONNECTORS_ENV_PATH";
 pub const CONNECTORS_RUNTIME_ENV_VARS: &[&str] = &[
-    "IGGY_CONNECTORS_CONFIG_PATH",
-    "IGGY_CONNECTORS_ENV_PATH",
+    CONNECTORS_CONFIG_PATH_ENV,
+    CONNECTORS_ENV_PATH_ENV,
     "IGGY_DISPLAY_CONFIG",
 ];

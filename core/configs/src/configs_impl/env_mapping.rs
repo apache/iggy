@@ -33,10 +33,14 @@ pub struct EnvVarMapping {
 ///
 /// Array indices are represented by `<N>` in `env_name`. `max_elements`
 /// contains the expansion limit for each placeholder, from left to right.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvVarTemplate {
     /// Environment variable name, with `<N>` for each array index.
     pub env_name: &'static str,
+    /// Config path, with `<N>` for each array index.
+    pub config_path: &'static str,
+    /// Whether this field contains secret data.
+    pub is_secret: bool,
     /// Maximum element count for each `<N>` placeholder, from left to right.
     pub max_elements: &'static [usize],
 }
@@ -76,56 +80,36 @@ pub trait ConfigEnvMappings {
 }
 
 impl EnvVarTemplate {
-    /// Expands this template into every concrete env-var name it represents,
-    /// substituting each `<N>` placeholder left-to-right with `0..limit`.
-    /// A leaf template (`max_elements: &[]`) expands to itself.
-    pub fn expand_names(&self) -> Vec<String> {
-        let mut results = vec![self.env_name.to_string()];
+    /// Expands this template into every concrete mapping it represents.
+    pub fn expand(&self) -> Vec<EnvVarMapping> {
+        let mut results = vec![(self.env_name.to_string(), self.config_path.to_string())];
 
         for &limit in self.max_elements {
             let mut next = Vec::new();
-            for name in results {
+            for (env_name, config_path) in results {
                 for i in 0..limit {
-                    next.push(name.replacen("<N>", &i.to_string(), 1));
+                    let index = i.to_string();
+                    next.push((
+                        env_name.replacen("<N>", &index, 1),
+                        config_path.replacen("<N>", &index, 1),
+                    ));
                 }
             }
             results = next;
         }
 
         results
+            .into_iter()
+            .map(|(env_name, config_path)| EnvVarMapping {
+                env_name: Box::leak(env_name.into_boxed_str()),
+                config_path: Box::leak(config_path.into_boxed_str()),
+                is_secret: self.is_secret,
+            })
+            .collect()
     }
 }
 
-#[cfg(test)]
-mod consistency_tests {
-    use super::*;
-    use crate::server::ServerConfig;
-    use std::collections::HashSet;
-
-    /// Asserts that `T::env_templates()`, expanded, names exactly the same
-    /// set as `T::env_mappings()`. One generic body for every `ConfigEnv`
-    /// type, so adding a type to check is one call, not one copy-pasted test.
-    fn assert_templates_and_mappings_align<T: ConfigEnvMappings>(type_name: &str) {
-        let expanded: HashSet<String> = T::env_templates()
-            .iter()
-            .flat_map(|t| t.expand_names())
-            .collect();
-        let mapped: HashSet<String> = T::env_mappings()
-            .iter()
-            .map(|m| m.env_name.to_string())
-            .collect();
-        assert_eq!(
-            expanded, mapped,
-            "{type_name} env_templates and env_mappings must align"
-        );
-    }
-
-    #[test]
-    fn server_config_templates_and_mappings_align() {
-        // ClusterConfig is only ever embedded as a field of ServerConfig
-        // (never derived or called standalone in production code), so this
-        // single check already covers its templates and mappings too -
-        // a separate ClusterConfig-only test would just repeat it.
-        assert_templates_and_mappings_align::<ServerConfig>("ServerConfig");
-    }
+/// Expands compact templates into the mappings consumed by the env provider.
+pub fn expand_env_templates(templates: &[EnvVarTemplate]) -> Vec<EnvVarMapping> {
+    templates.iter().flat_map(EnvVarTemplate::expand).collect()
 }

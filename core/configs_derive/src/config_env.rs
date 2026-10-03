@@ -180,18 +180,7 @@ fn generate_enum_impl(
         })
         .collect();
 
-    let tag_mapping = tag.as_deref().map(|tag_name: &str| {
-        let env_segment = tag_name.to_uppercase();
-        quote! {
-            all_mappings.push(configs::EnvVarMapping {
-                env_name: #env_segment,
-                config_path: #tag_name,
-                is_secret: false,
-            });
-        }
-    });
-
-    if variant_types.is_empty() && tag_mapping.is_none() {
+    if variant_types.is_empty() && tag.is_none() {
         return quote! {
             impl #impl_generics configs::ConfigEnvMappings for #enum_name #ty_generics #where_clause {
                 fn env_mappings() -> &'static [configs::EnvVarMapping] {
@@ -205,16 +194,6 @@ fn generate_enum_impl(
         };
     }
 
-    // Generate code to extend from each variant type
-    let extends: Vec<TokenStream2> = variant_types
-        .iter()
-        .map(|ty| {
-            quote! {
-                all_mappings.extend_from_slice(<#ty as configs::ConfigEnvMappings>::env_mappings());
-            }
-        })
-        .collect();
-
     let template_extends: Vec<TokenStream2> = variant_types
         .iter()
         .map(|ty| quote! {
@@ -226,6 +205,8 @@ fn generate_enum_impl(
         quote! {
             all_templates.push(configs::EnvVarTemplate {
                 env_name: #env_segment,
+                config_path: #tag_name,
+                is_secret: false,
                 max_elements: &[],
             });
         }
@@ -235,12 +216,7 @@ fn generate_enum_impl(
         impl #impl_generics configs::ConfigEnvMappings for #enum_name #ty_generics #where_clause {
             fn env_mappings() -> &'static [configs::EnvVarMapping] {
                 static MAPPINGS: std::sync::OnceLock<Vec<configs::EnvVarMapping>> = std::sync::OnceLock::new();
-                MAPPINGS.get_or_init(|| {
-                    let mut all_mappings: Vec<configs::EnvVarMapping> = Vec::new();
-                    #tag_mapping
-                    #(#extends)*
-                    all_mappings
-                })
+                MAPPINGS.get_or_init(|| configs::expand_env_templates(Self::env_templates()))
             }
 
             fn env_templates() -> &'static [configs::EnvVarTemplate] {
@@ -285,137 +261,53 @@ fn generate_struct_impl(
     let (mappings, nested_fields) = collect_mappings(&fields);
 
     let const_definitions = generate_const_definitions(&mappings, prefix_str);
-    let mapping_entries = generate_mapping_entries(&mappings);
     let builder_methods = generate_builder_methods(&mappings, prefix_str);
     let builder_name = format_ident!("{}EnvBuilder", struct_name);
-    let mappings_count = mappings.len();
-
-    // Generate code to include nested type mappings
-    let nested_extends: Vec<TokenStream2> = nested_fields
-        .iter()
-        .map(|info| {
-            let ty = &info.element_type;
-            let field_env_segment = &info.field_env_segment;
-            let field_name = &info.field_name;
-
-            if info.is_vec {
-                // For Vec fields, expand with array indices
-                let max_elements = info.max_elements;
-                quote! {
-                    let nested_mappings = <#ty as configs::ConfigEnvMappings>::env_mappings();
-                    for i in 0..#max_elements {
-                        for mapping in nested_mappings {
-                            // Transform env_name by prepending FIELD_INDEX_
-                            let new_env_name: &'static str = Box::leak(
-                                format!("{}_{}_{}", #field_env_segment, i, mapping.env_name).into_boxed_str()
-                            );
-                            // Transform config_path by prepending field.index.
-                            let new_config_path: &'static str = Box::leak(
-                                format!("{}.{}.{}", #field_name, i, mapping.config_path).into_boxed_str()
-                            );
-                            all_mappings.push(configs::EnvVarMapping {
-                                env_name: new_env_name,
-                                config_path: new_config_path,
-                                is_secret: mapping.is_secret,
-                            });
-                        }
-                    }
-                }
-            } else {
-                // For non-Vec nested types, transform by prepending field name
-                quote! {
-                    let nested_mappings = <#ty as configs::ConfigEnvMappings>::env_mappings();
-                    for mapping in nested_mappings {
-                        // Transform env_name by prepending FIELD_
-                        let new_env_name: &'static str = Box::leak(
-                            format!("{}_{}", #field_env_segment, mapping.env_name).into_boxed_str()
-                        );
-                        // Transform config_path by prepending field.
-                        let new_config_path: &'static str = Box::leak(
-                            format!("{}.{}", #field_name, mapping.config_path).into_boxed_str()
-                        );
-                        all_mappings.push(configs::EnvVarMapping {
-                            env_name: new_env_name,
-                            config_path: new_config_path,
-                            is_secret: mapping.is_secret,
-                        });
-                    }
-                }
-            }
-        })
-        .collect();
-
-    let prefix_application = if has_prefix {
-        quote! {
-            let all_mappings: Vec<configs::EnvVarMapping> = all_mappings
-                .into_iter()
-                .map(|m| configs::EnvVarMapping {
-                    env_name: Box::leak(format!("{}{}", #prefix_str, m.env_name).into_boxed_str()),
-                    config_path: m.config_path,
-                    is_secret: m.is_secret,
-                })
-                .collect();
-        }
-    } else {
-        quote! {}
-    };
-
-    // If there are nested types, we need to use OnceLock to combine mappings
-    let env_mappings_impl = if nested_fields.is_empty() && !has_prefix {
-        // Simple case: no nested fields, no prefix transformation needed
-        quote! {
-            fn env_mappings() -> &'static [configs::EnvVarMapping] {
-                static MAPPINGS: [configs::EnvVarMapping; #mappings_count] = [
-                    #(#mapping_entries),*
-                ];
-                &MAPPINGS
-            }
-        }
-    } else {
-        // Complex case: need OnceLock for dynamic construction
-        quote! {
-            fn env_mappings() -> &'static [configs::EnvVarMapping] {
-                static MAPPINGS: std::sync::OnceLock<Vec<configs::EnvVarMapping>> = std::sync::OnceLock::new();
-                MAPPINGS.get_or_init(|| {
-                    let own_mappings: [configs::EnvVarMapping; #mappings_count] = [
-                        #(#mapping_entries),*
-                    ];
-                    let mut all_mappings = Vec::from(own_mappings);
-                    #(#nested_extends)*
-                    #prefix_application
-                    all_mappings
-                })
-            }
-        }
-    };
 
     let own_template_entries = mappings.iter().map(|mapping| {
         let env_suffix = &mapping.env_suffix;
+        let config_path = &mapping.config_path;
+        let is_secret = mapping.is_secret;
         quote! {
-            configs::EnvVarTemplate { env_name: #env_suffix, max_elements: &[] }
+            configs::EnvVarTemplate {
+                env_name: #env_suffix,
+                config_path: #config_path,
+                is_secret: #is_secret,
+                max_elements: &[],
+            }
         }
     });
     let nested_template_extends = nested_fields.iter().map(|info| {
         let ty = &info.element_type;
         let segment = &info.field_env_segment;
+        let field_name = &info.field_name;
         if info.is_vec {
             let max_elements = info.max_elements;
             quote! {
                 for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
                     let env_name = Box::leak(format!("{}_<N>_{}", #segment, template.env_name).into_boxed_str());
+                    let config_path = Box::leak(format!("{}.<N>.{}", #field_name, template.config_path).into_boxed_str());
                     let limits = Box::leak(std::iter::once(#max_elements)
                         .chain(template.max_elements.iter().copied())
                         .collect::<Vec<_>>()
                         .into_boxed_slice());
-                    all_templates.push(configs::EnvVarTemplate { env_name, max_elements: limits });
+                    all_templates.push(configs::EnvVarTemplate {
+                        env_name,
+                        config_path,
+                        is_secret: template.is_secret,
+                        max_elements: limits,
+                    });
                 }
             }
         } else {
             quote! {
                 for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
                     let env_name = Box::leak(format!("{}_{}", #segment, template.env_name).into_boxed_str());
+                    let config_path = Box::leak(format!("{}.{}", #field_name, template.config_path).into_boxed_str());
                     all_templates.push(configs::EnvVarTemplate {
                         env_name,
+                        config_path,
+                        is_secret: template.is_secret,
                         max_elements: template.max_elements,
                     });
                 }
@@ -444,7 +336,10 @@ fn generate_struct_impl(
         }
 
         impl #impl_generics configs::ConfigEnvMappings for #struct_name #ty_generics #where_clause {
-            #env_mappings_impl
+            fn env_mappings() -> &'static [configs::EnvVarMapping] {
+                static MAPPINGS: std::sync::OnceLock<Vec<configs::EnvVarMapping>> = std::sync::OnceLock::new();
+                MAPPINGS.get_or_init(|| configs::expand_env_templates(Self::env_templates()))
+            }
 
             fn env_templates() -> &'static [configs::EnvVarTemplate] {
                 static TEMPLATES: std::sync::OnceLock<Vec<configs::EnvVarTemplate>> = std::sync::OnceLock::new();
@@ -641,25 +536,6 @@ fn generate_const_definitions(mappings: &[EnvMapping], prefix: &str) -> Vec<Toke
             let env_var_name = format!("{}{}", prefix, m.env_suffix);
             quote! {
                 pub const #const_name: &'static str = #env_var_name;
-            }
-        })
-        .collect()
-}
-
-fn generate_mapping_entries(mappings: &[EnvMapping]) -> Vec<TokenStream2> {
-    mappings
-        .iter()
-        .map(|m| {
-            let env_suffix = &m.env_suffix;
-            let config_path = &m.config_path;
-            let is_secret = m.is_secret;
-
-            quote! {
-                configs::EnvVarMapping {
-                    env_name: #env_suffix,
-                    config_path: #config_path,
-                    is_secret: #is_secret,
-                }
             }
         })
         .collect()

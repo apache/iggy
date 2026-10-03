@@ -21,7 +21,8 @@ use crate::configs::connectors::{
 };
 use crate::metrics::ConnectorType;
 use ::configs::{
-    CONNECTORS_RUNTIME_ENV_VARS, ConfigEnvMappings, ConfigProvider, print_env_var_names,
+    CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
+    ConfigEnvMappings, ConfigProvider, print_env_var_names,
 };
 use clap::Parser;
 use configs::connectors::ConfigFormat;
@@ -74,6 +75,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 struct Args {
     #[arg(
         long,
+        help = "Print supported configuration environment variables and exit",
         long_help = r#"Print supported configuration environment variables and exit.
 
 Lists all supported IGGY_* environment variable names and templates,
@@ -151,25 +153,23 @@ fn main() -> Result<(), RuntimeError> {
 }
 
 fn print_config_env_vars() -> std::io::Result<()> {
-    let sink_source_templates: Vec<String> = [
+    let sink_source_templates = [
         ("SINK", SinkConfig::env_templates()),
         ("SOURCE", SourceConfig::env_templates()),
     ]
-    .iter()
+    .into_iter()
     .flat_map(|(kind, templates)| {
         // "<KEY>" stands in for the real, per-connector key `local_provider`
         // uppercases at runtime - same prefix rule, so the listing can't
         // drift from the names the runtime actually reads.
         let prefix =
             crate::configs::connectors::local_provider::connector_env_prefix(kind, "<KEY>");
-        let enabled = format!("{prefix}ENABLED");
         let plugin_config = format!("{prefix}PLUGIN_CONFIG_<FIELD>");
         templates
             .iter()
             .map(move |template| format!("{prefix}{}", template.env_name))
-            .chain([enabled, plugin_config])
-    })
-    .collect();
+            .chain(std::iter::once(plugin_config))
+    });
 
     let names = ConnectorsRuntimeConfig::env_templates()
         .iter()
@@ -184,7 +184,7 @@ fn print_config_env_vars() -> std::io::Result<()> {
 async fn run() -> Result<(), RuntimeError> {
     print_ascii_art("Iggy Connectors");
 
-    if let Ok(env_path) = std::env::var("IGGY_CONNECTORS_ENV_PATH") {
+    if let Ok(env_path) = std::env::var(CONNECTORS_ENV_PATH_ENV) {
         if dotenvy::from_path(&env_path).is_ok() {
             println!("Loaded environment variables from path: {env_path}");
         }
@@ -196,7 +196,7 @@ async fn run() -> Result<(), RuntimeError> {
     }
 
     let config_path =
-        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        env::var(CONNECTORS_CONFIG_PATH_ENV).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     println!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
     let config: ConnectorsRuntimeConfig = ConnectorsRuntimeConfig::config_provider(config_path)

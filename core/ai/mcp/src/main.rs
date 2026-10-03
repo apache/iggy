@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ::configs::{ConfigEnvMappings, ConfigProvider, MCP_RUNTIME_ENV_VARS, print_env_var_names};
+use ::configs::{
+    ConfigEnvMappings, ConfigProvider, MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV, MCP_RUNTIME_ENV_VARS,
+    print_env_var_names,
+};
 use clap::Parser;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
@@ -83,7 +86,7 @@ async fn run() -> Result<(), McpRuntimeError> {
     let figure = standard_font.convert("Iggy MCP Server");
     eprintln!("{}", figure.unwrap());
 
-    if let Ok(env_path) = std::env::var("IGGY_MCP_ENV_PATH") {
+    if let Ok(env_path) = std::env::var(MCP_ENV_PATH_ENV) {
         if dotenvy::from_path(&env_path).is_ok() {
             eprintln!("Loaded environment variables from path: {env_path}");
         }
@@ -95,7 +98,7 @@ async fn run() -> Result<(), McpRuntimeError> {
     }
 
     let config_path =
-        env::var("IGGY_MCP_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        env::var(MCP_CONFIG_PATH_ENV).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     eprintln!("Configuration file path: {config_path}");
     let config: McpServerConfig = McpServerConfig::config_provider(config_path)
         .load_config()

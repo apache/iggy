@@ -75,22 +75,43 @@ fn run_list_config_env_vars_plain(binary: &str, extra_args: &[&str]) -> std::pro
 
 #[test]
 fn config_env_listing_exits_before_startup_for_each_binary() {
-    for (binary, config_env, dotenv_env) in [
-        ("iggy-server", "IGGY_CONFIG_PATH", "IGGY_ENV_PATH"),
+    for (binary, config_env, dotenv_env, invalid_env) in [
+        (
+            "iggy-server",
+            "IGGY_CONFIG_PATH",
+            "IGGY_ENV_PATH",
+            "IGGY_HTTP_ADDRESS",
+        ),
         (
             "iggy-connectors",
             "IGGY_CONNECTORS_CONFIG_PATH",
             "IGGY_CONNECTORS_ENV_PATH",
+            "IGGY_CONNECTORS_HTTP_ADDRESS",
         ),
-        ("iggy-mcp", "IGGY_MCP_CONFIG_PATH", "IGGY_MCP_ENV_PATH"),
+        (
+            "iggy-mcp",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_ENV_PATH",
+            "IGGY_MCP_HTTP_ADDRESS",
+        ),
     ] {
         let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("invalid-config.toml");
+        let dotenv_path = directory.path().join("invalid.env");
+        std::fs::write(&config_path, "not valid toml = [").expect("write invalid config");
+        std::fs::write(&dotenv_path, "not a dotenv assignment").expect("write invalid dotenv");
+
+        let entries_before: HashSet<_> = std::fs::read_dir(directory.path())
+            .expect("read temporary directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect();
         let output = run_list_config_env_vars_in(
             binary,
             directory.path(),
             [
-                (config_env, directory.path().join("missing-config.toml")),
-                (dotenv_env, directory.path().join("missing.env")),
+                (config_env, config_path.into_os_string()),
+                (dotenv_env, dotenv_path.into_os_string()),
+                (invalid_env, "invalid-value".into()),
             ],
             &[],
         );
@@ -102,6 +123,20 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(output.stderr.is_empty(), "{binary} wrote to stderr");
+
+        let baseline = run_list_config_env_vars_plain(binary, &[]);
+        assert_eq!(
+            output.stdout, baseline.stdout,
+            "{binary} output changed with invalid config, dotenv or env values"
+        );
+        let entries_after: HashSet<_> = std::fs::read_dir(directory.path())
+            .expect("read temporary directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect();
+        assert_eq!(
+            entries_after, entries_before,
+            "{binary} created startup side effects"
+        );
 
         let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
         let names: Vec<_> = stdout.lines().collect();
@@ -177,6 +212,14 @@ fn config_env_listing_includes_connector_templates() {
             .any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_<FIELD>")),
         "connectors should list SOURCE plugin config templates"
     );
+    assert!(
+        names.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_FORMAT"),
+        "connectors should list the typed SINK plugin config format"
+    );
+    assert!(
+        names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_FORMAT"),
+        "connectors should list the typed SOURCE plugin config format"
+    );
 
     // Verify SINK and SOURCE ENABLED fields are present
     assert!(
@@ -191,6 +234,55 @@ fn config_env_listing_includes_connector_templates() {
             .any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_ENABLED")),
         "connectors should list SOURCE_<KEY>_ENABLED"
     );
+
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|name| *name == "IGGY_CONNECTORS_CONNECTORS_CONFIG_TYPE")
+            .count(),
+        1,
+        "enum variants should produce one deduplicated tag name"
+    );
+}
+
+#[test]
+fn config_env_listing_excludes_other_processes_variables() {
+    let server = run_list_config_env_vars_plain("iggy-server", &[]);
+    let server = String::from_utf8(server.stdout).expect("UTF-8 output");
+    let server_names: HashSet<_> = server.lines().collect();
+    for excluded in [
+        "IGGY_CI_BUILD",
+        "IGGY_HOME",
+        "IGGY_PASSWORD",
+        "IGGY_TEST_CLEANUP_DISABLED",
+        "IGGY_TEST_CLUSTER_NODES",
+        "IGGY_TEST_VERBOSE",
+        "IGGY_USERNAME",
+    ] {
+        assert!(!server_names.contains(excluded), "server listed {excluded}");
+    }
+    assert!(
+        server_names
+            .iter()
+            .all(|name| !name.starts_with("IGGY_CONNECTORS_")
+                && !name.starts_with("IGGY_KAFKA_")
+                && !name.starts_with("IGGY_MCP_")),
+        "server listed a sibling binary's variables"
+    );
+
+    for (binary, prefix) in [
+        ("iggy-connectors", "IGGY_CONNECTORS_"),
+        ("iggy-mcp", "IGGY_MCP_"),
+    ] {
+        let output = run_list_config_env_vars_plain(binary, &[]);
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+        assert!(
+            stdout
+                .lines()
+                .all(|name| name == "IGGY_DISPLAY_CONFIG" || name.starts_with(prefix)),
+            "{binary} listed a variable outside {prefix}"
+        );
+    }
 }
 
 #[test]
