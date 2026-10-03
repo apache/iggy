@@ -977,6 +977,10 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                         .set(self.checkpoint_requested.get().max(*through_op));
                     true
                 }
+                Mutation::Barrier { offset_files, .. } => {
+                    self.retired_offset_files.borrow_mut().append(offset_files);
+                    false
+                }
                 _ => false,
             });
         self.accepted.borrow_mut().truncate_from(from_op);
