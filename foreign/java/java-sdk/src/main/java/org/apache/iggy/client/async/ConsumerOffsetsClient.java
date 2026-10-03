@@ -87,4 +87,30 @@ public interface ConsumerOffsetsClient {
      */
     CompletableFuture<Optional<ConsumerOffsetInfo>> getConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
+
+    /**
+     * Deletes a consumer offset asynchronously.
+     *
+     * @param streamId The stream identifier (numeric ID)
+     * @param topicId The topic identifier (numeric ID)
+     * @param partitionId The partition identifier (optional)
+     * @param consumerId The consumer identifier (numeric ID)
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    default CompletableFuture<Void> deleteConsumerOffset(
+            Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {
+        return deleteConsumerOffset(StreamId.of(streamId), TopicId.of(topicId), partitionId, Consumer.of(consumerId));
+    }
+
+    /**
+     * Deletes a consumer offset asynchronously.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param partitionId The partition identifier (optional)
+     * @param consumer The consumer
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    CompletableFuture<Void> deleteConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
 }
