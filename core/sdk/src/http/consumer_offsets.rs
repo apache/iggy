@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerOffsetInfo};
+use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
@@ -35,6 +35,7 @@ impl ConsumerOffsetClient for HttpClient {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
+        refuse_external_group(consumer)?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
@@ -54,6 +55,7 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
+        refuse_external_group(consumer)?;
         let response = self
             .get_with_query(
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -85,6 +87,7 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
+        refuse_external_group(consumer)?;
         let partition_id = partition_id
             .map(|id| format!("?partition_id={id}"))
             .unwrap_or_default();
@@ -100,4 +103,13 @@ impl ConsumerOffsetClient for HttpClient {
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/consumer-offsets")
+}
+
+/// The REST API cannot name a consumer kind, so an external group would land on a plain
+/// consumer's offset.
+pub(crate) fn refuse_external_group(consumer: &Consumer) -> Result<(), IggyError> {
+    if consumer.kind == ConsumerKind::ExternalGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
+    Ok(())
 }

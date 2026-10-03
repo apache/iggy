@@ -45,7 +45,10 @@ use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
-use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode};
+use iggy_binary_protocol::{
+    KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, RoutedRequestHeader,
+    WireDecode,
+};
 use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -360,6 +363,7 @@ fn capture_offset_attachment(
     }
     let (wire, _) =
         GetConsumerOffsetRequest::decode(body).map_err(|_| IggyError::InvalidCommand)?;
+    // An external group has no members, so its reads carry no membership.
     let group = if wire.consumer.kind == KIND_CONSUMER_GROUP {
         Some(crate::namespace::resolve_offset_group_id(
             streams,
@@ -681,11 +685,8 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         return;
     }
     let body = match resolve_consumer_offset_request(shard, &wire) {
-        Ok(Some((namespace, partition_id, consumer))) => {
-            match shard
-                .partition_read(namespace, PartitionRead::ConsumerOffset { consumer })
-                .await
-            {
+        Ok(Some((namespace, partition_id, read))) => {
+            match shard.partition_read(namespace, read).await {
                 Some(PartitionReadReply::ConsumerOffset {
                     stored: Some(stored_offset),
                     current_offset,
@@ -809,6 +810,10 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    // An external group only holds offsets. Nothing in Iggy may poll with it.
+    if wire.consumer.kind == KIND_EXTERNAL_GROUP {
+        return Err(IggyError::FeatureUnavailable);
+    }
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
 
@@ -861,8 +866,8 @@ where
 }
 
 /// Resolve a decoded consumer-offset read into its owning-shard read:
-/// namespace, partition, and polling consumer. Shared by the TCP dispatch and
-/// the HTTP route; needs no client id because offset reads are not fenced
+/// namespace, partition, and the read to run there. Shared by the TCP dispatch
+/// and the HTTP route; needs no client id because offset reads are not fenced
 /// (any client may read a group's offset, member or not).
 ///
 /// `Ok(None)` is the one outcome that means "no offset exists to report" (an
@@ -872,7 +877,7 @@ where
 pub fn resolve_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &GetConsumerOffsetRequest,
-) -> Result<Option<(IggyNamespace, u32, PollingConsumer)>, IggyError>
+) -> Result<Option<(IggyNamespace, u32, PartitionRead)>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -885,25 +890,37 @@ where
     let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
+    if wire.consumer.kind != KIND_CONSUMER_GROUP && wire.consumer.kind != KIND_EXTERNAL_GROUP {
+        let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
+        return Ok(Some((
+            namespace,
+            partition_id,
+            PartitionRead::ConsumerOffset { consumer },
+        )));
+    }
     // A group offset is keyed by the group's monotonic id (any client may read
     // it, member or not), the same key the write path is rewritten to. An
     // unresolved group (e.g. deleted) has no offset, so the read reports None.
-    let consumer = if wire.consumer.kind == KIND_CONSUMER_GROUP {
-        let Some(group_id) = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .resolve_consumer_group_id(&wire.stream_id, &wire.topic_id, &wire.consumer.id)
-        else {
-            return Ok(None);
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize)
-    } else {
-        polling_consumer_from_wire(&wire.consumer, partition_id)?
+    let Some(group_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_consumer_group_id(&wire.stream_id, &wire.topic_id, &wire.consumer.id)
+    else {
+        return Ok(None);
     };
-    Ok(Some((namespace, partition_id, consumer)))
+    #[allow(clippy::cast_possible_truncation)]
+    let read = if wire.consumer.kind == KIND_EXTERNAL_GROUP {
+        PartitionRead::ExternalGroupOffset {
+            group_id: u32::try_from(group_id).unwrap_or(u32::MAX),
+        }
+    } else {
+        PartitionRead::ConsumerOffset {
+            consumer: PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize),
+        }
+    };
+    Ok(Some((namespace, partition_id, read)))
 }
 
 fn polling_consumer_from_wire(
@@ -920,7 +937,7 @@ fn polling_consumer_from_wire(
         }
     } as usize;
     match consumer.kind {
-        1 => Ok(PollingConsumer::Consumer(
+        KIND_CONSUMER => Ok(PollingConsumer::Consumer(
             consumer_id,
             partition_id as usize,
         )),

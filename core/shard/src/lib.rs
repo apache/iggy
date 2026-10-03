@@ -350,6 +350,10 @@ pub enum PartitionRead {
     ConsumerOffset {
         consumer: PollingConsumer,
     },
+    /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
+    ExternalGroupOffset {
+        group_id: u32,
+    },
     /// Cooperative-rebalance classification: the group's last-polled and
     /// committed offsets on this partition, so the join enrichment can tell an
     /// in-flight partition (committed < last-polled) from a never-polled/drained
@@ -8211,18 +8215,18 @@ where
         // Republished per sweep like the repair count: a stranded key is
         // permanent until its own store or delete succeeds, so a gauge that
         // never falls is the operator's only signal.
-        let mut stranded = [0usize; 2];
+        let mut stranded = [0usize; ConsumerKind::COUNT];
         for namespace in partitions.namespaces() {
             if let Some(partition) = partitions.get_by_ns(namespace) {
-                stranded[0] += partition.stranded_consumer_offset_count(ConsumerKind::Consumer);
-                stranded[1] +=
-                    partition.stranded_consumer_offset_count(ConsumerKind::ConsumerGroup);
+                for kind in ConsumerKind::ALL {
+                    stranded[kind.index()] += partition.stranded_consumer_offset_count(kind);
+                }
             }
         }
-        self.metrics
-            .set_consumer_offsets_stranded(ConsumerKind::Consumer, stranded[0]);
-        self.metrics
-            .set_consumer_offsets_stranded(ConsumerKind::ConsumerGroup, stranded[1]);
+        for kind in ConsumerKind::ALL {
+            self.metrics
+                .set_consumer_offsets_stranded(kind, stranded[kind.index()]);
+        }
 
         fatal
     }

@@ -250,6 +250,14 @@ where
                         current_offset,
                     }
                 }),
+            PartitionRead::ExternalGroupOffset { group_id } => partitions
+                .external_group_offset_read(&namespace, group_id)
+                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                    PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    }
+                }),
             PartitionRead::GroupOffsetState { group_id } => partitions
                 .group_offset_state(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {

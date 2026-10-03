@@ -433,6 +433,7 @@ const fn polling_consumer(kind: ConsumerKind) -> PollingConsumer {
     match kind {
         ConsumerKind::Consumer => PollingConsumer::Consumer(CONSUMER_ID as usize, 0),
         ConsumerKind::ConsumerGroup => PollingConsumer::ConsumerGroup(CONSUMER_ID as usize, 0),
+        ConsumerKind::ExternalGroup => panic!("an external group is never polled"),
     }
 }
 

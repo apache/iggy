@@ -554,6 +554,20 @@ where
         })
     }
 
+    /// [`Self::consumer_offset_read`] for an external group, which is never polled.
+    pub fn external_group_offset_read(
+        &self,
+        namespace: &IggyNamespace,
+        group_id: u32,
+    ) -> Option<(Option<u64>, u64)> {
+        self.with_partition(namespace, |partition| {
+            (
+                partition.external_group_offset(group_id),
+                partition.offsets().commit_offset,
+            )
+        })
+    }
+
     /// Cooperative-rebalance: a group's `(last_polled, committed)` offsets on the
     /// partition for `namespace`. Synchronous (lock-free maps), under a single
     /// [`Self::with_partition`] borrow. `None` for a missing/tombstoned namespace.
