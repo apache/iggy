@@ -47,6 +47,21 @@ pub use crate::common::server::{
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
+/// Vars used by sibling binaries (iggy CLI) or test/CI-only: never advertised
+/// via `--list-config-env-vars`, but still non-config. Included in
+/// `SERVER_PROCESS_ENV_VARS` to suppress "unknown env var" warnings during
+/// config scanning.
+pub const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
+    "IGGY_TEST_VERBOSE",
+    "IGGY_TEST_CLUSTER_NODES",
+    "IGGY_TEST_CLEANUP_DISABLED",
+    "IGGY_CI_BUILD",
+    "IGGY_HOME",
+    "IGGY_USERNAME",
+    "IGGY_PASSWORD",
+];
+
+/// All non-config env vars the server process scans for.
 pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_CONFIG_PATH",
     "IGGY_ENV_PATH",
@@ -63,6 +78,17 @@ pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
 ];
+
+/// Vars safe to advertise to end users via `--list-config-env-vars` — every
+/// entry in `SERVER_PROCESS_ENV_VARS` except the sibling-binary/test-only
+/// ones in `SERVER_SCAN_ONLY_ENV_VARS`. Computed rather than retyped, so the
+/// two views cannot drift apart.
+pub fn server_runtime_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_PROCESS_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name))
+}
 
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
     &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];

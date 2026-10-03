@@ -87,6 +87,25 @@ For more information, visit: https://iggy.apache.org/docs/introduction/getting-s
 // variable names and paths must stay unquoted rather than wear rustdoc backticks.
 #[allow(clippy::doc_markdown)]
 pub struct Args {
+    #[arg(
+        long,
+        help = "Print supported configuration environment variables and exit",
+        long_help = r#"Print supported configuration environment variables and exit.
+
+Lists all supported IGGY_* environment variable names and templates,
+sorted and deduplicated. Template syntax:
+- <N> represents vector indices (0-255 for most fields, except
+  cluster.nodes[*].advertised_addresses, which caps at 0-15)
+
+Exits immediately before any startup (before dotenv, config loading,
+logging, runtimes, credentials, plugins, filesystem or network activity).
+Works even with missing or invalid configuration files.
+
+Example:
+  iggy-server --list-config-env-vars"#
+    )]
+    pub list_config_env_vars: bool,
+
     /// Remove the system path before starting (WARNING: THIS WILL DELETE ALL DATA!)
     ///
     /// Deletes the configured system data directory ('local_data' by default,

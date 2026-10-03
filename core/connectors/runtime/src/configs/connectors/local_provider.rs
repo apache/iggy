@@ -348,7 +348,10 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
     ) {
         let connector_type = base_config.connector_type().to_uppercase();
         let key = base_config.key().to_uppercase();
-        let prefix = format!("IGGY_CONNECTORS_{connector_type}_{key}_PLUGIN_CONFIG_");
+        let prefix = format!(
+            "{}PLUGIN_CONFIG_",
+            connector_env_prefix(&connector_type, &key)
+        );
 
         for (env_key, env_value) in std::env::vars() {
             let env_key_upper = env_key.to_uppercase();
@@ -393,6 +396,20 @@ impl BaseConnectorConfig {
             BaseConnectorConfig::Source { .. } => "source",
         }
     }
+}
+
+/// Builds the env-var prefix a connector's config and plugin-config overrides
+/// are matched against: `IGGY_CONNECTORS_{TYPE}_{KEY}_`. `connector_type` and
+/// `key` are expected uppercased, as `BaseConnectorConfig`'s callers already
+/// do. Shared by the runtime's actual override lookup here and by
+/// `--list-config-env-vars`'s listing in `main.rs` (passing the literal
+/// `<KEY>` as the key), so the two can't drift apart on the prefix the
+/// server actually reads.
+pub(crate) fn connector_env_prefix(connector_type: &str, key: &str) -> String {
+    format!(
+        "{}{connector_type}_{key}_",
+        crate::configs::runtime::ConnectorsRuntimeConfig::ENV_PREFIX
+    )
 }
 
 #[async_trait]
@@ -822,7 +839,7 @@ impl ConnectorEnvProvider {
     fn with_connector_base_config(base_config: &BaseConnectorConfig) -> Self {
         let connector_type = base_config.connector_type().to_uppercase();
         let key = base_config.key().to_uppercase();
-        let prefix = format!("IGGY_CONNECTORS_{}_{}_", connector_type, key);
+        let prefix = connector_env_prefix(&connector_type, &key);
         let connector_name = base_config.key().to_owned();
 
         match base_config {

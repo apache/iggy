@@ -16,10 +16,14 @@
 // under the License.
 
 use crate::configs::connectors::{
-    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, create_connectors_config_provider,
+    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, SinkConfig, SourceConfig,
+    create_connectors_config_provider,
 };
 use crate::metrics::ConnectorType;
-use ::configs::ConfigProvider;
+use ::configs::{
+    CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
+    ConfigEnvMappings, ConfigProvider, print_env_var_names,
+};
 use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
@@ -43,6 +47,7 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
+use tokio::runtime::Builder;
 use tracing::{error, info, warn};
 
 mod api;
@@ -67,7 +72,24 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(author = "Apache Iggy", version)]
-struct Args {}
+struct Args {
+    #[arg(
+        long,
+        help = "Print supported configuration environment variables and exit",
+        long_help = r#"Print supported configuration environment variables and exit.
+
+Lists all supported IGGY_* environment variable names and templates,
+sorted and deduplicated. Template syntax:
+- <N> represents vector indices (0-255 for stream fields)
+- <KEY> represents connector keys (uppercased from config).
+  Overrides via <KEY> require the local connectors provider.
+- <FIELD> represents plugin configuration field names, excluding
+  FORMAT (handled separately as a strongly-typed field)
+
+Exits immediately before any startup."#
+    )]
+    list_config_env_vars: bool,
+}
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
@@ -117,13 +139,52 @@ fn print_ascii_art(text: &str) {
     println!("{}", figure.unwrap());
 }
 
-#[tokio::main]
-async fn main() -> Result<(), RuntimeError> {
+fn main() -> Result<(), RuntimeError> {
+    let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars()?;
+        return Ok(());
+    }
     capture_allowed_cpus();
-    Args::parse();
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+fn print_config_env_vars() -> std::io::Result<()> {
+    let sink_source_templates = [
+        ("SINK", SinkConfig::env_templates()),
+        ("SOURCE", SourceConfig::env_templates()),
+    ]
+    .into_iter()
+    .flat_map(|(kind, templates)| {
+        // "<KEY>" stands in for the real, per-connector key `local_provider`
+        // uppercases at runtime - same prefix rule, so the listing can't
+        // drift from the names the runtime actually reads.
+        let prefix =
+            crate::configs::connectors::local_provider::connector_env_prefix(kind, "<KEY>");
+        let plugin_config = format!("{prefix}PLUGIN_CONFIG_<FIELD>");
+        templates
+            .iter()
+            .map(move |template| format!("{prefix}{}", template.env_name))
+            .chain(std::iter::once(plugin_config))
+    });
+
+    let names = ConnectorsRuntimeConfig::env_templates()
+        .iter()
+        .map(|t| t.env_name.to_string())
+        .chain(CONNECTORS_RUNTIME_ENV_VARS.iter().map(|s| s.to_string()))
+        .chain(sink_source_templates);
+
+    let mut stdout = std::io::stdout();
+    print_env_var_names(names, &mut stdout)
+}
+
+async fn run() -> Result<(), RuntimeError> {
     print_ascii_art("Iggy Connectors");
 
-    if let Ok(env_path) = std::env::var("IGGY_CONNECTORS_ENV_PATH") {
+    if let Ok(env_path) = std::env::var(CONNECTORS_ENV_PATH_ENV) {
         if dotenvy::from_path(&env_path).is_ok() {
             println!("Loaded environment variables from path: {env_path}");
         }
@@ -135,7 +196,7 @@ async fn main() -> Result<(), RuntimeError> {
     }
 
     let config_path =
-        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        env::var(CONNECTORS_CONFIG_PATH_ENV).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     println!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
     let config: ConnectorsRuntimeConfig = ConnectorsRuntimeConfig::config_provider(config_path)

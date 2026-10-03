@@ -22,7 +22,7 @@ mod banner;
 
 use args::Args;
 use clap::Parser;
-use configs::server::ServerConfig;
+use configs::{ConfigEnvMappings, print_env_var_names, server::ServerConfig};
 use server::boot::{
     apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
     raise_open_file_limit,
@@ -42,6 +42,10 @@ fn main() -> Result<(), ServerError> {
     // visible. `create_shard_executor` also reads its capacity knob from the
     // environment, which is why the `.env` load has to precede it.
     let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars().map_err(ServerError::ListConfigEnvVars)?;
+        return Ok(());
+    }
     banner::print(server::VERSION);
     // `logging` owns the tracing appender worker guards; it must outlive the
     // shard threads or every log line after bootstrap is silently dropped.
@@ -131,4 +135,15 @@ fn main() -> Result<(), ServerError> {
     joined?;
     info!("server shutdown complete");
     Ok(())
+}
+
+fn print_config_env_vars() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    print_env_var_names(
+        ServerConfig::env_templates()
+            .iter()
+            .map(|t| t.env_name)
+            .chain(configs::server::server_runtime_env_vars()),
+        &mut stdout,
+    )
 }

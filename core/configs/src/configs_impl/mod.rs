@@ -24,6 +24,7 @@
 //! - JSON value field handling
 //! - Automatic type conversion and validation
 
+mod env_listing;
 mod env_mapping;
 mod error;
 mod file_provider;
@@ -31,7 +32,11 @@ mod parsing;
 mod traits;
 mod typed_env_provider;
 
-pub use env_mapping::{ConfigEnvMappings, EnvVarMapping};
+pub use env_listing::{
+    CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
+    MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV, MCP_RUNTIME_ENV_VARS, print_env_var_names,
+};
+pub use env_mapping::{ConfigEnvMappings, EnvVarMapping, EnvVarTemplate, expand_env_templates};
 pub use error::ConfigurationError;
 pub use file_provider::{FileConfigProvider, RelocatedKey, RelocatedTarget};
 pub use parsing::parse_env_value_to_json;

@@ -23,8 +23,11 @@ mod server_config;
 pub use common::{COMPONENT, defaults, displays, http, system, validators};
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
+    CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
-    FileConfigProvider, RelocatedKey, RelocatedTarget, TypedEnvProvider, parse_env_value_to_json,
+    EnvVarTemplate, FileConfigProvider, MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV,
+    MCP_RUNTIME_ENV_VARS, RelocatedKey, RelocatedTarget, TypedEnvProvider, expand_env_templates,
+    parse_env_value_to_json, print_env_var_names,
 };
 pub use server_config::{
     cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,
