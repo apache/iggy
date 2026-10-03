@@ -26,6 +26,8 @@ cd "$CPP_ROOT"
 
 OUTPUT="$REPO_ROOT/reports/cpp-coverage.lcov"
 COVERAGE_DIR="$CPP_ROOT/target/cpp-coverage"
+# Cargo build scripts also inherit coverage instrumentation. Keep their profiles
+# separate because llvm-cov exports only the unit and e2e test objects below.
 BUILD_PROFRAW_DIR="$COVERAGE_DIR/build"
 PROFDATA="$COVERAGE_DIR/shim.profdata"
 CPP_RAW="$CPP_ROOT/bazel-out/_coverage/_coverage_report.dat"

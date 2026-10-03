@@ -31,7 +31,6 @@ genrule(
     ],
     outs = [
         "libiggy_cpp.a",
-        "libprofiler_builtins.a",
         "include/lib.rs.h",
         "cxxbridge/rust/cxx.h",
         "cxxbridge/sources/lib.rs.cc",
@@ -44,7 +43,6 @@ genrule(
         RUSTC="$$EXECROOT/$(execpath @rs_host_tools//:rustc)"
         CARGO_TARGET_DIR="$$EXECROOT/$(@D)/cargo_target"
         OUT_LIB="$$EXECROOT/$(location libiggy_cpp.a)"
-        PROFILER_RT_OUT="$$EXECROOT/$(location libprofiler_builtins.a)"
         OUT_RS="$$EXECROOT/$(location include/lib.rs.h)"
         OUT_CXX="$$EXECROOT/$(location cxxbridge/rust/cxx.h)"
         OUT_CC="$$EXECROOT/$(location cxxbridge/sources/lib.rs.cc)"
@@ -66,21 +64,6 @@ genrule(
             "$$CARGO" build --quiet $$FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
-
-        RT_SYSROOT="$$("$$RUSTC" --print sysroot)"
-        RT_HOST="$$("$$RUSTC" -vV | sed -n 's/^host: //p')"
-        RT_RLIB="$$(find "$$RT_SYSROOT/lib/rustlib/$$RT_HOST/lib" -maxdepth 1 -name 'libprofiler_builtins-*.rlib' -print -quit)"
-        if [ -z "$$RT_RLIB" ]; then
-            echo "ERROR: Failed to locate libprofiler_builtins rlib under $$RT_SYSROOT" >&2
-            exit 1
-        fi
-        cp "$$RT_RLIB" "$$PROFILER_RT_OUT"
-        for member in $$(ar t "$$PROFILER_RT_OUT"); do
-            case "$$member" in
-                *.o) ;;
-                *) ar d "$$PROFILER_RT_OUT" "$$member" ;;
-            esac
-        done
 
         RS_HDR="$$(find "$$CARGO_TARGET_DIR/$$PROFILE/build" -name lib.rs.h -print -quit)"
         if [ -z "$$RS_HDR" ]; then
@@ -106,6 +89,37 @@ genrule(
     local = 1,
     tools = [
         "@rs_host_tools//:cargo",
+        "@rs_host_tools//:rust_toolchain",
+        "@rs_host_tools//:rustc",
+    ],
+)
+
+genrule(
+    name = "extract_profiler_runtime",
+    outs = ["libprofiler_builtins.a"],
+    cmd = """
+        set -euo pipefail
+
+        EXECROOT="$$(pwd)"
+        RUSTC="$$EXECROOT/$(execpath @rs_host_tools//:rustc)"
+        PROFILER_RT_OUT="$$EXECROOT/$(location libprofiler_builtins.a)"
+
+        RT_SYSROOT="$$("$$RUSTC" --print sysroot)"
+        RT_HOST="$$("$$RUSTC" -vV | sed -n 's/^host: //p')"
+        RT_RLIB="$$(find "$$RT_SYSROOT/lib/rustlib/$$RT_HOST/lib" -maxdepth 1 -name 'libprofiler_builtins-*.rlib' -print -quit)"
+        if [ -z "$$RT_RLIB" ]; then
+            echo "ERROR: Failed to locate libprofiler_builtins rlib under $$RT_SYSROOT" >&2
+            exit 1
+        fi
+        cp "$$RT_RLIB" "$$PROFILER_RT_OUT"
+        for member in $$(ar t "$$PROFILER_RT_OUT"); do
+            case "$$member" in
+                *.o) ;;
+                *) ar d "$$PROFILER_RT_OUT" "$$member" ;;
+            esac
+        done
+    """,
+    tools = [
         "@rs_host_tools//:rust_toolchain",
         "@rs_host_tools//:rustc",
     ],
