@@ -23306,6 +23306,40 @@ mod tests {
     #[cfg(target_os = "linux")]
     const DEV_FULL: &str = "/dev/full";
 
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_an_unsyncable_messages_writer_when_installing_should_refuse_the_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("wal");
+        let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+        let messages_writer =
+            MessagesWriter::new(DEV_FULL, Rc::new(AtomicU64::new(0)), false, false, None)
+                .await
+                .unwrap();
+        let index_path = directory.path().join("segment.index");
+        let index_writer = IggyIndexWriter::new(
+            index_path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut partition = test_partition();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+            SegmentStorage::default(),
+            Some(Rc::new(messages_writer)),
+            Some(Rc::new(index_writer)),
+        );
+        partition.persistence = Some(Rc::clone(&persistence));
+
+        partition.barrier_install_files_locked();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_some());
+    }
+
     const FIRST_PAYLOAD: &[u8] = b"first-chunk";
     const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";
 

@@ -117,7 +117,7 @@ impl FileSyncBarrier {
         Self::from_future(path, async { Ok(()) })
     }
 
-    pub(crate) async fn run(self) -> io::Result<PathBuf> {
+    async fn run(self) -> io::Result<PathBuf> {
         self.sync.await.map_err(|error| {
             io::Error::new(error.kind(), format!("{}: {error}", self.path.display()))
         })?;
@@ -918,10 +918,10 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         });
     }
 
-    /// Queue a durability barrier through every retained original writer,
-    /// including offset files restored from the backup, without advancing
-    /// [`PartitionPersistence::checkpoint_op`].
-    pub(crate) fn barrier_files(&self, barriers: Vec<FileSyncBarrier>) -> BTreeSet<PathBuf> {
+    /// Queue a durability barrier through retained original writers without
+    /// advancing [`PartitionPersistence::checkpoint_op`]. The returned paths
+    /// count as synced only after the queued barrier succeeds.
+    pub fn barrier_files(&self, barriers: Vec<FileSyncBarrier>) -> BTreeSet<PathBuf> {
         let (offset_files, mut synced_files) = self.offset_files.take_checkpoint();
         synced_files.extend(barriers.iter().map(|barrier| barrier.path.clone()));
         self.queue.borrow_mut().push_back(Mutation::Barrier {

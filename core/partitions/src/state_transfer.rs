@@ -1719,11 +1719,13 @@ pub enum PartitionInstallError {
         previous_end: u64,
         next_start: u64,
     },
-    /// Filesystem failure at/after the swap; disk holds a contiguous prefix
-    /// of the new state and a crash-restart recovers it (see the module
-    /// crash-window notes). The IN-MEMORY partition is converged to an
-    /// empty, honestly-lagging state before this returns, so the live
-    /// process stays serviceable and the normal triggers re-transfer.
+    /// A writer sync or backup preparation failure returns before the swap;
+    /// the old in-memory partition remains in place and may be fenced.
+    /// At/after the swap, disk holds a contiguous prefix of the new state
+    /// and a crash-restart recovers it (see the module crash-window notes).
+    /// On the storeless post-swap failure path, the IN-MEMORY partition is
+    /// converged to an empty, honestly-lagging state before this returns,
+    /// so the live process stays serviceable and the normal triggers re-transfer.
     SwapIo {
         path: String,
         source: std::io::Error,
