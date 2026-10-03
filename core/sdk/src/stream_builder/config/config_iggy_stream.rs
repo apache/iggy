@@ -19,6 +19,93 @@ use crate::prelude::{Identifier, IggyDuration, IggyError};
 use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
 use bon::Builder;
 
+/// Describes the producer and the consumer that [`IggyStream`] builds.
+///
+/// The value is a pair: one [`IggyProducerConfig`] and one [`IggyConsumerConfig`]. It is a plain
+/// description that never talks to the server, and changing it later has no effect on a producer
+/// or a consumer that is built already.
+///
+/// # Creating a configuration
+///
+/// | Constructor | Use it for |
+/// | --- | --- |
+/// | [`from_stream_topic()`](Self::from_stream_topic) | one stream and one topic, defaults elsewhere |
+/// | [`new()`](Self::new) | two halves you built yourself |
+/// | [`builder()`](Self::builder) | the same two halves, named |
+/// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
+///
+/// The two halves carry their own stream and topic. [`from_stream_topic()`](Self::from_stream_topic)
+/// gives both the same pair. [`new()`](Self::new) and [`builder()`](Self::builder) do not, so they
+/// can point the producer and the consumer at different topics. [`stream_id()`](Self::stream_id),
+/// [`stream_name()`](Self::stream_name), [`topic_id()`](Self::topic_id) and
+/// [`topic_name()`](Self::topic_name) report what the producer half says. Read
+/// [`consumer_config()`](Self::consumer_config) for the other half.
+///
+/// # Examples
+///
+/// One topic, a batch of 100 messages, and one second between requests in both directions:
+///
+/// ```rust
+/// use iggy::prelude::*;
+///
+/// # fn main() -> Result<(), IggyError> {
+/// let config = IggyStreamConfig::from_stream_topic(
+///     "my-stream",
+///     "my-topic",
+///     100,
+///     IggyDuration::new_from_secs(1),
+///     IggyDuration::new_from_secs(1),
+/// )?;
+///
+/// assert_eq!(config.stream_name(), "my-stream");
+/// assert_eq!(config.producer_config().batch_length(), 100);
+/// assert_eq!(config.consumer_config().consumer_name(), "consumer-my-stream-my-topic");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A producer that writes to ten partitions, and a group that reads them:
+///
+/// ```rust
+/// use iggy::prelude::*;
+///
+/// # fn main() -> Result<(), IggyError> {
+/// let producer_config = IggyProducerConfig::builder()
+///     .stream_id(Identifier::from_str_value("my-stream")?)
+///     .stream_name("my-stream")
+///     .topic_id(Identifier::from_str_value("my-topic")?)
+///     .topic_name("my-topic")
+///     .topic_partitions_count(10)
+///     .batch_length(100)
+///     .linger_time(IggyDuration::new_from_secs(1))
+///     .partitioning(Partitioning::balanced())
+///     .build();
+///
+/// let consumer_config = IggyConsumerConfig::builder()
+///     .stream_id(Identifier::from_str_value("my-stream")?)
+///     .stream_name("my-stream")
+///     .topic_id(Identifier::from_str_value("my-topic")?)
+///     .topic_name("my-topic")
+///     .consumer_name("order-workers")
+///     .consumer_kind(ConsumerKind::ConsumerGroup)
+///     .create_stream_if_not_exists(false)
+///     .create_topic_if_not_exists(false)
+///     .partitions_count(10)
+///     .batch_length(100)
+///     .polling_interval(IggyDuration::new_from_secs(1))
+///     .polling_strategy(PollingStrategy::next())
+///     .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
+///     .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
+///     .init_interval(NonZeroIggyDuration::ONE_SECOND)
+///     .build();
+///
+/// let config = IggyStreamConfig::new(consumer_config, producer_config);
+/// # let _ = config;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`IggyStream`]: crate::prelude::IggyStream
 #[derive(Builder, Default, Debug, Clone)]
 pub struct IggyStreamConfig {
     consumer_config: IggyConsumerConfig,
@@ -26,16 +113,23 @@ pub struct IggyStreamConfig {
 }
 
 impl IggyStreamConfig {
-    /// Creates a new `IggyStreamConfig` with the given consumer and producer configurations.
+    /// Pairs a consumer configuration with a producer configuration.
     ///
-    /// # Args
+    /// The two halves are kept as given, so they can name different streams and topics.
     ///
-    /// * `consumer_config` - The consumer configuration.
-    /// * `producer_config` - The producer configuration.
+    /// # Examples
     ///
-    /// Returns:
-    /// A new `IggyStreamConfig`.
+    /// Pair the two defaults:
     ///
+    /// ```rust
+    /// use iggy::prelude::*;
+    ///
+    /// let config = IggyStreamConfig::new(
+    ///     IggyConsumerConfig::default(),
+    ///     IggyProducerConfig::default(),
+    /// );
+    /// assert_eq!(config.stream_name(), "test_stream");
+    /// ```
     pub fn new(consumer_config: IggyConsumerConfig, producer_config: IggyProducerConfig) -> Self {
         Self {
             consumer_config,
@@ -43,20 +137,36 @@ impl IggyStreamConfig {
         }
     }
 
-    /// Creates a new `IggyStreamConfig` from the given stream and topic names, along with the max
-    /// batch size, the send interval and the polling interval.
+    /// Points both halves at one stream and one topic, and takes the defaults for the rest.
     ///
-    /// # Args
+    /// `batch_length` becomes the batch length of both halves. `linger_time` paces the producer
+    /// and `polling_interval` paces the consumer. The consumer is named
+    /// `consumer-{stream}-{topic}` and joins a group under that name.
     ///
-    /// * `stream` - The stream name.
-    /// * `topic` - The topic name.
-    /// * `batch_length` - The max number of messages to send in a batch.
-    /// * `linger_time` - The interval between messages sent.
-    /// * `polling_interval` - The interval between polling for new messages.
+    /// # Examples
     ///
-    /// Returns:
-    /// A new `IggyStreamConfig`.
+    /// Describe one topic for both directions:
     ///
+    /// ```rust
+    /// use iggy::prelude::*;
+    ///
+    /// # fn main() -> Result<(), IggyError> {
+    /// let config = IggyStreamConfig::from_stream_topic(
+    ///     "my-stream",
+    ///     "my-topic",
+    ///     100,
+    ///     IggyDuration::new_from_secs(1),
+    ///     IggyDuration::new_from_secs(1),
+    /// )?;
+    /// assert_eq!(config.topic_name(), "my-topic");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError::InvalidIdentifier`] when `stream` or `topic` is not a valid
+    /// identifier.
     pub fn from_stream_topic(
         stream: &str,
         topic: &str,
@@ -78,26 +188,44 @@ impl IggyStreamConfig {
 }
 
 impl IggyStreamConfig {
+    /// Returns the half that describes the consumer.
     pub fn consumer_config(&self) -> &IggyConsumerConfig {
         &self.consumer_config
     }
 
+    /// Returns the half that describes the producer.
     pub fn producer_config(&self) -> &IggyProducerConfig {
         &self.producer_config
     }
 
+    /// Returns the stream identifier of the producer half.
+    ///
+    /// The consumer half carries its own, which can differ. Read
+    /// [`consumer_config()`](Self::consumer_config) for it.
     pub fn stream_id(&self) -> &Identifier {
         self.producer_config.stream_id()
     }
 
+    /// Returns the stream name of the producer half.
+    ///
+    /// The consumer half carries its own, which can differ. Read
+    /// [`consumer_config()`](Self::consumer_config) for it.
     pub fn stream_name(&self) -> &str {
         self.producer_config.stream_name()
     }
 
+    /// Returns the topic identifier of the producer half.
+    ///
+    /// The consumer half carries its own, which can differ. Read
+    /// [`consumer_config()`](Self::consumer_config) for it.
     pub fn topic_id(&self) -> &Identifier {
         self.producer_config.topic_id()
     }
 
+    /// Returns the topic name of the producer half.
+    ///
+    /// The consumer half carries its own, which can differ. Read
+    /// [`consumer_config()`](Self::consumer_config) for it.
     pub fn topic_name(&self) -> &str {
         self.producer_config.topic_name()
     }

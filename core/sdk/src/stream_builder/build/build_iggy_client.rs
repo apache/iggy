@@ -18,23 +18,16 @@
 use crate::prelude::{IggyClient, IggyError};
 use iggy_common::Client;
 
-/// Builds an `IggyClient` from the given connection string.
+/// Creates an [`IggyClient`] from `connection_string` and connects it.
 ///
-/// # Arguments
-///
-/// * `connection_string` - The connection string to use.
+/// The client comes back connected, so the caller can build a producer or a consumer on it.
 ///
 /// # Errors
 ///
-/// * `IggyError` - If the connection string is invalid or the client cannot be initialized.
+/// - [`IggyError::InvalidConnectionString`] when `connection_string` cannot be parsed.
+/// - Any error raised while connecting to the server.
 ///
-/// # Details
-///
-/// This function will create a new `IggyClient` with the given `connection_string`.
-/// It will then connect to the server using the provided connection string.
-/// If the connection string is invalid or the client cannot be initialized,
-/// an `IggyError` will be returned.
-///
+/// [`IggyClient`]: crate::prelude::IggyClient
 pub(crate) async fn build_iggy_client(connection_string: &str) -> Result<IggyClient, IggyError> {
     let client = IggyClient::from_connection_string(connection_string)?;
     client.connect().await?;
