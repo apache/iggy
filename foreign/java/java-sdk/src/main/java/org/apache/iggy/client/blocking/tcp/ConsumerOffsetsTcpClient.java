@@ -47,4 +47,10 @@ final class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
         return FutureUtil.resolve(delegate.getConsumerOffset(streamId, topicId, partitionId, consumer));
     }
+
+    @Override
+    public void deleteConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
+        FutureUtil.resolve(delegate.deleteConsumerOffset(streamId, topicId, partitionId, consumer));
+    }
 }

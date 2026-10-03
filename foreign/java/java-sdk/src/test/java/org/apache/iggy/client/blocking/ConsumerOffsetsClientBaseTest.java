@@ -63,4 +63,19 @@ public abstract class ConsumerOffsetsClientBaseTest extends IntegrationTest {
         // then
         assertThat(consumerOffset).isPresent();
     }
+
+    @Test
+    void shouldDeleteConsumerOffset() {
+        client.messages()
+                .sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("test")));
+
+        var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(1224L));
+        var partitionId = Optional.of(0L);
+        consumerOffsetsClient.storeConsumerOffset(STREAM_NAME, TOPIC_NAME, partitionId, consumer, BigInteger.ZERO);
+
+        consumerOffsetsClient.deleteConsumerOffset(STREAM_NAME, TOPIC_NAME, partitionId, consumer);
+
+        assertThat(consumerOffsetsClient.getConsumerOffset(STREAM_NAME, TOPIC_NAME, partitionId, consumer))
+                .isEmpty();
+    }
 }

@@ -44,4 +44,10 @@ public interface ConsumerOffsetsClient {
 
     Optional<ConsumerOffsetInfo> getConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
+
+    default void deleteConsumerOffset(Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {
+        deleteConsumerOffset(StreamId.of(streamId), TopicId.of(topicId), partitionId, Consumer.of(consumerId));
+    }
+
+    void deleteConsumerOffset(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
 }

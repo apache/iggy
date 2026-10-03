@@ -112,7 +112,8 @@ public interface CommandCode {
 
     enum ConsumerOffset implements CommandCode {
         GET(120),
-        STORE(121);
+        STORE(121),
+        DELETE(122);
 
         private final int value;
 
