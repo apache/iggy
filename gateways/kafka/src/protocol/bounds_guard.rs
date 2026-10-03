@@ -703,6 +703,44 @@ pub fn validate_create_topics_shape(
     Ok(())
 }
 
+/// Mirrors the field order `DeleteTopicsRequest::decode` walks, for the `topic_names`-based
+/// shape (v1-v5) only.
+///
+/// This bridge's `RANGE` never advertises v6, the `topics: Vec<DeleteTopicState>`
+/// (topic-id-based) shape, so that branch is never reached and isn't walked here.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_delete_topics_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 4;
+
+    let topic_names_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..topic_names_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+    }
+
+    let _timeout_ms = c.read_i32()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `MetadataRequest::decode` walks.
 ///
 /// # Errors
@@ -1324,6 +1362,41 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // u32::MAX topics count, 5-byte varint
         ]);
         assert!(validate_create_topics_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Same POC class as `create_topics_v5_huge_topics_count_rejected`, against
+    /// `validate_delete_topics_shape`'s own `topic_names` compact array count.
+    #[test]
+    fn delete_topics_v5_huge_topic_names_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_delete_topics_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Same desync class as `create_topics_v5_desync_varint_poc_rejected`: a 5-byte over-long
+    /// varint consumed as the (empty) `topic_names` count, matching `kafka_protocol`'s own 5-byte
+    /// cap. `DeleteTopics` has one fewer field than `CreateTopics` between the array and the
+    /// request's tagged fields (`timeout_ms` only, no `validate_only`), so the padding here is
+    /// four bytes, not five, to land the huge trailing varint on the tagged-fields count instead.
+    #[test]
+    fn delete_topics_v5_desync_varint_poc_rejected() {
+        let body = Bytes::from_static(&[
+            0x81, 0x80, 0x80, 0x80, 0x80, // 5-byte over-long varint, decodes to count 0
+            0x00, 0x00, 0x00, 0x00, // timeout_ms
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // u32::MAX read as the tagged-fields count
+        ]);
+        assert!(validate_delete_topics_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Legacy (non-flexible) shape: a declared topic-name length with nothing behind it. Covers
+    /// the `legacy_string` branch `validate_delete_topics_shape` walks below v4, which the two
+    /// flexible-only POCs above never reach.
+    #[test]
+    fn delete_topics_v1_truncated_legacy_topic_name_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // topic_names: legacy array count = 1
+            0x03, 0xE8, // first name's declared length: 1000, no bytes follow
+        ]);
+        assert!(validate_delete_topics_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     /// Reviewed POC (C2): 1 topic x 65,535 partitions was within the *old* 65,536 cumulative

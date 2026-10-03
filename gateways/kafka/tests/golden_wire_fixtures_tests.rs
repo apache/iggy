@@ -41,11 +41,11 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=12 (compact array: N+1=13)
+    // error_code=0, api_count=13 (compact array: N+1=14)
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 92] = [
+    let expected: [u8; 99] = [
         0x00, 0x00, // error_code
-        0x0D, // compact array count (12+1)
+        0x0E, // compact array count (13+1)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets     1-6
@@ -57,6 +57,7 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         0x00, 0x0E, 0x00, 0x00, 0x00, 0x05, 0x00, // key 14: SyncGroup       0-5
         0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key 18: ApiVersions     0-3
         0x00, 0x13, 0x00, 0x02, 0x00, 0x05, 0x00, // key 19: CreateTopics    2-5
+        0x00, 0x14, 0x00, 0x01, 0x00, 0x05, 0x00, // key 20: DeleteTopics    1-5
         0x00, 0x16, 0x00, 0x00, 0x00, 0x05, 0x00, // key 22: InitProducerId  0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
         0x00, // top-level tagged fields
@@ -71,10 +72,10 @@ async fn golden_apiversions_v1_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=12; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
-    let expected: [u8; 82] = [
+    // error_code=0, api_count=13; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
+    let expected: [u8; 88] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x0C, // api count = 12
+        0x00, 0x00, 0x00, 0x0D, // api count = 13
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets     1-6
@@ -86,6 +87,7 @@ async fn golden_apiversions_v1_response_fixture() {
         0x00, 0x0E, 0x00, 0x00, 0x00, 0x05, // key 14: SyncGroup       0-5
         0x00, 0x12, 0x00, 0x00, 0x00, 0x03, // key 18: ApiVersions     0-3
         0x00, 0x13, 0x00, 0x02, 0x00, 0x05, // key 19: CreateTopics    2-5
+        0x00, 0x14, 0x00, 0x01, 0x00, 0x05, // key 20: DeleteTopics    1-5
         0x00, 0x16, 0x00, 0x00, 0x00, 0x05, // key 22: InitProducerId  0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
     ];

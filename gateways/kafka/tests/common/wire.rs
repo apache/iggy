@@ -178,6 +178,24 @@ pub fn build_create_topics_empty_request(version: i16) -> Bytes {
     enc.freeze()
 }
 
+/// Empty `DeleteTopics` request (no topic names) for supported versions (v1-v5).
+pub fn build_delete_topics_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+
+    if flexible {
+        enc.write_varint(1); // empty topic_names compact array (N+1 = 1)
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_i32(5_000); // timeout_ms
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
 /// Produce v2–v8 legacy request with optional transactional id and topic.
 pub fn build_produce_legacy_request(
     version: i16,

@@ -38,9 +38,9 @@ use crate::protocol::bounds_guard::{
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, leave_group, list_offsets, metadata, produce, respond_or_close,
-    sync_group,
+    api_versions, create_topics, decode_guarded, delete_topics, dispatch, fetch, find_coordinator,
+    heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata, produce,
+    respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -59,6 +59,7 @@ pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_DELETE_TOPICS: i16 = 20;
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
@@ -272,6 +273,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     metadata::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    delete_topics::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,

@@ -257,6 +257,30 @@ impl IggyBridge {
         }
     }
 
+    /// Deletes the Iggy topic backing `kafka_topic`, resolved through the configured
+    /// [`TopicMapping`](crate::bridge::topic_map::TopicMapping).
+    ///
+    /// Deliberately leaves the backing Iggy stream alone, even when this delete empties it out:
+    /// `TopicMapping::resolve` sends every *unmapped* Kafka topic to the same `default_stream`
+    /// (`ensure_stream_and_topic`'s own doc comment flags the same sharing risk for create), so a
+    /// stream this call happens to empty may still be the live home for a different Kafka topic a
+    /// moment later - this call has no way to tell the two cases apart, and real Kafka itself has
+    /// no analogous container object for a `DeleteTopics` to clean up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
+    /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] with `StreamNameNotFound`/`TopicNameNotFound`
+    /// if the mapped stream or topic doesn't exist, or for connectivity/auth failures.
+    pub async fn delete_kafka_topic(&self, kafka_topic: &str) -> Result<(), BridgeError> {
+        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        with_request_timeout(self.client.delete_topic(&stream_id, &topic_id)).await
+    }
+
     /// Looks up `kafka_topic`, resolved through the configured
     /// [`TopicMapping`](crate::bridge::topic_map::TopicMapping), without creating it.
     ///
