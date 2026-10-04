@@ -2690,6 +2690,15 @@ func (e SessionMismatch) Is(target error) bool {
 	return ok
 }
 
+type RequestIdExhausted struct{}
+
+func (e RequestIdExhausted) Error() string { return "vsr request id exhausted" }
+func (e RequestIdExhausted) Code() Code    { return 14005 }
+func (e RequestIdExhausted) Is(target error) bool {
+	_, ok := target.(RequestIdExhausted)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2933,6 +2942,7 @@ var (
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 	ErrSessionMismatch                            = SessionMismatch{}
+	ErrRequestIdExhausted                         = RequestIdExhausted{}
 )
 
 type Code uint32
@@ -3180,6 +3190,7 @@ const (
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
 	SessionMismatchCode                            Code = 14004
+	RequestIdExhaustedCode                         Code = 14005
 )
 
 func (c Code) String() string {
@@ -3668,6 +3679,8 @@ func (c Code) String() string {
 		return "IncompatibleProtocolVersion"
 	case SessionMismatchCode:
 		return "SessionMismatch"
+	case RequestIdExhaustedCode:
+		return "RequestIdExhausted"
 	default:
 		return "Unknown error code"
 	}
@@ -4159,6 +4172,8 @@ func FromCode(code Code) IggyError {
 		return ErrIncompatibleProtocolVersion
 	case SessionMismatchCode:
 		return ErrSessionMismatch
+	case RequestIdExhaustedCode:
+		return ErrRequestIdExhausted
 	default:
 		return ErrError
 	}

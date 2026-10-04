@@ -1021,7 +1021,6 @@ func (c *IggyTcpClient) invalidateConnLocked() {
 	_ = c.closeConnLocked()
 	c.transportState = iggcon.TransportStateDisconnected
 	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
 	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()
@@ -1223,9 +1222,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 	c.connGeneration++
 	c.transportState = iggcon.TransportStateConnected
 	c.connectedAt = time.Now()
-	// The server fence does not survive the old socket, so the new connection
-	// starts from a fresh client identity.
-	c.session.Reset()
+	// The logical identity survives the socket and is authenticated by BindSession.
 	c.clearPollSession()
 	clientAddress := c.clientAddress
 	serverAddress := c.currentServerAddress
@@ -1385,6 +1382,15 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool
 		c.logger.Info("Skipping the automatic sign-in for a replayed login.")
 		return nil
 	}
+	c.registerMtx.Lock()
+	identity, resumeErr := c.resumeSession(ctx)
+	if resumeErr == nil && identity != nil {
+		_, resumeErr = c.settleOnLeader(ctx, uint32(command.BindSessionCode), nil, [vsr.BindSecretBytes]byte{})
+	}
+	c.registerMtx.Unlock()
+	if resumeErr != nil || identity != nil {
+		return resumeErr
+	}
 
 	if credentials.personalAccessToken != "" {
 		_, err := c.LoginWithPersonalAccessToken(ctx, credentials.personalAccessToken)
@@ -1520,7 +1526,6 @@ func (c *IggyTcpClient) disconnectLocked() error {
 	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
 	c.transportState = iggcon.TransportStateDisconnected
 	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
 	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()

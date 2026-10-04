@@ -57,6 +57,7 @@ const MAX_LEADER_REDIRECTS = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 const UNAUTHENTICATED = 40;
+const UNAUTHORIZED = 41;
 const STALE_CLIENT = 30;
 const FEATURE_UNAVAILABLE = 5;
 const MAX_POLL_ROUTES = 4096;
@@ -938,6 +939,13 @@ export class CommandResponseStream extends EventEmitter {
           parsed = decodeVsrResponse(response, command);
           break;
         } catch (error) {
+          if (error instanceof ResponseError &&
+              lastTransientError?.errorCode === TRANSIENT_NOT_COMMITTED &&
+              (error.errorCode === TRANSIENT_NOT_ACCEPTED ||
+               error.errorCode === UNAUTHENTICATED ||
+               error.errorCode === STALE_CLIENT ||
+               error.errorCode === UNAUTHORIZED))
+            error = responseError(command, TRANSIENT_NOT_COMMITTED);
           if (!(error instanceof ResponseError) ||
               !isTransientVsrError(error.errorCode))
             throw error;

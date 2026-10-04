@@ -38,7 +38,7 @@ internal sealed class VsrConnection : IDisposable
     private readonly long _maxResponseFrameSize;
 
     /// <summary>
-    ///     Tears this connection down at the transport level - session reset, state event - when a frame-level
+    ///     Tears this connection down at the transport level when a frame-level
     ///     failure makes the socket unusable. Runs under the sending lock the caller holds, and it is the
     ///     transport's job to ignore the call when a reconnect already replaced this connection.
     /// </summary>
@@ -143,7 +143,12 @@ internal sealed class VsrConnection : IDisposable
                 catch (IggyInvalidStatusCodeException e)
                 {
                     uncertain |= e is { FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_COMMITTED };
-                    var verdict = uncertain && e is { FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED }
+                    var verdict = uncertain && e is
+                    {
+                        FromServer: true,
+                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.UNAUTHORIZED or
+                            VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT
+                    }
                         ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
                             "A later refusal does not resolve the original request outcome.")
                         : e;

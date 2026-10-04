@@ -1583,11 +1583,8 @@ impl TcpClient {
                     let Ok(session) = consensus_session.lock() else {
                         return (Some(header), Err(IggyError::InvalidConfiguration));
                     };
-                    if header.client != session.client_id()
-                        || (header.operation != iggy_binary_protocol::Operation::Register
-                            && header.session != session.session().unwrap_or(0))
-                    {
-                        return (Some(header), Err(IggyError::TransientNotCommitted));
+                    if let Err(error) = crate::vsr::validate_retained_header(&header, &session) {
+                        return (Some(header), Err(error));
                     }
                     header
                 }

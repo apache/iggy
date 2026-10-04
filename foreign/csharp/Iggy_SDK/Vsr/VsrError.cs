@@ -32,6 +32,7 @@ internal static class VsrError
     internal const int INVALID_IDENTIFIER = 6;
     internal const int STALE_CLIENT = 30;
     internal const int UNAUTHENTICATED = 40;
+    internal const int UNAUTHORIZED = 41;
     internal const int INVALID_CREDENTIALS = 42;
     internal const int INVALID_USERNAME = 43;
     internal const int INVALID_PASSWORD = 44;
@@ -44,6 +45,7 @@ internal static class VsrError
     internal const int CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;
+    internal const int SESSION_MISMATCH = 14004;
 
     /// <summary>A failure the client raised itself, before or instead of a server verdict.</summary>
     internal static IggyInvalidStatusCodeException Exception(int code, string message)

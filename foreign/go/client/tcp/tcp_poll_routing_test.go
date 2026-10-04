@@ -79,6 +79,8 @@ func newPrimaryPollFixture(t *testing.T,
 			}
 		}
 		switch {
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
 		case read.operation() == vsr.OperationRegister:
 			return registerReplyFrame(7, uint64(100+connection))
 		case read.sessionID() == 0:
@@ -630,7 +632,7 @@ func TestPrimaryPoll_ControlConnectionRecoversBeforeRouting(t *testing.T) {
 	previous := fixture.client.session.ClientID()
 	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
-	assert.NotEqual(t, previous, fixture.client.session.ClientID())
+	assert.Equal(t, previous, fixture.client.session.ClientID())
 	assert.Equal(t, 2, fixture.coordinator.connections())
 	assert.Equal(t, 1, fixture.primaries[0].connections())
 }

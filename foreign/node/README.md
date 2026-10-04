@@ -65,6 +65,10 @@ a confirmed ended session requires a new registration. Logout forgets the local
 session. Transient not-committed responses retry the exact encoded request within
 one bounded deadline. A disconnected mutation is never replayed under a new session.
 
+An established session has its own lifetime. Password or PAT changes and PAT
+expiry do not end it. Logout, session lease expiry, or user deactivation end the
+session and prevent its bind proof from restoring it.
+
 The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
 `heartbeatInterval` also accepts a duration expression such as `"10s"` or

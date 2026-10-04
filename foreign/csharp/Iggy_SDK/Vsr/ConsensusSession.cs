@@ -204,7 +204,7 @@ internal sealed class ConsensusSession
         }
     }
 
-    /// <summary>Forget the binding and the client id, e.g. after an eviction or a torn connection.</summary>
+    /// <summary>Forget the binding and client id after logout or a terminal bind refusal.</summary>
     internal void Reset()
     {
         lock (_gate)

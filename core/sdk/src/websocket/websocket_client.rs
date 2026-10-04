@@ -1404,6 +1404,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retained_write_waiting_for_the_stream_must_recheck_its_session() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = WebSocketClient::create(Arc::new(WebSocketClientConfig {
+            server_address: listener.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (mut peer, connected) = tokio::join!(
+            async {
+                accept_async(listener.accept().await.unwrap().0)
+                    .await
+                    .unwrap()
+            },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let payload = Bytes::from_static(b"uncertain-send");
+        let retained = crate::vsr::encode_request_header(
+            &mut client.consensus_session.lock().unwrap(),
+            SEND_MESSAGES_CODE,
+            &payload,
+        )
+        .unwrap()
+        .0;
+        let stream_guard = client.stream.lock().await;
+        let mut retained = Some(retained);
+        let attempt = client.send_raw_request(SEND_MESSAGES_CODE, payload, false, &mut retained);
+        tokio::pin!(attempt);
+        tokio::select! {
+            biased;
+            _ = &mut attempt => panic!("the exchange must wait for the stream lock"),
+            () = tokio::task::yield_now() => {}
+        }
+        client.reset_vsr_session().await.unwrap();
+        client.bind_vsr_session(2).await.unwrap();
+        drop(stream_guard);
+        assert_eq!(
+            tokio::time::timeout(TEST_BUDGET, &mut attempt)
+                .await
+                .unwrap(),
+            Err(IggyError::TransientNotCommitted)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), peer.next())
+                .await
+                .is_err()
+        );
+        Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_lost_reply_resumes_and_replays_only_the_original_session() {
         const TEST_USER_ID: u32 = 7;
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);

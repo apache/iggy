@@ -43,12 +43,17 @@ internal static class MockFrames
     internal const byte OPERATION_REGISTER = 1;
     internal const byte OPERATION_NON_REPLICATED = 2;
     internal const int GET_CLUSTER_METADATA_CODE = 12;
+    internal const int BIND_SESSION_CODE = 15;
     internal const int PING_CODE = 1;
     internal const uint TRANSIENT_NOT_ACCEPTED = 58;
 
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
+        if (request.Code == BIND_SESSION_CODE)
+        {
+            return Reply(OPERATION_NON_REPLICATED, RegisterBody(request.Session)[4..]);
+        }
         return request.Operation == OPERATION_REGISTER
             ? Reply(OPERATION_REGISTER, RegisterBody(session: 128))
             : Reply(OPERATION_NON_REPLICATED, []);

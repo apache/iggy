@@ -48,6 +48,18 @@ public final class VsrRequestEncoder {
         return VsrLoginCodec.bindSession(alloc, clientLow, clientHigh, session, watermark, bindSecret);
     }
 
+    public ByteBuf bindSession(ByteBufAllocator alloc) {
+        synchronized (session) {
+            return bindSession(
+                    alloc,
+                    session.clientIdLow(),
+                    session.clientIdHigh(),
+                    session.boundSession(),
+                    session.metadataWatermark(),
+                    session.bindSecret());
+        }
+    }
+
     /**
      * Builds the full request frame. The caller keeps ownership of
      * {@code payload}; its reader index is not advanced.

@@ -144,9 +144,8 @@ using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         BackoffMultiplier = 2.0
     },
 
-    // Auto-login after connection. Optional for reconnection: a client that signs in with
-    // LoginUserAsync has that sign-in replayed on a reconnect too. Without either, a reconnect
-    // cannot restore the session and a lost connection fails the request
+    // Auto-login after connection. Reconnect first binds the retained session; configured or
+    // remembered LoginUserAsync credentials allow a fresh login after that session ends
     AutoLoginSettings = AutoLoginSettings.For("iggy", "iggy"),
     // or AutoLoginSettings.ForPersonalAccessToken("your_token")
 
@@ -186,8 +185,11 @@ await client.ConnectAsync();
 ### What changes under VSR
 
 - **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
-  authenticate Register. Auxiliary connections bind the parent's identity and proof without another Register.
-  Disconnecting removes only that binding; Logout or committed expiry ends the session. An unresolved mutation
+  authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
+  Disconnecting removes only that binding; Logout, committed lease expiry or user deactivation ends the session.
+  Password changes and PAT changes or expiry do not end an established session.
+  A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
+  retains the identity and surfaces to the caller, allowing a later reconnect to retry the bind. An unresolved mutation
   cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.
 - **Leader redirection is automatic.** The client reads the cluster roster, follows the current leader and
   re-checks it when a request is refused because the node stopped being primary.

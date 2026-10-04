@@ -142,9 +142,8 @@ func (s *Session) CurrentRequestID() uint64 {
 	return s.requestCounter
 }
 
-// Reset drops the session and mints a fresh client identifier. A disconnect
-// invalidates the server-side fence, so the next Register must arrive under a
-// new identity.
+// Reset drops the session and mints a fresh client identifier after logout or
+// a terminal bind refusal. Transport reconnects retain the logical identity.
 func (s *Session) Reset() {
 	s.reset()
 }

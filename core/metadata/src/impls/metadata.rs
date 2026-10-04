@@ -1796,9 +1796,9 @@ where
         Ok(offer)
     }
 
-    /// Install a fetched state transfer: persist + restore the snapshot,
-    /// replace the client table, and jump the commit state to the snapshot
-    /// floor so the tail repair takes over from there.
+    /// Install a fetched state transfer without rewinding either the state
+    /// machine or client table, then let tail repair continue above the local
+    /// applied frontier.
     ///
     /// Ordering: persist FIRST (a crash mid-install must reboot from the
     /// transferred state, not the pre-transfer one), then the in-place STM
@@ -1884,9 +1884,8 @@ where
         // commit walk never revisits ops it already counted as applied, so
         // the rewound-over effects would be lost until the next transfer.
         // Keep the local STM (it is a superset) and let tail repair cover
-        // `(commit_min, commit_op]`. The client table still installs below:
-        // it comes from the serving primary's LIVE state at `table_frontier
-        // == commit_op`, which is never behind this replica.
+        // `(commit_min, commit_op]`. The table is checked separately below:
+        // a cached offer can also lag the local table's committed protection.
         // Preliminary read, only to decide whether the gates are needed; the
         // binding decision is re-derived under them below.
         let snapshot_ahead = snapshot_seq > consensus.commit_min();
@@ -2013,20 +2012,31 @@ where
                 snapshot_seq,
                 local_applied,
                 "transferred snapshot at or below the local applied frontier; \
-                 keeping the local state machine and installing the table only"
+                 keeping the local state machine"
             );
         }
 
-        let configured_capacity = self.client_table.borrow().capacity();
-        if client_table.capacity_committed() && configured_capacity != client_table.capacity() {
-            warn!(
-                configured_capacity,
-                committed_capacity = client_table.capacity(),
-                "metadata retry capacity is fixed by committed state; ignoring local configuration"
+        // Commits can advance while the install awaits. A prior transfer may
+        // also have installed a table ahead of the local state machine.
+        let local_table_frontier = consensus.commit_min().max(self.client_table_frontier.get());
+        if table_frontier >= local_table_frontier {
+            let configured_capacity = self.client_table.borrow().capacity();
+            if client_table.capacity_committed() && configured_capacity != client_table.capacity() {
+                warn!(
+                    configured_capacity,
+                    committed_capacity = client_table.capacity(),
+                    "metadata retry capacity is fixed by committed state; ignoring local configuration"
+                );
+            }
+            *self.client_table.borrow_mut() = client_table;
+            self.client_table_frontier.set(table_frontier);
+        } else {
+            tracing::info!(
+                table_frontier,
+                local_table_frontier,
+                "transferred client table below the local table frontier; keeping the local client table"
             );
         }
-        *self.client_table.borrow_mut() = client_table;
-        self.client_table_frontier.set(table_frontier);
         if snapshot_ahead {
             self.applied_frontier
                 .record_recovery_revision(self.mux_stm.streams().read(|inner| inner.revision));
@@ -6898,6 +6908,185 @@ mod tests {
             Some(2),
             "entry created by the promoted register"
         );
+    }
+
+    #[compio::test]
+    async fn given_newer_local_state_when_installing_stale_transfer_should_preserve_sessions() {
+        const CLIENT: u128 = 9;
+        const NEW_CLIENT: u128 = 10;
+        const USER: u32 = 0;
+        const BIND_VERIFIER: [u8; 32] = [0x5a; 32];
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let original_session = metadata
+            .submit_register_in_process(CLIENT, USER, BIND_VERIFIER)
+            .await
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let transfer_op = consensus.commit_min();
+        let snapshot = <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, transfer_op, 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let transferred_table =
+            ClientTable::decode(&metadata.client_table.borrow().encode()).unwrap();
+
+        let original_reply = metadata
+            .submit_request_in_process(create_stream_request(CLIENT, 1, "original"))
+            .await
+            .unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(original_reply.body()),
+            Some(0),
+        );
+        let new_session = metadata
+            .submit_register_in_process(NEW_CLIENT, USER, BIND_VERIFIER)
+            .await
+            .unwrap();
+        let local_applied = consensus.commit_min();
+        let local_table = metadata.client_table.borrow().encode();
+        let local_snapshot =
+            <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, local_applied, 1)
+                .unwrap()
+                .encode()
+                .unwrap();
+
+        let outcome = metadata
+            .install_state_transfer(&snapshot, transferred_table, transfer_op, transfer_op)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.installed_frontier, local_applied);
+        assert_eq!(consensus.commit_min(), local_applied);
+        assert_eq!(consensus.commit_max(), local_applied);
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(NEW_CLIENT),
+            Some(new_session.epoch),
+            "a stale transfer must preserve registrations above its frontier",
+        );
+        assert_eq!(
+            metadata.client_table.borrow().encode(),
+            local_table,
+            "a stale transfer must preserve committed registrations and receipts",
+        );
+        assert_eq!(
+            <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, local_applied, 1)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            local_snapshot,
+        );
+        assert_eq!(
+            metadata
+                .bound_session(CLIENT, USER, BIND_VERIFIER)
+                .unwrap()
+                .epoch,
+            original_session.epoch,
+        );
+        assert_eq!(
+            metadata
+                .bound_session(NEW_CLIENT, USER, BIND_VERIFIER)
+                .unwrap()
+                .epoch,
+            new_session.epoch,
+        );
+        let replay = metadata
+            .submit_request_in_process(create_stream_request(CLIENT, 1, "original"))
+            .await
+            .unwrap();
+        assert_eq!(replay.as_slice(), original_reply.as_slice());
+        assert_eq!(consensus.commit_min(), local_applied);
+
+        let mut request = create_stream_request(NEW_CLIENT, 1, "after-transfer");
+        bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
+            &mut request.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+        )
+        .session = new_session.epoch;
+        let prepare = metadata.prepare_request(request).unwrap();
+        let op = prepare.header().op;
+        metadata
+            .journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .append(prepare)
+            .await
+            .unwrap();
+        consensus.advance_commit_max(op);
+        metadata.commit_journal().await;
+        assert_eq!(consensus.commit_min(), op);
+        assert_eq!(
+            metadata.client_table.borrow().get_watermark(NEW_CLIENT),
+            Some(1)
+        );
+    }
+
+    #[compio::test]
+    async fn given_ahead_client_table_when_installing_older_transfer_should_preserve_its_frontier()
+    {
+        const CLIENT: u128 = 9;
+        const OTHER_CLIENT: u128 = 10;
+        const NEW_CLIENT: u128 = 11;
+        const USER: u32 = 7;
+        const SESSION: u64 = 1;
+        const TABLE_FRONTIER: u64 = 3;
+        const OLDER_FRONTIER: u64 = 2;
+        let metadata = metadata_plane();
+        let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+        table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+        let snapshot = <IggySnapshot as Snapshot>::create(&TestMux::default(), SESSION, 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut older_table = None;
+        for (client, epoch) in [
+            (CLIENT, SESSION),
+            (OTHER_CLIENT, OLDER_FRONTIER),
+            (NEW_CLIENT, TABLE_FRONTIER),
+        ] {
+            let reply = build_reply_message(
+                &PrepareHeader {
+                    client,
+                    user_id: USER,
+                    op: epoch,
+                    operation: Operation::Register,
+                    ..Default::default()
+                },
+                &bytes::Bytes::new(),
+            );
+            table
+                .commit_register(client, USER, [0x5a; 32], reply)
+                .unwrap();
+            if epoch == OLDER_FRONTIER {
+                older_table = Some(ClientTable::decode(&table.encode()).unwrap());
+            }
+        }
+        let expected_table = table.encode();
+        metadata
+            .install_state_transfer(&snapshot, table, TABLE_FRONTIER, TABLE_FRONTIER)
+            .await
+            .unwrap();
+        metadata
+            .install_state_transfer(
+                &snapshot,
+                older_table.unwrap(),
+                OLDER_FRONTIER,
+                OLDER_FRONTIER,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), SESSION);
+        assert_eq!(metadata.client_table.borrow().encode(), expected_table);
+        assert_eq!(metadata.client_table_frontier.get(), TABLE_FRONTIER);
+        assert!(!metadata.client_table_mutation_allowed(TABLE_FRONTIER));
+        assert!(metadata.client_table_mutation_allowed(TABLE_FRONTIER + 1));
     }
 
     #[compio::test]

@@ -945,7 +945,7 @@ describe('primary auto-commit polling', () => {
 });
 
 describe('VSR client socket', () => {
-  for (const refusal of [0, 30, 58]) {
+  for (const refusal of [0, 30, 40, 57, 58]) {
     it(`resumes or replaces a lost connection only after bind verdict ${refusal}`, async () => {
       let registrations = 0;
       let sends = 0;
@@ -973,25 +973,26 @@ describe('VSR client socket', () => {
       try {
         await client.authenticate(config.credentials);
         await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, Buffer.from('lost-reply')));
-        if (refusal === 58) {
+        if (refusal === 57 || refusal === 58) {
           await assert.rejects(client.authenticate(config.credentials), (error: unknown) =>
-            error instanceof ResponseError && error.errorCode === 58);
+            error instanceof ResponseError && error.errorCode === refusal);
           assert.equal(registrations, 1, 'lagging metadata must not replace the logical session');
           bindStatus = 0;
         }
         await client.authenticate(config.credentials);
         assert.equal(sends, 1, 'authentication must not replay the uncertain mutation');
-        assert.equal(registrations, refusal === 30 ? 2 : 1);
+        const terminal = refusal === 30 || refusal === 40;
+        assert.equal(registrations, terminal ? 2 : 1);
         const binding = server.frames.find((frame) =>
           frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession)!;
         assertSharedBinding(server.frames[0], binding);
         await client.sendCommand(COMMAND_CODE.SendMessages, Buffer.from('explicit-new-write'));
         const writes = server.frames.filter((frame) => frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages);
         assert.equal(writes.length, 2);
-        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.session), refusal === 30 ? TEST_SESSION + 1n : TEST_SESSION);
-        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.request), refusal === 30 ? 1n : 2n);
+        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.session), terminal ? TEST_SESSION + 1n : TEST_SESSION);
+        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.request), terminal ? 1n : 2n);
         assert.equal(writes[0].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)
-          .equals(writes[1].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)), refusal !== 30);
+          .equals(writes[1].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)), !terminal);
       } finally {
         client.destroy();
         await server.close();
@@ -2251,7 +2252,8 @@ describe('VSR client socket', () => {
     }
   );
 
-  it('keeps an uncertain write uncertain after a later refusal', async () => {
+  for (const refusal of [58, 41, 40, 30]) {
+  it(`keeps an uncertain write uncertain after a later refusal ${refusal}`, async () => {
     const EXPIRED_REQUEST_TIME = 30_001;
     let now = 0;
     let attempts = 0;
@@ -2260,7 +2262,7 @@ describe('VSR client socket', () => {
         attempts += 1;
         now = attempts === 1 ? 1 : EXPIRED_REQUEST_TIME;
         socket.write(replyFrame(
-          Operation.SendMessages, Buffer.alloc(0), attempts === 1 ? 57 : 58
+          Operation.SendMessages, Buffer.alloc(0), attempts === 1 ? 57 : refusal
         ));
         return;
       }
@@ -2293,6 +2295,7 @@ describe('VSR client socket', () => {
       await server.close();
     }
   });
+  }
 
   it('shares token authentication between concurrent callers', async () => {
     const server = await startVsrServer(

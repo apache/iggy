@@ -61,10 +61,15 @@ pub(crate) fn no_confirmations() -> SendMessagesResponse {
     }
 }
 
-/// A producer retry creates another request identity. Only an explicit
-/// non-admission permits that; ambiguous retries belong to the transport.
+/// A producer retry creates another request identity. Only a refusal or
+/// failure before submission permits that; ambiguous retries belong to the transport.
 const fn stops_send_retries(error: &IggyError) -> bool {
-    !matches!(error, IggyError::TransientNotAccepted)
+    !matches!(
+        error,
+        IggyError::TransientNotAccepted
+            | IggyError::NotConnected
+            | IggyError::CannotEstablishConnection
+    )
 }
 
 pub struct ProducerCore {
@@ -683,6 +688,7 @@ unsafe impl Sync for IggyProducer {}
 /// | --- | --- | --- |
 /// | the client is not signed in, so nothing may be sent yet | yes | the send goes ahead as soon as the client is signed in, or fails with [`IggyError::CannotSendMessagesDueToClientDisconnection`] once the retry budget is spent |
 /// | the binary transport reports that the server refused admission ([`IggyError::TransientNotAccepted`]) | yes, as a new request | the confirmation of the admitted attempt, or the final refusal |
+/// | the binary transport cannot connect before submission ([`IggyError::NotConnected`] or [`IggyError::CannotEstablishConnection`]) | yes, as a new request | the confirmation of the submitted attempt, or the final connection error |
 /// | an HTTP request fails, including a server admission refusal | no producer retry | the HTTP error; HTTP transport retries are configured separately below |
 /// | another request error or an ambiguous failure | no | the cause and unconfirmed batch; the caller decides whether to resend |
 /// | the batch committed, but its confirmation could not be read ([`IggyError::InvalidBytesResponse`] or [`IggyError::InvalidJsonResponse`], raised on the HTTP transport only) | no | the write did happen and retrying would duplicate it on purpose |
@@ -1110,6 +1116,8 @@ mod tests {
             );
         }
         assert!(!stops_send_retries(&IggyError::TransientNotAccepted));
+        assert!(!stops_send_retries(&IggyError::NotConnected));
+        assert!(!stops_send_retries(&IggyError::CannotEstablishConnection));
     }
 
     #[tokio::test]

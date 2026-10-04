@@ -21,12 +21,13 @@
 //!
 //! # Lifecycle
 //!
-//! Create one session per logical login. `begin_register` preserves its client
-//! identity and secret when registration is retried. `bind` accepts only a
+//! Create one session per logical login. Registration preserves its client
+//! identity and secret when retried. `bind` accepts only a
 //! nonzero epoch matching any previous binding. Application request IDs are
 //! available only after binding; exhaustion fails instead of wrapping.
 //! Both `bind` and `next_request_id` return `Result` and callers must handle
-//! failure. Explicit disconnect clears sign-in and requires a new login.
+//! failure. Explicit disconnect clears remembered sign-in; configured AutoLogin
+//! still authenticates the next connection.
 
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_common::IggyError;
@@ -86,7 +87,8 @@ impl ConsensusSession {
         self.session.is_some()
     }
 
-    /// Registration proof retained across reconnects and session bindings.
+    /// Internal bearer proof retained across reconnects. Never log or expose it.
+    #[doc(hidden)]
     pub fn bind_secret(&self) -> BindSecret {
         self.bind_secret.clone()
     }
@@ -109,11 +111,6 @@ impl ConsensusSession {
     ///
     pub const fn register_request_id(&self) -> u64 {
         0
-    }
-
-    /// Start or retry registration without resetting the identity or counter.
-    pub const fn begin_register(&self) -> u64 {
-        self.register_request_id()
     }
 
     /// Get the next application request ID and advance the counter.
@@ -174,8 +171,8 @@ mod tests {
     fn lost_registration_reply_preserves_identity_and_secret() {
         let session = ConsensusSession::with_client_id(7);
         let secret = session.bind_secret();
-        assert_eq!(session.begin_register(), 0);
-        assert_eq!(session.begin_register(), 0);
+        assert_eq!(session.register_request_id(), 0);
+        assert_eq!(session.register_request_id(), 0);
         assert_eq!(session.client_id(), 7);
         assert_eq!(
             session.bind_secret().expose_secret(),
@@ -189,7 +186,7 @@ mod tests {
         let mut session = ConsensusSession::with_client_id(7);
         session.bind(42).unwrap();
         assert_eq!(session.next_request_id().unwrap(), 1);
-        assert_eq!(session.begin_register(), 0);
+        assert_eq!(session.register_request_id(), 0);
         session.bind(42).unwrap();
         assert_eq!(session.client_id(), 7);
         assert_eq!(session.session(), Some(42));

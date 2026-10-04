@@ -33,7 +33,6 @@ use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
-use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::ClientState;
 use iggy_common::{
@@ -389,14 +388,7 @@ impl<T: PollTransport> PollRouter<T> {
                 )
                 .await
                 .map_err(unaccepted_data_error)?;
-            let bound = LoginRegisterResponse::decode_from(&response)
-                .map_err(|_| IggyError::InvalidFormat)?;
-            if bound.session != route.consumer_session.session {
-                return Err(IggyError::SessionMismatch(
-                    route.consumer_session.session,
-                    bound.session,
-                ));
-            }
+            coordinator.decode_session_binding(route.consumer_session, &response)?;
             connection
                 .client
                 .set_state(ClientState::Authenticated)

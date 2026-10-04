@@ -179,6 +179,11 @@ asyncio.run(main())
 transport. `examples/python/getting-started/producer.py` shows each swap in
 context.
 
+Established binary sessions survive transport loss. Password/PAT changes and
+PAT expiry do not end these sessions; logout, session lease expiry and account
+deactivation do. Reconnection binds the retained session before attempting a
+fresh login.
+
 `HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
 heartbeat that `heartbeat_interval` configures, so call it and then
@@ -272,15 +277,18 @@ exchange. Persisted sends also provide crash-safe retry receipts; weaker topic
 policies can lose data and receipts on a crash. HTTP NoAck confirms dispatch
 only. An application resend creates a new request and can duplicate messages.
 
-Producer retries start a new attempt only after an explicit
-`TransientNotAccepted` refusal. Missing destinations and other terminal errors
+Producer retries start a new attempt after an explicit `TransientNotAccepted`
+refusal or a connection failure before submission (`NotConnected` or
+`CannotEstablishConnection`). Missing destinations and other terminal errors
 stop immediately. `send_retries` counts retries after the initial attempt. The
 first permitted retry runs immediately, and `send_retry_interval` delays only
 later retries. Set `send_retries` to `None` or `0` to disable producer retries.
 Set `send_retry_interval` to `None` to run permitted retries without a delay.
 A zero interval raises `ValueError`.
 
-Transport retries are separate from producer retries. For example, the default
+HTTP send errors stop producer retries immediately, so `send_retries` does not
+retry a failed HTTP send. Transport retries are separate from producer retries.
+For example, the default
 `HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
 
 A failed direct send raises `ProducerSendError`, which is a `RuntimeError`

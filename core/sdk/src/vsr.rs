@@ -68,7 +68,10 @@ pub(crate) fn encode_contiguous_request(
     retained_header: &mut Option<RequestHeader>,
 ) -> Result<Bytes, IggyError> {
     let header = match *retained_header {
-        Some(header) => header,
+        Some(header) => {
+            validate_retained_header(&header, session)?;
+            header
+        }
         None => encode_request_header(session, code, payload)?.0,
     };
     *retained_header = Some(header);
@@ -86,7 +89,7 @@ pub(crate) fn encode_request_header(
 ) -> Result<(RequestHeader, usize), IggyError> {
     let (operation, request_id, session_id) = match code {
         LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE => {
-            (Operation::Register, session.begin_register(), 0)
+            (Operation::Register, session.register_request_id(), 0)
         }
         _ => {
             let operation = operation_for_code(code);
@@ -187,6 +190,19 @@ pub(crate) fn retain_replay_header(
     } else {
         Err(IggyError::TransientNotCommitted)
     }
+}
+
+pub(crate) fn validate_retained_header(
+    header: &RequestHeader,
+    session: &ConsensusSession,
+) -> Result<(), IggyError> {
+    if header.client != session.client_id()
+        || (header.operation != Operation::Register
+            && header.session != session.session().unwrap_or(0))
+    {
+        return Err(IggyError::TransientNotCommitted);
+    }
+    Ok(())
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {

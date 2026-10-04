@@ -85,6 +85,12 @@ The source checkout uses protocol 0.11.1. Build it with a matching server.
 session's private bind secret. Auxiliary poll connections reuse that session
 instead of logging in independently.
 
+Transport loss retains the logical identity and reconnect uses `BindSession`.
+A definitive stale or unauthenticated bind response permits a fresh Register;
+transient responses retain the identity. The bind proof is an independent
+session credential: password/PAT changes or expiry do not end an established
+session. Logout, lease expiry and user deactivation end session access.
+
 ## Quick Start
 
 `Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It polls each partition through a separate connection to the primary of that partition.

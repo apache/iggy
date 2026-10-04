@@ -169,12 +169,13 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldReArmWithFreshClientIdOnSecondLogin() {
+    void shouldRetainClientIdAndSecretWhenRegistrationIsRepeated() {
         ByteBuf firstLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, firstLogin).release();
         firstLogin.release();
         long firstLow = session.clientIdLow();
         long firstHigh = session.clientIdHigh();
+        byte[] firstSecret = session.bindSecret();
         session.bind(7);
         long firstGeneration = session.generation();
 
@@ -182,13 +183,11 @@ class VsrRequestEncoderTest {
         encoder.encode(alloc, LOGIN_USER_CODE, secondLogin).release();
         secondLogin.release();
 
-        assertThat(session.isBound()).isFalse();
-        assertThat(session.clientIdLow() != firstLow || session.clientIdHigh() != firstHigh)
-                .isTrue();
-        assertThat(session.generation()).isGreaterThan(firstGeneration);
-        session.bind(7);
-        assertThatThrownBy(() -> session.bindSecret(firstLow, firstHigh, 7))
-                .isInstanceOf(IggyNotConnectedException.class);
+        assertThat(session.isBound()).isTrue();
+        assertThat(session.clientIdLow()).isEqualTo(firstLow);
+        assertThat(session.clientIdHigh()).isEqualTo(firstHigh);
+        assertThat(session.bindSecret()).isEqualTo(firstSecret);
+        assertThat(session.generation()).isEqualTo(firstGeneration);
     }
 
     @Test

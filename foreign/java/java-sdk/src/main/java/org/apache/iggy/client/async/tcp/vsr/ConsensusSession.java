@@ -45,7 +45,6 @@ public final class ConsensusSession {
     private Long session;
     private long requestCounter = 1;
     private long correlationCounter = 1;
-    private boolean registerConsumed;
     private long generation;
     private long metadataWatermark;
     private boolean shared;
@@ -55,27 +54,13 @@ public final class ConsensusSession {
     }
 
     /**
-     * Arms a {@code Register}: on re-login (or a consumed one-shot register)
-     * the whole identity re-arms with a fresh client id so the server sees a
-     * brand-new registration. Returns the request id a Register carries,
-     * which is always zero.
+     * Returns the zero request id of Register without changing its identity.
+     * Repeating a registration after a lost reply must resolve the same epoch.
      *
-     * <p>The request counter is deliberately not rewound. This SDK multiplexes
-     * a single pinned channel and correlates replies by (operation, request
-     * id), so a send still in flight when a re-login re-arms would share its
-     * key with the first send of the new session: the correlation map would
-     * refuse the second one and a late reply for the first could be handed to
-     * it. A re-arm registers a fresh client id, which the server admits at
-     * watermark zero and which accepts any id above it, so carrying the
-     * counter forward costs nothing on the wire.
+     * <p>The request counter survives explicit resets too, so late replies
+     * cannot collide with pending requests from a replacement identity.
      */
     synchronized long beginRegister() {
-        if (registerConsumed || session != null) {
-            generation++;
-            regenerateClientId();
-            session = null;
-        }
-        registerConsumed = true;
         return 0;
     }
 
@@ -83,6 +68,9 @@ public final class ConsensusSession {
     synchronized void bind(long sessionEpoch) {
         if (sessionEpoch == 0) {
             throw new IllegalStateException("Register reply carried a zero session epoch");
+        }
+        if (session != null && session != sessionEpoch) {
+            throw new IllegalStateException("Register reply changed the bound session epoch");
         }
         this.session = sessionEpoch;
         generation++;
@@ -126,20 +114,22 @@ public final class ConsensusSession {
         return session == null ? 0 : session;
     }
 
-    synchronized long boundSession() {
+    public synchronized long boundSession() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
         }
         return session;
     }
 
-    synchronized boolean isBound() {
+    public synchronized boolean isBound() {
         return session != null;
     }
 
-    /** Clears the bound epoch (logout / eviction); next login re-registers. */
-    synchronized void reset() {
+    /** Ends the local identity after explicit logout or a refused session bind. */
+    public synchronized void reset() {
         session = null;
+        metadataWatermark = 0;
+        regenerateClientId();
         generation++;
     }
 

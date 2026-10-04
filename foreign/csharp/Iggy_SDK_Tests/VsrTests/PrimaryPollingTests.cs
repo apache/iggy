@@ -389,8 +389,9 @@ public sealed class PrimaryPollingTests
         await PollAsync(client);
 
         Assert.Equal(2, routes);
-        Assert.Equal(2, cluster.Coordinator.Registrations);
-        Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        Assert.Equal(1, cluster.Coordinator.Registrations);
+        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.BIND_SESSION_CODE));
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE));
     }
 

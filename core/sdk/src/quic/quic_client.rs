@@ -1087,7 +1087,13 @@ impl QuicClient {
                 };
 
                 let request_header = match preencoded {
-                    Some(header) => header,
+                    Some(header) => {
+                        let session = consensus_session
+                            .lock()
+                            .map_err(|_| IggyError::InvalidConfiguration)?;
+                        crate::vsr::validate_retained_header(&header, &session)?;
+                        header
+                    }
                     None => {
                         let mut session = consensus_session
                         .lock()
@@ -1311,6 +1317,63 @@ mod tests {
         send.write_all(body).await.unwrap();
         send.finish().unwrap();
         send.stopped().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retained_write_waiting_for_the_connection_must_recheck_its_session() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let payload = Bytes::from_static(b"uncertain-send");
+        let retained = crate::vsr::encode_request_header(
+            &mut client.consensus_session.lock().unwrap(),
+            SEND_MESSAGES_CODE,
+            &payload,
+        )
+        .unwrap()
+        .0;
+        let connection_guard = client.connection.lock().await;
+        let mut retained = Some(retained);
+        let attempt = client.send_raw_request(SEND_MESSAGES_CODE, payload, false, &mut retained);
+        tokio::pin!(attempt);
+        tokio::select! {
+            biased;
+            _ = &mut attempt => panic!("the exchange must wait for the connection lock"),
+            () = tokio::task::yield_now() => {}
+        }
+        client.reset_vsr_session().await.unwrap();
+        client.bind_vsr_session(2).await.unwrap();
+        drop(connection_guard);
+        assert_eq!(
+            tokio::time::timeout(TEST_BUDGET, &mut attempt)
+                .await
+                .unwrap(),
+            Err(IggyError::TransientNotCommitted)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), peer.accept_bi())
+                .await
+                .is_err()
+        );
+        Client::shutdown(&client).await.unwrap();
     }
 
     #[tokio::test]

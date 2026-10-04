@@ -50,9 +50,14 @@ Disable the ones you do not need so they cannot race with another process.
 
 `SendMessages` returns any placements the server reports. A send whose reply
 is lost to a dropped connection returns `ErrDisconnected` without a replay.
-A reconnect registers a new client identity, so a caller retry can append
-the batch twice. Consumers must handle duplicates through idempotent
-processing or application-level deduplication.
+A reconnect retains the client identity and authenticates it with `BindSession`.
+Only a terminal bind refusal permits a new registration. An application resend
+still creates a new request and can append the batch twice. Consumers must handle
+duplicates through idempotent processing or application-level deduplication.
+
+An established session has its own lifetime. Password or PAT changes and PAT
+expiry do not end it. Logout, session lease expiry, or user deactivation end the
+session and prevent its bind proof from restoring it.
 
 Crash durability follows the topic's `durability` policy: `replicated`
 confirms replication, while `persisted` also waits for the required replicas

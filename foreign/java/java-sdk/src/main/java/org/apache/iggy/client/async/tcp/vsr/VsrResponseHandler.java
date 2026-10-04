@@ -168,7 +168,6 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void handleEviction(ChannelHandlerContext ctx, ByteBuf frame) {
         IggyServerException error = VsrHeaders.evictionToException(frame);
-        session.reset();
         try {
             // The reason travels with the notification so the listener can drop
             // what belonged to the evicted session and say which eviction it

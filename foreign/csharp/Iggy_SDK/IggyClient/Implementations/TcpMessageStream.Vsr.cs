@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers;
+using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.ExceptionServices;
 using Apache.Iggy.Contracts;
@@ -184,6 +185,10 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             else if (await RedirectAsync(token))
             {
                 await ConnectAsync(false, token);
+                if (await ResumeSessionAsync(token))
+                {
+                    return authResponse;
+                }
                 continue;
             }
 
@@ -195,6 +200,54 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return authResponse;
+        }
+    }
+
+    private async Task<bool> ResumeSessionAsync(CancellationToken token)
+    {
+        await _sendingSemaphore.WaitAsync(token);
+        try
+        {
+            if (_consensusSession.Session is not { } session || _connection is not { } connection)
+            {
+                return false;
+            }
+            var identity = new byte[ConsumerSessionSize];
+            BinaryPrimitives.WriteUInt128LittleEndian(identity, _consensusSession.ClientId);
+            BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionEpochOffset), session);
+            lock (_pollRoutingGate)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionWatermarkOffset), _metadataWatermark);
+            }
+            var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+            var attempt = await connection.SendAttemptAsync(CommandCodes.BIND_SESSION_CODE,
+                LoginRegister.SerializeBindSession(identity, _consensusSession.BindSecret), deadline, deadline,
+                false, token, retryTransient: false);
+            if (attempt.Error is IggyInvalidStatusCodeException
+                {
+                    FromServer: true,
+                    StatusCode: VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT
+                })
+            {
+                ResetConsensusSession();
+                return false;
+            }
+            if (attempt.Error is { } error)
+            {
+                ExceptionDispatchInfo.Throw(error);
+            }
+            using var response = attempt.Response!;
+            var bound = LoginRegister.Deserialize(response.Memory.Span);
+            if (bound.Session != session)
+            {
+                throw VsrError.Exception(VsrError.SESSION_MISMATCH, "Bind reply changed the logical session.");
+            }
+            SetConnectionState(ConnectionState.Authenticated);
+            return true;
+        }
+        finally
+        {
+            _sendingSemaphore.Release();
         }
     }
 
@@ -805,13 +858,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Drops the connection along with the session. A late or half-read reply would desync the framing of the
+    ///     Drops the connection while retaining the session. A late or half-read reply would desync the framing of the
     ///     next request, so the socket cannot be reused. The caller must hold <see cref="_sendingSemaphore" />,
     ///     which owns every write to <see cref="_connection" />.
     /// </summary>
     /// <param name="connection">
-    ///     The connection the caller was using. A reconnect that completed in the meantime already closed it and
-    ///     re-armed the session, so dropping anything but the live one would tear down a healthy replacement.
+    ///     The connection the caller was using. A reconnect that completed in the meantime already closed it,
+    ///     so dropping anything but the live one would tear down a healthy replacement.
     /// </param>
     private void DropVsrConnectionLocked(VsrConnection? connection)
     {
@@ -820,7 +873,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             return;
         }
 
-        ResetConsensusSession();
+        _groupState.ClearSessionScoped();
+        ClearPollSession();
         _connection = null;
         SetConnectionState(ConnectionState.Disconnected);
         connection.Dispose();

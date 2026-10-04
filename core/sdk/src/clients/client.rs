@@ -122,8 +122,9 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
 ///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
 ///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
-///    client that has been shut down cannot reconnect. Explicit disconnect clears sign-in;
-///    call [`connect()`] and [`login_user()`] again before issuing requests.
+///    client that has been shut down cannot reconnect. Explicit disconnect clears the remembered sign-in.
+///    Configured auto-login still authenticates on the next connection; otherwise call
+///    [`connect()`] and [`login_user()`] again before issuing requests.
 ///
 /// # Examples
 ///
@@ -757,7 +758,7 @@ impl IggyClient {
     ///
     /// let producer = client
     ///     .producer("stream_name", "topic_name")?
-    ///     .topic_durability(iggy::prelude::Durability::Persisted) // returns IggyProducerBuilder from IggyClient
+    ///     .topic_durability(iggy::prelude::Durability::Persisted)
     ///     .partitioning(Partitioning::balanced())
     ///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
     ///     .create_topic_if_not_exists(

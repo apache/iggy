@@ -1311,3 +1311,6 @@
       type: uint64
     - name: Bound
       type: uint64
+- name: RequestIdExhausted
+  code: 14005
+  format: "vsr request id exhausted"

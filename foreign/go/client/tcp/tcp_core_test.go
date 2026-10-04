@@ -296,7 +296,7 @@ func TestExchange_EscalatesNotAcceptedToALeaderRecheck(t *testing.T) {
 	assert.True(t, sawMetadata, "the client re-checked leadership")
 }
 
-func TestExchange_ResetsTheSessionOnAnEviction(t *testing.T) {
+func TestExchange_RetainsTheSessionUntilBindConfirmsAnEviction(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	client.config.reconnection.enabled = false
 	before := client.session.ClientID()
@@ -309,8 +309,8 @@ func TestExchange_ResetsTheSessionOnAnEviction(t *testing.T) {
 
 	var eviction *vsr.EvictionError
 	assert.ErrorAs(t, err, &eviction)
-	assert.False(t, client.session.Bound(), "the fence no longer holds")
-	assert.NotEqual(t, before, client.session.ClientID(), "a new identity is minted")
+	assert.True(t, client.session.Bound(), "retain the proof until the resume verdict")
+	assert.Equal(t, before, client.session.ClientID(), "an eviction does not authorize replay under a new identity")
 	assert.Equal(t, iggcon.SessionStateUnauthenticated, client.sessionState)
 }
 

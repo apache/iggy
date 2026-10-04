@@ -1140,7 +1140,10 @@ public sealed partial class TcpMessageStream : IIggyClient
                 // forwards the register to the primary.
                 if (autoLogin && SignInSettings() is { } signInSettings)
                 {
-                    await AutoLoginAsync(signInSettings, token);
+                    if (!await ResumeSessionAsync(token))
+                    {
+                        await AutoLoginAsync(signInSettings, token);
+                    }
 
                     if (settleOnLeader && await RedirectAsync(token))
                     {
@@ -1259,7 +1262,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <summary>
-    ///     Closes the current connection and forgets the consensus session bound to it. Takes the sending
+    ///     Closes the current connection while retaining its logical session. Takes the sending
     ///     semaphore, which owns every write to <see cref="_connection" />, so an in-flight request never
     ///     observes the field changing between its write and its reply. Never cancellable: a caller giving up is
     ///     exactly when the connection has to be released.
@@ -1272,7 +1275,8 @@ public sealed partial class TcpMessageStream : IIggyClient
             _connection?.Dispose();
             _connection = null;
 
-            ResetConsensusSession();
+            _groupState.ClearSessionScoped();
+            ClearPollSession();
         }
         finally
         {
