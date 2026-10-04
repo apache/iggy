@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
+use crate::FILE_SYNC_CONCURRENCY;
 use futures::TryStreamExt;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::ConsumerKind;
@@ -981,10 +982,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                         .set(self.checkpoint_requested.get().max(*through_op));
                     true
                 }
-                Mutation::Barrier { offset_files, .. } => {
-                    self.retired_offset_files.borrow_mut().append(offset_files);
-                    false
-                }
+                Mutation::Barrier { .. } => true,
                 _ => false,
             });
         self.accepted.borrow_mut().truncate_from(from_op);
@@ -1444,7 +1442,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         barriers: Vec<FileSyncBarrier>,
     ) -> io::Result<Vec<PathBuf>> {
         futures::stream::iter(offset_files.iter().map(Ok::<_, io::Error>))
-            .try_for_each_concurrent(16, |retained| retained.file.sync())
+            .try_for_each_concurrent(FILE_SYNC_CONCURRENCY, |retained| retained.file.sync())
             .await?;
         futures::future::try_join_all(barriers.into_iter().map(FileSyncBarrier::run)).await
     }

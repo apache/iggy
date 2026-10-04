@@ -796,6 +796,36 @@ async fn interrupted_install() -> SimStorage {
     storage
 }
 
+#[test]
+fn given_synced_install_file_when_power_loss_interrupts_install_should_restore_backup() {
+    block_on(async {
+        let storage = storage_for_partition().await;
+        let path = Path::new("/partition/materialized");
+        let mut writer = storage.open(path, OpenMode::Create).await.unwrap();
+        writer.write(0, b"old".to_vec()).await.unwrap();
+        writer.sync().await.unwrap();
+        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+
+        let synced_files = BTreeSet::from([path.to_path_buf()]);
+        storage.clear_trace();
+        install_backup::begin_with_storage(Path::new(DIRECTORY), &synced_files, &storage)
+            .await
+            .unwrap();
+        assert!(
+            !storage.trace().contains(&StorageOperation::FileSync),
+            "the backup synced a hard link whose original writer had passed its barrier"
+        );
+        replace(&storage, path, b"new").await.unwrap();
+
+        storage.crash(Crash::PowerLoss);
+        install_backup::recover_with_storage(Path::new(DIRECTORY), &storage)
+            .await
+            .unwrap();
+        let file = storage.open(path, OpenMode::Read).await.unwrap();
+        assert_eq!(file.read(0, 3).await.unwrap(), b"old");
+    });
+}
+
 /// A hard link preserves the inode, not the writer's error cursor. Opening the
 /// backup name after writeback failed must not authorize destructive install;
 /// [`FileSyncBarrier::from_file`] must retain the original error cursor.
@@ -824,9 +854,12 @@ fn given_a_failed_writeback_when_beginning_an_install_backup_should_refuse_publi
         }
         .await;
 
+        let error = result.unwrap_err();
         assert!(
-            result.is_err(),
-            "install backup published after synchronizing a fresh hard-link handle past the writeback error"
+            error
+                .to_string()
+                .contains("/partition/materialized: writeback failed before this handle synced"),
+            "unexpected barrier failure: {error}"
         );
         assert!(
             !storage
@@ -888,7 +921,7 @@ fn given_a_failed_offset_writeback_when_barriering_install_files_should_refuse_p
 }
 
 #[test]
-fn given_a_truncated_install_barrier_when_rebarriering_should_report_retained_offset_writeback_failure()
+fn given_a_truncated_install_barrier_when_checkpointing_should_report_retained_offset_writeback_failure()
  {
     block_on(async {
         let storage = storage_for_partition().await;
@@ -920,12 +953,9 @@ fn given_a_truncated_install_barrier_when_rebarriering_should_report_retained_of
         storage.fail_writeback(path).unwrap();
         persistence.barrier_files(Vec::new());
         persistence.truncate_from(2);
-        assert!(persistence.start());
-        Rc::clone(&persistence).run().await;
-        persistence.drain().await.unwrap();
-        assert!(persistence.failure().is_none());
-
-        persistence.barrier_files(Vec::new());
+        // Any later mutation must wait for the old barrier; a checkpoint also
+        // makes an accidental durability advance observable.
+        persistence.checkpoint(1);
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
         let error = persistence.drain().await.unwrap_err();
@@ -936,6 +966,7 @@ fn given_a_truncated_install_barrier_when_rebarriering_should_report_retained_of
             "unexpected barrier failure: {error}"
         );
         assert!(persistence.failure().is_some());
+        assert_eq!(persistence.checkpoint_op(), 0);
     });
 }
 
