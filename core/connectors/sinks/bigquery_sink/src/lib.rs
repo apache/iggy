@@ -21,11 +21,11 @@
 //! `_default` stream, with rows encoded as Arrow record batches.
 //!
 //! Module map:
-//! - [`schema`]: BigQuery table schema (from `tables.get`) to Arrow schema.
-//! - [`encode`]: `ConsumedMessage`s to Arrow record batches, split by size.
-//! - [`client`]: credentials, `tables.get`, and `AppendRows` calls.
-//! - [`error`]: gRPC status classification into retryable and permanent.
-//! - [`sink`]: the `Sink` trait implementation.
+//! - `schema`: BigQuery table schema (from `tables.get`) to Arrow schema.
+//! - `encode`: `ConsumedMessage`s to Arrow record batches, split by size.
+//! - `client`: credentials, `tables.get`, and `AppendRows` calls.
+//! - `error`: gRPC status classification into retryable and permanent.
+//! - `sink`: the `Sink` trait implementation.
 
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{Error, sink_connector};
