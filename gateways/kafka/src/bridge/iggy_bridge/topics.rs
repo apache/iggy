@@ -20,7 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
-    Identifier, IggyError, StreamClient, TopicClient, TopicCreateOptions, TopicDetails,
+    Identifier, IggyError, IggyExpiry, StreamClient, TopicClient, TopicCreateOptions, TopicDetails,
+    TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
 use tracing::{debug, info};
@@ -281,6 +282,37 @@ impl IggyBridge {
         // itself is missing (see high_watermarks' own doc on this same fact), so a probe first
         // would just pay a second round trip to learn something this one call already tells us.
         with_request_timeout(self.client.get_topic(&stream_id, &topic_id)).await
+    }
+
+    /// Sets `message_expiry` on the Iggy topic backing `kafka_topic`.
+    ///
+    /// Does not create the topic and does not rename it: `name` is the mapped Iggy
+    /// topic name, which `update_topic` also takes as the topic's new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
+    /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity, auth, or a
+    /// missing topic.
+    pub async fn update_kafka_topic_message_expiry(
+        &self,
+        kafka_topic: &str,
+        message_expiry: IggyExpiry,
+    ) -> Result<(), BridgeError> {
+        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        let options = TopicUpdateOptions {
+            message_expiry: Some(message_expiry),
+            ..TopicUpdateOptions::default()
+        };
+        with_request_timeout(
+            self.client
+                .update_topic(&stream_id, &topic_id, topic_name, &options),
+        )
+        .await
     }
 
     /// Resolves many Kafka-visible names at once, one entry per input in the same order.

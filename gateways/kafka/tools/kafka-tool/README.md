@@ -230,8 +230,8 @@ Kafka introduced "flexible" encoding (compact ULEB128 strings/arrays) starting a
 
 ### API Key Coverage
 
-- **Explicit builders (25 API keys):** Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, SaslHandshake, ApiVersions, CreateTopics, DeleteTopics, DeleteRecords, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit, DescribeConfigs, SaslAuthenticate
-- **Header-framing test (39 API keys):** All remaining API keys are framed correctly with an empty payload — useful for testing that your server returns a proper error response rather than crashing
+- **Explicit builders (26 API keys):** Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, SaslHandshake, ApiVersions, CreateTopics, DeleteTopics, DeleteRecords, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit, DescribeConfigs, AlterConfigs, SaslAuthenticate
+- **Header-framing test (38 API keys):** All remaining API keys are framed correctly with an empty payload — useful for testing that your server returns a proper error response rather than crashing
 
 ---
 

@@ -215,6 +215,41 @@ pub fn build_produce_flexible_empty_request(acks: i16) -> Bytes {
     enc.freeze()
 }
 
+/// `DescribeConfigs` with no resources. Flexible from v4. `include_documentation` exists from v3.
+pub fn build_describe_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // include_synonyms
+    if version >= 3 {
+        enc.write_bool(false); // include_documentation
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `AlterConfigs` with no resources. Flexible from v2.
+pub fn build_alter_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
 /// `InitProducerId` request for any supported version (v0-v5), flexible from v2.
 pub fn build_init_producer_id_request(version: i16, transactional_id: Option<&str>) -> Bytes {
     let flexible = version >= 2;

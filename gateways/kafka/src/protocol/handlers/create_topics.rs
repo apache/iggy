@@ -333,7 +333,8 @@ fn local_shape_error(
         return Err((
             ERROR_INVALID_CONFIG,
             Some(StrBytes::from(
-                "per-topic configs are not supported by this bridge".to_string(),
+                "CreateTopics does not apply per-topic configs. Set retention.ms with AlterConfigs"
+                    .to_string(),
             )),
         ));
     }

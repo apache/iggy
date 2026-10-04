@@ -37,11 +37,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
-    API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
-    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION, advertised_min_version,
-    handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_CONFIGS,
+    API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
+    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_NONE,
+    ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
+    supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -54,8 +55,9 @@ use tcp::{
     parse_response_payload, read_byte_with_timeout, round_trip,
 };
 use wire::{
-    JoinGroupParams, OUT_OF_SCOPE_API_KEYS, SyncGroupParams, build_api_versions_flexible_request,
-    build_create_topics_empty_request, build_fetch_empty_topics_request,
+    JoinGroupParams, OUT_OF_SCOPE_API_KEYS, SyncGroupParams, build_alter_configs_empty_request,
+    build_api_versions_flexible_request, build_create_topics_empty_request,
+    build_describe_configs_empty_request, build_fetch_empty_topics_request,
     build_find_coordinator_request, build_heartbeat_request, build_init_producer_id_request,
     build_join_group_request, build_leave_group_request, build_list_offsets_request,
     build_metadata_all_topics_flexible, build_metadata_all_topics_legacy,
@@ -63,8 +65,8 @@ use wire::{
 };
 
 #[test]
-fn supported_ranges_table_has_twelve_entries() {
-    assert_eq!(supported_api_ranges().len(), 12);
+fn supported_ranges_table_has_fourteen_entries() {
+    assert_eq!(supported_api_ranges().len(), 14);
 }
 
 #[test]
@@ -101,7 +103,7 @@ fn is_supported_version_matches_scope_table() {
 ///
 /// Relies on `SUPPORTED_RANGES` (src) and `SCOPED_API_KEYS` (test) sharing declaration order
 /// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`, `FindCoordinator`,
-/// `JoinGroup`, Heartbeat, `LeaveGroup`, `SyncGroup`) - `supported_ranges_table_has_twelve_entries` plus
+/// `JoinGroup`, Heartbeat, `LeaveGroup`, `SyncGroup`) - `supported_ranges_table_has_fourteen_entries` plus
 /// `is_supported_version_matches_scope_table` already pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
@@ -518,6 +520,8 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             },
         ),
         API_KEY_INIT_PRODUCER_ID => build_init_producer_id_request(version, None),
+        API_KEY_DESCRIBE_CONFIGS => build_describe_configs_empty_request(version),
+        API_KEY_ALTER_CONFIGS => build_alter_configs_empty_request(version),
         _ => Bytes::new(),
     }
 }
@@ -848,5 +852,57 @@ async fn corrupt_create_topics_body_returns_invalid_request_error() {
     assert_eq!(d.read_i32().unwrap(), 0, "throttle");
     assert_eq!(d.read_i32().unwrap(), 1, "topics len");
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// v1 is legacy. A count that stops mid-integer never reaches `kafka_protocol`.
+#[tokio::test]
+async fn corrupt_describe_configs_truncated_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_DESCRIBE_CONFIGS, 1, body, &default_broker())
+        .await
+        .expect_response("DescribeConfigs v1 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "results len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// A resource count past what the remaining frame can hold is rejected by the shape walk.
+#[tokio::test]
+async fn corrupt_describe_configs_overlong_count_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0x00, 0x01, 0x86, 0xA0]);
+    let resp = handle_request(API_KEY_DESCRIBE_CONFIGS, 1, body, &default_broker())
+        .await
+        .expect_response("DescribeConfigs v1 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "results len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// v0 is legacy. A count that stops mid-integer never reaches `kafka_protocol`.
+#[tokio::test]
+async fn corrupt_alter_configs_truncated_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_ALTER_CONFIGS, 0, body, &default_broker())
+        .await
+        .expect_response("AlterConfigs v0 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "responses len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// A resource count past what the remaining frame can hold is rejected by the shape walk.
+#[tokio::test]
+async fn corrupt_alter_configs_overlong_count_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0x00, 0x01, 0x86, 0xA0]);
+    let resp = handle_request(API_KEY_ALTER_CONFIGS, 0, body, &default_broker())
+        .await
+        .expect_response("AlterConfigs v0 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "responses len");
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }

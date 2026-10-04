@@ -38,6 +38,8 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (18, "ApiVersions", 0, 3),
     (19, "CreateTopics", 2, 5),
     (22, "InitProducerId", 0, 5),
+    (32, "DescribeConfigs", 1, 4),
+    (33, "AlterConfigs", 0, 2),
 ];
 
 pub fn default_broker() -> BrokerAdvertise {

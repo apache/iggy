@@ -222,13 +222,15 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 13 | LeaveGroup | 0 | 5 | −1, 0, 5, 6 |
 | 14 | SyncGroup | 0 | 5 | −1, 0, 5, 6 |
 | 22 | InitProducerId | 0 | 5 | −1, 0, 5, 6 |
+| 32 | DescribeConfigs | 1 | 4 | 0, 1, 4, 5 |
+| 33 | AlterConfigs | 0 | 2 | −1, 0, 2, 3 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 12 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 14 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
 | B3 | Produce/Fetch/ListOffsets/CreateTopics/InitProducerId out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these five messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,10,11,12,13,14,18,19,22 only — no OffsetCommit/OffsetFetch, and no transaction keys (24, 25, 26, 28) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,10,11,12,13,14,18,19,22,32,33 only — no OffsetCommit/OffsetFetch, and no transaction keys (24, 25, 26, 28) |
 
 An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
 key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
@@ -437,7 +439,7 @@ Gateway commit: ___________
 kcat version (if used): ___________
 
 [ ] A1–A10 Smoke tests
-[ ] B1–B4  Version firewall (all 7 keys × 4 boundary versions)
+[ ] B1–B4  Version firewall (all 14 keys × 4 boundary versions)
 [ ] C1–C4  Unsupported API keys
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
