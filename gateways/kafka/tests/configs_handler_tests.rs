@@ -28,8 +28,13 @@ use kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse
 use kafka_protocol::protocol::StrBytes;
 use tokio_util::sync::CancellationToken;
 
+use bytes::Bytes;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::api::{BrokerAdvertise, ERROR_NOT_CONTROLLER, GatewayState};
+
+use iggy_gateway_kafka::protocol::api::{
+    BrokerAdvertise, ERROR_NOT_CONTROLLER, GatewayState, handle_request, is_supported_version,
+    supported_api_ranges,
+};
 use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
 
 #[path = "common/codec.rs"]
@@ -105,4 +110,21 @@ async fn alter_configs_without_a_bridge_returns_not_controller() {
     );
     assert_eq!(response.responses.len(), 1);
     assert_eq!(response.responses[0].error_code, ERROR_NOT_CONTROLLER);
+}
+
+#[test]
+fn incremental_alter_configs_is_not_advertised() {
+    assert!(
+        supported_api_ranges()
+            .iter()
+            .all(|range| range.api_key != 44)
+    );
+    assert!(!is_supported_version(44, 0));
+    assert!(!is_supported_version(44, 1));
+}
+
+#[tokio::test]
+async fn incremental_alter_configs_closes_the_connection() {
+    let outcome = handle_request(44, 1, Bytes::new(), &BrokerAdvertise::default()).await;
+    assert!(outcome.is_close());
 }

@@ -37,7 +37,7 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_alter_configs_shape;
 use crate::protocol::handlers::topic_config::{
-    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, exceeds_topic_cap,
+    IggyTopicKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, exceeds_topic_cap,
     find_duplicate_names, name_reason, plan_retention_update, static_text, topic_cap_message,
 };
 use crate::protocol::handlers::{
@@ -84,7 +84,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let responses = alter_all(bridge, &req, deadline).await;
+    let responses = alter_all(state, bridge, &req, deadline).await;
     respond_or_close(
         encode_message(&response(responses), api_version, 256),
         "AlterConfigs",
@@ -112,6 +112,7 @@ fn response(responses: Vec<AlterConfigsResourceResponse>) -> AlterConfigsRespons
 }
 
 async fn alter_all(
+    state: &GatewayState,
     bridge: &IggyBridge,
     req: &AlterConfigsRequest,
     deadline: Instant,
@@ -177,7 +178,7 @@ async fn alter_all(
             continue;
         }
 
-        let result = alter_one(bridge, resource, req.validate_only, deadline).await;
+        let result = alter_one(state, bridge, resource, req.validate_only, deadline).await;
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
@@ -187,6 +188,7 @@ async fn alter_all(
 }
 
 async fn alter_one(
+    state: &GatewayState,
     bridge: &IggyBridge,
     resource: &AlterConfigsResource,
     validate_only: bool,
@@ -249,13 +251,13 @@ async fn alter_one(
         }
     }
 
-    let expiry = match plan_retention_update(resource.configs.iter().map(|config| {
+    let planned = match plan_retention_update(resource.configs.iter().map(|config| {
         (
             config.name.as_str(),
             config.value.as_ref().map(StrBytes::as_str),
         )
     })) {
-        Ok(expiry) => expiry,
+        Ok(planned) => planned,
         Err(fault) => {
             return resource_error(
                 resource,
@@ -264,14 +266,14 @@ async fn alter_one(
             );
         }
     };
-    // A resource that does not name retention.ms has nothing to store. Omitting the key
-    // does not clear a previously set expiry.
-    let Some(expiry) = expiry else {
+    // A resource that names no retention key has nothing to store. Omitting the key
+    // does not clear a previously set expiry or the remembered synonym names.
+    let Some(planned) = planned else {
         return resource_error(resource, ERROR_NONE, None);
     };
 
     // `validate_only` already performed the existence read and the same key checks.
-    // It does not call `update_topic`.
+    // It does not call `update_topic` and does not change synonym memory.
     if validate_only {
         return resource_error(resource, ERROR_NONE, None);
     }
@@ -287,8 +289,15 @@ async fn alter_one(
         );
         return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
     }
-    match bridge.update_kafka_topic_message_expiry(name, expiry).await {
+    match bridge
+        .update_kafka_topic_message_expiry(name, planned.expiry)
+        .await
+    {
         Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
+            // Keyed by the mapped Iggy stream and topic, not the Kafka name.
+            let (stream, iggy_topic) = bridge.topic_identity(name);
+            state
+                .record_retention_synonyms(IggyTopicKey::new(stream, iggy_topic), planned.synonyms);
             resource_error(resource, ERROR_NONE, None)
         }
         Err(error) => {

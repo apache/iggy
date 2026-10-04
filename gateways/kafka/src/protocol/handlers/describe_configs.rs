@@ -39,9 +39,11 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
 use crate::protocol::handlers::topic_config::{
     CLEANUP_DOC, CLEANUP_POLICY, CLEANUP_POLICY_VALUE, CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC,
-    CONFIG_TYPE_LONG, CONFIG_TYPE_STRING, CONFIG_TYPE_UNKNOWN, ListedKey, ONLY_TOPIC_RESOURCES,
-    RESOURCE_TYPE_TOPIC, RETENTION_DOC, RETENTION_MS, bridge_failure, exceeds_topic_cap,
-    find_duplicate_names, listed_keys, message_expiry_is_explicit, name_reason, retention_ms,
+    CONFIG_TYPE_LONG, CONFIG_TYPE_STRING, CONFIG_TYPE_UNKNOWN, IggyTopicKey, ListedKey,
+    MILLIS_PER_HOUR, MILLIS_PER_MINUTE, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, RETENTION_DOC,
+    RETENTION_HOURS, RETENTION_HOURS_DOC, RETENTION_MINUTES, RETENTION_MINUTES_DOC, RETENTION_MS,
+    RetentionMs, RetentionSynonyms, bridge_failure, exceeds_topic_cap, find_duplicate_names,
+    listed_keys, message_expiry_is_explicit, name_reason, retention_in_unit, retention_ms,
     static_text, topic_cap_message,
 };
 use crate::protocol::handlers::{
@@ -88,7 +90,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let results = describe_all(bridge, &req, deadline).await;
+    let results = describe_all(state, bridge, &req, deadline).await;
     respond_or_close(
         encode_message(&response(results), api_version, 256),
         "DescribeConfigs",
@@ -117,6 +119,7 @@ fn response(results: Vec<DescribeConfigsResult>) -> DescribeConfigsResponse {
 }
 
 async fn describe_all(
+    state: &GatewayState,
     bridge: &IggyBridge,
     req: &DescribeConfigsRequest,
     deadline: Instant,
@@ -207,6 +210,7 @@ async fn describe_all(
         }
 
         let result = describe_one(
+            state,
             bridge,
             resource,
             req.include_synonyms,
@@ -223,6 +227,7 @@ async fn describe_all(
 }
 
 async fn describe_one(
+    state: &GatewayState,
     bridge: &IggyBridge,
     resource: &DescribeConfigsResource,
     include_synonyms: bool,
@@ -281,11 +286,14 @@ async fn describe_one(
         }
     };
 
+    let (stream, iggy_topic) = bridge.topic_identity(name);
+    let remembered = state.remembered_retention_synonyms(&IggyTopicKey::new(stream, iggy_topic));
     let (configs, unknown_key, unrepresentable) = described_entries(
         &topic,
         resource.configuration_keys.as_deref(),
         include_synonyms,
         include_documentation,
+        remembered,
     );
 
     if let Some(unknown_key) = unknown_key {
@@ -317,6 +325,7 @@ fn described_entries(
     configuration_keys: Option<&[StrBytes]>,
     include_synonyms: bool,
     include_documentation: bool,
+    remembered: RetentionSynonyms,
 ) -> (Vec<DescribeConfigsResourceResult>, Option<String>, bool) {
     let explicit = message_expiry_is_explicit(&topic.options);
     let retention = retention_ms(topic.message_expiry, explicit);
@@ -327,32 +336,38 @@ fn described_entries(
     for key in keys {
         match key {
             ListedKey::Retention => {
-                let (value, source) = retention.as_ref().map_or_else(
-                    |()| {
-                        // A stored duration that cannot be shown as retention.ms is still the
-                        // topic's expiry, not the never-expire default.
-                        unrepresentable = true;
-                        (None, CONFIG_SOURCE_TOPIC)
-                    },
-                    |retention| (Some(retention.value.as_str()), retention.source),
-                );
+                let (value, source) = retention_parts(&retention, &mut unrepresentable);
                 configs.push(config_entry(
                     RETENTION_MS,
                     value,
                     false,
                     source,
                     CONFIG_TYPE_LONG,
-                    include_synonyms,
+                    synonyms(include_synonyms, remembered, value, source),
                     include_documentation.then_some(RETENTION_DOC),
                 ));
             }
+            ListedKey::Minutes => configs.push(derived_retention_entry(
+                RETENTION_MINUTES,
+                MILLIS_PER_MINUTE,
+                &retention,
+                include_documentation.then_some(RETENTION_MINUTES_DOC),
+                &mut unrepresentable,
+            )),
+            ListedKey::Hours => configs.push(derived_retention_entry(
+                RETENTION_HOURS,
+                MILLIS_PER_HOUR,
+                &retention,
+                include_documentation.then_some(RETENTION_HOURS_DOC),
+                &mut unrepresentable,
+            )),
             ListedKey::Cleanup => configs.push(config_entry(
                 CLEANUP_POLICY,
                 Some(CLEANUP_POLICY_VALUE),
                 true,
                 CONFIG_SOURCE_DEFAULT,
                 CONFIG_TYPE_STRING,
-                include_synonyms,
+                Vec::new(),
                 include_documentation.then_some(CLEANUP_DOC),
             )),
             ListedKey::Unknown(name) => {
@@ -365,7 +380,7 @@ fn described_entries(
                     false,
                     CONFIG_SOURCE_DEFAULT,
                     CONFIG_TYPE_UNKNOWN,
-                    include_synonyms,
+                    Vec::new(),
                     None,
                 ));
             }
@@ -374,13 +389,47 @@ fn described_entries(
     (configs, unknown_key, unrepresentable)
 }
 
+const fn retention_parts<'a>(
+    retention: &'a Result<RetentionMs, ()>,
+    unrepresentable: &mut bool,
+) -> (Option<&'a str>, i8) {
+    if let Ok(retention) = retention {
+        (Some(retention.value.as_str()), retention.source)
+    } else {
+        // A stored duration that cannot be shown as retention.ms is still the
+        // topic's expiry, not the never-expire default.
+        *unrepresentable = true;
+        (None, CONFIG_SOURCE_TOPIC)
+    }
+}
+
+fn derived_retention_entry(
+    name: &str,
+    unit_ms: u64,
+    retention: &Result<RetentionMs, ()>,
+    documentation: Option<&str>,
+    unrepresentable: &mut bool,
+) -> DescribeConfigsResourceResult {
+    let (millis, source) = retention_parts(retention, unrepresentable);
+    let value = millis.and_then(|millis| retention_in_unit(millis, unit_ms));
+    config_entry(
+        name,
+        value.as_deref(),
+        false,
+        source,
+        CONFIG_TYPE_LONG,
+        Vec::new(),
+        documentation,
+    )
+}
+
 fn config_entry(
     name: &str,
     value: Option<&str>,
     read_only: bool,
     source: i8,
     config_type: i8,
-    include_synonyms: bool,
+    synonyms: Vec<DescribeConfigsSynonym>,
     documentation: Option<&str>,
 ) -> DescribeConfigsResourceResult {
     DescribeConfigsResourceResult::default()
@@ -389,22 +438,43 @@ fn config_entry(
         .with_read_only(read_only)
         .with_config_source(source)
         .with_is_sensitive(false)
-        .with_synonyms(synonyms(include_synonyms))
+        .with_synonyms(synonyms)
         .with_config_type(config_type)
         .with_documentation(documentation.map(|text| StrBytes::from(text.to_string())))
 }
 
-/// Neither known key has a synonym. `true` asks for the list and receives none.
-#[allow(
-    clippy::if_same_then_else,
-    reason = "true asks for synonyms and there are none"
-)]
-fn synonyms(include_synonyms: bool) -> Vec<DescribeConfigsSynonym> {
-    if include_synonyms {
-        Vec::new()
-    } else {
-        Vec::new()
+fn synonyms(
+    include_synonyms: bool,
+    remembered: RetentionSynonyms,
+    retention_ms_value: Option<&str>,
+    source: i8,
+) -> Vec<DescribeConfigsSynonym> {
+    if !include_synonyms || remembered.is_empty() {
+        return Vec::new();
     }
+    let mut listed = Vec::new();
+    if remembered.minutes {
+        listed.push(synonym(
+            RETENTION_MINUTES,
+            retention_ms_value.and_then(|value| retention_in_unit(value, MILLIS_PER_MINUTE)),
+            source,
+        ));
+    }
+    if remembered.hours {
+        listed.push(synonym(
+            RETENTION_HOURS,
+            retention_ms_value.and_then(|value| retention_in_unit(value, MILLIS_PER_HOUR)),
+            source,
+        ));
+    }
+    listed
+}
+
+fn synonym(name: &'static str, value: Option<String>, source: i8) -> DescribeConfigsSynonym {
+    DescribeConfigsSynonym::default()
+        .with_name(StrBytes::from_static_str(name))
+        .with_value(value.map(StrBytes::from))
+        .with_source(source)
 }
 
 fn resource_error(
@@ -419,4 +489,193 @@ fn resource_error(
         .with_resource_type(resource.resource_type)
         .with_resource_name(resource.resource_name.clone())
         .with_configs(configs)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use iggy::prelude::{
+        CompressionAlgorithm, HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp,
+        MaxTopicSize, OptionValue, ResourceOptions, TopicDetails, topic_option_keys,
+    };
+    use kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
+    use kafka_protocol::protocol::StrBytes;
+
+    use super::described_entries;
+    use crate::protocol::handlers::topic_config::{
+        CLEANUP_POLICY, CONFIG_SOURCE_TOPIC, RETENTION_HOURS, RETENTION_MINUTES, RETENTION_MS,
+        RetentionSynonyms, parse_retention_ms,
+    };
+
+    fn topic_details(expiry: IggyExpiry, explicit: bool) -> TopicDetails {
+        let mut options = ResourceOptions::new();
+        if explicit {
+            let key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).expect("expiry key");
+            options.insert(
+                key,
+                OptionValue::explicit(HeaderValue::from(u64::from(expiry))),
+            );
+        }
+        TopicDetails {
+            id: 1,
+            created_at: IggyTimestamp::default(),
+            name: "orders".to_string(),
+            size: IggyByteSize::default(),
+            message_expiry: expiry,
+            compression_algorithm: CompressionAlgorithm::None,
+            max_topic_size: MaxTopicSize::default(),
+            messages_count: 0,
+            partitions_count: 1,
+            partitions: Vec::new(),
+            options,
+        }
+    }
+
+    fn value_of<'a>(configs: &'a [DescribeConfigsResourceResult], name: &str) -> Option<&'a str> {
+        configs
+            .iter()
+            .find(|config| config.name.as_str() == name)
+            .and_then(|config| config.value.as_ref().map(StrBytes::as_str))
+    }
+
+    #[test]
+    fn minutes_and_hours_describe_as_retention_ms_with_synonyms_when_asked() {
+        let minutes = parse_retention_ms("120000").expect("2 minutes in ms");
+        let remembered = RetentionSynonyms {
+            minutes: true,
+            hours: false,
+        };
+        let details = topic_details(minutes, true);
+        let (configs, unknown, bad) = described_entries(&details, None, true, false, remembered);
+        assert!(unknown.is_none());
+        assert!(!bad);
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| config.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![RETENTION_MS, CLEANUP_POLICY]
+        );
+        assert_eq!(value_of(&configs, RETENTION_MS), Some("120000"));
+        let retention = configs
+            .iter()
+            .find(|config| config.name.as_str() == RETENTION_MS)
+            .expect("retention.ms");
+        assert_eq!(retention.synonyms.len(), 1);
+        assert_eq!(retention.synonyms[0].name.as_str(), RETENTION_MINUTES);
+        assert_eq!(
+            retention.synonyms[0].value.as_ref().map(StrBytes::as_str),
+            Some("2")
+        );
+        assert_eq!(retention.synonyms[0].source, CONFIG_SOURCE_TOPIC);
+        let cleanup = configs
+            .iter()
+            .find(|config| config.name.as_str() == CLEANUP_POLICY)
+            .expect("cleanup");
+        assert!(cleanup.synonyms.is_empty());
+
+        let hours = parse_retention_ms("3600000").expect("1 hour in ms");
+        let (configs, unknown, bad) = described_entries(
+            &topic_details(hours, true),
+            None,
+            true,
+            false,
+            RetentionSynonyms {
+                minutes: false,
+                hours: true,
+            },
+        );
+        assert!(unknown.is_none() && !bad);
+        let retention = configs
+            .iter()
+            .find(|config| config.name.as_str() == RETENTION_MS)
+            .expect("retention.ms");
+        assert_eq!(
+            retention.value.as_ref().map(StrBytes::as_str),
+            Some("3600000")
+        );
+        assert_eq!(retention.synonyms.len(), 1);
+        assert_eq!(retention.synonyms[0].name.as_str(), RETENTION_HOURS);
+        assert_eq!(
+            retention.synonyms[0].value.as_ref().map(StrBytes::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn synonyms_are_empty_when_not_requested_or_only_milliseconds_were_set() {
+        let expiry = parse_retention_ms("120000").expect("ms");
+        let details = topic_details(expiry, true);
+        let remembered = RetentionSynonyms {
+            minutes: true,
+            hours: true,
+        };
+        let (configs, _, _) = described_entries(&details, None, false, false, remembered);
+        assert!(configs.iter().all(|config| config.synonyms.is_empty()));
+
+        let (configs, _, _) =
+            described_entries(&details, None, true, false, RetentionSynonyms::default());
+        assert!(configs.iter().all(|config| config.synonyms.is_empty()));
+    }
+
+    #[test]
+    fn requested_minutes_or_hours_return_that_name_from_stored_milliseconds() {
+        let expiry = parse_retention_ms("90000").expect("ms");
+        let details = topic_details(expiry, true);
+        let asked = [StrBytes::from_static_str(RETENTION_MINUTES)];
+        let (configs, unknown, bad) = described_entries(
+            &details,
+            Some(&asked),
+            true,
+            false,
+            RetentionSynonyms {
+                minutes: true,
+                hours: false,
+            },
+        );
+        assert!(unknown.is_none());
+        assert!(!bad);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name.as_str(), RETENTION_MINUTES);
+        assert_eq!(configs[0].value.as_ref().map(StrBytes::as_str), Some("1"));
+        assert!(configs[0].synonyms.is_empty());
+
+        let asked = [StrBytes::from_static_str(RETENTION_HOURS)];
+        let never = topic_details(IggyExpiry::NeverExpire, true);
+        let (configs, unknown, bad) = described_entries(
+            &never,
+            Some(&asked),
+            false,
+            false,
+            RetentionSynonyms::default(),
+        );
+        assert!(unknown.is_none() && !bad);
+        assert_eq!(configs[0].name.as_str(), RETENTION_HOURS);
+        assert_eq!(configs[0].value.as_ref().map(StrBytes::as_str), Some("-1"));
+    }
+
+    #[test]
+    fn stored_never_expire_reports_negative_one_for_a_remembered_hour_synonym() {
+        let (configs, unknown, bad) = described_entries(
+            &topic_details(IggyExpiry::NeverExpire, true),
+            None,
+            true,
+            false,
+            RetentionSynonyms {
+                minutes: false,
+                hours: true,
+            },
+        );
+        assert!(unknown.is_none() && !bad);
+        let retention = configs
+            .iter()
+            .find(|config| config.name.as_str() == RETENTION_MS)
+            .expect("retention.ms");
+        assert_eq!(retention.value.as_ref().map(StrBytes::as_str), Some("-1"));
+        assert_eq!(
+            retention.synonyms[0].value.as_ref().map(StrBytes::as_str),
+            Some("-1")
+        );
+    }
 }

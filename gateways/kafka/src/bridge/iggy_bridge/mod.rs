@@ -174,6 +174,16 @@ impl IggyBridge {
         })
     }
 
+    /// Iggy stream and topic names `kafka_topic` resolves to.
+    ///
+    /// Callers have already checked the Kafka name. Retention synonym memory is
+    /// keyed by this pair.
+    #[must_use]
+    pub(crate) fn topic_identity(&self, kafka_topic: &str) -> (String, String) {
+        let (stream, topic) = self.config.topic_mapping.resolve(kafka_topic);
+        (stream.to_string(), topic.to_string())
+    }
+
     /// Tears down the underlying Iggy client, including its background heartbeat task.
     ///
     /// Not `IggyClient::disconnect`: that only tears down the transport
