@@ -127,6 +127,8 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 	err = c.session.Bind(registered.Session)
 	if err == nil {
 		c.sessionState = iggcon.SessionStateAuthenticated
+		c.sessionUserID = registered.UserID
+		c.clearPollSession()
 		c.loggedOut = false
 	} else {
 		// The server committed a Register this client failed to adopt, so the
@@ -228,6 +230,7 @@ func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
 	c.mtx.Lock()
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
+	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()
 	c.mtx.Unlock()
@@ -246,6 +249,7 @@ func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	c.mtx.Lock()
 	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.session.Reset()
+	c.clearPollSession()
 	// The sign-out is caller intent: it suppresses the automatic sign-in on
 	// the reconnect path until the caller explicitly signs in again.
 	c.loggedOut = true

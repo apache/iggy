@@ -19,7 +19,7 @@ use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
@@ -32,11 +32,12 @@ use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{AppliedFrontier, IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
-use server::boot::wire_shell_handlers;
-use server::shell::{ShellHandlers, ShellShardHandle};
+use server::boot::ServerHost;
+use server::shell::ShellShardHandle;
 use server_common::crypto;
 use server_common::sharding::{METADATA_GROUP, ShardId};
 use shard::shards_table::PapayaShardsTable;
+use shard::{NoopHost, ShardHost};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -117,11 +118,11 @@ fn load_local_checkpoint(data_dir: &std::path::Path) -> Option<(IggySnapshot, u1
 /// shard routes through the same `dispatch` -> inbox -> pump path as
 /// production instead of the old `without_inbox` bypass.
 ///
-/// `shell` selects the dispatch handlers. Off is the fast path: inert
-/// no-ops, so the simulator drives raw client frames straight into
-/// `IggyShard::on_message`. On wires the server's real deferred dispatch
-/// handlers (via [`wire_shell_handlers`]), exactly as production does, so
-/// a client request runs as a task concurrent with the pump.
+/// `shell` selects the shard host. Off is the fast path: the inert
+/// [`NoopHost`], so the simulator drives raw client frames straight into
+/// `IggyShard::on_message`. On wires the server's real host (via
+/// [`ServerHost::new`]), exactly as production does, so a client request
+/// runs as a task concurrent with the pump.
 ///
 /// Mirrors the server bootstrap's single-writer metadata: the consensus
 /// group, journal, snapshot, and the only writable metadata STM live on
@@ -379,10 +380,8 @@ pub fn new_shard(
     let partitions_config = PartitionsConfig {
         messages_required_to_save: 1000,
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
-        enforce_fsync: false, //Disable fsync for simulation
-        consumer_offset_enforce_fsync: false,
         validate_checksum: true,
-        segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
         encryptor: None,
         path_layout: PartitionPathLayout::default(),
@@ -395,7 +394,7 @@ pub fn new_shard(
     // ids carried by `PartitionConsensusConfig`.
     let partitions = IggyPartitions::new(ShardId::new(shard_idx), partitions_config);
 
-    // The deferred handlers upgrade this weak self-reference per frame; it
+    // The host's handlers upgrade this weak self-reference per frame; it
     // stays `None` until the shard is built and downgraded into it below.
     let shard_handle: ShellShardHandle<
         SharedSimOutbox,
@@ -403,41 +402,41 @@ pub fn new_shard(
         SimSnapshot,
         SimSuperblock,
     > = Rc::new(RefCell::new(None));
-    let ShellHandlers {
-        on_replica_message,
-        on_client_request,
-        on_metadata_submit,
-        on_list_clients,
-        on_partition_read,
-        // Step 6 keeps this to register client sessions; unused shell-off.
-        sessions: _,
-    } = if shell {
-        wire_shell_handlers(
+    // TODO: Model automatic consumer liveness in shell-mode simulations:
+    // - Retain the host's sessions and consumer_group_liveness handles. Run heartbeat
+    //   verification on every shard and consumer_group::liveness::run on shard 0 of
+    //   every replica for session heartbeat reporting and expiry. Support simulated
+    //   shard/bus types.
+    // - Drive client heartbeats, task timers, and connection/lease timestamps
+    //   with virtual time instead of compio timers and Instant::now().
+    // - Stop these tasks on replica shutdown/crash and recreate them on restart.
+    // - Test missed heartbeats and failed disconnect Logout by advancing virtual
+    //   time, without calling expiry cleanup directly. Verify partition reassignment,
+    //   saved offsets, and preservation of live or reconnected consumers.
+    let host: Rc<dyn ShardHost> = if shell {
+        Rc::new(ServerHost::new(
             &SharedSimOutbox(Rc::clone(bus)),
             &shard_handle,
-            Arc::new(ServerSystemConfig::default()),
+            Arc::new(ServerConfig::default()),
             // Default-config PAT cap, like the system config above, so sim
             // ingress admits exactly what a default-configured server does.
             PersonalAccessTokenConfig::default().max_tokens_per_user,
-        )
+        ))
     } else {
-        ShellHandlers::noop()
+        Rc::new(NoopHost)
     };
 
     let shard = Rc::new(
         shard::IggyShard::new(
             shard::ShardIdentity::new(shard_idx, name),
             SharedSimOutbox(Rc::clone(bus)),
-            on_replica_message,
-            on_client_request,
-            on_metadata_submit,
-            on_list_clients,
-            on_partition_read,
+            host,
             metadata,
             partitions,
             senders,
             inbox,
             reply_inbox,
+            ServerConfig::default().sharding.poll_completion_capacity,
             PapayaShardsTable::new(),
             shard::PartitionConsensusConfig::with_clock(
                 CLUSTER_ID,
@@ -451,8 +450,8 @@ pub fn new_shard(
         .expect("sim mesh senders are built in canonical order"),
     );
 
-    // Late-bind the deferred handlers' self-reference. Harmless shell-off:
-    // the no-ops never upgrade it.
+    // Late-bind the host's self-reference. Harmless shell-off: `NoopHost`
+    // never upgrades it.
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     (shard, metadata_bundle)
 }

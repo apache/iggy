@@ -157,5 +157,7 @@ extend-exclude = [
     "core/bench/dashboard/frontend/dist",
     # WireMock test fixtures with base64-encoded JWT data
     "**/wiremock/__files/*.json",
+    # Swift SDK golden vectors dumped from the Rust crates (hex payloads)
+    "foreign/swift/Tests/IggyTests/Fixtures/golden.json",
     "**/.python-version",
 ]

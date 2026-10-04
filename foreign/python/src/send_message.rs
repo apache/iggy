@@ -38,20 +38,26 @@ pub struct SendMessage {
 
 impl Clone for SendMessage {
     fn clone(&self) -> Self {
+        Self::clone_from_rust(&self.inner)
+    }
+}
+
+impl SendMessage {
+    pub(crate) fn clone_from_rust(message: &RustIggyMessage) -> Self {
         Self {
             inner: RustIggyMessage {
                 header: IggyMessageHeader {
-                    checksum: self.inner.header.checksum,
-                    id: self.inner.header.id,
-                    offset: self.inner.header.offset,
-                    timestamp: self.inner.header.timestamp,
-                    origin_timestamp: self.inner.header.origin_timestamp,
-                    user_headers_length: self.inner.header.user_headers_length,
-                    payload_length: self.inner.header.payload_length,
-                    reserved: self.inner.header.reserved,
+                    checksum: message.header.checksum,
+                    id: message.header.id,
+                    offset: message.header.offset,
+                    timestamp: message.header.timestamp,
+                    origin_timestamp: message.header.origin_timestamp,
+                    user_headers_length: message.header.user_headers_length,
+                    payload_length: message.header.payload_length,
+                    reserved: message.header.reserved,
                 },
-                payload: self.inner.payload.clone(),
-                user_headers: self.inner.user_headers.clone(),
+                payload: message.payload.clone(),
+                user_headers: message.user_headers.clone(),
             },
         }
     }
@@ -146,12 +152,8 @@ impl SendMessagesConfirmation {
     /// at-least-once, so an earlier retry may already have committed these
     /// messages at a lower offset.
     ///
-    /// A batch is confirmed once it is committed in memory, not once it is
-    /// fsynced. A crash-restart can stamp a later batch with an offset a client
-    /// has already recorded.
-    ///
-    /// The legacy server confirms nothing, so its confirmation list is empty
-    /// and this value is never reached.
+    /// Confirmation follows VSR quorum commit. A topic with persisted message
+    /// durability also waits for recoverable stable-storage copies on the quorum.
     #[getter]
     pub fn base_offset(&self) -> u64 {
         self.inner.base_offset
@@ -176,15 +178,13 @@ impl From<RustSendMessagesResponse> for SendMessagesResponse {
 impl SendMessagesResponse {
     /// Gets the commit confirmations, one per partition the batch was written to.
     ///
-    /// The list is empty when the server reports no offsets, and the legacy
-    /// server never reports any, so branch on it being empty rather than
-    /// indexing into it.
+    /// The list is empty when the server reports no offsets, so check whether
+    /// it is empty before indexing into it.
     ///
     /// A reported `base_offset` never implies uniqueness, because delivery is
     /// at-least-once and an earlier retry may already have committed the same
-    /// messages at a lower offset. A batch is confirmed once it is committed in
-    /// memory, not once it is fsynced. A crash-restart can stamp a later batch
-    /// with an offset a client has already recorded.
+    /// messages at a lower offset. Confirmation follows the topic's message
+    /// durability policy: quorum commit, plus stable storage for persisted topics.
     #[getter]
     pub fn confirmations(&self) -> Vec<SendMessagesConfirmation> {
         self.inner

@@ -76,9 +76,8 @@ export class VsrSession {
     } else {
       if (this.state.session === null)
         throw responseError(command, UNAUTHENTICATED);
-      // Partition ops consume an id too, even though no partition-plane dedup
-      // exists yet: dedup needs each send to carry a distinct number, and the
-      // metadata watermark tolerates the gaps.
+      // Partition ops consume an id too: dedup needs each send to carry a
+      // distinct number, and the metadata watermark tolerates the gaps.
       request = this.state.nextRequestId();
       session = this.state.session;
     }
@@ -133,7 +132,7 @@ const registerCommand = (command: number): boolean =>
   command === COMMAND_CODE.LoginRegister ||
   command === COMMAND_CODE.LoginRegisterWithAccessToken;
 
-const readWireName = (
+export const readWireName = (
   payload: Buffer,
   offset: number
 ): { value: string, next: number } => {

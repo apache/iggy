@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
-use configs::server::ServerSystemConfig;
+use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_common::{ClusterMetadata, IggyTimestamp};
@@ -146,7 +146,7 @@ pub(in crate::http) struct ForwardState {
     /// the same scheme as this node (uniform cluster HTTP config).
     pub(in crate::http) scheme: &'static str,
     pub(in crate::http) body_limit: usize,
-    pub(in crate::http) in_flight: Cell<u32>,
+    pub(in crate::http) in_flight: Rc<Cell<u32>>,
 }
 
 /// Shared shard-0 HTTP state.
@@ -160,7 +160,7 @@ pub(in crate::http) struct HttpInner {
     /// Read-only server config for the snapshot collector (log directory +
     /// runtime config paths); the shard does not expose config on the read
     /// path.
-    pub(in crate::http) system_config: Arc<ServerSystemConfig>,
+    pub(in crate::http) server_config: Arc<ServerConfig>,
     /// Per-credential VSR sessions keyed by JWT `jti` / PAT hash. `RefCell` is
     /// sound here - shard 0 is single-threaded and the `SendWrapper` state
     /// bridge tolerates the `!Sync` interior - but the guard must never be held
@@ -316,14 +316,16 @@ impl HttpInner {
     /// Mint a shard-0 client id and run the VSR `Register` for a fresh session,
     /// retrying on a fresh id if the minted one turns out to be taken.
     ///
-    /// The minter is a per-process counter reseeded from the client table at
-    /// boot, so a fresh mint normally lands on a free id. Two situations break
-    /// that, and neither is predictable from here: a promoted primary mints
-    /// from a counter with no relationship to the ids its predecessor
-    /// committed, and in a cluster every node counts independently. Landing on
-    /// an occupied entry is therefore reactive to detect and cheap to fix --
-    /// mint again. Bounded, because a run of collisions means the counter is
-    /// wrong rather than unlucky, and looping would hide that.
+    /// The minter puts this boot's nonce above a per-process counter, so a fresh
+    /// mint lands on an id that no other node and no earlier boot minted. That
+    /// holds only while no cluster node runs server 0.9.0: it seeds its counter
+    /// from the low 112 bits of live ids, nonce included, so it can mint the ids
+    /// this node mints next. A fresh mint can still land on an occupied entry
+    /// if a binary-transport client chose that id for itself (the TCP login
+    /// path takes `client` off the wire), or if two boots drew the same nonce.
+    /// That is cheap to detect and to fix: mint again. Bounded, because a run
+    /// of collisions means the minter is wrong rather than unlucky, and looping
+    /// would hide that.
     ///
     /// The two collision signals are asymmetric. A different owner is refused
     /// terminally by the register ownership gate. The SAME user is not refused
@@ -338,8 +340,8 @@ impl HttpInner {
         user_id: u32,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
-        /// Enough to ride out a promotion-era counter overlap; beyond this the
-        /// minter is misconfigured and the 503 is the honest answer.
+        /// A collision is rare enough that this many in a row means the minter
+        /// is broken, and the 503 is the honest answer.
         const MINT_ATTEMPTS: u8 = 3;
 
         for attempt in 1..=MINT_ATTEMPTS {
@@ -374,31 +376,10 @@ impl HttpInner {
             .shard
             .coordinator()
             .ok_or(AuthError::SessionUnavailable)?;
-        // Refold the client table into the minter if this is the first mint of
-        // the current view. Cheap and skipped within a view, and it is what
-        // stops a PROMOTED primary from minting against ids its predecessor
-        // committed from an unrelated counter -- the table is replicated, the
-        // counter is per process. Boot does the same call (`bootstrap`); this
-        // one covers every later view.
-        {
-            let metadata = self.shard.plane.metadata();
-            if let Some(consensus) = metadata.consensus.as_ref() {
-                coordinator.seed_client_sequence(
-                    consensus.view(),
-                    metadata.client_table.borrow().client_ids(),
-                );
-            }
-        }
         // Reuse the TCP accept path's minter: it draws from the same shard-0
         // `client_seq`, so an HTTP session id can never collide with a TCP
         // virtual client's and the shard-0 tag (top 16 bits == 0) is preserved.
         let client_id = coordinator.mint_shard_zero_client_id();
-        // The minter seeds at 1, so 0 is only reachable after a 2^112 wrap.
-        // Guard anyway: `submit_register_in_process` asserts `client_id != 0`,
-        // and an assert on this request path would be a panic.
-        if client_id == 0 {
-            return Err(AuthError::SessionUnavailable);
-        }
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
         //

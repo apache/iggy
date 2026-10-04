@@ -103,7 +103,11 @@ impl PostgresSourceJsonFixture {
 impl TestFixture for PostgresSourceJsonFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = PostgresContainer::start().await?;
-        Ok(Self { container })
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -182,7 +186,11 @@ impl PostgresSourceByteaFixture {
 impl TestFixture for PostgresSourceByteaFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = PostgresContainer::start().await?;
-        Ok(Self { container })
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -262,7 +270,11 @@ impl PostgresSourceJsonbFixture {
 impl TestFixture for PostgresSourceJsonbFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = PostgresContainer::start().await?;
-        Ok(Self { container })
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -350,7 +362,11 @@ impl PostgresSourceDeleteFixture {
 impl TestFixture for PostgresSourceDeleteFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = PostgresContainer::start().await?;
-        Ok(Self { container })
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -362,6 +378,139 @@ impl TestFixture for PostgresSourceDeleteFixture {
         envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            "../../target/debug/libiggy_connector_postgres_source".to_string(),
+        );
+        envs
+    }
+}
+
+/// The longer poll interval leaves time to restart Iggy before the SDK's
+/// consecutive-NACK limit stops the source.
+pub struct PostgresSourceDeleteSlowPollFixture {
+    inner: PostgresSourceDeleteFixture,
+}
+
+impl std::ops::Deref for PostgresSourceDeleteSlowPollFixture {
+    type Target = PostgresSourceDeleteFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl PostgresOps for PostgresSourceDeleteSlowPollFixture {
+    fn container(&self) -> &PostgresContainer {
+        self.inner.container()
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceDeleteSlowPollFixture {
+    fn table_name(&self) -> &str {
+        self.inner.table_name()
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceDeleteSlowPollFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: PostgresSourceDeleteFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "5s".to_string());
+        envs
+    }
+}
+
+/// PostgreSQL source fixture with an exact NUMERIC tracking column.
+pub struct PostgresSourceNumericTrackingFixture {
+    container: PostgresContainer,
+}
+
+impl PostgresOps for PostgresSourceNumericTrackingFixture {
+    fn container(&self) -> &PostgresContainer {
+        &self.container
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceNumericTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl PostgresSourceNumericTrackingFixture {
+    const TABLE: &'static str = "test_numeric_tracking";
+
+    pub async fn create_table(&self, pool: &Pool<Postgres>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                tracking_value NUMERIC PRIMARY KEY
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<Postgres>, tracking_value: &str) {
+        let query = format!(
+            "INSERT INTO {} (tracking_value) VALUES ($1::numeric)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(tracking_value)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<Postgres>) -> i64 {
+        PostgresSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceNumericTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = PostgresContainer::start().await?;
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "tracking_value".to_string(),
+        );
         envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
         envs.insert(
@@ -465,7 +614,11 @@ impl PostgresSourceMarkFixture {
 impl TestFixture for PostgresSourceMarkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = PostgresContainer::start().await?;
-        Ok(Self { container })
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -496,6 +649,204 @@ impl TestFixture for PostgresSourceMarkFixture {
             ENV_SOURCE_PATH.to_string(),
             "../../target/debug/libiggy_connector_postgres_source".to_string(),
         );
+        envs
+    }
+}
+
+/// PostgreSQL source fixture with an explicitly configured non-unique cleanup key.
+pub struct PostgresSourceNonUniqueCleanupFixture {
+    container: PostgresContainer,
+}
+
+impl PostgresOps for PostgresSourceNonUniqueCleanupFixture {
+    fn container(&self) -> &PostgresContainer {
+        &self.container
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceNonUniqueCleanupFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl PostgresSourceNonUniqueCleanupFixture {
+    const TABLE: &'static str = "test_non_unique_cleanup";
+
+    async fn create_table(&self, pool: &Pool<Postgres>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id SERIAL PRIMARY KEY,
+                group_id INTEGER NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceNonUniqueCleanupFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = PostgresContainer::start().await?;
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(),
+            "group_id".to_string(),
+        );
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            "../../target/debug/libiggy_connector_postgres_source".to_string(),
+        );
+        envs
+    }
+}
+
+/// PostgreSQL source fixture with a non-unique scalar tracking cursor.
+pub struct PostgresSourceNonUniqueTrackingFixture {
+    container: PostgresContainer,
+}
+
+impl PostgresOps for PostgresSourceNonUniqueTrackingFixture {
+    fn container(&self) -> &PostgresContainer {
+        &self.container
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceNonUniqueTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl PostgresSourceNonUniqueTrackingFixture {
+    const TABLE: &'static str = "test_non_unique_tracking";
+
+    async fn create_table(&self, pool: &Pool<Postgres>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id SERIAL PRIMARY KEY,
+                cursor_value INTEGER NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceNonUniqueTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = PostgresContainer::start().await?;
+        let fixture = Self { container };
+        let pool = fixture.create_pool().await?;
+        fixture.create_table(&pool).await;
+        pool.close().await;
+        Ok(fixture)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "cursor_value".to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            "../../target/debug/libiggy_connector_postgres_source".to_string(),
+        );
+        envs
+    }
+}
+
+pub struct PostgresSourceTextKeyFixture {
+    source: PostgresSourceJsonFixture,
+}
+
+impl PostgresOps for PostgresSourceTextKeyFixture {
+    fn container(&self) -> &PostgresContainer {
+        self.source.container()
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceTextKeyFixture {
+    fn table_name(&self) -> &str {
+        self.source.table_name()
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceTextKeyFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let source = PostgresSourceJsonFixture {
+            container: PostgresContainer::start().await?,
+        };
+        let pool = source.create_pool().await?;
+        let query = format!(
+            "CREATE TABLE {} (id TEXT PRIMARY KEY, processed BOOLEAN NOT NULL DEFAULT FALSE)",
+            source.table_name()
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&pool)
+            .await
+            .expect("create validated tracking and cleanup key before source startup");
+        pool.close().await;
+        Ok(Self { source })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.source.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_string(), "text".to_string());
+        envs.insert(
+            ENV_SOURCE_PROCESSED_COLUMN.to_string(),
+            "processed".to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "text".to_string());
         envs
     }
 }

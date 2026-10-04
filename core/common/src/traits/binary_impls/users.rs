@@ -131,6 +131,9 @@ impl<B: BinaryClient> UserClient for B {
             .to_bytes(),
         )
         .await?;
+        if let Some(username) = username {
+            self.refresh_session_username(user_id, username).await;
+        }
         Ok(())
     }
 

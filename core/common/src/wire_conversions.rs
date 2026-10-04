@@ -472,6 +472,8 @@ impl From<StatsResponse> for Stats {
             threads_count: w.threads_count,
             free_disk_space: IggyByteSize::from(w.free_disk_space),
             total_disk_space: IggyByteSize::from(w.total_disk_space),
+            open_files_count: w.open_files_count,
+            open_files_limit: w.open_files_limit,
         }
     }
 }
@@ -479,6 +481,21 @@ impl From<StatsResponse> for Stats {
 // ---------------------------------------------------------------------------
 // System - Cluster Metadata
 // ---------------------------------------------------------------------------
+
+impl From<ClusterNode> for ClusterNodeResponse {
+    fn from(node: ClusterNode) -> Self {
+        Self {
+            name: node.name,
+            ip: node.ip,
+            tcp_port: node.endpoints.tcp,
+            quic_port: node.endpoints.quic,
+            http_port: node.endpoints.http,
+            websocket_port: node.endpoints.websocket,
+            role: node.role as u8,
+            status: node.status as u8,
+        }
+    }
+}
 
 impl TryFrom<ClusterNodeResponse> for ClusterNode {
     type Error = IggyError;

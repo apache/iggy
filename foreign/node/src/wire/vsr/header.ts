@@ -50,6 +50,7 @@ export const REQUEST_OFFSET = {
 export const REPLY_OFFSET = {
   size: 48,
   command: 60,
+  commit: 184,
   operation: 208,
   status: 216
 } as const;

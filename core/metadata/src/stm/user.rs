@@ -98,21 +98,21 @@ impl User {
 
 define_state! {
     Users {
-        index: AHashMap<Arc<str>, UserId>,
-        items: IdSlab<User>,
-        personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
+        pub(crate) index: AHashMap<Arc<str>, UserId>,
+        pub items: IdSlab<User>,
+        pub personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
         // SAFETY: deterministic-apply invariant. `AHashMap` iteration order
         // differs across replicas (random seed), so this map MUST only be
         // touched via single-key `.get` / `.insert` / `.remove`. Never
         // iterate. Reach for `BTreeMap` the first time iteration is needed.
-        personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
+        pub personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
         // Expiry-ordered index of expiring PATs: `(expiry_micros, user_id,
         // name)`. Never-expiring tokens are absent. Unlike the sibling
         // `AHashMap` index above, a `BTreeSet` is safe to iterate (its order
         // is deterministic across replicas), which lets the PAT cleaner find
         // expired tokens in O(log n) per tick instead of scanning every token.
-        personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)>,
-        permissioner: Permissioner,
+        pub(crate) personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)>,
+        pub(crate) permissioner: Permissioner,
     }
 }
 
@@ -144,6 +144,15 @@ impl UsersInner {
             }
             WireIdentifier::String(name) => self.index.get(name.as_str()).map(|&id| id as usize),
         }
+    }
+
+    /// Committed user record named `username`, `None` when no such user
+    /// exists.
+    #[must_use]
+    pub fn user_by_name(&self, username: &str) -> Option<&User> {
+        self.index
+            .get(username)
+            .and_then(|&id| self.items.get(id as usize))
     }
 
     /// Stored password hash of the user named by `identifier`, `None` when
@@ -649,7 +658,7 @@ impl StateHandler for UpdatePermissionsRequest {
 /// every WAL and snapshot. So the raw token leaves the primary by a side channel
 /// (`maybe_rewrite_pat_request` returns it alongside the rewritten request) and
 /// the home shard splices it into this op's reply as a typed
-/// `RawPersonalAccessTokenResponse` (server `responses::build_raw_pat_reply`).
+/// `RawPersonalAccessTokenResponse` (server `reply_frame::build_raw_pat_reply`).
 ///
 /// One consequence rides on that: the secret exists only on the wire of the
 /// original reply, so a replayed request cannot be served from the client-table

@@ -343,9 +343,45 @@ function portable_timeout() {
     fi
 }
 
+# Grep must see complete shell commands instead of individual README lines.
+function read_readme_logical_lines() {
+    local readme_file="$1"
+
+    awk '
+        function has_line_continuation(line, position, count) {
+            count = 0
+            for (position = length(line); position > 0; position--) {
+                if (substr(line, position, 1) != "\\") {
+                    break
+                }
+                count++
+            }
+            return count % 2 == 1
+        }
+
+        {
+            if (has_line_continuation($0)) {
+                pending = pending substr($0, 1, length($0) - 1)
+                continued = 1
+                next
+            }
+
+            print pending $0
+            pending = ""
+            continued = 0
+        }
+
+        END {
+            if (continued) {
+                print pending "\\"
+            }
+        }
+    ' "${readme_file}"
+}
+
 # Run commands extracted from a README file.
 # Usage: run_readme_commands readme_file grep_pattern [cmd_timeout [grep_exclude]]
-# Reads matching lines, strips backticks/comments, executes each.
+# Reads matching logical lines, strips backticks/comments, executes each.
 # Calls TRANSFORM_COMMAND function on each command if defined.
 # Returns: sets global EXAMPLES_EXIT_CODE and README_COMMANDS_EXECUTED.
 # Zero matches is not an error here: callers iterate multiple README
@@ -364,7 +400,7 @@ function run_readme_commands() {
     fi
 
     local commands
-    commands=$(grep -E "${grep_pattern}" "${readme_file}" || true)
+    commands=$(read_readme_logical_lines "${readme_file}" | grep -E "${grep_pattern}" || true)
     if [ -n "${grep_exclude}" ]; then
         commands=$(echo "${commands}" | grep -v -e "${grep_exclude}" || true)
     fi

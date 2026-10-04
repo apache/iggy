@@ -113,12 +113,12 @@ func consumeMessages(ctx context.Context, client iggcon.Client) error {
 			continue
 		}
 
-		offset += uint64(len(pollMessages.Messages))
 		for _, message := range pollMessages.Messages {
 			err = handleMessage(message)
 			if err != nil {
 				return err
 			}
+			offset = message.Header.Offset + 1
 		}
 		consumedBatches++
 		select {

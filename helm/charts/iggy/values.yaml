@@ -109,6 +109,10 @@ server:
   encryption:
     # -- Enable encryption at rest
     enabled: false
+    # -- Encryption config layout: `auto` selects `legacy` for released image
+    # versions through 0.9.0-edge.7. Set `flat` for newer server builds, or
+    # `legacy` for custom builds that still use `[system.encryption]`.
+    configVersion: auto
     # -- 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set.
     # Prefer `existingSecret` outside development: a value here is stored in the
     # Helm release and readable by anyone who can read it.

@@ -17,16 +17,13 @@
 
 use crate::session::ConsensusSession;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::codes::{
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
-};
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
-    RequestHeader, read_size_field, result_code, result_section_len,
+    RequestHeader, operation_for_code, read_size_field, result_code, result_section_len,
 };
-use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
-
-const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
+use iggy_common::{IggyError, eviction_reason_to_error};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // A reconnect creates a fresh VSR client and session. A replicated request
 // retried there gets a new (client_id, request_id) tuple, so server-side
@@ -95,71 +92,22 @@ pub(crate) fn encode_request_header(
                     session.session().unwrap_or(0),
                 )
             } else {
-                // Partition ops consume an id too, even though nothing dedups
-                // them yet: dedup needs each send to carry a distinct number,
-                // and the metadata watermark tolerates the resulting gaps
+                // Partition dedup needs each new write to carry a distinct id.
+                // The metadata watermark tolerates the resulting gaps
                 // (`client_table.rs`: "There is no `RequestGap`").
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.next_request_id(), session_id)
             }
         }
     };
-    // Stamped only for the ops the server's `ClientTable` dedups, and only by this
-    // SDK: the others leave the field zero, which the server reads as unstamped.
-    // Partition ops are the large payloads and already carry `batch_checksum` over
-    // the same bytes, and nothing dedups them, so hashing here would only buy the
-    // server a second full-payload pass in `verify_request_checksum`. NonReplicated
-    // ops bypass dedup too.
-    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
-        0
-    } else {
-        u128::from(calculate_checksum(payload))
-    };
-    let total_size = HEADER_SIZE
-        .checked_add(payload.len())
-        .ok_or(IggyError::InvalidConfiguration)?;
-    let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut reserved = [0; 60];
-    if operation == Operation::NonReplicated {
-        reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
-    }
-    let header = RequestHeader {
-        command: Command::Request,
-        operation,
-        size,
-        client: session.client_id(),
-        request: request_id,
-        session: session_id,
-        // Lets the client table tell a genuine retry from a `request` number reused
-        // for different arguments. Zero means unstamped, which is what an SDK
-        // predating this sends. A server that rewrites the body (PAT, password)
-        // carries it through untouched, so it keeps describing what the client sent.
-        request_checksum,
-        // Zeroed: the field is "informational" -- the server copies it into
-        // `ReplyHeader.timestamp` for RTT but nothing else reads it. Paying
-        // a `clock_gettime` syscall per encoded request (formerly held the
-        // `consensus_session` lock too) for an unused field is waste.
-        // Reintroduce a real stamp here when an RTT consumer actually wires
-        // it up.
-        timestamp: 0,
-        reserved,
-        ..Default::default()
-    };
-
-    Ok((header, total_size))
-}
-
-/// `COMMAND_TABLE` is a protocol registry, not a per-server capability list, so
-/// an SDK build cannot know which codes a given server implements. The server is
-/// the authority: an unmapped code is forwarded as non-replicated (the code
-/// rides `RequestHeader.reserved`, which that path already stamps) and the
-/// server answers with a proper error if it does not know it.
-pub(crate) fn operation_for_code(code: u32) -> Operation {
-    if code == LOGOUT_USER_CODE {
-        return Operation::Logout;
-    }
-
-    Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
+    // The header rules (checksum stamp, size, reserved code) live in the
+    // protocol crate so every client and the cross-SDK fixtures share them;
+    // only the session identity is decided here.
+    let header =
+        RequestHeader::for_request(code, session.client_id(), request_id, session_id, payload)
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+    debug_assert_eq!(header.operation, operation);
+    Ok((header, header.size as usize))
 }
 
 /// Whether replaying `code` after reconnecting with a new session cannot
@@ -211,8 +159,25 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
     }
 }
 
+/// Track metadata acknowledgments without adding coordinator traffic to warm polls.
+pub(crate) fn observe_metadata_reply(watermark: &AtomicU64, header: &[u8; HEADER_SIZE]) {
+    if peek_command(header) != Command::Reply {
+        return;
+    }
+    let Ok(operation) = read_operation(header) else {
+        return;
+    };
+    if operation == Operation::NonReplicated || operation.is_partition() {
+        return;
+    }
+    const COMMIT_OFFSET: usize = std::mem::offset_of!(ReplyHeader, commit);
+    let mut commit = [0; size_of::<u64>()];
+    commit.copy_from_slice(&header[COMMIT_OFFSET..COMMIT_OFFSET + size_of::<u64>()]);
+    watermark.fetch_max(u64::from_le_bytes(commit), Ordering::Release);
+}
+
 /// Decode a reply when the header and body have been read into separate
-/// buffers. Saves the 64B header `put_slice` that `decode_response` would
+/// buffers. Saves the 256-byte header `put_slice` that `decode_response` would
 /// otherwise perform when callers concatenate header + body before decoding.
 ///
 /// Also surfaces session-terminal `Command::Eviction` frames as typed
@@ -273,21 +238,15 @@ fn read_operation(header_bytes: &[u8; HEADER_SIZE]) -> Result<Operation, IggyErr
     .map_err(|_| IggyError::InvalidCommand)
 }
 
-/// Interpret the committed result section that leads a metadata reply body.
+/// Strip the result section from metadata, consumer-offset write, and
+/// non-empty Register replies. Success carries `count == 0` then the payload;
+/// a business or transient rejection carries an error code in a result entry.
+/// A result section can report a pre-commit rejection, so its presence alone
+/// does not prove commitment.
 ///
-/// Metadata ops ([`Operation::is_metadata`]) commit a result
-/// section ahead of their typed payload (encode mirror:
-/// `metadata::stm::result::ApplyReply::write_reply_body`): success carries
-/// `count == 0` then the payload; a committed business rejection carries one
-/// `{index, result}` entry and no payload. Strip the section on success and map
-/// a nonzero committed code to its [`IggyError`] -- the result discriminants
-/// share the `IggyError` code space, so this is the same [`IggyError::from_code`]
-/// mapping the legacy transport applies to a status word.
-///
-/// Reads, the partition data plane, and Register/Logout carry no result section
-/// and pass through untouched. A metadata body that is not a well-formed result
-/// section is corruption, never a silent success, so it maps to `InvalidCommand`
-/// rather than risk a rejection decoding as `Ok`.
+/// Reads, SendMessages, and Logout pass through untouched. An empty Register
+/// body passes through to fail the typed login decode. A malformed result
+/// section maps to `InvalidCommand` rather than decoding a rejection as `Ok`.
 fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, IggyError> {
     // Register (login/register) replies are result-framed too, so a transient
     // login decodes to `TransientNotCommitted` and the SDK replays it. The one
@@ -359,12 +318,14 @@ mod tests {
     use super::*;
     use crate::session::ConsensusSession;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE, SEND_MESSAGES_CODE,
+        CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::consensus::NON_REPLICATED_CODE_RANGE;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
     use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName, WireOptions};
+    use iggy_common::calculate_checksum;
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
@@ -450,19 +411,21 @@ mod tests {
 
     #[test]
     fn reply_with_nonzero_status_surfaces_as_typed_error() {
-        // A dispatch-time authorization denial rides `ReplyHeader.status`; the
-        // decode funnel surfaces it as the typed error before any body decode,
-        // even though the deny body is empty.
-        let header = ReplyHeader {
-            command: Command::Reply,
-            size: HEADER_SIZE as u32,
-            status: IggyError::Unauthorized.as_code(),
-            ..Default::default()
-        };
-        let mut buf = [0u8; HEADER_SIZE];
-        buf.copy_from_slice(bytemuck::bytes_of(&header));
-        let result = decode_response_split(&buf, Bytes::new());
-        assert!(matches!(result, Err(IggyError::Unauthorized)));
+        for error in [IggyError::Unauthorized, IggyError::RequestTooOld] {
+            let header = ReplyHeader {
+                command: Command::Reply,
+                operation: Operation::SendMessages,
+                size: HEADER_SIZE as u32,
+                status: error.as_code(),
+                ..Default::default()
+            };
+            let mut buffer = [0u8; HEADER_SIZE];
+            buffer.copy_from_slice(bytemuck::bytes_of(&header));
+            assert!(
+                matches!(decode_response_split(&buffer, Bytes::new()), Err(result) if result == error),
+                "an empty denial body must preserve {error}"
+            );
+        }
     }
 
     #[test]
@@ -500,12 +463,9 @@ mod tests {
     }
 
     #[test]
-    fn request_checksum_is_stamped_only_for_deduped_operations() {
-        // The stamp exists to stop a reused `request` number matching a dedup
-        // entry recorded for different bytes, so it is worth its hashing pass only
-        // where `ClientTable` dedups. Partition ops are the large payloads and
-        // already carry `batch_checksum` over the same bytes; NonReplicated ops
-        // bypass dedup. Neither stamps.
+    fn request_checksum_is_stamped_for_metadata_but_not_partition_operations() {
+        // Metadata dedup compares the stamp against cached replies. Partition
+        // dedup checks request ids without stamps; NonReplicated bypasses dedup.
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let payload = Bytes::from_static(b"payload");

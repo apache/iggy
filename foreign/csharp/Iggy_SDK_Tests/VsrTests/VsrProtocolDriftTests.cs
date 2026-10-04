@@ -96,6 +96,7 @@ public sealed class VsrProtocolDriftTests
         Assert.Equal(VsrHeader.SIZE_OFFSET, offsets["size"]);
         Assert.Equal(VsrHeader.COMMAND_OFFSET, offsets["command"]);
         Assert.Equal(VsrHeader.REPLY_OPERATION_OFFSET, offsets["operation"]);
+        Assert.Equal(VsrHeader.REPLY_COMMIT_OFFSET, offsets["commit"]);
         Assert.Equal(VsrHeader.REPLY_STATUS_OFFSET, offsets["status"]);
 
         Assert.DoesNotContain("namespace", offsets.Keys);
@@ -158,9 +159,10 @@ public sealed class VsrProtocolDriftTests
         var declared = Regex.Match(manifest, @"^version\s*=\s*""(\d+)\.(\d+)\.(\d+)", RegexOptions.Multiline);
 
         Assert.True(declared.Success, "iggy_binary_protocol no longer declares a semver version.");
+        // Patch releases never change the wire and the server accepts any patch of its own major.minor,
+        // so the patch is not pinned.
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MAJOR, Group(declared, 1));
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MINOR, Group(declared, 2));
-        Assert.Equal(LoginRegister.PROTOCOL_VERSION_PATCH, Group(declared, 3));
     }
 
     /// <summary>

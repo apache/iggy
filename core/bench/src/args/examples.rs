@@ -15,176 +15,223 @@
 // specific language governing permissions and limitations
 // under the License.
 
-const EXAMPLES: &str = r#"EXAMPLES:
+const EXAMPLES: &str = r"EXAMPLES:
 
-1) Pinned Mode Benchmarking:
+Start iggy-server separately. The benchmark connects to a running server.
+Global options precede the kind, kind options precede the transport, and
+transport options precede the optional output subcommand.
 
-    Run benchmarks with pinned producers and consumers. This mode pins specific producers
-    and consumers to specific streams and partitions (one to one):
+Default producer and consumer counts are six. Pinned workloads default to six streams.
+
+1) All benchmark kinds and aliases:
+
+    Pinned producer (pp), consumer (pc), and producer/consumer (ppc):
 
     $ cargo r -r --bin iggy-bench -- pinned-producer --streams 10 --producers 10 tcp
     $ cargo r -r --bin iggy-bench -- pinned-consumer --streams 10 --consumers 10 tcp
     $ cargo r -r --bin iggy-bench -- pinned-producer-and-consumer --streams 10 --producers 10 --consumers 10 tcp
-    $ cargo r -r --bin iggy-bench -- -T 10GB pp --producers 5 tcp
 
-2) Balanced Mode Benchmarking:
-
-    Run benchmarks with balanced distribution of producers and consumers. This mode
-    automatically balances the load across streams and consumer groups:
+    Balanced producer (bp), consumer group (bcg), and producer/consumer group (bpcg):
 
     $ cargo r -r --bin iggy-bench -- balanced-producer --partitions 24 --producers 6 tcp
     $ cargo r -r --bin iggy-bench -- balanced-consumer-group --consumers 6 tcp
     $ cargo r -r --bin iggy-bench -- balanced-producer-and-consumer-group --partitions 24 --producers 6 --consumers 6 tcp
-    $ cargo r -r --bin iggy-bench -- -T 10GB bpc tcp
+    $ cargo r -r --bin iggy-bench -- --total-data 10GiB bpcg tcp
 
-    Durability-matched run, where every produce ack waits for an fsync
-    (--partitions 1 routes every producer straight to that partition):
+    End-to-end producing consumer (e2e) and producing consumer group (e2ecg):
 
-    $ cargo r -r --bin iggy-bench -- --enforce-fsync --messages-required-to-save 1 \
-        balanced-producer --partitions 1 --producers 8 tcp
+    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer --producing-consumers 12 --streams 12 tcp
+    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer-group --partitions 24 --producers 6 --consumers 6 tcp
 
-3) End-to-End Benchmarking:
+2) All transports:
 
-    Run end-to-end benchmarks that measure performance for a producer that is also a consumer:
+    $ cargo r -r --bin iggy-bench -- pinned-producer tcp --server-address 127.0.0.1:8090
+    $ cargo r -r --bin iggy-bench -- pinned-producer quic --server-address 127.0.0.1:8080
+    $ cargo r -r --bin iggy-bench -- pinned-producer http --server-address 127.0.0.1:3000
+    $ cargo r -r --bin iggy-bench -- pinned-producer websocket --server-address 127.0.0.1:8092
 
-    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer --producers 12 --streams 12 tcp
-    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer-group --partitions 24 --producers 6 tcp
+3) Topic durability:
 
-4) Advanced Configuration:
+    --durability controls message completion.
+    --consumer-offset-durability controls explicit offset-store/delete completion.
+    Both independently default to replicated. Neither inherits the other.
+    Both policies normally write to disk. Persisted additionally waits for
+    recoverable stable storage on the required VSR quorum, or the single replica.
 
-    You can customize various parameters for any benchmark mode:
+    Both replicated (the default):
+    $ cargo r -r --bin iggy-bench -- balanced-producer-and-consumer-group tcp
 
-    Global options (before the benchmark command):
-    --messages-per-batch (-P): Number of messages per batch [default: 1000]
-                               For random batch sizes, use range format: "100..1000"
-    --message-batches (-b): Total number of batches [default: 1000]
-    --total-messages-size (-T): Total size of messages to send (e.g., "1GB", "500MB")
-                                Mutually exclusive with --message-batches
-    --message-size (-m): Message size in bytes [default: 1000]
-                        For random sizes, use range format: "100..1000"
-    --rate-limit (-r): Optional throughput limit per producer (e.g., "50KB", "10MB")
-    --warmup-time (-w): Warmup duration [default: 0s]
-    --sampling-time (-t): Metrics sampling interval [default: 10ms]
-    --moving-average-window (-W): Window size for moving average [default: 20]
-    --username (-u): Username for server authentication [default: iggy]
-    --password (-p): Password for server authentication [default: iggy]
-    --reuse-streams: Reuse existing bench streams instead of deleting them
+    Persisted messages, replicated offsets:
+    $ cargo r -r --bin iggy-bench -- --durability persisted balanced-producer-and-consumer-group tcp
 
-    Benchmark-specific options (after the benchmark command):
-    --streams (-s): Number of streams
-    --partitions (-a): Number of partitions
-    --producers (-c): Number of producers
-    --consumers (-c): Number of consumers
-    --max-topic-size (-T): Max topic size (e.g., "1GiB")
-    --message-expiry (-e): Topic message expiry time (e.g., "1s", "5min", "1h")
+    Replicated messages, persisted offsets:
+    $ cargo r -r --bin iggy-bench -- --consumer-offset-durability persisted balanced-producer-and-consumer-group tcp
 
-    Examples with detailed configuration:
+    Both persisted:
+    $ cargo r -r --bin iggy-bench -- --durability persisted --consumer-offset-durability persisted balanced-producer-and-consumer-group tcp
 
-    # Fixed message and batch sizes:
-    $ cargo r -r --bin iggy-bench -- \
-        --message-size 1000 \
-        --messages-per-batch 100 \
-        --message-batches 1000 \
-        --rate-limit "100MB" \
-        balanced-producer \
-        --streams 5 \
-        --producers 5 \
-        tcp
+    These options apply when topics are created. They do not modify topics
+    with --reuse-streams. Consumer polling with auto-commit remains asynchronous.
+    Its poll latency is not an acknowledged offset-store latency measurement.
+    In replicated groups, either persisted policy enables a WAL that also retains
+    message predecessors, even when message durability is replicated.
 
-    # Random message sizes (100-1000 bytes):
-    $ cargo r -r --bin iggy-bench -- \
-        --message-size "100..1000" \
-        --messages-per-batch 100 \
-        --total-messages-size "1GB" \
-        balanced-producer \
-        --streams 5 \
-        --producers 5 \
-        tcp
+4) Topic flush cadence and retention:
 
-    # Random batch sizes (10-100 messages per batch):
-    $ cargo r -r --bin iggy-bench -- \
-        --message-size 1000 \
-        --messages-per-batch "10..100" \
-        --total-messages-size "500MB" \
-        balanced-producer \
-        --streams 5 \
-        --producers 5 \
-        tcp
+    --messages-required-to-save is a global create-time topic option.
+    It controls segment flush cadence, not the acknowledgment guarantee.
+    --max-topic-size and --message-expiry are kind-specific topic options.
+    These flags do not change existing topics with --reuse-streams.
 
-    # Random message and batch sizes with rate limiting:
-    $ cargo r -r --bin iggy-bench -- \
-        --message-size "500..2000" \
-        --messages-per-batch "50..200" \
-        --total-messages-size "2GB" \
-        --rate-limit "50MB" \
-        balanced-producer \
-        --streams 5 \
-        --producers 5 \
-        tcp
+    Persisted messages without forcing a segment flush for every message:
+    $ cargo r -r --bin iggy-bench -- --durability persisted --messages-required-to-save 1024 balanced-producer --partitions 1 --producers 8 tcp
 
-5) Remote Server Benchmarking:
+    Replicated acknowledgments with eager segment flushing:
+    $ cargo r -r --bin iggy-bench -- --messages-required-to-save 1 balanced-producer tcp
 
-    To benchmark a remote server, specify the server address in the transport subcommand.
-    Both IP addresses and hostnames are supported:
+    Retention can delete data during a long run. Use matching policies when comparing:
+    $ cargo r -r --bin iggy-bench -- balanced-producer --max-topic-size 10GiB --message-expiry 1h tcp
 
-    $ cargo r -r --bin iggy-bench -- pinned-producer \
-        --streams 5 --producers 5 \
-        tcp --server-address 192.168.1.100:8090
-    $ cargo r -r --bin iggy-bench -- pinned-producer \
-        --streams 5 --producers 5 \
-        tcp --server-address localhost:8090
+5) Workload configuration:
 
-    With custom credentials:
+    --messages-per-batch (-P): Messages per batch, or a range such as 100..1000.
+    --message-batches (-b): Batches per actor, mutually exclusive with --total-data.
+    --total-data (-T): Total message bytes across actors, such as 10GiB.
+    --message-size (-m): Message bytes, or a range such as 100..1000.
+    --rate-limit (-r): Aggregate throughput limit across actors, such as 100MB.
+    --warmup-time (-w): Warmup duration, such as 10s.
+    --sampling-time (-t): Metrics sampling interval.
+    --moving-average-window (-W): Moving-average window size.
 
-    $ cargo r -r --bin iggy-bench -- \
-        --username admin --password secret \
-        pinned-producer --streams 5 --producers 5 \
-        tcp --server-address 192.168.1.100:8090
+    Fixed message and batch sizes:
+    $ cargo r -r --bin iggy-bench -- --message-size 1000 --messages-per-batch 100 --message-batches 1000 --rate-limit 100MB balanced-producer --streams 5 --producers 5 tcp
 
-6) Output Data and Results:
+    Random message sizes:
+    $ cargo r -r --bin iggy-bench -- --message-size 100..1000 --messages-per-batch 100 --total-data 1GiB balanced-producer --streams 5 --producers 5 tcp
 
-    The benchmark tool can store detailed results for analysis and comparison:
+    Random batch sizes:
+    $ cargo r -r --bin iggy-bench -- --message-size 1000 --messages-per-batch 10..100 --total-data 500MiB balanced-producer tcp
 
-    # Basic result storage (results will be stored in ./performance_results):
-    $ cargo r -r --bin iggy-bench -- pinned-producer --streams 10 --producers 10 tcp output
+    Random message and batch sizes with a warmup and aggregate rate limit:
+    $ cargo r -r --bin iggy-bench -- --message-size 500..2000 --messages-per-batch 50..200 --total-data 2GiB --warmup-time 10s --rate-limit 50MB balanced-producer tcp
 
+6) Remote server and output:
 
-    # Organized benchmarking with metadata:
-    $ cargo r -r --bin iggy-bench -- balanced-producer --partitions 24 --producers 6 tcp \
-        output \
-        --identifier "prod-test-$(date +%Y%m%d)" \
-        --remark "production-config" \
-        --gitref "$(git rev-parse --short HEAD)" \
-        --gitref-date "$(git show -s --format=%cI HEAD)"
+    $ cargo r -r --bin iggy-bench -- pinned-producer --streams 5 --producers 5 tcp --server-address localhost:8090
+    $ cargo r -r --bin iggy-bench -- --username admin --password secret pinned-producer tcp --server-address 192.168.1.100:8090
+    $ cargo r -r --bin iggy-bench -- pinned-producer tcp output
+    $ cargo r -r --bin iggy-bench -- --durability persisted balanced-producer tcp output --identifier dedicated-host --remark persisted-messages --gitref abc123
+    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer tcp output --open-charts
 
-    # Quick result visualization:
-    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer --producers 12 --streams 12 tcp \
-        output --open-charts
+    Output options include --output-dir (-o), --identifier, --remark, --gitref,
+    --gitref-date, --extra-info, and --open-charts (-c).
+    Record both durability policies, CPU allocation, host tuning, and storage.
+    See core/bench/README.md and https://iggy.apache.org/docs/server/linux-tuning.
 
-    Output configuration options:
-    --open-charts (-c)  : Open charts after the benchmark
-    --output-dir (-o)   : Directory for storing results [default: performance_results]
-    --identifier        : Benchmark run ID (if not provided defaults to hostname)
-    --remark            : Additional context (e.g., "production-config")
-    --extra-info        : Custom metadata for future analysis, currently unused
+7) Help:
 
-7) Help and Documentation:
-
-    For more details on available options:
-
-    # General help
     $ cargo r -r --bin iggy-bench -- --help
-
-    # Specific benchmark help
     $ cargo r -r --bin iggy-bench -- pinned-producer --help
-
-    # Protocol help
     $ cargo r -r --bin iggy-bench -- pinned-producer tcp --help
-
-    # Output help
     $ cargo r -r --bin iggy-bench -- pinned-producer tcp output --help
-"#;
+";
 
 pub fn print_examples() {
     println!("{EXAMPLES}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EXAMPLES;
+    use crate::args::common::IggyBenchArgs;
+    use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
+    use iggy::prelude::Durability;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn published_examples_parse_and_cover_every_kind_and_transport() {
+        let mut kinds = BTreeSet::new();
+        let mut transports = BTreeSet::new();
+        for command in EXAMPLES.lines().filter_map(|line| {
+            line.trim()
+                .strip_prefix("$ cargo r -r --bin iggy-bench -- ")
+        }) {
+            let arguments = std::iter::once("iggy-bench").chain(command.split_ascii_whitespace());
+            match IggyBenchArgs::command().try_get_matches_from(arguments) {
+                Ok(matches) => {
+                    let (kind, options) = matches.subcommand().unwrap();
+                    kinds.insert(kind.to_owned());
+                    transports.insert(options.subcommand_name().unwrap().to_owned());
+                    IggyBenchArgs::from_arg_matches(&matches)
+                        .unwrap()
+                        .validate();
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::DisplayHelp, "{command}: {error}");
+                }
+            }
+        }
+        let command = IggyBenchArgs::command();
+        for kind in command
+            .get_subcommands()
+            .filter(|kind| kind.get_name() != "examples")
+        {
+            assert!(
+                kinds.contains(kind.get_name()),
+                "missing kind {}",
+                kind.get_name()
+            );
+        }
+        let producer = command.find_subcommand("pinned-producer").unwrap();
+        for transport in producer.get_subcommands() {
+            assert!(
+                transports.contains(transport.get_name()),
+                "missing transport {}",
+                transport.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_and_its_alias_use_the_same_canonical_name() {
+        for name in ["websocket", "ws"] {
+            let parsed =
+                IggyBenchArgs::try_parse_from(["iggy-bench", "pinned-producer", name]).unwrap();
+            assert_eq!(parsed.transport_command().as_str(), "websocket");
+        }
+    }
+
+    #[test]
+    fn durability_defaults_are_independent() {
+        for (flags, messages, offsets) in [
+            (vec![], Durability::Replicated, Durability::Replicated),
+            (
+                vec!["--durability", "persisted"],
+                Durability::Persisted,
+                Durability::Replicated,
+            ),
+            (
+                vec!["--consumer-offset-durability", "persisted"],
+                Durability::Replicated,
+                Durability::Persisted,
+            ),
+            (
+                vec![
+                    "--durability",
+                    "persisted",
+                    "--consumer-offset-durability",
+                    "persisted",
+                ],
+                Durability::Persisted,
+                Durability::Persisted,
+            ),
+        ] {
+            let arguments = std::iter::once("iggy-bench")
+                .chain(flags)
+                .chain(["balanced-producer-and-consumer-group", "tcp"]);
+            let parsed = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            assert_eq!(parsed.durability, messages);
+            assert_eq!(parsed.consumer_offset_durability, offsets);
+        }
+    }
 }

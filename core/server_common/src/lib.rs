@@ -22,10 +22,12 @@ mod consensus_message;
 pub mod crypto;
 pub mod diagnostics;
 pub mod executor;
+pub mod fatal;
 pub mod fs_utils;
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
+pub mod poll;
 mod reactor_yield;
 mod segment_storage;
 pub mod send_messages;
@@ -43,7 +45,5 @@ pub use consensus_message::{
 pub use executor::create_shard_executor;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
 pub use reactor_yield::yield_to_reactor;
-pub use segment_storage::{
-    IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
-};
+pub use segment_storage::{IndexReader, MessagesReader, SegmentStorage};
 pub use storage::Storage;

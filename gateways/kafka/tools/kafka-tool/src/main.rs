@@ -26,6 +26,7 @@ use kafka_protocol::messages::delete_topics_request::*;
 use kafka_protocol::messages::describe_configs_request::*;
 use kafka_protocol::messages::fetch_request::*;
 use kafka_protocol::messages::join_group_request::*;
+use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
 use kafka_protocol::messages::offset_commit_request::*;
 use kafka_protocol::messages::produce_request::*;
@@ -365,9 +366,16 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("OffsetFetch")?;
         }
         10 => {
-            FindCoordinatorRequest::default()
-                .with_key(StrBytes::from_static_str("test-group"))
-                .with_key_type(0)
+            let key = StrBytes::from_static_str("test-group");
+            let request = FindCoordinatorRequest::default().with_key_type(0);
+            // v4 replaced the single key with `coordinator_keys`; the encoder refuses whichever
+            // field the version does not carry.
+            let request = if version >= 4 {
+                request.with_coordinator_keys(vec![key])
+            } else {
+                request.with_key(key)
+            };
+            request
                 .encode(&mut buf, version)
                 .context("FindCoordinator")?;
         }
@@ -394,11 +402,17 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("Heartbeat")?;
         }
         13 => {
-            LeaveGroupRequest::default()
-                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
-                .with_member_id(StrBytes::from_static_str("test-member-1"))
-                .encode(&mut buf, version)
-                .context("LeaveGroup")?;
+            let member_id = StrBytes::from_static_str("test-member-1");
+            let request = LeaveGroupRequest::default()
+                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")));
+            // v3 replaced the top-level member id with an identities array; the encoder refuses
+            // whichever field the version does not carry.
+            let request = if version >= 3 {
+                request.with_members(vec![MemberIdentity::default().with_member_id(member_id)])
+            } else {
+                request.with_member_id(member_id)
+            };
+            request.encode(&mut buf, version).context("LeaveGroup")?;
         }
         14 => {
             SyncGroupRequest::default()
@@ -862,4 +876,41 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use kafka_protocol::protocol::Decodable;
+
+    use super::*;
+
+    /// A version the gateway advertises but this tool cannot build leaves the fixture-backed
+    /// suites without a fixture, which `KAFKA_FIXTURES_REQUIRED=1` turns into a CI failure.
+    #[test]
+    fn given_every_gateway_scoped_version_should_build_a_request() {
+        for (api_key, name, min_version, max_version) in gateway_verify_registry() {
+            for version in min_version..=max_version {
+                assert!(
+                    build_framed(api_key, version, 1).is_ok(),
+                    "{name} v{version} must build"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_leave_group_from_v3_should_carry_the_member_in_the_identities_array() {
+        for version in 3..=5 {
+            let mut payload = build_payload(13, version).expect("LeaveGroup builds");
+            let request = LeaveGroupRequest::decode(&mut payload, version).expect("decodes");
+
+            assert!(request.member_id.is_empty(), "v{version}");
+            assert_eq!(request.members.len(), 1, "v{version}");
+            assert_eq!(
+                request.members[0].member_id.as_str(),
+                "test-member-1",
+                "v{version}"
+            );
+        }
+    }
 }

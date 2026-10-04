@@ -42,18 +42,18 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			wantValue: []byte{0, 0, 0, 64, 0, 0, 0, 0},
 		},
 		{
-			name:      "enforce fsync on",
-			entry:     EnforceFsyncOption(true),
-			wantKey:   "enforce_fsync",
-			wantKind:  Bool,
-			wantValue: []byte{1},
+			name:      "persisted message durability",
+			entry:     DurabilityOption(DurabilityPersisted),
+			wantKey:   "durability",
+			wantKind:  String,
+			wantValue: []byte("persisted"),
 		},
 		{
-			name:      "enforce fsync off",
-			entry:     EnforceFsyncOption(false),
-			wantKey:   "enforce_fsync",
-			wantKind:  Bool,
-			wantValue: []byte{0},
+			name:      "replicated message durability",
+			entry:     DurabilityOption(DurabilityReplicated),
+			wantKey:   "durability",
+			wantKind:  String,
+			wantValue: []byte("replicated"),
 		},
 		{
 			name:      "messages required to save",
@@ -99,7 +99,7 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			if !bytes.Equal(test.entry.Value.Value, test.wantValue) {
 				t.Errorf("value = %v, want %v", test.entry.Value.Value, test.wantValue)
 			}
-			if expected := test.wantKind.ExpectedSize(); len(test.entry.Value.Value) != expected {
+			if expected := test.wantKind.ExpectedSize(); test.wantKind != String && len(test.entry.Value.Value) != expected {
 				t.Errorf("value length = %d, want %d for kind %d",
 					len(test.entry.Value.Value), expected, test.wantKind)
 			}
@@ -110,7 +110,7 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 func TestTopicOptions_ConstructorEntriesSurviveTheHeaderCodec(t *testing.T) {
 	entries := []HeaderEntry{
 		SegmentSizeOption(1 << 20),
-		EnforceFsyncOption(true),
+		DurabilityOption(DurabilityPersisted),
 		MessagesRequiredToSaveOption(7),
 		SizeOfMessagesRequiredToSaveOption(4096),
 		PreallocateSegmentsOption(false),

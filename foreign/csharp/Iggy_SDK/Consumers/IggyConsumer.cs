@@ -129,12 +129,21 @@ public partial class IggyConsumer : IAsyncDisposable
             }
         }
 
-        if (_config.CreateIggyClient && _isInitialized)
+        if (_config.CreateIggyClient)
         {
             try
             {
-                await _client.LogoutUserAsync();
-                _client.Dispose();
+                try
+                {
+                    if (_isInitialized)
+                    {
+                        await _client.LogoutUserAsync();
+                    }
+                }
+                finally
+                {
+                    _client.Dispose();
+                }
             }
             catch (Exception e)
             {
@@ -231,8 +240,8 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="resetLastPolled">
-    ///     When true, also advances the cached last-polled offset for the partition so the next poll
-    ///     resumes past the stored offset.
+    ///     When true, changes the cached duplicate-filter offset for the partition.
+    ///     Does not change the polling strategy or clear buffered messages.
     /// </param>
     /// <param name="ct">Cancellation token</param>
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
@@ -248,7 +257,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>
     ///     Deletes the stored consumer offset for a specific partition.
-    ///     The next poll will start from the beginning or based on the polling strategy.
+    ///     The local duplicate filter, polling strategy, and buffered messages remain unchanged.
     /// </summary>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="ct">Cancellation token</param>

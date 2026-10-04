@@ -263,7 +263,7 @@ export class IggyConnection extends EventEmitter {
    *
    * @returns Promise that resolves when connected
    */
-  connect(): Promise<this> {
+  connect(boundDial = false): Promise<this> {
     if (this.ending)
       return Promise.reject(new Error('connection is closed'));
     if (this.connected)
@@ -282,7 +282,7 @@ export class IggyConnection extends EventEmitter {
     // hold it with no timer of its own and the redial pass would never start.
     const connectPromise = this._dialWithin(
       socket,
-      this._redialCandidates().length > 1
+      boundDial || this._redialCandidates().length > 1
     );
     this.connectPromise = connectPromise;
     const clearConnectPromise = () => {

@@ -90,7 +90,12 @@ internal static class MockFrames
     }
 }
 
-internal readonly record struct MockRequest(byte Operation, int Code, ulong RequestId);
+internal readonly record struct MockRequest(byte Operation, int Code, ulong RequestId)
+{
+    internal UInt128 ClientId { get; init; }
+    internal ulong Session { get; init; }
+    internal byte[] Body { get; init; } = [];
+}
 
 /// <summary>
 ///     A loopback VSR node. Killing it drops the live sockets and stops accepting, so a redial is refused the
@@ -206,7 +211,12 @@ internal sealed class MockNode : IDisposable
 
                 var request = new MockRequest(header[REQUEST_OPERATION_OFFSET],
                     BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(REQUEST_RESERVED_OFFSET, 4)),
-                    BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(REQUEST_ID_OFFSET, 8)));
+                    BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(REQUEST_ID_OFFSET, 8)))
+                {
+                    ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(128)),
+                    Session = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(184)),
+                    Body = body
+                };
                 lock (_recorded)
                 {
                     _recorded.Add(request);

@@ -96,18 +96,16 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
                 BigInteger.ZERO,
                 BigInteger.ZERO,
                 "options-topic",
-                Map.of("enforce_fsync", HeaderValue.fromString("true")));
+                Map.of("durability", HeaderValue.fromString("persisted")));
 
         // then
         var topic = topicsClient.getTopic(STREAM_NAME, TopicId.of(created.id())).orElseThrow();
-        // Asserted through the string rendering rather than the kind: the binary
-        // transport reports the key's canonical Bool while REST renders values as
-        // strings, and both mean the same setting.
-        assertThat(topic.options()).containsKey("enforce_fsync");
-        assertThat(topic.options().get("enforce_fsync").toStringValue()).isEqualTo("true");
+        // Both transports preserve the canonical durability token.
+        assertThat(topic.options()).containsKey("durability");
+        assertThat(topic.options().get("durability").toStringValue()).isEqualTo("persisted");
         // Keys the client left alone are resolved by admission and reported apart.
         assertThat(topic.derivedOptions()).containsKey("max_topic_size");
-        assertThat(topic.derivedOptions()).doesNotContainKey("enforce_fsync");
+        assertThat(topic.derivedOptions()).doesNotContainKey("durability");
     }
 
     @Test

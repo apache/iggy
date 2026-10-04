@@ -103,7 +103,7 @@ pub async fn write_current_config(
         node.ports.http = bound_ports.http.or(node.ports.http);
     }
 
-    let runtime_path = current_config.system.get_runtime_path();
+    let runtime_path = current_config.get_runtime_path();
     let config_path = format!("{runtime_path}/current_config.toml");
     let content = toml::to_string(&current_config).map_err(ServerError::CurrentConfigSerialize)?;
 

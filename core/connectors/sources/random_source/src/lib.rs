@@ -91,12 +91,12 @@ impl RandomSource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
-    fn generate_messages(&self, remaining: Option<usize>) -> Vec<ProducedMessage> {
+    fn generate_messages(&self, remaining: Option<usize>) -> Result<Vec<ProducedMessage>, Error> {
         let mut messages = Vec::new();
         let mut rng = rand::rng();
-        let messages_count = rng
-            .sample(Uniform::new(self.messages_range.0, self.messages_range.1).unwrap())
-            as usize;
+        let distribution = Uniform::new(self.messages_range.0, self.messages_range.1)
+            .map_err(|error| Error::InvalidConfigValue(format!("messages_range: {error}")))?;
+        let messages_count = rng.sample(distribution) as usize;
         let messages_count =
             remaining.map_or(messages_count, |remaining| messages_count.min(remaining));
         for _ in 0..messages_count {
@@ -124,7 +124,7 @@ impl RandomSource {
             };
             messages.push(message);
         }
-        messages
+        Ok(messages)
     }
 
     fn generate_random_text(&self) -> String {
@@ -171,7 +171,7 @@ impl Source for RandomSource {
         let remaining = self
             .max_count
             .map(|max_count| max_count.saturating_sub(messages_produced));
-        let messages = self.generate_messages(remaining);
+        let messages = self.generate_messages(remaining)?;
         let candidate_state = State {
             messages_produced: messages_produced + messages.len(),
         };
@@ -231,6 +231,25 @@ mod tests {
             max_count: Some(100),
             messages_range: Some((5, 10)),
             payload_size: Some(50),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_non_increasing_message_ranges_when_polling_should_return_config_error() {
+        for messages_range in [(0, 0), (5, 5), (10, 5)] {
+            let mut config = test_config();
+            config.messages_range = Some(messages_range);
+            let source = RandomSource::new(1, config, None);
+            let error = source
+                .poll()
+                .await
+                .expect_err("an invalid range must return an error instead of panicking");
+            assert!(
+                matches!(error, Error::InvalidConfigValue(ref reason) if reason.contains("messages_range")),
+                "range {messages_range:?} returned the wrong error: {error:?}"
+            );
+            assert_eq!(source.state.lock().await.messages_produced, 0);
+            assert!(source.pending_state.lock().await.is_none());
         }
     }
 

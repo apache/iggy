@@ -37,8 +37,7 @@ namespace {
 std::string required_env(const char *name) {
     const char *value = std::getenv(name);
     if (value == nullptr || *value == '\0') {
-        throw std::runtime_error(std::string(name) +
-                                 " must be set; run the suite via scripts/run-bdd-tests.sh");
+        throw std::runtime_error(std::string(name) + " must be set; run the suite via scripts/run-bdd-tests.sh");
     }
     return std::string(value);
 }

@@ -36,7 +36,7 @@ use crate::dispatch::failure::{
     FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
-use crate::responses::{
+use crate::reply_frame::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
 };
 use crate::session_manager::{ClientSdkInfo, SessionManager};
@@ -107,12 +107,7 @@ where
         return Err(LoginRegisterError::InvalidCredentials);
     }
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let user = users
-            .index
-            .get(username)
-            .copied()
-            .and_then(|user_id| users.items.get(user_id as usize));
-        let Some(user) = user else {
+        let Some(user) = users.user_by_name(username) else {
             // Constant-cost path: verify against a dummy hash so a missing
             // username is indistinguishable by response timing from a wrong
             // password (both return InvalidCredentials).
@@ -421,10 +416,10 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
             break;
         }
         // Production-only wall clock: the heartbeat verifier is spawned solely
-        // by `build_shard_for_thread`, never by the simulator's
-        // `wire_shell_handlers`, so neither the interval wait above nor this
-        // read is on a deterministic path. Driving this task under the
-        // deterministic executor means routing both through the injected clock.
+        // by `build_shard_for_thread`, never by the simulator's shell mode, so
+        // neither the interval wait above nor this read is on a deterministic
+        // path. Driving this task under the deterministic executor means
+        // routing both through the injected clock.
         let stale = sessions
             .borrow()
             .collect_stale(max_age, std::time::Instant::now());
@@ -1059,7 +1054,7 @@ pub(in crate::dispatch) fn submit_disconnect_logout<B, MJ, S, SB>(
             warn!(
                 vsr_client_id,
                 ?error,
-                "disconnect logout submit failed; peer slots may linger until eviction"
+                "disconnect logout submit failed; consumer-group cleanup will retry after session expiry"
             );
         }
     });
@@ -1471,8 +1466,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-                enforce_fsync: false,
-                consumer_offset_enforce_fsync: false,
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,

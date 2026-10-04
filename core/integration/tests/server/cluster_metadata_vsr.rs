@@ -45,7 +45,7 @@ use crate::server::http_client::{HttpClient, LOGIN_RETRY_INTERVAL, LOGIN_TIMEOUT
 /// where the metadata consensus that marks the leader lives. A request
 /// round-robined to a peer shard would still get the full roster but with no
 /// leader marked, since peer shards run no consensus.
-#[iggy_harness(cluster_nodes = 2, server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(cluster_nodes = 2, server(sharding.cpu_allocation = "0..1"))]
 async fn given_two_node_cluster_when_getting_cluster_metadata_should_return_full_roster(
     harness: &TestHarness,
 ) {

@@ -353,10 +353,9 @@ pub(in crate::http) fn error_response(status: StatusCode, code: &str, reason: &s
         .into_response()
 }
 
-/// Shared 504 rendering for an in-band request the partition plane did not
-/// answer in time, shaped like every other HTTP error (`ErrorResponse`) so
-/// clients parse one error schema. Consumed by the partition-write reply wait,
-/// the partition reads ([`ReadError::Timeout`]), and the forward attempt bound.
+/// Shared 504 rendering for partition writes and forwarding attempts that did
+/// not answer in time. Partition reads use [`ReadError::Timeout`] to preserve
+/// the same Iggy error identity as binary transports.
 pub(in crate::http) fn gateway_timeout_response(code: &str, reason: &str) -> Response {
     error_response(StatusCode::GATEWAY_TIMEOUT, code, reason)
 }
@@ -479,9 +478,9 @@ pub(in crate::http) enum ReadError {
     /// refusal (`TransientNotCommitted`) already renders as, so an SDK that
     /// speaks both sees one answer. Never a 2xx with stale state.
     MetadataFrontierUnreached,
-    /// A partition read (poll / consumer-offset) got no reply from the owning
-    /// shard within the mesh budget. 504 like a produce timeout: the outcome is
-    /// unknown (the abandoned read may still be running), so the caller retries.
+    /// A partition read got no reply after submission to the owning shard.
+    /// Render HTTP 504 with the same Iggy error identity as binary transports.
+    /// A missing reply does not prove that the owner rejected the read.
     Timeout,
 }
 
@@ -495,10 +494,13 @@ impl IntoResponse for ReadError {
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
             Self::RecoveryIncomplete | Self::MetadataFrontierUnreached => service_unavailable(),
-            Self::Timeout => gateway_timeout_response(
-                "partition_read_timeout",
-                "the partition owner did not answer the read in time; retry",
-            ),
+            Self::Timeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResponse::from_error(
+                    &IggyError::ShardCommunicationError,
+                )),
+            )
+                .into_response(),
         }
     }
 }
@@ -596,7 +598,9 @@ fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ResolvedC
 mod tests {
     use super::*;
 
+    use axum::body::to_bytes;
     use configs::cluster::{ClusterNodeConfig, TransportPorts};
+    use serde_json::Value;
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
@@ -772,6 +776,32 @@ mod tests {
         let response = CustomError::from(IggyError::TransientNotAccepted).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn partition_read_timeout_renders_504_with_shard_communication_error() {
+        let response = ReadError::Timeout.into_response();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], 11001);
+        assert_eq!(error["code"], "shard_communication_error");
+    }
+
+    #[tokio::test]
+    async fn rejected_partition_read_renders_503_with_transient_not_accepted() {
+        let response = ReadError::Rejected(IggyError::TransientNotAccepted).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(RETRY_AFTER_SECONDS))
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], 58);
+        assert_eq!(error["code"], "transient_not_accepted");
     }
 
     #[test]

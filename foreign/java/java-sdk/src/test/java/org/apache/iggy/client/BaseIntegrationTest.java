@@ -88,7 +88,7 @@ public abstract class BaseIntegrationTest {
                     .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:" + TCP_PORT)
                     .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:" + HTTP_PORT)
                     .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", LOCALHOST_IP)
-                    .withEnv("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION", "all")
+                    .withEnv("IGGY_SHARDING_CPU_ALLOCATION", "all")
                     .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                             .withCapAdd(Capability.SYS_NICE)
                             .withSecurityOpts(List.of("seccomp:unconfined"))

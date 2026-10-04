@@ -20,7 +20,6 @@ using System.Text;
 using Apache.Iggy;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
-using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Iggy_SDK.Examples.Shared;
@@ -38,29 +37,11 @@ public static class Utils
 
     public static async Task InitSystem(IIggyClient client, ILogger logger)
     {
-        try
-        {
-            await client.CreateStreamAsync("message-envelope-example-stream");
-            logger.LogInformation("Stream was created.");
-        }
-        catch (InvalidResponseException)
-        {
-            logger.LogWarning("Stream already exists and will not be created again.");
-        }
-
-        try
-        {
-            await client.CreateTopicAsync(
-                Identifier.String(StreamName),
-                "message-envelope-example-topic",
-                1
-            );
-            logger.LogInformation("Topic was created.");
-        }
-        catch (InvalidResponseException)
-        {
-            logger.LogWarning("Topic already exists and will not be created again.");
-        }
+        var streamId = Identifier.String(StreamName);
+        var topicId = Identifier.String(TopicName);
+        await ExampleHelpers.EnsureStreamExists(client, streamId, StreamName);
+        await ExampleHelpers.EnsureTopicExists(client, streamId, topicId, TopicName, 1);
+        logger.LogInformation("Stream and topic are ready.");
     }
 
     public static async Task ProduceMessages(IIggyClient client, ILogger logger)

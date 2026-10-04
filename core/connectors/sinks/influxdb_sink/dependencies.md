@@ -40,8 +40,8 @@ to `cargo tree -p iggy_connector_influxdb_sink` for the full graph.
 | `async-trait` | `^0.1.89` | MIT / Apache-2.0 | Proc-macro that enables `async fn` in trait definitions; required by the `Sink` trait impl in `lib.rs`. |
 | `base64` | `^0.22.1` | MIT / Apache-2.0 | Encodes raw message payloads as base64 when `payload_format = "base64"` is configured. Uses `Engine::encode_string` to write directly into the line-protocol output buffer with no intermediate allocation. |
 | `bytes` | `^1.11.1` | MIT | Zero-copy `Bytes::from(body.into_bytes())` converts the line-protocol string body into the request body sent to InfluxDB's write endpoint without an extra copy. |
-| `iggy_common` | `^0.10.1-edge.1` | Apache-2.0 | Shared Iggy types: `serde_secret` for safe token serialisation in config structs. |
-| `iggy_connector_sdk` | `^0.3.1-edge.1` | Apache-2.0 | Core connector abstractions: `Sink` trait, `ConsumedMessage`, `MessagesMetadata`, `TopicMetadata`, `Error`, retry/circuit-breaker utilities, and the `sink_connector!` registration macro. |
+| `iggy_common` | `^0.11.0` | Apache-2.0 | Shared Iggy types: `serde_secret` for safe token serialisation in config structs. |
+| `iggy_connector_sdk` | `^0.5.0` | Apache-2.0 | Core connector abstractions: `Sink` trait, `ConsumedMessage`, `MessagesMetadata`, `TopicMetadata`, `Error`, retry/circuit-breaker utilities, and the `sink_connector!` registration macro. |
 | `reqwest` | `^0.13.3` | MIT / Apache-2.0 | Async HTTP client used to POST line-protocol batches to `/api/v2/write` (V2) and `/api/v3/write_lp` (V3). |
 | `reqwest-middleware` | `^0.5.1` | MIT | Middleware wrapper around `reqwest::Client` that attaches the retry and tracing layers built by `iggy_connector_sdk::retry::build_retry_client`. |
 | `secrecy` | `^0.10` | MIT / Apache-2.0 | `SecretString` / `SecretBox` wrappers that prevent accidental logging of API tokens in config structs and the `auth_header` field. |

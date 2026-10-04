@@ -26,7 +26,7 @@ under the License.
         <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
-        <Version>0.9.0-edge.8</Version>
+        <Version>0.9.1-edge.1</Version>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
     </PropertyGroup>
 
@@ -39,7 +39,7 @@ under the License.
         <RepositoryUrl>https://github.com/apache/iggy</RepositoryUrl>
         <PackageProjectUrl>https://github.com/apache/iggy</PackageProjectUrl>
         <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
-        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <PackageReadmeFile>README.nuget.md</PackageReadmeFile>
 
         <PublishRepositoryUrl>true</PublishRepositoryUrl>
         <IncludeSymbols>true</IncludeSymbols>
@@ -55,8 +55,8 @@ under the License.
     </PropertyGroup>
 
     <ItemGroup>
-        <None Include="../README.md" Pack="true" PackagePath="">
-            <Link>Properties/README.md</Link>
+        <None Include="../README.nuget.md" Pack="true" PackagePath="">
+            <Link>Properties/README.nuget.md</Link>
         </None>
         <None Include="../LICENSE" Pack="true" PackagePath="">
             <Link>Properties/LICENSE</Link>

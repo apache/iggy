@@ -228,7 +228,7 @@ class IggyPinotIntegrationTest {
                 .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:" + IGGY_TCP_PORT)
                 .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:" + IGGY_HTTP_PORT)
                 .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", IGGY_NETWORK_ALIAS)
-                .withEnv("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION", "all")
+                .withEnv("IGGY_SHARDING_CPU_ALLOCATION", "all")
                 .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                         .withCapAdd(Capability.SYS_NICE)
                         .withSecurityOpts(List.of("seccomp:unconfined"))

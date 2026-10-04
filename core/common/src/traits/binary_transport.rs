@@ -20,6 +20,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::WireEncode;
+use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use std::sync::Arc;
 
 #[async_trait]
@@ -30,18 +33,39 @@ pub trait BinaryTransport {
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    /// Route a store or delete offset request while retaining the membership connection.
+    async fn send_offset_write_with_response(
+        &self,
+        code: u32,
+        payload: Bytes,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_response(code, payload).await
+    }
+    /// Transports may route an auto-commit poll without moving the connection
+    /// that owns consumer-group membership.
+    async fn send_poll_with_response(
+        &self,
+        request: &PollMessagesRequest,
+    ) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
+            .await
+    }
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
-    /// partitioning client-side under VSR (the broker never picks a
-    /// partition). Shared via `Arc` so a refresh task can hold it.
+    /// partitioning client-side under VSR. Shared via `Arc` so a refresh task can hold it.
     fn consumer_group_state(&self) -> Arc<crate::ConsumerGroupClientState>;
 }
 
-/// Sealed marker. Downstream crates cannot implement
-/// [`VsrSessionControl`] because they cannot name
-/// `vsr_session_sealed::Sealed`. The session-mutation methods stay
-/// in-crate so only the SDK's login/logout flows can call them.
+/// Separate opt-in marker for session control. Exported as `VsrSessionSealed`
+/// so the SDK crate and external transport implementations can implement it;
+/// this does not restrict implementations to this crate.
 mod vsr_session_sealed {
     pub trait Sealed {}
 }
@@ -73,6 +97,8 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// ran: the configured credentials still decide *who* the client signs in
     /// as, and a committed change decides what that user's password is.
     async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
+    /// Keep auxiliary logins and reconnects working after the session user is renamed.
+    async fn refresh_session_username(&self, _user: &Identifier, _new_username: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.

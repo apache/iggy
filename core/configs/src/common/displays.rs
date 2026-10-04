@@ -21,12 +21,8 @@ use super::server::{
 };
 use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    system::{
-        EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig, StreamConfig,
-        SystemConfig, TopicConfig,
-    },
+    system::{EncryptionConfig, LoggingConfig},
 };
-use configs::ConfigEnvMappings;
 use std::fmt::{Display, Formatter};
 
 impl Display for HttpConfig {
@@ -110,7 +106,11 @@ impl Display for MessagesMaintenanceConfig {
 
 impl Display for ConsumerGroupConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ rebalancing_timeout: {} }}", self.rebalancing_timeout)
+        write!(
+            f,
+            "{{ rebalancing_timeout: {}, session_timeout: {}, heartbeat_interval: {} }}",
+            self.rebalancing_timeout, self.session_timeout, self.heartbeat_interval
+        )
     }
 }
 
@@ -130,46 +130,19 @@ impl Display for EncryptionConfig {
     }
 }
 
-impl Display for StreamConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for TopicConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for PartitionConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, validate_checksum: {} }}",
-            self.path, self.validate_checksum
-        )
-    }
-}
-
-impl Display for SegmentConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ archive_expired: {} }}", self.archive_expired,)
-    }
-}
-
 impl Display for LoggingConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, level: {}, file_enabled: {}, max_file_size: {}, max_total_size: {}, rotation_check_interval: {}, retention: {} }}",
+            "{{ path: {}, level: {}, file_enabled: {}, max_file_size: {}, max_total_size: {}, rotation_check_interval: {}, retention: {}, sysinfo_print_interval: {} }}",
             self.path,
             self.level,
             self.file_enabled,
             self.max_file_size.as_human_string_with_zero_as_unlimited(),
             self.max_total_size.as_human_string_with_zero_as_unlimited(),
             self.rotation_check_interval,
-            self.retention
+            self.retention,
+            self.sysinfo_print_interval
         )
     }
 }
@@ -200,22 +173,6 @@ impl Display for TelemetryTracesConfig {
             f,
             "{{ transport: {}, endpoint: {} }}",
             self.transport, self.endpoint
-        )
-    }
-}
-
-impl<S: ConfigEnvMappings> Display for SystemConfig<S> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {} }}",
-            self.path,
-            self.logging,
-            self.stream,
-            self.topic,
-            self.partition,
-            self.segment,
-            self.encryption,
         )
     }
 }

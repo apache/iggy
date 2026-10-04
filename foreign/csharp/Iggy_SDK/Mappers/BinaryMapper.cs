@@ -37,6 +37,7 @@ internal static class BinaryMapper
     private const int MEMBER_HEADER_SIZE = 8;
     private const int CONSUMER_GROUP_INFO_SIZE = 12;
     private const int CACHE_METRICS_ENTRY_SIZE = 32;
+    private const int OPEN_FILES_FIELDS_SIZE = 8 + 8;
     private const int MIN_TOPIC_SIZE = 50 + 4 + 4;
     private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 4 + 4;
     private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
@@ -1188,6 +1189,23 @@ internal static class BinaryMapper
         var totalDiskSpace = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
         position += 8;
 
+        ulong openFilesCount = 0;
+        ulong openFilesLimit = 0;
+        // Servers that predate the open files fields end the reply at total_disk_space.
+        if (position < payload.Length)
+        {
+            if (payload.Length - position < OPEN_FILES_FIELDS_SIZE)
+            {
+                throw new MalformedResponseException(
+                    $"Stats open files fields at byte {position} are truncated.");
+            }
+
+            openFilesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
+            position += 8;
+            openFilesLimit = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
+            position += 8;
+        }
+
         return new StatsResponse
         {
             ProcessId = processId,
@@ -1217,7 +1235,9 @@ internal static class BinaryMapper
             CacheMetrics = cacheMetricsList,
             ThreadsCount = threadsCount,
             FreeDiskSpace = freeDiskSpace,
-            TotalDiskSpace = totalDiskSpace
+            TotalDiskSpace = totalDiskSpace,
+            OpenFilesCount = openFilesCount,
+            OpenFilesLimit = openFilesLimit
         };
     }
 
@@ -1378,7 +1398,7 @@ internal static class BinaryMapper
         };
     }
 
-    private static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
+    internal static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
     {
         var name = ReadString(payload, ref position, "Cluster node name");
         var ip = ReadString(payload, ref position, "Cluster node ip");

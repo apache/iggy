@@ -188,6 +188,7 @@ class IggyErrorCodeTest {
         "82, INVALID_NUMBER_ENCODING",
         "83, INVALID_BOOLEAN_VALUE",
         "84, INVALID_NUMBER_VALUE",
+        "85, REQUEST_TOO_OLD",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",
@@ -211,6 +212,7 @@ class IggyErrorCodeTest {
         "2016, INVALID_TOPIC_ID",
         "2018, INVALID_REPLICATION_FACTOR",
         "2021, TOO_MANY_TOPICS",
+        "2022, PARTITIONS_LIMIT_REACHED",
 
         // Partition errors
         "3007, PARTITION_NOT_FOUND",

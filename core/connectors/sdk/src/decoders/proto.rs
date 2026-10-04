@@ -83,39 +83,39 @@ impl ProtoStreamDecoder {
     }
 
     pub fn update_config(&mut self, config: ProtoConfig, reload_schema: bool) -> Result<(), Error> {
-        self.config = config;
-        if reload_schema
-            && (self.config.schema_path.is_some() || self.config.descriptor_set.is_some())
-        {
-            self.load_schema()
-        } else {
-            Ok(())
+        let old_config = std::mem::replace(&mut self.config, config);
+        if reload_schema && let Err(error) = self.load_schema() {
+            self.config = old_config;
+            return Err(error);
         }
+        Ok(())
     }
 
     pub fn load_schema(&mut self) -> Result<(), Error> {
         let schema_path = self.config.schema_path.clone();
         let descriptor_set = self.config.descriptor_set.clone();
 
-        if let Some(path) = schema_path {
-            self.compile_schema_internal(&path)?;
+        let old_message_descriptor = self.message_descriptor.take();
+        let old_file_descriptor_set = self.file_descriptor_set.take();
+        let result = if let Some(path) = schema_path {
+            self.compile_schema_internal(&path)
         } else if let Some(descriptor_bytes) = descriptor_set {
-            self.load_descriptor_set_internal(&descriptor_bytes)?;
+            self.load_descriptor_set_internal(&descriptor_bytes)
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.message_descriptor = old_message_descriptor;
+            self.file_descriptor_set = old_file_descriptor_set;
         }
-        Ok(())
+        result
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
         info!("Compiling protobuf schema from: {:?}", schema_path);
 
-        let proto_content = match fs::read_to_string(schema_path) {
-            Ok(content) => content,
-            Err(e) => {
-                error!("Failed to read proto file: {}", e);
-                error!("Falling back to Any wrapper mode");
-                return Ok(());
-            }
-        };
+        let proto_content = fs::read_to_string(schema_path)
+            .map_err(|error| Error::InitError(format!("Failed to read proto file: {error}")))?;
 
         let parsed_file = parse(&schema_path.to_string_lossy(), &proto_content)
             .map_err(|e| Error::InitError(format!("Failed to parse proto file: {e}")))?;
@@ -149,12 +149,9 @@ impl ProtoStreamDecoder {
                 self.file_descriptor_set = Some(file_descriptor_set);
                 Ok(())
             }
-            Err(e) => {
-                error!("Failed to compile proto schema: {}", e);
-                error!("Falling back to Any wrapper mode");
-
-                Ok(())
-            }
+            Err(error) => Err(Error::InitError(format!(
+                "Failed to compile proto schema: {error}"
+            ))),
         }
     }
 
@@ -197,23 +194,24 @@ impl ProtoStreamDecoder {
         package: &str,
     ) -> Option<prost_types::DescriptorProto> {
         let parent_name = parent_message.name.as_deref().unwrap_or("");
-
-        let package_prefix = if package.is_empty() {
-            String::new()
+        let parent_prefix = if package.is_empty() {
+            parent_name.to_string()
         } else {
-            format!("{package}.")
+            format!("{package}.{parent_name}")
         };
 
         for nested_message in &parent_message.nested_type {
             let nested_name = nested_message.name.as_deref().unwrap_or("");
-            let full_name = format!("{package_prefix}{parent_name}.{nested_name}");
+            let full_name = format!("{parent_prefix}.{nested_name}");
 
             if full_name == target_type {
                 info!("Found nested message descriptor: {}", full_name);
                 return Some(nested_message.clone());
             }
 
-            if let Some(deeper) = self.find_nested_message(nested_message, target_type, package) {
+            if let Some(deeper) =
+                self.find_nested_message(nested_message, target_type, &parent_prefix)
+            {
                 return Some(deeper);
             }
         }
@@ -369,6 +367,22 @@ impl ProtoStreamDecoder {
         Err(Error::InvalidProtobufPayload)
     }
 
+    fn parse_fixed_integer(
+        data: &[u8],
+        cursor: usize,
+        wire_type: u8,
+    ) -> Result<(u64, usize), Error> {
+        let width = match wire_type {
+            1 => size_of::<u64>(),
+            5 => size_of::<u32>(),
+            _ => return Err(Error::InvalidProtobufPayload),
+        };
+        let end_cursor = Self::length_delimited_end(cursor, width as u64, data.len())?;
+        let mut bytes = [0; size_of::<u64>()];
+        bytes[..width].copy_from_slice(&data[cursor..end_cursor]);
+        Ok((u64::from_le_bytes(bytes), end_cursor))
+    }
+
     fn decode_field_value(
         &self,
         data: &[u8],
@@ -384,15 +398,31 @@ impl ProtoStreamDecoder {
                     Type::Bool => {
                         simd_json::OwnedValue::Static(simd_json::StaticNode::Bool(value != 0))
                     }
-                    Type::Int32 | Type::Sint32 | Type::Sfixed32 => {
-                        simd_json::OwnedValue::from(value as i32)
+                    Type::Int32 | Type::Sfixed32 => simd_json::OwnedValue::from(value as i32),
+                    Type::Int64 | Type::Sfixed64 => simd_json::OwnedValue::from(value as i64),
+                    Type::Sint32 => {
+                        let value = value as u32;
+                        simd_json::OwnedValue::from(((value >> 1) as i32) ^ -((value & 1) as i32))
                     }
-                    Type::Int64 | Type::Sint64 | Type::Sfixed64 => {
-                        simd_json::OwnedValue::from(value as i64)
+                    Type::Sint64 => {
+                        simd_json::OwnedValue::from(((value >> 1) as i64) ^ -((value & 1) as i64))
                     }
                     Type::Uint32 | Type::Fixed32 => simd_json::OwnedValue::from(value as u32),
                     Type::Uint64 | Type::Fixed64 => simd_json::OwnedValue::from(value),
                     _ => simd_json::OwnedValue::from(value),
+                };
+                Ok((json_value, new_cursor))
+            }
+            1 | 5 => {
+                let (value, new_cursor) = Self::parse_fixed_integer(data, cursor, wire_type)?;
+                let json_value = match (wire_type, field_desc.r#type()) {
+                    (1, Type::Double) => simd_json::OwnedValue::from(f64::from_bits(value)),
+                    (1, Type::Fixed64) => simd_json::OwnedValue::from(value),
+                    (1, Type::Sfixed64) => simd_json::OwnedValue::from(value as i64),
+                    (5, Type::Float) => simd_json::OwnedValue::from(f32::from_bits(value as u32)),
+                    (5, Type::Fixed32) => simd_json::OwnedValue::from(value as u32),
+                    (5, Type::Sfixed32) => simd_json::OwnedValue::from(value as u32 as i32),
+                    _ => simd_json::OwnedValue::String("unsupported_wire_type".into()),
                 };
                 Ok((json_value, new_cursor))
             }
@@ -445,6 +475,10 @@ impl ProtoStreamDecoder {
                 let (value, new_cursor) = self.parse_simple_varint(data, cursor)?;
                 Ok((simd_json::OwnedValue::from(value), new_cursor))
             }
+            1 | 5 => {
+                let (_, new_cursor) = Self::parse_fixed_integer(data, cursor, wire_type)?;
+                Ok((simd_json::OwnedValue::String("unknown".into()), new_cursor))
+            }
             2 => {
                 let (length, mut new_cursor) = self.parse_simple_varint(data, cursor)?;
                 let end_cursor = Self::length_delimited_end(new_cursor, length, data.len())?;
@@ -463,6 +497,10 @@ impl ProtoStreamDecoder {
         match wire_type {
             0 => {
                 let (_, new_cursor) = self.parse_simple_varint(data, cursor)?;
+                Ok(new_cursor)
+            }
+            1 | 5 => {
+                let (_, new_cursor) = Self::parse_fixed_integer(data, cursor, wire_type)?;
                 Ok(new_cursor)
             }
             2 => {
@@ -672,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn load_schema_should_handle_missing_proto_file_gracefully() {
+    fn given_missing_proto_file_when_loading_schema_should_return_error() {
         let mut decoder = ProtoStreamDecoder::new(ProtoConfig {
             schema_path: Some(PathBuf::from("nonexistent.proto")),
             message_type: Some("com.example.Test".to_string()),
@@ -681,10 +719,7 @@ mod tests {
 
         let result = decoder.load_schema();
 
-        assert!(
-            result.is_ok(),
-            "Should handle missing proto file gracefully"
-        );
+        assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
     }
 
     #[test]
@@ -735,21 +770,26 @@ mod tests {
     }
 
     #[test]
-    fn update_config_should_reload_schema_when_requested() {
+    fn given_valid_schema_when_updating_config_should_decode_with_reloaded_schema() {
         let mut decoder = ProtoStreamDecoder::new(ProtoConfig::default());
 
         let new_config = ProtoConfig {
-            schema_path: Some(PathBuf::from("schemas/test.proto")),
-            message_type: Some("com.example.Test".to_string()),
+            schema_path: Some(PathBuf::from("examples/user.proto")),
+            message_type: Some("com.example.User".to_string()),
             use_any_wrapper: false,
             ..ProtoConfig::default()
         };
 
-        let result = decoder.update_config(new_config.clone(), true);
-        assert!(result.is_ok());
-        assert_eq!(decoder.config.schema_path, new_config.schema_path);
-        assert_eq!(decoder.config.message_type, new_config.message_type);
-        assert_eq!(decoder.config.use_any_wrapper, new_config.use_any_wrapper);
+        decoder
+            .update_config(new_config, true)
+            .expect("reload user schema");
+        let Payload::Json(decoded) = decoder
+            .decode(42i32.encode_to_vec())
+            .expect("decode user id")
+        else {
+            panic!("expected reloaded schema");
+        };
+        assert_eq!(decoded, simd_json::json!({"id": 42}));
     }
 
     #[test]

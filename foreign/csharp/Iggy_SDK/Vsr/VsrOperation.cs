@@ -71,8 +71,7 @@ internal static class VsrOperations
 
     /// <summary>
     ///     Non-replicated codes this build knows to leave no server-side state behind, so re-sending one after a
-    ///     lost connection is indistinguishable from sending it once. Flushing an unsaved buffer is included: it
-    ///     is idempotent by construction, a second flush writes nothing new.
+    ///     lost connection is indistinguishable from sending it once.
     /// </summary>
     private static readonly HashSet<int> NonReplicatedReadCodes =
     [
@@ -86,7 +85,6 @@ internal static class VsrOperations
         CommandCodes.GET_USER_CODE,
         CommandCodes.GET_USERS_CODE,
         CommandCodes.GET_PERSONAL_ACCESS_TOKENS_CODE,
-        CommandCodes.FLUSH_UNSAVED_BUFFER_CODE,
         CommandCodes.GET_CONSUMER_OFFSET_CODE,
         CommandCodes.GET_STREAM_CODE,
         CommandCodes.GET_STREAMS_CODE,
@@ -94,7 +92,8 @@ internal static class VsrOperations
         CommandCodes.GET_TOPICS_CODE,
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
-        CommandCodes.SYNC_CONSUMER_GROUP_CODE
+        CommandCodes.SYNC_CONSUMER_GROUP_CODE,
+        CommandCodes.GET_POLL_ROUTING_CODE
     ];
 
     /// <summary>
@@ -177,7 +176,7 @@ internal static class VsrOperations
 
         // A poll that auto-commits moves the consumer offset server-side, so a reply lost after the commit
         // would make the replay start past a batch the caller never saw. auto_commit is the last body byte.
-        if (code == CommandCodes.POLL_MESSAGES_CODE)
+        if (code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE)
         {
             return body.Length > 0 && body[^1] == 0;
         }

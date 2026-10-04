@@ -29,6 +29,7 @@
 //! for reading the log back, where it is the more honest observer.
 
 use bytes::{Bytes, BytesMut};
+use consensus::client_table::COMMITTED_WINDOW_BITS;
 use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
@@ -69,7 +70,7 @@ const REPLY_WAIT: Duration = Duration::from_secs(10);
 const COMMIT_BUDGET: Duration = Duration::from_secs(20);
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_committed_send_when_replayed_should_absorb_without_a_second_copy(
     harness: &mut TestHarness,
 ) {
@@ -102,7 +103,7 @@ async fn given_committed_send_when_replayed_should_absorb_without_a_second_copy(
     );
 }
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_committed_send_when_next_request_id_arrives_should_admit_it(
     harness: &mut TestHarness,
 ) {
@@ -128,7 +129,7 @@ async fn given_committed_send_when_next_request_id_arrives_should_admit_it(
     assert_eq!(polled, 3, "each distinct request id must append once");
 }
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_gapped_request_id_when_sent_should_commit(harness: &mut TestHarness) {
     // One client counter feeds every group it writes to, so a slice only ever
     // sees a subset of the ids minted. Gaps must be legal, not a wedge.
@@ -152,7 +153,7 @@ async fn given_gapped_request_id_when_sent_should_commit(harness: &mut TestHarne
     assert_eq!(polled, 3, "a gapped id is new, not a duplicate");
 }
 
-#[iggy_harness(server(system.sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
 async fn given_committed_consumer_offset_when_replayed_should_absorb(harness: &mut TestHarness) {
     // Dedup covers every replicated partition write, not just produces. A
     // replayed offset store must answer success rather than committing twice.
@@ -211,7 +212,7 @@ const WRITER_CLIENT_BASE: u128 = 0x0DED_C0DE_0000;
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.prepare_queue_depth = "4"
     )
 )]
@@ -299,6 +300,9 @@ const TOTAL_SENDS: u64 = TESTED_CLIENT_SENDS + FILLER_SENDS;
 /// Replayed id: the tested client's watermark itself. Absorbing it requires an
 /// entry for that client, which only the transferred artifact can supply.
 const REPLAYED_REQUEST: u64 = TESTED_CLIENT_SENDS;
+/// The newest id the window has aged out: exactly one window width below the
+/// watermark.
+const AGED_OUT_REQUEST: u64 = REPLAYED_REQUEST - COMMITTED_WINDOW_BITS;
 
 /// Filler identity whose sends evict the tested client from the repair ring.
 const FILLER_CLIENT_ID: u128 = 0x0DED_F111_E400;
@@ -315,7 +319,7 @@ const DISCONNECTED: u32 = u32::MAX - 1;
 #[iggy_harness(
     cluster_nodes = 3,
     server(
-        system.sharding.cpu_allocation = "0..1",
+        sharding.cpu_allocation = "0..1",
         partition.evicted_ring_capacity = "64"
     )
 )]
@@ -389,6 +393,13 @@ async fn given_transferred_dedup_slice_when_old_request_replays_should_absorb(
     assert_eq!(
         replayed, 0,
         "a replay of a transferred watermark is absorbed as a success"
+    );
+
+    let aged_out = send_reconnecting(addr, CLIENT_ID, AGED_OUT_REQUEST, FINAL_COMMIT_BUDGET).await;
+    assert_eq!(
+        aged_out,
+        IggyError::RequestTooOld.as_code(),
+        "the transferred window must reject an aged-out request with an unknown outcome"
     );
 
     // The count is the discriminator: an absorbed replay leaves it at

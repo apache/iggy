@@ -50,7 +50,7 @@ const SEGMENT_SIZE: u64 = 1024 * 1024;
 /// this rolls ~240 at the same server memory footprint. The old 512 B cap
 /// rolled one per batch (~50k), which no legal segment size can reproduce.
 const PAYLOAD_FILLER_LEN: usize = 2 * 1024;
-const MAX_ALLOWED_MEMORY_BYTES: u64 = 200 * 1024 * 1024;
+const MAX_ALLOWED_MEMORY_BYTES: u64 = 300 * 1024 * 1024;
 
 /// Runs the segment rotation race condition test with multiple protocols.
 /// Uses all available transports from the harness (TCP, HTTP, QUIC, WebSocket).

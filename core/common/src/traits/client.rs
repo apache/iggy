@@ -26,7 +26,7 @@ use std::fmt::Debug;
 
 /// The client trait which is the main interface to the Iggy server.
 /// It consists of multiple modules, each of which is responsible for a specific set of commands.
-/// Except the ping, login and get me, all the other methods require authentication.
+/// Server operations require authentication, except ping and the login flows.
 #[async_trait]
 pub trait Client:
     ClusterClient
@@ -51,7 +51,12 @@ pub trait Client:
     /// Disconnect from the server. If the client is not connected, it will do nothing.
     async fn disconnect(&self) -> Result<(), IggyError>;
 
-    // Shutdown the client and release all the resources.
+    /// Shut down the client and release all the resources. Repeated calls are safe.
+    ///
+    /// On TCP, QUIC and WebSocket, shutdown is final: `connect()` and every later
+    /// request fail with `IggyError::ClientShutdown`, and a later `disconnect()`
+    /// does not make the client usable again. HTTP keeps no connection, so there
+    /// this call does nothing.
     async fn shutdown(&self) -> Result<(), IggyError>;
 
     /// Subscribe to diagnostic events.

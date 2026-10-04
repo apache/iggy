@@ -32,11 +32,18 @@ import {
 } from './client.connection.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
+import { deserializeNode } from '../wire/cluster/cluster.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
+import { serializeIdentifier } from '../wire/identifier.utils.js';
+import {
+  Command, HEADER_SIZE, REPLY_OFFSET, peekCommand, readReplyOperation, readStatus
+} from '../wire/vsr/header.js';
+import { Operation, isKnownOperation } from '../wire/vsr/operation.js';
 import {
   decodeVsrResponse,
   prepareVsrCommand,
   readRegisteredSession,
+  readWireName,
   VsrEvictionError,
   VsrSession,
 } from '../wire/vsr/index.js';
@@ -49,6 +56,25 @@ const LEADERLESS_POLL_INTERVAL_MS = 250;
 const MAX_LEADER_REDIRECTS = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
+const UNAUTHENTICATED = 40;
+const STALE_CLIENT = 30;
+const FEATURE_UNAVAILABLE = 5;
+const MAX_POLL_ROUTES = 4096;
+const MAX_POLL_CONNECTIONS = 256;
+const CONSUMER_SESSION_SIZE = 32;
+const METADATA_WATERMARK_OFFSET = 24;
+const POLL_OPTIONS_SIZE = 9 + 4 + 1;
+
+type PollRoute = {
+  endpoint: Endpoint,
+  attachment: Buffer,
+};
+
+type PollConnection = {
+  client: CommandResponseStream,
+  attachment?: Buffer,
+  busy?: Promise<void>,
+};
 /**
  * How long a `TRANSIENT_NOT_ACCEPTED` request replays on the same connection
  * before the roster is re-read. A node that stopped being primary refuses
@@ -181,6 +207,12 @@ export class CommandResponseStream extends EventEmitter {
   heartbeatIntervalHandler?: NodeJS.Timeout;
   /** Whether a heartbeat ping is still awaiting its response */
   private heartbeatInFlight: boolean;
+  private rememberedCredentials?: ClientCredentials;
+  private clustered?: boolean;
+  private metadataWatermark = 0n;
+  private routingGeneration = 0;
+  private pollRoutes = new Map<string, PollRoute>();
+  private pollConnections = new Map<string, PollConnection>();
 
   /**
    * Creates a new CommandResponseStream.
@@ -282,12 +314,30 @@ export class CommandResponseStream extends EventEmitter {
         last = true,
         followsLeaderMoves = true
       } = options;
+      const autoCommitPoll = command === COMMAND_CODE.PollMessages &&
+        payload.length > POLL_OPTIONS_SIZE && payload.at(-1) === 1;
+      const pollDeadline = autoCommitPoll
+        ? options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS
+        : undefined;
 
       if (!this.connection.connected)
-        await this.connection.connect()
+        await (pollDeadline === undefined ? this.connection.connect()
+          : withinDeadline(this.connection.connect(), pollDeadline));
 
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
-        await this.authenticate(this.options.credentials);
+        await (pollDeadline === undefined ? this.authenticate(this._signInCredentials())
+          : withinDeadline(this.authenticate(this._signInCredentials()), pollDeadline));
+
+      if (pollDeadline !== undefined) {
+        const deadline = pollDeadline;
+        if (this.clustered === undefined)
+          await withinDeadline(this.sendCommand(GET_CLUSTER_METADATA.code,
+            GET_CLUSTER_METADATA.serialize(), { deadline, followsLeaderMoves: false }), deadline);
+        if (this.clustered === undefined)
+          throw new Error('cannot determine the poll routing topology');
+        if (this.clustered)
+          return await this._pollOnPrimary(payload, deadline, handleResponse);
+      }
 
       // The roster read is itself a queued command and the queue is
       // single-flighted, so the leader re-check cannot happen inside
@@ -370,7 +420,7 @@ export class CommandResponseStream extends EventEmitter {
           // command fails client-side, a non-replicated one goes out with
           // session 0.
           if (!this.isAuthenticated && !this.isUnloggedCommand(command))
-            await this.authenticate(this.options.credentials);
+            await this.authenticate(this._signInCredentials());
         }
       }
       if (!isLoginCommand(command) || this.settlingLeader)
@@ -519,6 +569,9 @@ export class CommandResponseStream extends EventEmitter {
   private _rememberRoster(response: CommandResponse): void {
     try {
       const metadata = GET_CLUSTER_METADATA.deserialize(response);
+      if (metadata.nodes.length === 0)
+        return;
+      this.clustered = metadata.nodes.length > 1;
       this.connection.rememberRoster(
         metadata.nodes
           .filter((node) => node.endpoints.tcp !== 0)
@@ -528,6 +581,211 @@ export class CommandResponseStream extends EventEmitter {
       debug('an unreadable roster leaves the redial candidates as they are',
         error);
     }
+  }
+
+  private async _pollOnPrimary(
+    payload: Buffer,
+    deadline: number,
+    handleResponse: boolean
+  ): Promise<CommandResponse> {
+    const key = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
+    while (Date.now() < deadline && !this.connection.ending) {
+      try {
+        const generation = this.routingGeneration;
+        let route = this.pollRoutes.get(key);
+        if (!route ||
+            route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
+              this.metadataWatermark) {
+          const response = await withinDeadline(
+            this._pollRoutingControl(payload, deadline), deadline);
+          if (generation !== this.routingGeneration)
+            throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+          if (response.data.length < CONSUMER_SESSION_SIZE)
+            throw new Error('poll routing response is incomplete');
+          const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE);
+          if (node.length + CONSUMER_SESSION_SIZE !== response.data.length || !node.data.ip)
+            throw new Error('poll routing response has no valid TCP endpoint');
+          if (node.data.endpoints.tcp === 0)
+            throw responseError(COMMAND_CODE.PollMessages, FEATURE_UNAVAILABLE);
+          const attachment = Buffer.from(response.data.subarray(0, CONSUMER_SESSION_SIZE));
+          if (attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) < this.metadataWatermark)
+            attachment.writeBigUInt64LE(this.metadataWatermark, METADATA_WATERMARK_OFFSET);
+          route = {
+            endpoint: { host: node.data.ip, port: node.data.endpoints.tcp },
+            attachment
+          };
+          if (this.pollRoutes.size >= MAX_POLL_ROUTES)
+            this.pollRoutes.clear();
+          this.pollRoutes.set(key, route);
+        }
+
+        const endpoint = endpointKey(route.endpoint);
+        let entry = this.pollConnections.get(endpoint);
+        if (!entry) {
+          if (this.pollConnections.size >= MAX_POLL_CONNECTIONS) {
+            const idle = Array.from(this.pollConnections).find(([, value]) => !value.busy);
+            if (!idle)
+              throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+            this.pollConnections.delete(idle[0]);
+            idle[1].client.destroy();
+          }
+          entry = {
+            client: new CommandResponseStream({
+              ...this.options,
+              options: { ...this.options.options, ...route.endpoint },
+              heartbeatInterval: 0,
+              reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+            })
+          };
+          this.pollConnections.set(endpoint, entry);
+        }
+        while (entry.busy)
+          await withinDeadline(entry.busy, deadline);
+        if (generation !== this.routingGeneration ||
+            this.pollConnections.get(endpoint) !== entry ||
+            route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
+              this.metadataWatermark)
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+
+        let release!: () => void;
+        entry.busy = new Promise<void>((resolve) => { release = resolve; });
+        let polling = false;
+        try {
+          if (!entry.client.isAuthenticated) {
+            entry.attachment = undefined;
+            await withinDeadline(entry.client.connection.connect(true), deadline,
+              () => entry.client.destroy());
+            const credentials = this._signInCredentials();
+            const login = 'token' in credentials ? LOGIN_WITH_TOKEN : LOGIN;
+            const loginPayload = 'token' in credentials
+              ? LOGIN_WITH_TOKEN.serialize(credentials)
+              : LOGIN.serialize(credentials);
+            await entry.client._queueCommand(login.code, loginPayload,
+              true, true, false, deadline);
+          }
+          if (!entry.attachment?.equals(route.attachment)) {
+            await entry.client._queueCommand(COMMAND_CODE.AttachConsumerSession,
+              route.attachment, true, true, false, deadline);
+            entry.attachment = route.attachment;
+          }
+          if (generation !== this.routingGeneration ||
+              route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
+                this.metadataWatermark)
+            throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+          polling = true;
+          return await entry.client._queueCommand(COMMAND_CODE.PollMessagesOnPrimary,
+            payload, handleResponse, true, false, deadline);
+        } catch (error) {
+          if (error instanceof ResponseError &&
+              error.errorCode === TRANSIENT_NOT_ACCEPTED) {
+            entry.attachment = undefined;
+          } else {
+            if (this.pollConnections.get(endpoint) === entry)
+              this.pollConnections.delete(endpoint);
+            entry.client.destroy();
+          }
+          if (!(error instanceof ResponseError) || error instanceof VsrEvictionError ||
+              error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT)
+            throw responseError(COMMAND_CODE.PollMessages,
+              polling ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
+          throw error;
+        } finally {
+          entry.busy = undefined;
+          release();
+        }
+      } catch (error) {
+        this.pollRoutes.delete(key);
+        if (error instanceof VsrResponseTimeoutError)
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_COMMITTED);
+        if (!(error instanceof ResponseError) ||
+            error.errorCode !== TRANSIENT_NOT_ACCEPTED)
+          throw error instanceof ResponseError
+            ? responseError(COMMAND_CODE.PollMessages, error.errorCode)
+            : error;
+        if (!worthAnotherAttempt(deadline))
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+        await delay(VSR_RETRY_INTERVAL_MS);
+      }
+    }
+    throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+  }
+
+  private async _pollRoutingControl(payload: Buffer, deadline: number): Promise<CommandResponse> {
+    const options = { deadline, followsLeaderMoves: false };
+    try {
+      return await this.sendCommand(COMMAND_CODE.GetPollRouting, payload, options);
+    } catch (error) {
+      if (error instanceof ResponseError &&
+          error.errorCode !== UNAUTHENTICATED && error.errorCode !== STALE_CLIENT)
+        throw error;
+      if (Date.now() >= deadline)
+        throw error;
+      // Only a failed coordinator exchange uses normal session recovery.
+      // A healthy coordinator refusing a route must retain its group membership.
+      if (error instanceof ResponseError) {
+        this.connection.abort();
+        this.connection.connected = false;
+        this._resetSession();
+      }
+      await this.sendCommand(PING.code, PING.serialize(), { deadline });
+      return this.sendCommand(COMMAND_CODE.GetPollRouting, payload, options);
+    }
+  }
+
+  private _observeMetadataReply(frame: Buffer): void {
+    if (frame.length < HEADER_SIZE || peekCommand(frame) !== Command.Reply)
+      return;
+    const operation = readReplyOperation(frame);
+    if (!isKnownOperation(operation) || operation === Operation.NonReplicated ||
+        operation === Operation.SendMessages || operation === Operation.StoreConsumerOffset ||
+        operation === Operation.DeleteConsumerOffset)
+      return;
+    const commit = frame.readBigUInt64LE(REPLY_OFFSET.commit);
+    if (commit > this.metadataWatermark)
+      this.metadataWatermark = commit;
+  }
+
+  private _rememberCredentials(command: number, payload: Buffer): void {
+    if (command === LOGIN.code) {
+      const username = readWireName(payload, 0);
+      this.rememberedCredentials = {
+        username: username.value, password: readWireName(payload, username.next).value
+      };
+    } else if (command === LOGIN_WITH_TOKEN.code) {
+      this.rememberedCredentials = { token: readWireName(payload, 0).value };
+    } else if ((command === COMMAND_CODE.ChangePassword || command === COMMAND_CODE.UpdateUser) &&
+        this.userId !== undefined && this.rememberedCredentials &&
+        'username' in this.rememberedCredentials) {
+      const credentials = this.rememberedCredentials;
+      const identifier = [serializeIdentifier(this.userId), serializeIdentifier(credentials.username)]
+        .find((encoded) => payload.subarray(0, encoded.length).equals(encoded));
+      if (!identifier)
+        return;
+      if (command === COMMAND_CODE.ChangePassword) {
+        const currentPassword = readWireName(payload, identifier.length);
+        const password = readWireName(payload, currentPassword.next).value;
+        this.rememberedCredentials = { ...credentials, password };
+        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
+          this.options.credentials = { ...this.options.credentials, password };
+      } else if (payload[identifier.length] === 1) {
+        const username = readWireName(payload, identifier.length + 1).value;
+        this.rememberedCredentials = { ...credentials, username };
+        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
+          this.options.credentials = { ...this.options.credentials, username };
+      }
+    }
+  }
+
+  private _signInCredentials(): ClientCredentials {
+    return this.rememberedCredentials ?? this.options.credentials;
+  }
+
+  private _clearPollRouting(): void {
+    this.routingGeneration += 1;
+    this.pollRoutes.clear();
+    for (const entry of this.pollConnections.values())
+      entry.client.destroy();
+    this.pollConnections.clear();
   }
 
   /**
@@ -653,14 +911,25 @@ export class CommandResponseStream extends EventEmitter {
         } finally {
           requestWritten ||= exchangeState.written;
         }
-        if (!handleResp)
+        this._observeMetadataReply(response);
+        if (!handleResp) {
+          // Routing still needs refusals when the caller decodes the frame.
+          if (command === COMMAND_CODE.PollMessagesOnPrimary &&
+              peekCommand(response) === Command.Reply &&
+              readStatus(response) === TRANSIENT_NOT_ACCEPTED)
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
           return response as unknown as CommandResponse;
+        }
         try {
           parsed = decodeVsrResponse(response, command);
           break;
         } catch (error) {
           if (!(error instanceof ResponseError) ||
               !isTransientVsrError(error.errorCode))
+            throw error;
+          if (command === COMMAND_CODE.PollMessagesOnPrimary ||
+              command === COMMAND_CODE.GetPollRouting ||
+              command === COMMAND_CODE.AttachConsumerSession)
             throw error;
           lastTransientError = error;
           // A not-admitted refusal is a statement about who leads, not about
@@ -689,7 +958,9 @@ export class CommandResponseStream extends EventEmitter {
         this.isAuthenticated = true;
         this.userId = parsed.data.readUInt32LE(0);
       }
+      this._rememberCredentials(command, payload);
       if (prepared.command === COMMAND_CODE.LogoutUser) {
+        this.rememberedCredentials = undefined;
         this._resetSession();
       }
       // Every roster read feeds the redial candidates, whoever asked for it
@@ -880,6 +1151,8 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private _resetSession(): void {
+    this._clearPollRouting();
+    this.clustered = undefined;
     if (!this.isAuthenticated &&
         this.userId === undefined &&
         !this.vsrSession.hasActivity)
@@ -1012,6 +1285,8 @@ export class CommandResponseStream extends EventEmitter {
    * Stops heartbeat and destroys the connection.
    */
   destroy() {
+    this.rememberedCredentials = undefined;
+    this._clearPollRouting();
     if (this.heartbeatIntervalHandler)
       clearInterval(this.heartbeatIntervalHandler);
     return this.connection._destroy();
@@ -1035,6 +1310,25 @@ const isLoginCommand = (command: number): boolean =>
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const withinDeadline = async <T>(
+  pending: Promise<T>, deadline: number, expired?: () => void
+): Promise<T> => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          expired?.();
+          reject(new VsrResponseTimeoutError(VSR_RESPONSE_TIMEOUT_MS));
+        }, Math.max(0, deadline - Date.now()));
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 const isTransientVsrError = (errorCode: number): boolean =>
   errorCode === TRANSIENT_NOT_COMMITTED ||

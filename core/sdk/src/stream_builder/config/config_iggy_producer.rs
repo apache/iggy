@@ -35,10 +35,9 @@ pub struct IggyProducerConfig {
     topic_name: String,
     /// Sets the number of partitions to create for the topic
     topic_partitions_count: u32,
-    /// Set the topic replication factor
-    /// The max number of messages to send in a batch. Must be greater than 0.
+    /// Maximum messages per direct-send request. Zero uses the SDK's maximum batch length.
     batch_length: u32,
-    /// Sets the interval between sending the messages, can be combined with `batch_length`.
+    /// Minimum gap between sequential direct sends, measured from the previous successful send.
     linger_time: IggyDuration,
     /// Specifies to which partition the messages should be sent.
     partitioning: Partitioning,

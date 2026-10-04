@@ -79,7 +79,7 @@ async fn given_a_client_producing_when_its_primary_is_killed_should_resume_witho
         partitions_count: Some(1),
         message_expiry: Some(IggyExpiry::NeverExpire),
         messages_required_to_save: Some(1),
-        enforce_fsync: Some(true),
+        durability: iggy_common::Durability::Persisted,
         ..TopicCreateOptions::default()
     };
     setup_client

@@ -31,4 +31,5 @@ mod partition_dedup;
 mod partition_primary_routing;
 mod partition_state_transfer;
 mod register_forwarding;
+mod replica_read_batching;
 mod staggered_bootstrap;

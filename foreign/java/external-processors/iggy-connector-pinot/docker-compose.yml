@@ -25,7 +25,7 @@ services:
       - "3000:3000"  # HTTP
       - "8080:8080"  # QUIC
     environment:
-      - IGGY_SYSTEM_LOGGING_LEVEL=info
+      - IGGY_LOGGING_LEVEL=info
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
       - IGGY_NODE_ADVERTISED_ADDRESS=iggy
       - IGGY_HTTP_ENABLED=true

@@ -14,12 +14,14 @@ _This is part of the Apache Iggy monorepo. For the main project, see the [root r
 
 ## Installation
 
+These examples target server **0.9.0**. SDK `0.9.0` is on Maven Central and works with server `0.9.0`. The older `0.8.0` artifact speaks the previous TCP protocol and does not work with server `0.9.0`. Java 17 or newer is required.
+
 Add the dependency to your project:
 
 **Gradle:**
 
 ```gradle
-implementation 'org.apache.iggy:iggy:0.6.0'
+implementation 'org.apache.iggy:iggy:0.9.0'
 ```
 
 **Maven:**
@@ -28,27 +30,28 @@ implementation 'org.apache.iggy:iggy:0.6.0'
 <dependency>
     <groupId>org.apache.iggy</groupId>
     <artifactId>iggy</artifactId>
-    <version>0.6.0</version>
+    <version>0.9.0</version>
 </dependency>
 ```
 
-Find the latest version on [Maven Repository](https://mvnrepository.com/artifact/org.apache.iggy/iggy).
+See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) for all published versions.
 
 ### Snapshot Versions
 
-Snapshot versions are also available through the ASF snapshot repository:
+Development builds of the next release carry the version `0.9.1-SNAPSHOT`. Get them from the ASF snapshot repository:
 
 **Gradle:**
 
 ```gradle
 repositories {
+    mavenCentral()
     maven {
         url = uri("https://repository.apache.org/content/repositories/snapshots/")
     }
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.6.1-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.9.1-SNAPSHOT'
 }
 ```
 
@@ -65,14 +68,20 @@ dependencies {
     </repository>
 </repositories>
 
-<dependency>
-    <groupId>org.apache.iggy</groupId>
-    <artifactId>iggy</artifactId>
-    <version>0.6.1-SNAPSHOT</version>
-</dependency>
+<dependencies>
+    <dependency>
+        <groupId>org.apache.iggy</groupId>
+        <artifactId>iggy</artifactId>
+        <version>0.9.1-SNAPSHOT</version>
+    </dependency>
+</dependencies>
 ```
 
 ## Quick Start
+
+`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It polls each partition through a separate connection to the primary of that partition.
+
+Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
 ### TCP Client (Blocking)
 
@@ -182,11 +191,41 @@ var client = Iggy.tcpClientBuilder()
     .buildAndLogin();
 ```
 
+### Event Loop Threads
+
+Each TCP client drives a single connection, so by default it creates an event loop group
+with one thread. An application that opens many clients can instead register them all on
+one caller-owned group. The clients never shut that group down. Close the clients first,
+then shut the group down:
+
+```java
+var group = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
+
+var producer = Iggy.tcpClientBuilder()
+    .blocking()
+    .eventLoopGroup(group)
+    .credentials("iggy", "iggy")
+    .buildAndLogin();
+var consumer = Iggy.tcpClientBuilder()
+    .blocking()
+    .eventLoopGroup(group)
+    .credentials("iggy", "iggy")
+    .buildAndLogin();
+
+// ... later
+producer.close();
+consumer.close();
+group.shutdownGracefully();
+```
+
+Do not block in a completion callback. Callbacks run on the group's loops, so a blocked
+callback stalls every client that shares the group.
+
 ### Version Information
 
 ```java
 // Get SDK version
-String version = Iggy.version();  // e.g., "0.6.1-SNAPSHOT"
+String version = Iggy.version();  // e.g., "0.9.0"
 
 // Get detailed version info
 IggyVersion info = Iggy.versionInfo();
@@ -198,18 +237,18 @@ info.getUserAgent();   // User-Agent string for HTTP
 
 ## Exception Handling
 
-All exceptions thrown by the SDK inherit from `IggyException`. This allows you to catch all SDK-related errors with a single catch block, or handle specific exception types for more granular error handling.
+The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
 
 ## Examples
 
 See the **[Java Examples](../../examples/java/)** directory for runnable applications demonstrating the SDK:
 
-- **BlockingProducer**: synchronous message production with batch sending
-- **BlockingConsumer**: synchronous consumption with polling loops
+- **GettingStartedProducer**: synchronous message production with batch sending
+- **GettingStartedConsumer**: synchronous consumption with polling loops
 - **AsyncProducer**: non-blocking batch production with concurrent request submission
 - **AsyncConsumer**: async consumption with backpressure and error recovery
 
-Each example includes comprehensive documentation on when to use blocking vs. async clients, CompletableFuture patterns, thread pool management, and performance characteristics.
+The examples README describes blocking and async clients, CompletableFuture patterns, and thread pool management.
 
 For Apache Flink integration, see the [Flink Connector Library](external-processors/iggy-connector-flink/iggy-connector-library/README.md).
 
@@ -233,7 +272,7 @@ The wrapper script will:
 
 No manual Gradle installation is required.
 
-**Note:** Only the Unix shell wrapper (`gradlew`) is provided. Windows users should use WSL, Git Bash, or install Gradle manually.
+**Note:** Only the Unix shell wrapper (`gradlew`) is provided. On Windows, use WSL or Git Bash, or install Gradle manually.
 
 ## Contributing
 
@@ -241,6 +280,6 @@ Before opening a pull request:
 
 1. **Format code:** `./gradlew spotlessApply`
 2. **Validate build:** `./gradlew check`
-3. **Use AssertJ for assertions:** Tests should use [AssertJ](https://assertj.github.io/doc/) (`assertThat(...)`) instead of JUnit assertions.
+3. **Use AssertJ for assertions:** Write test assertions with [AssertJ](https://assertj.github.io/doc/) (`assertThat(...)`) instead of JUnit assertions.
 
-This ensures code style compliance and that all tests and checkstyle validations pass.
+These steps keep the code style compliant and make sure that all tests and checkstyle validations pass.

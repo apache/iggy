@@ -78,9 +78,9 @@ public interface MessagesClient {
      * controls where in the partition to start reading (e.g., from the beginning, end,
      * a specific offset, or a timestamp).
      *
-     * <p>When {@code autoCommit} is {@code true}, the server automatically stores the
-     * consumer's offset after returning the messages. This simplifies offset management
-     * but provides at-least-once delivery semantics.
+     * <p>When {@code autoCommit} is {@code true}, the server submits an offset commit
+     * before returning the poll response, without waiting for application processing.
+     * A failure can therefore leave the stored offset ahead of processed messages.
      *
      * @param streamId    the stream identifier (numeric or string-based)
      * @param topicId     the topic identifier (numeric or string-based)
@@ -151,10 +151,9 @@ public interface MessagesClient {
      *       messages with the same key always go to the same partition, preserving order</li>
      * </ul>
      *
-     * <p>Over TCP the VSR broker routes explicit partitions only, so balanced and
-     * key-based partitioning are resolved to a concrete partition by the client
-     * (round-robin cursor and {@code xxh32(key) % partitionCount} respectively),
-     * consistently with the other Iggy SDKs.
+     * <p>This TCP client resolves balanced and key-based partitioning to a concrete
+     * partition before sending (round-robin cursor and
+     * {@code xxh32(key) % partitionCount} respectively).
      *
      * <p>Messages are batched into a single network request for efficiency. For high
      * throughput, accumulate messages and send them in larger batches rather than one

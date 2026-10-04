@@ -23,6 +23,7 @@ components:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
+      - ".config/**" # nextest + cargo-rail config gate every Rust test job
 
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes
@@ -217,6 +218,7 @@ components:
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
+      - "clippy-macos-aarch64"
       - "build-windows-sdk"
 
   # CLI component
@@ -333,6 +335,17 @@ components:
     paths:
       - "foreign/cpp/**"
     tasks: ["lint", "build", "test"]
+
+  sdk-swift:
+    depends_on:
+      - "rust-sdk" # Swift SDK depends on core SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
+    paths:
+      - "foreign/swift/**"
+      - "bdd/swift/**"
+      - "examples/swift/**"
+    tasks: ["lint", "test", "build", "build-macos", "golden"]
 
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:
@@ -528,7 +541,7 @@ components:
   web-ui:
     paths:
       - "web/**"
-    tasks: ["lint", "build"]
+    tasks: ["lint", "test", "build"]
 
   helm:
     paths:

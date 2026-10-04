@@ -51,6 +51,7 @@ public final class VsrHeaders {
     static final int REQUEST_RESERVED_CODE_OFFSET = 196;
 
     // ReplyHeader
+    static final int REPLY_COMMIT_OFFSET = 184;
     static final int REPLY_REQUEST_OFFSET = 200;
     static final int REPLY_OPERATION_OFFSET = 208;
     static final int REPLY_STATUS_OFFSET = 216;

@@ -33,6 +33,7 @@ default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
 
 [dependencies]
+apache-avro = { workspace = true }
 arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
@@ -71,6 +72,7 @@ iggy_connector_sdk = { workspace = true, features = ["api"] }
 journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
+lapin = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
@@ -82,6 +84,7 @@ rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+ring = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "reqwest",

@@ -26,7 +26,7 @@ use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
 pub use server_common::log::TelemetryTransport;
 
 /// Configuration for the memory pool.
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct MemoryPoolConfig {
     pub enabled: bool,
     #[config_env(leaf)]
@@ -85,10 +85,17 @@ pub struct HeartbeatConfig {
 
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(default)]
 pub struct ConsumerGroupConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub rebalancing_timeout: IggyDuration,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub session_timeout: IggyDuration,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub heartbeat_interval: IggyDuration,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

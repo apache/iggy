@@ -161,40 +161,4 @@ impl MessageClient for ClientWrapper {
             }
         }
     }
-
-    async fn flush_unsaved_buffer(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitioning_id: u32,
-        fsync: bool,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
-                    .await
-            }
-        }
-    }
 }

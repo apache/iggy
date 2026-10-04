@@ -297,6 +297,7 @@ pub mod clients;
 pub mod consumer_ext;
 pub mod http;
 mod leader_aware;
+mod poll_routing;
 pub mod prelude;
 pub mod quic;
 pub mod session;

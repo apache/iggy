@@ -200,7 +200,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Whether the partitioning has to be resolved to an explicit partition id before the request is framed.
-    ///     The broker never picks a partition, so balanced and message-key kinds resolve client-side.
+    ///     This client resolves balanced and message-key kinds using its partition cache and cursor.
     /// </summary>
     private static bool NeedsClientSidePartitioning(Partitioning partitioning)
     {
@@ -217,8 +217,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     /// <summary>
     ///     Resolves balanced and message-key partitioning to an explicit partition id, mirroring
-    ///     <c>core/common/src/traits/binary_impls/messages.rs</c>. The VSR broker never picks a partition, so
-    ///     sending either kind on the wire would fail to route.
+    ///     <c>core/common/src/traits/binary_impls/messages.rs</c> and retaining the client's routing cursor.
     /// </summary>
     private async ValueTask<Partitioning> ResolvePartitioningAsync(Identifier streamId, Identifier topicId,
         Partitioning partitioning, CancellationToken token)
@@ -431,6 +430,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// </summary>
     private void RememberRoster(ClusterMetadata clusterMetadata)
     {
+        var nodeCount = clusterMetadata.Nodes.Count();
+        if (nodeCount == 0)
+        {
+            throw new MalformedResponseException("Cluster metadata contains no nodes.");
+        }
+
+        Volatile.Write(ref _clusterNodeCount, nodeCount);
         var endpoints = clusterMetadata.Nodes
             .Where(node => node.Endpoints.Tcp != 0)
             .Select(node => ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp))
@@ -691,11 +697,6 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Whether the failure carries the server's verdict on this request. A lost connection, a reply frame
-    ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
-    ///     outcome of a request the server may still commit unknowable.
-    /// </summary>
-    /// <summary>
     ///     Whether the reply body may carry a credential - a raw personal access token, a session secret - and
     ///     therefore must be zeroed before its pooled buffer is handed back for reuse.
     /// </summary>
@@ -708,12 +709,18 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             or CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE;
     }
 
+    /// <summary>
+    ///     Whether the failure carries the server's verdict on this request. A lost connection, a reply frame
+    ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
+    ///     outcome of a request the server may still commit unknowable. REQUEST_TOO_OLD does too: the server
+    ///     refuses the request because it no longer holds the evidence that tells whether it committed.
+    /// </summary>
     private static bool IsDefinitiveVerdict(Exception error)
     {
         return error is IggyInvalidStatusCodeException
         {
             FromServer: true,
-            StatusCode: not VsrError.TRANSIENT_NOT_COMMITTED
+            StatusCode: not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.REQUEST_TOO_OLD)
         };
     }
 
@@ -753,6 +760,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     {
         _consensusSession.Reset();
         _groupState.ClearSessionScoped();
+        ClearPollSession();
     }
 
     /// <summary>

@@ -67,7 +67,7 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
             "knob-topic",
             &TopicCreateOptions {
                 partitions_count: Some(1),
-                enforce_fsync: Some(true),
+                durability: iggy_common::Durability::Persisted,
                 messages_required_to_save: Some(7),
                 size_of_messages_required_to_save: Some(IggyByteSize::from(4096u64)),
                 segment_size: Some(IggyByteSize::from(1024 * 1024u64)),
@@ -82,8 +82,11 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
         .await
         .unwrap()
         .expect("topic exists");
+    // The SDK sends both durability fields, including the independently
+    // defaulted offset policy. Explicit provenance describes those wire keys.
     for (key, expected_explicit) in [
-        (topic_option_keys::ENFORCE_FSYNC, true),
+        (topic_option_keys::DURABILITY, true),
+        (topic_option_keys::CONSUMER_OFFSET_DURABILITY, true),
         (topic_option_keys::MESSAGES_REQUIRED_TO_SAVE, true),
         (topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, true),
         // Never sent, so admission derived it from the built-in default.
@@ -277,7 +280,7 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 segment_size: Some(IggyByteSize::from(1024 * 1024u64)),
-                enforce_fsync: Some(true),
+                durability: iggy_common::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -317,10 +320,12 @@ async fn given_update_options_when_updating_topic_should_patch_not_replace(harne
         .await
         .unwrap()
         .expect("topic exists");
-    // The keys the update did not mention keep the values create resolved.
+    // The update preserves creation provenance. Both durability defaults were
+    // sent by the SDK at creation, whereas preallocate_segments was omitted.
     for (key, expected_explicit) in [
         (topic_option_keys::SEGMENT_SIZE, true),
-        (topic_option_keys::ENFORCE_FSYNC, true),
+        (topic_option_keys::DURABILITY, true),
+        (topic_option_keys::CONSUMER_OFFSET_DURABILITY, true),
         (topic_option_keys::PREALLOCATE_SEGMENTS, false),
     ] {
         let option = details

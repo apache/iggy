@@ -19,8 +19,8 @@ namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     Per-connection cache of consumer-group assignments and topic partition counts, mirroring
-///     <c>core/common/src/consumer_group_client_state.rs</c>. Under VSR the broker never picks a partition, so
-///     the client resolves group polls and balanced / message-key produce locally. The cursors have to survive
+///     <c>core/common/src/consumer_group_client_state.rs</c>. The client resolves group polls and
+///     balanced / message-key produce locally. The cursors have to survive
 ///     across calls, which is why this lives on the long-lived transport rather than on a request.
 /// </summary>
 internal sealed class ConsumerGroupClientState

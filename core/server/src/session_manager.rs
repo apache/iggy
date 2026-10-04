@@ -27,6 +27,9 @@
 
 use crate::cluster_meta::ClusterRoster;
 use ahash::AHashMap;
+use consensus::client_table::SessionAttachment;
+use iggy_binary_protocol::ConsumerSession;
+use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::net::SocketAddr;
@@ -39,7 +42,7 @@ use std::time::{Duration, Instant};
 /// and the read-your-writes floor. `Default` (everything absent, no address,
 /// floor `0`) stands for a connection neither this map nor the bus knows.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ConnectionContext {
+pub struct ConnectionContext {
     /// `(client_id, session)` once register committed, `None` before.
     pub bound: Option<(u128, u64)>,
     /// Acting user from `login`, `None` while still `Connected`.
@@ -114,6 +117,7 @@ pub struct Connection {
     /// THIS socket was told, and a client that reconnects re-seeds from the
     /// session it binds.
     pub metadata_watermark: u64,
+    consumer_session: Option<(u128, SessionAttachment)>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -181,6 +185,7 @@ impl SessionManager {
                 last_heartbeat: Instant::now(),
                 sdk: None,
                 metadata_watermark: 0,
+                consumer_session: None,
             });
     }
 
@@ -281,6 +286,7 @@ impl SessionManager {
                 // a write it never issued. Never the other direction - the
                 // bind below re-seeds from the register epoch.
                 conn.metadata_watermark = 0;
+                conn.consumer_session = None;
                 Ok(())
             }
             _ => Err(SessionError::InvalidTransition {
@@ -365,6 +371,73 @@ impl SessionManager {
         }
     }
 
+    /// Attach a consumer-group identity to an authenticated data connection.
+    ///
+    /// This connection retains its own consensus identity and disconnect cleanup.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` for an unbound connection or `StaleClient`
+    /// when the parent epoch has ended.
+    pub fn attach_consumer_session(
+        &mut self,
+        connection_id: u128,
+        client_id: u128,
+        attachment: SessionAttachment,
+        metadata_watermark: u64,
+    ) -> Result<(), IggyError> {
+        let connection = self
+            .connections
+            .get_mut(&connection_id)
+            .ok_or(IggyError::Unauthenticated)?;
+        if !matches!(connection.state, ConnectionState::Bound { .. }) {
+            return Err(IggyError::Unauthenticated);
+        }
+        if !attachment.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        connection.consumer_session = Some((client_id, attachment));
+        connection.metadata_watermark = connection.metadata_watermark.max(metadata_watermark);
+        Ok(())
+    }
+
+    /// Resolve the attached group identity without extending its lifetime.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` without an authenticated attachment, or
+    /// `StaleClient` when the parent epoch has ended.
+    pub fn consumer_session(
+        &self,
+        connection_id: u128,
+    ) -> Result<(u128, SessionAttachment), IggyError> {
+        self.attached_consumer_session(connection_id)?
+            .ok_or(IggyError::Unauthenticated)
+    }
+
+    /// An absent alias is an ordinary session; an expired alias must fail closed.
+    ///
+    /// # Errors
+    /// Returns `Unauthenticated` for an unbound connection and `StaleClient`
+    /// when its attached parent session has ended.
+    pub fn attached_consumer_session(
+        &self,
+        connection_id: u128,
+    ) -> Result<Option<(u128, SessionAttachment)>, IggyError> {
+        let connection = self
+            .connections
+            .get(&connection_id)
+            .ok_or(IggyError::Unauthenticated)?;
+        if !matches!(connection.state, ConnectionState::Bound { .. }) {
+            return Err(IggyError::Unauthenticated);
+        }
+        let Some((client_id, attachment)) = connection.consumer_session.as_ref() else {
+            return Ok(None);
+        };
+        if !attachment.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        Ok(Some((*client_id, attachment.clone())))
+    }
+
     /// The highest metadata op this connection was told committed, or `0` when
     /// it was told none (an unknown or still-unbound connection, which has no
     /// write to read back).
@@ -425,6 +498,26 @@ impl SessionManager {
             .iter()
             .map(|(&id, conn)| record_from(id, conn))
     }
+
+    /// The number of locally-homed connected clients, which
+    /// [`Self::iter_clients`] would yield, without building their records.
+    #[must_use]
+    pub fn client_count(&self) -> usize {
+        self.connections.len()
+    }
+
+    pub fn iter_consumer_sessions(&self) -> impl Iterator<Item = ConsumerSession> + '_ {
+        self.connections.values().filter_map(|connection| {
+            if let ConnectionState::Bound {
+                client_id, session, ..
+            } = connection.state
+            {
+                Some(ConsumerSession { client_id, session })
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl Default for SessionManager {
@@ -463,15 +556,12 @@ impl std::error::Error for SessionError {}
 
 /// Flatten a connection + its id into a [`ConnectedClientInfo`].
 fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
-    let user_id = match conn.state {
-        ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
-            Some(user_id)
-        }
-        ConnectionState::Connected => None,
-    };
-    let vsr_client_id = match conn.state {
-        ConnectionState::Bound { client_id, .. } => Some(client_id),
-        ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+    let (user_id, vsr_client_id) = match conn.state {
+        ConnectionState::Bound {
+            user_id, client_id, ..
+        } => (Some(user_id), Some(client_id)),
+        ConnectionState::Authenticated { user_id } => (Some(user_id), None),
+        ConnectionState::Connected => (None, None),
     };
     ConnectedClientInfo {
         client_id: connection_id,
@@ -496,10 +586,58 @@ const fn state_name(state: &ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reply_frame::build_empty_reply;
+    use consensus::ClientTable;
+    use consensus::client_table::SessionEnd;
+    use iggy_binary_protocol::{Operation, RoutedRequestHeader};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn data_disconnect_releases_only_its_own_session_and_parent_logout_fences_attachments() {
+        const USER: u32 = 7;
+        const PARENT: u128 = 11;
+        const DATA: u128 = 22;
+        const OTHER_DATA: u128 = 33;
+        let mut sessions = SessionManager::new();
+        let mut table = ClientTable::new(3);
+        let header = RoutedRequestHeader {
+            operation: Operation::Register,
+            ..Default::default()
+        };
+        for (client, epoch) in [(PARENT, 1), (DATA, 2), (OTHER_DATA, 3)] {
+            table.commit_register(
+                client,
+                USER,
+                build_empty_reply(&header, client, epoch, epoch),
+            );
+            sessions.ensure_connection(client, addr(5000), ClientTransportKind::Tcp);
+            sessions.login(client, USER).unwrap();
+            sessions.bind_session(client, client, epoch).unwrap();
+        }
+        for data in [DATA, OTHER_DATA] {
+            let attachment = table.attach_session(PARENT, 1, USER).unwrap();
+            sessions
+                .attach_consumer_session(data, PARENT, attachment, 3)
+                .unwrap();
+            assert_eq!(sessions.consumer_session(data).unwrap().0, PARENT);
+        }
+
+        let disconnected = sessions.remove_connection(DATA);
+        assert_eq!(disconnected, Some((DATA, 2)));
+        table.remove_client(DATA, USER, SessionEnd::DisconnectCleanup);
+        assert_eq!(sessions.get_session(PARENT), Some((PARENT, 1)));
+        assert_eq!(sessions.consumer_session(OTHER_DATA).unwrap().0, PARENT);
+
+        table.remove_client(PARENT, USER, SessionEnd::Explicit);
+        assert!(matches!(
+            sessions.consumer_session(OTHER_DATA),
+            Err(IggyError::StaleClient)
+        ));
+        assert_eq!(sessions.get_session(OTHER_DATA), Some((OTHER_DATA, 3)));
     }
 
     #[test]
@@ -546,6 +684,47 @@ mod tests {
             },
         );
         assert_eq!(mgr.iter_clients().count(), 1);
+    }
+
+    #[test]
+    fn consumer_session_gather_includes_only_live_bound_connections() {
+        const CLIENT: u128 = 7;
+        const USER: u32 = 1;
+        let mut sessions = SessionManager::new();
+        for connection in [1, 2] {
+            sessions.ensure_connection(connection, addr(5000), ClientTransportKind::Tcp);
+            sessions.record_sdk_info(
+                connection,
+                ClientSdkInfo {
+                    sdk_name: "rust-sdk".to_owned(),
+                    sdk_version: "1.0.0".to_owned(),
+                    protocol_version: 1,
+                },
+            );
+        }
+        assert_eq!(sessions.iter_consumer_sessions().count(), 0);
+        sessions.login(1, USER).unwrap();
+        assert_eq!(sessions.iter_consumer_sessions().count(), 0);
+        sessions.bind_session(1, CLIENT, 11).unwrap();
+        assert_eq!(
+            sessions.iter_consumer_sessions().collect::<Vec<_>>(),
+            [ConsumerSession {
+                client_id: CLIENT,
+                session: 11
+            }]
+        );
+        sessions.login(2, USER).unwrap();
+        sessions.bind_session(2, CLIENT, 12).unwrap();
+        assert_eq!(sessions.iter_clients().count(), 2);
+        assert_eq!(
+            sessions.iter_consumer_sessions().collect::<Vec<_>>(),
+            [ConsumerSession {
+                client_id: CLIENT,
+                session: 12
+            }]
+        );
+        sessions.remove_connection(2);
+        assert_eq!(sessions.iter_consumer_sessions().count(), 0);
     }
 
     #[test]
@@ -645,10 +824,12 @@ mod tests {
         assert_eq!(mgr.get_session(c1), Some((100, 10)));
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
         assert_eq!(mgr.iter_clients().count(), 2);
+        assert_eq!(mgr.client_count(), 2);
 
         assert_eq!(mgr.remove_connection(c1), Some((100, 10)));
         assert!(mgr.get_session(c1).is_none());
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
+        assert_eq!(mgr.client_count(), 1);
     }
     // Every disconnect releases its consensus session, group member or not.
     // Holding the slot open for a resume window instead leaked it: nothing

@@ -31,8 +31,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
@@ -82,6 +83,7 @@ pub struct ServerHandle {
     test_transport: Option<iggy_common::TransportProtocol>,
     mcp: Option<McpHandle>,
     connectors_runtime: Option<ConnectorsRuntimeHandle>,
+    open_files_limit: Option<u64>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -281,7 +283,7 @@ impl ServerHandle {
     fn build_envs(&mut self) -> Result<(), TestBinaryError> {
         // Pass through IGGY_* env vars from parent process, except those critical for test isolation.
         const PROTECTED_PREFIXES: &[&str] = &[
-            "IGGY_SYSTEM_PATH",
+            "IGGY_PATH",
             "IGGY_TCP_ADDRESS",
             "IGGY_HTTP_ADDRESS",
             "IGGY_QUIC_ADDRESS",
@@ -309,13 +311,13 @@ impl ServerHandle {
             Err(_) => "0..4".to_string(),
         };
         self.envs
-            .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
+            .entry("IGGY_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
         // On a 4-core CI runner every server computes the same `0..4` range, so
         // pinned shards of concurrently running tests pile onto the same cores
         // and starve each other. Leave thread placement to the scheduler.
         self.envs
-            .entry("IGGY_SYSTEM_SHARDING_PIN_CORES".to_string())
+            .entry("IGGY_SHARDING_PIN_CORES".to_string())
             .or_insert_with(|| "false".to_string());
 
         self.envs
@@ -326,10 +328,8 @@ impl ServerHandle {
             .or_insert_with(|| DEFAULT_ROOT_PASSWORD.to_string());
 
         let data_path = self.data_path();
-        self.envs.insert(
-            "IGGY_SYSTEM_PATH".to_string(),
-            data_path.display().to_string(),
-        );
+        self.envs
+            .insert("IGGY_PATH".to_string(), data_path.display().to_string());
 
         // Protocol enablement (special handling for defaults)
         if !self.config.quic_enabled {
@@ -351,10 +351,10 @@ impl ServerHandle {
         // Encryption (special handling for key injection)
         if let Some(ref enc) = self.config.encryption {
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string())
+                .entry("IGGY_ENCRYPTION_ENABLED".to_string())
                 .or_insert_with(|| "true".to_string());
             self.envs
-                .entry("IGGY_SYSTEM_ENCRYPTION_KEY".to_string())
+                .entry("IGGY_ENCRYPTION_KEY".to_string())
                 .or_insert_with(|| enc.key.clone());
         }
 
@@ -708,6 +708,7 @@ impl ServerHandle {
             test_transport: None,
             mcp: None,
             connectors_runtime: None,
+            open_files_limit: None,
         }
     }
 
@@ -735,6 +736,13 @@ impl ServerHandle {
     /// `impl Into<String>`.
     pub fn set_executable_path(&mut self, path: Option<String>) {
         self.config.executable_path = path;
+    }
+
+    /// Set the soft and hard `RLIMIT_NOFILE` of the next `start()`, or `None`
+    /// to inherit the limits of the test process. The server raises its soft
+    /// limit to the hard one at boot, so only a lowered hard limit holds.
+    pub fn set_open_files_limit(&mut self, limit: Option<u64>) {
+        self.open_files_limit = limit;
     }
 
     /// Configure MCP server for this iggy server.
@@ -879,6 +887,7 @@ impl TestBinary for ServerHandle {
             test_transport: None,
             mcp: None,
             connectors_runtime: None,
+            open_files_limit: None,
         }
     }
 
@@ -951,7 +960,7 @@ impl TestBinary for ServerHandle {
             })?
         };
 
-        command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
+        command.env("IGGY_PATH", data_path.display().to_string());
         // VSR multi-node tests spawn N shards per node * M nodes per test;
         // the 4096-entry per-ring default exhausts dev memlock budgets
         // (`ulimit -l` is commonly 8 MiB). Shrink unless the caller already
@@ -966,14 +975,32 @@ impl TestBinary for ServerHandle {
         // ambient value could silently filter out markers the test asserts.
         // A caller that explicitly puts `RUST_LOG` in `extra_envs` adds it back
         // through `command.envs` below.
-        if self
-            .config
-            .extra_envs
-            .contains_key("IGGY_SYSTEM_LOGGING_LEVEL")
-        {
+        if self.config.extra_envs.contains_key("IGGY_LOGGING_LEVEL") {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
+        if let Some(current_dir) = &self.config.current_dir {
+            command.current_dir(current_dir);
+        }
+
+        if let Some(limit) = self.open_files_limit {
+            let rlimit = libc::rlimit {
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: limit as libc::rlim_t,
+            };
+            // SAFETY: the hook runs in the forked child before `exec`, where
+            // only async-signal-safe calls are sound. `setrlimit` is one, and
+            // the hook touches nothing but its own copy of `rlimit`.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
 
         // `--replica-id` is the single identity input expected by the
         // server when cluster mode is enabled; all other cluster config is
@@ -1136,6 +1163,38 @@ impl ServerHandle {
             let _ = child.wait();
         }
         Ok(())
+    }
+
+    /// Disarm the watchdog ahead of an exit the test causes on purpose. The
+    /// watchdog panics on any exit, and its reap would take the exit status
+    /// that [`Self::wait_for_exit`] reports.
+    pub fn expect_exit(&mut self) {
+        self.stop_watchdog();
+    }
+
+    /// Wait up to `timeout` for the server to exit by itself, after
+    /// [`Self::expect_exit`], and return its exit status. Restart it
+    /// afterwards with [`TestBinary::start`].
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, TestBinaryError> {
+        let child = self
+            .child_handle
+            .as_mut()
+            .ok_or(TestBinaryError::NotStarted)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child_handle = None;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(TestBinaryError::InvalidState {
+                    message: format!(
+                        "the server was still running {timeout:?} after the test expected it to exit"
+                    ),
+                });
+            }
+            sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
+        }
     }
 
     /// Names this node in the log dumps. A cluster failure prints every

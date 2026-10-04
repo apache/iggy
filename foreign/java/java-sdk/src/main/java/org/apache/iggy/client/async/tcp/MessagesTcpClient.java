@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.MessagesClient;
@@ -46,12 +47,13 @@ import java.math.BigInteger;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 
+import static org.apache.iggy.serde.BytesSerializer.encodeMessagesBatchInto;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toMessagesBatch;
 
 /**
  * Async TCP implementation of MessagesClient using Netty for non-blocking I/O.
@@ -83,16 +85,33 @@ public class MessagesTcpClient implements MessagesClient {
     private final ClientRoutingState routingState;
     private final TopicsClient topicsClient;
     private final ConsumerGroupsClient consumerGroupsClient;
+    private final PollRouter pollRouter;
+    private final Supplier<CompletableFuture<Boolean>> clustered;
 
+    /**
+     * Creates a low-level client on the supplied connection without primary routing.
+     * Use {@code Iggy.tcpClientBuilder()} for clustered auto-commit polling so the
+     * coordinator retains group membership while data connections reach primaries.
+     */
     public MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this(connectionSupplier, new ClientRoutingState());
     }
 
     MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, ClientRoutingState routingState) {
+        this(connectionSupplier, routingState, null, () -> CompletableFuture.completedFuture(false));
+    }
+
+    MessagesTcpClient(
+            Supplier<AsyncTcpConnection> connectionSupplier,
+            ClientRoutingState routingState,
+            PollRouter pollRouter,
+            Supplier<CompletableFuture<Boolean>> clustered) {
         this.connectionSupplier = connectionSupplier;
         this.routingState = routingState;
         this.topicsClient = new TopicsTcpClient(connectionSupplier);
         this.consumerGroupsClient = new ConsumerGroupsTcpClient(connectionSupplier);
+        this.pollRouter = pollRouter;
+        this.clustered = clustered;
     }
 
     private AsyncTcpConnection connection() {
@@ -112,7 +131,15 @@ public class MessagesTcpClient implements MessagesClient {
             // The VSR broker fences group polls against unowned partitions
             // instead of picking one, so the partition is selected here from
             // the member's synced assignment, matching the Rust SDK.
-            return pollGroupMessages(streamId, topicId, consumer, strategy, count, autoCommit, GROUP_POLL_MAX_ATTEMPTS);
+            PollCancellation cancellation = new PollCancellation();
+            CompletableFuture<PolledMessages> result = pollGroupMessages(
+                    streamId, topicId, consumer, strategy, count, autoCommit, GROUP_POLL_MAX_ATTEMPTS, cancellation);
+            result.whenComplete((response, error) -> {
+                if (result.isCancelled()) {
+                    cancellation.cancel();
+                }
+            });
+            return result;
         }
         return pollPartition(streamId, topicId, partitionId, consumer, strategy, count, autoCommit);
     }
@@ -147,13 +174,48 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        return connection().send(CommandCode.Messages.POLL.getValue(), payload).thenApply(response -> {
+        CompletableFuture<ByteBuf> sent = sendPoll(payload, autoCommit);
+        CompletableFuture<PolledMessages> result = sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readPolledMessages(response);
             } finally {
                 response.release();
             }
         });
+        result.whenComplete((response, error) -> {
+            if (result.isCancelled()) {
+                sent.cancel(false);
+            }
+        });
+        return result;
+    }
+
+    private CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, boolean autoCommit) {
+        if (!autoCommit || pollRouter == null) {
+            return connection().send(CommandCode.Messages.POLL.getValue(), payload);
+        }
+        PollCancellation cancellation = new PollCancellation();
+        CompletableFuture<ByteBuf> result = clustered
+                .get()
+                .handle((isClustered, error) -> {
+                    if (error != null || cancellation.isCancelled()) {
+                        payload.release();
+                        return CompletableFuture.<ByteBuf>failedFuture(
+                                error != null ? error : new CancellationException());
+                    }
+                    CompletableFuture<ByteBuf> sent = isClustered
+                            ? pollRouter.poll(payload)
+                            : connection().send(CommandCode.Messages.POLL.getValue(), payload);
+                    cancellation.track(sent);
+                    return sent;
+                })
+                .thenCompose(sent -> sent);
+        result.whenComplete((response, error) -> {
+            if (result.isCancelled()) {
+                cancellation.cancel();
+            }
+        });
+        return result;
     }
 
     @Override
@@ -183,17 +245,24 @@ public class MessagesTcpClient implements MessagesClient {
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
 
         var metadataLength = streamId.getSize() + topicId.getSize() + partitioning.getSize() + 4;
-        var batch = toMessagesBatch(messages);
-        var payload = Unpooled.buffer(4 + metadataLength + batch.readableBytes());
+        // The batch is encoded straight after the metadata rather than into its
+        // own buffer and copied over, which is the whole payload once per send.
+        var payload = Unpooled.buffer(4 + metadataLength);
 
-        payload.writeIntLE(metadataLength);
-        payload.writeBytes(toBytes(streamId));
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(partitioning));
-        payload.writeIntLE(messages.size());
-        payload.writeBytes(batch);
-
-        return connection().send(CommandCode.Messages.SEND.getValue(), payload).thenApply(response -> {
+        CompletableFuture<ByteBuf> sent;
+        try {
+            payload.writeIntLE(metadataLength);
+            writeAndRelease(payload, toBytes(streamId));
+            writeAndRelease(payload, toBytes(topicId));
+            writeAndRelease(payload, toBytes(partitioning));
+            payload.writeIntLE(messages.size());
+            encodeMessagesBatchInto(payload, messages);
+            sent = connection().send(CommandCode.Messages.SEND.getValue(), payload);
+        } catch (RuntimeException | Error error) {
+            payload.release();
+            throw error;
+        }
+        return sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readSendMessagesResponse(response);
             } catch (RuntimeException e) {
@@ -208,6 +277,14 @@ public class MessagesTcpClient implements MessagesClient {
         });
     }
 
+    private static void writeAndRelease(ByteBuf destination, ByteBuf source) {
+        try {
+            destination.writeBytes(source);
+        } finally {
+            source.release();
+        }
+    }
+
     /**
      * One group-poll attempt: sync the assignment when missing or stale, pick
      * the next assigned partition round-robin, poll it explicitly, and on a
@@ -216,6 +293,7 @@ public class MessagesTcpClient implements MessagesClient {
      * re-sync after the coordinator rejects a stale assignment, then one
      * retry; an exhausted budget is an empty poll, not an error.
      */
+    @SuppressWarnings("checkstyle:ParameterNumber")
     private CompletableFuture<PolledMessages> pollGroupMessages(
             StreamId streamId,
             TopicId topicId,
@@ -223,12 +301,19 @@ public class MessagesTcpClient implements MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit,
-            int attemptsLeft) {
+            int attemptsLeft,
+            PollCancellation cancellation) {
+        if (cancellation.isCancelled()) {
+            return CompletableFuture.failedFuture(new CancellationException());
+        }
         if (attemptsLeft == 0) {
             return CompletableFuture.completedFuture(emptyPolledMessages());
         }
         var groupKey = ClientRoutingState.groupKey(streamId, topicId, consumer.id());
         return ensureFreshAssignment(streamId, topicId, consumer, groupKey).thenCompose(ignored -> {
+            if (cancellation.isCancelled()) {
+                return CompletableFuture.failedFuture(new CancellationException());
+            }
             var partitionId = routingState.nextGroupPartition(groupKey);
             if (partitionId.isEmpty()) {
                 if (routingState.assignment(groupKey).isPresent()) {
@@ -243,19 +328,22 @@ public class MessagesTcpClient implements MessagesClient {
                         Optional.empty(),
                         Optional.empty()));
             }
-            return pollPartition(
-                            streamId,
-                            topicId,
-                            Optional.of(partitionId.getAsLong()),
-                            consumer,
-                            strategy,
-                            count,
-                            autoCommit)
+            CompletableFuture<PolledMessages> polledPartition = pollPartition(
+                    streamId, topicId, Optional.of(partitionId.getAsLong()), consumer, strategy, count, autoCommit);
+            cancellation.track(polledPartition);
+            return polledPartition
                     .thenCompose(polled -> {
                         if (polled.messages().isEmpty() && polled.partitionId() == RESYNC_REQUIRED_PARTITION_SENTINEL) {
                             routingState.invalidateAssignment(groupKey);
                             return pollGroupMessages(
-                                    streamId, topicId, consumer, strategy, count, autoCommit, attemptsLeft - 1);
+                                    streamId,
+                                    topicId,
+                                    consumer,
+                                    strategy,
+                                    count,
+                                    autoCommit,
+                                    attemptsLeft - 1,
+                                    cancellation);
                         }
                         return CompletableFuture.completedFuture(polled);
                     })
@@ -265,7 +353,14 @@ public class MessagesTcpClient implements MessagesClient {
                         }
                         routingState.invalidateAssignment(groupKey);
                         return pollGroupMessages(
-                                streamId, topicId, consumer, strategy, count, autoCommit, attemptsLeft - 1);
+                                streamId,
+                                topicId,
+                                consumer,
+                                strategy,
+                                count,
+                                autoCommit,
+                                attemptsLeft - 1,
+                                cancellation);
                     });
         });
     }
@@ -349,5 +444,28 @@ public class MessagesTcpClient implements MessagesClient {
                     }
                     return CompletableFuture.failedFuture(error);
                 });
+    }
+
+    private static final class PollCancellation {
+        private boolean cancelled;
+        private CompletableFuture<?> active;
+
+        synchronized boolean isCancelled() {
+            return cancelled;
+        }
+
+        synchronized void track(CompletableFuture<?> poll) {
+            active = poll;
+            if (cancelled) {
+                poll.cancel(false);
+            }
+        }
+
+        synchronized void cancel() {
+            cancelled = true;
+            if (active != null) {
+                active.cancel(false);
+            }
+        }
     }
 }

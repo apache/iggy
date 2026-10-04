@@ -111,6 +111,24 @@ class VsrResponseHandlerTest {
     }
 
     @Test
+    void shouldObserveTruncateCommitWithoutUsingPartitionCommitAsMetadata() throws Exception {
+        CompletableFuture<ByteBuf> truncated = enqueue(VsrOperation.DELETE_SEGMENTS, 7);
+        ByteBuf truncateReply =
+                replyFrame(VsrOperation.TRUNCATE_PARTITION, 7, Unpooled.buffer().writeIntLE(0));
+        truncateReply.setLongLE(VsrHeaders.REPLY_COMMIT_OFFSET, 11);
+        channel.writeInbound(truncateReply);
+        truncated.get().release();
+        assertThat(session.metadataWatermark()).isEqualTo(11);
+
+        CompletableFuture<ByteBuf> sent = enqueue(VsrOperation.SEND_MESSAGES, 8);
+        ByteBuf partitionReply = replyFrame(VsrOperation.SEND_MESSAGES, 8, Unpooled.EMPTY_BUFFER);
+        partitionReply.setLongLE(VsrHeaders.REPLY_COMMIT_OFFSET, 99);
+        channel.writeInbound(partitionReply);
+        sent.get().release();
+        assertThat(session.metadataWatermark()).isEqualTo(11);
+    }
+
+    @Test
     void shouldSurfaceCommittedErrorFromMetadataRejection() {
         CompletableFuture<ByteBuf> future = enqueue(VsrOperation.DELETE_STREAM, 7);
         ByteBuf body = Unpooled.buffer();

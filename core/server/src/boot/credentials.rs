@@ -111,7 +111,9 @@ fn create_root_credentials() -> (String, String) {
     let password = crypto::generate_secret(20..40);
     // Through tracing, not stdout: this is the only time the operator can read
     // the password, so it has to reach the log file too.
-    warn!("Generated root user password: {password}");
+    warn!(
+        "Generated root user password: {password}. It is shown only once. To reset it, stop the server and delete the data directory, or start the server with --fresh. Both delete all stored data."
+    );
     (
         DEFAULT_ROOT_USERNAME.to_string(),
         crypto::hash_password(&password),
@@ -145,7 +147,7 @@ pub(in crate::boot) fn validate_root_credentials_env(
     // already stored. `--fresh` has already wiped by this point, so a wiped
     // replica is correctly treated as a first boot.
     let fresh_cluster = config.cluster.enabled
-        && !Path::new(&config.system.path)
+        && !Path::new(&config.path)
             .join(metadata::impls::METADATA_DIR)
             .exists();
 

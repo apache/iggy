@@ -18,11 +18,13 @@
 pub mod client;
 mod config;
 mod consumer;
+mod durability;
 mod duration;
 mod identifier;
 mod options;
 mod partitioning;
 mod permissions;
+mod producer;
 mod receive_message;
 mod send_message;
 mod stats;
@@ -43,6 +45,10 @@ use consumer::{
 use options::OptionSpec;
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
+use producer::{
+    BackgroundProducerConfig, BackpressureMode, DirectProducerConfig, IggyProducer,
+    ProducerSendError, ProducerSharding,
+};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -54,12 +60,19 @@ use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 
 /// Python client for Apache Iggy, the persistent message streaming platform.
 #[pymodule]
-fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    durability::Durability::register(py, m)?;
     m.add_class::<SendMessage>()?;
     m.add_class::<SendMessagesResponse>()?;
     m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<IggyProducer>()?;
+    m.add_class::<ProducerSendError>()?;
+    m.add_class::<DirectProducerConfig>()?;
+    m.add_class::<BackgroundProducerConfig>()?;
+    m.add_class::<ProducerSharding>()?;
+    m.add_class::<BackpressureMode>()?;
     m.add_class::<AutoLogin>()?;
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;

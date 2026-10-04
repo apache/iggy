@@ -18,13 +18,14 @@
 //! Shard construction and the partition recovery it drives.
 
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
-use crate::boot::wire_shell_handlers;
+use crate::consumer_group::lease::ConsumerGroupLiveness;
+use crate::dispatch::host::ServerHost;
 use crate::partition_helpers::load_partition_or_fence;
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
-    ServerMetadata, ServerShard, ShellHandlers, ShellShardHandle, consensus_timers,
-    repair_gap_debounce_ticks, repair_retry_ticks,
+    ServerMetadata, ServerShard, ShellShardHandle, consensus_timers, repair_gap_debounce_ticks,
+    repair_retry_ticks,
 };
 use configs::server::ServerConfig;
 use consensus::{
@@ -36,7 +37,6 @@ use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
 use message_bus::IggyMessageBus;
-use message_bus::client_listener::RequestHandler;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use partitions::{IggyPartitions, PartitionsConfig};
@@ -55,14 +55,13 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 /// A shard built for its thread, with what `shard_main` wires after the
-/// build: the session manager its request plane shares, the shard's one
-/// client-request handler (shard 0 hands the same instance to its local
-/// transports), and the weak self-reference the deferred handlers
-/// upgrade per frame, already backfilled.
+/// build: the session manager its request plane shares and the weak
+/// self-reference the host's handlers upgrade per frame, already
+/// backfilled.
 pub(in crate::boot) struct ShardBuild {
     pub shard: Rc<ServerShard>,
     pub sessions: Rc<RefCell<SessionManager>>,
-    pub on_client_request: RequestHandler,
+    pub consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
 }
 
@@ -81,6 +80,30 @@ pub(in crate::boot) async fn build_shard_for_thread(
     roster_cells: &RosterCells,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
+    let retired_key: iggy_common::HeaderKey =
+        "enforce_fsync".parse().expect("retired key is valid");
+    let enabled = iggy_common::HeaderValue::from(true);
+    let retired_durability = metadata.mux_stm.streams().read(|inner| {
+        inner.items.iter().find_map(|(stream_id, stream)| {
+            stream.topics.iter().find_map(|(topic_id, topic)| {
+                topic
+                    .options
+                    .get(&retired_key)
+                    .is_some_and(|option| option.value == enabled)
+                    .then_some((stream_id, topic_id))
+            })
+        })
+    });
+    if let Some((stream_id, topic_id)) = retired_durability {
+        error!(
+            stream_id,
+            topic_id,
+            "stored topic uses removed enforce_fsync=true. Recreate it with explicit durability in a data directory prepared for this version. No legacy durability translation is performed"
+        );
+        return Err(ServerError::Iggy(Box::new(
+            iggy_common::IggyError::UnsupportedOptionKey("enforce_fsync".to_owned()),
+        )));
+    }
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
             .items
@@ -107,8 +130,8 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // At-rest encryption: built once per shard from the shared config; the
     // ingestion path encrypts on the primary and the poll reply decrypts.
     // A bad key fails the boot rather than silently serving plaintext.
-    let encryptor = if config.system.encryption.enabled {
-        let aes = Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
+    let encryptor = if config.encryption.enabled {
+        let aes = Aes256GcmEncryptor::from_base64_key(&config.encryption.key)
             .map_err(|error| ServerError::Iggy(Box::new(error)))?;
         Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
     } else {
@@ -121,16 +144,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
             size_of_messages_required_to_save: IggyByteSize::from(
                 iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
             ),
-            enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
-            consumer_offset_enforce_fsync: config.partition.consumer_offset_enforce_fsync,
-            validate_checksum: config.system.partition.validate_checksum,
+            validate_checksum: config.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
             path_layout: partitions::PartitionPathLayout {
-                streams_root: config.system.get_streams_path(),
-                topics_dir: config.system.topic.path.clone(),
-                partitions_dir: config.system.partition.path.clone(),
+                streams_root: config.get_streams_path(),
             },
         },
         owned_partitions_capacity,
@@ -156,7 +175,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                         let stats = inner.stats_registry.partition(
                             stream.id,
                             topic_id,
-                            partition.id,
+                            partition,
                             topic.stats.clone(),
                         );
                         owned.push((
@@ -229,22 +248,17 @@ pub(in crate::boot) async fn build_shard_for_thread(
 
     let shard_handle = Rc::new(RefCell::new(None));
     // Same wiring path as the simulator's shell mode: one per-shard
-    // SessionManager shared by the client-request handler (binds sessions)
-    // and the get_clients handler (reads them). It also carries this shard's
-    // cluster roster for the GetClusterMetadata read.
-    let ShellHandlers {
-        on_replica_message,
-        on_client_request,
-        on_metadata_submit,
-        on_list_clients,
-        on_partition_read,
-        sessions,
-    } = wire_shell_handlers(
+    // SessionManager shared by the client-request path (binds sessions)
+    // and the list-clients handler (reads them). It also carries this
+    // shard's cluster roster for the GetClusterMetadata read.
+    let host = Rc::new(ServerHost::new(
         &bus,
         &shard_handle,
-        Arc::clone(&config.system),
+        Arc::new(config.clone()),
         config.personal_access_token.max_tokens_per_user,
-    );
+    ));
+    let sessions = Rc::clone(host.sessions());
+    let consumer_group_liveness = Rc::clone(host.consumer_group_liveness());
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -257,16 +271,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
-        on_replica_message,
-        Rc::clone(&on_client_request),
-        on_metadata_submit,
-        on_list_clients,
-        on_partition_read,
+        host,
         metadata,
         partitions,
         senders,
         inbox,
         reply_inbox,
+        config.sharding.poll_completion_capacity,
         shards_table,
         PartitionConsensusConfig::new(
             topology.cluster_id,
@@ -308,7 +319,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     Ok(ShardBuild {
         shard,
         sessions,
-        on_client_request,
+        consumer_group_liveness,
         shard_handle,
     })
 }
@@ -558,10 +569,12 @@ pub(in crate::boot) fn restore_metadata_consensus(
             // A present but unreadable superblock already refused boot in
             // `recover()`, so no durable record means genuinely absent: a
             // fresh node, or one that took writes but never checkpointed or
-            // changed view. There, inferring the view from the last WAL
-            // prepare is safe, since the persist-before-send gate guarantees
-            // this replica never externalized a view beyond what a re-probe
-            // re-derives, and it re-probes as a backup.
+            // changed view. The view of the last WAL prepare stands in there,
+            // and raises the view of a record whose `log_view` is zero; it
+            // never sets `log_view`. Inferring it is safe, since the
+            // persist-before-send gate guarantees this replica never
+            // externalized a view beyond what a re-probe re-derives, and it
+            // re-probes as a backup.
             durable_view: recovered_state.map(|state| (state.view, state.log_view)),
             view_fallback: last_header.map(|header| header.view),
             // Metadata, not a partition group: it has a journal to infer from
@@ -660,6 +673,33 @@ pub(in crate::boot) fn restore_metadata_consensus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_runtime_and_server_use_the_same_fixed_directory_layout() {
+        let server = ServerConfig {
+            path: "/var/lib/iggy".to_owned(),
+            ..ServerConfig::default()
+        };
+        let partition = PartitionsConfig {
+            messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: IggyByteSize::from(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            validate_checksum: server.partition.validate_checksum,
+            segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            encryptor: None,
+            path_layout: partitions::PartitionPathLayout {
+                streams_root: server.get_streams_path(),
+            },
+        };
+        for (stream, topic, id) in [(0, 0, 0), (1, 2, 3), (23, 45, 67)] {
+            assert_eq!(
+                server.get_partition_path(stream, topic, id),
+                partition.get_partition_path(stream, topic, id)
+            );
+        }
+    }
 
     #[test]
     fn superblock_fatal_window_converts_to_capped_backoff_retries() {
@@ -1000,6 +1040,24 @@ mod tests {
             config_default as u64,
             shard::REPAIR_CHUNK_MAX,
             "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn wal_capacity_defaults_and_bounds_match_journal() {
+        assert_eq!(
+            configs::partition::PartitionConfig::default()
+                .wal_bytes_max
+                .as_bytes_u64(),
+            journal::partition_journal::PARTITION_WAL_BYTES_MAX
+        );
+        assert_eq!(
+            configs::partition::MIN_PARTITION_WAL_BYTES_MAX,
+            journal::partition_journal::PARTITION_WAL_CAPACITY_MIN
+        );
+        assert_eq!(
+            configs::partition::MAX_PARTITION_WAL_BYTES_MAX,
+            journal::partition_journal::PARTITION_WAL_CAPACITY_MAX
         );
     }
 

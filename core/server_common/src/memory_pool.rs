@@ -44,8 +44,8 @@ const BUCKET_SIZES: [usize; NUM_BUCKETS] = [
     768 * 1024,
     1024 * 1024,
     1536 * 1024,
-    2 * 1024 * 1024, // Above 2MiB everything should be rounded up to the next power of 2 to take advantage of hugepages
-    4 * 1024 * 1024, // (environment variables MIMALLOC_ALLOW_LARGE_OS_PAGES=1 and MIMALLOC_LARGE_OS_PAGES=1).
+    2 * 1024 * 1024, // Larger buckets use 2 MiB multiples to fit large OS pages.
+    4 * 1024 * 1024,
     6 * 1024 * 1024,
     8 * 1024 * 1024,
     10 * 1024 * 1024,

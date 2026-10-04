@@ -67,7 +67,7 @@ async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 messages_required_to_save: Some(1),
-                enforce_fsync: Some(false),
+                durability: iggy_common::Durability::Replicated,
                 ..TopicCreateOptions::default()
             },
         )

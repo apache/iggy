@@ -133,6 +133,7 @@ var goHeaderOffsets = map[string]map[string]int{
 	"ReplyHeader": {
 		"size":      replyOffsetSize,
 		"command":   replyOffsetCommand,
+		"commit":    replyOffsetCommit,
 		"operation": replyOffsetOperation,
 		"status":    replyOffsetStatus,
 	},
@@ -144,10 +145,6 @@ var goHeaderOffsets = map[string]map[string]int{
 		"reason":                      evictionOffsetReason,
 	},
 }
-
-// unimplementedCommandCodes are protocol codes the Go SDK deliberately does
-// not declare. FlushUnsavedBuffer has no Go client method.
-var unimplementedCommandCodes = []uint32{102}
 
 // rustFieldLayout is the size and alignment of every field type the consensus
 // headers use, enough to recompute their repr(C) offsets.
@@ -280,8 +277,7 @@ func TestProtocolParity_CommandCodes(t *testing.T) {
 		}
 	}
 	slices.Sort(missing)
-	assert.Equal(t, unimplementedCommandCodes, missing,
-		"the set of protocol codes the Go SDK does not declare has changed")
+	assert.Empty(t, missing, "protocol command codes the Go SDK does not declare")
 }
 
 func TestProtocolParity_OperationDiscriminants(t *testing.T) {

@@ -17,4 +17,7 @@
 
 mod container;
 
-pub use container::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use container::{
+    QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,
+    QuickwitTextFixture,
+};

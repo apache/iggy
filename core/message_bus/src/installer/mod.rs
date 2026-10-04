@@ -50,16 +50,17 @@ use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
 use crate::installer::conn_info::ClientConnMeta;
 use crate::replica::listener::MessageHandler;
-use crate::{ClientConnectionLostFn, IggyMessageBus, ReplicaHandshakeDoneFn};
+use crate::{
+    ClientConnectionLostFn, ConnectionPermit, IggyMessageBus, ReplicaHandshakeDoneFn,
+    SharedTlsServerConfig,
+};
 use std::rc::Rc;
 use tracing::warn;
 
 /// Operations a shard needs to perform on its local bus when the router
 /// receives an inter-shard connection-setup frame.
 ///
-/// The production implementation is on `Rc<IggyMessageBus>`. The simulator
-/// does not exercise this path; if it ever does, add a no-op impl on
-/// `SharedSimOutbox`.
+/// The production implementation is on `Rc<IggyMessageBus>`.
 pub trait ConnectionInstaller {
     /// Wrap a blind-delegated inbound replica fd into a `TcpStream` on
     /// the local compio runtime, run the acceptor handshake in a spawned
@@ -99,8 +100,16 @@ pub trait ConnectionInstaller {
     /// Same for an SDK client connection. The owning shard is already
     /// encoded in the top 16 bits of `meta.client_id`. `meta` is stored
     /// on the bus and exposed via [`IggyMessageBus::client_meta`] for
-    /// the lifetime of the connection.
-    fn install_client_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
+    /// the lifetime of the connection. `permit` is the socket's slot in
+    /// the node's connection cap, and the install holds it until the socket
+    /// closes.
+    fn install_client_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
 
     /// Same for an SDK WebSocket client's pre-upgrade TCP fd. The
     /// receiving shard wraps the fd, runs
@@ -111,7 +120,35 @@ pub trait ConnectionInstaller {
     /// the fd is closed by dropping the wrapping `TcpStream`. No
     /// subprotocol negotiation: the caller (the server) gates command
     /// access via the LOGIN allowlist.
-    fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
+    fn install_client_ws_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
+
+    /// Wrap an unhandshaken TCP-TLS fd on this runtime and install its
+    /// transport task. The task owns the handshake, I/O and cleanup.
+    fn install_client_tcp_tls_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
+
+    /// Install an unhandshaken WSS fd on this runtime. TLS and the WebSocket
+    /// upgrade share the existing `handshake_grace` deadline in the task.
+    fn install_client_wss_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    );
 
     /// Per-connection metadata stored at install time, or `None` if the client
     /// is not (or no longer) connected on this bus. Dispatch reads `peer_addr`
@@ -153,12 +190,24 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         self.clear_dial_pending(replica_id);
     }
 
-    fn install_client_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {
+    fn install_client_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_client_tcp(self, meta, stream, on_request);
+        install_client_tcp(self, meta, stream, permit, on_request);
     }
 
-    fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {
+    fn install_client_ws_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
         let bus = Self::clone(self);
         let cfg = bus.config();
@@ -173,11 +222,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
             )
             .await;
             match outcome {
-                Ok(Ok(ws)) => {
-                    if !bus.is_shutting_down() {
-                        install_client_ws(&bus, meta, ws, on_request);
-                    }
-                }
+                Ok(Ok(ws)) => install_client_ws(&bus, meta, ws, permit, on_request),
                 Ok(Err(e)) => {
                     warn!(client_id = meta.client_id, "WS upgrade failed: {e}");
                 }
@@ -191,6 +236,30 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
             }
         });
         self.track_background(handle);
+    }
+
+    fn install_client_tcp_tls_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
+        install_client_tcp_tls(self, meta, stream, config, permit, on_request);
+    }
+
+    fn install_client_wss_fd(
+        &self,
+        fd: DupedFd,
+        meta: ClientConnMeta,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+        on_request: RequestHandler,
+    ) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
+        install_client_wss(self, meta, stream, config, permit, on_request);
     }
 
     fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {

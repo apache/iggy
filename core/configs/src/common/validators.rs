@@ -18,12 +18,12 @@
 use super::COMPONENT;
 use super::server::{DataMaintenanceConfig, MessagesMaintenanceConfig, TelemetryConfig};
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig};
-use super::system::SegmentConfig;
-use super::system::{LoggingConfig, PartitionConfig};
+use super::system::LoggingConfig;
 use crate::ConfigurationError;
 use cpu_allocation::{CpuAllocation, allowed_cpus};
 use err_trail::ErrContext;
 use iggy_common::Validatable;
+use server_common::log::LogFilter;
 use std::thread::available_parallelism;
 
 /// 1 GiB max segment size.
@@ -50,23 +50,6 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for PartitionConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        // The flush thresholds this used to check are per-topic creation
-        // options now; their bounds are enforced at admission.
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for SegmentConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        // Segment size is a per-topic creation option now; its ceiling, floor
-        // and 512 B-multiple rule are enforced by
-        // `iggy_common::validate_topic_segment_size` at admission.
         Ok(())
     }
 }
@@ -111,14 +94,17 @@ impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
 
 impl Validatable<ConfigurationError> for LoggingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.level.is_empty() {
-            eprintln!("system.logging.level is supposed be configured");
+        if let Err(error) = self.level.parse::<LogFilter>() {
+            eprintln!(
+                "Configured logging.level {:?} is invalid: {error}",
+                self.level
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if self.retention.as_secs() < 1 {
+        if !self.retention.is_zero() && self.retention.as_secs() < 1 {
             eprintln!(
-                "Configured system.logging.retention {} is less than minimum 1 second",
+                "Configured logging.retention {} is less than minimum 1 second, use 0 to turn off deletion by age",
                 self.retention
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -126,8 +112,17 @@ impl Validatable<ConfigurationError> for LoggingConfig {
 
         if self.rotation_check_interval.as_secs() < 1 {
             eprintln!(
-                "Configured system.logging.rotation_check_interval {} is less than minimum 1 second",
+                "Configured logging.rotation_check_interval {} is less than minimum 1 second",
                 self.rotation_check_interval
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if !self.sysinfo_print_interval.is_zero() && self.sysinfo_print_interval.as_secs() < 1 {
+            eprintln!(
+                "Configured logging.sysinfo_print_interval {} is less than minimum 1 second, \
+                 use \"0 s\" to disable it",
+                self.sysinfo_print_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -137,7 +132,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
             && self.max_file_size.as_bytes_u64() > self.max_total_size.as_bytes_u64()
         {
             eprintln!(
-                "Configured system.logging.max_total_size {} is less than system.logging.max_file_size {}",
+                "Configured logging.max_total_size {} is less than logging.max_file_size {}",
                 self.max_total_size, self.max_file_size
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -150,9 +145,7 @@ impl Validatable<ConfigurationError> for LoggingConfig {
 impl Validatable<ConfigurationError> for MemoryPoolConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.enabled && self.size == 0 {
-            eprintln!(
-                "Configured system.memory_pool.enabled is true and system.memory_pool.size is 0"
-            );
+            eprintln!("Configured memory_pool.enabled is true and memory_pool.size is 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -162,7 +155,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && self.size < MIN_POOL_SIZE {
             eprintln!(
-                "Configured system.memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
+                "Configured memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
                 self.size.as_bytes_u64(),
                 self.size.as_bytes_u64() / (1024 * 1024),
                 MIN_POOL_SIZE,
@@ -173,7 +166,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
             eprintln!(
-                "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
+                "Configured memory_pool.size {} B is not a multiple of default page size {} B",
                 self.size.as_bytes_u64(),
                 DEFAULT_PAGE_SIZE
             );
@@ -182,7 +175,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && self.bucket_capacity < MIN_BUCKET_CAPACITY {
             eprintln!(
-                "Configured system.memory_pool.buffers {} is less than minimum {}",
+                "Configured memory_pool.buffers {} is less than minimum {}",
                 self.bucket_capacity, MIN_BUCKET_CAPACITY
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -190,7 +183,7 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
         if self.enabled && !self.bucket_capacity.is_power_of_two() {
             eprintln!(
-                "Configured system.memory_pool.buffers {} is not a power of 2",
+                "Configured memory_pool.buffers {} is not a power of 2",
                 self.bucket_capacity
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -307,5 +300,85 @@ mod cpu_allocation_tests {
 
         let available = available_parallelism().unwrap().get();
         assert!(validate_cpu_allocation(&CpuAllocation::Range(0, available + 1), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use iggy_common::{IggyByteSize, IggyDuration};
+    use std::time::Duration;
+
+    fn with_sysinfo_print_interval(interval: Duration) -> LoggingConfig {
+        LoggingConfig {
+            sysinfo_print_interval: IggyDuration::new(interval),
+            ..LoggingConfig::default()
+        }
+    }
+
+    #[test]
+    fn sub_second_sysinfo_print_interval_is_rejected() {
+        let config = with_sysinfo_print_interval(Duration::from_millis(999));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn one_second_sysinfo_print_interval_is_accepted() {
+        let config = with_sysinfo_print_interval(Duration::from_secs(1));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_sysinfo_print_interval_is_accepted() {
+        let config = with_sysinfo_print_interval(Duration::ZERO);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn level_that_is_not_a_level_is_rejected() {
+        let config = LoggingConfig {
+            level: "inof".to_owned(),
+            ..LoggingConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_retention_is_accepted() {
+        let config = LoggingConfig {
+            retention: IggyDuration::new(Duration::ZERO),
+            ..LoggingConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sub_second_retention_and_check_interval_are_rejected() {
+        let half_second = IggyDuration::new(Duration::from_millis(500));
+        let retention = LoggingConfig {
+            retention: half_second,
+            ..LoggingConfig::default()
+        };
+        let check_interval = LoggingConfig {
+            rotation_check_interval: half_second,
+            ..LoggingConfig::default()
+        };
+        assert!(retention.validate().is_err());
+        assert!(check_interval.validate().is_err());
+    }
+
+    #[test]
+    fn max_total_size_below_max_file_size_is_rejected_unless_unlimited() {
+        let below = LoggingConfig {
+            max_file_size: IggyByteSize::from(100),
+            max_total_size: IggyByteSize::from(50),
+            ..LoggingConfig::default()
+        };
+        let unlimited = LoggingConfig {
+            max_total_size: IggyByteSize::from(0),
+            ..below.clone()
+        };
+        assert!(below.validate().is_err());
+        assert!(unlimited.validate().is_ok());
     }
 }

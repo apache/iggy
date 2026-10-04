@@ -50,7 +50,7 @@ public class IggyConsumerConfig
     public bool CreateIggyClient { get; set; }
 
     /// <summary>
-    ///     The protocol to use for communication (TCP, QUIC, HTTP)
+    ///     The protocol to use for communication (TCP or HTTP)
     /// </summary>
     public Protocol Protocol { get; set; }
 
@@ -100,7 +100,7 @@ public class IggyConsumerConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Optional partition ID to consume from. If null, consumes from all partitions.
+    ///     Optional partition ID to consume from. If null, selects partition 0.
     ///     Note: This is ignored when using consumer groups.
     /// </summary>
     public uint? PartitionId { get; set; }

@@ -55,7 +55,7 @@ fn msgs_req_9984() -> u32 {
 }
 
 /// The two axes that used to be `[system.segment] size` and
-/// `[system.partition] messages_required_to_save` are topic creation options
+/// `[partition] messages_required_to_save` are topic creation options
 /// now, so they travel with the topic the scenario creates rather than with
 /// the server.
 fn topic_options(segment_size: u64, messages_required_to_save: u32) -> TopicCreateOptions {

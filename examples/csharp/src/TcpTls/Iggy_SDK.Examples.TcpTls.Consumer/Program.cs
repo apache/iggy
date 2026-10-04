@@ -100,12 +100,12 @@ async Task ConsumeMessages()
             continue;
         }
 
-        offset += (ulong)polledMessages.Messages.Count;
         foreach (var message in polledMessages.Messages)
         {
             var payload = Encoding.UTF8.GetString(message.Payload);
             logger.LogInformation("Handling message at offset: {Offset}, payload: {Payload}...",
                 message.Header.Offset, payload);
+            offset = message.Header.Offset + 1;
         }
         consumedBatches++;
         await Task.Delay(interval);

@@ -54,7 +54,7 @@ for getting them to the external system reliably and efficiently.
 
 ### Payloads (efficiency-critical)
 
-- Dispatch on `messages_metadata.schema` and the `Payload` variant. Handle `Json`, `Raw`, `Text` at minimum. Unsupported -> `Error::InvalidPayloadType` or fall back to base64 (`elasticsearch_sink`).
+- Dispatch on the `Payload` variant. Handle `Json`, `Raw`, `Text` and `Proto` at minimum. `Proto` holds text that is a JSON document when `proto_convert` had no descriptor or could not encode, and arbitrary text otherwise: call `Payload::json_document()` first and fall back to the text handling when it returns `None`. Unsupported -> `Error::InvalidPayloadType` or fall back to base64 (`elasticsearch_sink`).
 - For `Payload::Json`, call `try_to_bytes(&self)` - single-pass serialization without cloning the `OwnedValue` tree (`sdk/src/lib.rs::Payload::try_to_bytes`). Never `payload.clone().try_into_vec()`.
 - To take a payload out of `ConsumedMessage` without cloning: `std::mem::replace(&mut message.payload, Payload::Raw(vec![]))`. Standard pattern across `http_sink::send_individual` / `send_ndjson` / `send_json_array`.
 - Pre-allocate per-batch buffers with `Vec::with_capacity(messages.len())` (or `* factor` for serialized bodies). Used across `postgres_sink`, `mongodb_sink`, `quickwit_sink`, `elasticsearch_sink`, `http_sink`.
@@ -82,7 +82,8 @@ for getting them to the external system reliably and efficiently.
 - SDK helpers cover the simple case: `iggy_connector_sdk::retry::check_connectivity_with_retry(...)` for `open()`, `HttpRetryMiddleware` for default 429/5xx/network policy on reqwest clients.
 - Custom strategies: `reqwest-middleware` + `reqwest_retry::RetryTransientMiddleware::new_with_policy_and_strategy`. `http_sink` defines its own `HttpSinkRetryStrategy` (honors `success_status_codes`, per-status decisions).
 - Non-HTTP clients: write `is_transient_error(&e)` mapping driver-specific codes. `postgres_sink::is_transient_error` maps SQLSTATEs `40001`, `40P01`, `57P01-03`, `08000/03/06`.
-- Backoff: `iggy_connector_sdk::retry::exponential_backoff(base, attempt, max)` + `jitter()`.
+- Retry loop: new connectors use `iggy_connector_sdk::retry::retry_async(policy, context, should_retry, op)` for anything that fails as `Err`. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }`; the caller logs the terminal failure.
+- Backoff only, for a loop that computes its own delay (it retries on an `Ok` response, carries a deadline, or reconnects between attempts): `retry_backoff(base, retry, max)`, where `retry` is 1-based. `exponential_backoff` is the 0-based primitive underneath, and it applies no jitter; call it directly only when the delay must be exact, as `sdk/src/source.rs::nack_retry_delay` needs for its tests.
 - Cap retries at 3 total attempts.
 
 ### Idempotency

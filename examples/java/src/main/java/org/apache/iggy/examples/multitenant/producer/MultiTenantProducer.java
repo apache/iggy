@@ -20,6 +20,7 @@
 package org.apache.iggy.examples.multitenant.producer;
 
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.exception.IggyAuthorizationException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -286,7 +287,7 @@ public final class MultiTenantProducer {
     private static Optional<StreamDetails> tryGetStream(IggyTcpClient client, StreamId streamId) {
         try {
             return client.streams().getStream(streamId);
-        } catch (Exception e) {
+        } catch (IggyAuthorizationException e) {
             log.debug("Unable to get stream {}: {}", streamId.getName(), e.getMessage());
             return Optional.empty();
         }

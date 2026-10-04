@@ -36,6 +36,7 @@
 
 use crate::Simulator;
 use crate::replica::Replica;
+use crate::workload::invariants::Invariants;
 use crate::workload::shadow::Shadow;
 use crate::workload::{Workload, apply_sim_commands, resubmit_due, state_checker};
 use consensus::{Consensus, MetadataHandle, Status};
@@ -102,8 +103,19 @@ impl CommittedMetadata {
 ///
 /// Returns `true` once drained, `false` if `max_ticks` elapses with requests
 /// still outstanding (a liveness failure the caller should surface).
+///
+/// `invariants` is the checker the active phase ran, carried in rather than built
+/// here. A drain is up to 50,000 ticks of a cluster still repairing itself, so a
+/// wedge that forms during it used to surface as nothing more than "did not drain",
+/// and a fresh checker would start with an empty commit chain, which is the memory
+/// that names a divergence.
 #[must_use]
-pub fn drive_to_quiesce(sim: &mut Simulator, workload: &mut Workload, max_ticks: u64) -> bool {
+pub fn drive_to_quiesce(
+    sim: &mut Simulator,
+    workload: &mut Workload,
+    max_ticks: u64,
+    invariants: &mut Invariants,
+) -> bool {
     let mut drained = false;
     for _ in 0..max_ticks {
         // The drain keeps resending: a request lost on the way out is never
@@ -122,6 +134,7 @@ pub fn drive_to_quiesce(sim: &mut Simulator, workload: &mut Workload, max_ticks:
         for client_id in sim.take_evictions() {
             workload.forget_evicted_client(client_id);
         }
+        invariants.check(sim, workload);
         if workload.total_in_flight() == 0 {
             drained = true;
             break;
@@ -135,6 +148,7 @@ pub fn drive_to_quiesce(sim: &mut Simulator, workload: &mut Workload, max_ticks:
             let cmds = workload.on_reply(&reply);
             apply_sim_commands(sim, &cmds);
         }
+        invariants.check(sim, workload);
     }
     true
 }
@@ -251,8 +265,16 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
 ///
 /// Returns `false` if the views never converge, which is a real liveness failure
 /// the caller should report rather than assert against an unsettled cluster.
+///
+/// Runs `invariants` per tick for the same reason [`drive_to_quiesce`] does: this is
+/// another 50,000-tick window, and it is the one a view change wedges in.
 #[must_use]
-pub fn settle_to_stable_view(sim: &mut Simulator, workload: &mut Workload, max_ticks: u64) -> bool {
+pub fn settle_to_stable_view(
+    sim: &mut Simulator,
+    workload: &mut Workload,
+    max_ticks: u64,
+    invariants: &mut Invariants,
+) -> bool {
     for _ in 0..max_ticks {
         if views_are_settled(sim, workload) {
             return true;
@@ -263,6 +285,7 @@ pub fn settle_to_stable_view(sim: &mut Simulator, workload: &mut Workload, max_t
             let cmds = workload.on_reply(&reply);
             apply_sim_commands(sim, &cmds);
         }
+        invariants.check(sim, workload);
     }
     views_are_settled(sim, workload)
 }
@@ -435,10 +458,20 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
         }
     }
 
+    // Partition-plane twin of the walk above: that one bounds how much each
+    // replica committed, this compares what they committed.
+    let partition_ops_compared =
+        state_checker::assert_partition_prefixes_agree(sim, &workload.options.namespaces, seed);
+    tracing::info!(
+        partition_ops_compared,
+        "committed partition entries agree across every live replica"
+    );
+
     let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
 
     let report = ConvergenceReport {
         ops_compared,
+        partition_ops_compared,
         replicas_compared,
         namespaces_checked,
     };
@@ -491,6 +524,10 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
 pub struct ConvergenceReport {
     /// Committed metadata ops witnessed by more than one live replica.
     pub ops_compared: usize,
+    /// Committed partition ops witnessed by more than one live replica, summed over
+    /// every namespace. Separate from `ops_compared`: a partition-plane run commits
+    /// almost no metadata and would otherwise read as having compared nothing.
+    pub partition_ops_compared: usize,
     /// Live replicas whose committed metadata CONTENT was compared against a peer
     /// sharing its commit point. Zero on a solo cluster.
     pub replicas_compared: usize,

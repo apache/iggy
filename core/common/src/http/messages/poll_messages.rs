@@ -53,6 +53,10 @@ pub struct PollMessages {
     #[serde(default = "PollMessages::default_number_of_messages_to_poll")]
     pub count: u32,
     /// Whether to commit offset on the server automatically after polling the messages.
+    /// The cursor can advance before the response arrives, and a successful
+    /// response does not acknowledge a durable offset commit. See the
+    /// [poll recovery contract](crate::MessageClient::poll_messages) for retrying
+    /// a missing response with explicit offsets for each partition.
     #[serde(default)]
     pub auto_commit: bool,
 }

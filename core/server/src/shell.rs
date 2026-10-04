@@ -18,19 +18,16 @@
 //! The shell vocabulary.
 //!
 //! The shard/metadata type aliases the dispatch layer is generic over, the
-//! [`ShellBus`] bound, the [`ShellHandlers`] slot struct, and the
-//! `[cluster]` timer-to-tick translation every consensus group boots with.
-//! Everything here is type- and config-level; construction (wiring the
-//! handlers against a live bus) stays in [`crate::boot`].
+//! [`ShellBus`] bound, and the `[cluster]` timer-to-tick translation every
+//! consensus group boots with. Everything here is type- and config-level;
+//! construction (the shard host against a live bus) stays in
+//! [`crate::boot`].
 
-use crate::session_manager::SessionManager;
 use configs::server::ServerConfig;
 use consensus::{ConsensusTimers, VsrConsensus};
 use iggy_common::variadic;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
-use message_bus::client_listener::RequestHandler;
-use message_bus::replica::listener::MessageHandler;
 use message_bus::{ConnectionInstaller, IggyMessageBus, MessageBus};
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -38,8 +35,8 @@ use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
+use shard::IggyShard;
 use shard::shards_table::PapayaShardsTable;
-use shard::{IggyShard, ListClientsHandler, MetadataSubmitHandler, PartitionReadHandler};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -69,7 +66,11 @@ pub(crate) type ServerMetadata = IggyMetadata<
 pub type ShellShard<B, MJ, S, SB = PingPongSuperblock> =
     IggyShard<B, MJ, S, ServerMuxStateMachine, PapayaShardsTable, SB>;
 
-/// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
+/// Late-bound self-reference the shard host's handlers upgrade per frame.
+///
+/// Weak, not a strong `Rc`: the shard owns the host, so a strong reference
+/// here would close the shard -> host -> shard cycle and keep the shard
+/// alive past shutdown.
 pub type ShellShardHandle<B, MJ, S, SB = PingPongSuperblock> =
     Rc<RefCell<Option<Weak<ShellShard<B, MJ, S, SB>>>>>;
 
@@ -77,42 +78,6 @@ pub type ShellShardHandle<B, MJ, S, SB = PingPongSuperblock> =
 /// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
 pub trait ShellBus: MessageBus + ConnectionInstaller + Clone + 'static {}
 impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
-
-/// The five dispatch handlers a shard is built with, plus the
-/// [`SessionManager`] the request-plane pair shares.
-///
-/// Both production (`build_shard_for_thread`) and the simulator's shell
-/// mode construct these through [`crate::boot::wire_shell_handlers`],
-/// so the request plane is wired one way. The simulator's shell-off fast
-/// path uses [`ShellHandlers::noop`] instead.
-pub struct ShellHandlers {
-    pub on_replica_message: MessageHandler,
-    pub on_client_request: RequestHandler,
-    pub on_metadata_submit: MetadataSubmitHandler,
-    pub on_list_clients: ListClientsHandler,
-    pub on_partition_read: PartitionReadHandler,
-    /// Bound by the client-request handler, read by the get-clients
-    /// handler; the caller keeps it to reach locally-homed sessions.
-    pub sessions: Rc<RefCell<SessionManager>>,
-}
-
-impl ShellHandlers {
-    /// Inert handlers for the shell-off fast path: every callback is a
-    /// no-op over an empty [`SessionManager`]. Behaviorally identical to
-    /// hand-written no-op closures, so a caller can keep one destructure
-    /// site across both toggle states.
-    #[must_use]
-    pub fn noop() -> Self {
-        Self {
-            on_replica_message: Rc::new(|_, _| {}),
-            on_client_request: Rc::new(|_, _| {}),
-            on_metadata_submit: Rc::new(|_| {}),
-            on_list_clients: Rc::new(|_| {}),
-            on_partition_read: Rc::new(|_, _, _| {}),
-            sessions: Rc::new(RefCell::new(SessionManager::new())),
-        }
-    }
-}
 
 pub type ServerShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>;
 

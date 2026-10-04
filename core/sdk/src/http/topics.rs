@@ -85,7 +85,7 @@ impl TopicClient for HttpClient {
                     // has no dedicated field for them, and dropping them here
                     // gave one transport a topic without the fsync the caller
                     // asked for while the other honored it.
-                    options: options.to_string_options(),
+                    options: options.to_string_options()?,
                 },
             )
             .await?;

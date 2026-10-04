@@ -19,7 +19,14 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import HeaderValue, IggyClient, IggyExpiry, MaxTopicSize, SendMessage
+from apache_iggy import (
+    Durability,
+    HeaderValue,
+    IggyClient,
+    IggyExpiry,
+    MaxTopicSize,
+    SendMessage,
+)
 
 from .utils import (
     get_server_config,
@@ -1380,7 +1387,8 @@ class TestTopicOptions:
             stream=stream_name,
             name=topic_name,
             partitions_count=1,
-            options={"enforce_fsync": "true", "segment_size": "128 MiB"},
+            durability=Durability.PERSISTED,
+            options={"segment_size": "128 MiB"},
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -1388,17 +1396,17 @@ class TestTopicOptions:
         # Options come back through the same typed dict message user headers
         # use, so the scalar helper reads them the same way.
         explicit = topic.options.to_scalar_dict()
-        assert explicit["enforce_fsync"] is True
+        assert explicit["durability"] == "persisted"
         assert explicit["segment_size"] == 128 * 1024 * 1024
         # Keys the client left alone are resolved by admission and reported
         # separately, so an operator can tell chosen from defaulted.
         derived = topic.derived_options.to_scalar_dict()
         assert "max_topic_size" in derived
-        assert "enforce_fsync" not in derived
+        assert "durability" not in derived
 
         topics = await iggy_client.get_topics(stream_name)
         listed = next(entry for entry in topics if entry.name == topic_name)
-        assert listed.options.to_scalar_dict()["enforce_fsync"] is True
+        assert listed.options.to_scalar_dict()["durability"] == "persisted"
 
     @pytest.mark.asyncio
     async def test_update_topic_options_reach_the_server(
@@ -1443,7 +1451,8 @@ class TestTopicOptions:
 
         by_key = {spec.key: spec for spec in specs}
         assert "segment_size" in by_key
-        assert "enforce_fsync" in by_key
+        assert "durability" in by_key
+        assert "consumer_offset_durability" in by_key
         segment_size = by_key["segment_size"]
         assert segment_size.kind == "uint64"
         # The default is the same HeaderValue type message headers carry, so it

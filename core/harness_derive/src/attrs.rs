@@ -766,7 +766,7 @@ mod tests {
     fn parse_dot_notation_deep() {
         let attrs: IggyTestAttrs = syn::parse_quote!(server(
             metadata.journal_slots = [512, 1024],
-            system.encryption.enabled = true
+            encryption.enabled = true
         ));
         assert_eq!(attrs.server.config_overrides.len(), 2);
         let msgs = attrs

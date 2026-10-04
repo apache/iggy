@@ -73,7 +73,7 @@ runs:
         # Pin version of hwloc to 2.12.2_1
         # brew extract doesn't have this version, so we fetch the formula directly
         brew tap-new iggy/local-hwloc
-        curl -fsSL https://raw.githubusercontent.com/Homebrew/homebrew-core/bb1e23f8e5eacf4d31acd489f6079c8a53ebd690/Formula/h/hwloc.rb \
+        curl -fsSL --retry 5 --retry-all-errors https://raw.githubusercontent.com/Homebrew/homebrew-core/bb1e23f8e5eacf4d31acd489f6079c8a53ebd690/Formula/h/hwloc.rb \
           -o "$(brew --repository iggy/local-hwloc)/Formula/hwloc.rb"
         brew install iggy/local-hwloc/hwloc
       shell: bash
@@ -144,7 +144,12 @@ runs:
             ;;
         esac
 
-        curl -LsSf "https://get.nexte.st/latest/${NEXTEST_PLATFORM}" | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+        CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+        tarball="$(mktemp)"
+        # Staged to a file because curl --retry cannot rewind a pipe.
+        curl -LsSf --retry 5 --retry-all-errors -o "$tarball" "https://get.nexte.st/latest/${NEXTEST_PLATFORM}"
+        tar xzf "$tarball" -C "$CARGO_BIN"
+        rm -f "$tarball"
         cargo nextest --version
       shell: bash
       continue-on-error: true
@@ -152,8 +157,8 @@ runs:
     - name: Configure Cargo for CI
       if: inputs.read-cache == 'true'
       run: |
-        echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
-        echo "CARGO_PROFILE_DEV_DEBUG=0" >> $GITHUB_ENV
-        echo "CARGO_PROFILE_TEST_DEBUG=0" >> $GITHUB_ENV
-        echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> $GITHUB_ENV
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> "$GITHUB_ENV"
       shell: bash
