@@ -21,7 +21,8 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use humantime::Duration as HumanDuration;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ use sqlx::{Column, MySql, Pool, Row, TypeInfo, mysql::MySqlPoolOptions};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -56,12 +57,23 @@ const DISABLED_TABLES_LOG_INTERVAL: u64 = 60;
 /// is a stall the operator has to see.
 const CURSOR_REGRESSION_ERROR_THRESHOLD: u32 = 3;
 
+/// Upper bound on applying a batch's staged mark/delete after its Ack. The SDK waits
+/// `BATCH_RESULT_TIMEOUT` (30s) for the result, so this has to finish well inside it.
+const ACK_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many mark/delete statements in a row may fail before the connector stops. The
+/// operations stay in the persisted state and run again on restart.
+const MAX_CONSECUTIVE_CLEANUP_FAILURES: u32 = 3;
+
 #[derive(Debug)]
 pub struct MySqlSource {
     pub id: u32,
     pool: Option<Pool<MySql>>,
     config: MySqlSourceConfig,
     state: Mutex<State>,
+    pending_batch: Mutex<Option<PendingBatch>>,
+    consecutive_cleanup_failures: AtomicU32,
+    verified_cleanup_keys: Mutex<HashSet<String>>,
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
@@ -373,6 +385,7 @@ impl PayloadFormat {
 /// converts the bound string to the column type). `Bytes` carries raw binary
 /// (BINARY/VARBINARY/BLOB) so a UUID stored as bytes matches the row instead of
 /// being compared as its base64 text, which never matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum PkValue {
     Text(String),
     Bytes(Vec<u8>),
@@ -406,10 +419,57 @@ struct RowProcessingConfig<'a> {
     include_metadata: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     tracking_offsets: HashMap<String, String>,
     processed_rows: u64,
+    /// Mark/delete work for a batch the runtime has already sent. It is persisted with
+    /// the batch's offsets so a crash between the send and the cleanup reruns it.
+    #[serde(default)]
+    pending_operations: Vec<PendingOperation>,
+}
+
+/// The rows of one table to mark or delete once their batch is acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingOperation {
+    table: String,
+    ids: Vec<PkValue>,
+    target: CleanupTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CleanupTarget {
+    key_column: String,
+    action: CleanupAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum CleanupAction {
+    Delete,
+    MarkProcessed { column: String },
+}
+
+/// The candidate state of the batch most recently handed to the runtime. Live state
+/// only takes it over on Ack, so a Nack leaves offsets and rows where they were.
+#[derive(Debug, Clone)]
+struct PendingBatch {
+    state: State,
+    /// The runtime has delivered the batch but its cleanup has not finished yet.
+    acknowledged: bool,
+    /// Cleanup finished and the next poll must persist `state` without the operations,
+    /// so a restart does not run them again.
+    retiring: bool,
+}
+
+struct PolledBatch {
+    messages: Vec<ProducedMessage>,
+    pending: Option<PendingBatch>,
+}
+
+enum CleanupKeyCheck {
+    Unique,
+    NotUnique,
+    TableMissing,
 }
 
 const CONNECTOR_NAME: &str = "MySQL source";
@@ -504,8 +564,10 @@ impl Source for MySqlSource {
             );
         }
 
+        self.validate_pending_cleanup()?;
         self.connect().await?;
         *self.tracking_kinds.get_mut() = self.resolve_tracking_columns().await?;
+        self.validate_cleanup_keys().await?;
 
         info!(
             "MySQL source connector with ID: {} opened successfully",
@@ -515,49 +577,128 @@ impl Source for MySqlSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        // Skip the pacing delay while draining a backlog
-        if !self.last_batch_full.load(Ordering::Relaxed) {
-            tokio::time::sleep(self.poll_interval).await;
-        }
-
-        let messages = self.poll_tables().await?;
-
-        let state = self.state.lock().await;
-        if self.verbose {
-            info!(
-                "MySQL source connector ID: {} produced {} messages. Total processed: {}",
-                self.id,
-                messages.len(),
-                state.processed_rows
-            );
-        } else {
-            debug!(
-                "MySQL source connector ID: {} produced {} messages. Total processed: {}",
-                self.id,
-                messages.len(),
-                state.processed_rows
-            );
-        }
-
         let schema = match self.payload_format() {
             PayloadFormat::Bytea => Schema::Raw,
             PayloadFormat::Text => Schema::Text,
             PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
         };
 
-        // Idle cycles produce no messages and leave offsets/processed_rows
-        // untouched, so return None to let the runtime skip the state fsync.
-        let persisted_state = if messages.is_empty() {
-            None
-        } else {
-            self.serialize_state(&state)
+        if let Some(state) = self.retiring_state().await {
+            return Ok(ProducedMessages {
+                schema,
+                messages: Vec::new(),
+                state: Some(self.serialize_pending_state(&state)?),
+            });
+        }
+
+        // Skip the pacing delay while draining a backlog, but never while a cleanup
+        // retry is pending, or a failing mark/delete would spin without a pause.
+        let cleanup_pending = self.pending_batch.lock().await.is_some();
+        if cleanup_pending || !self.last_batch_full.load(Ordering::Relaxed) {
+            tokio::time::sleep(self.poll_interval).await;
+        }
+
+        {
+            let pending = self.pending_batch.lock().await;
+            if let Some(pending) = pending.as_ref() {
+                if !pending.acknowledged {
+                    error!(
+                        "{CONNECTOR_NAME} connector ID: {} was polled while a batch was still in flight",
+                        self.id
+                    );
+                    return Err(Error::InvalidState);
+                }
+                // An empty batch whose Ack retries the cleanup the last one left behind.
+                return Ok(ProducedMessages {
+                    schema,
+                    messages: Vec::new(),
+                    state: None,
+                });
+            }
+        }
+
+        let polled = self.poll_tables().await?;
+
+        let processed_rows = match &polled.pending {
+            Some(pending) => pending.state.processed_rows,
+            None => self.state.lock().await.processed_rows,
         };
+        if self.verbose {
+            info!(
+                "MySQL source connector ID: {} produced {} messages. Total processed: {}",
+                self.id,
+                polled.messages.len(),
+                processed_rows
+            );
+        } else {
+            debug!(
+                "MySQL source connector ID: {} produced {} messages. Total processed: {}",
+                self.id,
+                polled.messages.len(),
+                processed_rows
+            );
+        }
+
+        // Idle cycles stage nothing, so return None to let the runtime skip the fsync.
+        let persisted_state = polled
+            .pending
+            .as_ref()
+            .map(|pending| self.serialize_pending_state(&pending.state))
+            .transpose()?;
+        *self.pending_batch.lock().await = polled.pending;
 
         Ok(ProducedMessages {
             schema,
-            messages,
+            messages: polled.messages,
             state: persisted_state,
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        if result == SourceBatchResult::Nack {
+            // Dropping the candidate leaves the live offsets where they were, so the
+            // next poll reads the same rows again. Delivered batches keep their cleanup.
+            let mut pending = self.pending_batch.lock().await;
+            if pending
+                .as_ref()
+                .is_some_and(|pending| !pending.acknowledged && !pending.retiring)
+            {
+                pending.take();
+            }
+            return Ok(());
+        }
+
+        let Some(PendingBatch { mut state, .. }) = self.pending_batch.lock().await.clone() else {
+            return Ok(());
+        };
+
+        let operations = std::mem::take(&mut state.pending_operations);
+        let had_operations = !operations.is_empty();
+        let deadline = tokio::time::Instant::now() + ACK_BATCH_TIMEOUT;
+        let failed_operations = self.apply_pending_operations(operations, deadline).await?;
+
+        if failed_operations.is_empty() {
+            *self.state.lock().await = state.clone();
+            let mut pending = self.pending_batch.lock().await;
+            if had_operations {
+                *pending = Some(PendingBatch {
+                    state,
+                    acknowledged: false,
+                    retiring: true,
+                });
+            } else {
+                pending.take();
+            }
+        } else {
+            state.pending_operations = failed_operations;
+            *self.pending_batch.lock().await = Some(PendingBatch {
+                state,
+                acknowledged: true,
+                retiring: false,
+            });
+        }
+
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -596,14 +737,26 @@ impl MySqlSource {
         let poll_interval = HumanDuration::from_str(interval_str)
             .map(|duration| duration.into())
             .unwrap_or_else(|_| Duration::from_secs(10));
+        let state = restored_state.unwrap_or(State {
+            tracking_offsets: HashMap::new(),
+            processed_rows: 0,
+            pending_operations: Vec::new(),
+        });
+        // The runtime only persists a batch's operations after sending it, so restored
+        // operations belong to a delivered batch and only the cleanup is left to do.
+        let pending_batch = (!state.pending_operations.is_empty()).then(|| PendingBatch {
+            state: state.clone(),
+            acknowledged: true,
+            retiring: false,
+        });
         MySqlSource {
             id,
             pool: None,
             config,
-            state: Mutex::new(restored_state.unwrap_or(State {
-                tracking_offsets: HashMap::new(),
-                processed_rows: 0,
-            })),
+            state: Mutex::new(state),
+            pending_batch: Mutex::new(pending_batch),
+            consecutive_cleanup_failures: AtomicU32::new(0),
+            verified_cleanup_keys: Mutex::new(HashSet::new()),
             verbose,
             retry_delay,
             poll_interval,
@@ -792,6 +945,129 @@ impl MySqlSource {
 
     fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
+    }
+
+    fn serialize_pending_state(&self, state: &State) -> Result<ConnectorState, Error> {
+        self.serialize_state(state).ok_or_else(|| {
+            Error::Serialization(format!("failed to serialize {CONNECTOR_NAME} state"))
+        })
+    }
+
+    async fn retiring_state(&self) -> Option<State> {
+        self.pending_batch
+            .lock()
+            .await
+            .as_ref()
+            .filter(|pending| pending.retiring)
+            .map(|pending| pending.state.clone())
+    }
+
+    fn primary_key_column(&self) -> &str {
+        self.config
+            .primary_key_column
+            .as_deref()
+            .unwrap_or(self.tracking_column())
+    }
+
+    fn cleanup_target(&self) -> Option<CleanupTarget> {
+        let action = if self.config.delete_after_read.unwrap_or(false) {
+            CleanupAction::Delete
+        } else if let Some(column) = &self.config.processed_column {
+            CleanupAction::MarkProcessed {
+                column: column.clone(),
+            }
+        } else {
+            return None;
+        };
+        Some(CleanupTarget {
+            key_column: self.primary_key_column().to_string(),
+            action,
+        })
+    }
+
+    /// Restored operations were staged under the config of the run that wrote them.
+    /// Running them under a different key or action would touch rows nobody read.
+    fn validate_pending_cleanup(&mut self) -> Result<(), Error> {
+        let configured = self.cleanup_target();
+        for operation in &self.state.get_mut().pending_operations {
+            if configured.as_ref() != Some(&operation.target) {
+                return Err(Error::InitError(format!(
+                    "the cleanup configuration changed while cleanup of {} delivered row(s) in \
+                     table '{}' is pending; restore primary_key_column '{}' and action {:?}",
+                    operation.ids.len(),
+                    operation.table,
+                    operation.target.key_column,
+                    operation.target.action
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `WHERE key IN (...)` on a key that repeats marks or deletes every row sharing a
+    /// value, including ones that were never read. Tables that don't exist yet are
+    /// checked by the first poll that stages cleanup for them.
+    async fn validate_cleanup_keys(&mut self) -> Result<(), Error> {
+        let Some(target) = self.cleanup_target() else {
+            return Ok(());
+        };
+        let pool = self.get_pool()?;
+        let mut verified = HashSet::with_capacity(self.config.tables.len());
+        for table in &self.config.tables {
+            let check = cleanup_key_check(pool, table, &target.key_column)
+                .await
+                .map_err(|e| {
+                    Error::InitError(format!(
+                        "failed to check primary_key_column '{}' on table '{table}': {e}",
+                        target.key_column
+                    ))
+                })?;
+            match check {
+                CleanupKeyCheck::Unique => {
+                    verified.insert(table.clone());
+                }
+                CleanupKeyCheck::NotUnique => {
+                    return Err(Error::InitError(not_unique_key_message(
+                        table,
+                        &target.key_column,
+                    )));
+                }
+                CleanupKeyCheck::TableMissing => {}
+            }
+        }
+        *self.verified_cleanup_keys.get_mut() = verified;
+        Ok(())
+    }
+
+    async fn cleanup_key_is_unique(
+        &self,
+        pool: &Pool<MySql>,
+        table: &str,
+        key_column: &str,
+    ) -> Result<bool, Error> {
+        if self.verified_cleanup_keys.lock().await.contains(table) {
+            return Ok(true);
+        }
+        let check = cleanup_key_check(pool, table, key_column)
+            .await
+            .map_err(|e| {
+                Error::Connection(format!(
+                    "failed to check primary_key_column '{key_column}' on table '{table}': {e}"
+                ))
+            })?;
+        match check {
+            CleanupKeyCheck::Unique => {
+                self.verified_cleanup_keys
+                    .lock()
+                    .await
+                    .insert(table.to_string());
+                Ok(true)
+            }
+            CleanupKeyCheck::NotUnique => Ok(false),
+            CleanupKeyCheck::TableMissing => Err(Error::Connection(format!(
+                "table '{table}' disappeared before its primary_key_column could be checked"
+            ))),
+        }
     }
 
     fn get_pool(&self) -> Result<&Pool<MySql>, Error> {
@@ -1003,41 +1279,107 @@ impl MySqlSource {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
     }
 
+    async fn apply_pending_operations(
+        &self,
+        operations: Vec<PendingOperation>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<PendingOperation>, Error> {
+        let mut failed_operations = Vec::new();
+        let mut operations = operations.into_iter();
+        while let Some(operation) = operations.next() {
+            if tokio::time::Instant::now() >= deadline {
+                failed_operations.push(operation);
+                failed_operations.extend(operations);
+                break;
+            }
+            let result = tokio::time::timeout_at(deadline, async {
+                let pool = self.get_pool()?;
+                self.mark_or_delete_processed_rows(pool, &operation).await
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {
+                    self.consecutive_cleanup_failures
+                        .store(0, Ordering::Relaxed);
+                }
+                Ok(Err(error)) => {
+                    self.record_cleanup_failure(&operation, &error)?;
+                    failed_operations.push(operation);
+                }
+                Err(_) => {
+                    self.record_cleanup_failure(
+                        &operation,
+                        "cleanup exceeded the 10s budget for one Ack",
+                    )?;
+                    failed_operations.push(operation);
+                }
+            }
+        }
+        Ok(failed_operations)
+    }
+
+    fn record_cleanup_failure(
+        &self,
+        operation: &PendingOperation,
+        error: impl std::fmt::Display,
+    ) -> Result<(), Error> {
+        let consecutive_failures = self
+            .consecutive_cleanup_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        error!(
+            "Failed to mark or delete {} delivered row(s) in table '{}' for {CONNECTOR_NAME} \
+             connector ID: {}, retrying on the next poll ({consecutive_failures} consecutive \
+             failures): {error}",
+            operation.ids.len(),
+            operation.table,
+            self.id
+        );
+        if consecutive_failures >= MAX_CONSECUTIVE_CLEANUP_FAILURES {
+            return Err(Error::Connection(format!(
+                "stopping {CONNECTOR_NAME} connector ID {} after {consecutive_failures} \
+                 consecutive mark/delete failures; the cleanup stays in the saved state and \
+                 runs again on restart",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
     async fn mark_or_delete_processed_rows(
         &self,
         pool: &Pool<MySql>,
-        table: &str,
-        pk_column: &str,
-        ids: &[PkValue],
+        operation: &PendingOperation,
     ) -> Result<(), Error> {
+        let PendingOperation { table, ids, target } = operation;
         if ids.is_empty() {
             return Ok(());
         }
 
         let quoted_table = quote_qualified_identifier(table)?;
-        let quoted_pk = quote_identifier(pk_column)?;
+        let quoted_pk = quote_identifier(&target.key_column)?;
         let placeholders = vec!["?"; ids.len()].join(", ");
 
-        let query = if self.config.delete_after_read.unwrap_or(false) {
-            if self.verbose {
-                info!("Deleting {} processed rows from '{table}'", ids.len());
-            } else {
-                debug!("Deleting {} processed rows from '{table}'", ids.len());
+        let query = match &target.action {
+            CleanupAction::Delete => {
+                if self.verbose {
+                    info!("Deleting {} processed rows from '{table}'", ids.len());
+                } else {
+                    debug!("Deleting {} processed rows from '{table}'", ids.len());
+                }
+                format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({placeholders})")
             }
-            format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({placeholders})")
-        } else if let Some(processed_col) = &self.config.processed_column {
-            let quoted_processed = quote_identifier(processed_col)?;
-            if self.verbose {
-                info!("Marking {} rows as processed in '{table}'", ids.len());
-            } else {
-                debug!("Marking {} rows as processed in '{table}'", ids.len());
+            CleanupAction::MarkProcessed { column } => {
+                let quoted_processed = quote_identifier(column)?;
+                if self.verbose {
+                    info!("Marking {} rows as processed in '{table}'", ids.len());
+                } else {
+                    debug!("Marking {} rows as processed in '{table}'", ids.len());
+                }
+                format!(
+                    "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({placeholders})"
+                )
             }
-            format!(
-                "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({placeholders})"
-            )
-        } else {
-            // Offset-tracking only: nothing to mark or delete.
-            return Ok(());
         };
 
         // The query and its binds are rebuilt on every attempt because with_retry
@@ -1060,16 +1402,12 @@ impl MySqlSource {
         .map(|_| ())
     }
 
-    async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
+    async fn poll_tables(&self) -> Result<PolledBatch, Error> {
         let pool = self.get_pool()?;
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
         let tracking_column = self.tracking_column();
-        let pk_column = self
-            .config
-            .primary_key_column
-            .as_deref()
-            .unwrap_or(tracking_column);
+        let pk_column = self.primary_key_column();
 
         let row_config = RowProcessingConfig {
             table: "",
@@ -1219,70 +1557,77 @@ impl MySqlSource {
             }
         }
 
-        // Phase 2: commit each table independently. If the mark/delete call fails
-        // for a table we just skip its messages this cycle instead of queuing them
-        // - `mark_or_delete_processed_rows` already retries transient errors, so a
-        // failure here is permanent and the table's rows stay in MySQL to be
-        // retried next cycle, without blocking the others.
-        //
-        // Doesn't cover the case where mark/delete succeeds but the runtime never
-        // gets to publish the batch (crash, send failure, etc) - those rows are
-        // gone from MySQL with nothing delivered.
+        // Phase 2: stage each table's batch. Nothing touches MySQL or the live state
+        // here: the offsets and the mark/delete are applied in `on_batch_result` once
+        // the runtime has sent the batch and saved this candidate state, and a Nack
+        // throws the candidate away so the same rows are read again.
+        let cleanup_target = self.cleanup_target();
+        let mut candidate_state = self.state.lock().await.clone();
+        let mut operations = Vec::new();
         let mut messages = Vec::new();
-        let mut state_updates: Vec<(String, String)> = Vec::new();
         let mut total_processed: u64 = 0;
 
-        let mark_or_delete = self.config.delete_after_read.unwrap_or(false)
-            || self.config.processed_column.is_some();
-
         for mut batch in batches {
-            if mark_or_delete && !batch.messages.is_empty() && batch.processed_ids.is_empty() {
-                error!(
-                    "Table '{}': mark/delete is configured but no primary keys were extracted \
-             from {} row(s), skipping this cycle so rows are not published without being \
-             marked or deleted (check that '{pk_column}' is projected and scalar)",
-                    batch.table,
-                    batch.messages.len()
-                );
-                continue;
-            }
-
-            if !batch.processed_ids.is_empty()
-                && let Err(error) = self
-                    .mark_or_delete_processed_rows(
-                        pool,
-                        &batch.table,
-                        pk_column,
-                        &batch.processed_ids,
-                    )
-                    .await
+            if let Some(target) = &cleanup_target
+                && !batch.messages.is_empty()
             {
-                error!(
-                    "Failed to mark or delete processed rows for table '{}', skipping this cycle: {error}",
-                    batch.table
-                );
-                continue;
+                if batch.processed_ids.is_empty() {
+                    error!(
+                        "Table '{}': mark/delete is configured but no primary keys were extracted \
+                         from {} row(s), skipping this cycle so rows are not published without \
+                         being marked or deleted (check that '{pk_column}' is projected and scalar)",
+                        batch.table,
+                        batch.messages.len()
+                    );
+                    continue;
+                }
+
+                match self
+                    .cleanup_key_is_unique(pool, &batch.table, &target.key_column)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        error!(
+                            "{}. Table disabled until restart.",
+                            not_unique_key_message(&batch.table, &target.key_column)
+                        );
+                        self.poisoned_tables.lock().await.insert(batch.table);
+                        continue;
+                    }
+                    Err(error) => {
+                        error!("Table '{}' skipped this cycle: {error}", batch.table);
+                        continue;
+                    }
+                }
+
+                operations.push(PendingOperation {
+                    table: batch.table.clone(),
+                    ids: std::mem::take(&mut batch.processed_ids),
+                    target: target.clone(),
+                });
             }
 
             total_processed += batch.messages.len() as u64;
             messages.append(&mut batch.messages);
             if let Some(offset) = batch.max_offset {
-                state_updates.push((batch.table, offset));
+                candidate_state.tracking_offsets.insert(batch.table, offset);
             }
         }
 
-        // Apply all state updates with a single lock acquisition
-        {
-            let mut state = self.state.lock().await;
-            state.processed_rows += total_processed;
-            for (table, offset) in state_updates {
-                state.tracking_offsets.insert(table, offset);
+        let pending = (total_processed > 0).then(|| {
+            candidate_state.processed_rows += total_processed;
+            candidate_state.pending_operations = operations;
+            PendingBatch {
+                state: candidate_state,
+                acknowledged: false,
+                retiring: false,
             }
-        }
+        });
 
         self.last_batch_full
             .store(any_batch_full, Ordering::Relaxed);
-        Ok(messages)
+        Ok(PolledBatch { messages, pending })
     }
 
     async fn fetch_table_batch(
@@ -1821,6 +2166,54 @@ fn redact_connection_string(conn_str: &str) -> String {
     format!("{preview}***")
 }
 
+/// Whether `key_column` alone backs a unique index on `table`. A composite unique
+/// index does not count: it lets the column repeat on its own.
+async fn cleanup_key_check(
+    pool: &Pool<MySql>,
+    table: &str,
+    key_column: &str,
+) -> Result<CleanupKeyCheck, sqlx::Error> {
+    let (schema, table_name) = table.split_once('.').unwrap_or(("", table));
+    // COUNT(*) comes back as BIGINT, so both columns decode as i64. Read by position:
+    // information_schema column names come back uppercased.
+    let row = sqlx::query(
+        "SELECT \
+           (SELECT COUNT(*) FROM information_schema.tables \
+            WHERE table_schema = IF(? = '', DATABASE(), ?) AND table_name = ?), \
+           (SELECT COUNT(*) FROM ( \
+              SELECT index_name FROM information_schema.statistics \
+              WHERE table_schema = IF(? = '', DATABASE(), ?) AND table_name = ? \
+                AND non_unique = 0 \
+              GROUP BY index_name \
+              HAVING COUNT(*) = 1 AND MAX(column_name) = ? \
+            ) AS single_column_unique)",
+    )
+    .bind(schema)
+    .bind(schema)
+    .bind(table_name)
+    .bind(schema)
+    .bind(schema)
+    .bind(table_name)
+    .bind(key_column)
+    .fetch_one(pool)
+    .await?;
+    let tables: i64 = row.try_get(0)?;
+    let unique_indexes: i64 = row.try_get(1)?;
+    Ok(match (tables, unique_indexes) {
+        (0, _) => CleanupKeyCheck::TableMissing,
+        (_, 0) => CleanupKeyCheck::NotUnique,
+        _ => CleanupKeyCheck::Unique,
+    })
+}
+
+fn not_unique_key_message(table: &str, key_column: &str) -> String {
+    format!(
+        "primary_key_column '{key_column}' on table '{table}' is not backed by a single-column \
+         PRIMARY KEY or UNIQUE index, so marking or deleting by it can hit rows that were never \
+         read; set primary_key_column to a unique column (it defaults to tracking_column)"
+    )
+}
+
 fn quote_identifier(name: &str) -> Result<String, Error> {
     if name.is_empty() {
         return Err(Error::InvalidConfigValue(
@@ -2043,6 +2436,7 @@ mod tests {
                 ("orders".to_string(), "2024-01-15T10:30:00Z".to_string()),
             ]),
             processed_rows: 500,
+            pending_operations: Vec::new(),
         };
         let connector_state =
             ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
@@ -2100,6 +2494,7 @@ mod tests {
         let original = State {
             tracking_offsets: HashMap::from([("table1".to_string(), "42".to_string())]),
             processed_rows: 1000,
+            pending_operations: Vec::new(),
         };
 
         let connector_state =
@@ -2110,6 +2505,343 @@ mod tests {
 
         assert_eq!(original.tracking_offsets, deserialized.tracking_offsets);
         assert_eq!(original.processed_rows, deserialized.processed_rows);
+    }
+
+    fn delete_operation(table: &str, ids: Vec<PkValue>) -> PendingOperation {
+        PendingOperation {
+            table: table.to_string(),
+            ids,
+            target: CleanupTarget {
+                key_column: "id".to_string(),
+                action: CleanupAction::Delete,
+            },
+        }
+    }
+
+    fn candidate_state(offset: &str, operations: Vec<PendingOperation>) -> State {
+        State {
+            tracking_offsets: HashMap::from([("users".to_string(), offset.to_string())]),
+            processed_rows: 10,
+            pending_operations: operations,
+        }
+    }
+
+    fn source_with_pending(config: MySqlSourceConfig, pending: PendingBatch) -> MySqlSource {
+        let source = MySqlSource::new(1, config, None);
+        *source.pending_batch.try_lock().unwrap() = Some(pending);
+        source
+    }
+
+    #[test]
+    fn given_state_saved_before_pending_operations_existed_should_restore_it() {
+        #[derive(Serialize)]
+        struct LegacyState {
+            tracking_offsets: HashMap<String, String>,
+            processed_rows: u64,
+        }
+        let legacy = LegacyState {
+            tracking_offsets: HashMap::from([("users".to_string(), "7".to_string())]),
+            processed_rows: 7,
+        };
+        let connector_state =
+            ConnectorState::serialize(&legacy, "test", 1).expect("Failed to serialize state");
+
+        let restored: State = connector_state
+            .deserialize("test", 1)
+            .expect("Failed to deserialize legacy state");
+
+        assert_eq!(
+            restored.tracking_offsets.get("users"),
+            Some(&"7".to_string())
+        );
+        assert_eq!(restored.processed_rows, 7);
+        assert!(restored.pending_operations.is_empty());
+    }
+
+    #[test]
+    fn given_pending_operations_should_survive_state_round_trip() {
+        let original = candidate_state(
+            "42",
+            vec![delete_operation(
+                "users",
+                vec![
+                    PkValue::Text("41".to_string()),
+                    PkValue::Bytes(vec![0, 1, 255]),
+                ],
+            )],
+        );
+
+        let connector_state =
+            ConnectorState::serialize(&original, "test", 1).expect("Failed to serialize state");
+        let restored: State = connector_state
+            .deserialize("test", 1)
+            .expect("Failed to deserialize state");
+
+        assert_eq!(restored.pending_operations, original.pending_operations);
+    }
+
+    #[test]
+    fn given_restored_pending_operations_should_resume_as_delivered_cleanup() {
+        let state = candidate_state(
+            "42",
+            vec![delete_operation(
+                "users",
+                vec![PkValue::Text("42".to_string())],
+            )],
+        );
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+
+        let source = MySqlSource::new(1, test_config(), Some(connector_state));
+
+        let pending = source.pending_batch.try_lock().unwrap().clone();
+        let pending = pending.expect("restored operations should be pending");
+        assert!(pending.acknowledged);
+        assert!(!pending.retiring);
+        assert_eq!(pending.state.pending_operations, state.pending_operations);
+    }
+
+    #[test]
+    fn given_cleanup_config_changed_while_operations_pending_should_fail_open() {
+        let state = candidate_state(
+            "42",
+            vec![delete_operation(
+                "users",
+                vec![PkValue::Text("42".to_string())],
+            )],
+        );
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut config = test_config();
+        config.processed_column = Some("is_processed".to_string());
+
+        let mut source = MySqlSource::new(1, config, Some(connector_state));
+
+        let error = source
+            .validate_pending_cleanup()
+            .expect_err("a changed cleanup action must not run restored operations");
+        assert!(
+            matches!(error, Error::InitError(message) if message.contains("cleanup configuration changed"))
+        );
+    }
+
+    #[test]
+    fn given_unchanged_cleanup_config_with_operations_pending_should_pass_open() {
+        let state = candidate_state(
+            "42",
+            vec![delete_operation(
+                "users",
+                vec![PkValue::Text("42".to_string())],
+            )],
+        );
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+
+        let mut source = MySqlSource::new(1, config, Some(connector_state));
+
+        assert!(source.validate_pending_cleanup().is_ok());
+    }
+
+    #[test]
+    fn given_nack_should_discard_candidate_and_keep_live_offsets() {
+        let mut config = test_config();
+        config.delete_after_read = Some(true);
+        let source = source_with_pending(
+            config,
+            PendingBatch {
+                state: candidate_state(
+                    "42",
+                    vec![delete_operation(
+                        "users",
+                        vec![PkValue::Text("42".to_string())],
+                    )],
+                ),
+                acknowledged: false,
+                retiring: false,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("Nack should be accepted");
+
+            assert!(source.pending_batch.lock().await.is_none());
+            let live = source.state.lock().await;
+            assert!(live.tracking_offsets.is_empty());
+            assert_eq!(live.processed_rows, 0);
+            assert!(live.pending_operations.is_empty());
+        });
+    }
+
+    #[test]
+    fn given_nack_after_delivery_should_keep_pending_cleanup() {
+        let operations = vec![delete_operation(
+            "users",
+            vec![PkValue::Text("42".to_string())],
+        )];
+        let source = source_with_pending(
+            test_config(),
+            PendingBatch {
+                state: candidate_state("42", operations.clone()),
+                acknowledged: true,
+                retiring: false,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("Nack should be accepted");
+
+            let pending = source.pending_batch.lock().await.clone();
+            let pending = pending.expect("delivered cleanup must survive a Nack");
+            assert_eq!(pending.state.pending_operations, operations);
+        });
+    }
+
+    #[test]
+    fn given_ack_without_cleanup_should_commit_candidate_offsets() {
+        let source = source_with_pending(
+            test_config(),
+            PendingBatch {
+                state: candidate_state("42", Vec::new()),
+                acknowledged: false,
+                retiring: false,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("Ack should be applied");
+
+            assert!(source.pending_batch.lock().await.is_none());
+            let live = source.state.lock().await;
+            assert_eq!(live.tracking_offsets.get("users"), Some(&"42".to_string()));
+            assert_eq!(live.processed_rows, 10);
+        });
+    }
+
+    #[test]
+    fn given_retiring_batch_poll_should_persist_state_without_operations() {
+        let source = source_with_pending(
+            test_config(),
+            PendingBatch {
+                state: candidate_state("42", Vec::new()),
+                acknowledged: false,
+                retiring: true,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let produced = source.poll().await.expect("retiring poll should succeed");
+
+            assert!(produced.messages.is_empty());
+            let persisted: State = produced
+                .state
+                .expect("retiring poll must persist state")
+                .deserialize("test", 1)
+                .expect("Failed to deserialize state");
+            assert!(persisted.pending_operations.is_empty());
+            assert_eq!(
+                persisted.tracking_offsets.get("users"),
+                Some(&"42".to_string())
+            );
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("Ack should be applied");
+            assert!(source.pending_batch.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_batch_in_flight_poll_should_fail() {
+        let mut config = test_config();
+        config.poll_interval = Some("1ms".to_string());
+        let source = source_with_pending(
+            config,
+            PendingBatch {
+                state: candidate_state("42", Vec::new()),
+                acknowledged: false,
+                retiring: false,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.poll());
+
+        assert!(matches!(result, Err(Error::InvalidState)));
+    }
+
+    #[test]
+    fn given_delivered_cleanup_pending_poll_should_not_fetch_new_rows() {
+        let mut config = test_config();
+        config.poll_interval = Some("1ms".to_string());
+        let source = source_with_pending(
+            config,
+            PendingBatch {
+                state: candidate_state(
+                    "42",
+                    vec![delete_operation(
+                        "users",
+                        vec![PkValue::Text("42".to_string())],
+                    )],
+                ),
+                acknowledged: true,
+                retiring: false,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // No pool is connected, so reaching `poll_tables` would fail.
+        let produced = runtime
+            .block_on(source.poll())
+            .expect("cleanup retry poll should succeed");
+
+        assert!(produced.messages.is_empty());
+        assert!(produced.state.is_none());
+    }
+
+    #[test]
+    fn given_cleanup_config_should_target_primary_key_or_tracking_column() {
+        let mut config = test_config();
+        assert_eq!(
+            MySqlSource::new(1, config.clone(), None).cleanup_target(),
+            None
+        );
+
+        config.processed_column = Some("is_processed".to_string());
+        assert_eq!(
+            MySqlSource::new(1, config.clone(), None).cleanup_target(),
+            Some(CleanupTarget {
+                key_column: "id".to_string(),
+                action: CleanupAction::MarkProcessed {
+                    column: "is_processed".to_string()
+                },
+            })
+        );
+
+        config.delete_after_read = Some(true);
+        config.primary_key_column = Some("uuid".to_string());
+        assert_eq!(
+            MySqlSource::new(1, config, None).cleanup_target(),
+            Some(CleanupTarget {
+                key_column: "uuid".to_string(),
+                action: CleanupAction::Delete,
+            })
+        );
     }
 
     #[test]

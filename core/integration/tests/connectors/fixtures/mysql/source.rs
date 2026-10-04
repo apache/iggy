@@ -570,6 +570,97 @@ impl TestFixture for MySqlSourceDeleteFixture {
     }
 }
 
+/// MySQL source fixture that deletes by a `primary_key_column` with no unique index.
+///
+/// Every row shares one `batch_no`, so `DELETE ... WHERE batch_no IN (...)` would wipe
+/// rows the connector never read. The table is created after the runtime starts,
+/// which leaves the check to the first poll that reads from it.
+pub struct MySqlSourceNonUniqueKeyDeleteFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceNonUniqueKeyDeleteFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceNonUniqueKeyDeleteFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceNonUniqueKeyDeleteFixture {
+    const TABLE: &'static str = "test_non_unique_key_delete";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                batch_no INT NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                INDEX (batch_no)
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!(
+            "INSERT INTO `{}` (batch_no, name) VALUES (1, ?)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceNonUniqueKeyDeleteFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(),
+            "batch_no".to_string(),
+        );
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture with `processed_column` marking.
 pub struct MySqlSourceMarkFixture {
     container: MySqlContainer,
@@ -1292,7 +1383,8 @@ impl TestFixture for MySqlSourceTimestampTrackingFixture {
 /// `WHERE pk IN (...)`. That predicate runs inside DML, where the default
 /// `STRICT_TRANS_TABLES` turns a datetime conversion that a `SELECT` only warns
 /// about into a hard error, so a value rendered with a zone suffix fails the
-/// statement outright and the batch is never published.
+/// statement outright and the batch is never published. The column carries a
+/// `UNIQUE` index because the connector refuses to delete by a key without one.
 pub struct MySqlSourceTimestampDeleteFixture {
     container: MySqlContainer,
 }
@@ -1318,7 +1410,7 @@ impl MySqlSourceTimestampDeleteFixture {
         let query = format!(
             "CREATE TABLE IF NOT EXISTS `{}` (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                updated_at TIMESTAMP(6) NOT NULL,
+                updated_at TIMESTAMP(6) NOT NULL UNIQUE,
                 name VARCHAR(255) NOT NULL
             )",
             Self::TABLE

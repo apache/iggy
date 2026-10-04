@@ -59,7 +59,7 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 | `payload_format` | string | `json` (invalid if `payload_column` is set — `payload_format` is required in that case) | Format of payload_column: `bytea`, `text`, or `json_direct` |
 | `delete_after_read` | bool | `false` | Delete rows after reading |
 | `processed_column` | string | none | Boolean column to mark as processed |
-| `primary_key_column` | string | tracking_column | PK for delete/mark operations |
+| `primary_key_column` | string | tracking_column | Key for delete/mark operations; must back a single-column `PRIMARY KEY` or `UNIQUE` index (see [Delete After Read / Mark as Processed](#delete-after-read--mark-as-processed)) |
 | `custom_query` | string | none | Custom SQL with parameter substitution; must be a read, and must either filter on `$offset` with an `ORDER BY` or consume its rows (see [What the query has to be](#what-the-query-has-to-be)) |
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
 | `max_retries` | u32 | `3` | Retries after the initial attempt for transient errors (3 = 4 total attempts) |
@@ -390,7 +390,7 @@ exactly the shape that binds a timestamp into that predicate.
 
 ### Delete After Read
 
-Deletes rows from the source table after successful processing. At-most-once — see [Delivery semantics](#delivery-semantics) below.
+Deletes rows from the source table once the runtime has delivered them to Iggy. At-least-once, see [Delivery semantics](#delivery-semantics) below.
 
 ```toml
 [plugin_config]
@@ -400,7 +400,7 @@ primary_key_column = "id"
 
 ### Mark as Processed
 
-Updates a boolean column instead of deleting. At-most-once — see [Delivery semantics](#delivery-semantics) below.
+Updates a boolean column instead of deleting. At-least-once, see [Delivery semantics](#delivery-semantics) below.
 
 ```toml
 [plugin_config]
@@ -414,22 +414,49 @@ Your table needs the boolean column:
 ALTER TABLE users ADD COLUMN is_processed BOOLEAN DEFAULT false;
 ```
 
+Both options mark or delete with `WHERE primary_key_column IN (...)`, so that
+column has to be unique on its own: a repeated value would also hit rows that
+were never read. The connector checks for a single-column `PRIMARY KEY` or
+`UNIQUE` index on it. A table that exists when the connector starts fails
+`open()` without one. A table created later is checked the first time rows are
+read from it, and is disabled until restart if the check fails, with nothing
+published or deleted. A composite index does not count. `primary_key_column`
+defaults to `tracking_column`, so set it explicitly when the tracking column is
+not unique.
+
 When `processed_column` is set, the connector adds a `WHERE is_processed = FALSE` filter to **the query it builds itself**, so only unprocessed rows are fetched. It cannot do that for a `custom_query`, which it substitutes as text without parsing: there, marking rows is all it does, and the query has to exclude them itself.
 
 ### Delivery semantics
 
-Both `delete_after_read` and `processed_column` mutate MySQL during the poll,
-before the batch is actually sent to Iggy. Only one mutation runs per row: with
-`delete_after_read = true` the row is deleted, otherwise (`processed_column`
-set) it is marked processed — the two are mutually exclusive, and
-`delete_after_read` wins if both are configured. If the connector crashes or the
-send fails after that mutation but before the batch reaches Iggy, the row is
-already deleted or already marked and won't be retried. So both options are
-at-most-once, not at-least-once.
+The connector stages each batch instead of committing it during the poll. The
+new tracking offsets and the rows to mark or delete are held back until the
+runtime has sent the batch to Iggy and saved the connector state. Only then
+does the connector take over the offsets and run the `DELETE` or `UPDATE`.
 
-Plain offset tracking (no `delete_after_read` / `processed_column`) has the same commit-before-send ordering: the offset advances in memory before the batch is sent. A failed send after that point loses the batch; a crash after the batch reaches Iggy but before the offset is persisted replays it on restart. It is best-effort, closer to at-least-once, and the deterministic message ids (see [Message IDs and Idempotent Replay](#message-ids-and-idempotent-replay)) let downstream drop the replays.
+- **The send or the state save fails (Nack).** Nothing is committed and no row is
+  touched. The next poll reads the same rows again.
+- **The mark/delete fails after delivery.** The offsets are not taken over and no
+  new rows are read. Each poll retries the cleanup, and the connector stops after
+  3 mark/delete statements in a row have failed. The pending cleanup is saved with the batch's offsets, so
+  a restart runs it before reading anything new. It refuses to start if
+  `delete_after_read`, `processed_column` or `primary_key_column` changed in the
+  meantime.
+- **The connector crashes after the send but before the state is saved.** The
+  batch is read and sent again on restart.
 
-If you can't tolerate losing rows, use `processed_column` instead of `delete_after_read` — at least the data's still there if something goes wrong.
+Delivery is therefore at-least-once with every option, including plain offset
+tracking. Replays carry the same message ids (see
+[Message IDs and Idempotent Replay](#message-ids-and-idempotent-replay)), so
+downstream can drop them.
+
+Only one mutation runs per row: with `delete_after_read = true` the row is
+deleted, otherwise (`processed_column` set) it is marked processed.
+`delete_after_read` wins if both are configured.
+
+There is one narrow window to know about. If the connector crashes after the
+cleanup ran but before the next poll saved the state without it, a restart runs
+the same `DELETE`/`UPDATE` again. That is harmless unless a new row has reused
+one of those key values in between, which an `AUTO_INCREMENT` key never does.
 
 ## Supported Column Types
 

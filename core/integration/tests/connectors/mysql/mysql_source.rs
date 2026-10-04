@@ -22,8 +22,9 @@ use crate::connectors::fixtures::{
     MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
     MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
     MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
-    MySqlSourceNoMetadataFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
-    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
+    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
     MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };
 use iggy_common::MessageClient;
@@ -1405,7 +1406,16 @@ async fn timestamp_primary_key_deletes_the_rows_it_published(
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
 
-    let remaining = fixture.count_rows(&pool).await;
+    // Rows are deleted only once the runtime acknowledges the batch, which can land
+    // after the consumer has already seen it.
+    let mut remaining = -1i64;
+    for _ in 0..POLL_ATTEMPTS {
+        remaining = fixture.count_rows(&pool).await;
+        if remaining == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
     pool.close().await;
 
     assert_eq!(
@@ -1631,5 +1641,59 @@ async fn tinyint_tracking_value_under_a_custom_query_publishes_nothing(
     assert!(
         logs.contains("has no usable value for tracking_column 'flag'"),
         "Expected the row loop to refuse the BOOLEAN tracking value, not open() to fail"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn non_unique_primary_key_column_publishes_and_deletes_nothing(
+    harness: &TestHarness,
+    fixture: MySqlSourceNonUniqueKeyDeleteFixture,
+) {
+    // Deleting by a key every row shares would remove rows that were never read, so
+    // the table has to be disabled before anything is published or deleted.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "non_unique_key_consumer".try_into().unwrap();
+
+    let mut received = 0usize;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    assert_eq!(
+        received, 0,
+        "Expected no messages from a table keyed by a non-unique column, got {received}"
+    );
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Expected every row to survive, {remaining} of {TEST_MESSAGE_COUNT} remain"
     );
 }

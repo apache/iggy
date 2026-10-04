@@ -89,8 +89,9 @@ pub use mysql::{
     MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
     MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
     MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
-    MySqlSourceNoMetadataFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
-    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
+    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
     MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };
 pub use postgres::{

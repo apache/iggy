@@ -24,7 +24,8 @@ pub use source::{
     MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
     MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
     MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
-    MySqlSourceNoMetadataFixture, MySqlSourceNullTrackingFixture, MySqlSourceRawFixture,
-    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
-    MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
+    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
+    MySqlSourceNullTrackingFixture, MySqlSourceRawFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
+    MySqlSourceTinyintTrackingFixture,
 };
