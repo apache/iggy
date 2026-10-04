@@ -1398,7 +1398,7 @@ mod tests {
             *source.state.lock().await = state_with(&[(0, 42)], 42);
 
             let state = source
-                .stage_batch_state(HashMap::from([(0, 45)]), 0, 0)
+                .stage_batch_state(HashMap::from([(0, 45)]), 0, 3)
                 .await
                 .expect("A batch of skipped rows should stage");
 
@@ -1407,6 +1407,13 @@ mod tests {
                 .expect("Offsets past skipped rows should be staged");
             assert_eq!(persisted.bucket_offsets.get(&0), Some(&45));
             assert_eq!(persisted.messages_produced, 42);
+            let pending_skipped = source
+                .pending_state
+                .lock()
+                .await
+                .as_ref()
+                .map(|pending| pending.rows_skipped);
+            assert_eq!(pending_skipped, Some(3));
         });
     }
 }
