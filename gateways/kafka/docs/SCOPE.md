@@ -247,7 +247,7 @@ below it are still open for the issues that build on top of it.
     duplicate - deleting the same topic twice has no race to protect against the way creating it
     twice does, so the first occurrence deletes it and the second then correctly answers
     `UNKNOWN_TOPIC_OR_PARTITION` (3) because the topic genuinely no longer exists.
-  - Same bridge-fan-out bounds as CreateTopics: a request naming more than 100 distinct topics is
+  - Same bridge-fan-out bounds as CreateTopics: a request naming more than 100 topic names is
     rejected outright (`POLICY_VIOLATION`, no bridge call for any of them), and the wire
     `timeout_ms` (clamped to `[1s, 30s]`) bounds the whole handler's aggregate bridge work.
   - v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape) is not advertised - this bridge

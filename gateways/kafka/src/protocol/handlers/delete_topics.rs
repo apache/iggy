@@ -27,8 +27,6 @@
 //! silently dropped. Unlike `CreateTopics`, whose equivalent field is encoded at every version it
 //! supports.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
@@ -46,8 +44,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_delete_topics_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, handle_versioned_request, is_supported_version,
-    respond_or_close, unsupported_version_response,
+    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
+    is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 /// This bridge never advertises v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape).
@@ -67,17 +65,6 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// Kafka connection on this gateway shares, duplicates included, so this charges the raw count
 /// rather than the distinct one `CreateTopics` charges.
 const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
-
-/// Same bounds as `create_topics::clamp_request_timeout` - this request carries the identical
-/// KIP-4 `timeout_ms` field for the identical reason (a client-supplied deadline that becomes
-/// the aggregate bridge-work budget, otherwise unchecked).
-const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_000);
-const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn clamp_request_timeout(timeout_ms: i32) -> Duration {
-    let requested = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
-    requested.clamp(MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
-}
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
@@ -204,7 +191,9 @@ async fn delete_one_topic(bridge: &IggyBridge, name: &TopicName) -> DeletableTop
 ///
 /// Same caution as `create_topics::bridge_error_result` on forwarding `err.to_string()`: a
 /// server-side rejection can reconstruct with default-valued fields, so only the client-caused
-/// variant (an invalid name) forwards its own text; everything else gets a fixed message.
+/// variant (an invalid name) forwards its own text. A missing topic and an unauthorized reply
+/// are routine, so they log at `debug!` with fixed text. Everything else gets a fixed message
+/// and logs at `error!`.
 fn bridge_error_result(
     result: DeletableTopicResult,
     kafka_topic: &str,
@@ -221,6 +210,33 @@ fn bridge_error_result(
             result
                 .with_error_code(error_code)
                 .with_error_message(Some(StrBytes::from(reason.clone())))
+        }
+        BridgeError::Iggy(
+            IggyError::StreamIdNotFound(_)
+            | IggyError::StreamNameNotFound(_)
+            | IggyError::TopicIdNotFound(_, _)
+            | IggyError::TopicNameNotFound(_, _)
+            | IggyError::PartitionNotFound(_, _, _)
+            | IggyError::ResourceNotFound(_),
+        ) => {
+            tracing::debug!(kafka_topic, error = %err, "DeleteTopics: topic does not exist");
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
+                    "this topic does not exist".to_string(),
+                )))
+        }
+        BridgeError::Iggy(IggyError::Unauthorized) => {
+            tracing::debug!(
+                kafka_topic,
+                error = %err,
+                "DeleteTopics: not authorized to delete this topic"
+            );
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
+                    "not authorized to delete this topic".to_string(),
+                )))
         }
         other => {
             tracing::error!(kafka_topic, %other, "DeleteTopics failed against the Iggy bridge");
@@ -265,22 +281,27 @@ fn encode_inner(version: i16, topic_names: &[TopicName], forced_error: i16) -> R
 
 #[cfg(test)]
 mod tests {
+    use iggy::prelude::Identifier;
+
     use super::*;
 
     #[test]
-    fn clamp_request_timeout_rejects_a_zero_or_negative_value_up_to_the_floor() {
-        assert_eq!(clamp_request_timeout(0), MIN_REQUEST_TIMEOUT);
-        assert_eq!(clamp_request_timeout(-1), MIN_REQUEST_TIMEOUT);
-        assert_eq!(clamp_request_timeout(i32::MIN), MIN_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn clamp_request_timeout_caps_an_oversized_value_at_the_ceiling() {
-        assert_eq!(clamp_request_timeout(i32::MAX), MAX_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn clamp_request_timeout_passes_through_a_reasonable_value_unchanged() {
-        assert_eq!(clamp_request_timeout(5_000), Duration::from_secs(5));
+    fn bridge_error_result_names_a_missing_topic_and_an_unauthorized_reply() {
+        let missing_stream = BridgeError::Iggy(IggyError::StreamIdNotFound(Identifier::default()));
+        let missing_topic = BridgeError::Iggy(IggyError::TopicIdNotFound(
+            Identifier::default(),
+            Identifier::default(),
+        ));
+        let unauthorized = BridgeError::Iggy(IggyError::Unauthorized);
+        let cases = [
+            (&missing_stream, "this topic does not exist"),
+            (&missing_topic, "this topic does not exist"),
+            (&unauthorized, "not authorized to delete this topic"),
+        ];
+        for (err, expected) in cases {
+            let result = bridge_error_result(DeletableTopicResult::default(), "orders", err);
+            assert_eq!(result.error_code, err.to_kafka_error_code());
+            assert_eq!(result.error_message.as_deref(), Some(expected));
+        }
     }
 }

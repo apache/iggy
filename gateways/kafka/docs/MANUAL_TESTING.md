@@ -216,6 +216,7 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
 | 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
+| 20 | DeleteTopics | 1 | 5 | 0, 1, 5, 6 |
 | 10 | FindCoordinator | 0 | 4 | −1, 0, 4, 5 |
 | 11 | JoinGroup | 0 | 9 | −1, 0, 9, 10 |
 | 12 | Heartbeat | 0 | 4 | −1, 0, 4, 5 |
@@ -225,10 +226,10 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 12 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 13 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
-| B3 | Produce/Fetch/ListOffsets/CreateTopics/InitProducerId out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these five messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,10,11,12,13,14,18,19,22 only — no OffsetCommit/OffsetFetch, and no transaction keys (24, 25, 26, 28) |
+| B3 | Produce/Fetch/ListOffsets/CreateTopics/DeleteTopics/InitProducerId out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these six messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,10,11,12,13,14,18,19,20,22 only — no OffsetCommit/OffsetFetch, and no transaction keys (24, 25, 26, 28) |
 
 An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
 key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
@@ -252,7 +253,10 @@ decoded `ec`.
 | C1 | 8 | OffsetCommit | `send --host 127.0.0.1:9093 --api-key 8 --version 2` | Connection closes, no response bytes |
 | C2 | 10 | FindCoordinator | `send --host 127.0.0.1:9093 --api-key 10` | Connection closes |
 | C3 | 17 | SaslHandshake | `send --host 127.0.0.1:9093 --api-key 17` | Connection closes |
-| C4 | 20 | DeleteTopics | `send --host 127.0.0.1:9093 --api-key 20` | Connection closes |
+| C4 | 20 | DeleteTopics | `send --host 127.0.0.1:9093 --api-key 20` | Sends v1-v6. Gateway answers v1-v5 (stub `NOT_CONTROLLER` (41) with the bridge off). v6 is above the advertised max and that one connection closes |
+
+Key 20 is scoped, so C4 is not an unsupported-key close. `send --api-key 20` walks v1-v6; the
+gateway answers v1-v5 and closes on v6, above the advertised max.
 
 Reconnect and send A2 in a **new** session after each of C1-C4 to confirm the *gateway* (not just
 that one connection) is still serving other clients.

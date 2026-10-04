@@ -271,8 +271,9 @@ impl IggyBridge {
     ///
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
     /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
-    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] with `StreamNameNotFound`/`TopicNameNotFound`
-    /// if the mapped stream or topic doesn't exist, or for connectivity/auth failures.
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] with `StreamIdNotFound` (1009) or
+    /// `TopicIdNotFound` (2010) if the mapped stream or topic doesn't exist, or for
+    /// connectivity/auth failures.
     pub async fn delete_kafka_topic(&self, kafka_topic: &str) -> Result<(), BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
