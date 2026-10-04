@@ -21,15 +21,12 @@ use std::time::Duration;
 
 const LIST_ENV_VARS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Runs `binary --list-config-env-vars` (plus `extra_args`) with `env` applied,
-/// isolated to `directory`. Shared by every test below so each only states
-/// what differs: the binary, the env it sets, and any extra flags.
-fn run_list_config_env_vars_in<I, K, V>(
+fn list_config_env_vars_in<I, K, V>(
     binary: &str,
     directory: &std::path::Path,
     env: I,
     extra_args: &[&str],
-) -> std::process::Output
+) -> Vec<String>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<std::ffi::OsStr>,
@@ -38,39 +35,32 @@ where
     let mut cmd = Command::cargo_bin(binary).expect("binary should be built");
     cmd.current_dir(directory)
         .arg("--list-config-env-vars")
+        .envs(env)
+        .args(extra_args)
         .timeout(LIST_ENV_VARS_TIMEOUT);
 
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-
-    for arg in extra_args {
-        cmd.arg(arg);
-    }
-
-    cmd.output().expect("listing command should run")
+    let output = cmd.output().expect("listing command should run");
+    assert!(
+        output.status.success(),
+        "{binary} failed: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{binary} wrote to stderr");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+    let names = stdout.lines().map(str::to_owned).collect::<Vec<_>>();
+    assert!(!names.is_empty(), "{binary} returned no variables");
+    names
 }
 
-/// Convenience wrapper over [`run_list_config_env_vars_in`] for tests that
-/// don't need to inspect the working directory afterward.
-fn run_list_config_env_vars<I, K, V>(
-    binary: &str,
-    env: I,
-    extra_args: &[&str],
-) -> std::process::Output
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: AsRef<std::ffi::OsStr>,
-    V: AsRef<std::ffi::OsStr>,
-{
+fn list_config_env_vars(binary: &str) -> Vec<String> {
     let directory = tempfile::tempdir().expect("temporary directory");
-    run_list_config_env_vars_in(binary, directory.path(), env, extra_args)
-}
-
-/// Convenience wrapper over [`run_list_config_env_vars`] for tests that don't
-/// need to set any environment variables.
-fn run_list_config_env_vars_plain(binary: &str, extra_args: &[&str]) -> std::process::Output {
-    run_list_config_env_vars(binary, std::iter::empty::<(&str, &str)>(), extra_args)
+    list_config_env_vars_in(
+        binary,
+        directory.path(),
+        std::iter::empty::<(&str, &str)>(),
+        &[],
+    )
 }
 
 #[test]
@@ -105,7 +95,7 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             .expect("read temporary directory")
             .map(|entry| entry.expect("directory entry").file_name())
             .collect();
-        let output = run_list_config_env_vars_in(
+        let names = list_config_env_vars_in(
             binary,
             directory.path(),
             [
@@ -116,17 +106,9 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             &[],
         );
 
-        assert!(
-            output.status.success(),
-            "{binary} failed: {:?}\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stderr.is_empty(), "{binary} wrote to stderr");
-
-        let baseline = run_list_config_env_vars_plain(binary, &[]);
+        let baseline = list_config_env_vars(binary);
         assert_eq!(
-            output.stdout, baseline.stdout,
+            names, baseline,
             "{binary} output changed with invalid config, dotenv or env values"
         );
         let entries_after: HashSet<_> = std::fs::read_dir(directory.path())
@@ -138,9 +120,6 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             "{binary} created startup side effects"
         );
 
-        let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
-        let names: Vec<_> = stdout.lines().collect();
-        assert!(!names.is_empty(), "{binary} returned no variables");
         assert!(
             names.windows(2).all(|pair| pair[0] < pair[1]),
             "{binary} output must be sorted and deduplicated"
@@ -154,11 +133,8 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
 
 #[test]
 fn config_env_listing_includes_vector_index_templates() {
-    // Verify that vector fields are correctly represented with <N> placeholder
-    let output = run_list_config_env_vars_plain("iggy-server", &[]);
-
-    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
-    let names: HashSet<_> = stdout.lines().collect();
+    let names = list_config_env_vars("iggy-server");
+    let names: HashSet<_> = names.iter().map(String::as_str).collect();
 
     // Cluster nodes should have indexed templates
     assert!(
@@ -179,37 +155,15 @@ fn config_env_listing_includes_vector_index_templates() {
 
 #[test]
 fn config_env_listing_includes_connector_templates() {
-    // Verify that connector SINK/SOURCE templates are correctly formatted
-    let output = run_list_config_env_vars_plain("iggy-connectors", &[]);
+    let names = list_config_env_vars("iggy-connectors");
+    let names: HashSet<_> = names.iter().map(String::as_str).collect();
 
-    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
-    let names: HashSet<_> = stdout.lines().collect();
-
-    // Both SINK and SOURCE templates should be present
     assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_")),
-        "connectors should list SINK templates with <KEY> placeholder"
-    );
-    assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_")),
-        "connectors should list SOURCE templates with <KEY> placeholder"
-    );
-
-    // Plugin config templates should be present
-    assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_<FIELD>")),
+        names.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_<FIELD>"),
         "connectors should list SINK plugin config templates"
     );
     assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_<FIELD>")),
+        names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_<FIELD>"),
         "connectors should list SOURCE plugin config templates"
     );
     assert!(
@@ -221,24 +175,19 @@ fn config_env_listing_includes_connector_templates() {
         "connectors should list the typed SOURCE plugin config format"
     );
 
-    // Verify SINK and SOURCE ENABLED fields are present
     assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CONNECTORS_SINK_<KEY>_ENABLED")),
+        names.contains("IGGY_CONNECTORS_SINK_<KEY>_ENABLED"),
         "connectors should list SINK_<KEY>_ENABLED"
     );
     assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CONNECTORS_SOURCE_<KEY>_ENABLED")),
+        names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_ENABLED"),
         "connectors should list SOURCE_<KEY>_ENABLED"
     );
 
     assert_eq!(
-        stdout
-            .lines()
-            .filter(|name| *name == "IGGY_CONNECTORS_CONNECTORS_CONFIG_TYPE")
+        names
+            .iter()
+            .filter(|name| **name == "IGGY_CONNECTORS_CONNECTORS_CONFIG_TYPE")
             .count(),
         1,
         "enum variants should produce one deduplicated tag name"
@@ -247,9 +196,8 @@ fn config_env_listing_includes_connector_templates() {
 
 #[test]
 fn config_env_listing_excludes_other_processes_variables() {
-    let server = run_list_config_env_vars_plain("iggy-server", &[]);
-    let server = String::from_utf8(server.stdout).expect("UTF-8 output");
-    let server_names: HashSet<_> = server.lines().collect();
+    let server = list_config_env_vars("iggy-server");
+    let server_names: HashSet<_> = server.iter().map(String::as_str).collect();
     for excluded in [
         "IGGY_CI_BUILD",
         "IGGY_HOME",
@@ -274,11 +222,10 @@ fn config_env_listing_excludes_other_processes_variables() {
         ("iggy-connectors", "IGGY_CONNECTORS_"),
         ("iggy-mcp", "IGGY_MCP_"),
     ] {
-        let output = run_list_config_env_vars_plain(binary, &[]);
-        let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+        let names = list_config_env_vars(binary);
         assert!(
-            stdout
-                .lines()
+            names
+                .iter()
                 .all(|name| name == "IGGY_DISPLAY_CONFIG" || name.starts_with(prefix)),
             "{binary} listed a variable outside {prefix}"
         );
@@ -286,21 +233,29 @@ fn config_env_listing_excludes_other_processes_variables() {
 }
 
 #[test]
-fn config_env_listing_exits_before_runtime_with_invalid_env_values() {
-    // Verify that invalid environment values don't cause failures
-    let output = run_list_config_env_vars(
-        "iggy-server",
-        [("IGGY_HTTP_ADDRESS", "invalid::address")], // Invalid address
-        &[],
-    );
-
-    assert!(
-        output.status.success(),
-        "listing should exit before validating environment values: {:?}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.stderr.is_empty(), "should not log validation errors");
+fn config_env_listing_includes_each_process_runtime_variables() {
+    for (binary, expected) in [
+        (
+            "iggy-server",
+            &["IGGY_ROOT_PASSWORD", "IGGY_SHARD_RUNTIME_CAPACITY"][..],
+        ),
+        (
+            "iggy-connectors",
+            &["IGGY_CONNECTORS_CONFIG_PATH", "IGGY_CONNECTORS_ENV_PATH"][..],
+        ),
+        (
+            "iggy-mcp",
+            &["IGGY_MCP_CONFIG_PATH", "IGGY_MCP_ENV_PATH"][..],
+        ),
+    ] {
+        let names = list_config_env_vars(binary);
+        for expected_name in expected {
+            assert!(
+                names.iter().any(|name| name == expected_name),
+                "{binary} did not list {expected_name}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -314,19 +269,13 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
     std::fs::write(&sentinel, "sentinel content").expect("write sentinel file");
 
     // Run with both --fresh and --list-config-env-vars
-    let output = run_list_config_env_vars_in(
+    let output_with_fresh = list_config_env_vars_in(
         "iggy-server",
         directory.path(),
         [("IGGY_PATH", data_dir.to_string_lossy().into_owned())],
         &["--fresh"],
     );
 
-    assert!(
-        output.status.success(),
-        "command failed: {:?}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
     assert!(
         sentinel.exists(),
         "sentinel file should not be deleted by early exit"
@@ -337,13 +286,7 @@ fn config_env_listing_with_fresh_does_not_wipe_data_dir() {
         "sentinel file should not be modified"
     );
 
-    // Verify the output is the same as without --fresh
-    let output_with_fresh = String::from_utf8(output.stdout).expect("UTF-8 output");
-
-    let output_without_fresh = run_list_config_env_vars_plain("iggy-server", &[]);
-
-    let output_without_fresh =
-        String::from_utf8(output_without_fresh.stdout).expect("UTF-8 output");
+    let output_without_fresh = list_config_env_vars("iggy-server");
     assert_eq!(
         output_with_fresh, output_without_fresh,
         "output should be identical with and without --fresh"

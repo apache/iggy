@@ -22,7 +22,7 @@ use crate::configs::connectors::{
 use crate::metrics::ConnectorType;
 use ::configs::{
     CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
-    ConfigEnvMappings, ConfigProvider, print_env_var_names,
+    ConfigEnvMappings, ConfigProvider, PLUGIN_CONFIG_ENV_SEGMENT, print_env_var_names,
 };
 use clap::Parser;
 use configs::connectors::ConfigFormat;
@@ -84,7 +84,9 @@ sorted and deduplicated. Template syntax:
 - <KEY> represents connector keys (uppercased from config).
   Overrides via <KEY> require the local connectors provider.
 - <FIELD> represents plugin configuration field names, excluding
-  FORMAT (handled separately as a strongly-typed field)
+  FORMAT (handled separately as a strongly-typed field). It sets one
+  lowercased top-level plugin_config key: A_B becomes a_b, not nested a.b.
+  Nested plugin configuration keys cannot be set via environment variables.
 
 Exits immediately before any startup."#
     )]
@@ -142,13 +144,14 @@ fn print_ascii_art(text: &str) {
 fn main() -> Result<(), RuntimeError> {
     let args = Args::parse();
     if args.list_config_env_vars {
-        print_config_env_vars()?;
+        print_config_env_vars().map_err(RuntimeError::ListConfigEnvVars)?;
         return Ok(());
     }
     capture_allowed_cpus();
     Builder::new_multi_thread()
         .enable_all()
-        .build()?
+        .build()
+        .map_err(RuntimeError::RuntimeCreation)?
         .block_on(run())
 }
 
@@ -164,7 +167,7 @@ fn print_config_env_vars() -> std::io::Result<()> {
         // drift from the names the runtime actually reads.
         let prefix =
             crate::configs::connectors::local_provider::connector_env_prefix(kind, "<KEY>");
-        let plugin_config = format!("{prefix}PLUGIN_CONFIG_<FIELD>");
+        let plugin_config = format!("{prefix}{PLUGIN_CONFIG_ENV_SEGMENT}<FIELD>");
         templates
             .iter()
             .map(move |template| format!("{prefix}{}", template.env_name))

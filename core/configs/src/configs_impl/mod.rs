@@ -34,7 +34,8 @@ mod typed_env_provider;
 
 pub use env_listing::{
     CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
-    MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV, MCP_RUNTIME_ENV_VARS, print_env_var_names,
+    MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV, MCP_RUNTIME_ENV_VARS, PLUGIN_CONFIG_ENV_SEGMENT,
+    print_env_var_names,
 };
 pub use env_mapping::{ConfigEnvMappings, EnvVarMapping, EnvVarTemplate, expand_env_templates};
 pub use error::ConfigurationError;

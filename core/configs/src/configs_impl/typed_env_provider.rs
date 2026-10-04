@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::PLUGIN_CONFIG_ENV_SEGMENT;
 use super::env_mapping::ConfigEnvMappings;
 use super::error::ConfigurationError;
 use super::parsing::parse_env_value;
@@ -292,7 +293,7 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
                             .any(|p| key.starts_with(p))
                 }
                 WarningContext::ConnectorConfig(prefix) => {
-                    let plugin_config_prefix = format!("{}PLUGIN_CONFIG_", prefix);
+                    let plugin_config_prefix = format!("{}{PLUGIN_CONFIG_ENV_SEGMENT}", prefix);
                     key.starts_with(&plugin_config_prefix)
                 }
             };
@@ -620,13 +621,21 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn ignored_env_vars_are_skipped_by_the_unknown_variable_scan() {
-        let runtime_env_vars = super::super::CONNECTORS_RUNTIME_ENV_VARS
-            .iter()
-            .chain(super::super::MCP_RUNTIME_ENV_VARS)
-            .copied()
-            .filter(|name| name.ends_with("_PATH"));
+        let runtime_env_vars = [
+            "IGGY_CONNECTORS_CONFIG_PATH",
+            "IGGY_CONNECTORS_ENV_PATH",
+            "IGGY_MCP_CONFIG_PATH",
+            "IGGY_MCP_ENV_PATH",
+        ];
 
-        for name in runtime_env_vars.clone() {
+        for name in runtime_env_vars {
+            assert!(
+                is_runtime_env_var(name),
+                "{name} is read before config loading and must be skipped by the scan"
+            );
+        }
+
+        for name in runtime_env_vars {
             // SAFETY: the race is process-wide, not per key: `set_var` is unsound
             // against any concurrent environment access. `serial_test::serial` on
             // this test is what prevents that.

@@ -21,7 +21,7 @@ use crate::configs::connectors::{
     SourceConfig,
 };
 use crate::error::RuntimeError;
-use ::configs::{ConfigProvider, FileConfigProvider, TypedEnvProvider};
+use ::configs::{ConfigProvider, FileConfigProvider, PLUGIN_CONFIG_ENV_SEGMENT, TypedEnvProvider};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use figment::value::Dict;
@@ -349,7 +349,7 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
         let connector_type = base_config.connector_type().to_uppercase();
         let key = base_config.key().to_uppercase();
         let prefix = format!(
-            "{}PLUGIN_CONFIG_",
+            "{}{PLUGIN_CONFIG_ENV_SEGMENT}",
             connector_env_prefix(&connector_type, &key)
         );
 
@@ -404,7 +404,7 @@ impl BaseConnectorConfig {
 /// do. Shared by the runtime's actual override lookup here and by
 /// `--list-config-env-vars`'s listing in `main.rs` (passing the literal
 /// `<KEY>` as the key), so the two can't drift apart on the prefix the
-/// server actually reads.
+/// connectors runtime actually reads.
 pub(crate) fn connector_env_prefix(connector_type: &str, key: &str) -> String {
     format!(
         "{}{connector_type}_{key}_",

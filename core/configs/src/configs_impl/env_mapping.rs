@@ -80,8 +80,7 @@ pub trait ConfigEnvMappings {
 }
 
 impl EnvVarTemplate {
-    /// Expands this template into every concrete mapping it represents.
-    pub fn expand(&self) -> Vec<EnvVarMapping> {
+    fn expand(&self) -> Vec<EnvVarMapping> {
         let mut results = vec![(self.env_name.to_string(), self.config_path.to_string())];
 
         for &limit in self.max_elements {
@@ -110,6 +109,10 @@ impl EnvVarTemplate {
 }
 
 /// Expands compact templates into the mappings consumed by the env provider.
+///
+/// The returned mappings own leaked names and paths so generated
+/// `ConfigEnvMappings` implementations can cache them in a `OnceLock` and
+/// return `'static` references. Call this once per config type.
 pub fn expand_env_templates(templates: &[EnvVarTemplate]) -> Vec<EnvVarMapping> {
     templates.iter().flat_map(EnvVarTemplate::expand).collect()
 }

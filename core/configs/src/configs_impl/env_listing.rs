@@ -41,19 +41,62 @@ where
     Ok(())
 }
 
-/// Env vars `iggy-mcp --list-config-env-vars` advertises beyond the derived
-/// `McpServerConfig` templates.
 pub const MCP_CONFIG_PATH_ENV: &str = "IGGY_MCP_CONFIG_PATH";
 pub const MCP_ENV_PATH_ENV: &str = "IGGY_MCP_ENV_PATH";
-pub const MCP_RUNTIME_ENV_VARS: &[&str] =
-    &["IGGY_DISPLAY_CONFIG", MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV];
+/// Env vars `iggy-mcp --list-config-env-vars` advertises beyond the derived
+/// `McpServerConfig` templates.
+pub const MCP_RUNTIME_ENV_VARS: &[&str] = &[
+    super::file_provider::DISPLAY_CONFIG_ENV,
+    MCP_CONFIG_PATH_ENV,
+    MCP_ENV_PATH_ENV,
+];
 
-/// Env vars `iggy-connectors --list-config-env-vars` advertises beyond the
-/// derived `ConnectorsRuntimeConfig` templates.
 pub const CONNECTORS_CONFIG_PATH_ENV: &str = "IGGY_CONNECTORS_CONFIG_PATH";
 pub const CONNECTORS_ENV_PATH_ENV: &str = "IGGY_CONNECTORS_ENV_PATH";
+/// Env vars `iggy-connectors --list-config-env-vars` advertises beyond the
+/// derived `ConnectorsRuntimeConfig` templates.
 pub const CONNECTORS_RUNTIME_ENV_VARS: &[&str] = &[
     CONNECTORS_CONFIG_PATH_ENV,
     CONNECTORS_ENV_PATH_ENV,
-    "IGGY_DISPLAY_CONFIG",
+    super::file_provider::DISPLAY_CONFIG_ENV,
 ];
+
+/// Segment between a connector env-var prefix and a plugin config field.
+pub const PLUGIN_CONFIG_ENV_SEGMENT: &str = "PLUGIN_CONFIG_";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind, Write};
+
+    struct FailingWriter(ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn print_env_var_names_sorts_and_deduplicates() {
+        let mut output = Vec::new();
+        print_env_var_names(["IGGY_B", "IGGY_A", "IGGY_B"], &mut output).unwrap();
+        assert_eq!(output, b"IGGY_A\nIGGY_B\n");
+    }
+
+    #[test]
+    fn print_env_var_names_accepts_a_closed_pipe() {
+        assert!(print_env_var_names(["IGGY_A"], &mut FailingWriter(ErrorKind::BrokenPipe)).is_ok());
+    }
+
+    #[test]
+    fn print_env_var_names_propagates_other_write_errors() {
+        let error = print_env_var_names(["IGGY_A"], &mut FailingWriter(ErrorKind::StorageFull))
+            .expect_err("storage-full error must be propagated");
+        assert_eq!(error.kind(), ErrorKind::StorageFull);
+    }
+}

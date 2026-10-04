@@ -243,8 +243,6 @@ fn generate_struct_impl(
     fields: Vec<FieldOpts>,
 ) -> TokenStream2 {
     let prefix_str = prefix.as_deref().unwrap_or("");
-    let has_prefix = !prefix_str.is_empty();
-
     // Metadata name: use provided or derive from type name (e.g., "ServerConfig" -> "server-config")
     let metadata_name = name.unwrap_or_else(|| {
         let type_name = struct_name.to_string();
@@ -265,12 +263,12 @@ fn generate_struct_impl(
     let builder_name = format_ident!("{}EnvBuilder", struct_name);
 
     let own_template_entries = mappings.iter().map(|mapping| {
-        let env_suffix = &mapping.env_suffix;
+        let env_name = format!("{}{}", prefix_str, mapping.env_suffix);
         let config_path = &mapping.config_path;
         let is_secret = mapping.is_secret;
         quote! {
             configs::EnvVarTemplate {
-                env_name: #env_suffix,
+                env_name: #env_name,
                 config_path: #config_path,
                 is_secret: #is_secret,
                 max_elements: &[],
@@ -279,50 +277,41 @@ fn generate_struct_impl(
     });
     let nested_template_extends = nested_fields.iter().map(|info| {
         let ty = &info.element_type;
-        let segment = &info.field_env_segment;
-        let field_name = &info.field_name;
-        if info.is_vec {
+        let env_segment = if info.is_vec {
+            format!("{}{}_<N>", prefix_str, info.field_env_segment)
+        } else {
+            format!("{}{}", prefix_str, info.field_env_segment)
+        };
+        let config_segment = if info.is_vec {
+            format!("{}.<N>", info.field_name)
+        } else {
+            info.field_name.clone()
+        };
+        let limits = if info.is_vec {
             let max_elements = info.max_elements;
             quote! {
-                for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
-                    let env_name = Box::leak(format!("{}_<N>_{}", #segment, template.env_name).into_boxed_str());
-                    let config_path = Box::leak(format!("{}.<N>.{}", #field_name, template.config_path).into_boxed_str());
-                    let limits = Box::leak(std::iter::once(#max_elements)
-                        .chain(template.max_elements.iter().copied())
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice());
-                    all_templates.push(configs::EnvVarTemplate {
-                        env_name,
-                        config_path,
-                        is_secret: template.is_secret,
-                        max_elements: limits,
-                    });
-                }
+                Box::leak(std::iter::once(#max_elements)
+                    .chain(template.max_elements.iter().copied())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice())
             }
         } else {
-            quote! {
-                for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
-                    let env_name = Box::leak(format!("{}_{}", #segment, template.env_name).into_boxed_str());
-                    let config_path = Box::leak(format!("{}.{}", #field_name, template.config_path).into_boxed_str());
-                    all_templates.push(configs::EnvVarTemplate {
-                        env_name,
-                        config_path,
-                        is_secret: template.is_secret,
-                        max_elements: template.max_elements,
-                    });
-                }
+            quote! { template.max_elements }
+        };
+        quote! {
+            for template in <#ty as configs::ConfigEnvMappings>::env_templates() {
+                let env_name = Box::leak(format!("{}_{}", #env_segment, template.env_name).into_boxed_str());
+                let config_path = Box::leak(format!("{}.{}", #config_segment, template.config_path).into_boxed_str());
+                let max_elements = #limits;
+                all_templates.push(configs::EnvVarTemplate {
+                    env_name,
+                    config_path,
+                    is_secret: template.is_secret,
+                    max_elements,
+                });
             }
         }
     });
-    let template_prefix_application = if has_prefix {
-        quote! {
-            for template in &mut all_templates {
-                template.env_name = Box::leak(format!("{}{}", #prefix_str, template.env_name).into_boxed_str());
-            }
-        }
-    } else {
-        quote! {}
-    };
 
     quote! {
         impl #impl_generics #struct_name #ty_generics #where_clause {
@@ -346,7 +335,6 @@ fn generate_struct_impl(
                 TEMPLATES.get_or_init(|| {
                     let mut all_templates = vec![#(#own_template_entries),*];
                     #(#nested_template_extends)*
-                    #template_prefix_application
                     all_templates
                 })
             }
