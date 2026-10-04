@@ -22,7 +22,6 @@ import {
   isInternal,
   isKnownOperation,
   isMetadata,
-  isPartition,
   isResultFramed,
   Operation,
   operationForCode
@@ -87,8 +86,6 @@ describe('VSR operation classification', () => {
     assert.equal(isMetadata(Operation.LeaveConsumerGroup), true);
     assert.equal(isMetadata(Operation.DeleteSegments), false);
     assert.equal(isMetadata(150), false);
-    assert.equal(isPartition(Operation.SendMessages), true);
-    assert.equal(isPartition(159), false);
     assert.equal(isResultFramed(Operation.StoreConsumerOffset), true);
     assert.equal(isResultFramed(Operation.DeleteConsumerOffset), true);
     assert.equal(isResultFramed(Operation.SendMessages), false);

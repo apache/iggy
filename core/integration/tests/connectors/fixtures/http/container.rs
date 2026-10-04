@@ -85,6 +85,12 @@ impl HttpSinkWireMockContainer {
                     .to_string(),
                 "/home/wiremock/mappings",
             ))
+            // Bind-mounted fixture files keep the host's SELinux label, which the
+            // container's confined context can't read on SELinux-enforcing hosts
+            // (denied even though the host user has full Unix permissions).
+            // `label=disable` skips that check instead of requiring every
+            // contributor to relabel the fixture directory themselves.
+            .with_security_opt("label=disable")
             .with_container_name(fixtures::unique_container_name("wiremock-http"))
             .start()
             .await
@@ -116,6 +122,29 @@ impl HttpSinkWireMockContainer {
             container,
             base_url,
         })
+    }
+
+    pub async fn set_ingest_status(
+        &self,
+        status: reqwest::StatusCode,
+    ) -> Result<(), TestBinaryError> {
+        let url = format!("{}/__admin/mappings", self.base_url);
+        let client = reqwest::Client::new();
+        let mapping = serde_json::json!({
+            "request": { "method": "POST", "urlPath": "/ingest" },
+            "response": { "status": status.as_u16() }
+        });
+        // Deleting mappings also removes the bind-mounted fixture files.
+        client
+            .post(&url)
+            .json(&mapping)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to set WireMock ingest response: {error}"),
+            })?;
+        Ok(())
     }
 
     /// Query WireMock's admin API and return all received requests.

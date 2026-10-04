@@ -21,8 +21,8 @@ mod url_builder;
 use crate::configs::connectors::http_provider::response_extractor::ResponseExtractor;
 use crate::configs::connectors::http_provider::url_builder::{TemplateKeys, UrlBuilder};
 use crate::configs::connectors::{
-    ConnectorConfigVersions, ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfig,
-    CreateSourceConfig, SinkConfig, SourceConfig,
+    ConnectorConfigVersions, ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider,
+    CreateSinkConfig, CreateSourceConfig, SinkConfig, SourceConfig,
 };
 use crate::configs::runtime::{ResponseConfig, RetryConfig};
 use crate::error::RuntimeError;
@@ -131,11 +131,11 @@ impl HttpConnectorsConfigProvider {
 impl ConnectorsConfigProvider for HttpConnectorsConfigProvider {
     async fn create_sink_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         config: CreateSinkConfig,
     ) -> Result<SinkConfig, RuntimeError> {
         let mut vars = HashMap::new();
-        vars.insert("key", key);
+        vars.insert("key", key.as_str());
         let url = self.url_builder.build(TemplateKeys::CREATE_SINK, &vars);
 
         let response = self
@@ -157,11 +157,11 @@ impl ConnectorsConfigProvider for HttpConnectorsConfigProvider {
 
     async fn create_source_config(
         &self,
-        key: &str,
+        key: &ConnectorKey,
         config: CreateSourceConfig,
     ) -> Result<SourceConfig, RuntimeError> {
         let mut vars = HashMap::new();
-        vars.insert("key", key);
+        vars.insert("key", key.as_str());
         let url = self.url_builder.build(TemplateKeys::CREATE_SOURCE, &vars);
 
         let response = self

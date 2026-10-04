@@ -30,6 +30,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod bench;
 // Drives the `iggy` CLI binary against a running server. Single-node and the
 // default 3-node cluster both pass.
 mod cli;

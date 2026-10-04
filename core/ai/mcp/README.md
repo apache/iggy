@@ -2,11 +2,17 @@
 
 The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The Apache Iggy MCP Server is an implementation of the MCP protocol for the message streaming infrastructure.
 
-To start the MCP server, simply run `cargo run --bin iggy-mcp`.
+Start an Iggy broker from the same checkout first. For a development broker started with `--with-default-root-credentials`, run from the repository root:
 
-The [docker image](https://hub.docker.com/r/apache/iggy-mcp) is available, and can be fetched via `docker pull apache/iggy-mcp`.
+```sh
+IGGY_MCP_IGGY_USERNAME=iggy IGGY_MCP_IGGY_PASSWORD=iggy cargo run --bin iggy-mcp
+```
 
-The minimal viable configuration requires at least the Iggy credentials, to create the connection with the running Iggy server using TCP with which the MCP server will communicate. You can choose between HTTP and STDIO transports (e.g. for the local usage with tools such as [Claude Desktop](https://claude.ai/download) choose `stdio`).
+Use the credentials or PAT of your existing broker when connecting to another installation.
+
+The [docker image](https://hub.docker.com/r/apache/iggy-mcp) is available, and can be fetched via `docker pull apache/iggy-mcp:edge`.
+
+The minimal viable configuration requires at least the Iggy credentials, to create the connection with the running Iggy server using TCP with which the MCP server will communicate. You can choose between HTTP (the default) and STDIO transports (e.g. for the local usage with tools such as [Claude Desktop](https://claude.ai/download) choose `stdio`).
 
 ```toml
 transport = "stdio" # http or stdio are supported
@@ -48,9 +54,13 @@ update = true
 delete = true
 ```
 
-Keep in mind that either of `toml`, `yaml`, or `json` formats are supported for the configuration file. The path to the configuration can be overridden by `IGGY_MCP_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_MCP_SECTION_NAME.KEY_NAME` e.g. `IGGY_MCP_IGGY_USERNAME` and so on.
+The configuration file must use TOML. The default path is `core/ai/mcp/config.toml`, relative to the working directory; override it with `IGGY_MCP_CONFIG_PATH`. Embedded defaults are loaded first, then the file if present, then environment overrides such as `IGGY_MCP_IGGY_USERNAME` and `IGGY_MCP_HTTP_ADDRESS`. Nested settings also use underscores, for example `IGGY_MCP_IGGY_TLS_ENABLED`.
 
-Here's the example configuration to be used with Claude Desktop:
+Set `IGGY_MCP_ENV_PATH` to load a particular dotenv file. Otherwise `.env` is searched for in the current directory and its parents. Existing environment variables take precedence over dotenv values.
+
+A non-empty `iggy.token` takes precedence over username and password. It accepts a literal PAT or a `file:` reference such as `file:/run/secrets/iggy_pat`; file contents are trimmed and a leading `~/` expands to the home directory.
+
+Set `command` to the absolute path of the built executable. This Claude Desktop example uses the development broker credentials:
 
 ```json
 {
@@ -59,7 +69,10 @@ Here's the example configuration to be used with Claude Desktop:
       "command": "/path/to/iggy-mcp",
       "args": [],
       "env": {
-        "IGGY_MCP_TRANSPORT": "stdio"
+        "IGGY_MCP_TRANSPORT": "stdio",
+        "IGGY_MCP_IGGY_ADDRESS": "localhost:8090",
+        "IGGY_MCP_IGGY_USERNAME": "iggy",
+        "IGGY_MCP_IGGY_PASSWORD": "iggy"
       }
     }
   }
@@ -70,6 +83,19 @@ Here's the example configuration to be used with Claude Desktop:
 
 ![MCP](../../../assets/iggy_mcp_server.png)
 
+## Tool permissions
+
+Each tool checks these MCP permissions before forwarding the request. The broker also enforces the authenticated Iggy account's permissions.
+
+| Permission | Tools |
+| --- | --- |
+| `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
+| `create` | `create_stream`, `create_topic`, `create_partitions`, `send_messages`, `create_consumer_group`, `create_personal_access_token`, `create_user` |
+| `update` | `update_stream`, `update_topic`, `store_consumer_offset`, `update_user`, `update_permissions`, `change_password` |
+| `delete` | `delete_stream`, `purge_stream`, `delete_topic`, `purge_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_consumer_offset`, `delete_personal_access_token`, `delete_user` |
+
+`poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
+
 ## Systemd integration
 
 Build with the `systemd` feature to enable systemd readiness and watchdog notifications:
@@ -78,8 +104,7 @@ Build with the `systemd` feature to enable systemd readiness and watchdog notifi
 cargo build --bin iggy-mcp --release --features iggy-mcp/systemd
 ```
 
-The MCP server behaves the same way the Iggy server does under systemd. See
-[Systemd integration](../../server/README.md#systemd-integration) for details.
+Readiness is sent after the HTTP listener starts or the stdio session initializes. The watchdog sends keep-alive notifications at half the interval supplied by systemd. SIGINT, SIGTERM, and stdio client disconnect trigger shutdown and a stopping notification.
 
 ## Telemetry
 
@@ -98,3 +123,7 @@ endpoint = "http://localhost:4317"
 transport = "grpc" # Options: "grpc", "http"
 endpoint = "http://localhost:4317"
 ```
+
+For HTTP export, set `transport = "http"` and use complete signal URLs: `http://localhost:4318/v1/logs` for logs and `http://localhost:4318/v1/traces` for traces. The MCP server does not append those paths.
+
+Shutdown flushes pending logs and spans before stopping the async runtime.

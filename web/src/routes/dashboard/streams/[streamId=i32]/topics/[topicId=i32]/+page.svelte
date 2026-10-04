@@ -39,7 +39,7 @@ under the License.
 
   let { data }: Props = $props();
   let topic = $derived(data.topic);
-  let prevPage = $derived(`/dashboard/streams/${page.params.streamId}/`);
+  let prevPage = $derived(typedRoute(`/dashboard/streams/${+(page.params.streamId || '')}`));
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">

@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include "iggy.hpp"
 #include "lib.rs.h"
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
@@ -62,7 +63,7 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
 
 inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
     rust::Vec<rust::String> snapshot_types;
-    for (const auto value : values) {
+    for (const auto *const value : values) {
         snapshot_types.push_back(value);
     }
     return snapshot_types;
@@ -100,6 +101,25 @@ inline bool has_header(const rust::Vec<iggy::ffi::HeaderEntry> &headers,
     return false;
 }
 
+inline iggy::ffi::TopicCreateOptions make_topic_create_options(
+    std::uint32_t partitions_count,
+    const std::string &compression_algorithm = "none",
+    const std::string &message_expiry_kind   = "server_default",
+    std::uint64_t message_expiry_value       = 0,
+    const std::string &max_topic_size        = "server_default") {
+    iggy::ffi::TopicCreateOptions opts{};
+    opts.has_partitions_count      = true;
+    opts.partitions_count          = partitions_count;
+    opts.has_compression_algorithm = true;
+    opts.compression_algorithm     = compression_algorithm;
+    opts.has_message_expiry        = true;
+    opts.message_expiry_kind       = message_expiry_kind;
+    opts.message_expiry_value      = message_expiry_value;
+    opts.has_max_topic_size        = true;
+    opts.max_topic_size            = max_topic_size;
+    return opts;
+}
+
 struct TrackedConsumerGroup {
     std::string stream_name;
     std::string topic_name;
@@ -108,7 +128,7 @@ struct TrackedConsumerGroup {
 
 class E2ETestFixture : public ::testing::Test {
   public:
-    ~E2ETestFixture() { CleanupBestEffort(); }
+    ~E2ETestFixture() override { CleanupBestEffort(); }
     void TearDown() override { Cleanup(); }
 
   protected:
@@ -141,6 +161,15 @@ class E2ETestFixture : public ::testing::Test {
         return client;
     }
 
+    iggy::IggyBlockingClient GetLoggedOutHighLevelClient() { return iggy::IggyBlockingClient::Builder().Build(); }
+
+    iggy::IggyBlockingClient GetLoggedInHighLevelClient(std::string username = "iggy", std::string password = "iggy") {
+        auto client = GetLoggedOutHighLevelClient();
+        client.Connect();
+        client.Login(std::move(username), std::move(password));
+        return client;
+    }
+
     std::string GetRandomName(const std::size_t max_length = 255) {
         if (max_length == 0) {
             return {};
@@ -170,6 +199,16 @@ class E2ETestFixture : public ::testing::Test {
                                           const bool has_permissions         = false,
                                           iggy::ffi::Permissions permissions = {}) {
         auto user = client->create_user(username, password, status, has_permissions, std::move(permissions));
+        tracked_user_names_.push_back(username);
+        return user;
+    }
+
+    iggy::UserInfoDetails CreateUser(iggy::IggyBlockingClient &client,
+                                     const std::string &username,
+                                     const std::string &password,
+                                     const iggy::UserStatus status,
+                                     std::optional<iggy::Permissions> permissions = std::nullopt) {
+        auto user = client.CreateUser(username, password, status, permissions);
         tracked_user_names_.push_back(username);
         return user;
     }
@@ -375,7 +414,6 @@ class E2ETestFixture : public ::testing::Test {
                !tracked_user_names_.empty();
     }
 
-  private:
     std::vector<iggy::ffi::Client *> clients_;
     std::vector<std::string> tracked_user_names_;
     std::vector<std::string> tracked_stream_names_;

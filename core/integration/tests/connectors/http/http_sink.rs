@@ -47,10 +47,9 @@
 //! 4. **WireMock**: Docker container accepting all POSTs to `/ingest`, recording
 //!    requests for later verification via `/__admin/requests`
 //!
-//! **Runtime model**: 1 process = 1 config = 1 plugin. The runtime reads `config.toml`,
-//! loads the plugin binary, iterates `for topic in stream.topics`, and spawns one
-//! `tokio::spawn` task per topic. Each task creates an `IggyConsumer` and polls
-//! sequentially — `consume()` is awaited before the next poll.
+//! **Runtime model**: One process can load multiple connector configurations.
+//! Each plugin instance has a consumer task per configured stream/topic. Topic tasks
+//! can run concurrently; each awaits `consume()` before processing its next batch.
 //!
 //! See `setup_sink_consumers()` and `spawn_consume_tasks()` in `runtime/src/sink.rs`.
 //!
@@ -127,13 +126,13 @@
 //! cargo build -p iggy_connector_http_sink
 //!
 //! # Run all HTTP sink integration tests
-//! cargo test -p integration --test connectors -- http_sink --nocapture
+//! cargo test -p integration -- http_sink --nocapture
 //!
 //! # Run a specific test
-//! cargo test -p integration --test connectors -- individual_json_messages --nocapture
+//! cargo test -p integration -- individual_json_messages --nocapture
 //!
 //! # Run with test isolation (sequential)
-//! cargo test -p integration --test connectors -- http_sink --test-threads=1 --nocapture
+//! cargo test -p integration -- http_sink --test-threads=1 --nocapture
 //! ```
 //!
 //! ## Success Criteria
@@ -159,11 +158,10 @@
 //!
 //! ## Known Limitations
 //!
-//! 1. **FFI return value ignored**: The runtime's `process_messages()` discards `consume()`'s
-//!    `i32` return code. Errors are logged by the sink but invisible to the runtime.
-//!    See [#2927](https://github.com/apache/iggy/issues/2927).
+//! 1. **No runtime batch retry**: Nonzero FFI results are logged and counted as errors,
+//!    but the runtime continues polling without retrying the failed batch.
 //! 2. **Offsets committed before processing**: `PollingMessages` auto-commit strategy commits
-//!    offsets before `consume()`. Combined with (1), effective guarantee is at-most-once.
+//!    offsets before `consume()`. Failed delivery can lose messages; sink retries can duplicate them.
 //!    See [#2928](https://github.com/apache/iggy/issues/2928).
 //!
 //! ## Test History
@@ -187,8 +185,112 @@ use crate::connectors::fixtures::{
 use bytes::Bytes;
 use iggy::prelude::IggyClient;
 use iggy_common::{Identifier, IggyMessage, MessageClient, Partitioning};
+use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus};
 use integration::harness::seeds;
 use integration::iggy_harness;
+use reqwest::StatusCode;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
+
+const HTTP_SINK_KEY: &str = "http";
+const SINK_STATS_TIMEOUT: Duration = Duration::from_secs(10);
+const SINK_STATS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_sink_rejection_when_delivery_recovers_should_report_batch_outcomes(
+    harness: &TestHarness,
+    fixture: HttpSinkJsonArrayFixture,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("root client should connect");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("valid stream name");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("valid topic name");
+    let stats_url = format!(
+        "{}/stats",
+        harness
+            .connectors_runtime()
+            .expect("connector runtime should be available")
+            .http_url()
+    );
+    let http_client = reqwest::Client::new();
+
+    for (status, expected_processed) in [(StatusCode::BAD_REQUEST, 0), (StatusCode::OK, 1)] {
+        fixture
+            .container()
+            .set_ingest_status(status)
+            .await
+            .expect("ingest response should be configured");
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(Bytes::from_static(br#"{"message":"sink status"}"#))
+                .build()
+                .expect("valid JSON message"),
+        ];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .expect("message should reach Iggy");
+
+        let sink = timeout(SINK_STATS_TIMEOUT, async {
+            loop {
+                let snapshot: ConnectorRuntimeStats = http_client
+                    .get(&stats_url)
+                    .send()
+                    .await
+                    .expect("stats request should complete")
+                    .error_for_status()
+                    .expect("stats endpoint should succeed")
+                    .json()
+                    .await
+                    .expect("stats response should decode");
+                let sink = snapshot
+                    .connectors
+                    .into_iter()
+                    .find(|connector| connector.key == HTTP_SINK_KEY)
+                    .expect("HTTP sink should be reported");
+                assert!(
+                    sink.messages_processed.unwrap_or_default() <= expected_processed,
+                    "rejected messages must not count as processed: {sink:?}"
+                );
+                if sink.errors > 0 && sink.messages_processed == Some(expected_processed) {
+                    break sink;
+                }
+                sleep(SINK_STATS_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("sink should report the completed batch outcome");
+
+        assert_eq!(sink.messages_consumed, Some(expected_processed + 1));
+        assert_eq!(
+            sink.errors, 1,
+            "one rejected batch should count as one error"
+        );
+        assert_eq!(sink.messages_filtered, Some(0));
+        assert_eq!(sink.status, ConnectorStatus::Running);
+    }
+
+    let requests = fixture
+        .container()
+        .get_received_requests()
+        .await
+        .expect("received requests should be available");
+    assert_eq!(
+        requests.len(),
+        2,
+        "both batches must reach the HTTP endpoint"
+    );
+}
 
 // ============================================================================
 // Test 1: Individual Batch Mode

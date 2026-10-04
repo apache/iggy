@@ -79,7 +79,7 @@ describe('VSR custom request framing', () => {
     );
   });
 
-  it('does not advance for non-replicated or partition operations', () => {
+  it('does not advance for non-replicated operations', () => {
     const session = new VsrSession(7n);
     session.bind(42n);
     const custom = session.encode(
@@ -88,26 +88,43 @@ describe('VSR custom request framing', () => {
     );
     assert.equal(custom.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
 
-    const partition = session.encode(
-      COMMAND_CODE.SendMessages,
-      serializeSendMessages(
-        1,
-        2,
-        [{ payload: 'x' }],
-        Partitioning.PartitionId(3)
-      )
-    );
-    assert.equal(
-      partition.readUInt8(REQUEST_OFFSET.operation),
-      Operation.SendMessages
-    );
-    assert.equal(partition.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
-
     const metadata = session.encode(
       COMMAND_CODE.CreateStream,
       Buffer.alloc(0)
     );
     assert.equal(metadata.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
     assert.equal(metadata.length, HEADER_SIZE);
+  });
+
+  it('partition operations consume a distinct id per send', () => {
+    // Dedup identity requires each send to carry a distinct number, so
+    // partition ops advance the counter exactly like metadata ops and the
+    // two planes interleave on one sequence.
+    const session = new VsrSession(7n);
+    session.bind(42n);
+    const sendMessages = () =>
+      session.encode(
+        COMMAND_CODE.SendMessages,
+        serializeSendMessages(
+          1,
+          2,
+          [{ payload: 'x' }],
+          Partitioning.PartitionId(3)
+        )
+      );
+
+    const first = sendMessages();
+    assert.equal(
+      first.readUInt8(REQUEST_OFFSET.operation),
+      Operation.SendMessages
+    );
+    assert.equal(first.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
+    assert.equal(sendMessages().readBigUInt64LE(REQUEST_OFFSET.request), 2n);
+
+    const metadata = session.encode(
+      COMMAND_CODE.CreateStream,
+      Buffer.alloc(0)
+    );
+    assert.equal(metadata.readBigUInt64LE(REQUEST_OFFSET.request), 3n);
   });
 });

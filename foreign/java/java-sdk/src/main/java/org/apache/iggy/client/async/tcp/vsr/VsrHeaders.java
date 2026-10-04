@@ -26,7 +26,11 @@ import org.apache.iggy.exception.IggyServerException;
  * Byte offsets and readers for the 256-byte consensus headers, mirroring the
  * {@code #[repr(C)]} layouts in
  * {@code core/binary_protocol/src/consensus/header.rs}. All fields are
- * little-endian; the checksum fields stay zero by protocol contract.
+ * little-endian. The checksum fields stay zero by choice, not by protocol
+ * requirement: the frame and body checksums are not read on the client request
+ * path, and {@code request_checksum} treats zero as unstamped, which opts out of
+ * the server's payload comparison. The Rust SDK stamps it for deduped
+ * operations; this SDK does not yet.
  */
 public final class VsrHeaders {
 
@@ -47,6 +51,7 @@ public final class VsrHeaders {
     static final int REQUEST_RESERVED_CODE_OFFSET = 196;
 
     // ReplyHeader
+    static final int REPLY_COMMIT_OFFSET = 184;
     static final int REPLY_REQUEST_OFFSET = 200;
     static final int REPLY_OPERATION_OFFSET = 208;
     static final int REPLY_STATUS_OFFSET = 216;

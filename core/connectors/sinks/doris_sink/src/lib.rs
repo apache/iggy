@@ -19,15 +19,16 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
-use iggy_connector_sdk::retry::{exponential_backoff, jitter};
+use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Schema, Sink, TopicMetadata, sink_connector,
 };
 use reqwest::{Method, StatusCode, header};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use simd_json::{OwnedValue, StaticNode};
+use std::borrow::Cow;
 use std::io::Write as _;
 use std::str::FromStr;
 use std::time::Duration;
@@ -155,10 +156,8 @@ pub struct DorisSinkConfig {
     pub where_clause: Option<String>,
     /// Stream Load output format: `"json"` (default) or `"csv"`. CSV is opt-in
     /// for throughput; because Doris CSV is positional (JSON is name-mapped), it
-    /// requires `columns` to pin the column order, else `open()` fails. Named
-    /// `output_format` (not `format`) so the env override
-    /// `..._PLUGIN_CONFIG_OUTPUT_FORMAT` doesn't collide with the runtime's
-    /// top-level `plugin_config_format` (both would flatten to `..._FORMAT`).
+    /// requires `columns` to pin the column order, else `open()` fails.
+    /// A field named `format` would lose its environment override to `PLUGIN_CONFIG_FORMAT`.
     pub output_format: Option<Format>,
     /// Total per-request HTTP timeout as a human-readable duration, e.g. "30s"
     /// (default 30s). Matches the `timeout` field on the http/influxdb sinks.
@@ -300,7 +299,7 @@ impl DorisSink {
             }
 
             let response = request.send().await.map_err(|e| {
-                error!("Doris sink ID {} HTTP request failed: {e}", self.id);
+                warn!("Doris sink ID {} HTTP request failed: {e}", self.id);
                 Error::HttpRequestFailed(e.to_string())
             })?;
 
@@ -385,7 +384,9 @@ impl DorisSink {
                     "Doris sink ID {} stream load returned HTTP {status}: {response_for_log}",
                     self.id
                 );
-                error!("{msg}");
+                // Per-attempt detail only: `retry_async` logs every retried
+                // attempt, and `consume` logs the terminal error carrying `msg`.
+                warn!("{msg}");
                 // 408/429 are 4xx but transient, so include them in the bounded
                 // in-request retry path.
                 return Err(match status {
@@ -417,36 +418,31 @@ impl DorisSink {
             ))
         })?;
 
-        let mut attempt = 0u32;
-        loop {
-            let error = match self
-                .send_stream_load(connected, label, body.clone())
-                .await
-                .and_then(|response| classify_status(self.id, &response).map(|()| response))
-            {
-                Ok(response) => return Ok(response),
-                Err(error) => error,
-            };
+        let policy = RetryPolicy {
+            max_attempts: connected.max_retries,
+            base_delay: connected.retry_delay,
+            max_delay: connected.max_retry_delay,
+        };
+        let context = format!("Doris sink ID {} Stream Load (label={label})", self.id);
 
-            attempt += 1;
-            if attempt >= connected.max_retries || !is_transient_error(&error) {
-                return Err(error);
+        retry_async(policy, &context, is_transient_error, || {
+            let body = body.clone();
+            async move {
+                let response = self.send_stream_load(connected, label, body).await?;
+                classify_status(self.id, &response)?;
+                Ok(response)
             }
-
-            // `attempt` counts completed attempts. Subtract one so the first
-            // retry waits exactly the configured base delay (base * 2^0).
-            let delay = jitter(exponential_backoff(
-                connected.retry_delay,
-                attempt - 1,
-                connected.max_retry_delay,
-            ))
-            .min(connected.max_retry_delay);
+        })
+        .await
+        .map_err(|failure| {
+            // The only place the attempt count and the reason survive:
+            // `consume` logs the error itself, which carries neither.
             warn!(
-                "Doris sink ID {} transient Stream Load failure on attempt {attempt}/{} (label={label}): {error}; retrying in {delay:?}",
-                self.id, connected.max_retries
+                "Doris sink ID {} Stream Load (label={label}) {failure}",
+                self.id
             );
-            tokio::time::sleep(delay).await;
-        }
+            failure.into_error()
+        })
     }
 }
 
@@ -641,6 +637,28 @@ fn csv_column_names(columns: &str) -> Vec<String> {
         .map(str::trim)
         .take_while(|name| !name.is_empty() && !name.contains('='))
         .map(str::to_string)
+        .collect()
+}
+
+/// The JSON document of every message in a chunk, or the schema-contract error
+/// that aborts the poll. Proto text is read as the document it holds, so the
+/// descriptor-less `proto_convert` fallback lands, and proto text that is not
+/// JSON is rejected like any other payload without a document.
+fn json_documents(
+    chunk: &[ConsumedMessage],
+    sink_id: u32,
+    schema: Schema,
+) -> Result<Vec<Cow<'_, OwnedValue>>, Error> {
+    chunk
+        .iter()
+        .map(|message| {
+            message.payload.json_document().ok_or_else(|| {
+                error!(
+                    "Doris sink ID {sink_id} received payload with no JSON document (schema={schema}); aborting poll"
+                );
+                Error::InvalidPayloadType
+            })
+        })
         .collect()
 }
 
@@ -1011,7 +1029,7 @@ impl Sink for DorisSink {
                 self.id
             );
         }
-        // `exponential_backoff` already caps at the max, but a base above the cap
+        // `retry_backoff` already caps at the max, but a base above the cap
         // is a config mistake worth surfacing rather than silently flattening.
         let (retry_delay, max_retry_delay) = if retry_delay > max_retry_delay {
             warn!(
@@ -1101,24 +1119,19 @@ impl Sink for DorisSink {
         // boundary (severity isn't propagated), and every chunk error is already
         // logged individually below — so first-error is sufficient.
         //
-        // The lone hard-abort is a non-JSON payload (via `?`): a stream-wide
-        // schema-contract violation, not a transient chunk failure. Under the
-        // documented `schema = "json"` config the SDK drops non-JSON before
-        // consume() is called, so this stands as a defensive guard.
+        // The lone hard-abort is a payload with no JSON document (via `?`): a
+        // stream-wide schema-contract violation, not a transient chunk failure.
+        // Under the documented `schema = "json"` config the runtime's JSON
+        // decoder drops non-JSON bytes before consume() is called, so this
+        // stands as a defensive guard unless a format-converting transform is
+        // configured. `proto_convert` is the one that reaches it: with no
+        // descriptor it hands over the JSON it was given as proto text, which
+        // is taken as the document it holds, and proto text that is not JSON
+        // still aborts.
         for chunk in messages.chunks(batch_size) {
-            let json_values: Vec<&simd_json::OwnedValue> = chunk
-                .iter()
-                .map(|m| match &m.payload {
-                    Payload::Json(value) => Ok(value),
-                    _ => {
-                        error!(
-                            "Doris sink ID {} received non-JSON payload (schema={}); aborting poll",
-                            self.id, messages_metadata.schema
-                        );
-                        Err(Error::InvalidPayloadType)
-                    }
-                })
-                .collect::<Result<_, _>>()?;
+            let documents = json_documents(chunk, self.id, messages_metadata.schema)?;
+            let json_values: Vec<&simd_json::OwnedValue> =
+                documents.iter().map(Cow::as_ref).collect();
 
             // `chunks()` never yields an empty slice, so first/last are present.
             // Use `zip` + `continue` (not `.expect`) so that if a future refactor
@@ -1207,6 +1220,7 @@ impl Sink for DorisSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_connector_sdk::Payload;
 
     fn make_config() -> DorisSinkConfig {
         DorisSinkConfig {
@@ -2349,6 +2363,38 @@ mod tests {
         assert_eq!(csv_column_names(" a ,b, c "), ["a", "b", "c"]);
         assert!(csv_column_names("").is_empty());
         assert!(csv_column_names("calc = x").is_empty());
+    }
+
+    fn proto_message(text: &str) -> ConsumedMessage {
+        ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload: Payload::Proto(text.to_string()),
+        }
+    }
+
+    #[test]
+    fn json_documents_reads_proto_text_that_is_json() {
+        let chunk = vec![proto_message(r#"{"id":1}"#)];
+
+        let documents = json_documents(&chunk, 1, Schema::Proto).unwrap();
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(*documents[0], owned(r#"{"id":1}"#));
+    }
+
+    #[test]
+    fn json_documents_rejects_proto_text_that_is_not_json() {
+        let chunk = vec![proto_message("id: 1")];
+
+        assert_eq!(
+            json_documents(&chunk, 1, Schema::Proto).unwrap_err(),
+            Error::InvalidPayloadType
+        );
     }
 
     #[test]

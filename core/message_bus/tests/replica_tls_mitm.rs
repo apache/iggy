@@ -36,7 +36,7 @@ use compio::io::compat::AsyncStream;
 use compio::net::{TcpListener, TcpStream};
 use futures::AsyncReadExt;
 use message_bus::IggyMessageBus;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::auth::ReplicaAuth;
 use message_bus::replica::handshake::ReplicaTlsCtx;
 use message_bus::replica::listener::{MessageHandler, bind, run};
@@ -100,7 +100,7 @@ async fn tls_relay_mitm_is_rejected_by_channel_binding() {
         0,
         vec![(1, relay_addr)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 

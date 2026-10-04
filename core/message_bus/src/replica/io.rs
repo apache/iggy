@@ -18,25 +18,20 @@
 //! Shard-0 listener bootstrap.
 //!
 //! Every shard on a node instantiates its own `Rc<IggyMessageBus>` on its
-//! own compio runtime, but only shard 0 terminates inbound traffic: it
-//! binds the replica listener, the plain-TCP client listener, and
-//! optionally the WS, QUIC, TCP-TLS, and WSS client listeners. It also
-//! dials higher-id peers for the replica plane. Each accepted or
+//! own compio runtime. Shard 0 binds the replica and client listeners
+//! and dials higher-id peers for the replica plane. Each accepted or
 //! dialed connection is handed to the delegate callback supplied by
 //! the caller (typically wrapping `shard::coordinator::ShardZeroCoordinator`).
-//! Replica, client-TCP, and pre-upgrade WS callbacks duplicate the raw
-//! fd and ship it to the owning shard via the inter-shard `ShardFrame`
-//! channel; replica delegation is blind (no byte is read on shard 0 -
-//! the owning shard runs the handshake, see
-//! [`crate::replica::handshake`]). TCP-TLS, WSS, and QUIC CLIENT
-//! callbacks install locally on shard 0: their handshake state
-//! materialises before delegation could happen, and post-handshake
-//! rustls / QUIC state is not serialisable.
+//! Replica, TCP, WS, TCP-TLS and WSS callbacks duplicate the raw fd and
+//! ship it to the owning shard before any bytes are read. TLS configuration
+//! travels with TCP-TLS and WSS sockets. The owning shard runs handshakes
+//! and subsequent I/O; see [`crate::replica::handshake`] for replica
+//! handshakes. QUIC client callbacks install locally on shard 0 through
+//! its shared UDP endpoint.
 //!
-//! Non-zero shards early-return `Ok(None)`; the launcher calls this helper
-//! unconditionally per shard, so non-zero shards just have no listener
-//! binding and rely on `send_to_*` slow-path forwarding to reach the
-//! owning shard.
+//! Non-zero shards early-return `Ok(None)` and receive delegated sockets
+//! through their inboxes. `send_to_*` forwards traffic when another shard
+//! owns the connection.
 
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -135,17 +130,13 @@ pub fn assert_listen_addrs_distinct(
 /// Optionally bind WS, QUIC, TCP-TLS, and WSS client listeners
 /// alongside. Non-zero shards early-return `Ok(None)`.
 ///
-/// Each accepted / dialed connection is handed to the supplied
-/// delegate callback. The replica callbacks (`on_accepted_replica` for
-/// blind inbound delegation, `on_dialed_replica` for outbound), the
-/// client-TCP callback (`on_accepted_client`), and the WS callback
-/// (`on_accepted_ws_client`) are responsible for the dup-fd +
-/// inter-shard send. The QUIC, TCP-TLS, and WSS callbacks
-/// (`on_accepted_quic_client` / `on_accepted_tcp_tls_client` /
-/// `on_accepted_wss_client`) install locally on shard 0; those CLIENT
-/// planes have no cross-shard handover (QUIC by transport design,
-/// TLS-family because the handshake completes before delegation could
-/// happen and the resulting rustls state is not serialisable).
+/// Each accepted or dialed connection is handed to its supplied callback.
+/// Replica, TCP, WS, TCP-TLS and WSS callbacks duplicate the raw fd and
+/// send it to the owning shard before any handshake. TCP-TLS and WSS
+/// also transfer the listener's shared TLS configuration. The owning
+/// shard supplies its handlers and performs handshakes and I/O.
+/// The QUIC client callback installs locally on shard 0 through its
+/// shared UDP endpoint.
 ///
 /// `ws_listen_addr` / `on_accepted_ws_client` are paired: if either is
 /// `Some`, both must be. Same for the QUIC trio
@@ -212,7 +203,7 @@ pub async fn start_on_shard_zero(
     );
 
     let (replica_listener, replica_bound) = bind_replica_listener(replica_listen_addr).await?;
-    let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr).await?;
+    let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr)?;
 
     let token_for_replica = bus.token();
     let replica_handle = compio::runtime::spawn(async move {
@@ -228,7 +219,7 @@ pub async fn start_on_shard_zero(
 
     let ws_bound = match (ws_listen_addr, on_accepted_ws_client) {
         (Some(addr), Some(on_accepted_ws)) => {
-            let (ws_listener, ws_bound) = client_listener::ws::bind(addr).await?;
+            let (ws_listener, ws_bound) = client_listener::ws::bind(addr)?;
             let token_for_ws = bus.token();
             let ws_handle = compio::runtime::spawn(async move {
                 client_listener::ws::run(ws_listener, token_for_ws, on_accepted_ws).await;

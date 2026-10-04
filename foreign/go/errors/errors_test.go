@@ -65,6 +65,12 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			message:  "request transiently not accepted; retry, on any replica",
 		},
 		{
+			err:      RequestTooOld{},
+			sentinel: ErrRequestTooOld,
+			code:     RequestTooOldCode,
+			message:  "request is below the deduplication window; outcome unknown, resending may duplicate the write",
+		},
+		{
 			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
 			sentinel: ErrConsumerGroupPartitionNotOwned,
 			code:     ConsumerGroupPartitionNotOwnedCode,
@@ -92,6 +98,25 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 				t.Errorf("FromCode(%d).Code() = %v, want %v", c.code, resolved.Code(), c.code)
 			}
 		})
+	}
+}
+
+func TestIggyError_TooManyConsumerOffsets(t *testing.T) {
+	err := TooManyConsumerOffsets{}
+	if err.Code() != TooManyConsumerOffsetsCode {
+		t.Errorf("Code() = %v, want %v", err.Code(), TooManyConsumerOffsetsCode)
+	}
+	if err.Error() != "consumer offset limit reached for partition, raise [partition] consumer_offsets_max" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if !errors.Is(err, ErrTooManyConsumerOffsets) {
+		t.Errorf("errors.Is(%v, ErrTooManyConsumerOffsets) = false", err)
+	}
+	if errors.Is(err, ErrConsumerOffsetNotFound) {
+		t.Errorf("errors.Is(%v, ErrConsumerOffsetNotFound) = true", err)
+	}
+	if resolved := FromCode(TooManyConsumerOffsetsCode); !errors.Is(resolved, ErrTooManyConsumerOffsets) {
+		t.Errorf("FromCode(%d) = %v", TooManyConsumerOffsetsCode, resolved)
 	}
 }
 

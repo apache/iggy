@@ -18,3 +18,5 @@
 mod clickhouse_sink;
 
 const TEST_MESSAGE_COUNT: usize = 3;
+
+mod proto_text;

@@ -1,0 +1,131 @@
+# Kafka gateway — automated regression test suite
+
+Regression tests live under [`tests/`](../tests/). Run from the workspace root:
+
+```bash
+cargo test -p iggy-gateway-kafka
+```
+
+## Prerequisites
+
+### Wire fixtures (required for some `api_handler_tests`, `server_e2e_tests`, and `version_firewall_tests` cases)
+
+```bash
+./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+```
+
+Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. CI runs the same script
+before `rust-gateway` test jobs and removes the directory afterward. Every fixture-dependent
+suite goes through `tests/common/fixtures.rs::load_fixture_body_or_skip`, which skips with a
+regeneration hint when a fixture is missing, and panics instead when `KAFKA_FIXTURES_REQUIRED=1`
+is set (CI sets this) so a broken generation step can't leave a suite green with zero assertions.
+
+### `iggy-server` binary (required for `bridge_iggy_integration_tests` and every `*_real_bridge_tests` suite)
+
+No fixtures needed, but `iggy-server` has to be built *first* - these suites spawn it directly and
+do not build it for you:
+
+```bash
+cargo build --package server --bin iggy-server
+cargo test -p iggy-gateway-kafka
+```
+
+Same prerequisite `core/integration`'s own server-spawning tests already carry (this suite's
+`iggy_server_binary()` walks up from its own `env::current_exe()` to find the already-built binary
+in the same target directory; neither harness invokes `cargo build` itself). Skipping this step
+fails with a clear "binary not found" message naming the build command to run, not a hang or a
+silent skip.
+
+### `iggy-gateway-kafka` binary (required for `phase1_e2e_tests`)
+
+`phase1_e2e_tests` spawns the compiled gateway itself, bridged to a spawned `iggy-server`, so
+`iggy-server` still needs the manual build step above. `iggy-gateway-kafka` does not: it is this
+package's own `[[bin]]`, so `CARGO_BIN_EXE_iggy-gateway-kafka` resolves at compile time and Cargo
+builds it automatically as part of `cargo test -p iggy-gateway-kafka`.
+
+```bash
+cargo build --package server --bin iggy-server
+cargo test -p iggy-gateway-kafka
+```
+
+---
+
+## Test files
+
+An exact per-file test count and a full test-name-to-scenario matrix used to live here; both
+drifted out of sync with the actual suites more than once as tests were added and consolidated.
+Rather than re-derive a snapshot that will drift again, this only lists what each file is for —
+`cargo test -p iggy-gateway-kafka -- --list` gives the exact current test names.
+
+Primitive encode/decode and adversarial wire-input coverage (varint, compact strings, tagged
+fields, malformed lengths, oversized declared counts) moved with the codec itself: `kafka_protocol`
+covers spec-correct decode/encode, and `src/protocol/bounds_guard.rs` carries its own inline
+`#[cfg(test)]` unit tests for the DoS-bound pre-checks it adds on top. Neither has a corresponding
+file under `tests/` anymore.
+
+| File | Suite focus | Depends on fixtures |
+| ------ | ------------- | --------------------- |
+| [`header_tests.rs`](../tests/header_tests.rs) | Request/response header v1/v2 delegation to `kafka_protocol::messages::ApiKey` | No |
+| [`api_handler_tests.rs`](../tests/api_handler_tests.rs) | ApiVersions, Metadata stub, unsupported key/version, `handle_request` dispatch | Partial |
+| [`response_negative_tests.rs`](../tests/response_negative_tests.rs) | Error-response encoding and validation for each API | No |
+| [`golden_wire_fixtures_tests.rs`](../tests/golden_wire_fixtures_tests.rs) | Byte-exact golden responses (ApiVersions v1, Metadata v0) | No |
+| [`fixtures_canary_tests.rs`](../tests/fixtures_canary_tests.rs) | Fails loudly if `KAFKA_FIXTURES_REQUIRED=1` and no `.bin` fixtures exist, so a broken generation step can't leave the fixture-backed suites green-but-empty | Canary only |
+| [`version_firewall_tests.rs`](../tests/version_firewall_tests.rs) | Version boundary matrix, unsupported keys, corrupt bodies | Partial |
+| [`idempotence_tests.rs`](../tests/idempotence_tests.rs) | `InitProducerId` allocation across every supported version, and the transactional refusals on `InitProducerId`/Produce | No |
+| [`broker_advertise_tests.rs`](../tests/broker_advertise_tests.rs) | `BrokerAdvertise::from_server_config` parsing | No |
+| [`server_integration_tests.rs`](../tests/server_integration_tests.rs) | `read_frame` unit-level I/O | No |
+| [`consumer_group_tests.rs`](../tests/consumer_group_tests.rs) | `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup` against one shared `GatewayState` with paused time, plus two-socket TCP rebalance and leave scenarios | No |
+| [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaGateway` TCP round-trips | Partial |
+| [`listener_robustness_tests.rs`](../tests/listener_robustness_tests.rs) | TCP listener robustness — framing, pipelining, concurrency, connection limits | No |
+| [`sasl_tests.rs`](../tests/sasl_tests.rs) | SASL/PLAIN over a socket — full handshake, every refusal path, and the disabled default. Drives a stub verifier implementing `SaslAuthenticator`, so no Iggy server is needed | No |
+| [`kafka_client_e2e_tests.rs`](../tests/kafka_client_e2e_tests.rs) | **Real Kafka clients** against the whole stack: a spawned `iggy-server`, the gateway in-process with a real authenticator, and kcat / the Java tools from containers. With a bridge, kcat writes records, and kcat and the Java consumer read them back through Fetch. The only suite that can catch a client-compatibility bug, since every other one hand-builds frames | No, but needs Docker and a built `iggy-server` |
+| [`bridge_iggy_integration_tests.rs`](../tests/bridge_iggy_integration_tests.rs) | `IggyBridge` against a real, spawned `iggy-server` — provisioning idempotency, high watermark, credential/connection edge cases | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`list_offsets_real_bridge_tests.rs`](../tests/list_offsets_real_bridge_tests.rs) | ListOffsets (key 2) through the whole handler against a real, spawned `iggy-server`: LATEST, EARLIEST, codes 3 and 43 | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`fetch_real_bridge_tests.rs`](../tests/fetch_real_bridge_tests.rs) | Fetch (key 1) through the whole handler against a real, spawned `iggy-server` — records go in through the Iggy SDK or the Produce handler and come back through `kafka_protocol`'s client decoder, at every version, with codes 0, 1, 3, 6, -1 and 70, paged polls, and the wait | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`produce_real_bridge_tests.rs`](../tests/produce_real_bridge_tests.rs) | Produce (key 0) through the whole handler against a real, spawned `iggy-server` — records go in as Kafka wire bytes and come back through the Iggy SDK, plus one error code per partition | No (needs the `iggy-server` binary - see Prerequisites) |
+| [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary bridged to a real spawned `iggy-server` - the only suite that spawns the gateway as a process rather than calling `KafkaGateway::run` in-process | No (needs both binaries - see Prerequisites) |
+
+`tests/common/` holds shared helpers (`codec.rs`, `fixtures.rs`, `gateway_process.rs`, `scope.rs`,
+`server.rs`, `iggy_server.rs`, `tcp.rs`, `wire.rs`), compiled per test binary via `#[path]`, not a test binary itself. `codec.rs`
+is test-only primitive encode/decode scaffolding for hand-building legacy/adversarial wire shapes
+`kafka_protocol`'s spec-correct encoder cannot produce - it is not the gateway's production codec.
+
+---
+
+## Real-client end-to-end suite
+
+`kafka_client_e2e_tests.rs` needs two things the rest of the suite does not: Docker, and an
+already-built `iggy-server` in the same target directory. Missing either makes it skip with a
+printed reason rather than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable
+without either.
+
+Client containers run with `--pull never`, so pull the two images first. Without them the suite
+skips and names the missing one.
+
+```bash
+cargo build --bin iggy-server
+docker pull edenhill/kcat:1.7.1
+docker pull apache/kafka:3.9.0
+KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test kafka_client_e2e_tests
+```
+
+`KAFKA_E2E_REQUIRED=1` turns a skip into a failure, mirroring `KAFKA_FIXTURES_REQUIRED`, so a CI
+job that means to run these cannot report a pass over zero assertions. Set it there.
+
+The suite runs in its own `kafka_client_e2e` nextest group, capped at one thread, so its spawned
+servers are serialized against each other. It is kept apart from the `kafka_bridge` group so the
+container-driven tests do not queue behind the bridge tests, and both groups cap their servers'
+shard pools, so the two can run alongside each other.
+
+It automates categories S and T of [`MANUAL_TESTING.md`](MANUAL_TESTING.md). Those procedures stay,
+because they cover cases a test does not assert, but the load-bearing ones now run in CI.
+
+## Adding new tests
+
+1. **New API key or version range** — update `SUPPORTED_RANGES` in `api.rs`, `SCOPE.md`, and add
+   a matching `validate_*_shape` guard function in `bounds_guard.rs` (see its module doc for why).
+2. **New decode path** — add a fixture via `kafka-message-gen`, extend `api_handler_tests.rs` or
+   `version_firewall_tests.rs`.
+3. **New error path** — add to `version_firewall_tests.rs` or `response_negative_tests.rs`.
+4. **New TCP behavior** — add to `server_e2e_tests.rs` or `listener_robustness_tests.rs` using
+   the helpers under `tests/common/`.

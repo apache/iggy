@@ -29,7 +29,7 @@ use common::{
     self_signed_replica_tls_ctx, set_replica_ctx, set_replica_ctx_with_tls,
 };
 use iggy_binary_protocol::Command;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::auth::ReplicaAuth;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
@@ -89,7 +89,7 @@ async fn two_replicas_exchange_prepare_and_ack_over_tls() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 
@@ -143,7 +143,7 @@ async fn tls_dialer_against_plaintext_acceptor_never_installs() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 
@@ -196,7 +196,7 @@ async fn plaintext_dialer_against_tls_acceptor_never_installs() {
         0,
         vec![(1, addr1)],
         dial_delegate_0,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 

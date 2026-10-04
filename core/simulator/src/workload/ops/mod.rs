@@ -53,8 +53,9 @@ pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use iggy_binary_protocol::{KIND_CONSUMER, KIND_CONSUMER_GROUP, RoutedRequestHeader};
+use rand::RngExt;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -62,6 +63,23 @@ use crate::workload::actions::Action;
 use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
+
+/// Draw a consumer kind for the four consumer-offset ops, as the WIRE
+/// discriminant rather than a bare boolean.
+///
+/// `WireConsumer::decode` accepts only [`KIND_CONSUMER`] (1) and
+/// [`KIND_CONSUMER_GROUP`] (2). Anything else maps to
+/// `IggyError::InvalidCommand`, which the partition plane answers by logging a
+/// WARN and dropping the frame with NO reply, so one malformed draw wedges that
+/// client's in-flight slot for the rest of the run. One bool draw either way, so
+/// the PRNG trace shape is unchanged.
+pub(crate) fn sample_consumer_kind(prng: &mut Xoshiro256PlusPlus) -> u8 {
+    if prng.random::<bool>() {
+        KIND_CONSUMER_GROUP
+    } else {
+        KIND_CONSUMER
+    }
+}
 
 /// Generates per-op enums (`InFlightInput`, `InFlightOutcome`) plus four
 /// dispatch fns over a fixed `(Action, module)` table. Missing variants
@@ -100,7 +118,7 @@ macro_rules! op_dispatch {
         pub fn sample(
             action: Action,
             shadow: &mut Shadow,
-            prng: &mut Xoshiro256Plus,
+            prng: &mut Xoshiro256PlusPlus,
             options: &WorkloadOptions,
             outcome_id: usize,
         ) -> Option<(InFlightInput, InFlightOutcome)> {

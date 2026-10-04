@@ -134,9 +134,6 @@ public sealed class StreamPermissions
     ///         <item>
     ///             <see cref="Apache.Iggy.IggyClient.IIggyPublisher.SendMessagesAsync(Apache.Iggy.Identifier, Apache.Iggy.Identifier, Apache.Iggy.Kinds.Partitioning, System.Collections.Generic.IList{Apache.Iggy.Messages.Message}, System.Threading.CancellationToken)" />
     ///         </item>
-    ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyPublisher.FlushUnsavedBufferAsync" />
-    ///         </item>
     ///     </list>
     /// </summary>
     public required bool SendMessages { get; init; }
@@ -144,5 +141,5 @@ public sealed class StreamPermissions
     /// <summary>
     ///     Permissions for topics in the stream.
     /// </summary>
-    public Dictionary<int, TopicPermissions>? Topics { get; init; }
+    public Dictionary<uint, TopicPermissions>? Topics { get; init; }
 }

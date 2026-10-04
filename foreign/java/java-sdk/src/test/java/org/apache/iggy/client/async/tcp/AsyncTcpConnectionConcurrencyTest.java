@@ -67,6 +67,61 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int TRANSIENT_NOT_COMMITTED = 57;
 
     @Test
+    void shouldFlushRequestFromReplyCallbackWithoutFurtherInboundTraffic() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, loopback)) {
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(2));
+                    InputStream input = socket.getInputStream();
+                    OutputStream output = socket.getOutputStream();
+                    Request register = readRequest(input);
+                    writeResponse(output, register, registerBody());
+                    Request first = readRequest(input);
+                    writeResponse(output, first, new byte[0]);
+                    Request next = readRequest(input);
+                    assertThat(next.requestId()).isNotEqualTo(first.requestId());
+                    writeResponse(output, next, "done".getBytes(StandardCharsets.UTF_8));
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = new AsyncTcpConnection(
+                    loopback.getHostAddress(),
+                    serverSocket.getLocalPort(),
+                    false,
+                    Optional.empty(),
+                    new AsyncTcpConnection.TcpConnectionPoolConfig(1000, 50),
+                    Optional.empty(),
+                    1,
+                    Optional.of(Duration.ofSeconds(1)),
+                    Optional.of(Duration.ofSeconds(2)),
+                    Duration.ofHours(1),
+                    1024 * 1024,
+                    null,
+                    errorCode -> {},
+                    ignored -> {});
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var sent = connection
+                        .send(SEND_MESSAGES_CODE, sendMessagesPayload())
+                        .thenCompose(response -> {
+                            response.release();
+                            return connection.send(SEND_MESSAGES_CODE, sendMessagesPayload());
+                        });
+                assertResponse(sent, "done");
+                server.get(5, TimeUnit.SECONDS);
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
     void shouldCorrelateConcurrentPartitionResponsesInReverseOrder() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket serverSocket = new ServerSocket(0, 1, loopback)) {
@@ -106,12 +161,14 @@ class AsyncTcpConnectionConcurrencyTest {
                     false,
                     Optional.empty(),
                     new AsyncTcpConnection.TcpConnectionPoolConfig(1000, 50),
+                    Optional.empty(),
+                    1,
                     Optional.of(Duration.ofSeconds(1)),
                     Optional.of(Duration.ofSeconds(2)),
                     Duration.ofHours(1),
                     1024 * 1024,
                     null,
-                    () -> {},
+                    errorCode -> {},
                     ignored -> {});
             try {
                 connection.connect().get(5, TimeUnit.SECONDS);
@@ -303,12 +360,14 @@ class AsyncTcpConnectionConcurrencyTest {
                 false,
                 Optional.empty(),
                 new AsyncTcpConnection.TcpConnectionPoolConfig(1000, acquireTimeoutMillis),
+                Optional.empty(),
+                1,
                 Optional.of(Duration.ofSeconds(1)),
                 Optional.of(Duration.ofSeconds(2)),
                 heartbeatInterval,
                 1024 * 1024,
                 null,
-                () -> {},
+                errorCode -> {},
                 ignored -> {});
     }
 

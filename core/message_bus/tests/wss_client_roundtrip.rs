@@ -25,8 +25,8 @@ use common::{
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
+use message_bus::BusMessage;
 use message_bus::client_listener::RequestHandler;
-use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
 use message_bus::replica::io::start_on_shard_zero;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
@@ -35,7 +35,7 @@ use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use server_common::Message;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +91,7 @@ async fn start_on_shard_zero_wss_round_trip() {
         None,
         None,
         Some(accepted_wss),
-        DEFAULT_RECONNECT_PERIOD,
+        bus.config().reconnect_period,
     )
     .await
     .expect("start_on_shard_zero must succeed")
@@ -117,7 +117,7 @@ async fn start_on_shard_zero_wss_round_trip() {
     let client_tcp = TcpStream::connect(server_addr).await.expect("client dial");
     let conn = WssTransportConn::new_client(client_tcp, client_cfg, server_name);
 
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
+    let (out_tx, out_rx) = bounded::<BusMessage>(8);
     let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
     let (client_shutdown, client_token) = Shutdown::new();
     let ctx = ActorContext {
@@ -133,7 +133,7 @@ async fn start_on_shard_zero_wss_round_trip() {
     let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
     let request = header_only(Command::Request, CLUSTER, 0).into_frozen();
-    out_tx.send(request).await.expect("client send");
+    out_tx.send(request.into()).await.expect("client send");
 
     let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await

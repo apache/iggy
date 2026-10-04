@@ -67,9 +67,8 @@ const (
 
 // Band boundaries. The internal band is never client-sent.
 const (
-	internalBandStart  = OperationCreateTopicWithAssignments
-	metadataBandStart  = OperationCreateStream
-	partitionBandStart = OperationSendMessages
+	internalBandStart = OperationCreateTopicWithAssignments
+	metadataBandStart = OperationCreateStream
 )
 
 // allOperations lists every declared discriminant in wire order. It backs both
@@ -204,12 +203,6 @@ func IsMetadata(operation Operation) bool {
 		return false
 	}
 	return operation >= metadataBandStart && operation <= OperationLeaveConsumerGroup
-}
-
-// IsPartition reports whether the operation is routed to the shard owning a
-// partition.
-func IsPartition(operation Operation) bool {
-	return operation >= partitionBandStart
 }
 
 // IsResultFramed reports whether the reply body leads with a committed result

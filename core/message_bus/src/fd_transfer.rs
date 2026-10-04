@@ -17,8 +17,8 @@
 
 //! File descriptor transfer between shards.
 //!
-//! After shard 0 accepts or connects a TCP socket and completes the
-//! handshake, it calls [`dup_fd`] to create a second kernel reference
+//! After shard 0 accepts or connects a TCP socket, before any handshake,
+//! it calls [`dup_fd`] to create a second kernel reference
 //! to the same socket. The duplicated fd is wrapped in an owning
 //! [`DupedFd`] and sent to the target shard via the inter-shard channel.
 //! The target shard calls [`wrap_duped_fd`] to construct a compio
@@ -138,7 +138,9 @@ fn close_fd(fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compio::io::AsyncRead;
     use compio::net::{TcpListener, TcpStream};
+    use std::time::Duration;
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
@@ -167,26 +169,28 @@ mod tests {
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn duped_fd_drops_close_underlying_fd() {
+        const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connect = TcpStream::connect(addr);
         let accept = listener.accept();
         let (client_res, accept_res) = futures::join!(connect, accept);
-        let (_server, _) = accept_res.unwrap();
+        let (mut server, _) = accept_res.unwrap();
         let client = client_res.unwrap();
 
         let duped = dup_fd(&client).expect("dup_fd failed");
-        let raw = duped.as_raw_fd();
+        drop(client);
         drop(duped);
 
-        // After drop the fd must be gone from this process' fd table.
-        // SAFETY: F_GETFD on a closed fd is defined and returns -1/EBADF.
-        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-        assert_eq!(flags, -1, "fd must be closed after DupedFd drop");
+        // Closed fd numbers can be reused immediately by other test threads.
+        let result = compio::time::timeout(CLOSE_TIMEOUT, server.read(vec![0]))
+            .await
+            .expect("DupedFd drop must release the socket")
+            .0;
         assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF),
-            "closed fd must report EBADF"
+            result.unwrap(),
+            0,
+            "peer must observe EOF after both socket handles close"
         );
     }
 }

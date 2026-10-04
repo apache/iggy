@@ -185,9 +185,8 @@ mod ffi {
         /// the same batch at a lower offset, so this never identifies a batch
         /// uniquely.
         ///
-        /// A batch is confirmed once it is committed in memory, not once it is
-        /// fsynced. A crash-restart can stamp a later batch with an offset a
-        /// client has already recorded.
+        /// Confirmation follows VSR quorum commit. Persisted message durability
+        /// also requires recoverable stable-storage copies on the quorum.
         base_offset: u64,
     }
 
@@ -305,6 +304,10 @@ mod ffi {
         threads_count: u32,
         free_disk_space: u64,
         total_disk_space: u64,
+        // `0` when the server cannot count its open file descriptors.
+        open_files_count: u64,
+        // `0` when the server cannot read its soft `RLIMIT_NOFILE`.
+        open_files_limit: u64,
     }
 
     struct TransportEndpoints {
@@ -383,6 +386,7 @@ mod ffi {
         created_at: u64,
         status: UserStatus,
         username: String,
+        options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -392,6 +396,7 @@ mod ffi {
         username: String,
         has_permissions: bool,
         permissions: Permissions,
+        options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -428,6 +433,42 @@ mod ffi {
         no_delay: bool,
     }
 
+    struct TopicCreateOptions {
+        has_partitions_count: bool,
+        partitions_count: u32,
+        has_compression_algorithm: bool,
+        compression_algorithm: String,
+        has_message_expiry: bool,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        has_max_topic_size: bool,
+        max_topic_size: String,
+        has_segment_size: bool,
+        segment_size: u64,
+        has_durability: bool,
+        durability: String,
+        has_consumer_offset_durability: bool,
+        consumer_offset_durability: String,
+        has_messages_required_to_save: bool,
+        messages_required_to_save: u32,
+        has_size_of_messages_required_to_save: bool,
+        size_of_messages_required_to_save: u64,
+        has_preallocate_segments: bool,
+        preallocate_segments: bool,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct TopicUpdateOptions {
+        has_compression_algorithm: bool,
+        compression_algorithm: String,
+        has_message_expiry: bool,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        has_max_topic_size: bool,
+        max_topic_size: String,
+        raw_options: Vec<HeaderEntry>,
+    }
+
     extern "Rust" {
         type Client;
         type Consumer;
@@ -440,22 +481,21 @@ mod ffi {
         fn logout_user(self: &Client) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
         fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
-        fn update_stream(self: &Client, stream_id: Identifier, stream_name: String) -> Result<()>;
+        fn update_stream(
+            self: &Client,
+            stream_id: Identifier,
+            stream_name: String,
+            options: Vec<HeaderEntry>,
+        ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        #[allow(clippy::too_many_arguments)]
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
             topic_name: String,
-            partitions_count: u32,
-            compression_algorithm: String,
-            message_expiry_kind: String,
-            message_expiry_value: u64,
-            max_topic_size: String,
-            options: Vec<HeaderEntry>,
+            options: TopicCreateOptions,
         ) -> Result<TopicDetails>;
         fn get_topic(
             self: &Client,
@@ -463,17 +503,12 @@ mod ffi {
             topic_id: Identifier,
         ) -> Result<TopicDetails>;
         fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
-        #[allow(clippy::too_many_arguments)]
         fn update_topic(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             topic_name: String,
-            compression_algorithm: String,
-            message_expiry_kind: String,
-            message_expiry_value: u64,
-            max_topic_size: String,
-            options: Vec<HeaderEntry>,
+            options: TopicUpdateOptions,
         ) -> Result<()>;
         fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
@@ -575,13 +610,6 @@ mod ffi {
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
         ) -> Result<SendMessagesResponse>;
-        fn flush_unsaved_buffer(
-            self: &Client,
-            stream_id: Identifier,
-            topic_id: Identifier,
-            partition_id: u32,
-            fsync: bool,
-        ) -> Result<()>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
         fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
@@ -599,7 +627,6 @@ mod ffi {
         ) -> Result<Vec<u8>>;
         fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
 
-        // Future functions
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;
         // fn subscribe_events(self: &Client) -> Result<()>;
@@ -628,6 +655,7 @@ mod ffi {
             username: String,
             has_status: bool,
             status: UserStatus,
+            options: Vec<HeaderEntry>,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,

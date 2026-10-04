@@ -54,6 +54,35 @@ fn given_payload_json_should_serialize_correctly() { ... }
 
 You may **omit one part** when the test is small (`given_X_should_Y` instead of full `given_X_when_Y_should_Z`), but **stay consistent within a file**. Imperative `test_foo` / `does_bar` names are not the convention here.
 
+A test whose subject is a **type** rather than a scenario has no "given" to name, and drops the prefix: it reads `<subject>_should_<property>`. The canonical state round trip below is `state_should_be_serializable_and_deserializable` in all three shipped sources (`random_source`, `postgres_source`, `http_source`). Leave those as they are rather than bending them into the scenario form.
+
+### Prove a test can fail, before trusting it
+
+A passing test says nothing until you have watched it fail. Break the behaviour it names, run the
+suite, and put the code back:
+
+```bash
+# commit first: this reverts with `git checkout --`, which discards
+# every uncommitted change in the file, not only the mutation
+git status --porcelain -- <file>            # must be empty
+<edit the guard out>
+cargo nextest run -p <crate>                # expect a failure naming that test
+git checkout -- <file>
+```
+
+Two failures this catches, both seen in review of `http_source`:
+
+- **A fixture that makes the interesting case unreachable.** A guard test for endpoint resurrection
+  passed `&[]` as the static config, so there was nothing to resurrect and the assertion held
+  whatever `restore` did.
+- **An assertion aimed at something self-healing.** A test for a teardown guard asserted on gauges,
+  which `Metrics::encode` rebuilds from the live instances on every scrape, so it passed with the
+  guard deleted. Delete such a test rather than keep it; a test that cannot fail is worse than none,
+  because it reads as coverage.
+
+Watch for an arm hidden behind a catch-all: `StatusClass::from` ends in `_ => ServerError`, so the
+redirect arm could be removed with every existing assertion still green.
+
 ### `test_config()` helper
 
 Every plugin's tests start with a small helper returning a tuned-down version of the production config. New tests extend it. don't construct from scratch each time.
@@ -126,6 +155,28 @@ fn state_should_be_serializable_and_deserializable() {
 ```
 
 State is the only thing that survives a plugin restart. Silent corruption here means lost data on the next deploy.
+
+**The third test has two correct shapes, and which one applies is a design decision rather than a style choice.**
+
+Starting fresh is right when the state is a cursor. The worst case is re-reading from the beginning, which the at-least-once contract already permits, so discarding an undecodable cursor costs duplicates and nothing else.
+
+It is wrong when the state carries something whose *absence* is a downgrade rather than a repeat. `http_source` keeps its revocation tombstones in state, so starting fresh after a decode failure would serve every revoked endpoint again, with its secret. Its `restore` returns `Err` instead and the connector refuses to open. A source in that position asserts the refusal:
+
+```rust
+#[test]
+fn given_invalid_state_should_refuse_to_open() {
+    let invalid = ConnectorState(b"not valid msgpack".to_vec());
+
+    let restored = MyState::restore(&config_entries(), Some(invalid), 1);
+
+    assert!(
+        restored.is_err(),
+        "discarding this state silently would re-serve what it was revoking"
+    );
+}
+```
+
+Name the test for whichever it is and say why in a comment. What is never right is starting fresh silently when the state that was discarded was load-bearing.
 
 ### Sink unit tests
 

@@ -210,8 +210,9 @@ fn tally_op<'a>(
         };
 
         let held = dvc.suffix.valid_header_at(index);
+        let offers_body = dvc.suffix.offers_body(index);
         if let (Some(held), Some(canonical)) = (held, canonical)
-            && dvc.suffix.offers_body(index)
+            && offers_body
             && held.checksum == canonical.checksum
         {
             copies += 1;
@@ -221,21 +222,31 @@ fn tally_op<'a>(
             // Explicit: the sender proves it never prepared this op.
             nacks += 1;
         } else if let Some(held) = held {
-            // Only a sender BEHIND the canonical log_view can implicitly nack.
-            // Without this, corrupting one canonical header in transit turns every
-            // honest sender's correct header into an implicit nack against the
-            // garbage: a nack quorum on three replicas. A same-log_view
-            // disagreement is evidence, not a vote, and goes through `conflict`.
-            let may_nack_implicitly = dvc.log_view < canonical_log_view;
-            match canonical {
-                // Implicit: the sender holds a DIFFERENT prepare, so not this one.
-                Some(canonical) if may_nack_implicitly && held.checksum != canonical.checksum => {
-                    nacks += 1;
+            if !offers_body && op > dvc.commit {
+                // A prepare is journaled before it is acked, so a header this
+                // sender cannot serve, above its own commit, proves it is outside
+                // the ack set. Below that commit a missing body is compaction.
+                nacks += 1;
+            } else {
+                // Only a sender BEHIND the canonical log_view can implicitly
+                // nack. Without this, corrupting one canonical header in transit
+                // turns every honest sender's correct header into an implicit
+                // nack against the garbage: a nack quorum on three replicas. A
+                // same-log_view disagreement is evidence, not a vote, and goes
+                // through `conflict`.
+                let may_nack_implicitly = dvc.log_view < canonical_log_view;
+                match canonical {
+                    // Implicit: the sender holds a DIFFERENT prepare, so not this one.
+                    Some(canonical)
+                        if may_nack_implicitly && held.checksum != canonical.checksum =>
+                    {
+                        nacks += 1;
+                    }
+                    // Implicit: no canonical sender holds anything here, so a newer
+                    // view already truncated this op and the sender holds a corpse.
+                    None if may_nack_implicitly => nacks += 1,
+                    _ => {}
                 }
-                // Implicit: no canonical sender holds anything here, so a newer
-                // view already truncated this op and the sender holds a corpse.
-                None if may_nack_implicitly => nacks += 1,
-                _ => {}
             }
         }
     }
@@ -707,23 +718,24 @@ mod tests {
     }
 
     #[test]
-    fn given_header_without_a_servable_body_when_replicas_outstanding_should_await_repair() {
-        // Both senders have op 4's header, neither can serve its body, and replica 2
-        // has not reported. A head whose body nobody holds would wedge the view.
+    fn given_header_without_a_servable_body_when_replicas_outstanding_should_truncate() {
+        // Neither sender journaled op 4, so the ack set was at most replica 2:
+        // short of a replication quorum, so it never committed.
         let mut quorum = dvc_quorum_array_empty();
         let headers = suffix_headers(2, 4, 1);
         let header_only = DvcSuffix::new(headers, 0, 0b110);
         dvc_record(&mut quorum, dvc(0, 1, 4, 2, header_only.clone()));
         dvc_record(&mut quorum, dvc(1, 1, 4, 2, header_only));
 
-        assert_eq!(
-            merge_dvc_quorum(&quorum, quorums_r3()),
-            MergeOutcome::AwaitingRepair { undecided_op: 4 }
-        );
+        let MergeOutcome::Ready(log) = merge_dvc_quorum(&quorum, quorums_r3()) else {
+            panic!("two senders provably outside the ack set decide op 4");
+        };
+        assert_eq!(log.op_head, 3, "op 4 is truncated, not awaited");
+        assert_eq!(log.commit_max, 2);
     }
 
     #[test]
-    fn given_all_replicas_reported_and_op_undecidable_should_deadlock() {
+    fn given_all_replicas_reported_and_no_body_should_truncate_rather_than_deadlock() {
         let mut quorum = dvc_quorum_array_empty();
         let headers = suffix_headers(2, 4, 1);
         let header_only = DvcSuffix::new(headers, 0, 0b110);
@@ -731,10 +743,32 @@ mod tests {
         dvc_record(&mut quorum, dvc(1, 1, 4, 2, header_only.clone()));
         dvc_record(&mut quorum, dvc(2, 1, 4, 2, header_only));
 
+        let MergeOutcome::Ready(log) = merge_dvc_quorum(&quorum, quorums_r3()) else {
+            panic!("no replica can serve op 4 and all three say so");
+        };
+        assert_eq!(log.op_head, 3);
+    }
+
+    #[test]
+    fn given_one_servable_copy_against_a_header_only_sender_should_keep_the_op() {
+        // Boundary: one servable copy outranks one derived nack.
+        let mut quorum = dvc_quorum_array_empty();
+        let headers = suffix_headers(2, 4, 1);
+        dvc_record(
+            &mut quorum,
+            dvc(0, 1, 4, 2, DvcSuffix::new(headers.clone(), 0, 0b111)),
+        );
+        dvc_record(
+            &mut quorum,
+            dvc(1, 1, 4, 2, DvcSuffix::new(headers, 0, 0b110)),
+        );
+
+        let MergeOutcome::Ready(log) = merge_dvc_quorum(&quorum, quorums_r3()) else {
+            panic!("op 4 is recoverable from replica 0, so the view must start");
+        };
         assert_eq!(
-            merge_dvc_quorum(&quorum, quorums_r3()),
-            MergeOutcome::Deadlocked { undecided_op: 4 },
-            "with every replica in, an unrecoverable op stalls the view forever"
+            log.op_head, 4,
+            "a servable copy keeps the op against a single derived nack"
         );
     }
 

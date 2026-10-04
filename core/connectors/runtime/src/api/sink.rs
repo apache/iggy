@@ -18,6 +18,7 @@
 use super::{
     config::map_connector_config,
     error::ApiError,
+    key::KeyPath,
     models::{SinkDetailsResponse, SinkInfoResponse, TransformResponse},
 };
 use crate::api::models::SinkConfigResponse;
@@ -69,10 +70,10 @@ async fn get_sinks(
 
 async fn get_sink(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<SinkDetailsResponse>, ApiError> {
     let Some(sink) = context.sinks.get(&key).await else {
-        return Err(ApiError::Error(RuntimeError::SinkNotFound(key)));
+        return Err(ApiError::Error(RuntimeError::SinkNotFound(key.into())));
     };
     let sink = sink.lock().await;
     Ok(Json(SinkDetailsResponse {
@@ -83,11 +84,11 @@ async fn get_sink(
 
 async fn get_sink_plugin_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
     Query(query): Query<GetSinkConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(sink) = context.sinks.get(&key).await else {
-        return Err(ApiError::Error(RuntimeError::SinkNotFound(key)));
+        return Err(ApiError::Error(RuntimeError::SinkNotFound(key.into())));
     };
     let sink = sink.lock().await;
     let Some(config) = sink.config.plugin_config.as_ref() else {
@@ -110,10 +111,10 @@ struct GetSinkConfig {
 
 async fn get_sink_transforms(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<Vec<TransformResponse>>, ApiError> {
     let Some(sink) = context.sinks.get(&key).await else {
-        return Err(ApiError::Error(RuntimeError::SinkNotFound(key)));
+        return Err(ApiError::Error(RuntimeError::SinkNotFound(key.into())));
     };
     let sink = sink.lock().await;
     let Some(transforms) = sink.config.transforms.as_ref() else {
@@ -134,13 +135,13 @@ async fn get_sink_transforms(
 
 async fn get_sink_configs(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<Vec<SinkConfigResponse>>, ApiError> {
     let active_config = context
         .sinks
         .get_config(&key)
         .await
-        .ok_or(ApiError::Error(RuntimeError::SinkNotFound(key.clone())))?;
+        .ok_or_else(|| ApiError::Error(RuntimeError::SinkNotFound(key.to_string())))?;
     let configs = context.config_provider.get_sink_configs(&key).await?;
     let configs = configs
         .into_iter()
@@ -154,12 +155,12 @@ async fn get_sink_configs(
 
 async fn create_sink_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
     Json(config): Json<CreateSinkConfig>,
 ) -> Result<Json<SinkConfigResponse>, ApiError> {
     let created_config = context
         .config_provider
-        .create_sink_config(&key, config.clone())
+        .create_sink_config(&key, config)
         .await?;
 
     Ok(Json(SinkConfigResponse {
@@ -168,15 +169,21 @@ async fn create_sink_config(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct ConfigVersion {
+    version: u64,
+}
+
 async fn get_sink_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key, version)): Path<(String, u64)>,
+    KeyPath(key): KeyPath,
+    Path(ConfigVersion { version }): Path<ConfigVersion>,
 ) -> Result<Json<SinkConfigResponse>, ApiError> {
     let active_config = context
         .sinks
         .get_config(&key)
         .await
-        .ok_or(ApiError::Error(RuntimeError::SinkNotFound(key.clone())))?;
+        .ok_or_else(|| ApiError::Error(RuntimeError::SinkNotFound(key.to_string())))?;
 
     let config = context
         .config_provider
@@ -192,20 +199,21 @@ async fn get_sink_config(
             }))
         }
         None => Err(ApiError::Error(RuntimeError::SinkConfigNotFound(
-            key, version,
+            key.into(),
+            version,
         ))),
     }
 }
 
 async fn get_sink_active_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
 ) -> Result<Json<SinkConfigResponse>, ApiError> {
     let config = context
         .sinks
         .get_config(&key)
         .await
-        .ok_or(ApiError::Error(RuntimeError::SinkNotFound(key)))?;
+        .ok_or(ApiError::Error(RuntimeError::SinkNotFound(key.into())))?;
     Ok(Json(SinkConfigResponse {
         config,
         active: true,
@@ -219,7 +227,7 @@ struct UpdateSinkActiveConfig {
 
 async fn update_sink_active_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
     Json(update): Json<UpdateSinkActiveConfig>,
 ) -> Result<StatusCode, ApiError> {
     context
@@ -236,7 +244,7 @@ struct DeleteSinkConfig {
 
 async fn delete_sink_config(
     State(context): State<Arc<RuntimeContext>>,
-    Path((key,)): Path<(String,)>,
+    KeyPath(key): KeyPath,
     Query(query): Query<DeleteSinkConfig>,
 ) -> Result<StatusCode, ApiError> {
     context
@@ -248,7 +256,7 @@ async fn delete_sink_config(
 
 async fn restart_sink(
     State(context): State<Arc<RuntimeContext>>,
-    Path(key): Path<String>,
+    KeyPath(key): KeyPath,
 ) -> Result<StatusCode, ApiError> {
     context
         .sinks

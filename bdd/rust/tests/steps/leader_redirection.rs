@@ -17,6 +17,7 @@
 
 use crate::common::leader_context::LeaderContext;
 use crate::helpers::cluster;
+use crate::helpers::env::{root_password, root_username};
 use cucumber::{given, then, when};
 use iggy::prelude::*;
 use std::time::Duration;
@@ -160,7 +161,7 @@ async fn when_authenticate_root(world: &mut LeaderContext) {
             .unwrap_or_else(|| panic!("Client {} should be created", client_name));
 
         client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .login_user(&root_username(), &root_password())
             .await
             .expect("Failed to login as root");
 
@@ -288,10 +289,16 @@ async fn then_both_use_same_server(world: &mut LeaderContext) {
     let conn_info_a = client_a.get_connection_info().await;
     let conn_info_b = client_b.get_connection_info().await;
 
-    // Verify both clients are connected to the same server
-    assert_eq!(
-        conn_info_a.server_address, conn_info_b.server_address,
-        "Both clients should be connected to the same server"
+    // Verify both clients are connected to the same server. Client A holds
+    // the address it was configured with and client B the one the roster
+    // published for the leader, so the spellings differ even when the node
+    // is the same.
+    assert!(
+        cluster::is_same_endpoint(&conn_info_a.server_address, &conn_info_b.server_address)
+            .expect("Server addresses should resolve"),
+        "Both clients should be connected to the same server, got {} and {}",
+        conn_info_a.server_address,
+        conn_info_b.server_address
     );
 
     // Verify both can communicate

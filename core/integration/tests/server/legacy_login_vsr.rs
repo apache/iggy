@@ -27,19 +27,15 @@
 //! TCP socket: a header-only non-replicated frame carrying the code in the
 //! reserved command slot.
 
-use iggy_binary_protocol::HEADER_SIZE;
+use iggy_binary_protocol::EvictionReason;
 use iggy_binary_protocol::codes::{LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE};
-use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
+use iggy_binary_protocol::consensus::Command;
 use integration::harness::TestHarness;
 use integration::iggy_harness;
-use std::mem::offset_of;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 
-// Wire byte pinned to `EvictionReason::MalformedLogin` in consensus::header.
-const EVICTION_REASON_MALFORMED_LOGIN: u8 = 15;
+use crate::server::raw_tcp::{
+    connect, eviction_reason, frame_command, non_replicated_header, read_frame_header, write_frame,
+};
 
 #[iggy_harness]
 async fn given_legacy_login_user_code_when_sent_raw_should_evict_malformed_login(
@@ -60,45 +56,26 @@ async fn given_legacy_pat_login_code_when_sent_raw_should_evict_malformed_login(
 /// eviction. The reject runs before the session gate, so this unbound socket
 /// exercises the same path a bound connection would.
 async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
-    let mut header = RequestHeader {
-        command: Command::Request,
-        operation: Operation::NonReplicated,
-        size: u32::try_from(HEADER_SIZE).unwrap(),
-        // NonReplicated leaves session / request unchecked, but the header
-        // validator still requires a nonzero client id.
-        client: 0xC0FFEE,
-        session: 0,
-        request: 0,
-        ..Default::default()
-    };
-    // A non-replicated command code travels in the first 4 reserved bytes.
-    header.reserved[..4].copy_from_slice(&code.to_le_bytes());
+    // NonReplicated leaves session / request unchecked, but the header
+    // validator still requires a nonzero client id.
+    let header = non_replicated_header(0xC0FFEE, 0, 0, code);
 
-    let addr = harness
-        .server()
-        .tcp_addr()
-        .expect("server must expose a TCP address");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    stream.write_all(bytemuck::bytes_of(&header)).await.unwrap();
+    let mut stream = connect(harness).await;
+    write_frame(&mut stream, &header, &[]).await;
 
-    // Eviction is header-only: exactly 256 bytes. The timeout makes the
+    // Eviction is header-only: exactly 256 bytes. The bounded read makes the
     // fail-fast contract explicit -- a regression that silently drops the
     // frame trips this instead of hanging until the test wall clock.
-    let mut reply = [0u8; HEADER_SIZE];
-    timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
-        .await
-        .expect("server must answer a legacy login code within 5s, not stall")
-        .expect("reading the eviction frame must succeed");
+    let reply = read_frame_header(&mut stream).await;
 
-    let command_offset = offset_of!(RequestHeader, command);
     assert_eq!(
-        reply[command_offset],
+        frame_command(&reply),
         Command::Eviction as u8,
         "expected an Eviction frame for legacy login code {code}, not a Reply"
     );
     assert_eq!(
-        reply[HEADER_SIZE - 1],
-        EVICTION_REASON_MALFORMED_LOGIN,
+        eviction_reason(&reply),
+        EvictionReason::MalformedLogin as u8,
         "legacy login code {code} must evict with MalformedLogin"
     );
 }

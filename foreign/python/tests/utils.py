@@ -32,16 +32,25 @@ MAX_USERNAME_BYTES = 50
 MIN_PASSWORD_BYTES = 3
 MAX_PASSWORD_BYTES = 100
 
+DEFAULT_TCP_PORT = 8090
+DEFAULT_QUIC_PORT = 8080
+DEFAULT_HTTP_PORT = 3000
+DEFAULT_WEBSOCKET_PORT = 8092
 
-def get_server_config() -> tuple[str, int]:
+
+def get_transport_config(port_env_var: str, default_port: int) -> tuple[str, int]:
     """
-    Get server configuration from environment variables or defaults.
+    Get transport-specific server configuration from environment variables or defaults.
+
+    Args:
+        port_env_var: Name of the environment variable holding the port.
+        default_port: Port to use if the environment variable is not set.
 
     Returns:
         tuple: (host, port) for the Iggy server
     """
     host = os.environ.get("IGGY_SERVER_HOST", "127.0.0.1")
-    port = int(os.environ.get("IGGY_SERVER_TCP_PORT", "8090"))
+    port = int(os.environ.get(port_env_var, str(default_port)))
 
     # Convert hostname to IP address for the Rust client
     if host not in ("127.0.0.1", "localhost"):
@@ -56,6 +65,46 @@ def get_server_config() -> tuple[str, int]:
         host = "127.0.0.1"
 
     return host, port
+
+
+def get_server_config() -> tuple[str, int]:
+    """
+    Get TCP server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_TCP_PORT", DEFAULT_TCP_PORT)
+
+
+def get_quic_server_config() -> tuple[str, int]:
+    """
+    Get QUIC server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_QUIC_PORT", DEFAULT_QUIC_PORT)
+
+
+def get_http_server_config() -> tuple[str, int]:
+    """
+    Get HTTP server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy HTTP API
+    """
+    return get_transport_config("IGGY_SERVER_HTTP_PORT", DEFAULT_HTTP_PORT)
+
+
+def get_websocket_server_config() -> tuple[str, int]:
+    """
+    Get WebSocket server configuration from environment variables or defaults.
+
+    Returns:
+        tuple: (host, port) for the Iggy server
+    """
+    return get_transport_config("IGGY_SERVER_WS_PORT", DEFAULT_WEBSOCKET_PORT)
 
 
 def wait_for_server(host: str, port: int, timeout: int = 60, interval: int = 2) -> None:

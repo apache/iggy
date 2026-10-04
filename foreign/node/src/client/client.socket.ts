@@ -18,20 +18,32 @@
 import { EventEmitter } from 'node:events';
 import type {
   ClientConfig,
+  ClientConfigOrString,
   ClientCredentials, CommandResponse,
   PasswordCredentials, RawClient, SendCommandOptions,
   TokenCredentials
 } from '../client/client.type.js';
 import { ResponseError, responseError } from '../wire/error.utils.js';
 import { debug } from './client.debug.js';
-import { IggyConnection } from './client.connection.js';
+import {
+  endpointKey,
+  type Endpoint,
+  IggyConnection
+} from './client.connection.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
+import { deserializeNode } from '../wire/cluster/cluster.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
+import { serializeIdentifier } from '../wire/identifier.utils.js';
+import {
+  Command, HEADER_SIZE, REPLY_OFFSET, peekCommand, readReplyOperation, readStatus
+} from '../wire/vsr/header.js';
+import { Operation, isKnownOperation } from '../wire/vsr/operation.js';
 import {
   decodeVsrResponse,
   prepareVsrCommand,
   readRegisteredSession,
+  readWireName,
   VsrEvictionError,
   VsrSession,
 } from '../wire/vsr/index.js';
@@ -44,6 +56,62 @@ const LEADERLESS_POLL_INTERVAL_MS = 250;
 const MAX_LEADER_REDIRECTS = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
+const UNAUTHENTICATED = 40;
+const STALE_CLIENT = 30;
+const FEATURE_UNAVAILABLE = 5;
+const MAX_POLL_ROUTES = 4096;
+const MAX_POLL_CONNECTIONS = 256;
+const CONSUMER_SESSION_SIZE = 32;
+const METADATA_WATERMARK_OFFSET = 24;
+const POLL_OPTIONS_SIZE = 9 + 4 + 1;
+
+type PollRoute = {
+  endpoint: Endpoint,
+  attachment: Buffer,
+};
+
+type PollConnection = {
+  client: CommandResponseStream,
+  attachment?: Buffer,
+  busy?: Promise<void>,
+};
+/**
+ * How long a `TRANSIENT_NOT_ACCEPTED` request replays on the same connection
+ * before the roster is re-read. A node that stopped being primary refuses
+ * forever, so replaying alone never recovers. Matches the Rust SDK.
+ */
+const VSR_FAILOVER_CHECK_MS = 2_000;
+
+/**
+ * Whether a request's budget still holds enough for another attempt. One
+ * exchange needs at least a replay interval to be worth starting; below that
+ * the attempt can only end in a timeout, which would hide the refusal that
+ * actually came back.
+ */
+const worthAnotherAttempt = (deadline: number): boolean =>
+  deadline - Date.now() > VSR_RETRY_INTERVAL_MS;
+
+/**
+ * A request the current node keeps refusing as not-admitted. Carries the
+ * refusal so the caller can surface it when the roster turns out to still name
+ * this node as the leader. Never escapes `sendCommand`.
+ */
+class LeaderMovedError extends Error {
+  constructor(readonly refusal: ResponseError) {
+    super('the node refused the request as not-admitted; re-reading the roster');
+  }
+}
+
+/**
+ * How a leader move resolved: onto the metadata leader, onto the next roster
+ * node (for a request the metadata leader itself keeps refusing), or not at
+ * all.
+ */
+type RosterWalkVerdict = {
+  endpoint: Endpoint,
+  moved: boolean
+};
+type LeaderMoveVerdict = 'leader' | RosterWalkVerdict | false;
 
 /**
  * Command codes that can be executed without authentication.
@@ -64,6 +132,12 @@ type Job = {
   payload: Buffer,
   /** Whether to parse the response */
   handleResponse: boolean,
+  /** Whether the command is appended rather than prepended to the queue */
+  last: boolean,
+  /** Whether a not-admitted refusal re-checks the leader and re-issues */
+  followsLeaderMoves: boolean,
+  /** When the whole request gives up, however often it is re-issued */
+  deadline: number,
   /** Promise resolve function */
   resolve: (v: CommandResponse | PromiseLike<CommandResponse>) => void,
   /** Promise reject function */
@@ -99,6 +173,24 @@ export class CommandResponseStream extends EventEmitter {
   private authenticationPromise?: Promise<boolean>;
   /** Whether a login is already being moved to the leader */
   private settlingLeader: boolean;
+  /**
+   * The leader re-check a refused request started, shared with every other
+   * request refused by the same node so one demotion moves the client once.
+   */
+  private leaderMoveInFlight?: Promise<LeaderMoveVerdict>;
+  /**
+   * Set when a roster walk just redirected this client, so the login that
+   * re-authenticates it stays on the dialed node instead of settling back on
+   * the metadata leader whose partition replica refused the request.
+   */
+  private walkSettleSuppressed = false;
+  /**
+   * Refusals handed out to callers that have not decided what to do with them
+   * yet. The queue holds while any are outstanding: the caller of a refused
+   * command re-checks the leader, and a command written in the meantime goes
+   * out on the socket that check is about to replace.
+   */
+  private leaderMovesUndecided: number;
   /** How long a leaderless roster is polled before settling in place */
   private leaderlessWaitBudget: number;
   /** Delay between roster reads while the cluster elects */
@@ -115,13 +207,19 @@ export class CommandResponseStream extends EventEmitter {
   heartbeatIntervalHandler?: NodeJS.Timeout;
   /** Whether a heartbeat ping is still awaiting its response */
   private heartbeatInFlight: boolean;
+  private rememberedCredentials?: ClientCredentials;
+  private clustered?: boolean;
+  private metadataWatermark = 0n;
+  private routingGeneration = 0;
+  private pollRoutes = new Map<string, PollRoute>();
+  private pollConnections = new Map<string, PollConnection>();
 
   /**
    * Creates a new CommandResponseStream.
    *
    * @param options - Client configuration
    */
-  constructor(options: ClientConfig) {
+  constructor(options: ClientConfigOrString) {
     super();
     const normalizedConfig = normalizeClientConfig(options);
     this.options = normalizedConfig;
@@ -132,6 +230,7 @@ export class CommandResponseStream extends EventEmitter {
     this.vsrSession = new VsrSession();
     this.authenticationPromise = undefined;
     this.settlingLeader = false;
+    this.leaderMovesUndecided = 0;
     this.leaderlessWaitBudget = LEADERLESS_WAIT_BUDGET_MS;
     this.leaderlessPollInterval = LEADERLESS_POLL_INTERVAL_MS;
     this.pendingSubmissions = 0;
@@ -153,10 +252,45 @@ export class CommandResponseStream extends EventEmitter {
     });
     this.connection.on('disconnected', () => {
       this._resetSession();
+      if (this.connection.redirecting) {
+        // The client is moving to the leader, which is its own doing: a queued
+        // command has not been written, so it belongs on the node being moved
+        // to rather than in an error.
+        this._reissueQueue();
+        return;
+      }
       this._failQueue(
         new Error('connection closed before queued commands were sent')
       );
     });
+  }
+
+  /**
+   * Re-submits queued commands through the full send path, so each one
+   * reconnects, re-authenticates and re-checks the leader as if it had just
+   * been called.
+   *
+   * Only for a drop the client caused. Nothing here was written, so there is no
+   * outcome in doubt: a command still in the queue when the socket is replaced
+   * would otherwise fail with a lost-connection error the caller can do nothing
+   * about.
+   */
+  private _reissueQueue(): void {
+    const queued = this._execQueue;
+    this._execQueue = [];
+    for (const job of queued) {
+      debug('re-issuing a queued command after a leader move', job.command);
+      // The whole job, not just the payload: a fresh budget would let a command
+      // caught in a move take twice the response timeout, and a roster read
+      // re-issued as leader-following would answer a leader check with another
+      // leader check.
+      this.sendCommand(job.command, job.payload, {
+        handleResponse: job.handleResponse,
+        last: job.last,
+        followsLeaderMoves: job.followsLeaderMoves,
+        deadline: job.deadline
+      }).then(job.resolve, job.reject);
+    }
   }
 
   /**
@@ -177,32 +311,127 @@ export class CommandResponseStream extends EventEmitter {
     try {
       const {
         handleResponse = true,
-        last = true
+        last = true,
+        followsLeaderMoves = true
       } = options;
+      const autoCommitPoll = command === COMMAND_CODE.PollMessages &&
+        payload.length > POLL_OPTIONS_SIZE && payload.at(-1) === 1;
+      const pollDeadline = autoCommitPoll
+        ? options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS
+        : undefined;
 
       if (!this.connection.connected)
-        await this.connection.connect()
+        await (pollDeadline === undefined ? this.connection.connect()
+          : withinDeadline(this.connection.connect(), pollDeadline));
 
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
-        await this.authenticate(this.options.credentials);
+        await (pollDeadline === undefined ? this.authenticate(this._signInCredentials())
+          : withinDeadline(this.authenticate(this._signInCredentials()), pollDeadline));
 
-      const response = await new Promise<CommandResponse>(
-        (resolve, reject) => {
-          const job = {
-            command,
-            payload,
-            handleResponse,
-            resolve,
-            reject
-          };
-          if (last)
-            this._execQueue.push(job);
-          else
-            this._execQueue.unshift(job);
-          this._processQueue();
-        });
+      if (pollDeadline !== undefined) {
+        const deadline = pollDeadline;
+        if (this.clustered === undefined)
+          await withinDeadline(this.sendCommand(GET_CLUSTER_METADATA.code,
+            GET_CLUSTER_METADATA.serialize(), { deadline, followsLeaderMoves: false }), deadline);
+        if (this.clustered === undefined)
+          throw new Error('cannot determine the poll routing topology');
+        if (this.clustered)
+          return await this._pollOnPrimary(payload, deadline, handleResponse);
+      }
+
+      // The roster read is itself a queued command and the queue is
+      // single-flighted, so the leader re-check cannot happen inside
+      // `_processVsr`. The refusal comes back out here instead, where the
+      // queue is free, and the command is re-issued on the node that now
+      // leads.
+      //
+      // A not-admitted refusal means the request was never applied, so it is
+      // re-issued for the whole request budget rather than given up on after
+      // one window: the roster can still name this node -- an election in
+      // flight, a leader that has not moved yet -- and that is a wait, not a
+      // verdict.
+      //
+      // One budget for the whole request: the transient replays on a
+      // connection, the leader re-checks, and the re-issues after a move all
+      // spend it, so a request cannot outlive it by moving. A command re-issued
+      // after a move keeps the budget it was first submitted with, rather than
+      // opening a second one.
+      const deadline = options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS;
+      let response: CommandResponse;
+      let walkingRoster = false;
+      const visitedRosterEndpoints = new Set<string>();
+      for (;;) {
+        try {
+          response = await this._queueCommand(command, payload, handleResponse,
+            last, followsLeaderMoves, deadline);
+          break;
+        } catch (error) {
+          if (!(error instanceof LeaderMovedError))
+            throw error;
+          // The roster read that a re-check runs is itself a command that can
+          // be refused this way, and answering a leader check with another
+          // leader check would recurse. Its caller reads a failure as "stay
+          // where you are".
+          //
+          // A budget too small to carry another attempt ends it here, with the
+          // refusal the server actually gave: re-issued into what is left, the
+          // request would time out instead and the caller would see a timeout
+          // where the answer was "not admitted".
+          let moved: LeaderMoveVerdict = false;
+          try {
+            if (!followsLeaderMoves || !worthAnotherAttempt(deadline))
+              throw responseError(command, error.refusal.errorCode);
+            // Once this request starts walking the roster it keeps walking: a
+            // leader recheck between hops would put it straight back on the
+            // metadata leader whose partition replica refused it, and the
+            // walk would bounce between two nodes without reaching the rest.
+            moved = await this._followLeaderMove(
+              walkingRoster,
+              visitedRosterEndpoints
+            );
+            if (typeof moved === 'object') {
+              walkingRoster = true;
+              visitedRosterEndpoints.add(endpointKey(moved.endpoint));
+            }
+          } finally {
+            // Released as soon as the move is decided, before the pace below
+            // and before any re-authentication: those go through the queue
+            // themselves, and a queue still held for this refusal would never
+            // reach them.
+            if (followsLeaderMoves)
+              this._releaseUndecidedMove();
+          }
+          const connectionMoved = moved === 'leader' ||
+            (typeof moved === 'object' && moved.moved);
+          if (!connectionMoved) {
+            // Nowhere else to go yet: the roster still names this node, or it
+            // could not be read. Paced, because the in-connection replay
+            // window belongs to the request's budget and has already been
+            // spent -- re-issuing straight away would spin.
+            await delay(Math.min(
+              VSR_FAILOVER_CHECK_MS,
+              Math.max(0, deadline - Date.now())
+            ));
+          }
+          if (!worthAnotherAttempt(deadline))
+            throw responseError(command, error.refusal.errorCode);
+          // A move drops the session with the socket it was bound to, so the
+          // re-issue would otherwise go out under no session: a replicated
+          // command fails client-side, a non-replicated one goes out with
+          // session 0.
+          if (!this.isAuthenticated && !this.isUnloggedCommand(command))
+            await this.authenticate(this._signInCredentials());
+        }
+      }
       if (!isLoginCommand(command) || this.settlingLeader)
         return response;
+      // A login that re-authenticates a roster walk stays on the dialed node:
+      // settling would put the client back on the metadata leader whose
+      // partition replica refused the walked request. One login only.
+      if (this.walkSettleSuppressed) {
+        this.walkSettleSuppressed = false;
+        return response;
+      }
       this.settlingLeader = true;
       try {
         const settled = await this._settleOnLeader(command, payload);
@@ -216,6 +445,349 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
+  private _queueCommand(
+    command: number,
+    payload: Buffer,
+    handleResponse: boolean,
+    last: boolean,
+    followsLeaderMoves: boolean,
+    deadline: number
+  ): Promise<CommandResponse> {
+    return new Promise<CommandResponse>((resolve, reject) => {
+      const job: Job = {
+        command,
+        payload,
+        handleResponse,
+        last,
+        followsLeaderMoves,
+        deadline,
+        resolve,
+        reject
+      };
+      if (last)
+        this._execQueue.push(job);
+      else
+        this._execQueue.unshift(job);
+      this._processQueue();
+    });
+  }
+
+  /**
+   * Re-reads the roster and moves to the leader it names.
+   *
+   * Best effort: an unreadable roster, or one that still names this node,
+   * leaves the client where it is and the refused request is re-issued anyway.
+   *
+   * Single-flighted, and concurrent callers share the outcome instead of
+   * failing: several commands are refused by the same demoted node, and each
+   * starting its own redirect would move the client once per command. The
+   * first redirect's `'disconnected'` also fails the others' roster reads, so
+   * a caller that raced one would report a refusal it never had to.
+   *
+   * @returns Whether the client moved
+   */
+  private _followLeaderMove(
+    walkPastLeader = false,
+    visitedRosterEndpoints = new Set<string>()
+  ): Promise<LeaderMoveVerdict> {
+    const inFlight = this.leaderMoveInFlight;
+    if (inFlight)
+      return inFlight;
+
+    const move = (async (): Promise<LeaderMoveVerdict> => {
+      try {
+        if (!walkPastLeader) {
+          const leader = await this._readLeaderEndpoint();
+          if (leader && !this.connection.isConnectedTo(leader.host, leader.port)) {
+            debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
+            await this.connection.redirect(leader.host, leader.port);
+            return 'leader';
+          }
+        }
+        // The roster names this node as the metadata leader (or said nothing
+        // usable), yet it keeps refusing to admit the request: its replica of
+        // the target partition group is not that group's primary, because
+        // metadata and partition consensus groups elect independently. Walk
+        // the roster instead of re-issuing into the same refusal.
+        const next = this.connection.nextRosterEndpoint(visitedRosterEndpoints);
+        if (!next)
+          return false;
+        debug(
+          'the request keeps being refused here, walking the roster to ' +
+          `${next.host}:${next.port}`
+        );
+        // The re-authentication after this redirect runs a login, and a login
+        // normally settles on the metadata leader, which would put the walk
+        // right back on the node that refused. One login only.
+        this.walkSettleSuppressed = true;
+        try {
+          await this.connection.redirect(next.host, next.port);
+        } catch (error) {
+          // The suppression belongs to the redirect above. If that redirect
+          // never lands, a later unrelated login must settle normally.
+          this.walkSettleSuppressed = false;
+          debug('the roster endpoint could not be reached', error);
+          return { endpoint: next, moved: false };
+        }
+        return { endpoint: next, moved: true };
+      } catch (error) {
+        debug('the leader could not be re-checked, staying on this node', error);
+        return false;
+      }
+    })();
+    this.leaderMoveInFlight = move;
+    void move.finally(() => {
+      if (this.leaderMoveInFlight !== move)
+        return;
+      this.leaderMoveInFlight = undefined;
+      // The drain stopped while the move was being decided. A move that
+      // happened re-issues what was held back on the new socket; one that did
+      // not leaves it here, with nothing else due to pick it up.
+      if (!this.connection.redirecting)
+        void this._processQueue();
+    });
+    return move;
+  }
+
+  /** Whether a leader move is being decided or carried out. */
+  private _movePending(): boolean {
+    return this.leaderMovesUndecided > 0 || this.leaderMoveInFlight !== undefined;
+  }
+
+  /**
+   * Releases the queue hold one refusal took, and drains what was held back
+   * once the last of them is decided.
+   */
+  private _releaseUndecidedMove(): void {
+    if (this.leaderMovesUndecided > 0)
+      this.leaderMovesUndecided -= 1;
+    if (this._movePending() || this.connection.redirecting)
+      return;
+    void this._processQueue();
+  }
+
+  private _rememberRoster(response: CommandResponse): void {
+    try {
+      const metadata = GET_CLUSTER_METADATA.deserialize(response);
+      if (metadata.nodes.length === 0)
+        return;
+      this.clustered = metadata.nodes.length > 1;
+      this.connection.rememberRoster(
+        metadata.nodes
+          .filter((node) => node.endpoints.tcp !== 0)
+          .map((node) => ({ host: node.ip, port: node.endpoints.tcp }))
+      );
+    } catch (error) {
+      debug('an unreadable roster leaves the redial candidates as they are',
+        error);
+    }
+  }
+
+  private async _pollOnPrimary(
+    payload: Buffer,
+    deadline: number,
+    handleResponse: boolean
+  ): Promise<CommandResponse> {
+    const key = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
+    while (Date.now() < deadline && !this.connection.ending) {
+      try {
+        const generation = this.routingGeneration;
+        let route = this.pollRoutes.get(key);
+        if (!route ||
+            route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
+              this.metadataWatermark) {
+          const response = await withinDeadline(
+            this._pollRoutingControl(payload, deadline), deadline);
+          if (generation !== this.routingGeneration)
+            throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+          if (response.data.length < CONSUMER_SESSION_SIZE)
+            throw new Error('poll routing response is incomplete');
+          const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE);
+          if (node.length + CONSUMER_SESSION_SIZE !== response.data.length || !node.data.ip)
+            throw new Error('poll routing response has no valid TCP endpoint');
+          if (node.data.endpoints.tcp === 0)
+            throw responseError(COMMAND_CODE.PollMessages, FEATURE_UNAVAILABLE);
+          const attachment = Buffer.from(response.data.subarray(0, CONSUMER_SESSION_SIZE));
+          if (attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) < this.metadataWatermark)
+            attachment.writeBigUInt64LE(this.metadataWatermark, METADATA_WATERMARK_OFFSET);
+          route = {
+            endpoint: { host: node.data.ip, port: node.data.endpoints.tcp },
+            attachment
+          };
+          if (this.pollRoutes.size >= MAX_POLL_ROUTES)
+            this.pollRoutes.clear();
+          this.pollRoutes.set(key, route);
+        }
+
+        const endpoint = endpointKey(route.endpoint);
+        let entry = this.pollConnections.get(endpoint);
+        if (!entry) {
+          if (this.pollConnections.size >= MAX_POLL_CONNECTIONS) {
+            const idle = Array.from(this.pollConnections).find(([, value]) => !value.busy);
+            if (!idle)
+              throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+            this.pollConnections.delete(idle[0]);
+            idle[1].client.destroy();
+          }
+          entry = {
+            client: new CommandResponseStream({
+              ...this.options,
+              options: { ...this.options.options, ...route.endpoint },
+              heartbeatInterval: 0,
+              reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+            })
+          };
+          this.pollConnections.set(endpoint, entry);
+        }
+        while (entry.busy)
+          await withinDeadline(entry.busy, deadline);
+        if (generation !== this.routingGeneration ||
+            this.pollConnections.get(endpoint) !== entry ||
+            route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
+              this.metadataWatermark)
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+
+        let release!: () => void;
+        entry.busy = new Promise<void>((resolve) => { release = resolve; });
+        let polling = false;
+        try {
+          if (!entry.client.isAuthenticated) {
+            entry.attachment = undefined;
+            await withinDeadline(entry.client.connection.connect(true), deadline,
+              () => entry.client.destroy());
+            const credentials = this._signInCredentials();
+            const login = 'token' in credentials ? LOGIN_WITH_TOKEN : LOGIN;
+            const loginPayload = 'token' in credentials
+              ? LOGIN_WITH_TOKEN.serialize(credentials)
+              : LOGIN.serialize(credentials);
+            await entry.client._queueCommand(login.code, loginPayload,
+              true, true, false, deadline);
+          }
+          if (!entry.attachment?.equals(route.attachment)) {
+            await entry.client._queueCommand(COMMAND_CODE.AttachConsumerSession,
+              route.attachment, true, true, false, deadline);
+            entry.attachment = route.attachment;
+          }
+          if (generation !== this.routingGeneration ||
+              route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
+                this.metadataWatermark)
+            throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+          polling = true;
+          return await entry.client._queueCommand(COMMAND_CODE.PollMessagesOnPrimary,
+            payload, handleResponse, true, false, deadline);
+        } catch (error) {
+          if (error instanceof ResponseError &&
+              error.errorCode === TRANSIENT_NOT_ACCEPTED) {
+            entry.attachment = undefined;
+          } else {
+            if (this.pollConnections.get(endpoint) === entry)
+              this.pollConnections.delete(endpoint);
+            entry.client.destroy();
+          }
+          if (!(error instanceof ResponseError) || error instanceof VsrEvictionError ||
+              error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT)
+            throw responseError(COMMAND_CODE.PollMessages,
+              polling ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
+          throw error;
+        } finally {
+          entry.busy = undefined;
+          release();
+        }
+      } catch (error) {
+        this.pollRoutes.delete(key);
+        if (error instanceof VsrResponseTimeoutError)
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_COMMITTED);
+        if (!(error instanceof ResponseError) ||
+            error.errorCode !== TRANSIENT_NOT_ACCEPTED)
+          throw error instanceof ResponseError
+            ? responseError(COMMAND_CODE.PollMessages, error.errorCode)
+            : error;
+        if (!worthAnotherAttempt(deadline))
+          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+        await delay(VSR_RETRY_INTERVAL_MS);
+      }
+    }
+    throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+  }
+
+  private async _pollRoutingControl(payload: Buffer, deadline: number): Promise<CommandResponse> {
+    const options = { deadline, followsLeaderMoves: false };
+    try {
+      return await this.sendCommand(COMMAND_CODE.GetPollRouting, payload, options);
+    } catch (error) {
+      if (error instanceof ResponseError &&
+          error.errorCode !== UNAUTHENTICATED && error.errorCode !== STALE_CLIENT)
+        throw error;
+      if (Date.now() >= deadline)
+        throw error;
+      // Only a failed coordinator exchange uses normal session recovery.
+      // A healthy coordinator refusing a route must retain its group membership.
+      if (error instanceof ResponseError) {
+        this.connection.abort();
+        this.connection.connected = false;
+        this._resetSession();
+      }
+      await this.sendCommand(PING.code, PING.serialize(), { deadline });
+      return this.sendCommand(COMMAND_CODE.GetPollRouting, payload, options);
+    }
+  }
+
+  private _observeMetadataReply(frame: Buffer): void {
+    if (frame.length < HEADER_SIZE || peekCommand(frame) !== Command.Reply)
+      return;
+    const operation = readReplyOperation(frame);
+    if (!isKnownOperation(operation) || operation === Operation.NonReplicated ||
+        operation === Operation.SendMessages || operation === Operation.StoreConsumerOffset ||
+        operation === Operation.DeleteConsumerOffset)
+      return;
+    const commit = frame.readBigUInt64LE(REPLY_OFFSET.commit);
+    if (commit > this.metadataWatermark)
+      this.metadataWatermark = commit;
+  }
+
+  private _rememberCredentials(command: number, payload: Buffer): void {
+    if (command === LOGIN.code) {
+      const username = readWireName(payload, 0);
+      this.rememberedCredentials = {
+        username: username.value, password: readWireName(payload, username.next).value
+      };
+    } else if (command === LOGIN_WITH_TOKEN.code) {
+      this.rememberedCredentials = { token: readWireName(payload, 0).value };
+    } else if ((command === COMMAND_CODE.ChangePassword || command === COMMAND_CODE.UpdateUser) &&
+        this.userId !== undefined && this.rememberedCredentials &&
+        'username' in this.rememberedCredentials) {
+      const credentials = this.rememberedCredentials;
+      const identifier = [serializeIdentifier(this.userId), serializeIdentifier(credentials.username)]
+        .find((encoded) => payload.subarray(0, encoded.length).equals(encoded));
+      if (!identifier)
+        return;
+      if (command === COMMAND_CODE.ChangePassword) {
+        const currentPassword = readWireName(payload, identifier.length);
+        const password = readWireName(payload, currentPassword.next).value;
+        this.rememberedCredentials = { ...credentials, password };
+        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
+          this.options.credentials = { ...this.options.credentials, password };
+      } else if (payload[identifier.length] === 1) {
+        const username = readWireName(payload, identifier.length + 1).value;
+        this.rememberedCredentials = { ...credentials, username };
+        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
+          this.options.credentials = { ...this.options.credentials, username };
+      }
+    }
+  }
+
+  private _signInCredentials(): ClientCredentials {
+    return this.rememberedCredentials ?? this.options.credentials;
+  }
+
+  private _clearPollRouting(): void {
+    this.routingGeneration += 1;
+    this.pollRoutes.clear();
+    for (const entry of this.pollConnections.values())
+      entry.client.destroy();
+    this.pollConnections.clear();
+  }
+
   /**
    * Processes queued commands sequentially.
    * Emits 'finishQueue' when all commands are processed.
@@ -226,17 +798,42 @@ export class CommandResponseStream extends EventEmitter {
       return;
     this.busy = true;
     while (this._execQueue.length > 0 && this.connection.socket.writable) {
-      const next = this._execQueue.shift();
+      // While a leader move is being decided, only the roster read the move
+      // itself runs goes out -- it is what decides where the client lands, and
+      // it is the one command that does not follow moves. Draining the rest
+      // would write them to the socket `redirect()` is about to replace, and a
+      // command in flight when that happens dies with a lost-connection error
+      // instead of being re-issued on the node the move lands on.
+      const index = this._movePending()
+        ? this._execQueue.findIndex((job) => !job.followsLeaderMoves)
+        : 0;
+      if (index < 0) break;
+      const [next] = this._execQueue.splice(index, 1);
       if (!next) break;
-      const { command, payload, handleResponse, resolve, reject } = next;
+      const { command, payload, handleResponse, deadline, resolve, reject } = next;
       try {
-        resolve(await this._processNext(command, payload, handleResponse));
+        resolve(await this._processNext(command, payload, handleResponse, deadline));
       } catch (err) {
+        if (err instanceof LeaderMovedError && next.followsLeaderMoves)
+          // Counted before the rejection is handed out, not after: the caller
+          // resumes as a microtask, so this loop would otherwise write the next
+          // command before the re-check it is about to start has begun.
+          this.leaderMovesUndecided += 1;
         reject(err);
       }
     }
-    if (this._execQueue.length > 0)
-      this._failQueue(new Error('connection is not writable'));
+    if (this._execQueue.length > 0) {
+      // The same distinction as on 'disconnected': the socket a leader move
+      // replaced stops being writable, and what is still queued belongs on the
+      // node being moved to.
+      if (this.connection.redirecting)
+        this._reissueQueue();
+      else if (!this._movePending())
+        this._failQueue(new Error('connection is not writable'));
+      // Otherwise the move is still being decided: these commands were never
+      // written, and they are drained again once it settles -- here if the
+      // client stays, on the new socket if it moves.
+    }
     this.busy = false;
     this._emitFinishQueue();
   }
@@ -254,38 +851,46 @@ export class CommandResponseStream extends EventEmitter {
    * @param command - Command code
    * @param payload - Command payload
    * @param handleResp - Whether to parse the response
+   * @param deadline - When the whole request gives up, shared with the leader
+   * re-checks and the re-issues after a move
    * @returns Promise resolving to the command response
    */
   _processNext(
     command: number,
     payload: Buffer,
-    handleResp = true
+    handleResp = true,
+    deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS
   ): Promise<CommandResponse> {
     if (isLoginCommand(command) && this.isAuthenticated)
-      return this._processVsrLogin(command, payload, handleResp);
-    return this._processVsr(command, payload, handleResp);
+      return this._processVsrLogin(command, payload, handleResp, deadline);
+    return this._processVsr(command, payload, handleResp, deadline);
   }
 
   private async _processVsrLogin(
     command: number,
     payload: Buffer,
-    handleResp: boolean
+    handleResp: boolean,
+    deadline: number
   ): Promise<CommandResponse> {
-    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true);
-    return this._processVsr(command, payload, handleResp);
+    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true, deadline);
+    return this._processVsr(command, payload, handleResp, deadline);
   }
 
   private async _processVsr(
     command: number,
     payload: Buffer,
-    handleResp: boolean
+    handleResp: boolean,
+    deadline: number
   ): Promise<CommandResponse> {
     let requestWritten = false;
     try {
       const prepared = prepareVsrCommand(command, payload);
       // A transient retry must preserve all request identity fields.
       const frame = this.vsrSession.encode(prepared.command, prepared.payload);
-      const deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS;
+      // Derived from the request's own budget rather than read off the clock,
+      // so one request spends one budget however many times it is re-issued.
+      const notAcceptedDeadline =
+        deadline - VSR_RESPONSE_TIMEOUT_MS + VSR_FAILOVER_CHECK_MS;
       let lastTransientError: ResponseError | undefined;
       let parsed: CommandResponse;
       while (true) {
@@ -306,8 +911,15 @@ export class CommandResponseStream extends EventEmitter {
         } finally {
           requestWritten ||= exchangeState.written;
         }
-        if (!handleResp)
+        this._observeMetadataReply(response);
+        if (!handleResp) {
+          // Routing still needs refusals when the caller decodes the frame.
+          if (command === COMMAND_CODE.PollMessagesOnPrimary &&
+              peekCommand(response) === Command.Reply &&
+              readStatus(response) === TRANSIENT_NOT_ACCEPTED)
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
           return response as unknown as CommandResponse;
+        }
         try {
           parsed = decodeVsrResponse(response, command);
           break;
@@ -315,7 +927,21 @@ export class CommandResponseStream extends EventEmitter {
           if (!(error instanceof ResponseError) ||
               !isTransientVsrError(error.errorCode))
             throw error;
+          if (command === COMMAND_CODE.PollMessagesOnPrimary ||
+              command === COMMAND_CODE.GetPollRouting ||
+              command === COMMAND_CODE.AttachConsumerSession)
+            throw error;
           lastTransientError = error;
+          // A not-admitted refusal is a statement about who leads, not about
+          // load: a node that stopped being primary refuses forever, so
+          // replaying on this connection never recovers. Hand it back for a
+          // roster re-read once the window is spent. Not-committed (57) stays
+          // here: the request is in flight on this very node, and its outcome
+          // is unknown anywhere else.
+          if (error.errorCode === TRANSIENT_NOT_ACCEPTED &&
+              !isLoginCommand(command) &&
+              Date.now() >= notAcceptedDeadline)
+            throw new LeaderMovedError(error);
           const retryDelay = Math.min(
             VSR_RETRY_INTERVAL_MS,
             Math.max(0, deadline - Date.now())
@@ -332,11 +958,23 @@ export class CommandResponseStream extends EventEmitter {
         this.isAuthenticated = true;
         this.userId = parsed.data.readUInt32LE(0);
       }
+      this._rememberCredentials(command, payload);
       if (prepared.command === COMMAND_CODE.LogoutUser) {
+        this.rememberedCredentials = undefined;
         this._resetSession();
       }
+      // Every roster read feeds the redial candidates, whoever asked for it
+      // and whatever it says: a node dies together with its address, the
+      // roster is unreachable exactly when it is needed, and reading it only
+      // during a login would leave the candidates stale between logins.
+      if (handleResp && command === GET_CLUSTER_METADATA.code)
+        this._rememberRoster(parsed);
       return parsed;
     } catch (error) {
+      // A not-admitted refusal is an answer, so the session is not in doubt
+      // and the request was never applied.
+      if (error instanceof LeaderMovedError)
+        throw error;
       // Once bytes were handed to the socket, a local transport or decode
       // failure leaves the request outcome ambiguous. Register a fresh session
       // rather than replaying that request under a different client identity.
@@ -454,8 +1092,7 @@ export class CommandResponseStream extends EventEmitter {
    * died between the login and this read), keeps the client on its current
    * node instead of failing a login that already succeeded.
    */
-  private async _readLeaderEndpoint():
-    Promise<{ host: string, port: number } | undefined> {
+  private async _readLeaderEndpoint(): Promise<Endpoint | undefined> {
     // A cluster can be transiently leaderless: a restarted node cedes the
     // primaryship its stale view assigns it, and the roster reports no leader
     // until the peers' election completes. That window is roughly one heartbeat
@@ -475,8 +1112,11 @@ export class CommandResponseStream extends EventEmitter {
         const response = await this.sendCommand(
           GET_CLUSTER_METADATA.code,
           GET_CLUSTER_METADATA.serialize(),
-          { last: false }
+          { last: false, followsLeaderMoves: false }
         );
+        // The redial candidates are fed by `_processVsr` for every roster
+        // read, leaderless ones included: a roster with no leader still names
+        // where the nodes are.
         const metadata = GET_CLUSTER_METADATA.deserialize(response);
         if (metadata.nodes.length <= 1)
           return undefined;
@@ -511,6 +1151,8 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private _resetSession(): void {
+    this._clearPollRouting();
+    this.clustered = undefined;
     if (!this.isAuthenticated &&
         this.userId === undefined &&
         !this.vsrSession.hasActivity)
@@ -643,6 +1285,8 @@ export class CommandResponseStream extends EventEmitter {
    * Stops heartbeat and destroys the connection.
    */
   destroy() {
+    this.rememberedCredentials = undefined;
+    this._clearPollRouting();
     if (this.heartbeatIntervalHandler)
       clearInterval(this.heartbeatIntervalHandler);
     return this.connection._destroy();
@@ -656,7 +1300,7 @@ export class CommandResponseStream extends EventEmitter {
  * @param options - Client configuration
  * @returns RawClient instance
  */
-export function getRawClient(options: ClientConfig): RawClient {
+export function getRawClient(options: ClientConfigOrString): RawClient {
   return new CommandResponseStream(options);
 }
 
@@ -666,6 +1310,25 @@ const isLoginCommand = (command: number): boolean =>
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const withinDeadline = async <T>(
+  pending: Promise<T>, deadline: number, expired?: () => void
+): Promise<T> => {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          expired?.();
+          reject(new VsrResponseTimeoutError(VSR_RESPONSE_TIMEOUT_MS));
+        }, Math.max(0, deadline - Date.now()));
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 const isTransientVsrError = (errorCode: number): boolean =>
   errorCode === TRANSIENT_NOT_COMMITTED ||

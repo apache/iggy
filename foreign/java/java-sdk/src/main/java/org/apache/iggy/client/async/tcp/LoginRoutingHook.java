@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.user.IdentityInfo;
 
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
@@ -41,4 +42,12 @@ interface LoginRoutingHook {
      * @return the identity returned by the successful Register response
      */
     CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt);
+
+    /**
+     * Drops any login kept for replay. Called on an explicit sign-out: there
+     * is no session left to restore, and a redial must not resurrect one.
+     */
+    default void forgetLogin() {}
+
+    default void refreshLogin(String oldUsername, Optional<String> username, Optional<String> password) {}
 }

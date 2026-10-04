@@ -29,7 +29,7 @@ use common::{
     set_replica_ctx,
 };
 use iggy_binary_protocol::Command;
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
 use std::rc::Rc;
@@ -66,7 +66,14 @@ async fn try_send_returns_backpressure_when_queue_full() {
     // bus0 dials bus1.
     let on_message0: MessageHandler = Rc::new(|_, _| {});
     let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_message0);
-    start_connector(&bus0, 0, vec![(1, addr1)], dial_0, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(
+        &bus0,
+        0,
+        vec![(1, addr1)],
+        dial_0,
+        bus0.config().reconnect_period,
+    )
+    .await;
 
     // Wait for the connection to register.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

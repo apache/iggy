@@ -25,7 +25,7 @@
 //! 2. duplicates the TCP fd,
 //! 3. sends a connection-setup `LifecycleFrame`
 //!    (`ReplicaInboundSetup` / `ReplicaOutboundSetup` /
-//!    `Client{,Ws}ConnectionSetup`) to the target shard's inbox,
+//!    `Client{,Ws,TcpTls,Wss}ConnectionSetup`) to the target shard's inbox,
 //! 4. drops its own `TcpStream` so only the target shard's wrapped fd
 //!    keeps the socket alive.
 //!
@@ -53,20 +53,23 @@ use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::{LifecycleFrame, ShardCtorError, ShardFrame, TaggedSender, validate_sender_ordering};
 use compio::net::TcpStream;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
-use message_bus::{SendError, fd_transfer};
+use message_bus::{ConnectionPermit, SendError, SharedTlsServerConfig, fd_transfer};
 use std::cell::Cell;
 use std::rc::Rc;
 use tracing::warn;
 
 /// Bit position of the target-shard tag inside a minted client id: the top 16
-/// bits carry the shard, the bottom 112 the mint sequence.
+/// bits carry the shard, the next 64 the boot nonce, the bottom 48 the mint
+/// sequence.
 const CLIENT_ID_SHARD_SHIFT: u32 = 112;
 
-/// Sequence half of a minted client id. The tag above it is the inter-shard
-/// reply routing key (`message_bus::client_id_owning_shard`), so a sequence
-/// that bled past this mask would silently re-route a connection's replies to
-/// another shard for the process lifetime.
-const CLIENT_SEQUENCE_MASK: u128 = (1 << CLIENT_ID_SHARD_SHIFT) - 1;
+/// Bit position of the boot nonce inside a minted client id.
+const CLIENT_ID_NONCE_SHIFT: u32 = 48;
+
+/// Sequence part of a minted client id. The boot nonce sits right above it, so
+/// a sequence that bled past this mask would first corrupt the nonce and could
+/// mint an id that an earlier boot already handed out.
+const CLIENT_SEQUENCE_MASK: u128 = (1 << CLIENT_ID_NONCE_SHIFT) - 1;
 
 /// Coordinator owned by shard 0 only.
 ///
@@ -89,10 +92,8 @@ pub struct ShardZeroCoordinator {
     replica_rr: Cell<u16>,
     client_rr: Cell<u16>,
     client_seq: Cell<u128>,
-    /// View the mint counter was last seeded for. `None` until the first seed.
-    /// Tracked so [`Self::seed_client_sequence`] can be called on the minting
-    /// path and fold the table exactly once per view instead of per mint.
-    seeded_view: Cell<Option<u32>>,
+    /// Fresh per boot, see [`Self::mint_client_id`].
+    boot_nonce: u64,
 }
 
 impl ShardZeroCoordinator {
@@ -109,6 +110,7 @@ impl ShardZeroCoordinator {
         total_shards: u16,
         cfg: CoordinatorConfig,
         metrics: crate::metrics::ShardMetrics,
+        boot_nonce: u64,
     ) -> Result<Self, ShardCtorError> {
         if total_shards == 0 || senders.len() != total_shards as usize {
             return Err(ShardCtorError::CoordinatorSendersMismatch {
@@ -125,7 +127,7 @@ impl ShardZeroCoordinator {
             replica_rr: Cell::new(0),
             client_rr: Cell::new(0),
             client_seq: Cell::new(1),
-            seeded_view: Cell::new(None),
+            boot_nonce,
         })
     }
 
@@ -153,79 +155,37 @@ impl ShardZeroCoordinator {
         )
     }
 
-    /// Mint a client id encoding `target_shard` in the top 16 bits and a
-    /// monotonic per-coordinator counter in the bottom 112 bits.
+    /// Mint a client id: `target_shard` in the top 16 bits, this boot's nonce
+    /// in the next 64, and a per-process counter in the bottom 48.
     ///
-    /// The sequence is masked into its half of the id. Counting there cannot
-    /// reach 2^112, but the counter is also SEEDED from recovered client-table
-    /// ids ([`Self::seed_client_sequence`]), and those include values a client
-    /// supplied on the wire -- so without the mask a chosen id near the top of
-    /// the range would, after a restart, push the next mint's carry into the
-    /// shard tag and misroute that connection's replies. Zero is skipped
-    /// because the wire header rejects `client == 0`.
+    /// The counter restarts at 1 on every boot and on every node, but an HTTP
+    /// session's id keys the replicated client table and the partition dedup
+    /// slices, and those keep ids minted by other nodes and by earlier boots.
+    /// The nonce keeps the ids apart. Without it a login can land on an id
+    /// that another session of the same user held, inherit that session's
+    /// dedup watermark, and get its writes in the watermark's window answered
+    /// as committed without being written.
+    ///
+    /// The mask keeps the sequence out of the nonce and the shard tag, so the
+    /// counter wraps after 2^48 mints in one boot. Zero is skipped because the
+    /// wire header rejects `client == 0`.
     fn mint_client_id(&self, target_shard: u16) -> u128 {
-        let mut seq = self.client_seq.get() & CLIENT_SEQUENCE_MASK;
+        let mut seq = self.client_seq.get();
         if seq == 0 {
             seq = 1;
         }
         self.client_seq
             .set(seq.wrapping_add(1) & CLIENT_SEQUENCE_MASK);
-        (u128::from(target_shard) << CLIENT_ID_SHARD_SHIFT) | seq
-    }
-
-    /// Reseed the mint counter above every sequence in `recovered_ids`, once
-    /// per `view`.
-    ///
-    /// The counter is per process and starts at 1, while the client table it
-    /// must not collide with is REPLICATED -- so it holds ids minted by other
-    /// nodes' counters, and by this node's previous boot. Left alone, a mint
-    /// lands on an id that is already taken: a different user's login is then
-    /// refused outright (the register ownership gate), and the same user's
-    /// rebinds and inherits a watermark it never wrote. Seeding past the
-    /// table's high-water mark makes that unreachable instead of handled.
-    ///
-    /// Two moments need it, which is why `view` is the key rather than "call
-    /// this at boot": startup, where the table was rebuilt from the previous
-    /// boot's WAL, and PROMOTION, where a node starts minting against ids its
-    /// predecessor committed from an unrelated counter. A view change is the
-    /// observable edge for the second, and re-seeding for a view already
-    /// covered is skipped, so this is cheap enough to call from the minting
-    /// path.
-    ///
-    /// Never lowers the counter, so a redundant call cannot hand back an id
-    /// this process already minted.
-    ///
-    /// Only ids whose tag names a shard of this node are folded in. The table
-    /// also holds ids a client chose for itself (the TCP login path takes
-    /// `client` straight off the wire), and those carry arbitrary tags; folding
-    /// them would let one login steer this node's counter. A chosen id with a
-    /// *plausible* tag can still move it, which is why the mint masks -- the
-    /// worst case is then a counter that wraps low and collides with live
-    /// entries, which the register ownership gate refuses rather than
-    /// mis-serves.
-    pub fn seed_client_sequence(&self, view: u32, recovered_ids: impl Iterator<Item = u128>) {
-        if self.seeded_view.get() == Some(view) {
-            return;
-        }
-        self.seeded_view.set(Some(view));
-        let highest = recovered_ids
-            .filter(|id| (id >> CLIENT_ID_SHARD_SHIFT) < u128::from(self.total_shards))
-            .map(|id| id & CLIENT_SEQUENCE_MASK)
-            .max();
-        let Some(highest) = highest else {
-            return;
-        };
-        let next = highest.saturating_add(1) & CLIENT_SEQUENCE_MASK;
-        if next > self.client_seq.get() {
-            self.client_seq.set(next);
-        }
+        (u128::from(target_shard) << CLIENT_ID_SHARD_SHIFT)
+            | (u128::from(self.boot_nonce) << CLIENT_ID_NONCE_SHIFT)
+            | seq
     }
 
     /// Mint a client id for a connection that terminates locally on shard 0
-    /// (QUIC, TCP-TLS) instead of being round-robin delegated.
+    /// (QUIC or HTTP) instead of being round-robin delegated.
     ///
     /// Shares the coordinator's `client_seq` counter with the delegated
-    /// TCP/WS path. Both a shard-0-local connection and a delegated
+    /// TCP/WS/TCP-TLS/WSS paths. Both a shard-0-local connection and a delegated
     /// connection that round-robined to shard 0 encode `target_shard = 0`
     /// in the top 16 bits; drawing from separate counters would let them
     /// mint the same id and collide in shard 0's single connection
@@ -312,6 +272,8 @@ impl ShardZeroCoordinator {
     }
 
     /// Ship a client TCP connection to the next round-robin target shard.
+    /// `permit` is the socket's slot in the node's connection cap. It rides
+    /// in the setup frame, so every failure below frees it with the socket.
     ///
     /// On success returns the minted client id. On failure closes the
     /// duplicated fd and returns an error.
@@ -322,24 +284,14 @@ impl ShardZeroCoordinator {
     /// fails or `dup(2)` fails. Returns [`SendError::RoutingFailed`]
     /// when the target shard's inbox refuses the setup frame (full or
     /// disconnected).
-    pub fn delegate_client(&self, stream: TcpStream) -> Result<u128, SendError> {
-        let target = self.next_client_target();
-        let client_id = self.mint_client_id(target);
-        let peer_addr = stream.peer_addr().map_err(SendError::DupFailed)?;
-
-        let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
-        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Tcp);
-        let setup = LifecycleFrame::ClientConnectionSetup { fd, meta };
-        if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
-            // The returned frame owns the `DupedFd` and closes it on drop.
-            self.metrics
-                .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
-            warn!(client_id, target, "delegate_client try_send failed: {e:?}");
-            return Err(SendError::RoutingFailed(target));
-        }
-
-        drop(stream);
-        Ok(client_id)
+    pub fn delegate_client(
+        &self,
+        stream: TcpStream,
+        permit: ConnectionPermit,
+    ) -> Result<u128, SendError> {
+        self.ship_client_fd(stream, ClientTransportKind::Tcp, |fd, meta| {
+            LifecycleFrame::ClientConnectionSetup { fd, meta, permit }
+        })
     }
 
     /// Ship a WebSocket client's pre-upgrade TCP connection to the next
@@ -357,31 +309,94 @@ impl ShardZeroCoordinator {
     /// Returns [`SendError::DupFailed`] if `stream.peer_addr()` lookup
     /// fails or `dup(2)` fails. Returns [`SendError::RoutingFailed`]
     /// when the target shard's inbox refuses the setup frame.
-    pub fn delegate_ws_client(&self, stream: TcpStream) -> Result<u128, SendError> {
+    pub fn delegate_ws_client(
+        &self,
+        stream: TcpStream,
+        permit: ConnectionPermit,
+    ) -> Result<u128, SendError> {
+        self.ship_client_fd(stream, ClientTransportKind::Ws, |fd, meta| {
+            LifecycleFrame::ClientWsConnectionSetup { fd, meta, permit }
+        })
+    }
+
+    /// Delegate a raw TCP socket and its listener's TLS configuration.
+    /// The destination shard owns the TLS handshake and encrypted I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lookup, duplication and routing errors as
+    /// [`Self::delegate_client`]. Both socket handles close on failure.
+    pub fn delegate_tcp_tls_client(
+        &self,
+        stream: TcpStream,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+    ) -> Result<u128, SendError> {
+        self.ship_client_fd(stream, ClientTransportKind::TcpTls, |fd, meta| {
+            LifecycleFrame::ClientTcpTlsConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            }
+        })
+    }
+
+    /// Delegate WSS before TLS or WebSocket state is created. Both
+    /// handshakes and all subsequent I/O run on the destination shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lookup, duplication and routing errors as
+    /// [`Self::delegate_client`]. Both socket handles close on failure.
+    pub fn delegate_wss_client(
+        &self,
+        stream: TcpStream,
+        config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
+    ) -> Result<u128, SendError> {
+        self.ship_client_fd(stream, ClientTransportKind::Wss, |fd, meta| {
+            LifecycleFrame::ClientWssConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            }
+        })
+    }
+
+    #[must_use]
+    pub const fn total_shards(&self) -> u16 {
+        self.total_shards
+    }
+
+    fn ship_client_fd(
+        &self,
+        stream: TcpStream,
+        transport: ClientTransportKind,
+        build_frame: impl FnOnce(fd_transfer::DupedFd, ClientConnMeta) -> LifecycleFrame,
+    ) -> Result<u128, SendError> {
         let target = self.next_client_target();
         let client_id = self.mint_client_id(target);
         let peer_addr = stream.peer_addr().map_err(SendError::DupFailed)?;
 
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
-        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Ws);
-        let setup = LifecycleFrame::ClientWsConnectionSetup { fd, meta };
+        let meta = ClientConnMeta::new(client_id, peer_addr, transport);
+        let setup = build_frame(fd, meta);
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
             self.metrics
                 .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
             warn!(
                 client_id,
-                target, "delegate_ws_client try_send failed: {e:?}"
+                target,
+                ?transport,
+                "client delegation try_send failed: {e:?}"
             );
             return Err(SendError::RoutingFailed(target));
         }
 
         drop(stream);
         Ok(client_id)
-    }
-
-    #[must_use]
-    pub const fn total_shards(&self) -> u16 {
-        self.total_shards
     }
 }
 
@@ -412,7 +427,34 @@ fn rr_pick(counter: &Cell<u16>, total_shards: u16, skip_zero: bool) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::IggyShardBuilder;
+    use crate::shards_table::PapayaShardsTable;
+    use crate::{NoopHost, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
+    use compio::io::AsyncRead;
     use compio::net::{TcpListener, TcpStream};
+    use consensus::{LocalPipeline, VsrConsensus};
+    use iggy_common::{IggyByteSize, variadic};
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::client_listener::tcp_tls;
+    use message_bus::transports::tls::self_signed_for_loopback;
+    use message_bus::{ConnectionCap, IggyMessageBus};
+    use metadata::stm::stream::Streams;
+    use metadata::stm::user::Users;
+    use metadata::{IggyMetadata, MuxStateMachine};
+    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
+    use server_common::sharding::{METADATA_GROUP, ShardId};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const CLIENT_TRANSPORTS: [ClientTransportKind; 4] = [
+        ClientTransportKind::Tcp,
+        ClientTransportKind::Ws,
+        ClientTransportKind::TcpTls,
+        ClientTransportKind::Wss,
+    ];
+    const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+    const BOOT_NONCE: u64 = 0x5eed_b007_c0de_f00d;
 
     fn build_senders(total: u16) -> Rc<Vec<TaggedSender>> {
         let mut senders = Vec::with_capacity(total as usize);
@@ -450,6 +492,7 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         );
         assert!(
             matches!(
@@ -471,6 +514,7 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
@@ -496,9 +540,14 @@ mod tests {
             skip_shard_zero_for_replicas: false,
             skip_shard_zero_for_clients: false,
         };
-        let coord =
-            ShardZeroCoordinator::new(senders, 4, cfg, crate::metrics::ShardMetrics::for_shard())
-                .expect("coord ctor ok");
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            cfg,
+            crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
+        )
+        .expect("coord ctor ok");
 
         assert_eq!(coord.next_replica_target(), 0);
         assert_eq!(coord.next_replica_target(), 1);
@@ -517,9 +566,14 @@ mod tests {
             skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: true,
         };
-        let coord =
-            ShardZeroCoordinator::new(senders, 4, cfg, crate::metrics::ShardMetrics::for_shard())
-                .expect("coord ctor ok");
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            cfg,
+            crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
+        )
+        .expect("coord ctor ok");
 
         for _ in 0..8 {
             let r = coord.next_replica_target();
@@ -536,9 +590,14 @@ mod tests {
             skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: true,
         };
-        let coord =
-            ShardZeroCoordinator::new(senders, 1, cfg, crate::metrics::ShardMetrics::for_shard())
-                .expect("coord ctor ok");
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            1,
+            cfg,
+            crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
+        )
+        .expect("coord ctor ok");
         for _ in 0..4 {
             assert_eq!(coord.next_replica_target(), 0);
             assert_eq!(coord.next_client_target(), 0);
@@ -546,170 +605,148 @@ mod tests {
     }
 
     #[test]
-    fn mint_client_id_encodes_target_shard() {
+    fn mint_client_id_encodes_target_shard_and_boot_nonce() {
         let senders = build_senders(8);
         let coord = ShardZeroCoordinator::new(
             senders,
             8,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
         let id = coord.mint_client_id(5);
-        assert_eq!((id >> 112) as u16, 5);
-        assert_eq!(id & ((1u128 << 112) - 1), 1, "first seq is 1");
-    }
-
-    // A restarted node recovers table entries keyed by the previous boot's
-    // ids while the minter restarts at 1. Reseeding past the recovered
-    // high-water mark is what keeps a fresh login off an existing entry.
-    #[test]
-    fn seed_client_sequence_mints_above_recovered_ids() {
-        let senders = build_senders(4);
-        let coord = ShardZeroCoordinator::new(
-            senders,
-            4,
-            CoordinatorConfig::default(),
-            crate::metrics::ShardMetrics::for_shard(),
-        )
-        .expect("coord ctor ok");
-
-        // Recovered ids carry their own shard tags; only the sequence matters.
-        let recovered = [
-            (1u128 << CLIENT_ID_SHARD_SHIFT) | 0x07,
-            (3u128 << CLIENT_ID_SHARD_SHIFT) | 0x2a,
-            9,
-        ];
-        // total_shards is 4, so tags 1 and 3 are this node's and fold in.
-        coord.seed_client_sequence(0, recovered.into_iter());
-
-        let id = coord.mint_client_id(2);
+        assert_eq!(message_bus::client_id_owning_shard(id), 5);
         assert_eq!(
-            id & ((1u128 << CLIENT_ID_SHARD_SHIFT) - 1),
-            0x2b,
-            "must mint above the highest recovered sequence"
+            (id >> CLIENT_ID_NONCE_SHIFT) & u128::from(u64::MAX),
+            u128::from(BOOT_NONCE)
         );
-        assert_eq!((id >> CLIENT_ID_SHARD_SHIFT) as u16, 2, "tag preserved");
+        assert_eq!(id & CLIENT_SEQUENCE_MASK, 1, "first seq is 1");
     }
 
-    // Never lower the counter: a later reseed (or an empty table) must not
-    // hand back ids this process already minted.
+    // Every boot and every node restarts the counter at 1, while the client
+    // table and the partition dedup slices keep the ids of earlier boots and
+    // of other nodes. Only the nonce keeps two boots from minting the same id.
     #[test]
-    fn seed_client_sequence_never_lowers_the_counter() {
-        let senders = build_senders(2);
-        let coord = ShardZeroCoordinator::new(
-            senders,
-            2,
-            CoordinatorConfig::default(),
-            crate::metrics::ShardMetrics::for_shard(),
-        )
-        .expect("coord ctor ok");
+    fn mints_of_two_boots_never_collide() {
+        const MINTS: usize = 64;
+        let mint_boot = |boot_nonce| {
+            let coord = ShardZeroCoordinator::new(
+                build_senders(2),
+                2,
+                CoordinatorConfig::default(),
+                crate::metrics::ShardMetrics::for_shard(),
+                boot_nonce,
+            )
+            .expect("coord ctor ok");
+            (0..MINTS)
+                .map(|_| coord.mint_shard_zero_client_id())
+                .collect::<HashSet<_>>()
+        };
 
-        for _ in 0..5 {
-            let _ = coord.mint_client_id(0);
-        }
-        coord.seed_client_sequence(0, std::iter::empty());
-        coord.seed_client_sequence(1, [1u128, 2].into_iter());
-
-        let id = coord.mint_client_id(0);
-        assert_eq!(
-            id & ((1u128 << CLIENT_ID_SHARD_SHIFT) - 1),
-            6,
-            "counter must keep advancing from where minting left off"
+        let previous_boot = mint_boot(BOOT_NONCE);
+        let next_boot = mint_boot(BOOT_NONCE + 1);
+        assert_eq!(previous_boot.len(), MINTS);
+        assert_eq!(next_boot.len(), MINTS);
+        assert!(
+            previous_boot.is_disjoint(&next_boot),
+            "a restarted node must not mint an id its previous boot minted"
         );
     }
 
-    // The sequence must never carry into the shard tag: that tag is the
-    // inter-shard reply routing key, so a carry would send a live connection's
-    // replies to a different shard for the process lifetime. Reachable only
-    // because the counter is seeded from recovered ids, and the TCP login path
-    // takes `client` straight off the wire -- so a client can choose one near
-    // the ceiling and a restart folds it in.
+    // Production takes the nonce from the builder, which must hand shard 0 the
+    // low half of the metadata incarnation that boot draws fresh.
     #[test]
-    fn mint_never_carries_the_sequence_into_the_shard_tag() {
-        let senders = build_senders(4);
-        let coord = ShardZeroCoordinator::new(
-            senders,
-            4,
-            CoordinatorConfig::default(),
-            crate::metrics::ShardMetrics::for_shard(),
-        )
-        .expect("coord ctor ok");
-
-        // A chosen id with a plausible tag, sequence at the ceiling.
-        coord.seed_client_sequence(0, std::iter::once(CLIENT_SEQUENCE_MASK));
-        for _ in 0..4 {
-            let id = coord.mint_shard_zero_client_id();
-            assert_eq!(
-                id >> CLIENT_ID_SHARD_SHIFT,
-                0,
-                "shard-0 mint must keep tag 0, got id {id:#x}"
-            );
-            assert_ne!(id, 0, "the wire header rejects client == 0");
-        }
-    }
-
-    // Ids a client chose for itself carry arbitrary tags. Folding those into
-    // this node's counter would let one login steer it.
-    #[test]
-    fn seed_ignores_ids_tagged_outside_this_node() {
-        let senders = build_senders(2);
-        let coord = ShardZeroCoordinator::new(
-            senders,
-            2,
-            CoordinatorConfig::default(),
-            crate::metrics::ShardMetrics::for_shard(),
-        )
-        .expect("coord ctor ok");
-
-        // Tag 9 is not a shard of a 2-shard node: caller-supplied, ignored.
-        coord.seed_client_sequence(
-            0,
-            std::iter::once((9u128 << CLIENT_ID_SHARD_SHIFT) | 0x0f_ff_ff),
-        );
-        assert_eq!(
-            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
+    fn builder_mints_shard_zero_ids_under_the_metadata_incarnation() {
+        type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
+        let incarnation = (u128::MAX << u64::BITS) | u128::from(BOOT_NONCE);
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let consensus = VsrConsensus::new(
             1,
-            "an id tagged outside this node must not move the counter"
+            0,
+            1,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
         );
-    }
-
-    // Promotion is the second moment the counter can be wrong: the new primary
-    // mints against ids its predecessor committed from an unrelated counter.
-    // A view change is the observable edge, and re-seeding within one view is
-    // skipped so this is cheap enough to sit on the minting path.
-    #[test]
-    fn seed_refolds_the_table_once_per_view() {
-        let senders = build_senders(2);
-        let coord = ShardZeroCoordinator::new(
-            senders,
-            2,
+        consensus.set_incarnation(incarnation);
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> =
+            IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None);
+        let segment_size = IggyByteSize::from(1_048_576_u64);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: segment_size,
+                validate_checksum: true,
+                segment_size,
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let (sender, inbox, reply_inbox) = crate::shard_channel(0, 16, 16);
+        let built = IggyShardBuilder::new(
+            ShardIdentity::new(0, "builder-nonce-test".to_string()),
+            Rc::clone(&bus),
+            Rc::new(NoopHost),
+            metadata,
+            partitions,
+            vec![sender],
+            inbox,
+            reply_inbox,
+            1,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus),
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
         )
+        .build()
+        .expect("single-shard wiring is valid");
+
+        let id = built
+            .shard
+            .coordinator()
+            .expect("shard 0 owns the coordinator")
+            .mint_shard_zero_client_id();
+        assert_eq!(
+            (id >> CLIENT_ID_NONCE_SHIFT) & u128::from(u64::MAX),
+            u128::from(BOOT_NONCE),
+            "shard 0 must mint under the low half of the metadata incarnation"
+        );
+    }
+
+    // The sequence must never carry into the nonce or the shard tag: the tag
+    // is the inter-shard reply routing key, so a carry would send a live
+    // connection's replies to a different shard for the process lifetime.
+    #[test]
+    fn mint_never_carries_the_sequence_into_the_nonce_or_tag() {
+        let senders = build_senders(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
+        )
         .expect("coord ctor ok");
 
-        coord.seed_client_sequence(4, std::iter::once(0x10));
-        assert_eq!(
-            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
-            0x11
-        );
-
-        // Same view: the table is not refolded, so a later entry is ignored.
-        coord.seed_client_sequence(4, std::iter::once(0x80));
-        assert_eq!(
-            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
-            0x12
-        );
-
-        // Promotion: new view, so the predecessor's high-water mark is folded.
-        coord.seed_client_sequence(5, std::iter::once(0x80));
-        assert_eq!(
-            coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK,
-            0x81,
-            "a promoted primary must mint above what its predecessor committed"
-        );
+        coord.client_seq.set(CLIENT_SEQUENCE_MASK);
+        for expected_seq in [CLIENT_SEQUENCE_MASK, 1] {
+            let id = coord.mint_client_id(3);
+            assert_eq!(message_bus::client_id_owning_shard(id), 3, "id {id:#x}");
+            assert_eq!(
+                (id >> CLIENT_ID_NONCE_SHIFT) & u128::from(u64::MAX),
+                u128::from(BOOT_NONCE),
+                "id {id:#x}"
+            );
+            assert_eq!(
+                id & CLIENT_SEQUENCE_MASK,
+                expected_seq,
+                "the wrap skips 0, which the wire header rejects"
+            );
+        }
     }
 
     #[test]
@@ -720,10 +757,11 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
-        // Interleave shard-0-local mints (QUIC / TCP-TLS path) with
+        // Interleave shard-0-local mints (QUIC / HTTP path) with
         // delegated mints that round-robin to shard 0. Both encode target
         // shard 0 in the top 16 bits; the shared counter keeps every id
         // distinct so they cannot overwrite each other in shard 0's
@@ -749,6 +787,7 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
@@ -800,6 +839,7 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
@@ -832,6 +872,7 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
@@ -841,7 +882,9 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let client_id = coord.delegate_client(client).expect("delegate ok");
+        let client_id = coord
+            .delegate_client(client, test_permit())
+            .expect("delegate ok");
         let target = (client_id >> 112) as u16;
         assert!(
             (0..4).contains(&target),
@@ -850,7 +893,7 @@ mod tests {
 
         let setup_frame = receivers[target as usize].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta }) => {
+            ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta, .. }) => {
                 assert_eq!(meta.client_id, client_id);
                 assert!(matches!(meta.transport, ClientTransportKind::Tcp));
                 drop(fd);
@@ -868,6 +911,7 @@ mod tests {
             4,
             CoordinatorConfig::default(),
             crate::metrics::ShardMetrics::for_shard(),
+            BOOT_NONCE,
         )
         .expect("coord ctor ok");
 
@@ -877,7 +921,9 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let client_id = coord.delegate_ws_client(client).expect("delegate ok");
+        let client_id = coord
+            .delegate_ws_client(client, test_permit())
+            .expect("delegate ok");
         let target = (client_id >> 112) as u16;
         assert!(
             (0..4).contains(&target),
@@ -886,7 +932,7 @@ mod tests {
 
         let setup_frame = receivers[target as usize].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta }) => {
+            ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta, .. }) => {
                 assert_eq!(meta.client_id, client_id);
                 assert!(
                     matches!(meta.transport, ClientTransportKind::Ws),
@@ -897,5 +943,221 @@ mod tests {
             }
             _ => panic!("expected ClientWsConnectionSetup variant"),
         }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn mixed_client_transports_share_placement_and_sequence() {
+        const ACCEPTS: u16 = 16;
+        let configs = [test_tls_config(), test_tls_config()];
+        for total_shards in [1, 3, 4] {
+            for skip_zero in [false, true] {
+                let (senders, receivers) = build_senders_with_rx(total_shards);
+                let coord = ShardZeroCoordinator::new(
+                    senders,
+                    total_shards,
+                    CoordinatorConfig {
+                        skip_shard_zero_for_clients: skip_zero,
+                        ..CoordinatorConfig::default()
+                    },
+                    crate::metrics::ShardMetrics::for_shard(),
+                    BOOT_NONCE,
+                )
+                .unwrap();
+                let first_shard = u16::from(skip_zero && total_shards > 1);
+                let mut sequences = HashSet::new();
+
+                for index in 0..ACCEPTS {
+                    let transport = CLIENT_TRANSPORTS[usize::from(index) % CLIENT_TRANSPORTS.len()];
+                    let config =
+                        &configs[(usize::from(index) / CLIENT_TRANSPORTS.len()) % configs.len()];
+                    let (stream, mut peer) = tcp_pair().await;
+                    let peer_addr = peer.local_addr().unwrap();
+                    let client_id =
+                        delegate_test_client(&coord, stream, transport, config).unwrap();
+                    let target = first_shard + index % (total_shards - first_shard);
+                    assert_eq!(message_bus::client_id_owning_shard(client_id), target);
+                    let sequence = client_id & CLIENT_SEQUENCE_MASK;
+                    assert_eq!(sequence, u128::from(index) * 2 + 1);
+                    assert!(sequences.insert(sequence));
+                    assert!(
+                        sequences.insert(coord.mint_shard_zero_client_id() & CLIENT_SEQUENCE_MASK)
+                    );
+
+                    let frame = receivers[usize::from(target)].try_recv().unwrap();
+                    let (fd, meta) = client_setup(frame, transport, config);
+                    assert_eq!(meta.client_id, client_id);
+                    assert_eq!(meta.transport, transport);
+                    assert_eq!(meta.peer_addr, peer_addr);
+                    assert!(
+                        receivers
+                            .iter()
+                            .all(|receiver| receiver.try_recv().is_err())
+                    );
+
+                    drop(fd);
+                    assert_socket_closed(&mut peer).await;
+                }
+            }
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn rejected_client_handoffs_close_both_socket_handles() {
+        let config = test_tls_config();
+        for transport in CLIENT_TRANSPORTS {
+            for disconnected in [false, true] {
+                let (senders, receivers) = build_senders_with_rx(2);
+                if !disconnected {
+                    while senders[1]
+                        .try_send(ShardFrame::lifecycle(
+                            LifecycleFrame::ReplicaInboundHandshakeDone { slot: 0 },
+                        ))
+                        .is_ok()
+                    {}
+                }
+                let _receivers = if disconnected {
+                    drop(receivers);
+                    None
+                } else {
+                    Some(receivers)
+                };
+                let coord = ShardZeroCoordinator::new(
+                    senders,
+                    2,
+                    CoordinatorConfig {
+                        skip_shard_zero_for_clients: true,
+                        ..CoordinatorConfig::default()
+                    },
+                    crate::metrics::ShardMetrics::for_shard(),
+                    BOOT_NONCE,
+                )
+                .unwrap();
+                let (stream, mut peer) = tcp_pair().await;
+                let result = delegate_test_client(&coord, stream, transport, &config);
+                assert!(
+                    matches!(result, Err(SendError::RoutingFailed(1))),
+                    "{transport:?}, disconnected={disconnected}: {result:?}"
+                );
+                assert_eq!(Arc::strong_count(&config), 1);
+                assert_socket_closed(&mut peer).await;
+            }
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn dropping_queued_tls_setups_releases_sockets_and_listener_configs() {
+        let config = test_tls_config();
+        for transport in [ClientTransportKind::TcpTls, ClientTransportKind::Wss] {
+            let (senders, receivers) = build_senders_with_rx(1);
+            let coord = ShardZeroCoordinator::new(
+                senders,
+                1,
+                CoordinatorConfig::default(),
+                crate::metrics::ShardMetrics::for_shard(),
+                BOOT_NONCE,
+            )
+            .unwrap();
+            let (stream, mut peer) = tcp_pair().await;
+            delegate_test_client(&coord, stream, transport, &config).unwrap();
+            assert_eq!(Arc::strong_count(&config), 2);
+            drop(coord);
+            drop(receivers);
+            assert_eq!(Arc::strong_count(&config), 1);
+            assert_socket_closed(&mut peer).await;
+        }
+    }
+
+    fn test_tls_config() -> SharedTlsServerConfig {
+        tcp_tls::bind("127.0.0.1:0".parse().unwrap(), self_signed_for_loopback())
+            .unwrap()
+            .1
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (connected, accepted) = futures::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        (accepted.unwrap().0, connected.unwrap())
+    }
+
+    /// A permit from an uncapped cap. The count is process-wide, so tests
+    /// here do not assert it: other tests hold permits at the same time.
+    fn test_permit() -> ConnectionPermit {
+        ConnectionCap::new(None)
+            .try_acquire()
+            .expect("an uncapped cap admits every socket")
+    }
+
+    fn delegate_test_client(
+        coord: &ShardZeroCoordinator,
+        stream: TcpStream,
+        transport: ClientTransportKind,
+        config: &SharedTlsServerConfig,
+    ) -> Result<u128, SendError> {
+        match transport {
+            ClientTransportKind::Tcp => coord.delegate_client(stream, test_permit()),
+            ClientTransportKind::Ws => coord.delegate_ws_client(stream, test_permit()),
+            ClientTransportKind::TcpTls => {
+                coord.delegate_tcp_tls_client(stream, Arc::clone(config), test_permit())
+            }
+            ClientTransportKind::Wss => {
+                coord.delegate_wss_client(stream, Arc::clone(config), test_permit())
+            }
+            _ => panic!("transport has no TCP delegation path: {transport:?}"),
+        }
+    }
+
+    fn client_setup(
+        frame: ShardFrame,
+        transport: ClientTransportKind,
+        expected_config: &SharedTlsServerConfig,
+    ) -> (fd_transfer::DupedFd, ClientConnMeta) {
+        match (transport, frame) {
+            (
+                ClientTransportKind::Tcp,
+                ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta, .. }),
+            )
+            | (
+                ClientTransportKind::Ws,
+                ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta, .. }),
+            ) => (fd, meta),
+            (
+                ClientTransportKind::TcpTls,
+                ShardFrame::Lifecycle(LifecycleFrame::ClientTcpTlsConnectionSetup {
+                    fd,
+                    meta,
+                    config,
+                    ..
+                }),
+            )
+            | (
+                ClientTransportKind::Wss,
+                ShardFrame::Lifecycle(LifecycleFrame::ClientWssConnectionSetup {
+                    fd,
+                    meta,
+                    config,
+                    ..
+                }),
+            ) => {
+                assert!(Arc::ptr_eq(&config, expected_config));
+                (fd, meta)
+            }
+            _ => panic!("wrong setup variant for {transport:?}"),
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn assert_socket_closed(peer: &mut TcpStream) {
+        let result = compio::time::timeout(SOCKET_CLOSE_TIMEOUT, peer.read(vec![0]))
+            .await
+            .expect("delegation must release both socket handles")
+            .0;
+        assert_eq!(result.unwrap(), 0, "peer must observe EOF");
     }
 }

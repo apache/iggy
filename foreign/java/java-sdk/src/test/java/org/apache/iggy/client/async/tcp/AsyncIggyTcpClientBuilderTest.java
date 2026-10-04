@@ -19,6 +19,10 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.channel.IoEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.local.LocalIoHandler;
+import io.netty.channel.nio.NioIoHandler;
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyAuthenticationException;
@@ -248,6 +252,96 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                         .heartbeatInterval(Duration.ofMillis(-1))
                         .build())
                 .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectNonPositiveIoThreads() {
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().ioThreads(0).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().ioThreads(-1).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldIgnoreIoThreadsWhenAnEventLoopGroupIsSupplied() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        try {
+            AsyncIggyTcpClient.builder().ioThreads(0).eventLoopGroup(group).build();
+        } finally {
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRejectNullEventLoopGroup() {
+        assertThatThrownBy(() -> AsyncIggyTcpClient.builder().eventLoopGroup(null))
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectAnEventLoopGroupThatCannotDriveNioChannels() throws Exception {
+        IoEventLoopGroup localGroup = new MultiThreadIoEventLoopGroup(1, LocalIoHandler.newFactory());
+        try {
+            assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
+                            .eventLoopGroup(localGroup)
+                            .build())
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("NIO");
+        } finally {
+            localGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRejectAShutDownEventLoopGroup() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+
+        assertThatThrownBy(
+                        () -> AsyncIggyTcpClient.builder().eventLoopGroup(group).build())
+                .isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldShareOneEventLoopGroupAcrossClients() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        AsyncIggyTcpClient other = null;
+        try {
+            client = AsyncIggyTcpClient.builder()
+                    .host(serverHost())
+                    .port(serverTcpPort())
+                    .eventLoopGroup(group)
+                    .build();
+            other = AsyncIggyTcpClient.builder()
+                    .host(serverHost())
+                    .port(serverTcpPort())
+                    .eventLoopGroup(group)
+                    .build();
+            client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            other.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            client.users().login(TEST_USERNAME, TEST_PASSWORD).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            other.users().login(TEST_USERNAME, TEST_PASSWORD).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(client.streams().getStreams().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .isNotNull();
+            assertThat(other.streams().getStreams().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .isNotNull();
+
+            client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            client = null;
+
+            assertThat(group.isShuttingDown())
+                    .as("closing a client must not take the shared group down")
+                    .isFalse();
+            assertThat(other.streams().getStreams().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .as("the other client keeps working on the shared group")
+                    .isNotNull();
+        } finally {
+            if (other != null) {
+                other.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertThat(group.isShuttingDown()).isFalse();
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
     }
 
     @Test

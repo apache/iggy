@@ -88,7 +88,7 @@ runs:
         cargo-bin: iggy-server
         wait-timeout-seconds: "90"
       env:
-        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-java-data
+        IGGY_PATH: ${{ runner.temp }}/iggy-java-data
 
     - name: Test
       if: inputs.task == 'test'
@@ -143,6 +143,11 @@ runs:
           mkdir -p reports/java-tests
           cp -r foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results reports/java-tests/flink
         fi
+        if [ -d "foreign/java/external-processors/iggy-connector-pinot/build/test-results" ]; then
+          echo "Found test reports in pinot"
+          mkdir -p reports/java-tests
+          cp -r foreign/java/external-processors/iggy-connector-pinot/build/test-results reports/java-tests/pinot
+        fi
 
     - name: Stop Iggy server
       if: always() && inputs.task == 'test'
@@ -161,7 +166,7 @@ runs:
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:
-        IGGY_SYSTEM_PATH: ${{ runner.temp }}/iggy-java-tls-data
+        IGGY_PATH: ${{ runner.temp }}/iggy-java-tls-data
         IGGY_TCP_TLS_ENABLED: "true"
         IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
         IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem
@@ -188,4 +193,5 @@ runs:
         paths: |
           foreign/java/java-sdk/build/test-results/**/TEST-*.xml
           foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results/**/TEST-*.xml
+          foreign/java/external-processors/iggy-connector-pinot/build/test-results/**/TEST-*.xml
       if: ${{ !cancelled() && inputs.task == 'test' }}

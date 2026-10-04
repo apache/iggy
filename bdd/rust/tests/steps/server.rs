@@ -16,12 +16,11 @@
 // under the License.
 
 use crate::common::global_context::GlobalContext;
+use crate::helpers::env::server_address;
 use cucumber::given;
 
 #[given("I have a running Iggy server")]
 pub async fn given_running_server(world: &mut GlobalContext) {
     // External server mode - connect to server from environment
-    let server_addr =
-        std::env::var("IGGY_TCP_ADDRESS").unwrap_or_else(|_| "localhost:8090".to_string());
-    world.server_addr = Some(server_addr);
+    world.server_addr = Some(server_address());
 }

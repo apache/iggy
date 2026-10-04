@@ -358,7 +358,7 @@ pub async fn recover<M>(
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
-    on_replayed_logout: impl Fn(&M, u128, iggy_common::IggyTimestamp),
+    on_replayed_session: impl Fn(&M, &PrepareHeader),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
@@ -589,8 +589,8 @@ where
             continue;
         }
 
-        // Register/Logout mutate the client table and skip the state
-        // machine, mirroring the commit paths (`on_ack` / `commit_journal`).
+        // Register/Logout apply their session effects through the callback,
+        // mirroring the commit paths (`on_ack` / `commit_journal`).
         //
         // Epochs come back identical on every replica: they are the register's
         // own commit op, so replay reads them out of the log rather than
@@ -614,6 +614,7 @@ where
         if header.operation == Operation::Register {
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table.commit_register(header.client, header.user_id, reply);
+            on_replayed_session(&mux_stm, header);
             last_applied_op = Some(header.op);
             continue;
         }
@@ -627,11 +628,7 @@ where
             // commit path: the caller drops the client from its consumer
             // groups (`remove_consumer_group_member`) so replay and live
             // apply converge on the same group membership.
-            on_replayed_logout(
-                &mux_stm,
-                header.client,
-                iggy_common::IggyTimestamp::from(header.timestamp),
-            );
+            on_replayed_session(&mux_stm, header);
             last_applied_op = Some(header.op);
             continue;
         }
@@ -843,6 +840,7 @@ mod tests {
             checkpoint_op,
             checkpoint_checksum,
             offset_frontier: 0,
+            offset_reserved: 0,
         }
     }
 
@@ -966,7 +964,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -992,7 +990,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1028,7 +1026,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1086,7 +1084,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1146,7 +1144,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await;
 
@@ -1197,7 +1195,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1235,7 +1233,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1305,7 +1303,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1382,7 +1380,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1448,7 +1446,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1505,7 +1503,11 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, client, _| replayed_logouts.borrow_mut().push(client),
+            |_, header| {
+                if header.operation == Operation::Logout {
+                    replayed_logouts.borrow_mut().push(header.client);
+                }
+            },
         )
         .await
         .unwrap();
@@ -1573,7 +1575,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await;
         assert!(matches!(
@@ -1606,7 +1608,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await;
         assert!(matches!(
@@ -1638,7 +1640,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1691,7 +1693,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
-                |_, _, _| {},
+                |_, _| {},
             )
             .await;
             match result {
@@ -1732,7 +1734,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         {
@@ -1797,7 +1799,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();
@@ -1850,7 +1852,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
-            |_, _, _| {},
+            |_, _| {},
         )
         .await
         .unwrap();

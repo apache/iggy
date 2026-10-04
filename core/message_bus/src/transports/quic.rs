@@ -319,7 +319,7 @@ enum ReplyRoute {
 /// Decide how to route an outbound frame. Only `Command::Reply` carries a
 /// `request` id; everything else must pass through unfiltered.
 fn reply_route(frame: &BusMessage) -> ReplyRoute {
-    let bytes = frame.as_slice();
+    let bytes = frame.first().as_slice();
     let is_reply = bytes
         .get(COMMAND_OFFSET)
         .is_some_and(|&command| command == Command::Reply as u8);
@@ -503,11 +503,19 @@ impl TransportConn for QuicTransportConn {
                 continue;
             };
 
-            // Write the reply, then `finish()` so quinn-proto flushes pending
-            // data + a FIN, signalling the SDK that the reply is complete.
-            let BufResult(result, _frozen) = send.write_all(first).await;
-            if let Err(e) = result {
-                debug!(%label, %peer, error = ?e, "quic: write failed");
+            // Write the reply fragment by fragment, then `finish()` so
+            // quinn-proto flushes pending data + a FIN, signalling the SDK
+            // that the reply is complete.
+            let mut write_failed = false;
+            for fragment in first.into_fragments() {
+                let BufResult(result, _frozen) = send.write_all(fragment).await;
+                if let Err(e) = result {
+                    debug!(%label, %peer, error = ?e, "quic: write failed");
+                    write_failed = true;
+                    break;
+                }
+            }
+            if write_failed {
                 continue;
             }
             if let Err(e) = send.finish() {
@@ -611,12 +619,12 @@ mod tests {
     fn drive(
         conn: QuicTransportConn,
     ) -> (
-        async_channel::Sender<Frozen<MESSAGE_ALIGN>>,
+        async_channel::Sender<BusMessage>,
         async_channel::Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (out_tx, out_rx) = bounded::<BusMessage>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
         let ctx = ActorContext {
@@ -654,11 +662,20 @@ mod tests {
             // and then awaits exactly one reply on `rx` before
             // accepting the next bidi. Feed three replies in step.
             let a = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command::Reply)).await.unwrap();
+            out_tx
+                .send(header_only(Command::Reply).into())
+                .await
+                .unwrap();
             let b = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command::Reply)).await.unwrap();
+            out_tx
+                .send(header_only(Command::Reply).into())
+                .await
+                .unwrap();
             let c = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command::Reply)).await.unwrap();
+            out_tx
+                .send(header_only(Command::Reply).into())
+                .await
+                .unwrap();
             shutdown.trigger();
             let _ = handle.await;
             (a.header().command, b.header().command, c.header().command)

@@ -15,11 +15,67 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from datetime import timedelta
+
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import (
+    AutoLogin,
+    HttpConfig,
+    IggyClient,
+    QuicConfig,
+    QuicReconnectionConfig,
+    TcpConfig,
+    TcpReconnectionConfig,
+    WebSocketConfig,
+)
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
+from .utils import (
+    get_http_server_config,
+    get_quic_server_config,
+    get_server_config,
+    get_websocket_server_config,
+    wait_for_ping,
+    wait_for_server,
+)
+
+
+def binary_transport_configs(auto_login: AutoLogin | None = None) -> list:
+    """Return a config for every transport that holds a connection.
+
+    Auto-login is disabled by default: with credentials to replay, a ping sent
+    while disconnected reconnects on its own instead of failing.
+
+    TCP and QUIC wait out `reestablish_after` before they connect again, so the
+    configs set it to zero to keep the reconnect cases fast.
+    """
+    tcp_host, tcp_port = get_server_config()
+    ws_host, ws_port = get_websocket_server_config()
+    quic_host, quic_port = get_quic_server_config()
+    return [
+        pytest.param(
+            TcpConfig(
+                server_address=f"{tcp_host}:{tcp_port}",
+                auto_login=auto_login,
+                reconnection=TcpReconnectionConfig(reestablish_after=timedelta(0)),
+            ),
+            id="tcp",
+        ),
+        pytest.param(
+            WebSocketConfig(
+                server_address=f"{ws_host}:{ws_port}", auto_login=auto_login
+            ),
+            id="websocket",
+        ),
+        pytest.param(
+            QuicConfig(
+                server_address=f"{quic_host}:{quic_port}",
+                auto_login=auto_login,
+                reconnection=QuicReconnectionConfig(reestablish_after=timedelta(0)),
+            ),
+            id="quic",
+        ),
+    ]
 
 
 class TestConnectivity:
@@ -40,6 +96,7 @@ class TestConnectivity:
             "iggy+http://iggy:iggy@127.0.0.1:3000?heartbeat_interval=5s&retries=3",
             "iggy+ws://iggy:iggy@127.0.0.1:8092",
             "iggy+ws://iggy:iggy@127.0.0.1:8092?heartbeat_interval=5s&reconnection_retries=3&reconnection_interval=1s&reestablish_after=5s&read_buffer_size=4096&write_buffer_size=4096&max_write_buffer_size=8192&max_message_size=16384&max_frame_size=16384&accept_unmasked_frames=false&tls_domain=localhost&tls_ca_file=unused.pem&tls_validate_certificate=false&tls=false",
+            "iggy+quic://iggy:iggy@127.0.0.1:8080?reconnection_max_retries=0",
         ],
     )
     @pytest.mark.asyncio
@@ -77,7 +134,6 @@ class TestConnectivity:
                 "iggy+tcp://iggy:iggy@{host}:{port}?invalid_option=value",
                 "Invalid connection string",
             ),
-            ("iggy+quic://iggy:iggy@127.0.0.1:8080", "Cannot create endpoint"),
         ],
     )
     def test_invalid_connection_string(self, invalid_value: str, expected_error: str):
@@ -168,3 +224,113 @@ class TestConnectivity:
     async def test_ping(self, iggy_client: IggyClient):
         """Test server ping functionality."""
         await iggy_client.ping()
+
+
+class TestLifecycle:
+    """Test the disconnect and shutdown lifecycle of the client."""
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_disconnect_is_idempotent_and_rejects_requests(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated disconnects succeed, requests fail, and connect works again."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.disconnect()
+        await client.disconnect()
+
+        with pytest.raises(RuntimeError):
+            await client.ping()
+
+        await client.connect()
+        await client.ping()
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_disconnected_client_reconnects_and_logs_in_again(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test a disconnected client needs a new login after it reconnects."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
+        await client.get_streams()
+
+        await client.disconnect()
+        await client.connect()
+        await wait_for_ping(client)
+
+        with pytest.raises(RuntimeError):
+            await client.get_streams()
+
+        await client.login_user("iggy", "iggy")
+        await client.get_streams()
+
+    @pytest.mark.parametrize(
+        "config",
+        binary_transport_configs(AutoLogin.username_password("iggy", "iggy")),
+    )
+    @pytest.mark.asyncio
+    async def test_disconnected_client_with_auto_login_signs_in_on_reconnect(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test a client with auto-login credentials signs in again on connect."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.disconnect()
+        await client.connect()
+
+        await client.get_streams()
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_shutdown_is_idempotent_and_rejects_requests(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated shutdowns succeed and later requests report the shutdown."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.shutdown()
+        await client.shutdown()
+
+        with pytest.raises(RuntimeError, match="Client shutdown"):
+            await client.ping()
+
+    @pytest.mark.parametrize("config", binary_transport_configs())
+    @pytest.mark.asyncio
+    async def test_shutdown_client_cannot_connect_again(
+        self, config: TcpConfig | WebSocketConfig | QuicConfig
+    ):
+        """Test repeated shutdowns leave the client unable to connect again."""
+        client = IggyClient(config)
+        await client.connect()
+        await wait_for_ping(client)
+
+        await client.shutdown()
+        await client.shutdown()
+
+        with pytest.raises(RuntimeError):
+            await client.connect()
+
+    @pytest.mark.asyncio
+    async def test_http_disconnect_and_shutdown_keep_the_session(self):
+        """Test HTTP has no connection to close, so the session keeps working."""
+        host, port = get_http_server_config()
+        client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
+
+        await client.disconnect()
+        await client.get_streams()
+
+        await client.shutdown()
+        await client.get_streams()

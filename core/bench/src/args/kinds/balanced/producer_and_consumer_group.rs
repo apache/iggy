@@ -107,7 +107,7 @@ impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
         if cg_number < streams {
             cmd.error(
                 ErrorKind::ArgumentConflict,
-                "Consumer groups number must be less than or equal to the number of streams.",
+                "Consumer groups number must be greater than or equal to the number of streams.",
             )
             .exit();
         }
@@ -118,7 +118,7 @@ impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
         if partitions < consumers {
             cmd.error(
                 ErrorKind::ArgumentConflict,
-                "Consumer number must be greater than the number of partitions.",
+                "Consumer number must be less than or equal to the number of partitions.",
             )
             .exit();
         }

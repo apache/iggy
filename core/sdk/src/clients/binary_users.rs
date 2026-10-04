@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::clients::redirect_login_settled;
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::UserUpdateOptions;
@@ -116,6 +117,15 @@ impl UserClient for IggyClient {
         if should_redirect {
             info!("Redirected to leader, reconnecting and re-authenticating");
             self.connect().await?;
+            // The reconnect signs in with the credentials this very call just
+            // remembered, so on a client without a configured `AutoLogin` the
+            // session is already this user's: signing in again would cost a
+            // logout and a second login (an argon2 each, on the server) for
+            // nothing. With `AutoLogin::Enabled` the reconnect signed in the
+            // configured user, who may not be this one, so the login runs.
+            if redirect_login_settled(&*self.client.read().await).await {
+                return Ok(identity);
+            }
             self.login_user(username, password).await
         } else {
             Ok(identity)

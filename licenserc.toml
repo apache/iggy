@@ -37,6 +37,7 @@ excludes = [
     "**/local_data*/**",
     "**/performance_results*/**",
     "**/*.lock",
+    "**/pylock.toml",
     "**/*.txt",
     "**/*.tpl",
     "**/LICENSE",
@@ -46,6 +47,7 @@ excludes = [
     "**/.gitignore",
     "**/.gitattributes",
     "**/.dockerignore",
+    "**/Dockerfile.dockerignore",
     "**/.helmignore",
     "**/.prettierignore",
     "**/.editorconfig",
@@ -78,7 +80,14 @@ excludes = [
     "**/META-INF/services/**",
     ".github/config/hawkeye.version",
     "**/.python-version",
+    "**/Package.resolved",
+    "**/.swift-format",
+    # SwiftPM requires `// swift-tools-version` as the very first line, which the
+    # header parser reads as part of the header. The header is still present.
+    "**/Package.swift",
+    "**/.build/**",
     "**/gradle/wrapper/**",
+    "**/.clang-tidy",
     # cargo-php regenerates this file with an extra separator after the header.
     "foreign/php/iggy-php.stubs.php",
 ]
@@ -91,6 +100,7 @@ extensions = [
     "php",
     "rs",
     "js",
+    "swift",
     "ts",
 ]
 style_out = "doubleslash"

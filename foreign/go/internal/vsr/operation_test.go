@@ -158,14 +158,6 @@ func TestIsMetadata_ExcludesDeleteSegments(t *testing.T) {
 	}
 }
 
-func TestIsPartition_CoversTheDataPlaneBand(t *testing.T) {
-	assert.True(t, IsPartition(OperationSendMessages))
-	assert.True(t, IsPartition(OperationStoreConsumerOffset))
-	assert.True(t, IsPartition(OperationDeleteConsumerOffset))
-	assert.False(t, IsPartition(OperationLeaveConsumerGroup))
-	assert.False(t, IsPartition(OperationDeleteSegments))
-}
-
 func TestIsResultFramed_ExcludesSendMessages(t *testing.T) {
 	assert.False(t, IsResultFramed(OperationSendMessages),
 		"a send confirmation is not preceded by a result section")

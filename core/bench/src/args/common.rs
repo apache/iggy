@@ -101,11 +101,18 @@ pub struct IggyBenchArgs {
     #[arg(long, default_value_t = false)]
     pub reuse_streams: bool,
 
-    /// Fsync every write on the benchmark topic instead of leaving it to the
-    /// page cache. Set as a topic option at creation, so it has no effect with
-    /// `--reuse-streams` against an already-created topic.
-    #[arg(long, default_value_t = false)]
-    pub enforce_fsync: bool,
+    /// Message completion policy for newly created benchmark topics.
+    #[arg(long, default_value_t = iggy::prelude::Durability::Replicated)]
+    pub durability: iggy::prelude::Durability,
+
+    /// Offset completion policy, independent of message durability.
+    #[arg(long, default_value_t = iggy::prelude::Durability::Replicated)]
+    pub consumer_offset_durability: iggy::prelude::Durability,
+
+    /// Topic journal flush threshold in messages (server default: 1024).
+    /// Topic option at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long)]
+    pub messages_required_to_save: Option<NonZeroU32>,
 }
 
 impl IggyBenchArgs {
@@ -154,7 +161,7 @@ impl IggyBenchArgs {
                 Self::command()
                     .error(
                         ErrorKind::ArgumentConflict,
-                        "--total-messages-size must be at least 2x greater than --message-size",
+                        "--total-data must be at least twice --message-size",
                     )
                     .exit();
             }
@@ -333,8 +340,16 @@ impl IggyBenchArgs {
         self.reuse_streams
     }
 
-    pub const fn enforce_fsync(&self) -> bool {
-        self.enforce_fsync
+    pub const fn durability(&self) -> iggy::prelude::Durability {
+        self.durability
+    }
+
+    pub const fn consumer_offset_durability(&self) -> iggy::prelude::Durability {
+        self.consumer_offset_durability
+    }
+
+    pub const fn messages_required_to_save(&self) -> Option<NonZeroU32> {
+        self.messages_required_to_save
     }
 
     pub fn username(&self) -> &str {
@@ -363,12 +378,7 @@ impl IggyBenchArgs {
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
-        let transport = match self.transport_command() {
-            BenchmarkTransportCommand::Tcp(_) => "tcp",
-            BenchmarkTransportCommand::Quic(_) => "quic",
-            BenchmarkTransportCommand::Http(_) => "http",
-            BenchmarkTransportCommand::WebSocket(_) => "ws",
-        };
+        let transport = self.transport_command().as_str();
 
         let actors = match &self.benchmark_kind {
             BenchmarkKindCommand::PinnedProducer(_)

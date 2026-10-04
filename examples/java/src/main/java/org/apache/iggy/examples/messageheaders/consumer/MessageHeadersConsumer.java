@@ -107,11 +107,10 @@ public final class MessageHeadersConsumer {
 
                 for (Message message : polledMessages.messages()) {
                     handleMessage(message);
+                    offset = message.header().offset().add(BigInteger.ONE);
                 }
 
                 consumedBatches++;
-
-                offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
             } catch (Exception e) {
                 log.error("Error polling messages", e);
                 break;

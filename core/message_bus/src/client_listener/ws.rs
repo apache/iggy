@@ -35,6 +35,7 @@
 //! without pulling `shard` in as a doc-only dep.
 
 use crate::AcceptedWsClientFn;
+use crate::accept::pause_after_accept_error;
 use crate::client_listener::bind_nodelay_listener;
 use crate::lifecycle::ShutdownToken;
 use compio::net::TcpListener;
@@ -54,13 +55,13 @@ use tracing::{debug, error, info};
 ///
 /// # Errors
 ///
-/// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
-#[allow(clippy::future_not_send)]
-pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
+/// Returns [`IggyError::CannotBindToSocket`] if the bind fails, or
+/// [`IggyError::IoError`] if listener configuration fails.
+pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
     // `SO_REUSEPORT` intentionally not set: only shard 0 binds the WS
     // listener. The shard-0 coordinator round-robins accepts to owning
     // shards via `shard::LifecycleFrame::ClientWsConnectionSetup`.
-    bind_nodelay_listener(addr).await
+    bind_nodelay_listener(addr)
 }
 
 /// Run the WS pre-upgrade listener accept loop until the shutdown
@@ -91,6 +92,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                     }
                     Err(e) => {
                         error!("Client listener (WS) accept failed: {e}");
+                        pause_after_accept_error(&e, &token).await;
                     }
                 }
             }

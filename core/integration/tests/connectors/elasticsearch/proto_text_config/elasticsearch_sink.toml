@@ -1,0 +1,62 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# `ElasticsearchSinkFixture::connectors_runtime_envs` overrides the plugin path,
+# the URL, the index and every `[[streams]]` key at run time, so those values are
+# structural rather than meaningful. The `[transforms.proto_convert]` block below
+# is the only part of this file specific to the test.
+
+type = "sink"
+key = "elasticsearch"
+enabled = true
+version = 0
+name = "Elasticsearch sink"
+path = "../../target/debug/libiggy_connector_elasticsearch_sink"
+verbose = false
+
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "elasticsearch_sink_cg"
+
+# No descriptor is configured, so `json_to_protobuf` falls back to proto text
+# and every message reaches the sink as `Payload::Proto`.
+[transforms.proto_convert]
+enabled = true
+source_format = "json"
+target_format = "proto"
+include_paths = []
+preserve_unknown_fields = false
+
+[transforms.proto_convert.conversion_options]
+validate_messages = true
+pretty_json = false
+include_metadata = false
+type_url_prefix = "type.googleapis.com"
+strict_mode = false
+
+[plugin_config]
+url = "http://localhost:9200"
+index = "iggy_messages"
+create_index_if_not_exists = true
+timeout_seconds = 30
+max_retries = 3
+retry_delay = "1s"
+retry_max_delay = "5s"

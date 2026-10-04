@@ -25,7 +25,9 @@
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo run --bin iggy-server
+//     cargo run --bin iggy-server -- --with-default-root-credentials
+//   Use local test certificates and credentials with disposable development state.
+//   Environment credentials take precedence; recovered credentials are unchanged.
 //
 // Run this example (from repo root):
 //   cargo run --example tcp-tls-producer -p iggy_examples

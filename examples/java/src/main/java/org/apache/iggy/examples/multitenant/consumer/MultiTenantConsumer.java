@@ -22,6 +22,7 @@ package org.apache.iggy.examples.multitenant.consumer;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
+import org.apache.iggy.exception.IggyAuthorizationException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -317,7 +318,7 @@ public final class MultiTenantConsumer {
                                 "Access to topic: " + topic + " in stream: " + otherStream + " should not be allowed");
                     }
                     log.info("Ensured no access to topic: {} in stream: {}", topic, otherStream);
-                } catch (Exception e) {
+                } catch (IggyAuthorizationException e) {
                     log.info("Ensured no access to topic: {} in stream: {} ({})", topic, otherStream, e.getMessage());
                 }
             }

@@ -30,8 +30,9 @@ use bench_report::{
     group_metrics_summary::BenchmarkGroupMetricsSummary,
     individual_metrics::BenchmarkIndividualMetrics,
     time_series::{TimeSeries, TimeSeriesKind},
-    utils::{max, min, std_dev},
+    utils::std_dev_values,
 };
+use std::cmp::Ordering;
 use std::thread;
 
 pub fn from_producers_and_consumers_statistics(
@@ -59,8 +60,7 @@ pub fn from_individual_metrics(
     let latency_metrics = calculate_latency_metrics(stats);
     let kind = determine_group_kind(stats);
     let time_series = calculate_group_time_series(stats, moving_average_window);
-    let (min_latency_ms_value, max_latency_ms_value) =
-        calculate_min_max_latencies(stats, &time_series.2);
+    let (min_latency_ms, max_latency_ms) = calculate_min_max_latencies(stats);
 
     let mut all_latencies: Vec<f64> = stats
         .iter()
@@ -88,9 +88,9 @@ pub fn from_individual_metrics(
         average_p9999_latency_ms: latency_metrics.p9999_latency,
         average_latency_ms: latency_metrics.average_latency,
         average_median_latency_ms: latency_metrics.median_latency,
-        min_latency_ms: min_latency_ms_value,
-        max_latency_ms: max_latency_ms_value,
-        std_dev_latency_ms: std_dev(&time_series.2).unwrap_or(0.0),
+        min_latency_ms,
+        max_latency_ms,
+        std_dev_latency_ms: std_dev_values(&all_latencies).unwrap_or(0.0),
     };
 
     Some(BenchmarkGroupMetrics {
@@ -235,30 +235,18 @@ fn extract_time_series_of_kind(
     ts_vec.swap_remove(position)
 }
 
-fn calculate_min_max_latencies(
-    stats: &[BenchmarkIndividualMetrics],
-    avg_latency_ts: &TimeSeries,
-) -> (f64, f64) {
-    let min_latency_ms = if stats.is_empty() {
-        None
-    } else {
-        stats
-            .iter()
-            .map(|s| s.summary.min_latency_ms)
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    };
+fn calculate_min_max_latencies(stats: &[BenchmarkIndividualMetrics]) -> (f64, f64) {
+    let min_latency_ms = stats
+        .iter()
+        .map(|s| s.summary.min_latency_ms)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+        .unwrap_or(0.0);
 
-    let max_latency_ms = if stats.is_empty() {
-        None
-    } else {
-        stats
-            .iter()
-            .map(|s| s.summary.max_latency_ms)
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    };
+    let max_latency_ms = stats
+        .iter()
+        .map(|s| s.summary.max_latency_ms)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+        .unwrap_or(0.0);
 
-    let min_latency_ms_value = min_latency_ms.unwrap_or_else(|| min(avg_latency_ts).unwrap_or(0.0));
-    let max_latency_ms_value = max_latency_ms.unwrap_or_else(|| max(avg_latency_ts).unwrap_or(0.0));
-
-    (min_latency_ms_value, max_latency_ms_value)
+    (min_latency_ms, max_latency_ms)
 }

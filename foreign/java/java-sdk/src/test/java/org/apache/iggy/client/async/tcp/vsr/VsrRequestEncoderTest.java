@@ -120,9 +120,10 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldCorrelatePartitionOpsWithoutAdvancingTheDedupRequestId() {
-        // Partition ops replicate in their own group with no client-table dedup, so
-        // they take a correlation id and leave the dedup counter where it was.
+    void shouldConsumeTheDedupRequestIdForPartitionOps() {
+        // Dedup identity requires each send to carry a distinct number, so
+        // partition ops advance the dedup counter exactly like metadata ops
+        // and the two planes interleave on one sequence.
         session.beginRegister();
         session.bind(42);
 
@@ -132,13 +133,16 @@ class VsrRequestEncoderTest {
         ByteBuf second = encoder.encode(alloc, SEND_MESSAGES_CODE, secondPayload);
         firstPayload.release();
         secondPayload.release();
+        ByteBuf metadata = encoder.encode(alloc, CREATE_STREAM_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(first.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(second.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
-            assertThat(session.currentRequestId()).isEqualTo(1);
+            assertThat(metadata.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(3);
+            assertThat(session.currentRequestId()).isEqualTo(4);
         } finally {
             first.release();
             second.release();
+            metadata.release();
         }
     }
 

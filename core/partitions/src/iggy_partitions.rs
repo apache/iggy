@@ -17,22 +17,28 @@
 
 #![allow(dead_code)]
 
-use crate::poll_plan::PollPlan;
+use crate::poll_plan::{PollPlan, PollReadResult};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
+use crate::{PollCompletion, PollReplication};
 use ahash::AHashSet;
-use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
-use iggy_binary_protocol::{
-    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
+use consensus::{
+    Consensus, Plane, PlaneIdentity, VsrConsensus, build_deny_reply_from_request_header,
 };
+use iggy_binary_protocol::{
+    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
+    RoutedRequestHeader,
+};
+use iggy_common::IggyError;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
+use server_common::Message;
 use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
-#[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use tracing::warn;
 
 /// RAII counter for live [`IggyPartitions::with_partition`] borrows. The
@@ -103,6 +109,8 @@ where
     /// per-shard runtime is single-threaded, so runtime borrow checks
     /// suffice; callers must not hold a borrow across `.await`.
     tombstoned: RefCell<AHashSet<IggyNamespace>>,
+    consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
     /// while a sanctioned non-pump read borrow is outstanding. Cannot fire for
@@ -126,6 +134,8 @@ where
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
+            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            persistence_notifier: RefCell::new(None),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -140,9 +150,20 @@ where
             // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
+            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            persistence_notifier: RefCell::new(None),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
+    }
+
+    pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
+        for namespace in self.namespaces() {
+            if let Some(partition) = self.get_by_ns(namespace) {
+                partition.set_persistence_notifier(Rc::clone(&notifier));
+            }
+        }
+        *self.persistence_notifier.borrow_mut() = Some(notifier);
     }
 
     pub const fn config(&self) -> &PartitionsConfig {
@@ -219,20 +240,42 @@ where
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
     /// pump-only, so it cannot alias this same-task mutation).
     #[doc(hidden)]
-    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B, SB>) -> LocalIdx {
+    pub fn insert(
+        &self,
+        namespace: IggyNamespace,
+        mut partition: IggyPartition<B, SB>,
+    ) -> LocalIdx {
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.borrow_active.get(),
             0,
             "IggyPartitions::insert while a with_partition borrow is live"
         );
+        if let Some(notifier) = self.persistence_notifier.borrow().as_ref() {
+            partition.set_persistence_notifier(Rc::clone(notifier));
+        }
         partition.publish_current_offset();
+        partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
+            &self.consumer_group_offsets_reconcile_epoch,
+        ));
         // Safety: pump-only invariant, caller responsibility.
         let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
         partitions.push(partition);
         self.namespace_map_mut().insert(namespace, local_idx);
         local_idx
+    }
+
+    pub fn consumer_group_offsets_reconcile_epoch(&self) -> u64 {
+        self.consumer_group_offsets_reconcile_epoch.get()
+    }
+
+    pub fn note_consumer_group_offsets_reconcile_needed(&self) {
+        self.consumer_group_offsets_reconcile_epoch.set(
+            self.consumer_group_offsets_reconcile_epoch
+                .get()
+                .wrapping_add(1),
+        );
     }
 
     /// Check if a namespace exists.
@@ -427,17 +470,9 @@ where
         self.tombstoned.borrow_mut().remove(namespace);
     }
 
-    /// Build an owned [`PollPlan`] for a partition poll synchronously, under a
-    /// single pump-only `&mut` borrow (the in-memory journal tier + the
-    /// resident-tail straddle snapshot are read here, and the sealed-read-handle
-    /// LRU is touched; mem reads never yield). Returns `None` for a missing or
-    /// tombstoned namespace.
-    ///
-    /// Pairs with [`PollPlan::execute`], which runs the disk read +
-    /// offset persist/apply off the borrow on the owned plan. Splitting the
-    /// borrow-bound plan build from the borrow-free execution is what keeps
-    /// poll-read sound: the only partition reference is taken here, on the pump,
-    /// sequential with the pump's own `&mut` mutations, never on a sibling task.
+    /// Snapshot read resources under a synchronous borrow on the owning pump.
+    /// Returns `None` for a missing or tombstoned namespace. Execution carries
+    /// no partition borrow; its result returns to [`Self::complete_poll`].
     pub fn build_poll_snapshot(
         &self,
         namespace: &IggyNamespace,
@@ -451,6 +486,55 @@ where
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
         Some(partition.build_poll_plan(consumer, args, validate_checksum))
+    }
+
+    /// Validate and accept a poll synchronously on the owning pump.
+    /// Attempt the reply synchronously, then immediately await any returned
+    /// continuation through [`Self::replicate_poll_completion`] on the same pump.
+    /// Do not suspend between acceptance and that call or discard the continuation.
+    /// Success does not acknowledge a durable offset commit.
+    ///
+    /// Acceptance is independent of reply delivery. A caller that stopped
+    /// waiting does not cancel completion: an accepted read can still advance
+    /// progress and admit an automatic commit even if its reply cannot be sent.
+    /// A history rejection accepts no progress from this read, but cannot
+    /// replace a response the transport already sent.
+    ///
+    /// # Errors
+    /// Rejects stale history, unavailable partition or admission state, invalid
+    /// consumer identifiers, and exhausted consumer, queue, or journal capacity.
+    /// Rejection does not accept progress from this read.
+    pub fn complete_poll(
+        &self,
+        namespace: &IggyNamespace,
+        result: PollReadResult,
+    ) -> Result<PollCompletion, IggyError> {
+        let partition = self
+            .get_mut_by_ns(namespace)
+            .ok_or(IggyError::TransientNotAccepted)?;
+        partition.complete_poll(result)
+    }
+
+    /// Drive an accepted poll's replication on the owning pump after its reply.
+    /// Use the continuation returned by [`Self::complete_poll`] for this namespace.
+    /// Begin this call immediately after the synchronous reply attempt, with no
+    /// intervening suspension. Dropping the assigned prepare would leave an
+    /// unjournaled operation in the pipeline and prevent later commits.
+    /// This call may suspend with a partition borrow, so it must remain on the
+    /// owning pump.
+    ///
+    /// # Panics
+    /// Panics if the namespace is missing or tombstoned. Its availability cannot
+    /// change between acceptance and this call in the same synchronous owner turn.
+    pub async fn replicate_poll_completion(
+        &self,
+        namespace: &IggyNamespace,
+        replication: PollReplication,
+    ) {
+        let partition = self
+            .get_mut_by_ns(namespace)
+            .expect("IggyPartitions invariant: accepted poll namespace missing or tombstoned");
+        partition.replicate_poll_completion(replication).await;
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully
@@ -528,21 +612,34 @@ where
     }
 }
 
-impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
+impl<B, SB> IggyPartitions<B, SB>
 where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    async fn on_request(
+    /// [`Plane::on_request`] carrying the in-process reply channel a
+    /// `PartitionSubmit` arrived with; `None` keeps the bus-reply path.
+    pub async fn on_request_with_reply(
         &self,
         message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let namespace = IggyNamespace::from_raw(message.header().group);
+        // Every exit below that drops the request answers its waiter first: a
+        // submit's reply cannot be routed by `header.client` (the VSR id), so
+        // an unanswered channel costs the client a full read-timeout for an
+        // outcome that was decided here and now.
+        let mut reply = reply;
         if self.is_tombstoned(&namespace) {
             warn!(
                 target: "iggy.partitions.diag",
                 namespace_raw = namespace.inner(),
                 "dropping request: namespace tombstoned"
+            );
+            Self::answer_waiter(
+                reply.take(),
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
             );
             return;
         }
@@ -559,6 +656,9 @@ where
             // `encrypt_batch_request`'s decode before re-encryption, and the
             // re-encrypted batch (checksum kept by `encrypt_batch_request`) then
             // re-enters `convert` as the canonical-vs-legacy discriminator.
+            // The header outlives the message consumed by the conversion, so a
+            // failure can still be answered with the frame's own identity.
+            let header = *message.header();
             let canonical = convert_request_message(namespace, message, ChecksumMode::Compute)
                 .and_then(|message| encrypt_batch_request(message, encryptor));
             match canonical {
@@ -570,6 +670,7 @@ where
                         %error,
                         "dropping send_messages: failed to encrypt batch at ingestion"
                     );
+                    Self::answer_waiter(reply.take(), &header, error.as_code());
                     return;
                 }
             }
@@ -584,9 +685,40 @@ where
                 operation = ?message.header().operation,
                 "partition not initialized for namespace"
             );
+            Self::answer_waiter(
+                reply.take(),
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
+            );
             return;
         };
-        partition.on_request(message).await;
+        partition.on_request(message, reply).await;
+    }
+
+    /// Deny a request that never reached its partition on the submit channel
+    /// it arrived with, if any. The bus path has no waiter to answer and keeps
+    /// its drop-and-warn behaviour.
+    fn answer_waiter(
+        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
+        header: &RoutedRequestHeader,
+        status: u32,
+    ) {
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(build_deny_reply_from_request_header(header, status));
+        }
+    }
+}
+
+impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        self.on_request_with_reply(message, None).await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
@@ -663,14 +795,17 @@ mod tests {
     use bytes::Bytes;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::Operation;
-    use iggy_common::{IggyByteSize, PartitionStats};
+    use iggy_common::{IggyByteSize, PartitionStats, PollingStrategy};
     use journal::Journal as _;
     use message_bus::IggyMessageBus;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT, SendMessagesOwned,
         stamp_prepare_for_persistence,
     };
-    use server_common::{Message, iobuf::Frozen};
+    use server_common::{
+        Message,
+        iobuf::{Frozen, Owned},
+    };
     use std::sync::Arc;
 
     const TEST_CLUSTER: u128 = 1;
@@ -690,7 +825,6 @@ mod tests {
             Arc::new(PartitionStats::default()),
             consensus,
             IggyByteSize::from(1024 * 1024),
-            false,
         )
     }
 
@@ -712,7 +846,6 @@ mod tests {
             Arc::new(PartitionStats::default()),
             consensus,
             IggyByteSize::from(1024 * 1024),
-            false,
         )
     }
 
@@ -968,5 +1101,59 @@ mod tests {
             .is_none(),
             "no committed message at or after offset 3, so the poll is empty",
         );
+    }
+
+    #[compio::test]
+    #[should_panic(expected = "accepted poll namespace missing or tombstoned")]
+    async fn given_accepted_poll_when_namespace_is_tombstoned_should_trip_invariant() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let config = PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+            validate_checksum: false,
+            segment_size: IggyByteSize::from(1024 * 1024),
+            preallocate_segments: false,
+            encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
+        };
+        let partitions = IggyPartitions::new(ShardId::new(0), config);
+        partitions.insert(namespace, build_partition());
+        let consumer = PollingConsumer::Consumer(7, 0);
+        let auto_commit = true;
+        let mut read_result = partitions
+            .build_poll_snapshot(
+                &namespace,
+                consumer,
+                &PollingArgs::new(PollingStrategy::next(), 1, auto_commit),
+            )
+            .expect("snapshot the current history")
+            .execute_resident();
+
+        // Supply a nonempty result with the captured history so acceptance
+        // assigns an automatic commit, without needing message I/O for this test.
+        read_result
+            .fragments
+            .push(crate::Fragment::whole(Owned::<4096>::zeroed(8).into()));
+        read_result.last_matching_offset = Some(0);
+        let replication = partitions
+            .complete_poll(&namespace, read_result)
+            .expect("accept automatic commit")
+            .replication
+            .expect("assign a prepare");
+        let partition = partitions.get_by_ns(&namespace).expect("partition exists");
+        let prepare_header = partition
+            .consensus()
+            .pipeline_head_header()
+            .expect("acceptance queued the prepare");
+        assert_eq!(prepare_header.operation, Operation::StoreConsumerOffset);
+        assert!(!partition.log.journal().inner.holds_op(prepare_header.op));
+
+        // A future caller that yields after acceptance could permit this
+        // tombstone. The partition still exists and must not lose its prepare.
+        partitions.tombstone(namespace);
+        assert!(partitions.local_idx(&namespace).is_some());
+        partitions
+            .replicate_poll_completion(&namespace, replication)
+            .await;
     }
 }

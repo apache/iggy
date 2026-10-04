@@ -40,7 +40,7 @@ import java.util.Map;
  * <pre>{@code
  * var options = TopicOptions.builder()
  *         .segmentSize(BigInteger.valueOf(134_217_728))
- *         .enforceFsync(true)
+ *         .durability(Durability.PERSISTED)
  *         .build();
  * topicsClient.createTopic(streamId, 1L, CompressionAlgorithm.None,
  *         BigInteger.ZERO, BigInteger.ZERO, "orders", options);
@@ -50,6 +50,25 @@ public final class TopicOptions {
 
     private TopicOptions() {}
 
+    public static Map<String, HeaderValue> withDurabilityDefaults(Map<String, HeaderValue> source) {
+        Map<String, HeaderValue> resolved = new LinkedHashMap<>();
+        if (source != null) {
+            resolved.putAll(source);
+        }
+        for (String key : new String[] {"durability", "consumer_offset_durability"}) {
+            var value = resolved.get(key);
+            if (!resolved.containsKey(key)) {
+                resolved.put(key, HeaderValue.fromString(Durability.REPLICATED.value()));
+            } else if (value == null
+                    || value.kind() != org.apache.iggy.message.HeaderKind.String
+                    || !(value.toStringValue().equals("replicated")
+                            || value.toStringValue().equals("persisted"))) {
+                throw new IllegalArgumentException("Invalid " + key);
+            }
+        }
+        return resolved;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -58,7 +77,10 @@ public final class TopicOptions {
 
         private final Map<String, HeaderValue> options = new LinkedHashMap<>();
 
-        private Builder() {}
+        private Builder() {
+            durability(Durability.REPLICATED);
+            consumerOffsetDurability(Durability.REPLICATED);
+        }
 
         /** Per-topic segment size in bytes: a 512-byte multiple within the server's bounds. */
         public Builder segmentSize(BigInteger bytes) {
@@ -66,9 +88,14 @@ public final class TopicOptions {
             return this;
         }
 
-        /** Whether writes to this topic's partitions fsync. */
-        public Builder enforceFsync(boolean enabled) {
-            options.put("enforce_fsync", HeaderValue.fromBool(enabled));
+        /** Message completion policy, independently defaulting to replicated. */
+        public Builder durability(Durability durability) {
+            options.put("durability", HeaderValue.fromString(durability.value()));
+            return this;
+        }
+
+        public Builder consumerOffsetDurability(Durability durability) {
+            options.put("consumer_offset_durability", HeaderValue.fromString(durability.value()));
             return this;
         }
 

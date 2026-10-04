@@ -41,9 +41,9 @@ def running_server(context):
 
 
 @given("I am authenticated as the root user")
-def authenticated_root_user(context):
+def authenticated_root_user(context, root_credentials):
     async def login():
-        await context.client.login_user("iggy", "iggy")
+        await context.client.login_user(*root_credentials)
 
     asyncio.run(login())
 

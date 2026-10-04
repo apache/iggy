@@ -105,12 +105,11 @@ public final class MessageEnvelopeConsumer {
                 }
 
                 for (Message message : polledMessages.messages()) {
-                    handleMessage(message, offset);
+                    handleMessage(message, message.header().offset());
+                    offset = message.header().offset().add(BigInteger.ONE);
                 }
 
                 consumedBatches++;
-
-                offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
 
                 Thread.sleep(INTERVAL_MS);
 

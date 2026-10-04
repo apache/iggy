@@ -18,7 +18,8 @@
 //! On-disk schema for the metadata consensus plane (shard 0's VSR
 //! replica: users, streams, topics, sessions).
 //!
-//! Three capacity knobs previously hardcoded in the runtime crates:
+//! Four capacity knobs. The first three were hardcoded in the runtime
+//! crates before:
 //!
 //! - `prepare_queue_depth` -> `consensus::PIPELINE_PREPARE_QUEUE_MAX`
 //!   (the pipeline's in-flight prepare bound; submits beyond it bounce
@@ -29,6 +30,8 @@
 //! - `clients_table_max` -> `consensus::CLIENTS_TABLE_MAX` (the VSR
 //!   client-table slot count; independent of the two above). The
 //!   HTTP session cap tracks it at half.
+//! - `partitions_max` (the partitions of all streams and topics, checked
+//!   by the metadata primary when it admits a create; zero is no cap)
 //!
 //! The first two interlock through the forced-checkpoint margin
 //! (`max(64, prepare_queue_depth)` at bootstrap): while a checkpoint
@@ -100,7 +103,9 @@ pub struct MetadataConfig {
     /// Size of the metadata WAL's in-memory index, in slots (one
     /// committed-but-unsnapshotted op per slot). Headroom between forced
     /// checkpoints; more slots = rarer checkpoints, more memory, larger
-    /// per-checkpoint WAL rewrites.
+    /// per-checkpoint WAL rewrites. Reducing this for an existing data directory
+    /// is refused at boot when the live WAL suffix cannot fit without collisions;
+    /// restore the previous value to recover.
     pub journal_slots: usize,
 
     /// Slot count of the VSR client table: how many distinct clients
@@ -109,6 +114,17 @@ pub struct MetadataConfig {
     /// HTTP session cap tracks this at half, so raising it lifts
     /// both.
     pub clients_table_max: usize,
+
+    /// Cap on the partitions of all streams and topics. A CreateTopic or
+    /// CreatePartitions that would exceed it is rejected with
+    /// `PartitionsLimitReached` before it enters consensus. Zero is no cap.
+    ///
+    /// The metadata primary checks it with its own value, so every node needs
+    /// the same value. A soft cap: the check counts committed partitions only.
+    /// Up to 3 x `prepare_queue_depth` creates can be in flight, with up to
+    /// 1000 partitions each, and each one passes the check on its own.
+    #[serde(default)]
+    pub partitions_max: u32,
 }
 
 impl MetadataConfig {
@@ -188,6 +204,7 @@ mod tests {
             prepare_queue_depth: DEFAULT_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(config.validate().is_ok());
         assert_eq!(config.checkpoint_margin(), METADATA_CHECKPOINT_MARGIN_FLOOR);
@@ -199,6 +216,7 @@ mod tests {
             prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: 4096,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(config.validate().is_ok());
         assert_eq!(config.checkpoint_margin(), MAX_METADATA_PREPARE_QUEUE_DEPTH);
@@ -213,6 +231,7 @@ mod tests {
             prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: min_slots,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(boundary.validate().is_ok());
         // ...one slot fewer is refused.
@@ -220,6 +239,7 @@ mod tests {
             prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: min_slots - 1,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(starved.validate().is_err());
     }
@@ -233,6 +253,7 @@ mod tests {
             prepare_queue_depth: MAX_METADATA_PREPARE_QUEUE_DEPTH + 1,
             journal_slots: MAX_METADATA_JOURNAL_SLOTS,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(over.validate().is_err());
         assert_eq!(
@@ -248,6 +269,7 @@ mod tests {
             prepare_queue_depth: 0,
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: DEFAULT_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -268,6 +290,7 @@ mod tests {
             prepare_queue_depth: DEFAULT_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: MIN_METADATA_CLIENTS_TABLE_MAX - 1,
+            partitions_max: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -278,6 +301,7 @@ mod tests {
             prepare_queue_depth: DEFAULT_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: MIN_METADATA_CLIENTS_TABLE_MAX,
+            partitions_max: 0,
         };
         assert!(config.validate().is_ok());
     }
@@ -288,6 +312,7 @@ mod tests {
             prepare_queue_depth: DEFAULT_METADATA_PREPARE_QUEUE_DEPTH,
             journal_slots: DEFAULT_METADATA_JOURNAL_SLOTS,
             clients_table_max: MAX_METADATA_CLIENTS_TABLE_MAX + 1,
+            partitions_max: 0,
         };
         assert!(config.validate().is_err());
     }

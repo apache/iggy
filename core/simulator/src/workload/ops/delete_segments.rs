@@ -27,7 +27,7 @@
 //! outcome expansion lands cleanly post-upgrade.
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -53,7 +53,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
 pub const fn sample(
     _shadow: &mut Shadow,
     _outcome: Outcome,
-    _prng: &mut Xoshiro256Plus,
+    _prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     // Disabled until shadow grows a topic-to-namespace index. See module docs.

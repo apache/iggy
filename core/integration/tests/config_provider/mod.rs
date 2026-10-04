@@ -37,7 +37,7 @@ async fn validate_config_env_override() {
         env::set_var("IGGY_HTTP_ENABLED", expected_http.to_string());
         env::set_var("IGGY_TCP_ENABLED", expected_tcp.to_string());
         env::set_var(
-            "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM",
+            "IGGY_PARTITION_VALIDATE_CHECKSUM",
             expected_validate_checksum.to_string(),
         );
     }
@@ -53,14 +53,14 @@ async fn validate_config_env_override() {
     assert_eq!(config.http.enabled, expected_http);
     assert_eq!(config.tcp.enabled, expected_tcp);
     assert_eq!(
-        config.system.partition.validate_checksum,
+        config.partition.validate_checksum,
         expected_validate_checksum
     );
 
     unsafe {
         env::remove_var("IGGY_HTTP_ENABLED");
         env::remove_var("IGGY_TCP_ENABLED");
-        env::remove_var("IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM");
+        env::remove_var("IGGY_PARTITION_VALIDATE_CHECKSUM");
     }
 }
 

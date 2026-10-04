@@ -50,6 +50,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use server_common::fatal::NoteDescriptorExhaustion;
 
 use crate::prepare_journal::TmpFileGuard;
 use twox_hash::XxHash3_64;
@@ -70,8 +71,8 @@ const MIN_RECORD_LEN: usize = HEADER_LEN + CHECKSUM_LEN;
 
 /// Ceiling on a record's payload, bounding every allocation this module makes from
 /// a length it read off disk (`PrepareJournal::MAX_ENTRY_SIZE` bounds the WAL for the
-/// same reason). The only payload today is a [`consensus::VsrState`], 66 bytes now
-/// that it carries the offset frontier (58 before it, a length its decode still
+/// same reason). The only payload today is a [`consensus::VsrState`], 74 bytes now
+/// that it carries the offset reservation (66 before it, a length its decode still
 /// accepts); the headroom is for a payload that grows fields, not for bulk data.
 /// `read_slot` treats a longer file as corrupt WITHOUT reading it, and
 /// `build_record` refuses to write one, so a length this store could have
@@ -491,7 +492,12 @@ const fn has_unreadable_sequence(slot: &SlotClass) -> bool {
 }
 
 async fn read_slot(path: &Path) -> io::Result<SlotClass> {
-    let file = match compio::fs::File::open(path).await {
+    // Read-only, but the load gates every later write of the group, so it
+    // counts like a write open.
+    let file = match compio::fs::File::open(path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {}", path.display()))
+    {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SlotClass::Absent),
         Err(e) => return Err(e),
@@ -528,7 +534,9 @@ async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Resu
     // un-advanced so a retry re-targets the same slot; it keeps a failing disk from
     // littering `superblock.{a,b}.tmp` next to the slots an operator is inspecting.
     let guard = TmpFileGuard::new(tmp_path.clone());
-    let mut tmp = compio::fs::File::create(&tmp_path).await?;
+    let mut tmp = compio::fs::File::create(&tmp_path)
+        .await
+        .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
     let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
     result?;
     tmp.sync_all().await?;
@@ -536,7 +544,9 @@ async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Resu
     compio::fs::rename(&tmp_path, &final_path).await?;
     guard.defuse();
 
-    let dir_file = compio::fs::File::open(dir).await?;
+    let dir_file = compio::fs::File::open(dir)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening directory {}", dir.display()))?;
     dir_file.sync_all().await?;
     Ok(())
 }

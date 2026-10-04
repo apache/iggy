@@ -19,6 +19,7 @@ use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
@@ -243,12 +244,7 @@ async fn truncate_or_fail(
         reason,
         "truncating torn WAL tail; no complete entry follows the damage"
     );
-    storage.truncate(pos).await?;
-    // The repair must be crash-durable. `FileStorage::truncate` is a
-    // bare `set_len`; without this fsync a power loss right after the
-    // repair re-presents the torn tail on the next boot. Mirrors the
-    // write-then-fsync the `append` path already does.
-    storage.fsync().await?;
+    storage.truncate(pos)?;
     Ok(())
 }
 
@@ -365,6 +361,28 @@ impl Drop for DrainInFlightGuard<'_> {
     fn drop(&mut self) {
         self.0.set(false);
     }
+}
+
+/// Poison stage names of one `rewrite_wal` caller, for the steps past its commit
+/// point. `poison` keeps a `&'static str`, so the names cannot be built at runtime.
+struct RewriteStages {
+    open_parent: &'static str,
+    sync_parent: &'static str,
+    reopen: &'static str,
+}
+
+impl RewriteStages {
+    const TRUNCATE_FROM: Self = Self {
+        open_parent: "truncate_from: open parent dir for fsync",
+        sync_parent: "truncate_from: parent dir fsync",
+        reopen: "truncate_from: storage reopen after rename",
+    };
+
+    const DRAIN: Self = Self {
+        open_parent: "drain: open parent dir for fsync",
+        sync_parent: "drain: parent dir fsync",
+        reopen: "drain: storage reopen after rename",
+    };
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -575,8 +593,25 @@ impl PrepareJournal {
 
             let slot = slot_for_op(header.op, slot_count);
 
-            // Note: Regarding duplicate op in WAL. We rewrite it with whichever
-            // is the latest entry.
+            // Match append's collision fence while rebuilding the index. Reopening
+            // with fewer configured slots can otherwise hide an unsnapshotted op
+            // even though its bytes remain in the WAL. A duplicate op deliberately
+            // keeps the latest entry, and a snapshotted op is safe to evict.
+            if let Some(existing) = headers[slot]
+                && existing.op != header.op
+                && existing.op > snapshot_op
+            {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal slot collision while rebuilding the index: op {} and \
+                         unsnapshotted op {} map to slot {slot} with slot_count={slot_count} \
+                         (snapshot_op={snapshot_op}); restore the previous \
+                         metadata.journal_slots value or checkpoint before shrinking it",
+                        header.op, existing.op,
+                    ),
+                )));
+            }
             headers[slot] = Some(header);
             offsets[slot] = Some(pos);
 
@@ -734,6 +769,73 @@ impl PrepareJournal {
         )?;
         Ok(Some(msg))
     }
+
+    /// Replace the WAL with the `live` entries, in the given order, and point the
+    /// storage at the new file. The caller holds `drain_in_flight`, because every
+    /// rewrite goes through the same tmp path, and rebuilds the index afterwards.
+    ///
+    /// A failure before the rename leaves the old WAL in place and removes the tmp
+    /// file. A failure after it poisons the journal under the matching name in
+    /// `stages`.
+    #[allow(clippy::future_not_send)]
+    async fn rewrite_wal(
+        &self,
+        live: &[(PrepareHeader, u64)],
+        stages: &RewriteStages,
+    ) -> io::Result<()> {
+        let wal_path = self.storage.path();
+        let tmp_path = wal_path.with_extension("wal.tmp");
+        let tmp_guard = TmpFileGuard::new(tmp_path.clone());
+        {
+            let mut tmp = compio::fs::File::create(&tmp_path)
+                .await
+                .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
+            let mut write_pos: u64 = 0;
+            for (header, old_offset) in live {
+                let size = header.size as usize;
+                let buf = vec![0u8; size];
+                let buf = self.storage.read_at(*old_offset, buf).await?;
+                let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
+                result?;
+                write_pos += size as u64;
+            }
+            tmp.sync_all().await?;
+        }
+
+        // COMMIT POINT. From here on the on-disk WAL is the new one while the
+        // in-memory index still describes the old layout. Every fallible step
+        // below poisons the journal before returning, so the next `append`
+        // cannot write at a stale `write_offset` into the orphaned old fd, and
+        // the next `entry`/`entry_at` cannot serve offsets that no longer exist
+        // in the new file.
+        compio::fs::rename(&tmp_path, wal_path).await?;
+        // The rename consumed `tmp_path`, so nothing is left to unlink.
+        tmp_guard.defuse();
+
+        // Without the parent directory fsync the rename can be lost across a
+        // power failure, and the old WAL comes back on recovery. With the
+        // journal poisoned the caller learns that the rewrite is not durable.
+        if let Some(parent) = wal_path.parent() {
+            let opened = compio::fs::File::open(parent)
+                .await
+                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()));
+            let dir = match opened {
+                Ok(dir) => dir,
+                Err(error) => return Err(self.poison(stages.open_parent, error)),
+            };
+            if let Err(error) = dir.sync_all().await {
+                return Err(self.poison(stages.sync_parent, error));
+            }
+        }
+
+        // A failed reopen leaves the old fd, now on the orphaned pre-rename
+        // inode, live inside `FileStorage` with a stale `write_offset`. Bytes
+        // appended there would disappear on the next restart.
+        if let Err(error) = self.storage.reopen().await {
+            return Err(self.poison(stages.reopen, error));
+        }
+        Ok(())
+    }
 }
 
 #[allow(
@@ -803,43 +905,8 @@ impl Journal for PrepareJournal {
         }
         live.sort_unstable_by_key(|(header, _)| header.op);
 
-        let wal_path = self.storage.path();
-        let tmp_path = wal_path.with_extension("wal.tmp");
-        let tmp_guard = TmpFileGuard::new(tmp_path.clone());
-        {
-            let mut tmp = compio::fs::File::create(&tmp_path).await?;
-            let mut write_pos: u64 = 0;
-            for (header, old_offset) in &live {
-                let size = header.size as usize;
-                let buf = vec![0u8; size];
-                let buf = self.storage.read_at(*old_offset, buf).await?;
-                let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
-                result?;
-                write_pos += size as u64;
-            }
-            tmp.sync_all().await?;
-        }
-
-        // COMMIT POINT, same as `drain`: past the rename the on-disk WAL is the new
-        // one while the in-memory index still describes the old layout, so every
-        // fallible step below poisons rather than serving stale offsets.
-        compio::fs::rename(&tmp_path, wal_path).await?;
-        tmp_guard.defuse();
-
-        if let Some(parent) = wal_path.parent() {
-            let dir = match compio::fs::File::open(parent).await {
-                Ok(dir) => dir,
-                Err(error) => {
-                    return Err(self.poison("truncate_from: open parent dir for fsync", error));
-                }
-            };
-            if let Err(error) = dir.sync_all().await {
-                return Err(self.poison("truncate_from: parent dir fsync", error));
-            }
-        }
-        if let Err(error) = self.storage.reopen().await {
-            return Err(self.poison("truncate_from: storage reopen after rename", error));
-        }
+        self.rewrite_wal(&live, &RewriteStages::TRUNCATE_FROM)
+            .await?;
 
         // `snapshot_op` is deliberately untouched. See the doc comment.
         let mut headers = self.headers.borrow_mut();
@@ -964,66 +1031,10 @@ impl Journal for PrepareJournal {
             drained.push(msg);
         }
 
-        // Write live entries to a temp file.
-        let wal_path = self.storage.path();
-        let tmp_path = wal_path.with_extension("wal.tmp");
-        let tmp_guard = TmpFileGuard::new(tmp_path.clone());
-        {
-            let mut tmp = compio::fs::File::create(&tmp_path).await?;
-            let mut write_pos: u64 = 0;
-            for (header, old_offset) in &live {
-                let size = header.size as usize;
-                let buf = vec![0u8; size];
-                let buf = self.storage.read_at(*old_offset, buf).await?;
-                let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
-                result?;
-                write_pos += size as u64;
-            }
-            tmp.sync_all().await?;
-        }
+        self.rewrite_wal(&live, &RewriteStages::DRAIN).await?;
 
-        // Atomic replace.
-        //
-        // COMMIT POINT. From here on the on-disk WAL has been swapped
-        // and the in-memory index has not yet been rebuilt for the
-        // compacted layout. Every subsequent fallible step poisons the
-        // journal before returning so the next `append` cannot write at
-        // a stale `write_offset` into the orphaned old fd, and the next
-        // `entry`/`entry_at` cannot serve offsets from the pre-drain
-        // layout that no longer exist in the new file.
-        compio::fs::rename(&tmp_path, wal_path).await?;
-        // Rename has consumed `tmp_path`; nothing left to unlink.
-        tmp_guard.defuse();
-
-        // Fsync parent directory to make the rename durable. Without
-        // this the rename can be lost across a power failure and the
-        // pre-drain WAL re-presents on recovery; with the journal
-        // poisoned the caller learns the drain is not durable instead
-        // of silently proceeding.
-        if let Some(parent) = wal_path.parent() {
-            let dir = match compio::fs::File::open(parent).await {
-                Ok(d) => d,
-                Err(e) => {
-                    return Err(self.poison("drain: open parent dir for fsync", e));
-                }
-            };
-            if let Err(e) = dir.sync_all().await {
-                return Err(self.poison("drain: parent dir fsync", e));
-            }
-        }
-
-        // Reopen the file descriptor at the same path. A failure here
-        // leaves the old fd (now pointing at the orphaned pre-rename
-        // inode) live inside `FileStorage` with a stale `write_offset`;
-        // poisoning prevents a follow-up `append` from writing bytes
-        // into the orphan that disappear on the next process restart.
-        if let Err(e) = self.storage.reopen().await {
-            return Err(self.poison("drain: storage reopen after rename", e));
-        }
-
-        // Advance the snapshot watermark only AFTER the WAL rewrite is
-        // durable (tmp create -> write -> fsync -> rename -> fsync parent
-        // -> reopen). Advancing earlier would leave `snapshot_op` past
+        // Advance the snapshot watermark only AFTER `rewrite_wal` made the
+        // new WAL durable. Advancing earlier would leave `snapshot_op` past
         // entries still present on disk on any `?` failure above, letting
         // a future `append()` pass the slot collision check at
         // `existing.op <= snapshot_op` and silently evict a live entry
@@ -1174,6 +1185,8 @@ impl JournalHandle for PrepareJournal {
 mod tests {
     use super::*;
     use iggy_binary_protocol::consensus::Operation;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     /// An entry as the primary's `project` produces it: body checksum sealed.
@@ -1441,6 +1454,46 @@ mod tests {
             journal.last_op(),
             Some(1),
             "op 2 does not chain to op 1 and must be truncated as a torn tail"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_refuses_boot_on_interior_parent_chain_break() {
+        // The shape a repair frontier rewind leaves behind: every entry is
+        // complete and individually well sealed, op 3 parents to op 1 instead
+        // of op 2, and a valid chain continues from op 3. Complete entries
+        // after the break can be quorum committed, so boot must refuse rather
+        // than truncate them away as a torn tail.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let op_1 = make_identity_sealed_prepare(1, BODY, 0);
+            let checksum_1 = op_1.header().checksum;
+            journal.append(op_1.deep_copy()).await.unwrap();
+            let op_2 = make_identity_sealed_prepare(2, BODY, checksum_1);
+            journal.append(op_2.deep_copy()).await.unwrap();
+            let op_3 = make_identity_sealed_prepare(3, BODY, checksum_1);
+            let checksum_3 = op_3.header().checksum;
+            journal.append(op_3.deep_copy()).await.unwrap();
+            let op_4 = make_identity_sealed_prepare(4, BODY, checksum_3);
+            journal.append(op_4.deep_copy()).await.unwrap();
+        }
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        let error = PrepareJournal::open(&path, 0).await.unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("interior WAL corruption") && message.contains("does not chain"),
+            "a rewound parent with a complete suffix following must refuse \
+             boot rather than truncate, got: {message}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes_before,
+            "the refusal must leave the WAL bytes untouched"
         );
     }
 
@@ -1745,8 +1798,7 @@ mod tests {
             let storage = FileStorage::open(&path).await.unwrap();
             let full_len = storage.file_len();
             // Remove the last 10 bytes (partial second entry)
-            storage.truncate(full_len - 10).await.unwrap();
-            storage.fsync().await.unwrap();
+            storage.truncate(full_len - 10).unwrap();
         }
 
         // Reopen, should recover only the first entry
@@ -2059,6 +2111,70 @@ mod tests {
         assert_eq!(journal.last_op(), Some(3));
     }
 
+    #[compio::test]
+    async fn reopen_with_fewer_slots_rejects_unsnapshotted_collision_without_changing_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+        let wal_before = std::fs::read(&path).unwrap();
+
+        let error = PrepareJournal::open_with_slots(&path, 0, 2)
+            .await
+            .expect_err("shrinking the index must not hide an unsnapshotted entry");
+
+        assert!(
+            error.to_string().contains("journal slot collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            wal_before,
+            "a refused scan must leave the WAL intact"
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_keeps_latest_duplicate_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.set_snapshot_op(1);
+        journal.append(make_prepare(1, 64)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 0, 2).await.unwrap();
+        let header = *journal.header(1).expect("duplicate op must remain indexed");
+        assert_eq!(header.size as usize, HEADER_SIZE + 64);
+        assert_eq!(
+            journal
+                .entry_at(&header)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice()
+                .len(),
+            HEADER_SIZE + 64
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_can_evict_snapshotted_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 1, 2).await.unwrap();
+        assert!(journal.header(1).is_none());
+        assert_eq!(journal.header(3).map(|header| header.op), Some(3));
+    }
+
     const POISON_REASON: &str = "test: simulated post-rename failure";
 
     #[compio::test]
@@ -2165,6 +2281,115 @@ mod tests {
         assert!(journal.header(1).is_some());
         assert!(journal.header(2).is_some());
         assert_eq!(journal.iter_headers_from(1).len(), 2);
+    }
+
+    /// Takes read permission off a directory. Creates and renames inside it still
+    /// work, but a read-only open of the directory, as the rewrite does for its
+    /// fsync, fails with `EACCES`. Drop restores the mode, also after a failed
+    /// assertion, so the temp dir can be removed.
+    struct UnreadableDir<'a> {
+        path: &'a Path,
+        mode: u32,
+    }
+
+    impl<'a> UnreadableDir<'a> {
+        /// `None` when the directory stays readable, as it does for root.
+        fn new(path: &'a Path) -> Option<Self> {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            std::fs::set_permissions(path, Permissions::from_mode(0o300)).unwrap();
+            let guard = Self { path, mode };
+            std::fs::read_dir(path).is_err().then_some(guard)
+        }
+    }
+
+    impl Drop for UnreadableDir<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.path, Permissions::from_mode(self.mode));
+        }
+    }
+
+    #[compio::test]
+    async fn truncate_from_poisons_when_the_rename_cannot_be_made_durable() {
+        // The rename already swapped the WAL, so the index no longer describes the
+        // file. A plain error would let the next append write at a stale offset.
+        const STAGE: &str = RewriteStages::TRUNCATE_FROM.open_parent;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=4 {
+            journal.append(make_prepare(op, 64)).await.unwrap();
+        }
+        let Some(unreadable) = UnreadableDir::new(dir.path()) else {
+            return;
+        };
+
+        let error = journal
+            .truncate_from(3)
+            .await
+            .expect_err("an unreadable WAL directory must fail the truncation");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(journal.poison_reason(), Some(STAGE));
+        let error = journal
+            .append(make_prepare(5, 64))
+            .await
+            .expect_err("a poisoned journal must refuse appends");
+        assert!(
+            error.to_string().contains(STAGE),
+            "unexpected error: {error}"
+        );
+
+        drop(unreadable);
+        drop(journal);
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(2),
+            "the failure came after the rename, so the WAL on disk is the truncated one"
+        );
+    }
+
+    #[compio::test]
+    async fn drain_poisons_when_the_rename_cannot_be_made_durable() {
+        // Same commit point as in `truncate_from`, reached through the other caller.
+        const STAGE: &str = RewriteStages::DRAIN.open_parent;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=4 {
+            journal.append(make_prepare(op, 64)).await.unwrap();
+        }
+        let Some(unreadable) = UnreadableDir::new(dir.path()) else {
+            return;
+        };
+
+        let error = journal
+            .drain(1..=2)
+            .await
+            .expect_err("an unreadable WAL directory must fail the drain");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(journal.poison_reason(), Some(STAGE));
+        assert_eq!(
+            journal.snapshot_op(),
+            0,
+            "the snapshot floor must not move past a drain that failed"
+        );
+        let error = journal
+            .append(make_prepare(5, 64))
+            .await
+            .expect_err("a poisoned journal must refuse appends");
+        assert!(
+            error.to_string().contains(STAGE),
+            "unexpected error: {error}"
+        );
+
+        drop(unreadable);
+        drop(journal);
+        let journal = PrepareJournal::open(&path, 2).await.unwrap();
+        assert!(
+            journal.header(1).is_none(),
+            "the failure came after the rename, so the WAL on disk is the drained one"
+        );
+        assert_eq!(journal.last_op(), Some(4));
     }
 
     #[compio::test]

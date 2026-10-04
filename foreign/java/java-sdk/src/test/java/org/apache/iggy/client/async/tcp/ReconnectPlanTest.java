@@ -19,7 +19,6 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.config.RetryPolicy;
 import org.junit.jupiter.api.Test;
 
@@ -28,23 +27,6 @@ import java.time.Duration;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ReconnectPlanTest {
-
-    private final ConnectionInfo seed = new ConnectionInfo("seed-node", 8090);
-    private final ConnectionInfo current = new ConnectionInfo("leader-node", 8090);
-
-    @Test
-    void shouldAlternateBetweenCurrentAndSeed() {
-        assertThat(ReconnectPlan.target(current, seed, 1)).isEqualTo(current);
-        assertThat(ReconnectPlan.target(current, seed, 2)).isEqualTo(seed);
-        assertThat(ReconnectPlan.target(current, seed, 3)).isEqualTo(current);
-        assertThat(ReconnectPlan.target(current, seed, 4)).isEqualTo(seed);
-    }
-
-    @Test
-    void shouldDialOnlyOneAddressWhenNeverRedirected() {
-        assertThat(ReconnectPlan.target(seed, seed, 1)).isEqualTo(seed);
-        assertThat(ReconnectPlan.target(seed, seed, 2)).isEqualTo(seed);
-    }
 
     @Test
     void shouldKeepFixedDelayConstant() {

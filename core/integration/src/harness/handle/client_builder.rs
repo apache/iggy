@@ -38,12 +38,12 @@ use crate::harness::config::{AutoLoginConfig, TlsConfig};
 use crate::harness::error::TestBinaryError;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
-    Client, HttpClientConfig, IggyClient, QuicClientConfig, TcpClient, TcpClientConfig, UserClient,
-    WebSocketClientConfig,
+    Client, HttpClientConfig, IggyClient, IggyDuration, QuicClientConfig, TcpClient,
+    TcpClientConfig, UserClient, WebSocketClientConfig,
 };
 use iggy::quic::quic_client::QuicClient;
 use iggy::websocket::websocket_client::WebSocketClient;
-use iggy_common::TransportProtocol;
+use iggy_common::{AutoLogin, Credentials, TransportProtocol};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,7 +69,9 @@ pub struct ClientBuilder {
     transport: TransportProtocol,
     connection: ServerConnection,
     auto_login: Option<AutoLoginConfig>,
+    reconnecting_login: bool,
     tcp_nodelay: bool,
+    reestablish_after: Option<IggyDuration>,
     encryptor: Option<Arc<iggy_common::EncryptorKind>>,
 }
 
@@ -79,7 +81,9 @@ impl ClientBuilder {
             transport,
             connection,
             auto_login: None,
+            reconnecting_login: false,
             tcp_nodelay: false,
+            reestablish_after: None,
             encryptor: None,
         }
     }
@@ -87,6 +91,14 @@ impl ClientBuilder {
     /// Enable automatic login as root user after connection.
     pub fn with_root_login(mut self) -> Self {
         self.auto_login = Some(AutoLoginConfig::root());
+        self
+    }
+
+    /// Configure the binary transport itself to restore the root session
+    /// after reconnecting instead of running a one-time harness login.
+    pub fn with_reconnecting_root_login(mut self) -> Self {
+        self.auto_login = Some(AutoLoginConfig::root());
+        self.reconnecting_login = true;
         self
     }
 
@@ -99,6 +111,13 @@ impl ClientBuilder {
     /// Enable TCP_NODELAY (only affects TCP transport).
     pub fn with_nodelay(mut self) -> Self {
         self.tcp_nodelay = true;
+        self
+    }
+
+    /// Override how long a binary transport prefers its previous endpoint
+    /// before rotating through the cluster roster after a disconnect.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.reestablish_after = Some(reestablish_after);
         self
     }
 
@@ -117,7 +136,9 @@ impl ClientBuilder {
             TransportProtocol::WebSocket => self.create_websocket_client().await?,
         };
 
-        if let Some(ref login) = self.auto_login {
+        if let Some(ref login) = self.auto_login
+            && (!self.reconnecting_login || self.transport == TransportProtocol::Http)
+        {
             client
                 .login_user(&login.username, &login.password)
                 .await
@@ -142,7 +163,7 @@ impl ClientBuilder {
         let tls_enabled = self.connection.tls.is_some();
         let tls_validate = self.connection.tls.as_ref().is_some_and(|t| !t.self_signed);
 
-        let config = TcpClientConfig {
+        let mut config = TcpClientConfig {
             server_address: addr.to_string(),
             nodelay: self.tcp_nodelay,
             tls_enabled,
@@ -153,8 +174,12 @@ impl ClientBuilder {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             tls_validate_certificate: tls_validate,
+            auto_login: self.binary_auto_login(),
             ..TcpClientConfig::default()
         };
+        if let Some(reestablish_after) = self.reestablish_after {
+            config.reconnection.reestablish_after = reestablish_after;
+        }
 
         let client =
             TcpClient::create(Arc::new(config)).map_err(|e| TestBinaryError::ClientCreation {
@@ -213,11 +238,15 @@ impl ClientBuilder {
                 message: "QUIC transport not available".to_string(),
             })?;
 
-        let config = QuicClientConfig {
+        let mut config = QuicClientConfig {
             server_address: addr.to_string(),
             max_idle_timeout: 2_000_000,
+            auto_login: self.binary_auto_login(),
             ..QuicClientConfig::default()
         };
+        if let Some(reestablish_after) = self.reestablish_after {
+            config.reconnection.reestablish_after = reestablish_after;
+        }
 
         let client =
             QuicClient::create(Arc::new(config)).map_err(|e| TestBinaryError::ClientCreation {
@@ -256,7 +285,7 @@ impl ClientBuilder {
             .as_ref()
             .is_some_and(|t| !t.self_signed);
 
-        let config = WebSocketClientConfig {
+        let mut config = WebSocketClientConfig {
             server_address: addr.to_string(),
             tls_enabled,
             tls_domain: "localhost".to_string(),
@@ -266,8 +295,12 @@ impl ClientBuilder {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             tls_validate_certificate: tls_validate,
+            auto_login: self.binary_auto_login(),
             ..WebSocketClientConfig::default()
         };
+        if let Some(reestablish_after) = self.reestablish_after {
+            config.reconnection.reestablish_after = reestablish_after;
+        }
 
         let client = WebSocketClient::create(Arc::new(config)).map_err(|e| {
             TestBinaryError::ClientCreation {
@@ -290,6 +323,20 @@ impl ClientBuilder {
             None,
             self.encryptor.clone(),
         ))
+    }
+
+    fn binary_auto_login(&self) -> AutoLogin {
+        if !self.reconnecting_login {
+            return AutoLogin::Disabled;
+        }
+        self.auto_login
+            .as_ref()
+            .map_or(AutoLogin::Disabled, |login| {
+                AutoLogin::Enabled(Credentials::UsernamePassword(
+                    login.username.clone(),
+                    login.password.clone().into(),
+                ))
+            })
     }
 
     fn get_address_string(&self) -> String {

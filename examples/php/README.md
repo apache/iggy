@@ -34,6 +34,7 @@ php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_p
 php -d extension="${PHP_IGGY_EXTENSION:-../../foreign/php/target/debug/libiggy_php.so}" basic/consumer.php
 ```
 
-The examples use `IGGY_CONNECTION_STRING` when it is set. Otherwise they build
-`iggy+tcp://iggy:iggy@127.0.0.1:8090` from `IGGY_HOST`, `IGGY_PORT`,
-`IGGY_USERNAME`, and `IGGY_PASSWORD`, which can be set individually.
+The examples use `IGGY_CONNECTION_STRING` when it is set; use a binary transport
+with credentials for automatic login. Otherwise they connect over TCP using
+`IGGY_HOST` and `IGGY_PORT`, then log in with `IGGY_USERNAME` and `IGGY_PASSWORD`
+without URL encoding. Defaults are `127.0.0.1:8090` and `iggy`/`iggy`.

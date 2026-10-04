@@ -85,6 +85,7 @@ export const translateErrorCode = (code: number): string => {
     case '82': return "Invalid number encoding";
     case '83': return "Invalid boolean value";
     case '84': return "Invalid number value";
+    case '85': return "Request is below the deduplication window; outcome unknown, resending may duplicate the write";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
@@ -146,6 +147,7 @@ export const translateErrorCode = (code: number): string => {
     case '2019': return "Invalid partitions count";
     case '2020': return "Topic directory: {0} not found";
     case '2021': return "Too many topics";
+    case '2022': return "Partitions limit reached, raise [metadata] partitions_max";
 
     // TOPIC
     case '3000': return "Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}";
@@ -165,6 +167,7 @@ export const translateErrorCode = (code: number): string => {
     case '3021': return "Consumer offset for consumer with ID: {0} was not found.";
     case '3022': return "Failed to resolve consumer with ID: {0}";
     case '3023': return "Cannot open consumer offsets file for path: {0}";
+    case '3024': return "Consumer offset limit reached for partition, raise [partition] consumer_offsets_max";
     case '3013': return "Partition id space exhausted for this topic";
 
     // MESSAGE

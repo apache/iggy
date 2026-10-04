@@ -44,9 +44,8 @@ func (c *IggyTcpClient) SendMessages(
 		return nil, ierror.ErrInvalidMessagesCount
 	}
 
-	// Routing needs an explicit partition: the broker never picks one under
-	// consensus. Balanced and key-based strategies resolve here against the
-	// topic's partition count.
+	// Resolve balanced and key-based routing here so the SDK can cache the
+	// topic's partition count and retain its own round-robin position.
 	resolved, err := c.resolvePartitioning(ctx, streamId, topicId, partitioning)
 	if err != nil {
 		return nil, err
@@ -140,6 +139,11 @@ func (c *IggyTcpClient) PollMessages(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
+	if autoCommit && !c.topologyKnown.Load() {
+		if _, err := c.GetClusterMetadata(ctx); err != nil {
+			return nil, err
+		}
+	}
 	// A group poll that names no partition is orchestrated client-side: the
 	// member fetches its assignment and polls the partitions it owns in turn.
 	if consumer.Kind == iggcon.ConsumerKindGroup && partitionId == nil {
@@ -159,7 +163,7 @@ func (c *IggyTcpClient) pollPartition(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
-	buffer, err := c.do(ctx, &command.PollMessages{
+	request := &command.PollMessages{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
@@ -167,7 +171,15 @@ func (c *IggyTcpClient) pollPartition(
 		Strategy:    strategy,
 		Count:       count,
 		PartitionId: partitionId,
-	})
+	}
+	routed := autoCommit && c.clustered.Load()
+	var buffer []byte
+	var err error
+	if routed {
+		buffer, err = c.pollPrimary(ctx, request)
+	} else {
+		buffer, err = c.do(ctx, request)
+	}
 	if err != nil {
 		return nil, err
 	}

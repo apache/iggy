@@ -25,15 +25,13 @@ using Apache.Iggy.IggyClient;
 using Reqnroll;
 using Shouldly;
 using TestContext = Apache.Iggy.Tests.BDD.Context.TestContext;
+using TestEnvironment = Apache.Iggy.Tests.BDD.Context.TestEnvironment;
 
 namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 
 [Binding]
 public class LeaderRedirectionSteps
 {
-    private const string RootUsername = "iggy";
-    private const string RootPassword = "iggy";
-
     private readonly TestContext _context;
 
     public LeaderRedirectionSteps(TestContext context)
@@ -141,7 +139,7 @@ public class LeaderRedirectionSteps
         {
             var client = GetClient(name);
             var initialAddress = client.GetCurrentAddress();
-            var result = await client.LoginUserAsync(RootUsername, RootPassword);
+            var result = await client.LoginUserAsync(TestEnvironment.RootUsername, TestEnvironment.RootPassword);
             result.ShouldNotBeNull("Failed to login as root");
 
             // RedirectAsync runs inside LoginUserAsync; if address changed, redirection happened.

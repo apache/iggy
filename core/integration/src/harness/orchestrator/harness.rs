@@ -216,7 +216,6 @@ impl TestHarness {
 
             const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(15);
             const CLUSTER_READY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
-            const LOGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
 
             let deadline = Instant::now() + CLUSTER_READY_TIMEOUT;
 
@@ -247,32 +246,96 @@ impl TestHarness {
                 });
             }
 
-            let mut last_error = None;
+            self.wait_for_login_ready(deadline).await
+        }
+    }
 
-            while Instant::now() < deadline {
-                match timeout(LOGIN_ATTEMPT_TIMEOUT, self.tcp_root_client()).await {
-                    Ok(Ok(client)) => {
-                        let _ = client.disconnect().await;
-                        return Ok(());
-                    }
-                    Ok(Err(error)) => {
-                        last_error = Some(error.to_string());
-                        sleep(CLUSTER_READY_RETRY_INTERVAL).await;
-                    }
-                    Err(_) => {
-                        last_error = Some("login attempt timed out".to_string());
-                        sleep(CLUSTER_READY_RETRY_INTERVAL).await;
-                    }
+    /// Poll a root login until one succeeds or `deadline` passes.
+    ///
+    /// A root login is a replicated `Register`, so it cannot commit without a
+    /// commit quorum. One succeeding is therefore direct evidence that the
+    /// nodes which ARE up formed a working quorum, which is what the mesh
+    /// marker cannot tell you: that marker only reports peer TCP links, and
+    /// `mesh_expected_peers` counts every CONFIGURED peer, so a deliberately
+    /// partial cluster never emits it however healthy its quorum is.
+    async fn wait_for_login_ready(&self, deadline: Instant) -> Result<(), TestBinaryError> {
+        const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+        const LOGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
+
+        let mut last_error = None;
+        while Instant::now() < deadline {
+            match timeout(LOGIN_ATTEMPT_TIMEOUT, self.tcp_root_client()).await {
+                Ok(Ok(client)) => {
+                    let _ = client.disconnect().await;
+                    return Ok(());
+                }
+                Ok(Err(error)) => {
+                    last_error = Some(error.to_string());
+                    sleep(RETRY_INTERVAL).await;
+                }
+                Err(_) => {
+                    last_error = Some("login attempt timed out".to_string());
+                    sleep(RETRY_INTERVAL).await;
                 }
             }
-
-            Err(TestBinaryError::InvalidState {
-                message: format!(
-                    "Timed out waiting for VSR cluster readiness: {}",
-                    last_error.unwrap_or_else(|| "unknown error".to_string())
-                ),
-            })
         }
+
+        Err(TestBinaryError::InvalidState {
+            message: format!(
+                "Timed out waiting for VSR cluster readiness: {}",
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            ),
+        })
+    }
+
+    /// Spawn only the nodes at `indexes` and wait for them to form a quorum.
+    ///
+    /// The counterpart of [`Self::start`] for boot-ordering tests: it models a
+    /// cluster that begins serving before every configured node has arrived,
+    /// which is what production does (nothing in the server's bootstrap waits
+    /// for peers) and what `start` deliberately does not.
+    ///
+    /// Readiness is a root login succeeding, not the all-nodes mesh gate
+    /// `start` uses: `mesh_expected_peers` counts every CONFIGURED peer, so a
+    /// deliberately partial cluster never reports a complete mesh however
+    /// healthy its quorum is. A login is a replicated `Register` and cannot
+    /// commit without quorum, which is the stronger signal anyway.
+    ///
+    /// Dependents (MCP, connectors runtime) and the configured clients are NOT
+    /// started: their addresses resolve against nodes this call deliberately
+    /// left down. Bring the rest up with [`Self::start_node`] and build clients
+    /// per node with [`Self::root_client_for_node`].
+    pub async fn start_nodes(&mut self, indexes: &[usize]) -> Result<(), TestBinaryError> {
+        if self.started {
+            return Err(TestBinaryError::AlreadyStarted);
+        }
+        const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+        for &index in indexes {
+            let server = self
+                .servers
+                .get_mut(index)
+                .ok_or(TestBinaryError::MissingServer)?;
+            server.start()?;
+        }
+        self.started = true;
+
+        let deadline = Instant::now() + READY_TIMEOUT;
+        self.wait_for_login_ready(deadline).await
+    }
+
+    /// Spawn one node into an already-running cluster, without waiting for it.
+    ///
+    /// The late-joiner half of [`Self::start_nodes`]. No readiness wait: what
+    /// "ready" means for a node joining an established cluster is the caller's
+    /// question (rejoin at the live view, journal repair, state transfer), and
+    /// each has its own observable.
+    pub fn start_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.start()
     }
 
     async fn start_dependents(&mut self) -> Result<(), TestBinaryError> {
@@ -298,7 +361,9 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Restart the primary server and reconnect all clients.
+    /// Restart the node at index 0 and reconnect all clients. Index 0 is not
+    /// "the primary" (see [`Self::running_server`]); use
+    /// [`Self::restart_node`] to name a different one.
     pub async fn restart_server(&mut self) -> Result<(), TestBinaryError> {
         if self.servers.is_empty() {
             return Err(TestBinaryError::MissingServer);
@@ -416,12 +481,38 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Get reference to the first (primary) server handle.
+    /// The node client helpers dial when the caller names none: node 0 while
+    /// it is alive, otherwise the lowest-indexed node whose process is.
+    ///
+    /// Index 0 is a default, not a role. It carries no leadership: the
+    /// metadata primary is `view % replica_count` and moves on every
+    /// election, and the SDK redirects to whoever that is on connect. Pinning
+    /// these helpers to node 0 meant every client helper failed outright once
+    /// a test stopped it, which is why cluster tests reach for
+    /// [`Self::root_client_for_node`] instead. Preferring 0 keeps the common
+    /// case deterministic; falling through keeps the harness usable with it
+    /// down.
+    pub fn running_server(&self) -> Result<&ServerHandle, TestBinaryError> {
+        if self.servers.is_empty() {
+            return Err(TestBinaryError::MissingServer);
+        }
+        self.servers
+            .iter()
+            .find(|server| server.is_running())
+            .ok_or(TestBinaryError::MissingServer)
+    }
+
+    /// Get reference to the node at index 0.
+    ///
+    /// Index 0 is not "the primary": see [`Self::running_server`]. Use
+    /// [`Self::node`] when the index matters and `running_server` when any
+    /// live node will do.
     pub fn server(&self) -> &ServerHandle {
         self.servers.first().expect("No servers configured")
     }
 
-    /// Get mutable reference to the first (primary) server handle.
+    /// Get mutable reference to the node at index 0. Index 0 is not "the
+    /// primary": see [`Self::running_server`].
     pub fn server_mut(&mut self) -> &mut ServerHandle {
         self.servers.first_mut().expect("No servers configured")
     }
@@ -556,7 +647,7 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<ClientBuilder, TestBinaryError> {
-        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let server = self.running_server()?;
         match transport {
             TransportProtocol::Tcp => server.tcp_client(),
             TransportProtocol::Http => server.http_client(),
@@ -583,7 +674,7 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let server = self.running_server()?;
         let builder = match transport {
             TransportProtocol::Tcp => server.tcp_client()?,
             TransportProtocol::Http => server.http_client()?,

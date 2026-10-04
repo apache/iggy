@@ -44,7 +44,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         let wire_consumer = consumer_to_wire(consumer)?;
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
-        self.send_raw_with_response(
+        self.send_offset_write_with_response(
             STORE_CONSUMER_OFFSET_CODE,
             StoreConsumerOffsetRequest {
                 consumer: wire_consumer,
@@ -101,7 +101,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         let wire_consumer = consumer_to_wire(consumer)?;
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
-        self.send_raw_with_response(
+        self.send_offset_write_with_response(
             DELETE_CONSUMER_OFFSET_CODE,
             DeleteConsumerOffsetRequest {
                 consumer: wire_consumer,

@@ -16,20 +16,22 @@
 // under the License.
 
 import type { Readable } from 'stream';
-import { type TcpSocketConnectOpts } from 'node:net';
+import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
 
 /**
  * TCP socket connection options.
- * Alias for Node.js TcpSocketConnectOpts.
+ * Alias for Node.js TcpNetConnectOpts, what net.createConnection accepts.
  */
-export type TcpOption = TcpSocketConnectOpts;
+export type TcpOption = TcpNetConnectOpts;
 
 /**
  * TLS socket connection options.
- * Combines port number with Node.js TLS ConnectionOptions.
+ * Combines port number with Node.js TLS ConnectionOptions and the
+ * net.connect options tls.connect forwards at runtime. `caFile` is an SDK
+ * extension: a CA certificate path read when the TLS socket is created.
  */
-export type TlsOption = { port: number } & ConnectionOptions;
+export type TlsOption = { port: number } & ConnectionOptions & Partial<TcpNetConnectOpts> & { caFile?: string };
 
 /**
  * Response from a command sent to the Iggy server.
@@ -47,7 +49,20 @@ export type SendCommandOptions = {
   /** Whether the response uses the standard command response decoder */
   handleResponse?: boolean,
   /** Whether to append rather than prepend the command to the queue */
-  last?: boolean
+  last?: boolean,
+  /**
+   * Whether a not-admitted refusal re-checks the leader and re-issues the
+   * command. False for the roster read a re-check itself runs: answering a
+   * leader check with another leader check would recurse.
+   */
+  followsLeaderMoves?: boolean,
+  /**
+   * When the whole request gives up, as an epoch timestamp in milliseconds.
+   * Set when a command already carries a budget -- one re-issued after a
+   * leader move keeps the budget it was first submitted with, rather than
+   * opening a second one on top of it. Defaults to a fresh response timeout.
+   */
+  deadline?: number
 };
 
 /**
@@ -100,9 +115,16 @@ export type TransportType = typeof Transports[number];
 export type ReconnectOption = {
   /** Whether automatic reconnection is enabled */
   enabled: boolean,
-  /** Interval between reconnection attempts in milliseconds */
+  /**
+   * Milliseconds to wait between passes. The first pass runs at once when more
+   * than one endpoint is known.
+   */
   interval: number,
-  /** Maximum number of reconnection attempts */
+  /**
+   * Maximum number of passes over the known endpoints. One pass dials the
+   * endpoint the client is on, the endpoint it was configured with, and every
+   * node the roster named, so this counts passes rather than dials.
+   */
   maxRetries: number
 }
 
@@ -146,6 +168,12 @@ export type PoolSizeOption = {
 }
 
 /**
+ * Client configuration or a connection string such as
+ * `iggy://username:password@host:port`.
+ */
+export type ClientConfigOrString = ClientConfig | string;
+
+/**
  * Complete client configuration for connecting to the Iggy server.
  */
 export type ClientConfig = {
@@ -159,12 +187,7 @@ export type ClientConfig = {
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
-  /**
-   * Interval for sending heartbeat pings in milliseconds, as an integer
-   * between 0 and Node's timer ceiling. Defaults to 5000. Set to 0 to disable
-   * client heartbeats; any other unusable value is rejected rather than
-   * silently disabling them.
-   */
+  /** Interval for sending heartbeat pings, in milliseconds */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
   maxResponseFrameSize?: number

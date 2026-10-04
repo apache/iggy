@@ -22,10 +22,10 @@
 //! `max_topic_size` below the configured segment size denies with
 //! `InvalidTopicSize`; `ServerDefault` and `Unlimited` sizes pass. Update
 //! enforces the same size floor, since a topic capped below one segment can
-//! never rotate however it acquired that cap. Update otherwise stores
-//! `max_topic_size` and `message_expiry` verbatim and gets echo the stored
-//! value (never the node default frozen at update time), matching legacy wire
-//! behavior. Deleting more partitions than the topic has rejects
+//! never rotate however it acquired that cap. Updates preserve existing
+//! `max_topic_size` and `message_expiry` values for omitted keys and default
+//! sentinels. Explicit values are echoed in both typed fields and options.
+//! Deleting more partitions than the topic has rejects
 //! with `InvalidPartitionsCount` as a committed result instead of silently
 //! acking a no-op. Listing topics of a missing stream replies with an empty
 //! list, as the legacy server does.
@@ -251,20 +251,20 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
                 .await
                 .expect("get topic")
                 .expect("topic exists");
+            let reported_options = TopicCreateOptions::from_resource_options(&topic.options);
+            assert_eq!(reported_options.max_topic_size, Some(topic.max_topic_size));
+            assert_eq!(reported_options.message_expiry, Some(topic.message_expiry));
             (topic.max_topic_size, topic.message_expiry)
         }
     };
 
-    // Settings ride the options block and 0 is its "resolve the default"
-    // sentinel, so a `ServerDefault` on update carries no key at all: the topic
-    // keeps what it already had. Resetting a setting back to the node default
-    // is deliberately not expressible -- an update states the values it wants,
-    // and everything it omits survives.
+    // ServerDefault is a no-op on update, so it must preserve the effective
+    // value in both the typed fields and the reported options.
     let created_size = MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").expect("byte size"));
     assert_eq!(
         update_topic(MaxTopicSize::ServerDefault, IggyExpiry::ServerDefault).await,
         (created_size, IggyExpiry::NeverExpire),
-        "a sentinel carries no key, so the value set at creation survives"
+        "a sentinel leaves the value set at creation unchanged"
     );
     let custom_size = MaxTopicSize::Custom(IggyByteSize::from_str("3GiB").expect("byte size"));
     let custom_expiry = IggyExpiry::ExpireDuration(IggyDuration::from_str("5s").expect("duration"));

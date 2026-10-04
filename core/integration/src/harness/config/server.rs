@@ -18,6 +18,7 @@
 use super::common::{EncryptionConfig, IpAddrKind, TlsConfig};
 use bon::Builder;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Builder)]
 pub struct TestServerConfig {
@@ -38,6 +39,15 @@ pub struct TestServerConfig {
     pub extra_envs: HashMap<String, String>,
     #[builder(into)]
     pub executable_path: Option<String>,
+    /// Working directory of the server process. Unset, the server inherits
+    /// the working directory of the test, which is inside the checkout.
+    #[builder(into)]
+    pub current_dir: Option<PathBuf>,
+    /// Bind every enabled transport to port 0 and discover the bound addresses
+    /// from `runtime/current_config.toml` instead of pre-reserving ports.
+    /// Single node only: a cluster roster names every port before boot.
+    #[builder(default)]
+    pub ephemeral_ports: bool,
 }
 
 impl Default for TestServerConfig {

@@ -409,7 +409,7 @@ public class IggyPublisherTests
                 false);
 
             polledMessages.Messages.Count.ShouldBeGreaterThanOrEqualTo(10);
-            polledMessages.PartitionId.ShouldBe((int)partitionId);
+            polledMessages.PartitionId.ShouldBe(partitionId);
         }
     }
 

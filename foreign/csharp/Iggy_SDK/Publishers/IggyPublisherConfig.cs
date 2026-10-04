@@ -50,14 +50,14 @@ public class IggyPublisherConfig
     public bool CreateIggyClient { get; set; }
 
     /// <summary>
-    ///     Gets or sets the protocol to use for communication (TCP, QUIC, or HTTP).
+    ///     Gets or sets the protocol to use for communication (TCP or HTTP).
     ///     Only used when <see cref="CreateIggyClient" /> is true.
     /// </summary>
     public Protocol Protocol { get; set; }
 
     /// <summary>
     ///     Gets or sets the server address to connect to.
-    ///     Format depends on protocol (e.g., "localhost:8090" for TCP/QUIC, "http://localhost:3000" for HTTP).
+    ///     Format depends on protocol (e.g., "localhost:8090" for TCP, "http://localhost:3000" for HTTP).
     ///     Only used when <see cref="CreateIggyClient" /> is true.
     /// </summary>
     public string Address { get; set; } = string.Empty;
@@ -93,16 +93,18 @@ public class IggyPublisherConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Gets or sets the size of the receive buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
 
     /// <summary>
-    ///     Gets or sets the size of the send buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     Gets or sets the partitioning strategy for messages.
@@ -217,14 +219,14 @@ public class IggyPublisherConfig
     public TimeSpan BackgroundDisposalTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    ///     Gets or sets a value indicating whether retry is enabled for failed sends.
-    ///     When enabled, failed send operations will be retried according to the retry policy.
+    ///     Gets or sets a value indicating whether retry is enabled for failed background sends.
+    ///     When enabled, failed background sends follow the retry policy; direct sends surface errors.
     ///     Default is true.
     /// </summary>
     public bool EnableRetry { get; set; } = true;
 
     /// <summary>
-    ///     Gets or sets the maximum number of retry attempts.
+    ///     Gets or sets the total send attempts, including the first send.
     ///     After this many failed attempts, the operation will fail permanently.
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 3 attempts.

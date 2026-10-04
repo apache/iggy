@@ -17,6 +17,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { Durability } from './topic.utils.js';
 import { CREATE_TOPIC } from './create-topic.command.js';
 import { deserializeOptions } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
@@ -37,13 +38,15 @@ describe('CreateTopic', () => {
     // TLV field: [kind:u8][len:u32_le][bytes]
     const tlvSize = (bytes: number) => 1 + 4 + bytes;
     const identifierSize = 1 + 1 + 4; // numeric stream id
+    const defaultPolicySize = tlvSize('durability'.length) + tlvSize('replicated'.length)
+      + tlvSize('consumer_offset_durability'.length) + tlvSize('replicated'.length);
     const fixedSize = identifierSize + 4 + 1; // + partitions_count + name_len
 
     it('serialize name and default options into buffer', () => {
-      // Server-default sentinels are omitted, leaving an empty options block.
+      // Durability defaults are explicit, while the other sentinels are omitted.
       assert.deepEqual(
         CREATE_TOPIC.serialize(t1).length,
-        fixedSize + t1.name.length
+        fixedSize + t1.name.length + defaultPolicySize
       );
     });
 
@@ -52,7 +55,7 @@ describe('CreateTopic', () => {
       const b = CREATE_TOPIC.serialize(t);
       assert.equal(b.readUInt32LE(identifierSize), 7);
       assert.equal(b.readUInt8(identifierSize + 4), t.name.length);
-      assert.equal(b.subarray(fixedSize).toString(), t.name);
+      assert.equal(b.subarray(fixedSize, fixedSize + t.name.length).toString(), t.name);
     });
 
     it('serialize non-default options into buffer', () => {
@@ -64,7 +67,7 @@ describe('CreateTopic', () => {
       };
       assert.deepEqual(
         CREATE_TOPIC.serialize(t).length,
-        fixedSize + t1.name.length
+        fixedSize + t1.name.length + defaultPolicySize
         + tlvSize('compression_algorithm'.length) + tlvSize('gzip'.length)
         + tlvSize('message_expiry'.length) + tlvSize(8)
         + tlvSize('max_topic_size'.length) + tlvSize(8)
@@ -75,16 +78,16 @@ describe('CreateTopic', () => {
       const t = {
         ...t1,
         segmentSize: 1048576n,
-        enforceFsync: true,
+        durability: Durability.Persisted,
         messagesRequiredToSave: 1000,
         sizeOfMessagesRequiredToSave: 4096n,
         preallocateSegments: false
       };
       assert.deepEqual(
         CREATE_TOPIC.serialize(t).length,
-        fixedSize + t1.name.length
+        fixedSize + t1.name.length + defaultPolicySize
         + tlvSize('segment_size'.length) + tlvSize(8)
-        + tlvSize('enforce_fsync'.length) + tlvSize(1)
+        + 'persisted'.length - 'replicated'.length
         + tlvSize('messages_required_to_save'.length) + tlvSize(4)
         + tlvSize('size_of_messages_required_to_save'.length) + tlvSize(8)
         + tlvSize('preallocate_segments'.length) + tlvSize(1)
@@ -96,7 +99,7 @@ describe('CreateTopic', () => {
         ...t1,
         maxTopicSize: 4096n,
         options: [
-          { key: 'enforce_fsync', value: HeaderValue.Bool(true) },
+          { key: 'preallocate_segments', value: HeaderValue.Bool(true) },
           // The typed field covers this key, so the caller's entry is dropped:
           // a duplicate key makes the server refuse the whole block.
           { key: 'max_topic_size', value: HeaderValue.String('1 GiB') }
@@ -107,9 +110,28 @@ describe('CreateTopic', () => {
       // The create payload runs its options block to the end, unprefixed.
       const options = deserializeOptions(b, fixedSize + t.name.length);
 
-      assert.deepEqual(Object.keys(options).sort(), ['enforce_fsync', 'max_topic_size']);
-      assert.equal(options.enforce_fsync, true);
+      assert.deepEqual(Object.keys(options).sort(), ['consumer_offset_durability', 'durability', 'max_topic_size', 'preallocate_segments']);
+      assert.equal(options.preallocate_segments, true);
       assert.equal(options.max_topic_size, 4096n);
+    });
+
+    it('keeps each omitted durability policy replicated', () => {
+      for (const selected of [
+        { durability: Durability.Persisted },
+        { consumerOffsetDurability: Durability.Persisted }
+      ]) {
+        const input = { ...t1, ...selected };
+        const encoded = CREATE_TOPIC.serialize(input);
+        const options = deserializeOptions(encoded, fixedSize + input.name.length);
+        assert.equal(options.durability, selected.durability ?? 'replicated');
+        assert.equal(options.consumer_offset_durability, selected.consumerOffsetDurability ?? 'replicated');
+      }
+    });
+
+    it('rejects a conflicting raw durability instead of weakening it', () => {
+      assert.throws(() => CREATE_TOPIC.serialize({ ...t1, options: [
+        { key: 'durability', value: HeaderValue.String('persisted') }
+      ] }));
     });
 
     it('throw on name < 1', () => {

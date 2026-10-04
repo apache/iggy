@@ -353,10 +353,9 @@ pub(in crate::http) fn error_response(status: StatusCode, code: &str, reason: &s
         .into_response()
 }
 
-/// Shared 504 rendering for an in-band request the partition plane did not
-/// answer in time, shaped like every other HTTP error (`ErrorResponse`) so
-/// clients parse one error schema. Consumed by the partition-write reply wait,
-/// the partition reads ([`ReadError::Timeout`]), and the forward attempt bound.
+/// Shared 504 rendering for partition writes and forwarding attempts that did
+/// not answer in time. Partition reads use [`ReadError::Timeout`] to preserve
+/// the same Iggy error identity as binary transports.
 pub(in crate::http) fn gateway_timeout_response(code: &str, reason: &str) -> Response {
     error_response(StatusCode::GATEWAY_TIMEOUT, code, reason)
 }
@@ -471,9 +470,17 @@ pub(in crate::http) enum ReadError {
     /// [`service_unavailable`] body, retryable once the cluster re-commits the
     /// suffix.
     RecoveryIncomplete,
-    /// A partition read (poll / consumer-offset) got no reply from the owning
-    /// shard within the mesh budget. 504 like a produce timeout: the outcome is
-    /// unknown (the abandoned read may still be running), so the caller retries.
+    /// A metadata read waited out its budget with this node's applied frontier
+    /// still below the op the caller was told committed. Fail-closed on the
+    /// same retryable 503 as [`Self::RecoveryIncomplete`]: the two are the same
+    /// hazard (serving state the caller already saw replaced) reached from
+    /// different directions, and 503 is what the binary transports' equivalent
+    /// refusal (`TransientNotCommitted`) already renders as, so an SDK that
+    /// speaks both sees one answer. Never a 2xx with stale state.
+    MetadataFrontierUnreached,
+    /// A partition read got no reply after submission to the owning shard.
+    /// Render HTTP 504 with the same Iggy error identity as binary transports.
+    /// A missing reply does not prove that the owner rejected the read.
     Timeout,
 }
 
@@ -486,11 +493,14 @@ impl IntoResponse for ReadError {
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
-            Self::RecoveryIncomplete => service_unavailable(),
-            Self::Timeout => gateway_timeout_response(
-                "partition_read_timeout",
-                "the partition owner did not answer the read in time; retry",
-            ),
+            Self::RecoveryIncomplete | Self::MetadataFrontierUnreached => service_unavailable(),
+            Self::Timeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResponse::from_error(
+                    &IggyError::ShardCommunicationError,
+                )),
+            )
+                .into_response(),
         }
     }
 }
@@ -555,7 +565,7 @@ pub(in crate::http) fn primary_http_socket(
     primary_index: u8,
 ) -> Option<SocketAddr> {
     let (node, http_port) = primary_node(roster, primary_index)?;
-    Some(SocketAddr::new(node.replica_ip()?, http_port))
+    Some(SocketAddr::new(node.replica_ip(), http_port))
 }
 
 /// Resolve the client-facing HTTP authority (`host:port`) for a redirect
@@ -563,18 +573,16 @@ pub(in crate::http) fn primary_http_socket(
 /// match first, then the catch-all advertised address, then the private
 /// roster IP as the compatibility fallback. `AdvertisedAddress::authority`
 /// brackets IPv6 hosts and passes hostnames through, so the redirect URL
-/// stays valid. This is the fail-closed caller: a host that is neither a
-/// valid IP nor a valid hostname yields `None` and the redirect becomes a
-/// 503 rather than a `Location` pointing at an unparsable target (cluster
-/// metadata makes the opposite choice and publishes such a host verbatim).
+/// stays valid. `None` here means the roster has no node at `primary_index`
+/// or that node declares no HTTP port, never that its address failed to
+/// parse: such a node never becomes a [`ResolvedClusterNode`].
 fn primary_advertised_http_authority(
     roster: &ClusterRoster,
     primary_index: u8,
     client_ip: Option<IpAddr>,
 ) -> Option<String> {
     let (node, http_port) = primary_node(roster, primary_index)?;
-    let address = node.advertised_for(client_ip)?;
-    Some(address.authority(http_port))
+    Some(node.advertised_for(client_ip).authority(http_port))
 }
 
 fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ResolvedClusterNode, u16)> {
@@ -590,7 +598,9 @@ fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ResolvedC
 mod tests {
     use super::*;
 
+    use axum::body::to_bytes;
     use configs::cluster::{ClusterNodeConfig, TransportPorts};
+    use serde_json::Value;
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
@@ -614,9 +624,13 @@ mod tests {
         ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: nodes.into_iter().map(Into::into).collect(),
-            self_ip: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            nodes: nodes
+                .into_iter()
+                .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
+                .collect(),
+            self_advertised: "127.0.0.1".to_owned(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: std::sync::Arc::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),
@@ -764,6 +778,32 @@ mod tests {
         assert!(response.headers().contains_key(RETRY_AFTER));
     }
 
+    #[tokio::test]
+    async fn partition_read_timeout_renders_504_with_shard_communication_error() {
+        let response = ReadError::Timeout.into_response();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], 11001);
+        assert_eq!(error["code"], "shard_communication_error");
+    }
+
+    #[tokio::test]
+    async fn rejected_partition_read_renders_503_with_transient_not_accepted() {
+        let response = ReadError::Rejected(IggyError::TransientNotAccepted).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(RETRY_AFTER_SECONDS))
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], 58);
+        assert_eq!(error["code"], "transient_not_accepted");
+    }
+
     #[test]
     fn business_error_renders_without_retry_after() {
         let response = CustomError::from(IggyError::UserAlreadyExists).into_response();
@@ -813,6 +853,22 @@ mod tests {
         assert_eq!(
             recovery.headers().get(RETRY_AFTER),
             not_primary.headers().get(RETRY_AFTER)
+        );
+    }
+
+    // An unreached read frontier must never degrade into a 2xx carrying stale
+    // state, and must not read as terminal either: it is the same retryable 503
+    // the recovery barrier's expiry renders, so an SDK retries rather than
+    // surfacing the read as failed.
+    #[test]
+    fn metadata_frontier_unreached_renders_the_same_retryable_503_as_the_barrier() {
+        let frontier = ReadError::MetadataFrontierUnreached.into_response();
+        let recovery = ReadError::RecoveryIncomplete.into_response();
+        assert_eq!(frontier.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(frontier.status(), recovery.status());
+        assert_eq!(
+            frontier.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(RETRY_AFTER_SECONDS))
         );
     }
 }

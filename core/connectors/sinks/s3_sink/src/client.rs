@@ -78,21 +78,6 @@ pub(crate) async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, 
     Ok(bucket)
 }
 
-/// Verify bucket connectivity with a zero-byte probe write. Only requires
-/// `s3:PutObject` permission, unlike `list_page` which needs `s3:ListBucket`
-/// and fails for write-only IAM policies.
-pub(crate) async fn verify_bucket(bucket: &Bucket) -> Result<(), Error> {
-    const PROBE_KEY: &str = ".iggy-sink-probe";
-    bucket.put_object(PROBE_KEY, &[]).await.map_err(|e| {
-        Error::InitError(format!(
-            "S3 bucket '{}' connectivity check failed: {e}",
-            bucket.name
-        ))
-    })?;
-    let _ = bucket.delete_object(PROBE_KEY).await;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

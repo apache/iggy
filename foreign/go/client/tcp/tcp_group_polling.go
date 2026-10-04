@@ -174,8 +174,8 @@ func newGroupKey(streamId, topicId, groupId iggcon.Identifier) groupKey {
 }
 
 // pollGroup polls a consumer group that named no explicit partition. The
-// broker does not pick a partition under consensus, so the client fetches its
-// assignment and polls the partitions it owns in turn.
+// broker requires an explicit assigned partition for a group poll, so the
+// client fetches its assignment and polls the partitions it owns in turn.
 func (c *IggyTcpClient) pollGroup(
 	ctx context.Context,
 	streamId iggcon.Identifier,

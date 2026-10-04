@@ -185,6 +185,25 @@ impl From<RustTopic> for Topic {
     }
 }
 
+impl From<&RustTopic> for Topic {
+    fn from(topic: &RustTopic) -> Self {
+        Self {
+            inner: RustTopic {
+                id: topic.id,
+                created_at: topic.created_at,
+                name: topic.name.clone(),
+                size: topic.size,
+                message_expiry: topic.message_expiry,
+                compression_algorithm: topic.compression_algorithm,
+                max_topic_size: topic.max_topic_size,
+                messages_count: topic.messages_count,
+                partitions_count: topic.partitions_count,
+                options: topic.options.clone(),
+            },
+        }
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl Topic {
@@ -254,7 +273,7 @@ impl Topic {
 
     /// Options admission resolved for the keys the client did not send.
     ///
-    /// Same shape as [`Self::options`]. These would have resolved differently
+    /// Same shape as `options`. These would have resolved differently
     /// under another server configuration.
     #[getter]
     pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
@@ -345,7 +364,7 @@ impl TopicDetails {
 
     /// Options admission resolved for the keys the client did not send.
     ///
-    /// Same shape as [`Self::options`]. These would have resolved differently
+    /// Same shape as `options`. These would have resolved differently
     /// under another server configuration.
     #[getter]
     pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {

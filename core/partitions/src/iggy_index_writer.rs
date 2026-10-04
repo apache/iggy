@@ -18,6 +18,7 @@
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncWriteAtExt;
 use iggy_common::IggyError;
+use server_common::fatal::NoteDescriptorExhaustion;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, trace};
@@ -51,6 +52,7 @@ impl IggyIndexWriter {
         let file = opts
             .open(file_path)
             .await
+            .note_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
@@ -97,14 +99,25 @@ impl IggyIndexWriter {
         })
     }
 
-    /// Appends encoded sparse index bytes to the backing file.
+    /// Appends encoded sparse index bytes at the current write cursor and
+    /// returns how many bytes landed. The cursor is left where it was: the
+    /// caller advances it with `advance` once the companion segment save has
+    /// also succeeded.
     ///
     /// # Errors
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
-    pub async fn save_indexes(&self, indexes: Vec<u8>) -> Result<(), IggyError> {
+    pub(crate) async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
+        let saved = self.save_indexes_buffered(indexes).await?;
+        if saved > 0 && self.fsync {
+            self.fsync().await?;
+        }
+        Ok(saved)
+    }
+
+    pub(crate) async fn save_indexes_buffered(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
         if indexes.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let len = indexes.len();
@@ -116,16 +129,6 @@ impl IggyIndexWriter {
             .0
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
-        if self.fsync {
-            self.fsync().await?;
-        }
-
-        // Advance the write cursor last: if the write or fsync fails, the
-        // counter must stay put so the retry overwrites the same slot instead
-        // of appending a duplicate entry that boot recovery would refuse.
-        self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
-
         trace!(
             target: "iggy.partitions.storage",
             file = self.file_path.as_str(),
@@ -133,7 +136,18 @@ impl IggyIndexWriter {
             position,
             "saved sparse index bytes to file"
         );
-        Ok(())
+        Ok(len as u64)
+    }
+
+    /// Move the write cursor forward over `bytes` that are now durable. Split
+    /// out of the save so the index and segment cursors advance together, only
+    /// once both halves have succeeded.
+    pub(crate) fn advance(&self, bytes: u64) {
+        self.index_size_bytes.fetch_add(bytes, Ordering::Release);
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.file_path
     }
 
     /// Flushes buffered index file contents to disk.
@@ -157,6 +171,17 @@ impl IggyIndexWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn buffered_indexes_defer_sync_errors_to_the_original_writer_barrier() {
+        let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        assert_eq!(writer.save_indexes_buffered(vec![1; 32]).await.unwrap(), 32);
+        assert!(writer.fsync().await.is_err());
+        assert!(writer.save_indexes(vec![1; 32]).await.is_err());
+    }
 
     #[compio::test]
     async fn given_seeded_size_diverging_from_disk_when_opening_existing_file_should_return_size_mismatch_error()

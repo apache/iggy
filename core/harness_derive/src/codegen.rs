@@ -557,6 +557,11 @@ fn generate_harness_setup(
 /// after server but before MCP and connectors runtime (which may depend on seed data).
 /// Fixture seeds are combined with the global seed.
 fn generate_start_and_seed(attrs: &IggyTestAttrs, fixture_seed: TokenStream) -> TokenStream {
+    // `manual_start` hands the bring-up to the test body, so there is nothing
+    // to emit and no client for a seed to run against.
+    if attrs.manual_start {
+        return TokenStream::new();
+    }
     let has_fixture_seed = !fixture_seed.is_empty();
     match (&attrs.seed_fn, has_fixture_seed) {
         (Some(seed_fn), true) => {
@@ -837,6 +842,7 @@ mod tests {
             },
             seed_fn: None,
             cluster_nodes: crate::attrs::ClusterNodesValue::None,
+            manual_start: false,
             jwks_server: None,
         };
         let variants = generate_variants(&attrs);

@@ -76,12 +76,10 @@ public final class VsrRequestEncoder {
                 // sessionless before login.
                 requestId = session.nextCorrelationId();
                 sessionId = session.sessionOrZero();
-            } else if (VsrOperation.isPartition(operation)) {
-                // Partition ops replicate in their own group without client
-                // table dedup, so use the independent correlation sequence.
-                sessionId = session.boundSession();
-                requestId = session.nextCorrelationId();
             } else {
+                // Partition ops consume the dedup counter too: dedup needs each
+                // send to carry a distinct number, and the metadata watermark
+                // tolerates the gaps.
                 sessionId = session.boundSession();
                 requestId = session.nextRequestId();
             }

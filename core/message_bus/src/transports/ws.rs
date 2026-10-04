@@ -234,8 +234,12 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 }
                 let drained = batch.len();
                 #[allow(clippy::iter_with_drain)]
+                // One WS frame per message: tungstenite takes a single payload
+                // buffer, so a multi-fragment frame is joined here (the only
+                // record copy left on this plane; single-fragment frames move).
                 for msg in batch.drain(..) {
-                    if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
+                    let payload = Bytes::from_owner(msg.into_contiguous());
+                    if let Err(e) = ws.send(WsMessage::Binary(payload)).await {
                         warn!(%label, %peer, error = ?e, batch_len = drained, "ws writer: send failed");
                         return;
                     }
@@ -364,7 +368,7 @@ mod tests {
     fn drive(
         conn: WsTransportConn,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
@@ -377,12 +381,12 @@ mod tests {
         conn: WsTransportConn,
         max_message_size: usize,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (out_tx, out_rx) = bounded::<BusMessage>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
         let ctx = ActorContext {
@@ -442,7 +446,7 @@ mod tests {
         // Server replies via its outbound mailbox; the serial pump writes
         // the reply on the same bidi the request arrived on, client reads.
         server_out
-            .send(header_only(Command::Reply))
+            .send(header_only(Command::Reply).into())
             .await
             .expect("server send");
         let reply = compio::time::timeout(Duration::from_secs(5), raw_recv(&mut client_ws))

@@ -26,12 +26,12 @@ use std::{
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Default, Copy, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitioningKind {
-    /// The partition ID is calculated by the server using the round-robin algorithm.
+    /// Select a partition using round-robin.
     #[default]
     Balanced,
     /// The partition ID is provided by the client.
     PartitionId,
-    /// The partition ID is calculated by the server using the hash of the provided messages key.
+    /// Hash the messages key modulo the topic partition count.
     MessagesKey,
 }
 

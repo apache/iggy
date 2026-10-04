@@ -19,10 +19,10 @@
 
 use super::conn_info::ClientConnMeta;
 use super::tcp::install_client_conn;
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::socket_opts::apply_nodelay_for_connection;
 use crate::transports::tcp_tls::TcpTlsTransportConn;
+use crate::{ConnectionPermit, IggyMessageBus};
 use compio::net::TcpStream;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -43,18 +43,16 @@ use tracing::warn;
 /// to accepted sockets, so toggling here is required. `SO_KEEPALIVE`
 /// is intentionally NOT set; see `socket_opts`.
 ///
-/// TCP-TLS is shard-0 terminal: the rustls connection state machine
-/// is non-serialisable and tied to the local task; pre-handshake the
-/// fd is plain TCP and could in principle be dup'd to another shard,
-/// but the receiving shard would then have to re-handshake against
-/// shard-0-resident key material — losing the point of the cross-shard
-/// handover.
+/// Called on the destination shard after raw-fd delegation. The shared
+/// configuration crosses shards; per-connection TLS state stays on this
+/// runtime for the lifetime of the connection.
 #[allow(clippy::future_not_send)]
 pub fn install_client_tcp_tls(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -71,6 +69,7 @@ pub fn install_client_tcp_tls(
         TcpTlsTransportConn::new_server(stream, config)
             .with_close_grace(cfg.close_grace)
             .with_handshake_grace(cfg.handshake_grace),
+        Some(permit),
         on_request,
     );
 }

@@ -26,6 +26,7 @@ using Reqnroll;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 using TestContext = Apache.Iggy.Tests.BDD.Context.TestContext;
+using TestEnvironment = Apache.Iggy.Tests.BDD.Context.TestEnvironment;
 
 namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 
@@ -55,10 +56,10 @@ public class BasicMessagingOperationsSteps
     [Given(@"I am authenticated as the root user")]
     public async Task GivenIAmAuthenticatedAsTheRootUser()
     {
-        var loginResult = await _context.IggyClient.LoginUserAsync("iggy", "iggy");
+        var loginResult = await _context.IggyClient.LoginUserAsync(TestEnvironment.RootUsername, TestEnvironment.RootPassword);
 
         loginResult.ShouldNotBeNull();
-        loginResult.UserId.ShouldBe(0);
+        loginResult.UserId.ShouldBe(0u);
     }
 
     [Given(@"I have no streams in the system")]

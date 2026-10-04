@@ -30,5 +30,5 @@ public sealed class Permissions
     /// <summary>
     ///     Permissions applied to specific streams.
     /// </summary>
-    public Dictionary<int, StreamPermissions>? Streams { get; init; }
+    public Dictionary<uint, StreamPermissions>? Streams { get; init; }
 }

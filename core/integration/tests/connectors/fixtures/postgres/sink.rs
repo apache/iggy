@@ -29,6 +29,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 
+pub const POSTGRES_LARGE_BATCH_SIZE: usize = 10_000;
+const ENV_SINK_BATCH_SIZE: &str = "IGGY_CONNECTORS_SINK_POSTGRES_PLUGIN_CONFIG_BATCH_SIZE";
+const ENV_SINK_BATCH_LENGTH: &str = "IGGY_CONNECTORS_SINK_POSTGRES_STREAMS_0_BATCH_LENGTH";
+
 /// PostgreSQL sink connector fixture.
 ///
 /// Starts a PostgreSQL container and provides environment variables
@@ -213,5 +217,37 @@ impl TestFixture for PostgresSinkJsonFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         self.inner.connectors_runtime_envs()
+    }
+}
+
+pub struct PostgresSinkLargeBatchFixture {
+    inner: PostgresSinkFixture,
+}
+
+impl std::ops::Deref for PostgresSinkLargeBatchFixture {
+    type Target = PostgresSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSinkLargeBatchFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let mut inner = PostgresSinkFixture::setup().await?;
+        inner.payload_format = SinkPayloadFormat::Json;
+        inner.schema = SinkSchema::Raw;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_BATCH_SIZE.to_string(), u32::MAX.to_string());
+        envs.insert(
+            ENV_SINK_BATCH_LENGTH.to_string(),
+            POSTGRES_LARGE_BATCH_SIZE.to_string(),
+        );
+        envs
     }
 }

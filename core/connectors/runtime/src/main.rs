@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
+use crate::configs::connectors::{
+    ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, create_connectors_config_provider,
+};
+use crate::metrics::ConnectorType;
 use ::configs::ConfigProvider;
 use clap::Parser;
 use configs::connectors::ConfigFormat;
@@ -40,7 +43,7 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod api;
 mod benchmark;
@@ -155,6 +158,7 @@ async fn main() -> Result<(), RuntimeError> {
         connectors_config.sources().len(),
         connectors_config.sinks().len()
     );
+    warn_on_unaddressable_keys(&connectors_config);
     let sources_config = connectors_config.sources();
     let (sources, failed_sources) = source::init(
         sources_config.clone(),
@@ -183,7 +187,7 @@ async fn main() -> Result<(), RuntimeError> {
     let mut source_wrappers = vec![];
     let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
     for (_path, source) in sources {
-        let container = Arc::new(source.container);
+        let container = source.container;
         let handle_callback = container.iggy_source_handle_v2;
         let batch_result_callback = container.iggy_source_batch_result;
         for plugin in &source.plugins {
@@ -306,6 +310,29 @@ async fn main() -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Keys loaded from a provider are not held to `ConnectorKey`, so existing
+/// deployments keep starting, but the control API only routes keys that pass
+/// it. Say so at startup instead of letting the operator discover a 400.
+fn warn_on_unaddressable_keys(connectors_config: &ConnectorsConfig) {
+    let keys = connectors_config
+        .sinks()
+        .keys()
+        .map(|key| ("sink", key))
+        .chain(
+            connectors_config
+                .sources()
+                .keys()
+                .map(|key| ("source", key)),
+        );
+    for (connector_type, key) in keys {
+        if let Err(error) = key.parse::<ConnectorKey>() {
+            warn!(
+                "Loaded {connector_type} connector with key {key:?} that the control API cannot address: {error}"
+            );
+        }
+    }
+}
+
 /// Resolves a plugin shared library path from the connector config `path` field.
 ///
 /// Accepts both `plugin.so` and `plugin` (OS-specific extension appended if missing).
@@ -328,12 +355,7 @@ pub(crate) fn resolve_plugin_path(path: &str) -> Result<String, RuntimeError> {
     let with_extension = if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
         path.to_string()
     } else {
-        let os_extension = match std::env::consts::OS {
-            "macos" => "dylib",
-            "windows" => "dll",
-            _ => "so",
-        };
-        format!("{path}.{os_extension}")
+        format!("{path}.{}", std::env::consts::DLL_EXTENSION)
     };
 
     let candidate = std::path::Path::new(&with_extension);
@@ -435,8 +457,30 @@ struct SinkConnectorWrapper {
     plugins: Vec<SinkConnectorPlugin>,
 }
 
+/// Closes a plugin instance whose setup did not finish, reporting a refusal
+/// rather than returning it: every caller is already on a failure path with an
+/// error of its own to surface.
+///
+/// The two sides had this body inline, one word apart. That word is the label
+/// [`ConnectorType`] already defines, so it is taken as the enum rather than a
+/// string nothing constrains.
+pub(crate) fn close_plugin_instance(
+    close: &dyn Fn(u32) -> i32,
+    kind: ConnectorType,
+    plugin_id: u32,
+    key: &str,
+) {
+    let close_result = close(plugin_id);
+    if close_result != 0 {
+        let kind = kind.as_label();
+        warn!(
+            "iggy_{kind}_close returned {close_result} while cleaning up failed {kind} connector with ID: {plugin_id} ({key})"
+        );
+    }
+}
+
 struct SourceConnector {
-    container: Container<SourceApi>,
+    container: Arc<Container<SourceApi>>,
     plugins: Vec<SourceConnectorPlugin>,
 }
 
@@ -522,10 +566,7 @@ mod tests {
     fn path_without_extension_gets_os_suffix() {
         let result = resolve_plugin_path("/tmp/nonexistent_test_plugin");
         let err = result.unwrap_err().to_string();
-        let expected_ext = match std::env::consts::OS {
-            "macos" => "dylib",
-            _ => "so",
-        };
+        let expected_ext = std::env::consts::DLL_EXTENSION;
         assert!(
             err.contains(&format!("nonexistent_test_plugin.{expected_ext}")),
             "Error should mention OS-specific extension, got: {err}"

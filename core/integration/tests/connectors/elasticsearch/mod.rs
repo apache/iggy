@@ -17,6 +17,7 @@
 
 mod elasticsearch_sink;
 mod elasticsearch_source;
+mod proto_text;
 
 const TEST_MESSAGE_COUNT: usize = 3;
 const POLL_ATTEMPTS: usize = 100;

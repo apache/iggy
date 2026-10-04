@@ -30,8 +30,19 @@ pub enum BenchmarkTransportCommand {
     Http(HttpArgs),
     Tcp(TcpArgs),
     Quic(QuicArgs),
-    #[command(alias = "ws")]
+    #[command(name = "websocket", alias = "ws")]
     WebSocket(WebSocketArgs),
+}
+
+impl BenchmarkTransportCommand {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http(_) => "http",
+            Self::Tcp(_) => "tcp",
+            Self::Quic(_) => "quic",
+            Self::WebSocket(_) => "websocket",
+        }
+    }
 }
 
 impl Serialize for BenchmarkTransportCommand {
@@ -39,13 +50,7 @@ impl Serialize for BenchmarkTransportCommand {
     where
         S: Serializer,
     {
-        let variant_str = match self {
-            Self::Http(_) => "http",
-            Self::Tcp(_) => "tcp",
-            Self::Quic(_) => "quic",
-            Self::WebSocket(_) => "websocket",
-        };
-        serializer.serialize_str(variant_str)
+        serializer.serialize_str(self.as_str())
     }
 }
 

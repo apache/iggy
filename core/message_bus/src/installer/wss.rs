@@ -19,10 +19,10 @@
 
 use super::conn_info::ClientConnMeta;
 use super::tcp::install_client_conn;
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::socket_opts::apply_nodelay_for_connection;
 use crate::transports::wss::WssTransportConn;
+use crate::{ConnectionPermit, IggyMessageBus};
 use compio::net::TcpStream;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -43,15 +43,15 @@ use tracing::warn;
 /// [`super::tcp_tls::install_client_tcp_tls`]. `SO_KEEPALIVE` is
 /// intentionally NOT set; see `socket_opts`.
 ///
-/// WSS is shard-0 terminal for the same reasons as the TCP-TLS plane;
-/// see [`super::tcp_tls::install_client_tcp_tls`] for the rustls
-/// non-serialisability argument.
+/// Called on the destination shard after raw-fd delegation. Both TLS and
+/// WebSocket state are created and driven exclusively on this runtime.
 #[allow(clippy::future_not_send)]
 pub fn install_client_wss(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -69,6 +69,7 @@ pub fn install_client_wss(
             .with_close_grace(cfg.close_grace)
             .with_handshake_grace(cfg.handshake_grace)
             .with_ws_config(cfg.ws_config),
+        Some(permit),
         on_request,
     );
 }

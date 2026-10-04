@@ -69,7 +69,6 @@ public final class VsrOperation {
 
     private static final int INTERNAL_START = 64;
     private static final int METADATA_START = 128;
-    private static final int PARTITION_START = 160;
 
     /**
      * Replicated command code to operation, from the server's
@@ -141,10 +140,6 @@ public final class VsrOperation {
             return false;
         }
         return operation >= METADATA_START && operation <= LEAVE_CONSUMER_GROUP;
-    }
-
-    static boolean isPartition(int operation) {
-        return operation >= PARTITION_START;
     }
 
     /**

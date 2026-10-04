@@ -280,10 +280,16 @@ impl ConsensusGroupAllocator {
 /// Generates the state's inner struct and wrapper type.
 ///
 /// # Generated items
-/// - `{$state}Inner` struct with the specified fields (the data)
+/// - `{$state}Inner` struct with the specified fields (the data), plus a
+///   `pub(crate) last_result`
 /// - `$state` wrapper struct (contains `LeftRight` storage)
 /// - `From<LeftRight<...>>` impl for `$state`
 /// - `From<{$state}Inner>` impl for `$state`
+///
+/// Each field carries its own visibility, written as in a struct definition.
+/// Declare a field `pub(crate)` when other crates must reach it only through
+/// this crate's accessors, such as a name-to-id index behind a resolver: a
+/// `pub` index lets another crate write it or fork the resolver.
 ///
 /// The command enum, parsing, dispatch, and Absorb impl are generated
 /// by `collect_handlers!` separately, keeping state definition decoupled
@@ -292,16 +298,16 @@ impl ConsensusGroupAllocator {
 macro_rules! define_state {
     (
         $state:ident {
-            $($field_name:ident : $field_type:ty),* $(,)?
+            $($field_vis:vis $field_name:ident : $field_type:ty),* $(,)?
         }
     ) => {
         paste::paste! {
             #[derive(Debug, Clone, Default)]
             pub struct [<$state Inner>] {
                 $(
-                    pub $field_name: $field_type,
+                    $field_vis $field_name: $field_type,
                 )*
-                pub last_result: Option<$crate::stm::result::ApplyReply>,
+                pub(crate) last_result: Option<$crate::stm::result::ApplyReply>,
             }
 
             impl [<$state Inner>] {
@@ -384,12 +390,14 @@ macro_rules! define_state {
 /// # Requirements
 /// Each listed operation must have a corresponding `{Operation}Request` wire type
 /// that implements `WireDecode` and `StateHandler<State = {$state}Inner>`.
+/// Internal commands only implement `StateHandler` and are never decoded from wire data.
 #[macro_export]
 macro_rules! collect_handlers {
     (
         $state:ident {
             $($operation:ident),* $(,)?
         }
+        $(internal { $($internal:ident),* $(,)? })?
     ) => {
         paste::paste! {
             #[derive(Debug, Clone)]
@@ -397,6 +405,9 @@ macro_rules! collect_handlers {
                 $(
                     $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
                 )*
+                $($(
+                    $internal([<$internal Request>], ::iggy_common::IggyTimestamp),
+                )*)?
                 /// Replace the whole state from a snapshot section, in place.
                 /// Never parsed off the wire (state transfer installs it via
                 /// `RestoreSnapshotInPlace`); absorbed on both left-right
@@ -448,6 +459,11 @@ macro_rules! collect_handlers {
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
+                        $($(
+                            [<$state Command>]::$internal(payload, ts) => {
+                                $crate::stm::StateHandler::apply(payload, self, *ts)
+                            },
+                        )*)?
                         [<$state Command>]::RestoreSnapshot(snapshot) => {
                             self.restore_in_place(snapshot.clone());
                             $crate::stm::result::ApplyReply::default()

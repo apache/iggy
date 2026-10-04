@@ -46,7 +46,10 @@ func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
 		0x02, 0x00, 0x00, 0x00, // PartitionsCount (2)
 		0x05,                         // Name Length (5)
 		0x74, 0x6F, 0x70, 0x69, 0x63, // Name ("topic")
-		// options: empty, every default is derived server-side
+		2, 10, 0, 0, 0, 'd', 'u', 'r', 'a', 'b', 'i', 'l', 'i', 't', 'y',
+		2, 10, 0, 0, 0, 'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd',
+		2, 26, 0, 0, 0, 'c', 'o', 'n', 's', 'u', 'm', 'e', 'r', '_', 'o', 'f', 'f', 's', 'e', 't', '_', 'd', 'u', 'r', 'a', 'b', 'i', 'l', 'i', 't', 'y',
+		2, 10, 0, 0, 0, 'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd',
 	}
 
 	if !bytes.Equal(serialized, expected) {
@@ -90,8 +93,8 @@ func TestSerialize_CreateTopic_NonDefaultsBecomeOptions(t *testing.T) {
 		byKey[string(entry.Key.Value)] = entry.Value
 	}
 
-	if len(byKey) != 3 {
-		t.Fatalf("expected 3 options, got %d: %v", len(byKey), byKey)
+	if len(byKey) != 5 {
+		t.Fatalf("expected 5 options, got %d: %v", len(byKey), byKey)
 	}
 	if _, found := byKey["partitions_count"]; found {
 		t.Error("partitions_count rides the fixed field, not the options block")
@@ -163,8 +166,8 @@ func TestCreateTopic_CallerOptionsRideTheBlockAndTypedFieldsWin(t *testing.T) {
 		MaxTopicSize:    4096,
 		Options: []iggcon.HeaderEntry{
 			{
-				Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("enforce_fsync")},
-				Value: iggcon.HeaderValue{Kind: iggcon.Bool, Value: []byte{1}},
+				Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("durability")},
+				Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("persisted")},
 			},
 			// The typed field already covers this key, so the caller's entry is
 			// dropped: a duplicate key makes the server refuse the whole block.
@@ -188,7 +191,7 @@ func TestCreateTopic_CallerOptionsRideTheBlockAndTypedFieldsWin(t *testing.T) {
 		}
 		byKey[key] = entry.Value
 	}
-	if _, ok := byKey["enforce_fsync"]; !ok {
+	if _, ok := byKey["durability"]; !ok {
 		t.Error("a caller-supplied key must reach the options block")
 	}
 	if got := byKey["max_topic_size"]; got.Kind != iggcon.Uint64 {
@@ -207,7 +210,7 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		PartitionsCount: 1,
 		Options: []iggcon.HeaderEntry{
 			iggcon.SegmentSizeOption(1 << 20),
-			iggcon.EnforceFsyncOption(true),
+			iggcon.DurabilityOption(iggcon.DurabilityPersisted),
 			iggcon.MessagesRequiredToSaveOption(7),
 			iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 			iggcon.PreallocateSegmentsOption(false),
@@ -238,7 +241,8 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		value []byte
 	}{
 		{"segment_size", iggcon.Uint64, []byte{0, 0, 16, 0, 0, 0, 0, 0}},
-		{"enforce_fsync", iggcon.Bool, []byte{1}},
+		{"durability", iggcon.String, []byte("persisted")},
+		{"consumer_offset_durability", iggcon.String, []byte("replicated")},
 		{"messages_required_to_save", iggcon.Uint32, []byte{7, 0, 0, 0}},
 		{"size_of_messages_required_to_save", iggcon.Uint64, []byte{0, 16, 0, 0, 0, 0, 0, 0}},
 		{"preallocate_segments", iggcon.Bool, []byte{0}},

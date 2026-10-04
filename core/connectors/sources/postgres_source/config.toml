@@ -20,7 +20,7 @@ key = "postgres"
 enabled = true
 version = 0
 name = "Postgres source"
-path = "../../target/release/libiggy_connector_postgres_source"
+path = "target/release/libiggy_connector_postgres_source"
 verbose = false
 
 [[streams]]
@@ -30,7 +30,7 @@ schema = "json"
 batch_length = 100
 
 [plugin_config]
-connection_string = "postgresql://user:pass@localhost:5432/database"
+connection_string = "postgresql://iggy:iggy@localhost:5432/iggy"
 mode = "polling"
 tables = ["users", "orders"]
 poll_interval = "1s"

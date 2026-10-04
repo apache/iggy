@@ -39,20 +39,22 @@
 //! - **Batch ordering**: each transport drains the per-peer
 //!   `BusReceiver` in FIFO order, but the dispatch shape differs:
 //!     * **TCP (vectored batch)** assembles up to `max_batch` frames
-//!       into one `write_vectored_all` call. The kernel may short-write
-//!       the iovec set (so `writev` is not atomic), but FIFO order
-//!       across the batch is preserved and any short or failed write
-//!       tears the connection down rather than retrying on a
+//!       (every fragment of each [`BusMessage`](crate::BusMessage), chunked at `IOV_MAX`
+//!       iovecs) into `write_vectored_all` calls. The kernel may
+//!       short-write the iovec set (so `writev` is not atomic), but FIFO
+//!       order across the batch is preserved and any short or failed
+//!       write tears the connection down rather than retrying on a
 //!       half-written batch.
 //!     * **TCP-TLS, WS, WSS (drain-and-flush)** drain the same
 //!       `max_batch` window into a `Vec<BusMessage>` and then write
 //!       each frame through the per-record API (`AsyncWriteExt::write_all`
-//!       for TLS, `WebSocketStream::send` for WS / WSS) followed by ONE
-//!       trailing `flush()` per batch. This avoids per-frame TCP/TLS
+//!       per fragment for TLS, `WebSocketStream::send` for WS / WSS, which
+//!       joins a multi-fragment frame into one payload first) followed by
+//!       ONE trailing `flush()` per batch. This avoids per-frame TCP/TLS
 //!       record overhead while staying inside the per-record API
 //!       constraints of those transports.
 //!     * **QUIC (per-frame)** uses one bidirectional stream per peer
-//!       and writes each `BusMessage` with a separate
+//!       and writes each `BusMessage` fragment with a separate
 //!       `SendStream::write_all` call; quinn coalesces at the datagram
 //!       layer.
 //!
@@ -127,7 +129,7 @@ pub struct ActorContext {
     /// message to the bus's per-plane handler (`MessageHandler` /
     /// `RequestHandler`).
     pub in_tx: Sender<Message<GenericHeader>>,
-    /// Outbound channel: the bus's `send_to_*` path pushes `Frozen`
+    /// Outbound channel: the bus's `send_to_*` path pushes [`BusMessage`](crate::BusMessage)
     /// frames into the matching `Sender`; the transport drains here.
     pub rx: BusReceiver,
     /// Cooperative cancellation. Fires on bus shutdown OR on

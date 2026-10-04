@@ -25,7 +25,7 @@ pub(crate) enum SegmentAction {
     ///
     /// Stream ID can be specified as a stream name or ID
     /// Topic ID can be specified as a topic name or ID
-    /// Partition ID can be specified as a name or ID
+    /// Partition ID must be numeric
     ///
     /// Examples
     ///  iggy segment delete 1 1 1 10
@@ -49,9 +49,42 @@ pub(crate) struct SegmentDeleteArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partition ID to delete segments
-    #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) partition_id: u32,
     /// Segments count to be deleted
     #[arg(value_parser = clap::value_parser!(u32).range(1..100_001))]
     pub(crate) segments_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentAction;
+    use crate::args::{Command, IggyConsoleArgs};
+    use clap::Parser;
+
+    #[test]
+    fn given_numeric_partition_when_deleting_segments_should_parse_command() {
+        for partition in ["0", "1"] {
+            let parsed = IggyConsoleArgs::try_parse_from([
+                "iggy", "segment", "delete", "dev", "events", partition, "3",
+            ])
+            .unwrap();
+            let Some(Command::Segment(SegmentAction::Delete(args))) = parsed.command else {
+                panic!("Expected the segment delete command");
+            };
+            assert_eq!(args.partition_id.to_string(), partition);
+            assert_eq!(args.segments_count, 3);
+        }
+        assert!(
+            IggyConsoleArgs::try_parse_from([
+                "iggy",
+                "segment",
+                "delete",
+                "dev",
+                "events",
+                "named-partition",
+                "3",
+            ])
+            .is_err()
+        );
+    }
 }

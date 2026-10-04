@@ -46,10 +46,4 @@ public class ClusterNode
     ///     Node status
     /// </summary>
     public required ClusterNodeStatus Status { get; set; }
-
-    internal int GetSize()
-    {
-        // name length, name, ip length, ip, endpoints (4 * 2 bytes), role, status
-        return 4 + Name.Length + 4 + Ip.Length + 8 + 1 + 1;
-    }
 }

@@ -62,6 +62,16 @@ impl FileBuffer {
         self.boundaries.is_empty()
     }
 
+    pub fn byte_len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn take_data(&mut self) -> Vec<u8> {
+        let data = std::mem::take(&mut self.data);
+        self.reset();
+        data
+    }
+
     /// Returns an iterator over individual entry slices without copying.
     pub fn entries(&self) -> impl Iterator<Item = &[u8]> {
         let mut start = 0;

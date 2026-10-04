@@ -81,7 +81,7 @@ public class OffsetTests
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(0);
+        offset.PartitionId.ShouldBe(0u);
         offset.CurrentOffset.ShouldBe(3u);
     }
 
@@ -142,7 +142,7 @@ public class OffsetTests
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(0);
+        offset.PartitionId.ShouldBe(0u);
         offset.CurrentOffset.ShouldBe(3u);
     }
 
@@ -175,7 +175,7 @@ public class OffsetTests
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(0);
+        offset.PartitionId.ShouldBe(0u);
         offset.CurrentOffset.ShouldBe(3u);
     }
 

@@ -17,6 +17,7 @@
 
 use crate::{Error, Payload, Schema, StreamEncoder, convert::owned_value_to_serde_json};
 use apache_avro::Schema as AvroSchema;
+use apache_avro::writer::datum::GenericDatumWriter;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -158,10 +159,13 @@ impl AvroStreamEncoder {
         let serde_value = owned_value_to_serde_json(&json_value);
         let avro_value = Self::serde_json_to_avro_value(serde_value, schema)?;
 
-        apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
-            error!("Failed to encode Avro datum: {}", e);
-            Error::Serialization(format!("Avro encoding failed: {e}"))
-        })
+        GenericDatumWriter::builder(schema)
+            .build()
+            .and_then(|datum_writer| datum_writer.write_value_to_vec(avro_value))
+            .map_err(|e| {
+                error!("Failed to encode Avro datum: {}", e);
+                Error::Serialization(format!("Avro encoding failed: {e}"))
+            })
     }
 
     fn serde_json_to_avro_value(
@@ -264,7 +268,9 @@ impl AvroStreamEncoder {
             }
 
             (value, schema) => {
-                let avro_val: AvroValue = value.into();
+                let avro_val = AvroValue::try_from(value).map_err(|e| {
+                    Error::Serialization(format!("JSON value cannot be converted to Avro: {e}"))
+                })?;
                 if avro_val.validate(schema) {
                     Ok(avro_val)
                 } else {

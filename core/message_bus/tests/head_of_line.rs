@@ -31,7 +31,7 @@ use common::{
 };
 use compio::net::TcpListener;
 use iggy_binary_protocol::{Command, HEADER_SIZE};
-use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
+use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
 use std::cell::Cell;
@@ -96,7 +96,7 @@ async fn slow_peer_does_not_block_other_peers() {
         0,
         vec![(1, addr_a), (2, addr_b)],
         dial_delegate,
-        DEFAULT_RECONNECT_PERIOD,
+        bus0.config().reconnect_period,
     )
     .await;
 

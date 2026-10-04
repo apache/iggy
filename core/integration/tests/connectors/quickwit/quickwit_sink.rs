@@ -16,12 +16,15 @@
 // under the License.
 
 use crate::connectors::create_test_messages;
-use crate::connectors::fixtures::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+use crate::connectors::fixtures::{
+    QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,
+    QuickwitTextFixture,
+};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
-use integration::harness::seeds;
+use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use serde::{Deserialize, Serialize};
 
@@ -250,6 +253,127 @@ async fn given_invalid_messages_should_not_store(harness: &TestHarness, fixture:
         assert_eq!(
             hit,
             &serde_json::from_slice::<serde_json::Value>(payload).unwrap()
+        );
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_raw_messages_should_store_objects_and_encoded_wrappers(
+    harness: &TestHarness,
+    fixture: QuickwitRawFixture,
+) {
+    let cases = [
+        (
+            Bytes::from_static(br#"{"message":"raw JSON object"}"#),
+            serde_json::json!({"message": "raw JSON object"}),
+        ),
+        (
+            Bytes::from_static(b"YWJj"),
+            serde_json::json!({"data": "YWJj", "data_type": "raw", "data_encoding": "utf8"}),
+        ),
+        (
+            Bytes::from_static(b"\xff\x00\x80"),
+            serde_json::json!({"data": "/wCA", "data_type": "raw", "data_encoding": "base64"}),
+        ),
+        (
+            Bytes::from_static(br#"{"message":"escaped\ntext",broken}"#),
+            serde_json::json!({
+                "data": r#"{"message":"escaped\ntext",broken}"#,
+                "data_type": "raw",
+                "data_encoding": "utf8"
+            }),
+        ),
+        (
+            Bytes::from_static(b"42"),
+            serde_json::json!({"data": "42", "data_type": "raw", "data_encoding": "utf8"}),
+        ),
+        (
+            Bytes::from_static(br#""text""#),
+            serde_json::json!({"data": "\"text\"", "data_type": "raw", "data_encoding": "utf8"}),
+        ),
+        (
+            Bytes::from_static(b"[1,2]"),
+            serde_json::json!({"data": "[1,2]", "data_type": "raw", "data_encoding": "utf8"}),
+        ),
+        (
+            Bytes::from_static(b"null"),
+            serde_json::json!({"data": "null", "data_type": "raw", "data_encoding": "utf8"}),
+        ),
+    ];
+
+    assert_documents_stored(harness, &fixture, &cases).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_text_messages_should_store_text_wrappers(
+    harness: &TestHarness,
+    fixture: QuickwitTextFixture,
+) {
+    let cases = [
+        (
+            Bytes::from_static(b"log entry\n\"ready\""),
+            serde_json::json!({"text": "log entry\n\"ready\"", "data_type": "text"}),
+        ),
+        (
+            Bytes::from_static(br#"{"message":"text containing JSON"}"#),
+            serde_json::json!({
+                "text": r#"{"message":"text containing JSON"}"#,
+                "data_type": "text"
+            }),
+        ),
+    ];
+
+    assert_documents_stored(harness, &fixture, &cases).await;
+}
+
+async fn assert_documents_stored(
+    harness: &TestHarness,
+    fixture: &QuickwitFixture,
+    cases: &[(Bytes, serde_json::Value)],
+) {
+    let client = harness.root_client().await.expect("create Iggy client");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("stream identifier");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic identifier");
+    let mut messages: Vec<IggyMessage> = cases
+        .iter()
+        .enumerate()
+        .map(|(message_index, (payload, _))| {
+            IggyMessage::builder()
+                .id(message_index as u128 + 1)
+                .payload(payload.clone())
+                .build()
+                .expect("build message")
+        })
+        .collect();
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    let search = fixture
+        .wait_for_documents(seeds::names::TOPIC, cases.len())
+        .await
+        .expect("wait for indexed documents");
+
+    assert_eq!(search.num_hits, cases.len());
+    assert_eq!(search.hits.len(), cases.len());
+    for (_, expected) in cases {
+        assert!(
+            search.hits.contains(expected),
+            "Missing document {expected}; search hits: {:?}",
+            search.hits
         );
     }
 }

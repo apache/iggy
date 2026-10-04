@@ -24,9 +24,10 @@ under the License.
   import { isNumber } from '$lib/utils/parsers';
   import { twMerge } from 'tailwind-merge';
   import { resolve } from '$app/paths';
+  import type { Pathname } from '$app/types';
 
   type Crumb = {
-    path: string;
+    path: Pathname;
     label: string;
   };
 
@@ -50,7 +51,7 @@ under the License.
   }
 
   function formatPathSegment(segment: string, index: number, parts: string[]): Crumb {
-    const path = `/dashboard/${parts.slice(0, index + 1).join('/')}`;
+    const path = `/dashboard/${parts.slice(0, index + 1).join('/')}` as Pathname;
 
     if (isNumber(segment)) {
       const prevSegment = parts[index - 1];

@@ -37,5 +37,8 @@ server_common = { workspace = true }
 static-toml = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+serial_test = { workspace = true }
+
 [lints]
 workspace = true

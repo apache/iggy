@@ -28,7 +28,7 @@ public sealed class PartitionResponse
     /// <summary>
     ///     Partition identifier.
     /// </summary>
-    public required int Id { get; init; }
+    public required uint Id { get; init; }
 
     /// <summary>
     ///     Number of messages in the partition.
@@ -44,7 +44,7 @@ public sealed class PartitionResponse
     /// <summary>
     ///     Number of segments in the partition.
     /// </summary>
-    public required int SegmentsCount { get; init; }
+    public required uint SegmentsCount { get; init; }
 
     /// <summary>
     ///     Current offset of the partition.

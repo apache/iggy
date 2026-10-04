@@ -722,6 +722,17 @@ func (e InvalidNumberValue) Is(target error) bool {
 	return ok
 }
 
+type RequestTooOld struct{}
+
+func (e RequestTooOld) Error() string {
+	return "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+}
+func (e RequestTooOld) Code() Code { return 85 }
+func (e RequestTooOld) Is(target error) bool {
+	_, ok := target.(RequestTooOld)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -1358,6 +1369,17 @@ func (e TooManyTopics) Is(target error) bool {
 	return ok
 }
 
+type PartitionsLimitReached struct{}
+
+func (e PartitionsLimitReached) Error() string {
+	return "partitions limit reached, raise [metadata] partitions_max"
+}
+func (e PartitionsLimitReached) Code() Code { return 2022 }
+func (e PartitionsLimitReached) Is(target error) bool {
+	_, ok := target.(PartitionsLimitReached)
+	return ok
+}
+
 type CannotCreatePartition struct {
 	PartitionId uint32
 	StreamId    uint32
@@ -1581,6 +1603,17 @@ func (e CannotOpenConsumerOffsetsFile) Error() string {
 func (e CannotOpenConsumerOffsetsFile) Code() Code { return 3023 }
 func (e CannotOpenConsumerOffsetsFile) Is(target error) bool {
 	_, ok := target.(CannotOpenConsumerOffsetsFile)
+	return ok
+}
+
+type TooManyConsumerOffsets struct{}
+
+func (e TooManyConsumerOffsets) Error() string {
+	return "consumer offset limit reached for partition, raise [partition] consumer_offsets_max"
+}
+func (e TooManyConsumerOffsets) Code() Code { return 3024 }
+func (e TooManyConsumerOffsets) Is(target error) bool {
+	_, ok := target.(TooManyConsumerOffsets)
 	return ok
 }
 
@@ -2712,6 +2745,7 @@ var (
 	ErrInvalidNumberEncoding                      = InvalidNumberEncoding{}
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
+	ErrRequestTooOld                              = RequestTooOld{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2767,6 +2801,7 @@ var (
 	ErrInvalidPartitionsCount                     = InvalidPartitionsCount{}
 	ErrTopicDirectoryNotFound                     = TopicDirectoryNotFound{}
 	ErrTooManyTopics                              = TooManyTopics{}
+	ErrPartitionsLimitReached                     = PartitionsLimitReached{}
 	ErrCannotCreatePartition                      = CannotCreatePartition{}
 	ErrCannotCreatePartitionsDirectory            = CannotCreatePartitionsDirectory{}
 	ErrCannotCreatePartitionDirectory             = CannotCreatePartitionDirectory{}
@@ -2784,6 +2819,7 @@ var (
 	ErrConsumerOffsetNotFound                     = ConsumerOffsetNotFound{}
 	ErrNotResolvedConsumer                        = NotResolvedConsumer{}
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
+	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
@@ -2955,6 +2991,7 @@ const (
 	InvalidNumberEncodingCode                      Code = 82
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
+	RequestTooOldCode                              Code = 85
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3010,6 +3047,7 @@ const (
 	InvalidPartitionsCountCode                     Code = 2019
 	TopicDirectoryNotFoundCode                     Code = 2020
 	TooManyTopicsCode                              Code = 2021
+	PartitionsLimitReachedCode                     Code = 2022
 	CannotCreatePartitionCode                      Code = 3000
 	CannotCreatePartitionsDirectoryCode            Code = 3001
 	CannotCreatePartitionDirectoryCode             Code = 3002
@@ -3027,6 +3065,7 @@ const (
 	ConsumerOffsetNotFoundCode                     Code = 3021
 	NotResolvedConsumerCode                        Code = 3022
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
+	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
@@ -3265,6 +3304,8 @@ func (c Code) String() string {
 		return "InvalidBooleanValue"
 	case InvalidNumberValueCode:
 		return "InvalidNumberValue"
+	case RequestTooOldCode:
+		return "RequestTooOld"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3375,6 +3416,8 @@ func (c Code) String() string {
 		return "TopicDirectoryNotFound"
 	case TooManyTopicsCode:
 		return "TooManyTopics"
+	case PartitionsLimitReachedCode:
+		return "PartitionsLimitReached"
 	case CannotCreatePartitionCode:
 		return "CannotCreatePartition"
 	case CannotCreatePartitionsDirectoryCode:
@@ -3409,6 +3452,8 @@ func (c Code) String() string {
 		return "NotResolvedConsumer"
 	case CannotOpenConsumerOffsetsFileCode:
 		return "CannotOpenConsumerOffsetsFile"
+	case TooManyConsumerOffsetsCode:
+		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
 	case SegmentNotFoundCode:
@@ -3748,6 +3793,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidBooleanValue
 	case InvalidNumberValueCode:
 		return ErrInvalidNumberValue
+	case RequestTooOldCode:
+		return ErrRequestTooOld
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -3858,6 +3905,8 @@ func FromCode(code Code) IggyError {
 		return ErrTopicDirectoryNotFound
 	case TooManyTopicsCode:
 		return ErrTooManyTopics
+	case PartitionsLimitReachedCode:
+		return ErrPartitionsLimitReached
 	case CannotCreatePartitionCode:
 		return ErrCannotCreatePartition
 	case CannotCreatePartitionsDirectoryCode:
@@ -3892,6 +3941,8 @@ func FromCode(code Code) IggyError {
 		return ErrNotResolvedConsumer
 	case CannotOpenConsumerOffsetsFileCode:
 		return ErrCannotOpenConsumerOffsetsFile
+	case TooManyConsumerOffsetsCode:
+		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
 	case SegmentNotFoundCode:

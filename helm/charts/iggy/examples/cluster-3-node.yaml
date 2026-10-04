@@ -1,0 +1,130 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Shared roster for a three-node Iggy cluster. Install one release per node,
+# overriding only the identity:
+#
+#   for i in 0 1 2; do
+#     helm upgrade --install "iggy-n$i" ./helm/charts/iggy \
+#       -f ./helm/charts/iggy/examples/cluster-3-node.yaml \
+#       --set "server.cluster.selfReplicaId=$i" \
+#       --set "server.nodeSelector.kubernetes\.io/hostname=node-$i"
+#   done
+#
+# Replace the `ip` values with the IPs of the nodes you pin each release to.
+# The server binds this address verbatim for replica traffic, so with
+# hostNetwork it must be the node's own IP.
+#
+# Every secret below has to be byte-identical on every node, so they live in one
+# Secret that all three releases reference rather than in this file. Create it
+# once, in the release namespace, before the first install:
+#
+#   JWT="$(head -c 32 /dev/urandom | base64)"
+#   kubectl create secret generic iggy-cluster-secrets \
+#     --from-literal=username=iggy \
+#     --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
+#     --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
+#     --from-literal=jwtEncodingSecret="$JWT" \
+#     --from-literal=jwtDecodingSecret="$JWT" \
+#     --from-literal=encryptionKey="$(head -c 32 /dev/urandom | base64)"
+#
+# The JWT encoding and decoding secrets are one HMAC key, which is why both
+# entries carry the same value. Two different values make every token from
+# /users/login fail with 401, and the server only warns about the mismatch.
+
+ui:
+  enabled: false
+
+server:
+  hostNetwork: true
+
+  # The root user is created locally on each node out of that node's own
+  # IGGY_ROOT_* environment, so the credentials have to match across the
+  # releases the same way the keys below do.
+  users:
+    root:
+      createSecret: false
+      existingSecret:
+        name: iggy-cluster-secrets
+
+  # A release is pinned to one node, so its storage has to stay on that node.
+  # On emptyDir every pod replacement wipes the replica, which then refetches
+  # the whole dataset from its peers.
+  persistence:
+    enabled: true
+    # Name a node-local class here (local-path, topolvm, a local volume
+    # provisioner). Empty takes the default provisioner, which may hand out
+    # storage that does not stay on the pinned node.
+    storageClass: ""
+    size: 8Gi
+
+  # Encrypts message payloads and state commands at rest with AES-256-GCM. The
+  # key is cluster-wide: a node that holds a different one cannot read what its
+  # peers wrote.
+  encryption:
+    enabled: true
+    existingSecret:
+      name: iggy-cluster-secrets
+
+  # Makes bearer tokens valid on every node and survive a restart. Redundant
+  # while cluster.auth is enabled, which derives the same key from the replica
+  # PSK, but set explicitly here so tokens keep working if auth is turned off.
+  jwt:
+    existingSecret:
+      name: iggy-cluster-secrets
+
+  cluster:
+    enabled: true
+    name: iggy-cluster
+
+    # Every replica connection completes an authenticated handshake or is
+    # rejected. Turning this on or off is a coordinated restart of the whole
+    # cluster, not a rolling one.
+    auth:
+      enabled: true
+      existingSecret:
+        name: iggy-cluster-secrets
+    nodes:
+      - name: iggy-node-0
+        ip: 10.0.1.10
+        replicaId: 0
+        ports:
+          tcpReplica: 9090
+      - name: iggy-node-1
+        ip: 10.0.1.11
+        replicaId: 1
+        ports:
+          tcpReplica: 9090
+      - name: iggy-node-2
+        ip: 10.0.1.12
+        replicaId: 2
+        ports:
+          tcpReplica: 9090
+
+  env:
+    - name: RUST_LOG
+      value: info
+    # Bind interface only: in cluster mode every listener port comes from the
+    # roster entry for this node.
+    - name: IGGY_HTTP_ADDRESS
+      value: "0.0.0.0:3000"
+    - name: IGGY_TCP_ADDRESS
+      value: "0.0.0.0:8090"
+    - name: IGGY_QUIC_ADDRESS
+      value: "0.0.0.0:8080"
+    - name: IGGY_WEBSOCKET_ADDRESS
+      value: "0.0.0.0:8092"

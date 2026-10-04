@@ -16,40 +16,80 @@
 // under the License.
 
 //! The `[http.metrics]` scrape surface: the legacy-parity metric registry
-//! (entity gauges plus the request counter), its public scrape handler, and
-//! the config gate deciding whether the route is mounted.
+//! (entity gauges plus the request counter) and the config gate deciding
+//! whether the route is mounted. The scrape handler itself lives with the
+//! other route handlers so this leaf never imports the state hub.
 
-use axum::extract::State;
 use configs::http::HttpMetricsConfig;
-use consensus::MetadataHandle;
-use iggy_common::IggyError;
-use metadata::impls::metadata::StreamsFrontend;
+use iggy_common::{IggyError, stats_rollup_underflows};
+use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::metrics::counter::Counter;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use send_wrapper::SendWrapper;
 use tracing::error;
 
-use crate::http::extractor::Identity;
-use crate::http::state::HttpState;
+/// Exports the process-wide clamped-rollup count as a counter series, read at
+/// encode time rather than mirrored into one.
+///
+/// Non-zero means a partition, topic or stream total was asked to give back
+/// more than it held, so what that scope now reports is low, and stays low
+/// until a rebuild or a restart. All three levels clamp and all three feed this
+/// one counter, which carries no scope label -- the `warn!` in `iggy_common`
+/// names the scope and counter that moved it.
+///
+/// Not "alert on any increase". A delete, a purge, a partition teardown and a
+/// snapshot restore each open a window where a retention pass hands back bytes
+/// the parents have already given up, and the clamp is the intended outcome
+/// there -- `given_a_rolled_back_partition_when_a_late_decrement_arrives_should_leave_siblings_alone`
+/// in `core/common/src/types/streaming_stats.rs` drives exactly that. What is
+/// worth paging on is a bounded rate OUTSIDE those windows: that is the shape
+/// that says the tree is diverging rather than settling.
+///
+/// A counter, not a gauge: the source only ever climbs within a process, so
+/// `rate()` and `increase()` are the queries an operator wants, and both are
+/// counter-only. A restart resets the source and the exposition together,
+/// which is the counter reset Prometheus expects.
+///
+/// Read only by the `/metrics` scrape, so it needs `http.enabled` and
+/// `http.metrics.enabled` -- as does every other series in this registry,
+/// which is the only Prometheus surface the server has. A TCP-only or
+/// QUIC-only deployment exports nothing, and the per-scope `warn!` in
+/// `iggy_common` is the whole signal there.
+#[derive(Debug)]
+struct StatsRollupUnderflows;
+
+impl Collector for StatsRollupUnderflows {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let counter = ConstCounter::new(stats_rollup_underflows());
+        let metric_encoder = encoder.encode_descriptor(
+            "stats_rollup_underflows",
+            "total count of aggregate stats decrements clamped at zero",
+            None,
+            counter.metric_type(),
+        )?;
+        counter.encode(metric_encoder)
+    }
+}
 
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
 /// Unlike the legacy server, the entity gauges are not counted at mutation
-/// sites: [`get_metrics`] samples the live state on every scrape, so a gauge
-/// can never drift from the state it describes.
+/// sites: the scrape handler (`http::handlers::get_metrics`) samples the live
+/// state on every scrape, so a gauge can never drift from the state it
+/// describes.
 pub(in crate::http) struct HttpMetrics {
     registry: Registry,
     http_requests: Counter,
-    streams: Gauge,
-    topics: Gauge,
-    partitions: Gauge,
-    segments: Gauge,
-    messages: Gauge,
-    users: Gauge,
-    clients: Gauge,
+    pub(in crate::http) streams: Gauge,
+    pub(in crate::http) topics: Gauge,
+    pub(in crate::http) partitions: Gauge,
+    pub(in crate::http) segments: Gauge,
+    pub(in crate::http) messages: Gauge,
+    pub(in crate::http) users: Gauge,
+    pub(in crate::http) clients: Gauge,
 }
 
 impl HttpMetrics {
@@ -79,6 +119,9 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        // Not a legacy-parity metric, and not a mirrored one: the source is a
+        // process-wide static the scrape reads directly.
+        registry.register_collector(Box::new(StatsRollupUnderflows));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -111,7 +154,7 @@ impl HttpMetrics {
         self.http_requests.clone()
     }
 
-    fn formatted_output(&self) -> String {
+    pub(in crate::http) fn formatted_output(&self) -> String {
         let mut buffer = String::new();
         if let Err(error) = encode(&mut buffer, &self.registry) {
             error!(%error, "failed to encode metrics");
@@ -147,75 +190,9 @@ pub(in crate::http) fn validated_endpoint(
     Ok(Some(config.endpoint.clone()))
 }
 
-/// `GET <http.metrics.endpoint>`: the metric set in prometheus text
-/// exposition. Auth-only, like `/stats`: the `Identity` extractor rejects a
-/// missing or invalid bearer with 401, and any authenticated user may scrape
-/// (no RBAC rule guards it). Scrapers present a JWT or a raw PAT the same way
-/// every read route accepts them.
-///
-/// The entity gauges sample the same reads `/stats` serves: the metadata STM
-/// stream and user maps plus the stats-registry rollups, whose partition-plane
-/// increments are relaxed, so scraped values are approximate while writes are
-/// in flight. The clients count scatter-gathers the per-shard session managers
-/// exactly like `GET /clients` and turns partial when a shard misses the reply
-/// deadline.
-pub(in crate::http) async fn get_metrics(
-    State(state): State<HttpState>,
-    _identity: Identity,
-) -> String {
-    let (streams_count, topics_count, partitions_count, segments_count, messages_count) = state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .read(|streams| {
-            let mut topics_count = 0u64;
-            let mut partitions_count = 0u64;
-            let mut segments_count = 0u64;
-            let mut messages_count = 0u64;
-            for (_, stream) in &streams.items {
-                topics_count = topics_count.saturating_add(stream.topics.len() as u64);
-                segments_count = segments_count
-                    .saturating_add(u64::from(stream.stats.segments_count_inconsistent()));
-                messages_count =
-                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                for (_, topic) in &stream.topics {
-                    partitions_count =
-                        partitions_count.saturating_add(topic.partitions.len() as u64);
-                }
-            }
-            (
-                streams.items.len() as u64,
-                topics_count,
-                partitions_count,
-                segments_count,
-                messages_count,
-            )
-        });
-    let users_count = state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .users()
-        .read(|users| users.items.len() as u64);
-    let clients_count = SendWrapper::new(state.shard.list_all_clients()).await.len() as u64;
-
-    let metrics = &state.metrics;
-    metrics.streams.set(gauge_value(streams_count));
-    metrics.topics.set(gauge_value(topics_count));
-    metrics.partitions.set(gauge_value(partitions_count));
-    metrics.segments.set(gauge_value(segments_count));
-    metrics.messages.set(gauge_value(messages_count));
-    metrics.users.set(gauge_value(users_count));
-    metrics.clients.set(gauge_value(clients_count));
-    metrics.formatted_output()
-}
-
 /// Clamp a count into the gauge's `i64` domain; only `messages` can pass
 /// `i64::MAX` even in theory, the rest are bounded far below it.
-fn gauge_value(count: u64) -> i64 {
+pub(in crate::http) fn gauge_value(count: u64) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
 }
 
@@ -271,6 +248,25 @@ mod tests {
         assert!(
             output.ends_with("# EOF\n"),
             "missing exposition trailer:\n{output}"
+        );
+    }
+
+    /// Outside `PARITY_METRIC_NAMES`: the legacy server had no such series, so
+    /// it gets its own assertion rather than a row in the parity list.
+    ///
+    /// The value is a process-wide static shared with every other test in this
+    /// binary, so this asserts the series and its type, not a number.
+    #[test]
+    fn rollup_underflow_collector_lands_in_the_exposition() {
+        let metrics = HttpMetrics::init(&[]);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains("# TYPE stats_rollup_underflows counter\n"),
+            "expected the collector's series in the exposition:\n{output}"
+        );
+        assert!(
+            output.contains("\nstats_rollup_underflows_total "),
+            "expected the collector's sample in the exposition:\n{output}"
         );
     }
 

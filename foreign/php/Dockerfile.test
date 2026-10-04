@@ -36,8 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV PHP=/usr/bin/php
 ENV PHP_CONFIG=/usr/bin/php-config
-ENV IGGY_HOST=iggy-server
-ENV IGGY_PORT=8090
+ENV IGGY_TCP_ADDRESS=iggy-server:8090
 
 WORKDIR /workspace
 

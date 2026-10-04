@@ -33,7 +33,7 @@ pub use crate::client_wrappers::connection_info::ConnectionInfo;
 pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
+    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, IggyConsumerState, ReceivedMessage,
 };
 pub use crate::clients::consumer_builder::IggyConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
@@ -41,6 +41,8 @@ pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
 pub use crate::consumer_ext::IggyConsumerMessageExt;
+pub use crate::http::http_client::HttpClient;
+pub use crate::quic::quic_client::QuicClient;
 pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
@@ -51,10 +53,10 @@ pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, CacheMetrics, CacheMetricsKey, ClientError,
     ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus,
     CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember,
-    ConsumerKind, Credentials, EncryptorKind, GlobalPermissions, HeaderField, HeaderKey,
-    HeaderKind, HeaderValue, HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind,
-    Identifier, IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView,
-    IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
+    ConsumerKind, Credentials, Durability, EncryptorKind, GlobalPermissions, HeaderField,
+    HeaderKey, HeaderKind, HeaderValue, HttpClientConfig, HttpClientConfigBuilder, HttpMethod,
+    IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
+    IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
     IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, NonZeroDurationError,
     NonZeroIggyDuration, OptionSpec, OptionValue, OptionsScope, Partition, Partitioner,
     Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
@@ -65,8 +67,8 @@ pub use iggy_common::{
     TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
     TopicPermissions, TopicUpdateOptions, TransportEndpoints, TransportProtocol, UserId, UserInfo,
     UserInfoDetails, UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
-    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
-    topic_option_keys,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, WebSocketConfig, defaults,
+    locking, topic_option_keys,
 };
 pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
@@ -78,6 +80,7 @@ pub use iggy_common::{
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_ID_OFFSET_RANGE,
     IGGY_MESSAGE_OFFSET_OFFSET_RANGE, IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE,
     IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE, INDEX_SIZE,
-    MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, SEC_IN_MICRO,
+    MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, NO_ASSIGNED_PARTITION,
+    RESYNC_REQUIRED_PARTITION_SENTINEL, SEC_IN_MICRO,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USER_ID, DEFAULT_ROOT_USERNAME},
 };

@@ -42,6 +42,8 @@ public final class ConsensusSession {
     private long requestCounter = 1;
     private long correlationCounter = 1;
     private boolean registerConsumed;
+    private long generation;
+    private long metadataWatermark;
 
     public ConsensusSession() {
         regenerateClientId();
@@ -52,12 +54,20 @@ public final class ConsensusSession {
      * the whole identity re-arms with a fresh client id so the server sees a
      * brand-new registration. Returns the request id a Register carries,
      * which is always zero.
+     *
+     * <p>The request counter is deliberately not rewound. This SDK multiplexes
+     * a single pinned channel and correlates replies by (operation, request
+     * id), so a send still in flight when a re-login re-arms would share its
+     * key with the first send of the new session: the correlation map would
+     * refuse the second one and a late reply for the first could be handed to
+     * it. A re-arm registers a fresh client id, which the server admits at
+     * watermark zero and which accepts any id above it, so carrying the
+     * counter forward costs nothing on the wire.
      */
     synchronized long beginRegister() {
         if (registerConsumed || session != null) {
             regenerateClientId();
             session = null;
-            requestCounter = 1;
         }
         registerConsumed = true;
         return 0;
@@ -69,19 +79,34 @@ public final class ConsensusSession {
             throw new IllegalStateException("Register reply carried a non-positive session epoch: " + sessionEpoch);
         }
         this.session = sessionEpoch;
+        generation++;
     }
 
-    /** Replicated metadata ops consume the monotonic VSR dedup counter. */
+    /**
+     * Replicated ops (metadata and partition) consume the monotonic VSR dedup
+     * counter. The wire field is a u64 but Java has no unsigned long, so the
+     * counter is refused at {@link Long#MAX_VALUE} rather than wrapping
+     * negative and sending an id below the server's watermark.
+     *
+     * <p>Exhaustion is terminal for this instance. {@link #beginRegister()}
+     * deliberately carries the counter across a re-login to keep pending-reply
+     * correlation keys unique, so reconnecting cannot rewind it; only a new
+     * client instance starts a fresh sequence.
+     */
     synchronized long nextRequestId() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
+        }
+        if (requestCounter == Long.MAX_VALUE) {
+            throw new IllegalStateException(
+                    "VSR request counter exhausted, create a fresh client instance (reconnecting preserves the counter)");
         }
         return requestCounter++;
     }
 
     /**
-     * Partition and non-replicated ops use an independent sequence for reply
-     * correlation, so they do not create gaps in the metadata dedup sequence.
+     * Non-replicated ops use an independent sequence for reply correlation,
+     * so they do not create gaps in the dedup sequence.
      */
     synchronized long nextCorrelationId() {
         return correlationCounter++;
@@ -109,6 +134,21 @@ public final class ConsensusSession {
     /** Clears the bound epoch (logout / eviction); next login re-registers. */
     synchronized void reset() {
         session = null;
+        generation++;
+    }
+
+    public synchronized long generation() {
+        return generation;
+    }
+
+    public synchronized long metadataWatermark() {
+        return metadataWatermark;
+    }
+
+    synchronized void observeMetadata(long commit) {
+        if (Long.compareUnsigned(commit, metadataWatermark) > 0) {
+            metadataWatermark = commit;
+        }
     }
 
     synchronized long clientIdLow() {

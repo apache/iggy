@@ -119,15 +119,30 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
-    public void Resolve_DoesNotConsumeAnIdForNonReplicatedOrPartitionOps()
+    public void Resolve_DoesNotConsumeAnIdForNonReplicatedOps()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
         session.Bind(10);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
-        Assert.Equal(1UL, session.Resolve(VsrOperation.SendMessages).RequestId);
         Assert.Equal(1UL, session.RequestCounter);
+    }
+
+    [Fact]
+    public void Resolve_PartitionOpsConsumeADistinctIdPerSend()
+    {
+        // Dedup identity requires each send to carry a distinct number, so
+        // partition ops advance the counter exactly like metadata ops and the
+        // two planes interleave on one sequence.
+        var session = new ConsensusSession(1);
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10);
+
+        Assert.Equal(1UL, session.Resolve(VsrOperation.SendMessages).RequestId);
+        Assert.Equal(2UL, session.Resolve(VsrOperation.SendMessages).RequestId);
+        Assert.Equal(3UL, session.Resolve(VsrOperation.CreateStream).RequestId);
+        Assert.Equal(4UL, session.RequestCounter);
     }
 
     [Fact]
