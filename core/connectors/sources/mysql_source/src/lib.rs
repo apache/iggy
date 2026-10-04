@@ -214,26 +214,16 @@ fn unusable_tracking_type(data_type: &str) -> Option<&'static str> {
     // BOOLEAN, because that width is not reliably reported: MySQL 8.0.19 and later drop
     // it for unsigned columns while MariaDB keeps it.
     if data_type.eq_ignore_ascii_case("tinyint") {
-        return Some(
-            "at most 256 distinct values cannot be unique per row, and at display width 1 MySQL \
-             spells the type BOOLEAN, which reaches the connector as true/false with no ordered \
-             scalar form",
-        );
+        return Some("it has too few distinct values to be unique per row");
     }
     if BINARY
         .iter()
         .any(|binary| data_type.eq_ignore_ascii_case(binary))
     {
-        return Some(
-            "binary values are carried as base64 text, which does not order the way the raw \
-             bytes do, and that text is what gets compared against the column",
-        );
+        return Some("binary values are compared as base64 text, which does not keep byte order");
     }
     if data_type.eq_ignore_ascii_case("enum") || data_type.eq_ignore_ascii_case("set") {
-        return Some(
-            "MySQL orders these by declaration index while only their labels reach the \
-             connector, and a bounded set of labels cannot be unique per row either",
-        );
+        return Some("MySQL orders these by declaration index, not by label");
     }
     None
 }
@@ -290,19 +280,15 @@ fn ensure_tracking_column_projected<'a>(
         return Ok(());
     }
     Err(FetchError::MissingTrackingColumn(format!(
-        "the result set has no column '{tracking_column}', it returned [{}]. Every row's cursor \
-         comes from that column, so the same rows would be re-published on every poll while the \
-         stored offset never moved.",
+        "the result set has no column '{tracking_column}', it returned [{}]",
         projected.into_iter().collect::<Vec<_>>().join(", ")
     )))
 }
 
 fn unusable_tracking_value(tracking_column: &str, pk: &str) -> FetchError {
     FetchError::UnusableTrackingValue(format!(
-        "row (pk {pk}) has no usable value for tracking_column '{tracking_column}': it is NULL, or \
-         of a type with no ordered scalar form (tinyint(1), JSON). The cursor is taken from that \
-         value, so publishing the row would advance nothing and the same rows would be re-read on \
-         every poll."
+        "row (pk {pk}) has no usable value for tracking_column '{tracking_column}': it is NULL \
+         or not an ordered scalar (tinyint(1), JSON)"
     ))
 }
 
@@ -342,17 +328,13 @@ impl<'a> OrderingGuard<'a> {
             let column = self.tracking_column;
             return Err(if self.at_cursor {
                 OrderingViolation::BelowCursor(format!(
-                    "a row arrived below the offset the poll resumed from by tracking_column \
-                     '{column}': stored offset '{previous}', first row '{value}'. Taking the \
-                     cursor from the last row would move it backwards. Filter the query on \
-                     '{column}' with $offset so a batch cannot reach behind its own cursor."
+                    "row '{value}' is below the stored offset '{previous}' for tracking_column \
+                     '{column}'. Filter the query with `{column} > $offset`"
                 ))
             } else {
                 OrderingViolation::WithinBatch(format!(
                     "rows arrived out of order by tracking_column '{column}': '{previous}' \
-                     preceded '{value}'. The cursor is taken from the last row, so it would \
-                     move backwards and rows would be skipped permanently. Order the query \
-                     ascending by '{column}'."
+                     preceded '{value}'. Order the query ascending by '{column}'"
                 ))
             });
         }
@@ -440,27 +422,19 @@ impl Source for MySqlSource {
             self.id, self.config.tables
         );
 
-        // Every poll iterates `tables`, so an empty list makes the connector a
-        // silent no-op rather than an obvious misconfiguration.
         if self.config.tables.is_empty() {
             return Err(Error::InitError(
-                "tables must not be empty. Even when custom_query hardcodes the table, list it \
-                 here: the table name supplies the offset key, the deterministic message ID, \
-                 and the table_name metadata field"
+                "tables must not be empty, list the table even when custom_query hardcodes it"
                     .to_string(),
             ));
         }
 
-        // A zero batch would make every fetch look like a full batch, so `poll`
-        // would drop its pacing sleep and spin on `LIMIT 0` queries forever.
         if self.config.batch_size == Some(0) {
             return Err(Error::InitError(
                 "batch_size must be greater than 0; omit it to use the default of 1000".to_string(),
             ));
         }
 
-        // Only when the operator owns the ORDER BY. The built query sorts ascending by
-        // construction, so a one-row batch is safe there and legitimate for a slow table.
         if self.config.batch_size == Some(1)
             && self
                 .config
@@ -469,11 +443,7 @@ impl Source for MySqlSource {
                 .is_some_and(|query| query.contains("$offset"))
         {
             return Err(Error::InitError(
-                "batch_size must be greater than 1 when custom_query filters on $offset: a \
-                 one-row batch offers no pair to compare, so the ordering check reduces to \
-                 the row against the offset it resumed from, and a query ordered descending \
-                 opens above that offset on every poll. The cursor would walk to the table's \
-                 maximum and skip every row below it with nothing reporting it"
+                "batch_size must be greater than 1 when custom_query filters on $offset"
                     .to_string(),
             ));
         }
@@ -485,15 +455,12 @@ impl Source for MySqlSource {
             .is_none_or(str::is_empty)
         {
             let guidance = if self.config.custom_query.is_some() {
-                "the connector does not parse custom_query, so it has to be told which projected \
-                 column supplies the cursor: name the one the query orders by and filters with \
-                 $offset"
+                "name the column custom_query orders by and filters with $offset"
             } else {
-                "it has to be unique and monotonically increasing under the order MySQL sorts it \
-                 in."
+                "use a unique, monotonically increasing column"
             };
             return Err(Error::InitError(format!(
-                "tracking_column must be set: every row's cursor is taken from it, and {guidance}."
+                "tracking_column must be set, {guidance}"
             )));
         }
 
@@ -670,8 +637,6 @@ impl MySqlSource {
         Ok(())
     }
 
-    /// The column every cursor is read from. `open()` refuses a config that leaves it
-    /// unset, so the fallback is unreachable in a running connector.
     fn tracking_column(&self) -> &str {
         self.config.tracking_column.as_deref().unwrap_or("id")
     }
@@ -806,13 +771,8 @@ impl MySqlSource {
             if is_collation_ordered(&data_type) {
                 warn!(
                     "tracking_column '{tracking_column}' on table '{table}' has type \
-                     '{column_type}', so its cursor is compared in the column's collation and has \
-                     to be unique and monotonically increasing in that order. Unpadded digit \
-                     strings are not: '17' sorts below '9', after which the connector idles at \
-                     the collation maximum forever. Zero-padded numbers, ULIDs and KSUIDs are. A \
-                     case- or accent-insensitive collation such as the default utf8mb4_0900_ai_ci \
-                     also breaks uniqueness, since 'ORD-1a' equals 'ORD-1A' and one of the two is \
-                     dropped, so prefer a _bin collation."
+                     '{column_type}': values must be unique and increase in its collation order \
+                     (zero-pad numbers, prefer a _bin collation)"
                 );
             }
 
@@ -947,10 +907,8 @@ impl MySqlSource {
             }
             Some(token) if !READ_STATEMENT_STARTS.contains(&token.as_str()) => {
                 return Err(Error::InitError(format!(
-                    "custom_query must be a read, but it starts with '{token}'. It is executed \
-                     once per configured table on every poll for the life of the process, so a \
-                     statement that writes would re-run forever. Start it with SELECT, WITH or \
-                     TABLE."
+                    "custom_query must be a read starting with SELECT, WITH or TABLE, found \
+                     '{token}'"
                 )));
             }
             Some(_) => {}
@@ -964,41 +922,25 @@ impl MySqlSource {
             .join(" ")
             .to_uppercase();
 
-        // Two shapes, two failures. With `$offset` the stored cursor is what limits
-        // the next poll, and it is only the batch's maximum when the rows arrive
-        // ascending, so an unordered query skips rows. Without `$offset` nothing
-        // limits the poll at all: the cursor is written but never read back, so the
-        // same rows return forever unless the rows leave the result set. Only
-        // `delete_after_read` guarantees that on its own - `processed_column` marks
-        // rows the connector never filters on outside the query it builds itself, so
-        // that arm rests on the operator's WHERE and is the weaker of the two.
         if query.contains("$offset") {
             if !normalized.contains("ORDER BY") {
                 return Err(Error::InitError(format!(
-                    "custom_query filters on $offset but has no ORDER BY. The next offset is the \
-                     tracking value of the last row returned, which is only the highest one when \
-                     the batch arrives ascending by '{tracking_column}'; without that, rows below \
-                     it are skipped permanently. Add `ORDER BY {tracking_column}`."
+                    "custom_query filters on $offset but has no ORDER BY, add \
+                     `ORDER BY {tracking_column}`"
                 )));
             }
         } else if !self.config.delete_after_read.unwrap_or(false)
             && self.config.processed_column.is_none()
         {
             return Err(Error::InitError(format!(
-                "custom_query does not filter on $offset, so every poll returns the same rows and \
-                 publishes them again. Interpolate $offset (`WHERE {tracking_column} > $offset`, \
-                 which also needs an ORDER BY), or take the rows out of the next poll by setting \
-                 delete_after_read, which deletes them, or processed_column, which marks them - \
-                 with processed_column the query has to exclude the marked rows itself, since the \
-                 connector only appends that filter to the query it builds."
+                "custom_query must filter with $offset (`WHERE {tracking_column} > $offset`), or \
+                 set delete_after_read or processed_column"
             )));
         }
 
         if query.contains("$table") && self.config.tables.is_empty() {
             return Err(Error::InitError(
-                "custom_query uses $table but no tables are configured, so the placeholder \
-                 can never resolve; list the tables to poll in `tables`"
-                    .to_string(),
+                "custom_query uses $table but no tables are configured".to_string(),
             ));
         }
         // Without $table the same SQL is executed once per table, so identical rows
@@ -1007,9 +949,8 @@ impl MySqlSource {
         // static query, so reject the combination instead of guessing one.
         if !query.contains("$table") && self.config.tables.len() > 1 {
             return Err(Error::InitError(format!(
-                "custom_query has no $table placeholder but {} tables are configured ({}); \
-                 the same query would run once per table and emit its rows multiple times. \
-                 Use $table in the query, or configure a single table.",
+                "custom_query has no $table placeholder but {} tables are configured ({}), use \
+                 $table in the query or configure a single table",
                 self.config.tables.len(),
                 self.config.tables.join(", ")
             )));
@@ -1193,16 +1134,8 @@ impl MySqlSource {
                     batches.push(batch);
                 }
                 Err(FetchError::Ordering(reason) | FetchError::MissingTrackingColumn(reason)) => {
-                    let remedy = if self.config.custom_query.is_some() {
-                        "with a corrected query"
-                    } else {
-                        "with a corrected tracking_column, since the connector wrote this query \
-                         itself"
-                    };
                     error!(
-                        "Table '{table}' at offset {}: {reason} No rows were published and the \
-                         offset was not advanced. This is deterministic, so the table is disabled \
-                         until the connector is restarted {remedy}.",
+                        "Table '{table}' at offset {}: {reason}. Table disabled until restart.",
                         last_offset.as_deref().unwrap_or("<start>")
                     );
                     newly_poisoned.push(table.clone());
@@ -1220,33 +1153,23 @@ impl MySqlSource {
                     let offset = last_offset.as_deref().unwrap_or("<start>");
                     if consecutive >= CURSOR_REGRESSION_ERROR_THRESHOLD {
                         error!(
-                            "Table '{table}' at offset {offset}: {reason} No rows were published \
-                             and the offset was not advanced. This is the {consecutive}th \
-                             consecutive poll to end this way, so it is no longer resolving on \
-                             its own: the table stays enabled but has published nothing since."
+                            "Table '{table}' at offset {offset}: {reason}. Skipping this poll \
+                             ({consecutive} consecutive polls)."
                         );
                     } else {
-                        warn!(
-                            "Table '{table}' at offset {offset}: {reason} No rows were published \
-                             and the offset was not advanced. The table stays enabled, since this \
-                             can resolve without a config change."
-                        );
+                        warn!("Table '{table}' at offset {offset}: {reason}. Skipping this poll.");
                     }
                 }
                 Err(FetchError::StaleOffsetKind(reason)) => {
                     warn!(
-                        "Table '{table}' at offset {}: {reason} No rows were published and the \
-                         offset was not advanced. The next poll rebuilds the query from the type \
-                         the result set reported.",
+                        "Table '{table}' at offset {}: {reason}. Retrying on the next poll.",
                         last_offset.as_deref().unwrap_or("<start>")
                     );
                 }
                 Err(FetchError::UnusableTrackingValue(reason)) => {
                     error!(
-                        "Table '{table}' at offset {}: {reason} No rows were published and the \
-                         offset was not advanced. The table stays enabled so a corrected row is \
-                         picked up without a restart, but nothing will be published until then - \
-                         this repeats every poll.",
+                        "Table '{table}' at offset {}: {reason}. Retrying each poll until the row \
+                         is fixed.",
                         last_offset.as_deref().unwrap_or("<start>")
                     );
                 }
@@ -1423,11 +1346,8 @@ impl MySqlSource {
                     && offset_literal_diverged(offset, query_kind, observed)
                 {
                     return Err(FetchError::StaleOffsetKind(format!(
-                        "the poll filtered on '{tracking_column}' with {}, written for the \
-                         comparison order known before this poll, but the result set reports an \
-                         order whose literal is {}. A filter that disagrees with the query's own \
-                         ordering strands rows below the cursor permanently, so the batch was \
-                         discarded.",
+                        "tracking_column '{tracking_column}' type differs from the one detected \
+                         at startup (filtered with {}, expected {}), batch discarded",
                         format_offset_value(offset, query_kind),
                         format_offset_value(offset, observed)
                     )));
@@ -2683,7 +2603,7 @@ mod tests {
         let Err(Error::InitError(message)) = result else {
             panic!("expected an InitError, got {result:?}");
         };
-        assert!(message.contains("does not parse custom_query"), "{message}");
+        assert!(message.contains("custom_query orders by"), "{message}");
     }
 
     #[test]

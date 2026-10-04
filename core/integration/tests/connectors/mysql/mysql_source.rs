@@ -520,14 +520,12 @@ async fn processed_column_source_marks_rows_after_producing(
             .await;
     }
 
-    let initial_unprocessed = fixture.count_unprocessed(&pool).await;
-    let initial_processed = fixture.count_processed(&pool).await;
+    // One query: the connector is already marking rows, so separate processed and
+    // unprocessed counts can see the same row twice.
+    let initial_count = fixture.count_rows(&pool).await;
     assert_eq!(
-        initial_unprocessed + initial_processed,
-        TEST_MESSAGE_COUNT as i64,
-        "Expected {TEST_MESSAGE_COUNT} total rows before processing, got {} unprocessed + {} processed",
-        initial_unprocessed,
-        initial_processed
+        initial_count, TEST_MESSAGE_COUNT as i64,
+        "Expected {TEST_MESSAGE_COUNT} total rows before processing, got {initial_count}"
     );
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
@@ -1038,7 +1036,7 @@ async fn first_fetch_on_an_unresolved_table_discards_a_batch_its_filter_disagree
         .collect_logs();
     let logs = format!("{stdout}{stderr}");
     assert!(
-        logs.contains("the poll filtered on 'code'"),
+        logs.contains("tracking_column 'code' type differs from the one detected at startup"),
         "Expected the first batch to be discarded for filtering on a stale comparison order"
     );
 }
@@ -1127,7 +1125,7 @@ async fn custom_query_aliasing_the_tracking_column_publishes_nothing_and_stays_d
         "Expected the error to list the columns the query actually returned"
     );
     assert!(
-        logs.contains("the table is disabled"),
+        logs.contains("Table disabled until restart"),
         "Expected the table to be disabled rather than retried, since the query cannot \
          correct itself"
     );
