@@ -278,6 +278,7 @@ class Identifier final {
 
     [[nodiscard]] ffi::Identifier ToFfi() const;
 
+    friend class Consumer;
     friend class IggyBlockingClient;
 
     Kind kind_;
@@ -780,6 +781,17 @@ class Permissions final {
  * A consumer offset belongs either to an individual consumer or to a consumer
  * group. Create a value with Single() or Group(), then pass it to the consumer
  * offset operations on IggyBlockingClient.
+ *
+ * Two callers naming the same identifier share one offset, so under
+ * PollingStrategy::Next() with auto-commit each sees only the messages the
+ * other has not read yet. Give every independent consumer its own name.
+ *
+ * @code{.cpp}
+ * const auto polled{client.PollMessages(
+ *     stream, topic, std::nullopt,
+ *     iggy::Consumer::Group(iggy::Identifier::String("my-group")),
+ *     iggy::PollingStrategy::Next(), 10, true)};
+ * @endcode
  */
 class Consumer final {
   public:
@@ -817,8 +829,11 @@ class Consumer final {
   private:
     Consumer(Kind kind, Identifier id) : kind_(kind), id_(std::move(id)) {}
 
-    [[nodiscard]] std::string_view KindName() const noexcept {
-        return kind_ == Kind::Single ? "consumer" : "consumer_group";
+    [[nodiscard]] ffi::Consumer ToFfi() const {
+        ffi::Consumer consumer{};
+        consumer.kind = kind_ == Kind::Single ? ffi::ConsumerKind::Consumer : ffi::ConsumerKind::ConsumerGroup;
+        consumer.id   = id_.ToFfi();
+        return consumer;
     }
 
     friend class IggyBlockingClient;
@@ -872,24 +887,29 @@ class ConsumerOffsetInfo final {
  * @brief Type tag for a HeaderField payload.
  *
  * Specifies how a HeaderField payload is encoded. Each field stores a type tag
- * and its corresponding bytes. Numeric payloads use little-endian byte order.
+ * and its corresponding bytes. Raw and string payloads contain between 1 and
+ * 255 bytes, and string payloads must contain valid UTF-8. A boolean is one
+ * byte containing either 0 or 1. Integers use their exact natural width and
+ * little-endian byte order; signed integers use two's-complement
+ * representation. Floating-point values use little-endian IEEE 754 binary32
+ * or binary64 representation.
  */
 enum class HeaderKind : std::uint8_t {
-    Raw     = 1,
-    String  = 2,
-    Bool    = 3,
-    Int8    = 4,
-    Int16   = 5,
-    Int32   = 6,
-    Int64   = 7,
-    Int128  = 8,
-    Uint8   = 9,
-    Uint16  = 10,
-    Uint32  = 11,
-    Uint64  = 12,
-    Uint128 = 13,
-    Float32 = 14,
-    Float64 = 15,
+    Raw     = 1,   ///< Uninterpreted byte sequence.
+    String  = 2,   ///< UTF-8 encoded text.
+    Bool    = 3,   ///< Boolean encoded as one byte: 0 for false or 1 for true.
+    Int8    = 4,   ///< One-byte signed integer.
+    Int16   = 5,   ///< Two-byte signed integer.
+    Int32   = 6,   ///< Four-byte signed integer.
+    Int64   = 7,   ///< Eight-byte signed integer.
+    Int128  = 8,   ///< Sixteen-byte signed integer.
+    Uint8   = 9,   ///< One-byte unsigned integer.
+    Uint16  = 10,  ///< Two-byte unsigned integer.
+    Uint32  = 11,  ///< Four-byte unsigned integer.
+    Uint64  = 12,  ///< Eight-byte unsigned integer.
+    Uint128 = 13,  ///< Sixteen-byte unsigned integer.
+    Float32 = 14,  ///< Four-byte IEEE 754 binary32 value.
+    Float64 = 15,  ///< Eight-byte IEEE 754 binary64 value.
 };
 
 /**
@@ -1510,6 +1530,7 @@ class PartitionContext final {
     static PartitionContext FromFfi(ffi::PartitionContext context);
 
     friend class Partition;
+    friend class PolledMessages;
     friend class IggyBlockingClient;
 
     std::uint64_t incarnation_;
@@ -2358,9 +2379,8 @@ class ClientInfoDetails final {
 /**
  * @brief Cache counters for one stream, topic, and partition.
  *
- * Stats::CacheMetrics() contains these entries when the server implementation
- * reports partition cache metrics. The current VSR server returns an empty
- * cache-metrics collection.
+ * Stats::CacheMetrics() contains these entries when partition cache metrics
+ * are available. The server returns an empty cache-metrics collection.
  */
 class CacheMetricEntry final {
   public:
@@ -2586,8 +2606,8 @@ class Stats final {
 
     /**
      * @brief Returns partition cache metrics reported by the server.
-     * @return Entries owned by this value. The current VSR server returns an
-     *         empty collection.
+     * @return Entries owned by this value. The server returns an empty
+     *         collection.
      */
     [[nodiscard]] const std::vector<CacheMetricEntry> &CacheMetrics() const noexcept { return cache_metrics_; }
 
@@ -2930,16 +2950,6 @@ enum class Durability : std::uint8_t {
     Replicated,  ///< Wait for quorum commit.
     Persisted,   ///< Wait for quorum commit backed by stable storage.
 };
-
-constexpr std::string_view to_string(const Durability durability) {
-    switch (durability) {
-        case Durability::Replicated:
-            return "replicated";
-        case Durability::Persisted:
-            return "persisted";
-    }
-    throw std::invalid_argument("Unknown durability");
-}
 
 /**
  * @brief Whether a topic's partition set may change after creation.
@@ -5821,8 +5831,8 @@ class SendMessagesConfirmation final {
  * @brief Result of a successful SendMessages() operation.
  *
  * Confirmations are returned per partition. The collection may be empty when
- * the server reports no offsets, including successful sends to a legacy
- * server. An empty collection does not mean the send failed.
+ * the server reports no offsets. An empty collection does not mean the send
+ * failed.
  */
 class SendMessagesResponse final {
   public:
@@ -5880,12 +5890,23 @@ class PolledMessages final {
      */
     [[nodiscard]] const std::vector<IggyMessagePolled> &Messages() const noexcept { return messages_; }
 
+    /**
+     * @brief Returns the partition context accepted for this poll.
+     * @return Context to pass with an offset to StoreConsumerPosition().
+     */
+    [[nodiscard]] PartitionContext Context() const noexcept { return context_; }
+
   private:
     PolledMessages(std::uint32_t partition_id,
                    std::uint64_t current_offset,
                    std::uint32_t count,
-                   std::vector<IggyMessagePolled> messages)
-        : partition_id_(partition_id), current_offset_(current_offset), count_(count), messages_(std::move(messages)) {}
+                   std::vector<IggyMessagePolled> messages,
+                   PartitionContext context)
+        : partition_id_(partition_id),
+          current_offset_(current_offset),
+          count_(count),
+          messages_(std::move(messages)),
+          context_(context) {}
 
     static PolledMessages FromFfi(ffi::PolledMessages polled);
 
@@ -5895,56 +5916,7 @@ class PolledMessages final {
     std::uint64_t current_offset_;
     std::uint32_t count_;
     std::vector<IggyMessagePolled> messages_;
-};
-
-/**
- * @brief One server-supported resource option returned by DescribeOptions().
- *
- * The default value is encoded according to Kind(), using the same HeaderKind
- * codes as typed header fields. An empty default value means that the option
- * has no default.
- */
-class OptionSpec final {
-  public:
-    /**
-     * @brief Returns the option name accepted by the resource command.
-     * @return Option key owned by this value.
-     */
-    [[nodiscard]] const std::string &Key() const noexcept { return key_; }
-
-    /**
-     * @brief Returns the HeaderKind code for the option's default value.
-     * @return Numeric code corresponding to a HeaderKind enumerator.
-     */
-    [[nodiscard]] std::uint8_t Kind() const noexcept { return kind_; }
-
-    /**
-     * @brief Returns the server default encoded according to Kind().
-     * @return Encoded default value, or an empty vector when none is defined.
-     */
-    [[nodiscard]] const std::vector<std::uint8_t> &DefaultValue() const noexcept { return default_value_; }
-
-    /**
-     * @brief Returns the server-provided option description.
-     * @return Human-readable description owned by this value.
-     */
-    [[nodiscard]] const std::string &Description() const noexcept { return description_; }
-
-  private:
-    OptionSpec(std::string key, std::uint8_t kind, std::vector<std::uint8_t> default_value, std::string description)
-        : key_(std::move(key)),
-          kind_(kind),
-          default_value_(std::move(default_value)),
-          description_(std::move(description)) {}
-
-    static OptionSpec FromFfi(ffi::OptionSpec spec);
-
-    friend class IggyBlockingClient;
-
-    std::string key_;
-    std::uint8_t kind_;
-    std::vector<std::uint8_t> default_value_;
-    std::string description_;
+    PartitionContext context_;
 };
 
 /**
@@ -6674,9 +6646,9 @@ class IggyBlockingClient final {
      * The group name must be unique within the topic, non-empty, and no more
      * than 255 UTF-8 bytes. The new group initially has no members.
      *
-     * The VSR server assigns consumer group IDs monotonically. Deleting a
-     * group and recreating it with the same name is allowed, but the recreated
-     * group receives a new ID rather than reusing the deleted group's ID.
+     * The server assigns consumer group IDs monotonically. Deleting a group
+     * and recreating it with the same name is allowed, but the recreated group
+     * receives a new ID rather than reusing the deleted group's ID.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
@@ -6712,10 +6684,9 @@ class IggyBlockingClient final {
      * The summaries include member and partition counts but omit individual
      * member details. Use GetConsumerGroup() to retrieve those details.
      *
-     * The VSR server reports a missing parent stream or topic as an error. This
-     * differs from the legacy server, which returned an empty list, so an empty
-     * result does not establish whether the parent resources exist across
-     * server implementations.
+     * The server reports a missing parent stream or topic as an error. An empty
+     * result means both parent resources existed when the request was
+     * evaluated.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
@@ -7072,8 +7043,7 @@ class IggyBlockingClient final {
      *
      * The catalog describes accepted create-option keys, their HeaderKind
      * encodings, defaults, and descriptions. A supported scope with no option
-     * keys returns an empty collection. This is currently the case for the
-     * `stream` and `user` scopes.
+     * keys returns an empty collection.
      *
      * @param scope Resource scope. Must be `topic`, `stream`, or `user`.
      * @return Option specifications for the requested scope.
