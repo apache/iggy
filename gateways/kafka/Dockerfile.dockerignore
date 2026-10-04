@@ -15,31 +15,34 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "bench-dashboard-frontend"
-license = "Apache-2.0"
-version = "0.8.1-edge.1"
-edition = "2024"
-publish = false
-
-[package.metadata.cargo-machete]
-ignored = ["getrandom"]
-
-[dependencies]
-bench-dashboard-shared = { workspace = true }
-bench-report = { workspace = true }
-charming = { workspace = true, features = ["wasm"] }
-chrono = { workspace = true }
-getrandom = { workspace = true }
-gloo = { workspace = true }
-js-sys = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true, features = ["js"] }
-wasm-bindgen = { workspace = true }
-web-sys = { workspace = true }
-yew = { workspace = true }
-yew-router = { workspace = true }
-
-[lints]
-workspace = true
+# This image only. Root .dockerignore must keep .git so the server image
+# can stamp vergen git metadata. This file replaces the root ignore file
+# for gateways/kafka/Dockerfile.
+.git
+.config
+.dockerignore
+.github
+.gitignore
+.idea
+.vscode
+.zed
+/assets
+/core/certs
+/helm
+/licenses
+/local_data
+/performance_results
+# Selectively exclude scripts/ subdirs not needed in container builds.
+# scripts/ci/third-party-licenses.sh + render-node-licenses.mjs are
+# required by the convenience-binary Dockerfiles to render LICENSE-binary
+# at build time.
+/scripts/dashboard
+/scripts/performance
+/scripts/*.sh
+/scripts/ci/*
+!/scripts/ci/third-party-licenses.sh
+!/scripts/ci/render-node-licenses.mjs
+**/target
+/target
+/web/node_modules
+/web/dist

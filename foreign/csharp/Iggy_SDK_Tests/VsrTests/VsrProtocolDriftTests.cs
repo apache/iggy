@@ -159,9 +159,10 @@ public sealed class VsrProtocolDriftTests
         var declared = Regex.Match(manifest, @"^version\s*=\s*""(\d+)\.(\d+)\.(\d+)", RegexOptions.Multiline);
 
         Assert.True(declared.Success, "iggy_binary_protocol no longer declares a semver version.");
+        // Patch releases never change the wire and the server accepts any patch of its own major.minor,
+        // so the patch is not pinned.
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MAJOR, Group(declared, 1));
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MINOR, Group(declared, 2));
-        Assert.Equal(LoginRegister.PROTOCOL_VERSION_PATCH, Group(declared, 3));
     }
 
     /// <summary>
