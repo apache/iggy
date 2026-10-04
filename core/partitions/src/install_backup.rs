@@ -24,7 +24,7 @@ use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMod
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
 
-use crate::CREATED_REVISION_FILE;
+use crate::{CREATED_REVISION_FILE, FILE_SYNC_CONCURRENCY};
 
 const BACKUP: &str = ".install-backup";
 const BUILDING: &str = ".install-building";
@@ -172,7 +172,7 @@ async fn link_tree<S: DurableStorage>(
         }
     }
     futures::stream::iter(files_to_sync.into_iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(16, |destination| async move {
+        .try_for_each_concurrent(FILE_SYNC_CONCURRENCY, |destination| async move {
             storage
                 .open(&destination, OpenMode::Read)
                 .await?

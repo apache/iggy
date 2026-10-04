@@ -77,6 +77,9 @@ pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
 
 /// Shipped per-kind durable consumer-offset limit for one partition.
 pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
+
+pub(crate) const FILE_SYNC_CONCURRENCY: usize = 16;
+
 pub use iggy_partition::{PollCompletion, PollReplication};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;

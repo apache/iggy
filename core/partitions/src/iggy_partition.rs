@@ -23313,7 +23313,7 @@ mod tests {
         let wal = directory.path().join("wal");
         let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
         let messages_writer =
-            MessagesWriter::new(DEV_FULL, Rc::new(AtomicU64::new(0)), false, false, None)
+            MessagesWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), false, false, None)
                 .await
                 .unwrap();
         let index_path = directory.path().join("segment.index");
