@@ -727,9 +727,40 @@ where
             && !self.requires_state_transfer()
             && self.consensus.is_normal()
             && !self.consensus.is_transferring()
-            && self.consensus.commit_min() == self.consensus.commit_max()
+            && self.consensus.pending_request(identity.client_id).is_none()
             && self.required_metadata_frontier >= identity.metadata_watermark
             && self.dedup.get_epoch(identity.client_id) != Some(identity.session)
+    }
+
+    fn pending_session_retirement(&self, client_id: u128, session: u64) -> bool {
+        let matches_identity = |body: &[u8]| {
+            SessionIdentity::decode_from(body).is_ok_and(|identity| {
+                identity.client_id == client_id && identity.session == session
+            })
+        };
+        self.consensus.with_pipeline(|pipeline| {
+            pipeline.pending_requests().any(|entry| {
+                entry.message.header().operation == Operation::RetireSession
+                    && matches_identity(entry.message.body())
+            }) || pipeline.prepare_head().is_some_and(|head| {
+                let tail = pipeline.prepare_tail().expect("pipeline head implies tail");
+                (head.header.op..=tail.header.op).any(|op| {
+                    pipeline.message_by_op(op).is_some_and(|entry| {
+                        entry.header.operation == Operation::RetireSession
+                            && self
+                                .log
+                                .journal()
+                                .inner
+                                .repair_entry(op)
+                                .is_none_or(|prepare| {
+                                    matches_identity(
+                                        &prepare.as_slice()[iggy_binary_protocol::HEADER_SIZE..],
+                                    )
+                                })
+                    })
+                })
+            })
+        })
     }
 
     /// Seed [`Self::applied_purge_generation`] from the partition dir's
@@ -4484,6 +4515,38 @@ where
                     message.header(),
                     error.as_code(),
                     "oversized prepare rejection failed",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+
+            // Retirement and the retiring identity must never occupy the same
+            // pipeline. Otherwise a later commit could recreate its receipt.
+            let retirement_conflict = if message.header().operation == Operation::RetireSession {
+                let Ok(identity) = SessionIdentity::decode_from(message.body()) else {
+                    Self::send_partition_deny_or_log(
+                        consensus,
+                        message.header(),
+                        IggyError::InvalidCommand.as_code(),
+                        "invalid retirement reply failed",
+                        reply.take(),
+                    )
+                    .await;
+                    return;
+                };
+                consensus.pending_request(identity.client_id).is_some()
+                    || self.pending_session_retirement(identity.client_id, identity.session)
+            } else {
+                !is_auto_commit_client(client_id)
+                    && self.pending_session_retirement(client_id, message.header().session)
+            };
+            if retirement_conflict {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "session retirement admission reply failed",
                     reply.take(),
                 )
                 .await;
@@ -9443,6 +9506,10 @@ mod tests {
             .set_last_prepare_checksum(inflight.header().checksum);
         origin.consensus().advance_commit_max(1);
         origin.consensus().advance_commit_min(1);
+        origin
+            .dedup_mut()
+            .commit_capacity(usize::try_from(committed.header().retry_capacity).unwrap())
+            .unwrap();
         // Retention can remove all polled segments while the repair ring still
         // serves the checkpoint prepare and the primary keeps accepting writes.
         origin.offset_space.committed_seeded = true;
@@ -9454,6 +9521,7 @@ mod tests {
 
         let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
         let offsets = crate::state_transfer::ConsumerOffsetsWire::decode(&offer.offsets.1).unwrap();
+        assert_eq!(offsets.dedup_capacity, origin.dedup().capacity());
         assert_eq!(offsets.prepare_checksum, Some(committed.header().checksum));
         assert_eq!(offsets.checkpoint_prepare, committed.as_slice());
         let (mut receiver, _) = recording_partition_at(1, 3);
@@ -10319,6 +10387,29 @@ mod tests {
         assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
     }
 
+    fn retire_session_request(
+        namespace: IggyNamespace,
+        identity: SessionIdentity,
+    ) -> Message<RoutedRequestHeader> {
+        let body = identity.to_bytes();
+        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size).transmute_header(
+            |_, header: &mut RoutedRequestHeader| {
+                header.command = Command::Request;
+                header.operation = Operation::RetireSession;
+                header.cluster = TEST_CLUSTER;
+                header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                header.session = 1;
+                header.request = identity.metadata_watermark;
+                header.metadata_watermark = identity.metadata_watermark;
+                header.group = namespace.inner();
+                header.size = u32::try_from(size).unwrap();
+            },
+        );
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        request
+    }
+
     #[compio::test]
     async fn given_interleaved_sends_and_retirements_when_committing_should_preserve_live_receipts()
     {
@@ -10335,44 +10426,46 @@ mod tests {
             send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
                 .copy_from_slice(&build_segment_record(partition.namespace(), 0));
             partition.on_request(send, None).await;
-            if client_id == CLIENTS {
-                continue;
-            }
+        }
+        partition
+            .consensus
+            .advance_commit_max(u64::try_from(CLIENTS).unwrap());
+        partition.commit_journal(&repair_config()).await;
+        for client_id in 1..CLIENTS {
             let identity = SessionIdentity {
                 client_id,
                 session: 1,
                 metadata_watermark: ENDING_FRONTIER + u64::try_from(client_id).unwrap(),
             };
-            let body = identity.to_bytes();
-            let size = size_of::<RoutedRequestHeader>() + body.len();
-            let mut retire = Message::<RoutedRequestHeader>::new(size).transmute_header(
-                |_, header: &mut RoutedRequestHeader| {
-                    header.command = Command::Request;
-                    header.operation = Operation::RetireSession;
-                    header.cluster = TEST_CLUSTER;
-                    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
-                    header.session = 1;
-                    header.request = identity.metadata_watermark;
-                    header.metadata_watermark = identity.metadata_watermark;
-                    header.group = partition.consensus.group();
-                    header.size = u32::try_from(size).unwrap();
-                },
-            );
-            retire.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
-            partition.on_request(retire, None).await;
+            partition
+                .on_request(
+                    retire_session_request(partition.namespace(), identity),
+                    None,
+                )
+                .await;
+            if client_id == 1 {
+                let mut send = checksumless_send_request(partition.namespace(), 1)
+                    .transmute_header(|header, next: &mut RoutedRequestHeader| {
+                        *next = header;
+                        next.client = CLIENTS;
+                        next.request = 2;
+                    });
+                send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                    .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+                partition.on_request(send, None).await;
+            }
         }
-        let committed_op = u64::try_from(CLIENTS * 2 - 1).unwrap();
-        assert_eq!(
-            partition.consensus.pipeline_len(),
-            usize::try_from(committed_op).unwrap()
-        );
+        let committed_op = u64::try_from(CLIENTS * 2).unwrap();
         partition.consensus.advance_commit_max(committed_op);
         partition.commit_journal(&repair_config()).await;
         assert!(partition.fatal.is_none(), "{:?}", partition.fatal);
         assert_eq!(partition.consensus.commit_min(), committed_op);
         assert_eq!(partition.dedup.count(), 1);
         assert!(partition.dedup.contains(CLIENTS));
-        assert_eq!(replies.borrow().len(), usize::try_from(CLIENTS).unwrap());
+        assert_eq!(
+            replies.borrow().len(),
+            usize::try_from(CLIENTS + 1).unwrap()
+        );
         for client_id in 1..CLIENTS {
             assert!(partition.session_retired(SessionIdentity {
                 client_id,
@@ -10380,6 +10473,121 @@ mod tests {
                 metadata_watermark: ENDING_FRONTIER + u64::try_from(client_id).unwrap(),
             }));
         }
+    }
+
+    #[compio::test]
+    async fn retirement_excludes_pending_target_writes_and_reports_during_unrelated_commits() {
+        const ENDING_FRONTIER: u64 = 10;
+        let (mut partition, replies) = recording_partition_at(0, 3);
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: ENDING_FRONTIER,
+        };
+        let mut send = checksumless_send_request(partition.namespace(), 1);
+        send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+        partition.on_request(send.clone(), None).await;
+        partition
+            .on_request(
+                retire_session_request(partition.namespace(), identity),
+                None,
+            )
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            1,
+            "retirement must wait for the target write"
+        );
+        partition.consensus.advance_commit_max(1);
+        partition.commit_journal(&repair_config()).await;
+        partition
+            .on_request(
+                retire_session_request(partition.namespace(), identity),
+                None,
+            )
+            .await;
+        let retry = send
+            .clone()
+            .transmute_header(|header, next: &mut RoutedRequestHeader| {
+                *next = header;
+                next.request = 2;
+            });
+        partition.on_request(retry, None).await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            2,
+            "target write must wait for its retirement"
+        );
+        let rejected = *bytemuck::checked::from_bytes::<ReplyHeader>(
+            &replies.borrow().last().unwrap().1.as_slice()[..size_of::<ReplyHeader>()],
+        );
+        assert_eq!(rejected.status, IggyError::TransientNotAccepted.as_code());
+        partition.consensus.advance_commit_max(2);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(partition.dedup.count(), 0);
+        let unrelated = send.transmute_header(|header, next: &mut RoutedRequestHeader| {
+            *next = header;
+            next.client = 2;
+            next.metadata_watermark = ENDING_FRONTIER;
+        });
+        partition.on_request(unrelated, None).await;
+        partition.consensus.advance_commit_max(3);
+        assert_eq!(partition.consensus.commit_min(), 2);
+        assert!(
+            partition.session_retired(identity),
+            "unrelated commits must not block the completed retirement"
+        );
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(partition.dedup.count(), 1);
+        assert!(!partition.dedup.contains(identity.client_id));
+    }
+
+    #[compio::test]
+    async fn queued_retirement_excludes_a_later_target_write() {
+        let (mut partition, replies) =
+            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 4));
+        let mut unrelated = checksumless_send_request(partition.namespace(), 1).transmute_header(
+            |header, next: &mut RoutedRequestHeader| {
+                *next = header;
+                next.client = 2;
+            },
+        );
+        unrelated.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+        partition.on_request(unrelated, None).await;
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 10,
+        };
+        partition
+            .on_request(
+                retire_session_request(partition.namespace(), identity),
+                None,
+            )
+            .await;
+        assert_eq!(
+            partition
+                .consensus
+                .with_pipeline(LocalPipeline::request_queue_len),
+            1
+        );
+        let mut target = checksumless_send_request(partition.namespace(), 1);
+        target.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+        partition.on_request(target, None).await;
+        assert_eq!(
+            partition
+                .consensus
+                .with_pipeline(LocalPipeline::request_queue_len),
+            1,
+            "target cannot queue behind its retirement"
+        );
+        let rejected = *bytemuck::checked::from_bytes::<ReplyHeader>(
+            &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
+        );
+        assert_eq!(rejected.status, IggyError::TransientNotAccepted.as_code());
     }
 
     #[compio::test]
@@ -11063,6 +11271,78 @@ mod tests {
             .consensus()
             .restore_commit_state(through, through);
         checkpoint.persist_retry_checkpoint(through).await.unwrap();
+    }
+
+    #[compio::test]
+    async fn receipt_checkpoint_excludes_consumer_offsets_and_restores_retry_protection() {
+        const CHECKPOINT_OP: u64 = 1;
+        const METADATA_FRONTIER: u64 = 17;
+        const CLIENT: u128 = 42;
+        const SESSION: u64 = 4;
+        const CONSUMER_ID: u32 = 7;
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        std::fs::create_dir(directory.path().join("prepares-0")).unwrap();
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, CONSUMER_ID, 10, 10);
+        partition.consumer_offsets.pin().insert(
+            CONSUMER_ID as usize,
+            ConsumerOffset::new(ConsumerKind::Consumer, CONSUMER_ID, 10, String::new()),
+        );
+        partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, CONSUMER_ID, 11, 11);
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(CONSUMER_ID as usize),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, CONSUMER_ID, 11, String::new()),
+        );
+        partition.required_metadata_frontier = METADATA_FRONTIER;
+        partition
+            .dedup_mut()
+            .commit_capacity(consensus::PARTITION_DEDUP_CLIENTS_MAX)
+            .unwrap();
+        let reply = consensus::build_reply_message(
+            &PrepareHeader {
+                client: CLIENT,
+                request: 1,
+                session: SESSION,
+                op: CHECKPOINT_OP,
+                operation: Operation::StoreConsumerOffset,
+                ..Default::default()
+            },
+            &Bytes::new(),
+        );
+        partition
+            .dedup_mut()
+            .commit_partition_reply(1, SESSION, reply)
+            .unwrap();
+        partition
+            .consensus()
+            .restore_commit_state(CHECKPOINT_OP, CHECKPOINT_OP);
+        let path = partition
+            .persist_retry_checkpoint(CHECKPOINT_OP)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let content = consensus::le_cursor::split_verified_trailer(&bytes).unwrap();
+        let mut cursor = consensus::le_cursor::LeCursor::new(content);
+        cursor.take(size_of::<[u8; 4]>()).unwrap();
+        assert_eq!(cursor.u64().unwrap(), partition.consensus().group());
+        assert_eq!(cursor.u64().unwrap(), partition.created_revision);
+        assert_eq!(cursor.u64().unwrap(), CHECKPOINT_OP);
+        let wire = crate::state_transfer::ConsumerOffsetsWire::decode(cursor.remaining()).unwrap();
+        assert!(wire.consumers.is_empty() && wire.groups.is_empty());
+        assert!(wire.checkpoint_prepare.is_empty());
+        assert_eq!(wire.required_metadata_frontier, METADATA_FRONTIER);
+        let mut recovered = test_partition();
+        recovered.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        recovered
+            .restore_retry_checkpoint(CHECKPOINT_OP)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.dedup().watermarks_sorted(),
+            partition.dedup().watermarks_sorted()
+        );
+        assert_eq!(recovered.required_metadata_frontier, METADATA_FRONTIER);
     }
 
     #[compio::test]

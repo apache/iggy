@@ -583,27 +583,30 @@ async fn load_partition(
     // recovered message timestamp here, or an NTP rewind across a restart could
     // regress persisted `base_timestamp`.
 
+    let wal_directory =
+        Path::new(&partition_dir).join(format!("prepares-{}", partition_metadata.created_revision));
+    let wal_error = |source: std::io::Error| match source.kind() {
+        std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::NotFound => {
+            ServerError::PartitionRecovery(PartitionRecoveryError::Refused {
+                dir: PathBuf::from(&partition_dir),
+                stream_id: namespace.stream_id(),
+                topic_id: namespace.topic_id(),
+                partition_id: namespace.partition_id(),
+                reason: PartitionRecoveryRefusal::PrepareWal {
+                    directory: wal_directory.clone(),
+                    source,
+                },
+            })
+        }
+        _ => ServerError::PartitionPrepareWalIo {
+            dir: wal_directory.clone(),
+            source,
+        },
+    };
     let recovered_persistence = {
-        let directory = Path::new(&partition_dir)
-            .join(format!("prepares-{}", partition_metadata.created_revision));
-        let wal_error = |source: std::io::Error| match source.kind() {
-            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-                ServerError::PartitionRecovery(PartitionRecoveryError::Refused {
-                    dir: PathBuf::from(&partition_dir),
-                    stream_id: namespace.stream_id(),
-                    topic_id: namespace.topic_id(),
-                    partition_id: namespace.partition_id(),
-                    reason: PartitionRecoveryRefusal::PrepareWal {
-                        directory: directory.clone(),
-                        source,
-                    },
-                })
-            }
-            _ => ServerError::PartitionPrepareWalIo {
-                dir: directory.clone(),
-                source,
-            },
-        };
+        let directory = wal_directory.clone();
         if replica_count == 1
             && !journal::PartitionPrepareJournal::has_published_frontier(&directory)
                 .await
@@ -633,7 +636,7 @@ async fn load_partition(
                 .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
         )
         .await
-        .map_err(wal_error)?;
+        .map_err(&wal_error)?;
         if let Some(log_view) = persistence.certified_log_view()
             && log_view != 0
             && log_view < partition_metadata.created_view
@@ -667,11 +670,7 @@ async fn load_partition(
     partition
         .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
         .await
-        .map_err(|source| ServerError::PartitionPrepareWalIo {
-            dir: Path::new(&partition_dir)
-                .join(format!("prepares-{}", partition_metadata.created_revision)),
-            source,
-        })?;
+        .map_err(wal_error)?;
     let recovered_segments = recover_partition_segments(
         partitions_config,
         namespace,
@@ -1162,7 +1161,8 @@ mod tests {
     use configs::server::ServerConfig;
     use consensus::Sequencer;
     use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
-    use iggy_binary_protocol::{Command, Operation, PrepareHeader};
+    use iggy_binary_protocol::requests::system::SessionIdentity;
+    use iggy_binary_protocol::{Command, Operation, PrepareHeader, WireEncode};
     use journal::DurableAppend;
     use journal::superblock::SuperblockStore;
     use partitions::PartitionPathLayout;
@@ -1703,6 +1703,76 @@ mod tests {
                 .unwrap();
             assert_eq!(journal.certified_log_view(), Some(LOG_VIEW));
             assert_eq!(journal.head(), 1);
+        }
+    }
+
+    #[compio::test]
+    async fn missing_or_corrupt_retry_checkpoints_fence_only_the_partition() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for checkpoint in [None, Some(b"corrupt receipt checkpoint".as_slice())] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            drop(build_solo_partition(&config).await.unwrap());
+            let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+            let wal = directory.join("prepares-0");
+            let mut journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+                .await
+                .unwrap();
+            let identity = SessionIdentity {
+                client_id: 1,
+                session: 1,
+                metadata_watermark: 2,
+            };
+            let body = identity.to_bytes();
+            let total = size_of::<PrepareHeader>() + body.len();
+            let mut prepare = Message::<PrepareHeader>::new(total);
+            prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+            let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::RetireSession;
+                header.cluster = CLUSTER;
+                header.group = namespace.inner();
+                header.op = 1;
+                header.retry_capacity = u32::try_from(config.partition.dedup_clients_max).unwrap();
+                header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                header.session = 1;
+                header.request = identity.metadata_watermark;
+                header.size = u32::try_from(total).unwrap();
+                header.checksum = header.identity_checksum();
+            });
+            journal.append(prepare.into_frozen()).await.unwrap();
+            journal.checkpoint(1).await.unwrap();
+            drop(journal);
+            if let Some(checkpoint) = checkpoint {
+                std::fs::write(wal.join("receipts-1.checkpoint"), checkpoint).unwrap();
+            }
+            let partitions = solo_partitions(&config);
+            let outcome = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                1,
+                false,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap();
+            assert!(
+                outcome.is_none(),
+                "unusable retry protection must refuse this partition"
+            );
+            assert!(wal.exists(), "refusal must retain the WAL evidence");
+            if let Some(checkpoint) = checkpoint {
+                assert_eq!(
+                    std::fs::read(wal.join("receipts-1.checkpoint")).unwrap(),
+                    checkpoint
+                );
+            }
         }
     }
 

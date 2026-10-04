@@ -70,9 +70,10 @@ use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     EvictionReason, GenericHeader, Operation, RequestHeader, RoutedRequestHeader,
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use metadata::impls::metadata::StreamsFrontend;
 use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::RefCell;
@@ -100,43 +101,9 @@ type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHea
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<AHashSet<u128>>>;
 
-// Session resume is performed BY THE LOGIN PATH, not by a separate
-// credential-free rebind.
-//
-// A reconnecting client re-authenticates on the new connection and presents
-// its previous `client_id` in the login frame; `submit_register_in_process`
-// finds the existing table entry, verifies the authenticated user owns it,
-// and returns its epoch, so `bind_session` binds the new transport to the
-// old entry with its watermark and reply ring intact. That IS the resume.
-//
-// An earlier revision instead rebound an *unbound* transport straight from
-// the table whenever a replicated frame carried a matching
-// `(client, session)`, treating that pair as a bearer token. That was wrong
-// in four ways, and the combination was a pre-auth session takeover:
-//
-//   - it called `SessionManager::login` itself, so no credential was ever
-//     presented, and the connection was logged in as the entry's cached
-//     `user_id`; authority for replicated ops then resolves from the table
-//     (`resolve_acting_user_id`) and for partition ops from the session
-//     manager, so BOTH planes ran as the original registrant;
-//   - the pair carries far less entropy than "client-generated random
-//     u128" implies: HTTP mints `client_id` from a per-boot nonce and the
-//     shard-0 sequential counter (`mint_shard_zero_client_id`) and the epoch
-//     is a metadata commit position, so neither value is an authentication
-//     secret;
-//   - `ClientEntry` carries no transport or plane tag, so a raw TCP peer
-//     could bind an HTTP-originated session;
-//   - `bind_session` demotes the evicted holder to `Connected`, the one
-//     state `login` accepts, so the loser's next replicated frame
-//     re-resumed and stole the session back, unbounded and with no eviction
-//     frame either way.
-//
-// Routing resume through login also restores the checks that path owns:
-// password / PAT verification, `UserStatus::Active`, PAT expiry, the
-// protocol-version gate, and SDK-info recording.
-//
-// An unbound transport sending a replicated frame therefore gets the typed
-// `Eviction(NoSession)` fail-fast below and must log in.
+// BindSession authenticates with the registered secret, never with the
+// public client id and epoch alone. It retains the original retry identity;
+// unbound replicated frames still fail with Eviction(NoSession).
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_client_request<B, MJ, S, SB>(
@@ -643,6 +610,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 transport_client_id,
                 user_id,
                 consumer_session,
+                None,
             )
             .await;
         }
@@ -836,6 +804,15 @@ where
             Either::Right(_) => return Err(IggyError::TransientNotAccepted),
         }
     };
+    let active_user = shard.plane.metadata().mux_stm.users().read(|users| {
+        users
+            .items
+            .get(user_id as usize)
+            .is_some_and(|user| user.status == UserStatus::Active)
+    });
+    if !active_user {
+        return Err(IggyError::Unauthenticated);
+    }
     sessions.borrow_mut().bind_authenticated_connection(
         transport_client_id,
         identity.client_id,
@@ -852,15 +829,22 @@ mod tests {
     use super::*;
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::host::ServerHost;
-    use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestMux, TestShard, test_shard};
+    use crate::dispatch::test_support::{
+        FIRST_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply, test_shard,
+    };
+    use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::requests::users::UpdateUserRequest;
     use iggy_binary_protocol::{EvictionHeader, ReplyHeader};
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireOptions};
     use journal::prepare_journal::PrepareJournal;
+    use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::StateMachine;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::ShardId;
@@ -873,6 +857,79 @@ mod tests {
     };
     use std::mem::size_of;
     use std::sync::atomic::AtomicBool;
+
+    #[compio::test]
+    async fn bind_session_rechecks_the_owner_exists_and_is_active() {
+        const CLIENT: u128 = 1;
+        const TRANSPORT: u128 = 2;
+        const SESSION: u64 = 1;
+        const SECRET: [u8; 32] = [0x5a; 32];
+        for status in [None, Some(UserStatus::Inactive), Some(UserStatus::Active)] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let metadata = shard.plane.metadata();
+            if let Some(status) = status {
+                metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+                metadata
+                    .mux_stm
+                    .update(prepare_message(
+                        Operation::UpdateUser,
+                        CLIENT,
+                        SESSION,
+                        &UpdateUserRequest {
+                            user_id: WireIdentifier::numeric(0),
+                            username: None,
+                            status: Some(status.as_code()),
+                            options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                    ))
+                    .unwrap();
+            }
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(
+                    CLIENT,
+                    0,
+                    bind_verifier(CLIENT, 0, &SECRET),
+                    register_reply(CLIENT, SESSION),
+                )
+                .unwrap();
+            metadata.applied_frontier().advance(SESSION);
+            let sessions = Rc::new(RefCell::new(SessionManager::new()));
+            sessions.borrow_mut().ensure_connection(
+                TRANSPORT,
+                "127.0.0.1:34567".parse().unwrap(),
+                ClientTransportKind::Tcp,
+            );
+            let outcome = complete_session_binding(
+                &shard,
+                &sessions,
+                TRANSPORT,
+                SessionIdentity {
+                    client_id: CLIENT,
+                    session: SESSION,
+                    metadata_watermark: SESSION,
+                },
+                BindSecret::new(Box::new(SECRET)),
+            )
+            .await;
+            if status == Some(UserStatus::Active) {
+                assert_eq!(outcome.unwrap(), (0, SESSION));
+                assert_eq!(
+                    sessions.borrow().get_session(TRANSPORT),
+                    Some((CLIENT, SESSION))
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(IggyError::Unauthenticated)),
+                    "{status:?}: {outcome:?}"
+                );
+                assert!(sessions.borrow().get_session(TRANSPORT).is_none());
+            }
+        }
+    }
 
     /// A test shard wired to its own lanes (the held sender feeds them),
     /// for the reply-lane pump tests below.

@@ -447,7 +447,7 @@ impl ConsumerOffsetsWire {
         let group_count = cursor.u32()?;
         let external_group_count = cursor.u32()?;
         let dedup_count = cursor.u32()?;
-        if dedup_capacity == 0 || dedup_capacity > CLIENTS_TABLE_SLOT_MAX {
+        if dedup_capacity > CLIENTS_TABLE_SLOT_MAX {
             return Err(ConsumerOffsetsWireError::InvalidCapacity);
         }
         if dedup_count as usize > dedup_capacity {
@@ -826,6 +826,28 @@ mod tests {
             latest_commit,
             committed_window: 0b1011,
         }
+    }
+
+    #[test]
+    fn given_zero_frontier_transfer_when_capacity_is_uncommitted_should_keep_local_limit() {
+        const LOCAL_CAPACITY: usize = 2;
+        const FIRST_COMMITTED_CAPACITY: usize = 3;
+        let wire = ConsumerOffsetsWire {
+            dedup_capacity: 0,
+            ..Default::default()
+        };
+        let decoded = ConsumerOffsetsWire::decode(&wire.encode()).unwrap();
+        let mut restored = checked_retry_table(&decoded, 0, LOCAL_CAPACITY).unwrap();
+        assert!(!restored.capacity_committed());
+        assert_eq!(restored.capacity(), LOCAL_CAPACITY);
+        restored.commit_capacity(FIRST_COMMITTED_CAPACITY).unwrap();
+        assert_eq!(restored.capacity(), FIRST_COMMITTED_CAPACITY);
+        assert!(checked_retry_table(&decoded, 1, LOCAL_CAPACITY).is_err());
+        let with_receipt = ConsumerOffsetsWire {
+            dedup: vec![dedup_entry(1, 1, 1)],
+            ..wire
+        };
+        assert!(ConsumerOffsetsWire::decode(&with_receipt.encode()).is_err());
     }
 
     #[test]
@@ -2314,7 +2336,7 @@ where
         // frontier 0 claim a history that neither replica holds.
         // `install_state_transfer`'s `purge_advances` check re-decides the purge
         // against the metadata plane and refuses the rest.
-        let offsets_wire = self.offsets_wire_snapshot(true)?;
+        let offsets_wire = self.offsets_wire_snapshot()?;
         if segments.is_empty()
             && offsets_wire.next_offset == 0
             && offsets_wire.purge_generation == 0
@@ -2496,10 +2518,7 @@ where
     /// Snapshot committed durable offsets only. Eager auto-commit progress and
     /// follower-local cursor entries stay in the live maps until a replicated
     /// store commits them, so neither can be promoted by state transfer.
-    fn offsets_wire_snapshot(
-        &self,
-        require_prepare: bool,
-    ) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
+    fn offsets_wire_snapshot(&self) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
         self.validate_consumer_offset_transfer_counts()?;
         let consumer_map = self.consumer_offsets.pin();
         let consumers = self.snapshot_offset_kind(ConsumerKind::Consumer, |id| {
@@ -2535,24 +2554,24 @@ where
                         .then(|| self.consensus().last_prepare_checksum())
                 })
         };
-        let checkpoint_prepare = if require_prepare {
-            self.log
-                .journal()
-                .inner
-                .repair_entry(commit_op)
-                .map_or_else(Vec::new, |prepare| prepare.as_slice().to_vec())
-        } else {
-            Vec::new()
-        };
-        if require_prepare
-            && self.persistence.is_some()
+        let checkpoint_prepare = self
+            .log
+            .journal()
+            .inner
+            .repair_entry(commit_op)
+            .map_or_else(Vec::new, |prepare| prepare.as_slice().to_vec());
+        if self.persistence.is_some()
             && (prepare_checksum.is_none() || (commit_op > 0 && checkpoint_prepare.is_empty()))
         {
             return Err(PartitionTransferUnavailable::MissingPrepareChecksum { op: commit_op });
         }
         Ok(ConsumerOffsetsWire {
             required_metadata_frontier: self.required_metadata_frontier,
-            dedup_capacity: self.dedup().capacity(),
+            dedup_capacity: if self.dedup().capacity_committed() {
+                self.dedup().capacity()
+            } else {
+                0
+            },
             checkpoint_prepare,
             prepare_checksum,
             purge_generation: self.applied_purge_generation,
@@ -2591,7 +2610,7 @@ where
     pub(crate) fn offsets_wire_snapshot_for_test(
         &self,
     ) -> Result<Vec<(u32, u64)>, PartitionTransferUnavailable> {
-        self.offsets_wire_snapshot(true).map(|wire| wire.consumers)
+        self.offsets_wire_snapshot().map(|wire| wire.consumers)
     }
 
     /// Validate one completed `SEGMENT_LOG` artifact and spill it to staging
@@ -2843,7 +2862,7 @@ where
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
-        let retry_table = checked_retry_table(&offsets_wire, commit_op)
+        let retry_table = checked_retry_table(&offsets_wire, commit_op, self.dedup().capacity())
             .map_err(PartitionInstallError::RetryProtection)?;
         if self.persistence.is_some()
             && (offsets_wire.prepare_checksum.is_none()
@@ -4256,7 +4275,26 @@ fn segment_manifest_digest(manifest: &[consensus::StateArtifact]) -> u64 {
 fn checked_retry_table(
     wire: &ConsumerOffsetsWire,
     through_op: u64,
+    configured_capacity: usize,
 ) -> Result<ClientTable, consensus::client_table::ClientTableWireError> {
+    if wire.dedup_capacity == 0 {
+        if through_op != 0 || !wire.dedup.is_empty() {
+            return Err(
+                consensus::client_table::ClientTableWireError::InvalidCapacity { capacity: 0 },
+            );
+        }
+        return Ok(ClientTable::with_mode(
+            configured_capacity,
+            ClientTableMode::PartitionSlice,
+        ));
+    }
+    if wire.dedup_capacity != configured_capacity {
+        tracing::warn!(
+            configured_capacity,
+            committed_capacity = wire.dedup_capacity,
+            "partition retry capacity is fixed by committed state; ignoring local configuration"
+        );
+    }
     let mut table = ClientTable::with_mode(wire.dedup_capacity, ClientTableMode::PartitionSlice);
     table.install_watermarks(wire.dedup_capacity, wire.dedup.iter().cloned())?;
     for entry in &wire.dedup {
@@ -4322,9 +4360,12 @@ where
                 "receipt frontier differs from the applied frontier",
             ));
         }
-        let wire = self
-            .offsets_wire_snapshot(false)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let wire = ConsumerOffsetsWire {
+            dedup_capacity: self.dedup().capacity(),
+            required_metadata_frontier: self.required_metadata_frontier,
+            dedup: self.dedup().watermarks_sorted(),
+            ..Default::default()
+        };
         let path = self.retry_checkpoint_path(through_op)?;
         write_retry_checkpoint(
             &path,
@@ -4399,7 +4440,7 @@ where
         }
         let wire = ConsumerOffsetsWire::decode(cursor.remaining())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let table = checked_retry_table(&wire, through_op)
+        let table = checked_retry_table(&wire, through_op, self.dedup().capacity())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         *self.dedup_mut() = table;
         self.required_metadata_frontier = self

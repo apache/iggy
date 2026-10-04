@@ -273,7 +273,7 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 /// # Errors
 ///
 /// Returns an error if shard allocation fails, the inbox capacity is
-/// invalid, or any OS thread fails to spawn. Per-shard recovery /
+/// invalid, the executable cannot be read, or any OS thread fails to spawn. Per-shard recovery /
 /// listener / consensus failures surface through the per-thread `Result`
 /// the caller observes on `.join()`.
 ///
@@ -298,6 +298,9 @@ pub fn bootstrap(
     install_default_crypto_provider();
     validate_root_credentials_env(&config)?;
     warm_dummy_password_hash();
+    // Hash the executable before shard runtimes start doing asynchronous work.
+    message_bus::replica::handshake::binary_identity(crate::VERSION)
+        .map_err(ServerError::BinaryIdentity)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());

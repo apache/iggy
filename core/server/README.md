@@ -62,6 +62,24 @@ External group offsets belong to groups managed outside Iggy, such as a Kafka
 gateway. They require no Iggy group membership and can exceed the partition's
 message-offset range.
 
+The bind proof is an independent session credential. Password changes and PAT
+revocation or expiry do not end an established session. Binding checks that the
+owner still exists and is active; current permissions still govern each request.
+Explicit logout, lease expiry and user deactivation end session access.
+
+`clients_table_max` and `dedup_clients_max` nominate immutable limits when the
+first operation commits in each metadata or partition group. Recovery and state
+transfer preserve those committed limits. Configuration changes affect groups
+that have not committed a limit yet; existing groups log a mismatch and retain
+their committed capacity. At capacity, new sessions or writers are refused until
+ordered retirement releases slots. Live retry protection is never evicted.
+
+HTTP writes using one session and partition serialize through the previous
+write's reply or bounded deadline. With `ack=none`, a request returns 202 after
+its dispatch, while the next request to that partition waits for the previous
+write to settle. Waiters acquire the in-flight permit after the partition gate,
+so they do not consume the session's budget for other partitions.
+
 Durability defaults remain `Replicated`, and ordinary SDK sends and explicit
 offset writes support the configured policy. Crash-safe send retries require
 `Persisted`; crash-safe explicit offset retries require `Persisted` and
@@ -75,6 +93,10 @@ completion contracts.
 This release changes protocol and storage formats. Servers and compatible
 clients deploy together; mixed versions and rolling upgrades are unsupported.
 Peers verify protocol, release and executable identity before admission.
+Deploy the same executable artifact to every replica; stripped or independently
+rebuilt binaries have different identities even when their release matches.
+Protocol 0.11.1 is the coordinated release boundary. Intermediate development
+builds advertising that version are not a compatibility guarantee.
 An unsupported data directory is refused before WAL scanning or file changes.
 Replacing the binary does not migrate old data. Restore or migrate retained data
 only through a separately verified procedure; copying a format marker is not

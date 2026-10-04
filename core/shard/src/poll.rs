@@ -31,7 +31,7 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
-use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
@@ -60,12 +60,7 @@ pub struct ConsumerAttachment {
 
 impl ConsumerAttachment {
     pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
-        if !matches!(
-            operation,
-            Operation::SendMessages
-                | Operation::StoreConsumerOffset
-                | Operation::DeleteConsumerOffset
-        ) {
+        if !is_partition_receipt_operation(operation) {
             return Err(IggyError::InvalidCommand);
         }
         if !self.session.is_valid() {

@@ -1045,6 +1045,13 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
             );
             return false;
         }
+        if client_table.capacity_committed() && current.capacity() != client_table.capacity() {
+            warn!(
+                configured_capacity = current.capacity(),
+                committed_capacity = client_table.capacity(),
+                "metadata retry capacity is fixed by committed state; ignoring local configuration"
+            );
+        }
         *current = client_table;
         true
     }
@@ -2010,6 +2017,14 @@ where
             );
         }
 
+        let configured_capacity = self.client_table.borrow().capacity();
+        if client_table.capacity_committed() && configured_capacity != client_table.capacity() {
+            warn!(
+                configured_capacity,
+                committed_capacity = client_table.capacity(),
+                "metadata retry capacity is fixed by committed state; ignoring local configuration"
+            );
+        }
         *self.client_table.borrow_mut() = client_table;
         self.client_table_frontier.set(table_frontier);
         if snapshot_ahead {
@@ -3529,6 +3544,11 @@ where
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
+        // A transferred table may include replies above the restored STM floor.
+        // Recovery must never replay that interval against its later protection.
+        if snap_op < self.client_table_frontier.get() {
+            return;
+        }
         // Stamp created_at from the injected consensus clock (seed-derived
         // under the simulator), not the wall clock, so replayed snapshots are
         // byte-identical.
@@ -6877,6 +6897,127 @@ mod tests {
             md.client_table.borrow().get_epoch(CLIENT_C),
             Some(2),
             "entry created by the promoted register"
+        );
+    }
+
+    #[compio::test]
+    async fn transferred_client_table_waits_for_applied_frontier_before_checkpoint() {
+        const CLIENT: u128 = 9;
+        const USER: u32 = 7;
+        const SNAPSHOT_OP: u64 = 1;
+        const TABLE_FRONTIER: u64 = 3;
+        const JOURNAL_SLOTS: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_directory = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_directory).unwrap();
+        let journal = PrepareJournal::open(&metadata_directory.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        let mut transferred_table = ClientTable::new(CLIENTS_TABLE_MAX);
+        transferred_table
+            .commit_capacity(CLIENTS_TABLE_MAX)
+            .unwrap();
+        transferred_table
+            .commit_register(
+                CLIENT,
+                USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SNAPSHOT_OP),
+            )
+            .unwrap();
+        let mut snapshot =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_OP, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(transferred_table.to_snapshot());
+        for request in 1..TABLE_FRONTIER {
+            let reply = build_reply_message(
+                &PrepareHeader {
+                    client: CLIENT,
+                    user_id: USER,
+                    session: SNAPSHOT_OP,
+                    request,
+                    op: request + SNAPSHOT_OP,
+                    operation: Operation::CreateStream,
+                    ..Default::default()
+                },
+                &bytes::Bytes::new(),
+            );
+            assert_eq!(
+                transferred_table.commit_reply(CLIENT, USER, reply),
+                CommitReply::Cached,
+            );
+        }
+        metadata
+            .install_state_transfer(
+                &snapshot.encode().unwrap(),
+                transferred_table,
+                TABLE_FRONTIER,
+                TABLE_FRONTIER,
+            )
+            .await
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        metadata.set_checkpoint_margin(usize::MAX);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        let persisted = IggySnapshot::load(&coordinator.snapshot_path()).unwrap().0;
+        assert_eq!(persisted.sequence_number(), SNAPSHOT_OP);
+        assert_eq!(
+            persisted.snapshot().client_table.as_ref().unwrap().slots[0]
+                .1
+                .watermark,
+            0,
+            "ahead retry protection cannot be persisted at an earlier state-machine floor",
+        );
+        drop(persisted);
+        for (request, name) in [(1, "s1"), (2, "s2")] {
+            let prepare = metadata
+                .prepare_request(create_stream_request(CLIENT, request, name))
+                .unwrap();
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            journal.handle().append(prepare).await.unwrap();
+        }
+        metadata.resume_stranded_commits().await;
+        assert_eq!(consensus.commit_min(), TABLE_FRONTIER);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        let persisted = IggySnapshot::load(&coordinator.snapshot_path()).unwrap().0;
+        assert_eq!(persisted.sequence_number(), TABLE_FRONTIER);
+        drop(persisted);
+        drop(metadata);
+        let recovered = crate::impls::recovery::recover::<TestMux>(
+            directory.path(),
+            crate::impls::recovery::ReplicaIdentity {
+                cluster: 1,
+                replica_id: 0,
+                replica_count: 1,
+            },
+            JOURNAL_SLOTS,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.client_table.get_watermark(CLIENT),
+            Some(TABLE_FRONTIER - 1)
         );
     }
 

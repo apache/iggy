@@ -101,6 +101,14 @@ pub const REGISTER_REQUEST_ID: u64 = 0;
 /// validation rejects this id, so no external client can claim it.
 pub const RESERVED_CLIENT_ID: u128 = 0;
 
+#[must_use]
+pub const fn is_partition_receipt_operation(operation: Operation) -> bool {
+    matches!(
+        operation,
+        Operation::SendMessages | Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+    )
+}
+
 pub use iggy_binary_protocol::requests::users::login_register::BIND_SECRET_BYTES;
 const BIND_VERIFIER_CONTEXT: &str = "apache.iggy session bind verifier v1";
 
@@ -228,8 +236,8 @@ pub struct ClientEntrySnapshot {
     pub epoch: u64,
     pub user_id: u32,
     pub watermark: u64,
-    /// Wire bytes of the entry's latest committed reply, round-tripped through
-    /// `CachedReply::from_message`. Never empty: registration seeds the ring.
+    /// Wire bytes of the latest committed reply, validated as [`Message<ReplyHeader>`]
+    /// on restore. Never empty: registration seeds the ring.
     ///
     /// Serialized as a msgpack `bin` blob, not the integer array a plain `Vec<u8>`
     /// produces, which spends 2 bytes on every byte >= 0x80 and runs a checkpoint's
@@ -401,7 +409,7 @@ pub enum RequestStatus {
 
 /// Committed-window verdict for a partition dedup slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SliceRequestStatus {
+enum SliceRequestStatus {
     /// No retained commit mark for this request.
     New,
     /// A retained commit mark protects this request from execution.
@@ -426,17 +434,13 @@ pub enum CommitReply {
 
 /// Which of the table's mechanisms an instance runs.
 ///
-/// The metadata plane needs all of them. A partition group's slice needs only
-/// the watermark: it has no register to mint an epoch from, no result section
-/// worth caching, and one table per group rather than per node, so the
-/// preallocated slot array would reserve ~384 KiB per partition before a single
-/// client connects. The predicates below are the only two combinations that
-/// exist, so the mode is an enum rather than three independent flags.
+/// Metadata registers sessions and keeps a reply ring in preallocated slots.
+/// Partition slices grow lazily and retain one session-qualified receipt per client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientTableMode {
     /// Metadata plane: replies cached, epoch fenced, slots preallocated.
     Metadata,
-    /// One partition consensus group's slice: watermark only.
+    /// One partition consensus group's receipt protection.
     PartitionSlice,
 }
 
@@ -448,9 +452,8 @@ impl ClientTableMode {
         matches!(self, Self::Metadata)
     }
 
-    /// Enforce the register-minted epoch fence. Off: entries carry no epoch,
-    /// `check_request` ignores the presented one, and a committed request may
-    /// create its own entry (there is no register to do it).
+    /// Enforce the metadata registration fence in `check_request`.
+    /// Partition admission checks its receipt's epoch independently.
     #[must_use]
     pub const fn fence_epoch(self) -> bool {
         matches!(self, Self::Metadata)
@@ -608,25 +611,28 @@ impl ClientTable {
     /// Verify a binding credential, resolving a zero epoch to its original registration.
     ///
     /// # Errors
-    /// Returns `TransientNotCommitted` while registration is not visible,
-    /// `Unauthenticated` for a bad proof or ended session, and `InvalidSession`
-    /// for a different nonzero epoch.
+    /// Returns `TransientNotAccepted` while an uncertain registration is not visible,
+    /// `Unauthenticated` for an absent known session, bad proof or ended session,
+    /// and `InvalidSession` for a different nonzero epoch.
     pub fn bind_session(
         &mut self,
         client_id: u128,
         session: u64,
         secret: &[u8; BIND_SECRET_BYTES],
     ) -> Result<(u32, u64, SessionAttachment), IggyError> {
-        let user_id = self
-            .get_user_id(client_id)
-            .ok_or(IggyError::TransientNotCommitted)?;
+        let missing = if session == 0 {
+            IggyError::TransientNotAccepted
+        } else {
+            IggyError::Unauthenticated
+        };
+        let user_id = self.get_user_id(client_id).ok_or(missing)?;
         let epoch = self
             .registered_session(
                 client_id,
                 user_id,
                 bind_verifier(client_id, user_id, secret),
             )?
-            .ok_or(IggyError::TransientNotCommitted)?;
+            .ok_or(IggyError::Unauthenticated)?;
         if session != 0 && session != epoch {
             return Err(IggyError::InvalidSession(session));
         }
@@ -1110,36 +1116,6 @@ impl ClientTable {
         CommitReply::Cached
     }
 
-    /// Watermark-plus-window dedup check for a plane that mints no epoch.
-    ///
-    /// Only marked IDs in the retained window prove a committed request.
-    /// Unmarked IDs remain admissible within that window. Another user's
-    /// entry is not evidence about this caller and reads as new.
-    ///
-    /// # Panics
-    /// If called on a table that fences epochs, which must use
-    /// [`Self::check_request`].
-    #[must_use]
-    pub fn check_slice_request(
-        &self,
-        client_id: u128,
-        user_id: u32,
-        request: u64,
-    ) -> SliceRequestStatus {
-        debug_assert!(
-            !self.mode.fence_epoch(),
-            "check_slice_request: an epoch-fencing table must use check_request"
-        );
-        let Some(&slot_idx) = self.index.get(&client_id) else {
-            return SliceRequestStatus::New;
-        };
-        let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
-        if entry.user_id != user_id {
-            return SliceRequestStatus::New;
-        }
-        entry.check_slice_request(request)
-    }
-
     #[must_use]
     /// # Panics
     /// Only if the private index refers to an unoccupied slot.
@@ -1197,12 +1173,7 @@ impl ClientTable {
         if header.client == 0
             || session == 0
             || header.commit == 0
-            || !matches!(
-                header.operation,
-                iggy_binary_protocol::Operation::SendMessages
-                    | iggy_binary_protocol::Operation::StoreConsumerOffset
-                    | iggy_binary_protocol::Operation::DeleteConsumerOffset
-            )
+            || !is_partition_receipt_operation(header.operation)
         {
             return Err(ClientTableWireError::InvalidReply);
         }
@@ -1223,11 +1194,13 @@ impl ClientTable {
             return Ok(cached.clone());
         }
         let cached = CachedReply::from(reply);
-        entry.push_latest(cached.clone());
+        entry.ring.clear();
+        entry.latest_commit = cached.header().commit;
+        entry.ring.push_back(cached.clone());
         Ok(cached)
     }
 
-    /// Fold an AUTO offset request into the partition watermark without a receipt.
+    /// Fold a partition receipt's identity into its committed request window.
     ///
     /// Replay is idempotent and order-insensitive within the retained window.
     /// The first committed request fixes its principal. Entries are never
@@ -1240,7 +1213,7 @@ impl ClientTable {
     /// # Errors
     /// Returns an error for zero identities, a changed principal, or exhausted
     /// committed protection capacity.
-    pub fn commit_request(
+    pub(crate) fn commit_request(
         &mut self,
         client_id: u128,
         user_id: u32,
@@ -1251,11 +1224,6 @@ impl ClientTable {
             !self.mode.cache_replies(),
             "commit_request: a reply-caching table must use commit_reply"
         );
-        // Zero is the reserved client id, refused at every ingress (wire
-        // validation, the HTTP minter, the auto-commit guard at the call
-        // sites). Kept as a return rather than an assert so that an artifact
-        // slipping past the decoder degrades to no dedup for that entry instead
-        // of taking the replica down.
         if client_id == 0 {
             return Err(ClientTableWireError::InvalidWatermark { client_id });
         }
@@ -1364,12 +1332,7 @@ impl ClientTable {
                     || header.commit != entry.latest_commit
                     || header.commit == 0
                     || header.size as usize != entry.reply.len()
-                    || !matches!(
-                        header.operation,
-                        iggy_binary_protocol::Operation::SendMessages
-                            | iggy_binary_protocol::Operation::StoreConsumerOffset
-                            | iggy_binary_protocol::Operation::DeleteConsumerOffset
-                    )
+                    || !is_partition_receipt_operation(header.operation)
                 {
                     return Err(ClientTableWireError::InvalidReply);
                 }
@@ -1784,11 +1747,8 @@ impl ClientTable {
         Ok(table)
     }
 
-    /// Slot capacity, i.e. the largest table this one can absorb from a peer.
-    ///
-    /// Sized at construction from the configured cap, then raised by
-    /// [`Self::from_snapshot`] to cover any slot the checkpoint holds, so this
-    /// can exceed `[metadata] clients_table_max`.
+    /// Protection slots fixed by the first committed prepare's capacity.
+    /// Recovery and transfer preserve that limit over local configuration.
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.clients_max
@@ -1796,10 +1756,8 @@ impl ClientTable {
 }
 
 impl ClientEntry {
-    /// Entry for a plane that mints no epoch and caches no reply: the fields a
-    /// [`ClientTableMode::PartitionSlice`] table never reads stay at their
-    /// zero values. Bit 0 of the window is forced on: the watermark itself is
-    /// committed by definition.
+    /// Partition identity initialized before its session and receipt are installed.
+    /// Bit 0 is always set because the watermark itself is committed.
     const fn watermark_only(
         client_id: u128,
         user_id: u32,
@@ -2583,7 +2541,6 @@ mod tests {
     // partition plane actually relies on.
 
     const SLICE_USER: u32 = 3;
-    const OTHER_USER: u32 = 4;
 
     fn slice(clients_max: usize) -> ClientTable {
         ClientTable::with_mode(clients_max, ClientTableMode::PartitionSlice)
@@ -2630,68 +2587,6 @@ mod tests {
     }
 
     #[test]
-    fn given_partition_slice_when_empty_should_admit_and_not_preallocate() {
-        // The reason this plane cannot use the metadata mode: one table per
-        // group, so preallocating the cap would reserve hundreds of KiB per
-        // partition before a single client connects.
-        let table = slice(4096);
-        assert_eq!(table.count(), 0);
-        assert_eq!(table.slots.len(), 0, "slots must grow on demand");
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 1),
-            SliceRequestStatus::New
-        ));
-    }
-
-    #[test]
-    fn given_partition_slice_when_request_replayed_should_report_duplicate() {
-        // Only what committed is a duplicate: an id below the watermark that
-        // never committed is a reordered arrival and still executes.
-        let mut table = slice(4);
-        table.commit_request(7, SLICE_USER, 5, 100).unwrap();
-
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 5),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 4),
-            SliceRequestStatus::New
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 6),
-            SliceRequestStatus::New
-        ));
-    }
-
-    #[test]
-    fn given_partition_slice_when_request_id_gaps_should_accept_the_jump() {
-        // One client counter feeds several groups, so a slice legitimately sees
-        // only a subset of the ids that client mints; the skipped ids stay
-        // admissible in case they were routed here late rather than elsewhere.
-        let mut table = slice(4);
-        table.commit_request(7, SLICE_USER, 5, 100).unwrap();
-        table.commit_request(7, SLICE_USER, 9, 101).unwrap();
-
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 5),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 9),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 7),
-            SliceRequestStatus::New
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 10),
-            SliceRequestStatus::New
-        ));
-    }
-
-    #[test]
     fn given_partition_slice_when_commit_replayed_should_be_idempotent() {
         let mut table = slice(4);
         table.commit_request(7, SLICE_USER, 5, 100).unwrap();
@@ -2699,99 +2594,6 @@ mod tests {
         table.commit_request(7, SLICE_USER, 5, 100).unwrap();
 
         assert_eq!(table.watermarks_sorted(), vec![watermark(7, 5, 100)]);
-    }
-
-    #[test]
-    fn given_partition_slice_when_lower_id_commits_late_should_admit_then_absorb() {
-        // A pipelining client had request 2 refused transiently and replays it
-        // after 3 committed: the replay is a new write, not a duplicate, and
-        // only once it commits does it read as one.
-        let mut table = slice(4);
-        table.commit_request(7, SLICE_USER, 1, 100).unwrap();
-        table.commit_request(7, SLICE_USER, 3, 101).unwrap();
-
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 2),
-            SliceRequestStatus::New
-        ));
-        table.commit_request(7, SLICE_USER, 2, 102).unwrap();
-
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 2),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 1),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 3),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 4),
-            SliceRequestStatus::New
-        ));
-        assert_eq!(
-            table.watermarks_sorted(),
-            vec![DedupWatermark {
-                client: 7,
-                user_id: SLICE_USER,
-                watermark: 3,
-                latest_commit: 102,
-                committed_window: 0b111,
-                session: 0,
-                reply: Vec::new(),
-            }]
-        );
-    }
-
-    #[test]
-    fn given_partition_slice_when_id_ages_out_of_window_should_report_unknown_outcome() {
-        let mut table = slice(4);
-        table.commit_request(7, SLICE_USER, 1, 100).unwrap();
-        table
-            .commit_request(7, SLICE_USER, 1 + COMMITTED_WINDOW_BITS + 10, 101)
-            .unwrap();
-
-        for request in [1, 2, 11] {
-            assert_eq!(
-                table.check_slice_request(7, SLICE_USER, request),
-                SliceRequestStatus::AgedOut,
-                "aged-out request {request} must have an unknown outcome"
-            );
-        }
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 12),
-            SliceRequestStatus::New
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 1 + COMMITTED_WINDOW_BITS),
-            SliceRequestStatus::New
-        ));
-    }
-
-    #[test]
-    fn given_partition_slice_when_watermark_jumps_should_shift_the_window() {
-        let mut table = slice(4);
-        table.commit_request(7, SLICE_USER, 1, 100).unwrap();
-        table.commit_request(7, SLICE_USER, 2, 101).unwrap();
-        table.commit_request(7, SLICE_USER, 5, 102).unwrap();
-
-        // 5 (bit 0), 2 (bit 3), 1 (bit 4) committed; 3 and 4 did not.
-        assert_eq!(table.watermarks_sorted()[0].committed_window, 0b11001);
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 3),
-            SliceRequestStatus::New
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 4),
-            SliceRequestStatus::New
-        ));
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 2),
-            SliceRequestStatus::Committed
-        ));
     }
 
     #[test]
@@ -2808,35 +2610,6 @@ mod tests {
         assert_eq!(table.count(), 64);
         assert_eq!(table.slots.len(), 64);
         assert!(table.slots.iter().all(Option::is_some));
-    }
-
-    #[test]
-    fn given_partition_slice_when_watermarks_installed_should_replace_not_merge() {
-        let mut table = slice(4);
-        table.commit_request(9, SLICE_USER, 3, 1).unwrap();
-        table
-            .install_watermarks(
-                4,
-                [receipt_watermark(1, 4, 50), receipt_watermark(2, 7, 60)],
-            )
-            .unwrap();
-
-        assert_eq!(table.count(), 2);
-        assert!(
-            matches!(
-                table.check_slice_request(9, SLICE_USER, 3),
-                SliceRequestStatus::New
-            ),
-            "install replaces rather than merges"
-        );
-        assert!(matches!(
-            table.check_slice_request(1, SLICE_USER, 4),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(2, SLICE_USER, 8),
-            SliceRequestStatus::New
-        ));
     }
 
     #[test]
@@ -2857,29 +2630,6 @@ mod tests {
     }
 
     #[test]
-    fn given_partition_slice_when_install_carries_user_should_keep_it() {
-        let mut table = slice(4);
-        table
-            .install_watermarks(
-                4,
-                [DedupWatermark {
-                    user_id: OTHER_USER,
-                    ..receipt_watermark(1, 4, 50)
-                }],
-            )
-            .unwrap();
-
-        assert!(matches!(
-            table.check_slice_request(1, OTHER_USER, 4),
-            SliceRequestStatus::Committed
-        ));
-        assert!(matches!(
-            table.check_slice_request(1, SLICE_USER, 4),
-            SliceRequestStatus::New
-        ));
-    }
-
-    #[test]
     fn given_partition_slice_when_exported_should_sort_ascending_by_client() {
         let mut table = slice(8);
         for (commit_op, client) in [30u128, 10, 20].into_iter().enumerate() {
@@ -2889,19 +2639,6 @@ mod tests {
         }
 
         assert_eq!(clients_of(&table), vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn given_partition_slice_when_cleared_should_admit_everything() {
-        let mut table = slice(4);
-        table.commit_request(7, SLICE_USER, 5, 100).unwrap();
-        table.install_watermarks(4, std::iter::empty()).unwrap();
-
-        assert_eq!(table.count(), 0);
-        assert!(matches!(
-            table.check_slice_request(7, SLICE_USER, 5),
-            SliceRequestStatus::New
-        ));
     }
 
     #[test]
@@ -2919,13 +2656,6 @@ mod tests {
                 .is_err()
         );
         assert!(clients_of(&table).is_empty());
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "an epoch-fencing table must use check_request")]
-    fn given_metadata_table_when_is_duplicate_called_should_panic() {
-        let _ = ClientTable::new(4).check_slice_request(7, SLICE_USER, 1);
     }
 
     #[cfg(debug_assertions)]
@@ -3147,6 +2877,144 @@ mod tests {
                 RequestStatus::Fenced { .. }
             ));
         }
+    }
+
+    #[test]
+    fn given_partition_receipts_when_requests_commit_should_retain_only_the_latest() {
+        const CLIENT: u128 = 7;
+        const SESSION: u64 = 42;
+        const REQUESTS: u64 = 40;
+        let mut table = slice(1);
+        for request in 1..=REQUESTS {
+            table
+                .commit_partition_reply(
+                    TEST_USER_ID,
+                    SESSION,
+                    make_reply_for(CLIENT, request, request),
+                )
+                .unwrap();
+        }
+        let entry = table.slots[table.index[&CLIENT]].as_ref().unwrap();
+        assert_eq!(
+            entry.ring.len(),
+            1,
+            "only the unresolved result needs bytes"
+        );
+        assert_eq!(entry.latest().header().request, REQUESTS);
+        assert!(matches!(
+            table.check_partition_request(
+                CLIENT,
+                TEST_USER_ID,
+                SESSION,
+                REQUESTS - 1,
+                Operation::SendMessages,
+            ),
+            RequestStatus::AlreadyApplied { .. }
+        ));
+        assert!(matches!(
+            table.check_partition_request(
+                CLIENT,
+                TEST_USER_ID,
+                SESSION,
+                REQUESTS,
+                Operation::SendMessages,
+            ),
+            RequestStatus::Duplicate(_)
+        ));
+    }
+
+    #[test]
+    fn given_missing_session_when_binding_should_distinguish_registration_uncertainty() {
+        const CLIENT: u128 = 7;
+        const SESSION: u64 = 42;
+        let secret = [0x5a; BIND_SECRET_BYTES];
+        let mut table = ClientTable::new(1);
+        assert!(matches!(
+            table.bind_session(CLIENT, SESSION, &secret),
+            Err(IggyError::Unauthenticated)
+        ));
+        assert!(matches!(
+            table.bind_session(CLIENT, 0, &secret),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        table
+            .commit_register(
+                CLIENT,
+                TEST_USER_ID,
+                bind_verifier(CLIENT, TEST_USER_ID, &secret),
+                make_register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        assert!(matches!(
+            table.bind_session(CLIENT, SESSION, &[0x6a; BIND_SECRET_BYTES]),
+            Err(IggyError::Unauthenticated)
+        ));
+    }
+
+    #[test]
+    fn given_partition_receipts_when_request_ids_skip_should_protect_only_committed_ids() {
+        const CLIENT: u128 = 7;
+        const SESSION: u64 = 42;
+        let mut table = slice(1);
+        for (request, commit) in [(1, 100), (5, 101)] {
+            table
+                .commit_partition_reply(
+                    TEST_USER_ID,
+                    SESSION,
+                    make_reply_for(CLIENT, request, commit),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            table.check_partition_request(
+                CLIENT,
+                TEST_USER_ID,
+                SESSION,
+                3,
+                Operation::SendMessages,
+            ),
+            RequestStatus::New
+        ));
+        assert!(matches!(
+            table.check_partition_request(
+                CLIENT,
+                TEST_USER_ID,
+                SESSION,
+                1,
+                Operation::SendMessages,
+            ),
+            RequestStatus::AlreadyApplied {
+                request: 1,
+                watermark: 5
+            }
+        ));
+        table
+            .commit_partition_reply(
+                TEST_USER_ID,
+                SESSION,
+                make_reply_for(CLIENT, COMMITTED_WINDOW_BITS + 10, 102),
+            )
+            .unwrap();
+        assert!(matches!(
+            table.check_partition_request(
+                CLIENT,
+                TEST_USER_ID,
+                SESSION,
+                3,
+                Operation::SendMessages,
+            ),
+            RequestStatus::AlreadyApplied { .. }
+        ));
+        assert!(matches!(
+            table.check_partition_request(
+                CLIENT,
+                TEST_USER_ID + 1,
+                SESSION,
+                COMMITTED_WINDOW_BITS + 11,
+                Operation::SendMessages,
+            ),
+            RequestStatus::Fenced { .. }
+        ));
     }
 
     #[test]

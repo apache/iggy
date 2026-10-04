@@ -366,7 +366,6 @@ async fn partition_write(
     dispatched: &mut Option<oneshot::Sender<Result<(), PartitionWriteError>>>,
 ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
     let deadline = Instant::now() + PARTITION_WRITE_REPLY_TIMEOUT;
-    let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     let namespace = crate::namespace::resolve_partition_request_namespace(
         &state.shard,
         operation,
@@ -383,6 +382,7 @@ async fn partition_write(
     )
     .await
     .map_err(|_| PartitionWriteError::Rejected(IggyError::TransientNotAccepted))?;
+    let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     ensure_in_process_reply_target(state, session);
     let request_id = {
         let mut next_id = session.data_gate.lock().await;
@@ -423,6 +423,7 @@ async fn partition_write(
                 session.client_id,
                 Some(session.user_id),
                 Some((session.client_id, attachment)),
+                Some(namespace),
             )
             .await;
             if let Some(dispatched) = dispatched.take() {

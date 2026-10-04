@@ -88,7 +88,11 @@ use tracing::{debug, warn};
 ///
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub async fn dispatch_partition_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
@@ -97,6 +101,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     transport_client_id: u128,
     acting_user_id: Option<u32>,
     consumer_session: Option<(u128, SessionAttachment)>,
+    resolved_namespace: Option<u64>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -105,13 +110,32 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let header = *request.header();
-    let namespace = match resolve_partition_request_namespace(
-        shard,
-        header.operation,
-        request_body(&request),
-        consumer_session
-            .as_ref()
-            .map_or(vsr_client_id, |(parent, _)| *parent),
+    let metadata_watermark = shard.plane.metadata().applied_frontier().get();
+    if consumer_session
+        .as_ref()
+        .is_some_and(|(_, attachment)| !attachment.is_valid())
+    {
+        send_deny_reply(
+            shard,
+            transport_client_id,
+            &header,
+            IggyError::StaleClient.as_code(),
+        )
+        .await;
+        return;
+    }
+    let namespace = match resolved_namespace.map_or_else(
+        || {
+            resolve_partition_request_namespace(
+                shard,
+                header.operation,
+                request_body(&request),
+                consumer_session
+                    .as_ref()
+                    .map_or(vsr_client_id, |(parent, _)| *parent),
+            )
+        },
+        Ok,
     ) {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -258,7 +282,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         // gate above failed closed on `None`, so `0` (unattributed) is only a
         // type-level fallback here.
         new_header.user_id = acting_user_id.unwrap_or(0);
-        new_header.metadata_watermark = shard.plane.metadata().applied_frontier().get();
+        new_header.metadata_watermark = metadata_watermark;
     });
     if attachment.is_none() && vsr_client_id == transport_client_id {
         shard.dispatch(request.into_generic());
@@ -1343,6 +1367,131 @@ mod tests {
     }
 
     #[compio::test]
+    async fn pre_resolved_balanced_write_keeps_its_namespace_and_admission_frontier() {
+        const CLIENT: u128 = 1;
+        const ADMISSION_FRONTIER: u64 = 10;
+        const LATER_FRONTIER: u64 = 20;
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                CLIENT,
+                1,
+                &CreateStreamRequest {
+                    name: WireName::new("stream").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                CLIENT,
+                2,
+                &CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 2,
+                        name: WireName::new("topic").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: vec![
+                        CreatedPartitionAssignment {
+                            partition_id: 0,
+                            consensus_group_id: 1,
+                        },
+                        CreatedPartitionAssignment {
+                            partition_id: 1,
+                            consensus_group_id: 2,
+                        },
+                    ],
+                    created_view: 0,
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        metadata.applied_frontier().advance(ADMISSION_FRONTIER);
+        let wire_header = SendMessagesHeader {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partitioning: WirePartitioning::Balanced,
+            messages_count: 1,
+        }
+        .to_bytes();
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::try_from(wire_header.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(&wire_header);
+        let namespace =
+            resolve_partition_request_namespace(&shard, Operation::SendMessages, &body, CLIENT)
+                .unwrap();
+        let delayed_shard = Rc::clone(&shard);
+        let updater = compio::runtime::spawn(async move {
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            delayed_shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .advance(LATER_FRONTIER);
+            for partition_id in 0..2 {
+                let namespace = delayed_shard
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .namespace_from_partition(
+                        &WireIdentifier::numeric(0),
+                        &WireIdentifier::numeric(0),
+                        partition_id,
+                    )
+                    .unwrap();
+                delayed_shard
+                    .shards_table()
+                    .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+            }
+        });
+        dispatch_partition_request(
+            &shard,
+            request_message(Operation::SendMessages, CLIENT, 1, 1, &body),
+            CLIENT,
+            1,
+            CLIENT,
+            Some(DEFAULT_ROOT_USER_ID),
+            None,
+            Some(namespace),
+        )
+        .await;
+        let _ = updater.await;
+        let ShardFrame::Consensus {
+            message: MessageBag::Request(request),
+            ..
+        } = owner_inbox.try_recv().unwrap()
+        else {
+            panic!("the dispatcher must submit one partition write");
+        };
+        assert_eq!(
+            request.header().group,
+            namespace,
+            "Balanced must advance once for the gate and write"
+        );
+        assert_eq!(
+            request.header().metadata_watermark,
+            ADMISSION_FRONTIER,
+            "routing waits cannot promote an old binding past Logout"
+        );
+        assert_eq!(metadata.applied_frontier().get(), LATER_FRONTIER);
+    }
+
+    #[compio::test]
     async fn given_invalid_partition_writes_when_resolving_should_preserve_offset_error_codes() {
         const VSR_CLIENT: u128 = 1;
         let bus = SpyBus::default();
@@ -1468,8 +1617,17 @@ mod tests {
         ));
         for (index, (operation, body, expected)) in cases.into_iter().enumerate() {
             let request = request_message(operation, 1, 1, index as u64 + 1, &body);
-            dispatch_partition_request(&shard, request, 1, 1, 91, Some(DEFAULT_ROOT_USER_ID), None)
-                .await;
+            dispatch_partition_request(
+                &shard,
+                request,
+                1,
+                1,
+                91,
+                Some(DEFAULT_ROOT_USER_ID),
+                None,
+                None,
+            )
+            .await;
             let replies = bus.client_replies.borrow();
             assert_eq!(
                 replies.len(),
@@ -1976,6 +2134,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
             None,
         )
         .await;

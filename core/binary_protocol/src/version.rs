@@ -96,7 +96,10 @@ const COMPONENT_MAX: u32 = (1 << COMPONENT_BITS) - 1;
 const PATCH_MASK: u32 = COMPONENT_MAX;
 
 /// Current binary protocol version, independent of the crate's release version.
+///
 /// Version 0.11.1 requires the session-binding secret in login requests.
+/// Intermediate development builds with this version may use incompatible layouts;
+/// coordinated deployment requires matching clients and server binaries.
 pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 1);
 
 /// Oldest protocol version this build accepts at login.

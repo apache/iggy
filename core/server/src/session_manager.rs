@@ -379,11 +379,16 @@ impl SessionManager {
     #[must_use]
     pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {
         let conn = self.connections.get(&connection_id)?;
+        if conn
+            .consumer_session
+            .as_ref()
+            .is_some_and(|(_, attachment)| !attachment.is_valid())
+        {
+            return None;
+        }
         match conn.state {
-            ConnectionState::Bound { user_id, .. } if self.get_session(connection_id).is_some() => {
-                Some(user_id)
-            }
-            _ => None,
+            ConnectionState::Bound { user_id, .. } => Some(user_id),
+            ConnectionState::Connected => None,
         }
     }
 

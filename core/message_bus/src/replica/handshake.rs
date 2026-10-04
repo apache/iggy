@@ -539,11 +539,9 @@ fn with_identity(
 /// # Errors
 /// Returns an error if the running executable cannot be opened or read.
 pub fn binary_identity(release: &str) -> std::io::Result<[u8; auth::IDENTITY_LEN]> {
-    static ARTIFACT: OnceLock<[u8; auth::IDENTITY_LEN]> = OnceLock::new();
+    static ARTIFACT: OnceLock<std::io::Result<[u8; auth::IDENTITY_LEN]>> = OnceLock::new();
     const READ_BYTES: usize = 32 * 1024;
-    let artifact = if let Some(artifact) = ARTIFACT.get() {
-        *artifact
-    } else {
+    let artifact = ARTIFACT.get_or_init(|| {
         let mut file = std::fs::File::open(std::env::current_exe()?)?;
         let mut hasher = blake3::Hasher::new();
         let mut bytes = vec![0; READ_BYTES];
@@ -554,14 +552,15 @@ pub fn binary_identity(release: &str) -> std::io::Result<[u8; auth::IDENTITY_LEN
             }
             hasher.update(&bytes[..count]);
         }
-        let artifact = *hasher.finalize().as_bytes();
-        let _ = ARTIFACT.set(artifact);
-        artifact
-    };
+        Ok(*hasher.finalize().as_bytes())
+    });
+    let artifact = artifact
+        .as_ref()
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
     let mut hasher = blake3::Hasher::new_derive_key("apache.iggy replica identity v1");
     hasher.update(&iggy_binary_protocol::IGGY_PROTOCOL_VERSION.to_le_bytes());
     hasher.update(&(release.len() as u64).to_le_bytes());
     hasher.update(release.as_bytes());
-    hasher.update(&artifact);
+    hasher.update(artifact);
     Ok(*hasher.finalize().as_bytes())
 }

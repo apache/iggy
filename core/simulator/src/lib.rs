@@ -3276,9 +3276,10 @@ mod tests {
             expected.commit_offset, 1,
             "both reordered requests must append"
         );
-        for replay in [delayed, later] {
+        for (replay, expected_status) in [(delayed, 0), (later, IggyError::RequestTooOld.as_code())]
+        {
             let duplicate = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, replay);
-            assert_eq!(duplicate.header().status, 0);
+            assert_eq!(duplicate.header().status, expected_status);
             assert_eq!(
                 sim.offsets(0, namespace),
                 Some(expected),

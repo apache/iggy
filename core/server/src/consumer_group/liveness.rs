@@ -273,6 +273,7 @@ async fn retire_sessions<B, MJ, S, SB>(
         return;
     }
     let view = consensus.view();
+    liveness.borrow_mut().observe_view(Some(view));
     let identity = metadata
         .client_table
         .borrow()
@@ -286,6 +287,24 @@ async fn retire_sessions<B, MJ, S, SB>(
     liveness
         .borrow_mut()
         .reconcile_retirement(Some(identity), revision);
+    let remote_quorum = consensus.is_primary()
+        && liveness
+            .borrow()
+            .retirement
+            .as_ref()
+            .is_some_and(|progress| progress.reporters.len() >= consensus.quorum_replication());
+    if remote_quorum {
+        // The metadata primary need not belong to the common reporting quorum.
+        // Every reporter already proved retirement in every allocated group.
+        if let Err(error) = metadata.submit_session_finalization(identity).await {
+            trace!(
+                ?error,
+                client_id = identity.client_id,
+                "session finalization deferred"
+            );
+        }
+        return;
+    }
     let (cursor, reported) = {
         let tracker = liveness.borrow();
         let Some(progress) = &tracker.retirement else {
@@ -591,8 +610,8 @@ mod tests {
     use crate::dispatch::test_support::{
         SpyBus, TestShard, prepare_message, register_reply, test_shard,
     };
-    use consensus::Sequencer;
     use consensus::client_table::ClientTable;
+    use consensus::{LocalPipeline, Sequencer, ViewRestore, VsrConsensus};
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -1272,6 +1291,84 @@ mod tests {
             tracker.receive(CLUSTER, Some(VIEW), &message, now + TIMEOUT, TIMEOUT);
         }
         assert!(tracker.expired(VIEW, CLIENT, Some(SESSION), now + TIMEOUT, TIMEOUT));
+    }
+
+    #[compio::test]
+    async fn retirement_sweep_discards_quorum_from_the_previous_view() {
+        const END_OP: u64 = SESSION + 1;
+        let (_directory, mut shard) = shard_with_members(1).await;
+        let mut consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.restore_view(ViewRestore {
+            durable_view: Some((VIEW, VIEW)),
+            view_fallback: None,
+            seed_view: None,
+        });
+        consensus.init();
+        consensus.restore_commit_state(END_OP, END_OP);
+        consensus.sequencer().set_sequence(END_OP);
+        Rc::get_mut(&mut shard)
+            .unwrap()
+            .plane
+            .metadata_mut()
+            .consensus = Some(consensus);
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, END_OP)
+        );
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        let revision = metadata.mux_stm.streams().read(|inner| inner.revision);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(VIEW - 1));
+            tracker.reconcile_retirement(Some(identity), revision);
+            let progress = tracker.retirement.as_mut().unwrap();
+            progress.reported = true;
+            progress.reporters.extend([0, 1]);
+        }
+        let (stop, receiver) = shard::channel(1);
+        stop.try_send(()).unwrap();
+        let (_signal, shutdown) = Shutdown::new();
+        let sweep = Box::pin(retire_sessions(
+            &shard, &tracker, &receiver, &shutdown, TIMEOUT,
+        ));
+        assert!(
+            futures::poll!(sweep).is_ready(),
+            "old-view quorum must not start a session finalization"
+        );
+        let tracker = tracker.borrow();
+        let progress = tracker.retirement.as_ref().unwrap();
+        assert!(!progress.reported);
+        assert!(progress.reporters.is_empty());
+        assert_eq!(progress.cursor, 0);
+        assert_eq!(
+            metadata
+                .consensus
+                .as_ref()
+                .unwrap()
+                .sequencer()
+                .current_sequence(),
+            END_OP
+        );
+        assert_eq!(
+            metadata.client_table.borrow().ended_sessions().next(),
+            Some(identity)
+        );
     }
 
     #[test]
