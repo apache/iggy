@@ -24,8 +24,8 @@
 //! written.
 //!
 //! Mapped mode decodes JSON objects with `arrow-json`. The fast path decodes
-//! the whole run at once. When that fails, the run is decoded again row by
-//! row so that only the offending rows are dropped.
+//! the whole run at once. When that fails, bisection isolates the offending
+//! rows before the survivors are decoded together.
 //!
 //! The writer schema of a request only contains the columns that at least one
 //! row in the run sets. Columns no row mentions are left out, so BigQuery
@@ -33,9 +33,10 @@
 
 use crate::schema::{BqType, Column, MetaColumn, Mode, RawKind, TableLayout, UTC};
 use arrow::array::{
-    ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray, StringBuilder,
+    TimestampMicrosecondArray,
 };
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::ipc::writer::{
@@ -51,6 +52,8 @@ use std::sync::Arc;
 
 const HEADER_ENCODING_BASE64: &str = "base64";
 const UTC_OFFSET: &str = "+00:00";
+const IPC_BATCH_OVERHEAD: usize = 1024;
+const IPC_COLUMN_OVERHEAD: usize = 128;
 
 /// One `AppendRows` request worth of rows.
 #[derive(Debug)]
@@ -174,7 +177,7 @@ fn encode_mapped(
     }
     let payload_fields: Vec<FieldRef> = present.iter().map(|&i| layout.fields[i].clone()).collect();
 
-    let (decoded, survivors) = decode_rows(&payload_fields, &rows, kept.len(), |row, reason| {
+    let (decoded, survivors) = decode_rows(&payload_fields, &rows, |row, reason| {
         rejected.push(Rejected {
             offset: kept[row].offset,
             reason,
@@ -277,7 +280,7 @@ fn normalize_scalar(value: &mut OwnedValue, column: &Column) -> Result<(), Strin
             let bytes = BASE64
                 .decode(text.as_bytes())
                 .map_err(|e| format!("column '{}': invalid base64: {e}", column.name))?;
-            *value = OwnedValue::String(to_hex(&bytes));
+            *value = OwnedValue::String(hex::encode(bytes));
         }
         BqType::Record(children) => {
             let OwnedValue::Object(object) = value else {
@@ -322,11 +325,19 @@ fn present_columns(rows: &[OwnedValue], layout: &TableLayout) -> Vec<usize> {
 fn decode_rows(
     fields: &[FieldRef],
     rows: &[OwnedValue],
-    row_count: usize,
-    mut on_reject: impl FnMut(usize, String),
+    on_reject: impl FnMut(usize, String),
 ) -> Result<(Option<RecordBatch>, Vec<usize>), ArrowError> {
-    if fields.is_empty() {
-        return Ok((None, (0..row_count).collect()));
+    decode_rows_with(fields, rows, on_reject, decode)
+}
+
+fn decode_rows_with<'a>(
+    fields: &[FieldRef],
+    rows: &'a [OwnedValue],
+    mut on_reject: impl FnMut(usize, String),
+    mut decoder: impl FnMut(&SchemaRef, &[&'a OwnedValue]) -> Result<RecordBatch, ArrowError>,
+) -> Result<(Option<RecordBatch>, Vec<usize>), ArrowError> {
+    if fields.is_empty() || rows.is_empty() {
+        return Ok((None, (0..rows.len()).collect()));
     }
     let target: SchemaRef = Arc::new(Schema::new(fields.to_vec()));
     let schema: SchemaRef = Arc::new(Schema::new(
@@ -339,26 +350,75 @@ fn decode_rows(
             })
             .collect::<Vec<_>>(),
     ));
-    if let Ok(batch) = decode(&schema, rows) {
-        return Ok((Some(to_target(batch, &target)?), (0..row_count).collect()));
-    }
+    let row_refs: Vec<&OwnedValue> = rows.iter().collect();
+    let first_error = match decoder(&schema, &row_refs) {
+        Ok(batch) => {
+            return Ok((Some(to_target(batch, &target)?), (0..rows.len()).collect()));
+        }
+        Err(error) => error,
+    };
 
-    let mut batches = Vec::with_capacity(rows.len());
+    let mut valid = vec![true; rows.len()];
+    isolate_invalid_rows(
+        &schema,
+        &row_refs,
+        0,
+        first_error,
+        &mut valid,
+        &mut on_reject,
+        &mut decoder,
+    )?;
+
+    let mut valid_rows = Vec::with_capacity(rows.len());
     let mut survivors = Vec::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
-        match decode(&schema, std::slice::from_ref(row)) {
-            Ok(batch) => {
-                batches.push(batch);
-                survivors.push(index);
-            }
-            Err(e) => on_reject(index, format!("row does not match the table schema: {e}")),
+    for (index, row) in row_refs.into_iter().enumerate() {
+        if valid[index] {
+            valid_rows.push(row);
+            survivors.push(index);
         }
     }
-    if batches.is_empty() {
+    if valid_rows.is_empty() {
         return Ok((None, survivors));
     }
-    let batch = concat_batches(&schema, &batches)?;
+    let batch = decoder(&schema, &valid_rows)?;
     Ok((Some(to_target(batch, &target)?), survivors))
+}
+
+fn isolate_invalid_rows<'a>(
+    schema: &SchemaRef,
+    rows: &[&'a OwnedValue],
+    first_index: usize,
+    error: ArrowError,
+    valid: &mut [bool],
+    on_reject: &mut impl FnMut(usize, String),
+    decoder: &mut impl FnMut(&SchemaRef, &[&'a OwnedValue]) -> Result<RecordBatch, ArrowError>,
+) -> Result<(), ArrowError> {
+    if rows.len() == 1 {
+        valid[first_index] = false;
+        on_reject(
+            first_index,
+            format!("row does not match the table schema: {error}"),
+        );
+        return Ok(());
+    }
+
+    let midpoint = rows.len() / 2;
+    let (left, right) = rows.split_at(midpoint);
+    if let Err(error) = decoder(schema, left) {
+        isolate_invalid_rows(schema, left, first_index, error, valid, on_reject, decoder)?;
+    }
+    if let Err(error) = decoder(schema, right) {
+        isolate_invalid_rows(
+            schema,
+            right,
+            first_index + midpoint,
+            error,
+            valid,
+            on_reject,
+            decoder,
+        )?;
+    }
+    Ok(())
 }
 
 /// The type `arrow-json` decodes into. Without the `chrono-tz` feature it
@@ -403,7 +463,7 @@ fn to_target(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch, Arro
     RecordBatch::try_new(target.clone(), columns)
 }
 
-fn decode(schema: &SchemaRef, rows: &[OwnedValue]) -> Result<RecordBatch, ArrowError> {
+fn decode<S: serde::Serialize>(schema: &SchemaRef, rows: &[S]) -> Result<RecordBatch, ArrowError> {
     let mut decoder = ReaderBuilder::new(schema.clone())
         .with_batch_size(rows.len().max(1))
         .build_decoder()?;
@@ -528,9 +588,16 @@ fn append_metadata(
                 )
                 .with_timezone(UTC),
             ),
-            MetaColumn::Id => Arc::new(StringArray::from_iter_values(
-                messages.iter().map(|m| m.id.to_string()),
-            )),
+            MetaColumn::Id => {
+                let mut builder = StringBuilder::with_capacity(rows, rows.saturating_mul(39));
+                for message in messages {
+                    write!(&mut builder, "{}", message.id).map_err(|_| {
+                        ArrowError::ComputeError("cannot format message ID".to_owned())
+                    })?;
+                    builder.append_value("");
+                }
+                Arc::new(builder.finish())
+            }
             MetaColumn::Headers => {
                 let required = !field.is_nullable();
                 Arc::new(StringArray::from_iter(
@@ -568,8 +635,8 @@ fn headers_json(message: &ConsumedMessage, required: bool) -> Option<String> {
 
 // ─── Request sizing ──────────────────────────────────────────────────────────
 
-/// Encode `batch` and halve it until every piece fits `max_bytes`. A single
-/// row that does not fit is rejected.
+/// Estimate the rows per request from the Arrow allocation, then encode each
+/// candidate chunk. A single row that does not fit is rejected.
 fn split_into_chunks(
     batch: RecordBatch,
     offsets: Vec<u64>,
@@ -577,57 +644,105 @@ fn split_into_chunks(
     chunks: &mut Vec<Chunk>,
     rejected: &mut Vec<Rejected>,
 ) -> Result<(), ArrowError> {
-    let (schema_bytes, batch_bytes) = encode_ipc(&batch)?;
-    let size = schema_bytes.len() + batch_bytes.len();
-    if size <= max_bytes {
-        chunks.push(Chunk {
-            batch,
-            offsets,
-            schema_bytes,
-            batch_bytes,
-        });
-        return Ok(());
-    }
-    if batch.num_rows() == 1 {
-        rejected.push(Rejected {
-            offset: offsets[0],
-            reason: format!("row is {size} bytes encoded, above max_request_bytes ({max_bytes})"),
-        });
-        return Ok(());
-    }
-    let half = batch.num_rows() / 2;
-    let (left_offsets, right_offsets) = offsets.split_at(half);
-    split_into_chunks(
-        batch.slice(0, half),
-        left_offsets.to_vec(),
+    let schema_bytes = encode_schema(batch.schema_ref())?;
+    split_into_chunks_with(
+        batch,
+        offsets,
         max_bytes,
+        schema_bytes,
         chunks,
         rejected,
-    )?;
-    split_into_chunks(
-        batch.slice(half, batch.num_rows() - half),
-        right_offsets.to_vec(),
-        max_bytes,
-        chunks,
-        rejected,
+        encode_batch,
     )
+}
+
+fn split_into_chunks_with(
+    batch: RecordBatch,
+    offsets: Vec<u64>,
+    max_bytes: usize,
+    schema_bytes: Vec<u8>,
+    chunks: &mut Vec<Chunk>,
+    rejected: &mut Vec<Rejected>,
+    mut encoder: impl FnMut(&RecordBatch) -> Result<Vec<u8>, ArrowError>,
+) -> Result<(), ArrowError> {
+    let rows_per_chunk = estimated_rows_per_chunk(&batch, schema_bytes.len(), max_bytes);
+    let mut start = 0;
+    while start < batch.num_rows() {
+        let remaining = batch.num_rows() - start;
+        let mut row_count = rows_per_chunk.min(remaining);
+        loop {
+            let candidate = batch.slice(start, row_count);
+            let batch_bytes = encoder(&candidate)?;
+            let size = schema_bytes.len() + batch_bytes.len();
+            if size <= max_bytes {
+                chunks.push(Chunk {
+                    batch: candidate,
+                    offsets: offsets[start..start + row_count].to_vec(),
+                    schema_bytes: schema_bytes.clone(),
+                    batch_bytes,
+                });
+                start += row_count;
+                break;
+            }
+            if row_count == 1 {
+                rejected.push(Rejected {
+                    offset: offsets[start],
+                    reason: format!(
+                        "row is {size} bytes encoded, above max_request_bytes ({max_bytes})"
+                    ),
+                });
+                start += 1;
+                break;
+            }
+
+            let batch_budget = max_bytes.saturating_sub(schema_bytes.len());
+            let smaller = row_count.saturating_mul(batch_budget) / batch_bytes.len().max(1);
+            row_count = smaller.clamp(1, row_count - 1);
+        }
+    }
+    Ok(())
+}
+
+fn estimated_rows_per_chunk(batch: &RecordBatch, schema_bytes: usize, max_bytes: usize) -> usize {
+    if batch.num_rows() == 0 {
+        return 0;
+    }
+    let overhead =
+        IPC_BATCH_OVERHEAD.saturating_add(batch.num_columns().saturating_mul(IPC_COLUMN_OVERHEAD));
+    let batch_budget = max_bytes.saturating_sub(schema_bytes.saturating_add(overhead));
+    let bytes_per_row = batch
+        .get_array_memory_size()
+        .div_ceil(batch.num_rows())
+        .max(1);
+    (batch_budget / bytes_per_row).max(1).min(batch.num_rows())
 }
 
 /// Serialize the schema and the batch as Arrow IPC stream messages, the
 /// format `AppendRowsRequest.arrow_rows` carries.
 fn encode_ipc(batch: &RecordBatch) -> Result<(Vec<u8>, Vec<u8>), ArrowError> {
+    Ok((encode_schema(batch.schema_ref())?, encode_batch(batch)?))
+}
+
+fn encode_schema(schema: &SchemaRef) -> Result<Vec<u8>, ArrowError> {
+    let options = IpcWriteOptions::default();
+    let generator = IpcDataGenerator::default();
+    let mut tracker = DictionaryTracker::new(true);
+    let schema = generator.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
+    let mut schema_bytes = Vec::new();
+    write_message(&mut schema_bytes, schema, &options)?;
+    Ok(schema_bytes)
+}
+
+fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
     let options = IpcWriteOptions::default();
     let generator = IpcDataGenerator::default();
     let mut tracker = DictionaryTracker::new(true);
     let mut compression = CompressionContext::default();
-
-    let schema = generator.schema_to_bytes_with_dictionary_tracker(
+    let _ = generator.schema_to_bytes_with_dictionary_tracker(
         batch.schema_ref(),
         &mut tracker,
         &options,
     );
-    let mut schema_bytes = Vec::new();
-    write_message(&mut schema_bytes, schema, &options)?;
 
     let (dictionaries, encoded) =
         generator.encode(batch, &mut tracker, &options, &mut compression)?;
@@ -636,7 +751,7 @@ fn encode_ipc(batch: &RecordBatch) -> Result<(Vec<u8>, Vec<u8>), ArrowError> {
         write_message(&mut batch_bytes, dictionary, &options)?;
     }
     write_message(&mut batch_bytes, encoded, &options)?;
-    Ok((schema_bytes, batch_bytes))
+    Ok(batch_bytes)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -654,14 +769,6 @@ fn payload_kind(payload: &Payload) -> &'static str {
 
 fn empty_array() -> OwnedValue {
     OwnedValue::Array(Box::default())
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 fn saturating_i64(value: u64) -> i64 {
@@ -829,6 +936,44 @@ mod tests {
             chunk.batch.column(0).as_primitive::<Int64Type>().values(),
             &[1, 3]
         );
+    }
+
+    #[test]
+    fn given_one_invalid_row_should_isolate_it_with_logarithmic_decodes() {
+        let layout = layout(
+            r#"{"name":"user_id","type":"INT64"}"#,
+            WriteMode::Mapped,
+            false,
+        );
+        let rows: Vec<OwnedValue> = (0..32)
+            .map(|index| {
+                let text = if index == 17 {
+                    r#"{"user_id":"not-a-number"}"#.to_owned()
+                } else {
+                    format!(r#"{{"user_id":{index}}}"#)
+                };
+                let mut bytes = text.into_bytes();
+                simd_json::to_owned_value(&mut bytes).unwrap()
+            })
+            .collect();
+        let mut rejected = Vec::new();
+        let mut decode_calls = 0;
+
+        let (batch, survivors) = decode_rows_with(
+            &layout.fields,
+            &rows,
+            |index, _| rejected.push(index),
+            |schema, rows| {
+                decode_calls += 1;
+                decode(schema, rows)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rejected, vec![17]);
+        assert_eq!(survivors.len(), 31);
+        assert_eq!(batch.unwrap().num_rows(), 31);
+        assert!(decode_calls <= 12, "used {decode_calls} decode calls");
     }
 
     #[test]
@@ -1046,18 +1191,34 @@ mod tests {
         let messages = (0..40)
             .map(|offset| message(offset, Payload::Text("x".repeat(4096))))
             .collect();
-        let encoded = run_with_budget(&layout, messages, 64 * 1024);
-        assert!(encoded.rejected.is_empty());
-        assert!(encoded.chunks.len() > 1);
-        for chunk in &encoded.chunks {
+        let mut encoded = run(&layout, messages);
+        let source = encoded.chunks.pop().unwrap();
+        let schema_bytes = encode_schema(source.batch.schema_ref()).unwrap();
+        let mut chunks = Vec::new();
+        let mut rejected = Vec::new();
+        let mut encode_calls = 0;
+        split_into_chunks_with(
+            source.batch,
+            source.offsets,
+            64 * 1024,
+            schema_bytes,
+            &mut chunks,
+            &mut rejected,
+            |batch| {
+                encode_calls += 1;
+                encode_batch(batch)
+            },
+        )
+        .unwrap();
+
+        assert!(rejected.is_empty());
+        assert!(chunks.len() > 1);
+        assert_eq!(encode_calls, chunks.len());
+        for chunk in &chunks {
             assert!(chunk.schema_bytes.len() + chunk.batch_bytes.len() <= 64 * 1024);
             assert_eq!(chunk.batch.num_rows(), chunk.offsets.len());
         }
-        let offsets: Vec<u64> = encoded
-            .chunks
-            .iter()
-            .flat_map(|c| c.offsets.clone())
-            .collect();
+        let offsets: Vec<u64> = chunks.iter().flat_map(|c| c.offsets.clone()).collect();
         assert_eq!(offsets, (0..40).collect::<Vec<_>>());
     }
 

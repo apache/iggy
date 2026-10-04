@@ -159,14 +159,19 @@ pub(crate) struct Counters {
 }
 
 #[derive(Debug)]
+struct OpenState {
+    client: client::BigQueryClient,
+    layout: schema::TableLayout,
+}
+
+#[derive(Debug)]
 pub struct BigQuerySink {
     id: u32,
     config: BigQuerySinkConfig,
     settings: Settings,
     /// `project.dataset.table`, safe to log.
     target: String,
-    client: Option<client::BigQueryClient>,
-    layout: Option<schema::TableLayout>,
+    state: Option<OpenState>,
     counters: Counters,
 }
 
@@ -179,8 +184,7 @@ impl BigQuerySink {
             config,
             settings,
             target,
-            client: None,
-            layout: None,
+            state: None,
             counters: Counters::default(),
         }
     }

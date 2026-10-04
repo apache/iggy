@@ -60,8 +60,8 @@ impl TableError {
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
             TableError::Http { status, .. } => *status == 429 || *status >= 500,
-            TableError::Transport(_) => true,
-            TableError::Token(_) | TableError::Schema(_) => false,
+            TableError::Transport(_) | TableError::Token(_) => true,
+            TableError::Schema(_) => false,
         }
     }
 }
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn given_table_http_errors_should_retry_only_throttling_and_server_errors() {
+    fn given_table_failures_should_retry_only_transient_errors() {
         let http = |status| TableError::Http {
             status,
             body: String::new(),
@@ -202,6 +202,6 @@ mod tests {
         assert!(!http(403).is_retryable());
         assert!(!http(404).is_retryable());
         assert!(TableError::Transport("reset".into()).is_retryable());
-        assert!(!TableError::Token("bad key".into()).is_retryable());
+        assert!(TableError::Token("token service unavailable".into()).is_retryable());
     }
 }

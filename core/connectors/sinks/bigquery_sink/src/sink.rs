@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::BigQuerySink;
 use crate::client::{AppendOutcome, BigQueryClient};
 use crate::encode::{self, Chunk, RunContext};
 use crate::error::{AppendError, TableError};
 use crate::schema::{TableLayout, parse_table_schema};
+use crate::{BigQuerySink, OpenState};
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
@@ -52,7 +52,7 @@ impl Sink for BigQuerySink {
         if messages.is_empty() {
             return Ok(());
         }
-        let (Some(client), Some(layout)) = (&self.client, &self.layout) else {
+        let Some(state) = &self.state else {
             return Err(Error::InitError("BigQuery sink is not open".into()));
         };
         let received = messages.len();
@@ -66,7 +66,7 @@ impl Sink for BigQuerySink {
         );
 
         let ctx = RunContext {
-            layout,
+            layout: &state.layout,
             topic: topic_metadata,
             messages: &messages_metadata,
             max_request_bytes: self.settings.max_request_bytes,
@@ -101,7 +101,7 @@ impl Sink for BigQuerySink {
         let mut last_error = None;
         for chunk in &encoded.chunks {
             match self
-                .write_chunk(client, chunk, topic_metadata, &messages_metadata)
+                .write_chunk(&state.client, chunk, topic_metadata, &messages_metadata)
                 .await
             {
                 Ok(rows) => written += rows,
@@ -112,18 +112,24 @@ impl Sink for BigQuerySink {
             .rows_written
             .fetch_add(written, Ordering::Relaxed);
 
-        let summary = format!(
-            "BigQuery sink ID: {} wrote {written} of {received} messages from {}/{} partition {} to {}",
-            self.id,
-            topic_metadata.stream,
-            topic_metadata.topic,
-            messages_metadata.partition_id,
-            self.target
-        );
         if self.settings.verbose {
-            info!("{summary}");
+            info!(
+                "BigQuery sink ID: {} wrote {written} of {received} messages from {}/{} partition {} to {}",
+                self.id,
+                topic_metadata.stream,
+                topic_metadata.topic,
+                messages_metadata.partition_id,
+                self.target
+            );
         } else {
-            debug!("{summary}");
+            debug!(
+                "BigQuery sink ID: {} wrote {written} of {received} messages from {}/{} partition {} to {}",
+                self.id,
+                topic_metadata.stream,
+                topic_metadata.topic,
+                messages_metadata.partition_id,
+                self.target
+            );
         }
 
         match last_error {
@@ -133,8 +139,7 @@ impl Sink for BigQuerySink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        self.client = None;
-        self.layout = None;
+        self.state = None;
         info!(
             "Closed BigQuery sink connector ID: {}, rows written: {}, rows rejected: {}, rows failed: {}",
             self.id,
@@ -179,8 +184,7 @@ impl BigQuerySink {
             layout.raw.as_ref().map_or(layout.columns.len(), |_| 1),
             layout.metadata.len()
         );
-        self.layout = Some(layout);
-        self.client = Some(client);
+        self.state = Some(OpenState { client, layout });
         Ok(())
     }
 
