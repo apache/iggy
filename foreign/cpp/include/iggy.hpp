@@ -803,24 +803,29 @@ class ConsumerOffsetInfo final {
  * @brief Type tag for a HeaderField payload.
  *
  * Specifies how a HeaderField payload is encoded. Each field stores a type tag
- * and its corresponding bytes. Numeric payloads use little-endian byte order.
+ * and its corresponding bytes. Raw and string payloads contain between 1 and
+ * 255 bytes, and string payloads must contain valid UTF-8. A boolean is one
+ * byte containing either 0 or 1. Integers use their exact natural width and
+ * little-endian byte order; signed integers use two's-complement
+ * representation. Floating-point values use little-endian IEEE 754 binary32
+ * or binary64 representation.
  */
 enum class HeaderKind : std::uint8_t {
-    Raw     = 1,
-    String  = 2,
-    Bool    = 3,
-    Int8    = 4,
-    Int16   = 5,
-    Int32   = 6,
-    Int64   = 7,
-    Int128  = 8,
-    Uint8   = 9,
-    Uint16  = 10,
-    Uint32  = 11,
-    Uint64  = 12,
-    Uint128 = 13,
-    Float32 = 14,
-    Float64 = 15,
+    Raw     = 1,   ///< Uninterpreted byte sequence.
+    String  = 2,   ///< UTF-8 encoded text.
+    Bool    = 3,   ///< Boolean encoded as one byte: 0 for false or 1 for true.
+    Int8    = 4,   ///< One-byte signed integer.
+    Int16   = 5,   ///< Two-byte signed integer.
+    Int32   = 6,   ///< Four-byte signed integer.
+    Int64   = 7,   ///< Eight-byte signed integer.
+    Int128  = 8,   ///< Sixteen-byte signed integer.
+    Uint8   = 9,   ///< One-byte unsigned integer.
+    Uint16  = 10,  ///< Two-byte unsigned integer.
+    Uint32  = 11,  ///< Four-byte unsigned integer.
+    Uint64  = 12,  ///< Eight-byte unsigned integer.
+    Uint128 = 13,  ///< Sixteen-byte unsigned integer.
+    Float32 = 14,  ///< Four-byte IEEE 754 binary32 value.
+    Float64 = 15,  ///< Eight-byte IEEE 754 binary64 value.
 };
 
 /**
@@ -1101,7 +1106,7 @@ class IggyMessagePolled final {
  * resource is recreated with a different server configuration.
  *
  * This is a response-only model returned by Options(). Use TopicCreateOptions
- * to configure a new topic. Stream creation currently accepts only a name.
+ * to configure a new topic. Stream creation accepts only a name.
  */
 class ResourceOptions final {
   public:
@@ -1114,7 +1119,7 @@ class ResourceOptions final {
     /**
      * @brief Returns entries derived from configured defaults at admission.
      * @return Derived entries as map from option name to typed value.
-     * @note Stream responses currently expose explicit entries only, so this
+     * @note The server returns only explicit entries for streams, so this
      *       collection is empty for Stream and StreamDetails.
      */
     [[nodiscard]] const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
@@ -1660,7 +1665,7 @@ class StreamDetails final {
     /**
      * @brief Returns explicit stream creation options.
      * @return Options owned by this value.
-     * @note The current bridge does not return derived stream options.
+     * @note The server does not return derived stream options.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
@@ -1749,7 +1754,7 @@ class Stream final {
     /**
      * @brief Returns explicit stream creation options.
      * @return Options owned by this value.
-     * @note The current bridge does not return derived stream options.
+     * @note The server does not return derived stream options.
      */
     [[nodiscard]] const ResourceOptions &Options() const noexcept { return options_; }
 
@@ -2110,9 +2115,8 @@ class ClientInfoDetails final {
 /**
  * @brief Cache counters for one stream, topic, and partition.
  *
- * Stats::CacheMetrics() contains these entries when the server implementation
- * reports partition cache metrics. The current VSR server returns an empty
- * cache-metrics collection.
+ * Stats::CacheMetrics() contains these entries when partition cache metrics
+ * are available. The server returns an empty cache-metrics collection.
  */
 class CacheMetricEntry final {
   public:
@@ -2338,8 +2342,8 @@ class Stats final {
 
     /**
      * @brief Returns partition cache metrics reported by the server.
-     * @return Entries owned by this value. The current VSR server returns an
-     *         empty collection.
+     * @return Entries owned by this value. The server returns an empty
+     *         collection.
      */
     [[nodiscard]] const std::vector<CacheMetricEntry> &CacheMetrics() const noexcept { return cache_metrics_; }
 
@@ -3087,10 +3091,10 @@ class TopicUpdateOptions final {
 /**
  * @brief Options for updating a stream.
  *
- * Use this class to supply stream settings to UpdateStream(). Currently, Iggy
- * does not support updating stream settings, so the server rejects every
- * supplied setting. The raw entries are retained for compatibility with future
- * server versions that add mutable stream settings.
+ * Use this class to supply stream settings to UpdateStream(). The server does
+ * not support updating stream settings and rejects every supplied setting. The
+ * raw entries allow settings to be passed without changing this C++ API when
+ * the server adds mutable stream settings.
  */
 class StreamUpdateOptions final {
   public:
@@ -3099,7 +3103,7 @@ class StreamUpdateOptions final {
     /**
      * @brief Returns the requested stream settings as key-value pairs.
      * @return Ordered map of setting names and values.
-     * @note The server currently rejects all stream settings.
+     * @note The server rejects all stream settings.
      */
     [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
@@ -3107,7 +3111,7 @@ class StreamUpdateOptions final {
      * @brief Adds or replaces requested stream settings.
      * @param entries Setting names and values to add.
      * @return Reference to this options object.
-     * @note The server currently rejects all stream settings.
+     * @note The server rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
@@ -3120,7 +3124,7 @@ class StreamUpdateOptions final {
      * @param entries Setting names and values to move into this options object.
      * @return Reference to this options object.
      * @see SetRawEntries(const std::map<std::string, std::string>&)
-     * @note The server currently rejects all stream settings.
+     * @note The server rejects all stream settings.
      */
     StreamUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         while (!entries.empty()) {
@@ -3142,9 +3146,9 @@ class StreamUpdateOptions final {
  *
  * Use this class to supply user settings to UpdateUser(). Updating a user
  * patches only the supplied settings; omitted settings remain unchanged.
- * Currently, Iggy does not support updating user settings, so the server
- * rejects every supplied setting. The raw entries are retained for
- * compatibility with future server versions that add mutable user settings.
+ * The server does not support updating user settings and rejects every
+ * supplied setting. The raw entries allow settings to be passed without
+ * changing this C++ API when the server adds mutable user settings.
  */
 class UserUpdateOptions final {
   public:
@@ -3154,7 +3158,7 @@ class UserUpdateOptions final {
     /**
      * @brief Returns the requested user settings as key-value pairs.
      * @return Ordered map of setting names and values.
-     * @note The server currently rejects all user settings.
+     * @note The server rejects all user settings.
      */
     [[nodiscard]] const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
 
@@ -3162,7 +3166,7 @@ class UserUpdateOptions final {
      * @brief Adds or replaces requested user settings.
      * @param entries Setting names and values to add.
      * @return Reference to this options object.
-     * @note The server currently rejects all user settings.
+     * @note The server rejects all user settings.
      */
     UserUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
         for (const auto &entry : entries) {
@@ -3175,7 +3179,7 @@ class UserUpdateOptions final {
      * @param entries Setting names and values to move into this options object.
      * @return Reference to this options object.
      * @see SetRawEntries(const std::map<std::string, std::string>&)
-     * @note The server currently rejects all user settings.
+     * @note The server rejects all user settings.
      */
     UserUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
         while (!entries.empty()) {
@@ -3370,8 +3374,8 @@ class SendMessagesConfirmation final {
  * @brief Result of a successful SendMessages() operation.
  *
  * Confirmations are returned per partition. The collection may be empty when
- * the server reports no offsets, including successful sends to a legacy
- * server. An empty collection does not mean the send failed.
+ * the server reports no offsets. An empty collection does not mean the send
+ * failed.
  */
 class SendMessagesResponse final {
   public:
@@ -4212,9 +4216,9 @@ class IggyBlockingClient final {
      * The group name must be unique within the topic, non-empty, and no more
      * than 255 UTF-8 bytes. The new group initially has no members.
      *
-     * The VSR server assigns consumer group IDs monotonically. Deleting a
-     * group and recreating it with the same name is allowed, but the recreated
-     * group receives a new ID rather than reusing the deleted group's ID.
+     * The server assigns consumer group IDs monotonically. Deleting a group
+     * and recreating it with the same name is allowed, but the recreated group
+     * receives a new ID rather than reusing the deleted group's ID.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
@@ -4250,10 +4254,9 @@ class IggyBlockingClient final {
      * The summaries include member and partition counts but omit individual
      * member details. Use GetConsumerGroup() to retrieve those details.
      *
-     * The VSR server reports a missing parent stream or topic as an error. This
-     * differs from the legacy server, which returned an empty list, so an empty
-     * result does not establish whether the parent resources exist across
-     * server implementations.
+     * The server reports a missing parent stream or topic as an error. An empty
+     * result means both parent resources existed when the request was
+     * evaluated.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
