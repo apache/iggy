@@ -30,6 +30,8 @@ use std::str::FromStr;
 use iggy::prelude::{HeaderKey, IggyDuration, IggyExpiry, ResourceOptions, topic_option_keys};
 use kafka_protocol::protocol::StrBytes;
 
+use crate::bridge::BridgeError;
+
 /// Kafka `ConfigResource.Type.TOPIC`.
 pub const RESOURCE_TYPE_TOPIC: i8 = 2;
 
@@ -45,12 +47,14 @@ pub const CONFIG_TYPE_STRING: i8 = 2;
 /// Kafka `ConfigType.LONG`.
 pub const CONFIG_TYPE_LONG: i8 = 5;
 
+/// Kafka `ConfigType.UNKNOWN`.
+pub const CONFIG_TYPE_UNKNOWN: i8 = 0;
+
 pub const RETENTION_MS: &str = "retention.ms";
 pub const CLEANUP_POLICY: &str = "cleanup.policy";
 pub const CLEANUP_POLICY_VALUE: &str = "delete";
 
 pub const ONLY_TOPIC_RESOURCES: &str = "only topic resources are supported";
-pub const UNKNOWN_TAGGED_FIELDS: &str = "unknown tagged fields are not supported";
 
 pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active segment does not expire. -1 means sealed segments never expire.";
 pub const CLEANUP_DOC: &str = "Iggy deletes expired messages and does not compact a topic.";
@@ -58,8 +62,10 @@ pub const CLEANUP_DOC: &str = "Iggy deletes expired messages and does not compac
 /// Distinct Kafka topic names one `DescribeConfigs` or `AlterConfigs` request may send to Iggy.
 ///
 /// Same ceiling as `CreateTopics`: each distinct name is a lockstep call on the shared client.
-/// Duplicate names in one request count once. A larger batch is `POLICY_VIOLATION` on every
-/// resource. The decode-time element ceiling is a separate, larger limit and is not this cap.
+/// Duplicate names in one request count once for this cap, but a repeated name is itself
+/// rejected outright - see [`find_duplicate_names`]. A larger batch is `POLICY_VIOLATION` on
+/// every resource. The decode-time element ceiling is a separate, larger limit and is not this
+/// cap.
 pub const MAX_CONFIG_TOPICS: usize = 100;
 
 /// One config name a describe request asked for, in request order.
@@ -139,12 +145,8 @@ pub fn retention_ms(expiry: IggyExpiry, explicit: bool) -> Result<RetentionMs, (
             if micros == 0 || !micros.is_multiple_of(1_000) {
                 return Err(());
             }
-            let millis = i64::try_from(micros / 1_000).map_err(|_| ())?;
-            if millis <= 0 {
-                return Err(());
-            }
             Ok(RetentionMs {
-                value: millis.to_string(),
+                value: (micros / 1_000).to_string(),
                 source: CONFIG_SOURCE_TOPIC,
             })
         }
@@ -177,9 +179,9 @@ pub fn parse_retention_ms(value: &str) -> Result<IggyExpiry, ConfigFault> {
         return Err(ConfigFault::InvalidRetention);
     }
     let millis = u64::try_from(millis).map_err(|_| ConfigFault::InvalidRetention)?;
-    // `IggyExpiry::from_str` rejects `as_secs() > u32::MAX`. A longer duration makes
-    // `Segment::is_expired` wrap `max_timestamp + micros` (and panic in debug), so a
-    // sealed segment looks expired and is deleted.
+    // `IggyExpiry::from_str` rejects `as_secs() > u32::MAX`. The typed update path
+    // does not, but a value the server's own parser refuses is not one this gateway
+    // should store.
     if millis / 1_000 > u64::from(u32::MAX) {
         return Err(ConfigFault::InvalidRetention);
     }
@@ -201,6 +203,67 @@ pub fn topic_cap_message(api_name: &str) -> String {
     format!(
         "this gateway addresses at most {MAX_CONFIG_TOPICS} distinct topics per {api_name} request"
     )
+}
+
+/// Names in `names` that occur more than once.
+///
+/// Real Kafka refuses every occurrence of a duplicate resource name with `INVALID_REQUEST`
+/// (42) rather than silently picking a winner - the same choice `CreateTopics`' own
+/// `find_duplicate_names` makes for a repeated topic name in one batch.
+#[must_use]
+pub fn find_duplicate_names<'a>(names: impl IntoIterator<Item = &'a str>) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            duplicates.insert(name);
+        }
+    }
+    duplicates
+}
+
+/// The reason a topic name failed Kafka's own naming rules, or a fixed fallback.
+#[must_use]
+pub fn name_reason(error: &BridgeError) -> String {
+    match error {
+        BridgeError::InvalidKafkaTopicName { reason, .. } => reason.clone(),
+        _ => "invalid topic name".to_string(),
+    }
+}
+
+#[must_use]
+pub const fn static_text(message: &'static str) -> StrBytes {
+    StrBytes::from_static_str(message)
+}
+
+/// Maps a bridge failure to a Kafka error code and client-facing message, logging the real
+/// cause server-side.
+///
+/// `handler` names the API in the log line (`"DescribeConfigs"`/`"AlterConfigs"`); `action` is
+/// the present participle of what the bridge call was doing (`"reading"`/`"altering"`), reused
+/// in both the timeout log and the generic internal-error message.
+#[must_use]
+pub fn bridge_failure(error: &BridgeError, handler: &str, action: &str) -> (i16, Option<StrBytes>) {
+    let code = error.to_kafka_error_code();
+    match error {
+        BridgeError::InvalidKafkaTopicName { reason, .. } => {
+            tracing::debug!(reason, "{handler} rejected an invalid topic name");
+            (code, Some(StrBytes::from(reason.clone())))
+        }
+        BridgeError::Timeout | BridgeError::SendLost(_) => {
+            tracing::warn!(%error, "{handler} {action} exceeded the bridge deadline");
+            (code, None)
+        }
+        other => {
+            tracing::error!(%other, "{handler} failed while {action} topic configuration");
+            (
+                code,
+                Some(StrBytes::from(format!(
+                    "internal error {action} topic configuration"
+                ))),
+            )
+        }
+    }
 }
 
 /// Keys to return for one describe resource.
@@ -325,6 +388,17 @@ mod tests {
                 ListedKey::Unknown("no.such".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn find_duplicate_names_finds_a_name_repeated_across_two_resources() {
+        let duplicates = find_duplicate_names(["orders", "payments", "orders"]);
+        assert_eq!(duplicates, HashSet::from(["orders"]));
+    }
+
+    #[test]
+    fn find_duplicate_names_is_empty_when_every_name_is_unique() {
+        assert!(find_duplicate_names(["orders", "payments"]).is_empty());
     }
 
     #[test]

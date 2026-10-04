@@ -46,6 +46,34 @@ const TOPIC: &str = "orders";
 /// process until the runner itself was killed.
 const CHILD_LIMIT: Duration = Duration::from_secs(120);
 
+/// Reports why the suite cannot run, and whether that is fatal.
+///
+/// Returns `true` when the caller should skip. `JAVA_E2E_REQUIRED=1` makes it panic instead, so a
+/// CI job that means to run this fails loudly rather than reporting a pass over zero assertions -
+/// same convention as `kafka_client_e2e_tests.rs`'s own `skip`/`KAFKA_E2E_REQUIRED`.
+fn skip(reason: &str) -> bool {
+    assert!(
+        std::env::var("JAVA_E2E_REQUIRED").as_deref() != Ok("1"),
+        "JAVA_E2E_REQUIRED=1 but the suite cannot run: {reason}"
+    );
+    eprintln!("skipping Java admin-client end-to-end test: {reason}");
+    true
+}
+
+fn java_missing() -> bool {
+    let available = Command::new("java")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if available {
+        false
+    } else {
+        skip("java is unavailable")
+    }
+}
+
 fn output_bounded(command: &mut Command, what: &str) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
@@ -188,12 +216,9 @@ async fn spawn_gateway(server: &TestServer) -> SocketAddr {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
-    let java = output_bounded(Command::new("java").arg("-version"), "java -version");
-    assert!(
-        java.status.success(),
-        "java -version failed: {}",
-        String::from_utf8_lossy(&java.stderr)
-    );
+    if java_missing() {
+        return;
+    }
 
     let jars = jar_dir();
     ensure_jars(&jars);

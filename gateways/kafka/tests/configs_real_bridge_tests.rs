@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::alter_configs_request::{
     AlterConfigsRequest, AlterConfigsResource, AlterableConfig,
 };
@@ -30,7 +29,7 @@ use kafka_protocol::messages::describe_configs_request::{
 use kafka_protocol::messages::describe_configs_response::{
     DescribeConfigsResourceResult, DescribeConfigsResponse,
 };
-use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use kafka_protocol::protocol::StrBytes;
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
@@ -42,10 +41,15 @@ use iggy_gateway_kafka::protocol::api::{
 };
 use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
 
+#[path = "common/codec.rs"]
+mod codec;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
+#[path = "common/wire.rs"]
+mod wire;
 
 use iggy_server::TestServer;
+use wire::{decode, encode};
 
 const DESCRIBE_V4: i16 = 4;
 const DESCRIBE_V1: i16 = 1;
@@ -57,17 +61,6 @@ const SOURCE_DEFAULT: i8 = 5;
 
 const fn text(value: &'static str) -> StrBytes {
     StrBytes::from_static_str(value)
-}
-
-fn encode<M: Encodable>(message: &M, version: i16) -> Bytes {
-    let mut buf = BytesMut::new();
-    message.encode(&mut buf, version).expect("encode request");
-    buf.freeze()
-}
-
-fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
-    let mut buf = body;
-    M::decode(&mut buf, version).expect("decode response")
 }
 
 async fn connected_state(server: &TestServer) -> GatewayState {
@@ -318,7 +311,10 @@ async fn describe_and_alter_configs_reject_unknown_nontopic_missing_and_invalid_
         .error_message
         .as_ref()
         .map_or("", StrBytes::as_str);
-    assert!(!message.contains("no.such"));
+    assert!(
+        message.contains("no.such"),
+        "unknown-key message must name the key, matching AlterConfigs' own wording: {message}"
+    );
 
     let broker = describe(
         &state,
@@ -518,4 +514,121 @@ async fn alter_configs_one_bad_key_skips_only_that_resource() {
         Some("5000")
     );
     assert_eq!(described.results[1].configs[0].config_source, SOURCE_TOPIC);
+}
+
+/// Regression test for the duplicate-resource memoization bug: a second `AlterConfigs`
+/// resource entry for an already-seen topic name must not be silently answered from a cached
+/// result - its own, different `retention.ms` must never be reported as applied when the write
+/// for it never ran.
+#[tokio::test]
+#[serial]
+async fn alter_configs_rejects_every_occurrence_of_a_duplicate_resource_name() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+
+    let altered = alter(
+        &state,
+        ALTER_V2,
+        vec![
+            alter_resource("orders", TOPIC, &[("retention.ms", "4000")]),
+            alter_resource("orders", TOPIC, &[("retention.ms", "5000")]),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(altered.responses.len(), 2);
+    assert_eq!(altered.responses[0].error_code, ERROR_INVALID_REQUEST);
+    assert_eq!(altered.responses[1].error_code, ERROR_INVALID_REQUEST);
+
+    // Neither occurrence's value was applied - the stored retention is still the default.
+    let described = describe(
+        &state,
+        DESCRIBE_V4,
+        vec![describe_resource("orders", Some(vec!["retention.ms"]))],
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(
+        described.results[0].configs[0]
+            .value
+            .as_ref()
+            .map(StrBytes::as_str),
+        Some("-1")
+    );
+}
+
+/// The `DescribeConfigs` sibling of the same memoization pattern: a duplicate resource name
+/// with a *different* `configuration_keys` filter must not be answered from the first entry's
+/// cached, differently-filtered result.
+#[tokio::test]
+#[serial]
+async fn describe_configs_rejects_every_occurrence_of_a_duplicate_resource_name() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+
+    let described = describe(
+        &state,
+        DESCRIBE_V4,
+        vec![
+            describe_resource("orders", Some(vec!["retention.ms"])),
+            describe_resource("orders", Some(vec!["cleanup.policy"])),
+        ],
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(described.results.len(), 2);
+    assert_eq!(described.results[0].error_code, ERROR_INVALID_REQUEST);
+    assert_eq!(described.results[1].error_code, ERROR_INVALID_REQUEST);
+}
+
+/// An alter that does not name `retention.ms` does not clear a previously set expiry.
+#[tokio::test]
+#[serial]
+async fn alter_configs_with_no_configs_leaves_retention_unchanged() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+
+    let first = alter(
+        &state,
+        ALTER_V2,
+        vec![alter_resource("orders", TOPIC, &[("retention.ms", "4000")])],
+        false,
+    )
+    .await;
+    assert_eq!(first.responses[0].error_code, ERROR_NONE);
+
+    let reset = alter(
+        &state,
+        ALTER_V2,
+        vec![alter_resource("orders", TOPIC, &[])],
+        false,
+    )
+    .await;
+    assert_eq!(reset.responses[0].error_code, ERROR_NONE);
+
+    let described = describe(
+        &state,
+        DESCRIBE_V4,
+        vec![describe_resource("orders", Some(vec!["retention.ms"]))],
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(
+        described.results[0].configs[0]
+            .value
+            .as_ref()
+            .map(StrBytes::as_str),
+        Some("4000"),
+        "an empty configs list must not clear a previously set retention.ms"
+    );
+    assert_eq!(described.results[0].configs[0].config_source, SOURCE_TOPIC);
 }

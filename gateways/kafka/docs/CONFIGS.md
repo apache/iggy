@@ -34,7 +34,9 @@ the never-expire default. The gateway does not round.
 
 ## What an alter stores
 
-Only `retention.ms` is written, through `update_topic`'s `message_expiry`.
+Only `retention.ms` is written, through `update_topic`'s `message_expiry`. A resource
+whose `configs` list does not name `retention.ms` is left unchanged. Omitting the key
+does not clear a previously set expiry.
 
 - `-1` stores `IggyExpiry::NeverExpire`. The server treats `0`
   (`IggyExpiry::ServerDefault`) as "leave the current expiry", so `-1` is not
@@ -63,5 +65,6 @@ call `update_topic`.
 | Resource type other than topic | `INVALID_REQUEST` (42) | Message is `only topic resources are supported`. Other resources in the batch still run |
 | Topic name fails the same rules as CreateTopics | `INVALID_TOPIC_EXCEPTION` (17) | The message is the validation reason and does not repeat the topic name |
 | Topic does not exist | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Checked before config keys, so a missing topic is not `INVALID_CONFIG` |
-| More than 100 distinct topic names | `POLICY_VIOLATION` (44) | Every resource in the request. Duplicate names count once and are not an error by themselves |
-| Non-empty tagged fields | `INVALID_REQUEST` (42) | Request-level tags fail every resource. Per-resource or per-entry tags fail that resource |
+| More than 100 distinct topic names | `POLICY_VIOLATION` (44) | Every resource in the request |
+| A topic name repeated across resources | `INVALID_REQUEST` (42) | Every occurrence of the duplicate, not just the second one. Same choice CreateTopics makes for a repeated topic name |
+| Non-empty unknown tagged fields | `INVALID_REQUEST` (42) | Request-level tags fail every resource. A resource or config entry's own tags fail that resource. Empty tagged fields are the normal flexible encoding |

@@ -26,9 +26,23 @@
 //! every function some *other* binary uses as unused here.
 #![allow(dead_code)]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use kafka_protocol::protocol::{Decodable, Encodable};
 
 use super::codec::Encoder;
+
+/// Encodes any `kafka_protocol` request or response type at `version`.
+pub fn encode<M: Encodable>(message: &M, version: i16) -> Bytes {
+    let mut buf = BytesMut::new();
+    message.encode(&mut buf, version).expect("encode request");
+    buf.freeze()
+}
+
+/// Decodes any `kafka_protocol` request or response type at `version`.
+pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
+    let mut buf = body;
+    M::decode(&mut buf, version).expect("decode response")
+}
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[

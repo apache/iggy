@@ -17,7 +17,6 @@
 
 //! `DescribeConfigs` and `AlterConfigs` with the bridge off.
 
-use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::alter_configs_request::{
     AlterConfigsRequest, AlterConfigsResource, AlterableConfig,
 };
@@ -26,12 +25,19 @@ use kafka_protocol::messages::describe_configs_request::{
     DescribeConfigsRequest, DescribeConfigsResource,
 };
 use kafka_protocol::messages::describe_configs_response::DescribeConfigsResponse;
-use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use kafka_protocol::protocol::StrBytes;
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{BrokerAdvertise, ERROR_NOT_CONTROLLER, GatewayState};
 use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
+
+#[path = "common/codec.rs"]
+mod codec;
+#[path = "common/wire.rs"]
+mod wire;
+
+use wire::{decode, encode};
 
 const DESCRIBE_VERSION: i16 = 4;
 const ALTER_VERSION: i16 = 2;
@@ -45,17 +51,6 @@ fn state_without_bridge() -> GatewayState {
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
-}
-
-fn encode<M: Encodable>(message: &M, version: i16) -> Bytes {
-    let mut buf = BytesMut::new();
-    message.encode(&mut buf, version).expect("encode request");
-    buf.freeze()
-}
-
-fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
-    let mut buf = body;
-    M::decode(&mut buf, version).expect("decode response")
 }
 
 #[tokio::test]

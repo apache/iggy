@@ -17,8 +17,6 @@
 
 //! `DescribeConfigs` (API key 32).
 
-use std::collections::HashMap;
-
 use bytes::Bytes;
 use iggy::prelude::TopicDetails;
 use kafka_protocol::messages::DescribeConfigsRequest;
@@ -30,8 +28,8 @@ use kafka_protocol::messages::describe_configs_response::{
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
+use crate::bridge::IggyBridge;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
@@ -41,9 +39,10 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
 use crate::protocol::handlers::topic_config::{
     CLEANUP_DOC, CLEANUP_POLICY, CLEANUP_POLICY_VALUE, CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC,
-    CONFIG_TYPE_LONG, CONFIG_TYPE_STRING, ListedKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC,
-    RETENTION_DOC, RETENTION_MS, UNKNOWN_TAGGED_FIELDS, exceeds_topic_cap, listed_keys,
-    message_expiry_is_explicit, retention_ms, topic_cap_message,
+    CONFIG_TYPE_LONG, CONFIG_TYPE_STRING, CONFIG_TYPE_UNKNOWN, ListedKey, ONLY_TOPIC_RESOURCES,
+    RESOURCE_TYPE_TOPIC, RETENTION_DOC, RETENTION_MS, bridge_failure, exceeds_topic_cap,
+    find_duplicate_names, listed_keys, message_expiry_is_explicit, name_reason, retention_ms,
+    static_text, topic_cap_message,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -75,17 +74,6 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             );
         }
     };
-
-    if !req.unknown_tagged_fields.is_empty() {
-        return respond_or_close(
-            encode_message(
-                &response(reject_tagged_resources(&req.resources)),
-                api_version,
-                256,
-            ),
-            "DescribeConfigs",
-        );
-    }
 
     let Some(bridge) = &state.bridge else {
         let results = req
@@ -133,12 +121,39 @@ async fn describe_all(
     req: &DescribeConfigsRequest,
     deadline: Instant,
 ) -> Vec<DescribeConfigsResult> {
-    let topic_names = req
+    if !req.unknown_tagged_fields.is_empty() {
+        let message = static_text("unknown tagged fields are not supported");
+        return if req.resources.is_empty() {
+            vec![
+                DescribeConfigsResult::default()
+                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_message(Some(message))
+                    .with_resource_type(RESOURCE_TYPE_TOPIC)
+                    .with_resource_name(StrBytes::from_static_str(""))
+                    .with_configs(Vec::new()),
+            ]
+        } else {
+            req.resources
+                .iter()
+                .map(|resource| {
+                    resource_error(
+                        resource,
+                        ERROR_INVALID_REQUEST,
+                        Some(message.clone()),
+                        Vec::new(),
+                    )
+                })
+                .collect()
+        };
+    }
+
+    let topic_names: Vec<&str> = req
         .resources
         .iter()
         .filter(|resource| resource.resource_type == RESOURCE_TYPE_TOPIC)
-        .map(|resource| resource.resource_name.as_str());
-    if exceeds_topic_cap(topic_names) {
+        .map(|resource| resource.resource_name.as_str())
+        .collect();
+    if exceeds_topic_cap(topic_names.iter().copied()) {
         let message = StrBytes::from(topic_cap_message("DescribeConfigs"));
         tracing::warn!("DescribeConfigs request addresses too many distinct topics; rejecting");
         return req
@@ -155,16 +170,23 @@ async fn describe_all(
             .collect();
     }
 
-    // `get_kafka_topics` lists partition counts, not `message_expiry`, so each distinct
-    // topic is one `get_kafka_topic`. Duplicates reuse the first result and do not call again.
-    let mut seen: HashMap<String, DescribeConfigsResult> = HashMap::new();
+    // Real Kafka refuses every occurrence of a duplicate resource name outright rather than
+    // answering it from a cached result that may have been filtered by a different
+    // `configuration_keys` list - the same choice CreateTopics makes for a repeated topic name.
+    let duplicate_names = find_duplicate_names(topic_names.iter().copied());
+
     let mut results = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
     for resource in &req.resources {
         if resource.resource_type == RESOURCE_TYPE_TOPIC
-            && let Some(prior) = seen.get(resource.resource_name.as_str())
+            && duplicate_names.contains(resource.resource_name.as_str())
         {
-            results.push(prior.clone());
+            results.push(resource_error(
+                resource,
+                ERROR_INVALID_REQUEST,
+                None,
+                Vec::new(),
+            ));
             continue;
         }
         if deadline_exceeded || Instant::now() >= deadline {
@@ -175,9 +197,12 @@ async fn describe_all(
                      instead of starting new Iggy calls"
                 );
             }
-            let timed_out = resource_error(resource, ERROR_REQUEST_TIMED_OUT, None, Vec::new());
-            remember_topic(&mut seen, resource, &timed_out);
-            results.push(timed_out);
+            results.push(resource_error(
+                resource,
+                ERROR_REQUEST_TIMED_OUT,
+                None,
+                Vec::new(),
+            ));
             continue;
         }
 
@@ -192,20 +217,9 @@ async fn describe_all(
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
-        remember_topic(&mut seen, resource, &result);
         results.push(result);
     }
     results
-}
-
-fn remember_topic(
-    seen: &mut HashMap<String, DescribeConfigsResult>,
-    resource: &DescribeConfigsResource,
-    result: &DescribeConfigsResult,
-) {
-    if resource.resource_type == RESOURCE_TYPE_TOPIC {
-        seen.insert(resource.resource_name.as_str().to_string(), result.clone());
-    }
 }
 
 async fn describe_one(
@@ -219,7 +233,7 @@ async fn describe_one(
         return resource_error(
             resource,
             ERROR_INVALID_REQUEST,
-            Some(static_text(UNKNOWN_TAGGED_FIELDS)),
+            Some(static_text("unknown tagged fields are not supported")),
             Vec::new(),
         );
     }
@@ -248,34 +262,49 @@ async fn describe_one(
         );
         return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None, Vec::new());
     }
-    let topic = match bridge.get_kafka_topic(name).await {
-        Ok(Some(topic)) => topic,
-        Ok(None) => {
+    let topic = match tokio::time::timeout_at(deadline, bridge.get_kafka_topic(name)).await {
+        Ok(Ok(Some(topic))) => topic,
+        Ok(Ok(None)) => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None, Vec::new());
         }
-        Err(error) => {
-            let (code, message) = bridge_failure(&error, "reading");
+        Ok(Err(error)) => {
+            let (code, message) = bridge_failure(&error, "DescribeConfigs", "reading");
             return resource_error(resource, code, message, Vec::new());
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                resource = name,
+                "DescribeConfigs: this resource's bridge work exceeded the request deadline; \
+                 answering retriable instead of blocking further"
+            );
+            return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None, Vec::new());
         }
     };
 
-    let (configs, unknown, unrepresentable) = described_entries(
+    let (configs, unknown_key, unrepresentable) = described_entries(
         &topic,
         resource.configuration_keys.as_deref(),
         include_synonyms,
         include_documentation,
     );
 
-    if unknown || unrepresentable {
-        let message = if unrepresentable {
-            "stored message expiry is not a whole number of milliseconds"
-        } else {
-            "unknown config key"
-        };
+    if let Some(unknown_key) = unknown_key {
         return resource_error(
             resource,
             ERROR_INVALID_CONFIG,
-            Some(static_text(message)),
+            Some(StrBytes::from(format!(
+                "unknown config key '{unknown_key}'"
+            ))),
+            configs,
+        );
+    }
+    if unrepresentable {
+        return resource_error(
+            resource,
+            ERROR_INVALID_CONFIG,
+            Some(static_text(
+                "stored message expiry is not a whole number of milliseconds",
+            )),
             configs,
         );
     }
@@ -288,11 +317,11 @@ fn described_entries(
     configuration_keys: Option<&[StrBytes]>,
     include_synonyms: bool,
     include_documentation: bool,
-) -> (Vec<DescribeConfigsResourceResult>, bool, bool) {
+) -> (Vec<DescribeConfigsResourceResult>, Option<String>, bool) {
     let explicit = message_expiry_is_explicit(&topic.options);
     let retention = retention_ms(topic.message_expiry, explicit);
     let keys = listed_keys(configuration_keys);
-    let mut unknown = false;
+    let mut unknown_key = None;
     let mut unrepresentable = false;
     let mut configs = Vec::with_capacity(keys.len());
     for key in keys {
@@ -327,20 +356,22 @@ fn described_entries(
                 include_documentation.then_some(CLEANUP_DOC),
             )),
             ListedKey::Unknown(name) => {
-                unknown = true;
+                if unknown_key.is_none() {
+                    unknown_key = Some(name.clone());
+                }
                 configs.push(config_entry(
                     &name,
                     None,
                     false,
                     CONFIG_SOURCE_DEFAULT,
-                    0,
+                    CONFIG_TYPE_UNKNOWN,
                     include_synonyms,
                     None,
                 ));
             }
         }
     }
-    (configs, unknown, unrepresentable)
+    (configs, unknown_key, unrepresentable)
 }
 
 fn config_entry(
@@ -363,33 +394,17 @@ fn config_entry(
         .with_documentation(documentation.map(|text| StrBytes::from(text.to_string())))
 }
 
-/// Neither known key has a synonym. `include_synonyms` asks for the list and receives none.
-const fn synonyms(_include_synonyms: bool) -> Vec<DescribeConfigsSynonym> {
-    Vec::new()
-}
-
-fn reject_tagged_resources(resources: &[DescribeConfigsResource]) -> Vec<DescribeConfigsResult> {
-    if resources.is_empty() {
-        return vec![
-            DescribeConfigsResult::default()
-                .with_error_code(ERROR_INVALID_REQUEST)
-                .with_error_message(Some(static_text(UNKNOWN_TAGGED_FIELDS)))
-                .with_resource_type(0)
-                .with_resource_name(StrBytes::from_static_str(""))
-                .with_configs(Vec::new()),
-        ];
+/// Neither known key has a synonym. `true` asks for the list and receives none.
+#[allow(
+    clippy::if_same_then_else,
+    reason = "true asks for synonyms and there are none"
+)]
+fn synonyms(include_synonyms: bool) -> Vec<DescribeConfigsSynonym> {
+    if include_synonyms {
+        Vec::new()
+    } else {
+        Vec::new()
     }
-    resources
-        .iter()
-        .map(|resource| {
-            resource_error(
-                resource,
-                ERROR_INVALID_REQUEST,
-                Some(static_text(UNKNOWN_TAGGED_FIELDS)),
-                Vec::new(),
-            )
-        })
-        .collect()
 }
 
 fn resource_error(
@@ -404,36 +419,4 @@ fn resource_error(
         .with_resource_type(resource.resource_type)
         .with_resource_name(resource.resource_name.clone())
         .with_configs(configs)
-}
-
-fn name_reason(error: &BridgeError) -> String {
-    match error {
-        BridgeError::InvalidKafkaTopicName { reason, .. } => reason.clone(),
-        _ => "invalid topic name".to_string(),
-    }
-}
-
-fn bridge_failure(error: &BridgeError, action: &str) -> (i16, Option<StrBytes>) {
-    let code = error.to_kafka_error_code();
-    match error {
-        BridgeError::InvalidKafkaTopicName { reason, .. } => {
-            tracing::debug!(reason, "DescribeConfigs rejected an invalid topic name");
-            (code, Some(StrBytes::from(reason.clone())))
-        }
-        BridgeError::Timeout | BridgeError::SendLost(_) => {
-            tracing::warn!(%error, "DescribeConfigs {action} exceeded the bridge deadline");
-            (code, None)
-        }
-        other => {
-            tracing::error!(%other, "DescribeConfigs failed while {action} topic configuration");
-            (
-                code,
-                Some(static_text("internal error reading topic configuration")),
-            )
-        }
-    }
-}
-
-const fn static_text(message: &'static str) -> StrBytes {
-    StrBytes::from_static_str(message)
 }

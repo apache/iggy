@@ -17,8 +17,6 @@
 
 //! `AlterConfigs` (API key 33).
 
-use std::collections::HashMap;
-
 use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::AlterConfigsRequest;
@@ -39,8 +37,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_alter_configs_shape;
 use crate::protocol::handlers::topic_config::{
-    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, UNKNOWN_TAGGED_FIELDS, exceeds_topic_cap,
-    plan_retention_update, topic_cap_message,
+    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, exceeds_topic_cap,
+    find_duplicate_names, name_reason, plan_retention_update, static_text, topic_cap_message,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -72,17 +70,6 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             );
         }
     };
-
-    if !req.unknown_tagged_fields.is_empty() {
-        return respond_or_close(
-            encode_message(
-                &response(reject_tagged_resources(&req.resources)),
-                api_version,
-                256,
-            ),
-            "AlterConfigs",
-        );
-    }
 
     let Some(bridge) = &state.bridge else {
         let responses = req
@@ -129,12 +116,33 @@ async fn alter_all(
     req: &AlterConfigsRequest,
     deadline: Instant,
 ) -> Vec<AlterConfigsResourceResponse> {
-    let topic_names = req
+    if !req.unknown_tagged_fields.is_empty() {
+        let message = static_text("unknown tagged fields are not supported");
+        return if req.resources.is_empty() {
+            vec![
+                AlterConfigsResourceResponse::default()
+                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_message(Some(message))
+                    .with_resource_type(RESOURCE_TYPE_TOPIC)
+                    .with_resource_name(StrBytes::from_static_str("")),
+            ]
+        } else {
+            req.resources
+                .iter()
+                .map(|resource| {
+                    resource_error(resource, ERROR_INVALID_REQUEST, Some(message.clone()))
+                })
+                .collect()
+        };
+    }
+
+    let topic_names: Vec<&str> = req
         .resources
         .iter()
         .filter(|resource| resource.resource_type == RESOURCE_TYPE_TOPIC)
-        .map(|resource| resource.resource_name.as_str());
-    if exceeds_topic_cap(topic_names) {
+        .map(|resource| resource.resource_name.as_str())
+        .collect();
+    if exceeds_topic_cap(topic_names.iter().copied()) {
         let message = StrBytes::from(topic_cap_message("AlterConfigs"));
         tracing::warn!("AlterConfigs request addresses too many distinct topics; rejecting");
         return req
@@ -144,14 +152,17 @@ async fn alter_all(
             .collect();
     }
 
-    let mut seen: HashMap<String, AlterConfigsResourceResponse> = HashMap::new();
+    // Real Kafka refuses every occurrence of a duplicate resource name outright rather than
+    // picking a winner - the same choice CreateTopics makes for a repeated topic name.
+    let duplicate_names = find_duplicate_names(topic_names.iter().copied());
+
     let mut responses = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
     for resource in &req.resources {
         if resource.resource_type == RESOURCE_TYPE_TOPIC
-            && let Some(prior) = seen.get(resource.resource_name.as_str())
+            && duplicate_names.contains(resource.resource_name.as_str())
         {
-            responses.push(prior.clone());
+            responses.push(resource_error(resource, ERROR_INVALID_REQUEST, None));
             continue;
         }
         if deadline_exceeded || Instant::now() >= deadline {
@@ -162,9 +173,7 @@ async fn alter_all(
                      instead of starting new Iggy calls"
                 );
             }
-            let timed_out = resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
-            remember_topic(&mut seen, resource, &timed_out);
-            responses.push(timed_out);
+            responses.push(resource_error(resource, ERROR_REQUEST_TIMED_OUT, None));
             continue;
         }
 
@@ -172,20 +181,9 @@ async fn alter_all(
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
-        remember_topic(&mut seen, resource, &result);
         responses.push(result);
     }
     responses
-}
-
-fn remember_topic(
-    seen: &mut HashMap<String, AlterConfigsResourceResponse>,
-    resource: &AlterConfigsResource,
-    result: &AlterConfigsResourceResponse,
-) {
-    if resource.resource_type == RESOURCE_TYPE_TOPIC {
-        seen.insert(resource.resource_name.as_str().to_string(), result.clone());
-    }
 }
 
 async fn alter_one(
@@ -203,7 +201,7 @@ async fn alter_one(
         return resource_error(
             resource,
             ERROR_INVALID_REQUEST,
-            Some(static_text(UNKNOWN_TAGGED_FIELDS)),
+            Some(static_text("unknown tagged fields are not supported")),
         );
     }
     if resource.resource_type != RESOURCE_TYPE_TOPIC {
@@ -232,14 +230,22 @@ async fn alter_one(
         );
         return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
     }
-    match bridge.get_kafka_topic(name).await {
-        Ok(Some(_topic)) => {}
-        Ok(None) => {
+    match tokio::time::timeout_at(deadline, bridge.get_kafka_topic(name)).await {
+        Ok(Ok(Some(_topic))) => {}
+        Ok(Ok(None)) => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None);
         }
-        Err(error) => {
-            let (code, message) = bridge_failure(&error);
+        Ok(Err(error)) => {
+            let (code, message) = bridge_failure(&error, "AlterConfigs", "altering");
             return resource_error(resource, code, message);
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                resource = name,
+                "AlterConfigs: this resource's bridge work exceeded the request deadline; \
+                 answering retriable instead of blocking further"
+            );
+            return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
         }
     }
 
@@ -258,12 +264,14 @@ async fn alter_one(
             );
         }
     };
-
-    // `validate_only` already performed the existence read and the same key checks.
-    // It does not call `update_topic`.
+    // A resource that does not name retention.ms has nothing to store. Omitting the key
+    // does not clear a previously set expiry.
     let Some(expiry) = expiry else {
         return resource_error(resource, ERROR_NONE, None);
     };
+
+    // `validate_only` already performed the existence read and the same key checks.
+    // It does not call `update_topic`.
     if validate_only {
         return resource_error(resource, ERROR_NONE, None);
     }
@@ -284,34 +292,10 @@ async fn alter_one(
             resource_error(resource, ERROR_NONE, None)
         }
         Err(error) => {
-            let (code, message) = bridge_failure(&error);
+            let (code, message) = bridge_failure(&error, "AlterConfigs", "altering");
             resource_error(resource, code, message)
         }
     }
-}
-
-fn reject_tagged_resources(
-    resources: &[AlterConfigsResource],
-) -> Vec<AlterConfigsResourceResponse> {
-    if resources.is_empty() {
-        return vec![
-            AlterConfigsResourceResponse::default()
-                .with_error_code(ERROR_INVALID_REQUEST)
-                .with_error_message(Some(static_text(UNKNOWN_TAGGED_FIELDS)))
-                .with_resource_type(0)
-                .with_resource_name(StrBytes::from_static_str("")),
-        ];
-    }
-    resources
-        .iter()
-        .map(|resource| {
-            resource_error(
-                resource,
-                ERROR_INVALID_REQUEST,
-                Some(static_text(UNKNOWN_TAGGED_FIELDS)),
-            )
-        })
-        .collect()
 }
 
 fn resource_error(
@@ -324,36 +308,4 @@ fn resource_error(
         .with_error_message(error_message)
         .with_resource_type(resource.resource_type)
         .with_resource_name(resource.resource_name.clone())
-}
-
-fn name_reason(error: &BridgeError) -> String {
-    match error {
-        BridgeError::InvalidKafkaTopicName { reason, .. } => reason.clone(),
-        _ => "invalid topic name".to_string(),
-    }
-}
-
-fn bridge_failure(error: &BridgeError) -> (i16, Option<StrBytes>) {
-    let code = error.to_kafka_error_code();
-    match error {
-        BridgeError::InvalidKafkaTopicName { reason, .. } => {
-            tracing::debug!(reason, "AlterConfigs rejected an invalid topic name");
-            (code, Some(StrBytes::from(reason.clone())))
-        }
-        BridgeError::Timeout | BridgeError::SendLost(_) => {
-            tracing::warn!(%error, "AlterConfigs exceeded the bridge deadline");
-            (code, None)
-        }
-        other => {
-            tracing::error!(%other, "AlterConfigs failed while updating topic configuration");
-            (
-                code,
-                Some(static_text("internal error updating topic configuration")),
-            )
-        }
-    }
-}
-
-const fn static_text(message: &'static str) -> StrBytes {
-    StrBytes::from_static_str(message)
 }
