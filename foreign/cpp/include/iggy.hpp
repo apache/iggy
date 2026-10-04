@@ -2687,16 +2687,6 @@ enum class Durability : std::uint8_t {
     Persisted,   ///< Wait for quorum commit backed by stable storage.
 };
 
-constexpr std::string_view to_string(const Durability durability) {
-    switch (durability) {
-        case Durability::Replicated:
-            return "replicated";
-        case Durability::Persisted:
-            return "persisted";
-    }
-    throw std::invalid_argument("Unknown durability");
-}
-
 /**
  * @brief Options for creating a topic.
  *

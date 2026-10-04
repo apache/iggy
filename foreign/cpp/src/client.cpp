@@ -205,14 +205,32 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
         }
         if (auto value = options.Durability()) {
             ffi_options.has_durability = true;
-            ffi_options.durability     = std::string(iggy::to_string(*value));
+            switch (*value) {
+                case Durability::Replicated:
+                    ffi_options.durability = "replicated";
+                    break;
+                case Durability::Persisted:
+                    ffi_options.durability = "persisted";
+                    break;
+                default:
+                    throw std::invalid_argument("Unknown durability");
+            }
         } else {
             ffi_options.has_durability = false;
             ffi_options.durability     = "";
         }
         if (auto value = options.ConsumerOffsetDurability()) {
             ffi_options.has_consumer_offset_durability = true;
-            ffi_options.consumer_offset_durability     = std::string(iggy::to_string(*value));
+            switch (*value) {
+                case Durability::Replicated:
+                    ffi_options.consumer_offset_durability = "replicated";
+                    break;
+                case Durability::Persisted:
+                    ffi_options.consumer_offset_durability = "persisted";
+                    break;
+                default:
+                    throw std::invalid_argument("Unknown consumer offset durability");
+            }
         } else {
             ffi_options.has_consumer_offset_durability = false;
             ffi_options.consumer_offset_durability     = "";
