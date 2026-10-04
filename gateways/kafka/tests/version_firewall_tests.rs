@@ -101,10 +101,10 @@ fn is_supported_version_matches_scope_table() {
 /// KIP-511 compatibility) is hardcoded here rather than obtained by calling
 /// `advertised_min_version` - the same reasoning applies to it as the function under test.
 ///
-/// Relies on `SUPPORTED_RANGES` (src) and `SCOPED_API_KEYS` (test) sharing declaration order
-/// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`, `FindCoordinator`,
-/// `JoinGroup`, Heartbeat, `LeaveGroup`, `SyncGroup`) - `supported_ranges_table_has_fourteen_entries` plus
-/// `is_supported_version_matches_scope_table` already pin that both tables cover the same keys.
+/// The wire rows are `supported_api_ranges()` sorted by `api_key` (`api_versions.rs`).
+/// `SCOPED_API_KEYS` is already in that ascending order, and this test reads the response
+/// in that order. `supported_ranges_table_has_fourteen_entries` and
+/// `is_supported_version_matches_scope_table` pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())

@@ -37,7 +37,7 @@ mod topics;
 
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
-pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
+pub use topics::{KafkaTopicMetadata, StreamTopicCache, TopicCreationOutcome, TopicLoad};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///

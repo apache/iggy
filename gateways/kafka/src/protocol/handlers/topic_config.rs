@@ -48,9 +48,6 @@ pub const CONFIG_TYPE_STRING: i8 = 2;
 /// Kafka `ConfigType.LONG`.
 pub const CONFIG_TYPE_LONG: i8 = 5;
 
-/// Kafka `ConfigType.UNKNOWN`.
-pub const CONFIG_TYPE_UNKNOWN: i8 = 0;
-
 pub const RETENTION_MS: &str = "retention.ms";
 pub const RETENTION_MINUTES: &str = "retention.minutes";
 pub const RETENTION_HOURS: &str = "retention.hours";
@@ -66,13 +63,14 @@ pub const RETENTION_MINUTES_DOC: &str = "How long a sealed segment is kept, in m
 pub const RETENTION_HOURS_DOC: &str = "How long a sealed segment is kept, in hours, derived from retention.ms. The count truncates toward zero. -1 means sealed segments never expire.";
 pub const CLEANUP_DOC: &str = "Iggy deletes expired messages and does not compact a topic.";
 
-/// Distinct Kafka topic names one `DescribeConfigs` or `AlterConfigs` request may send to Iggy.
+/// Distinct topic names one `CreateTopics`, `DescribeConfigs`, or `AlterConfigs` request
+/// may address through the bridge.
 ///
-/// Same ceiling as `CreateTopics`: each distinct name is a lockstep call on the shared client.
-/// Duplicate names in one request count once for this cap, but a repeated name is itself
-/// rejected outright - see [`find_duplicate_names`]. A larger batch is `POLICY_VIOLATION` on
-/// every resource. The decode-time element ceiling is a separate, larger limit and is not this
-/// cap.
+/// `bounds_guard`'s element ceiling is a pre-decode limit. `CreateTopics` can spend several
+/// lockstep Iggy calls per name on the shared client (`ensure_stream`, `create_topic`, and a
+/// possible race-retry read). 100 keeps that worst case small and is shared with the config
+/// APIs. Duplicate names count once toward the cap and are rejected on their own. A larger
+/// batch is `POLICY_VIOLATION` on every resource.
 pub const MAX_CONFIG_TOPICS: usize = 100;
 
 /// One config name a describe request asked for, in request order.
@@ -244,6 +242,7 @@ pub fn retention_ms(expiry: IggyExpiry, explicit: bool) -> Result<RetentionMs, (
 ///
 /// Returns [`ConfigFault::InvalidRetention`] for any value other than `-1` or a
 /// positive millisecond count of at most `u32::MAX` seconds.
+#[cfg(test)]
 pub fn parse_retention_ms(value: &str) -> Result<IggyExpiry, ConfigFault> {
     parse_scaled_retention(value, 1)
 }
@@ -380,7 +379,8 @@ pub fn bridge_failure(error: &BridgeError, handler: &str, action: &str) -> (i16,
 ///
 /// `None` and an empty list both mean `retention.ms` and `cleanup.policy`.
 /// `retention.minutes` and `retention.hours` are listed only when the client
-/// names them. Any other name is [`ListedKey::Unknown`] and stays in the list.
+/// names them. Any other name is [`ListedKey::Unknown`]. `DescribeConfigs` omits
+/// those names from the response and does not fail the resource.
 #[must_use]
 pub fn listed_keys(configuration_keys: Option<&[StrBytes]>) -> Vec<ListedKey> {
     let Some(keys) = configuration_keys.filter(|keys| !keys.is_empty()) else {
@@ -426,11 +426,7 @@ pub fn plan_retention_update<'a>(
         let Some(value) = value else {
             return Err(ConfigFault::InvalidRetention);
         };
-        let parsed = if unit_ms == 1 {
-            parse_retention_ms(value)?
-        } else {
-            parse_scaled_retention(value, unit_ms)?
-        };
+        let parsed = parse_scaled_retention(value, unit_ms)?;
         if let Some(existing) = expiry
             && existing != parsed
         {

@@ -75,13 +75,23 @@ fn java_missing() -> bool {
 }
 
 fn output_bounded(command: &mut Command, what: &str) -> Output {
+    try_output_bounded(command, what).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn try_output_bounded(command: &mut Command, what: &str) -> Result<Output, String> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|error| panic!("spawn {what}: {error}"));
-    let mut stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
+        .map_err(|error| format!("spawn {what}: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{what} stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{what} stderr"))?;
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         stdout.read_to_end(&mut buf).map(|_read| buf)
@@ -97,25 +107,25 @@ fn output_bounded(command: &mut Command, what: &str) -> Output {
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{what} exceeded {CHILD_LIMIT:?}");
+                return Err(format!("{what} exceeded {CHILD_LIMIT:?}"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => panic!("poll {what}: {error}"),
+            Err(error) => return Err(format!("poll {what}: {error}")),
         }
     };
     let stdout = stdout_thread
         .join()
-        .unwrap_or_else(|_| panic!("{what} stdout thread"))
-        .unwrap_or_else(|error| panic!("read {what} stdout: {error}"));
+        .map_err(|_| format!("{what} stdout thread"))?
+        .map_err(|error| format!("read {what} stdout: {error}"))?;
     let stderr = stderr_thread
         .join()
-        .unwrap_or_else(|_| panic!("{what} stderr thread"))
-        .unwrap_or_else(|error| panic!("read {what} stderr: {error}"));
-    Output {
+        .map_err(|_| format!("{what} stderr thread"))?
+        .map_err(|error| format!("read {what} stderr: {error}"))?;
+    Ok(Output {
         status,
         stdout,
         stderr,
-    }
+    })
 }
 
 const JARS: &[(&str, &str)] = &[
@@ -149,14 +159,14 @@ fn jar_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-3.9-admin-jars")
 }
 
-fn ensure_jars(dir: &Path) {
-    std::fs::create_dir_all(dir).expect("create jar cache");
+fn ensure_jars(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("create jar cache: {error}"))?;
     for (name, url) in JARS {
         let path = dir.join(name);
         if path.exists() {
             continue;
         }
-        let output = output_bounded(
+        let output = match try_output_bounded(
             Command::new("curl")
                 .args([
                     "--fail",
@@ -170,17 +180,23 @@ fn ensure_jars(dir: &Path) {
                 .arg(&path)
                 .arg(url),
             name,
-        );
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+        };
         if !output.status.success() {
             let _ = std::fs::remove_file(&path);
+            return Err(format!(
+                "download {url} failed: {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
-        assert!(
-            output.status.success(),
-            "download {url} failed: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
+    Ok(())
 }
 
 fn classpath(jars: &Path, classes: &Path) -> String {
@@ -221,7 +237,11 @@ async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
     }
 
     let jars = jar_dir();
-    ensure_jars(&jars);
+    if let Err(reason) = ensure_jars(&jars)
+        && skip(&reason)
+    {
+        return;
+    }
     let classes = tempfile::tempdir().expect("class dir");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/ConfigsProbe.java");
     let javac = output_bounded(

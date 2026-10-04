@@ -20,11 +20,12 @@
 use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
-    Identifier, IggyError, IggyExpiry, StreamClient, TopicClient, TopicCreateOptions, TopicDetails,
-    TopicUpdateOptions,
+    Identifier, IggyError, IggyExpiry, ResourceOptions, StreamClient, Topic, TopicClient,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
-use tracing::{debug, info};
+use tokio::time::{Instant, timeout_at};
+use tracing::{debug, info, warn};
 
 use super::{IggyBridge, with_request_timeout};
 use crate::bridge::error::BridgeError;
@@ -315,6 +316,13 @@ impl IggyBridge {
         .await
     }
 
+    async fn topics_in_stream(&self, stream_name: &str) -> Result<Vec<Topic>, BridgeError> {
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        // A missing stream lists as empty, the same fact `get_kafka_topics` relies on, so a
+        // name that resolves here and is absent from the list is "no such topic".
+        with_request_timeout(self.client.get_topics(&stream_id)).await
+    }
+
     /// Resolves many Kafka-visible names at once, one entry per input in the same order.
     ///
     /// Batches by the Iggy stream each name resolves to, rather than paying one round trip per
@@ -524,5 +532,110 @@ impl IggyBridge {
         }
 
         Ok(results)
+    }
+}
+
+/// `message_expiry` and admission options from one `get_topics` row.
+///
+/// Enough for `DescribeConfigs`. The partition list on `TopicDetails` is not loaded.
+#[derive(Debug, Clone)]
+pub struct TopicConfigSnapshot {
+    pub message_expiry: IggyExpiry,
+    pub options: ResourceOptions,
+}
+
+/// One stream's `get_topics` result, shared by every Kafka name that resolves there.
+#[derive(Debug, Default)]
+pub struct StreamTopicCache {
+    streams: HashMap<String, StreamLoad>,
+}
+
+#[derive(Debug)]
+enum StreamLoad {
+    Ready(HashMap<String, TopicConfigSnapshot>),
+    Failed(BridgeError),
+    NotStarted,
+    TimedOut,
+}
+
+/// What [`StreamTopicCache::lookup`] found for one Kafka topic name.
+#[derive(Debug)]
+pub enum TopicLoad<'a> {
+    Found(&'a TopicConfigSnapshot),
+    Missing,
+    Failed(&'a BridgeError),
+    NotStarted,
+    TimedOut,
+}
+
+impl StreamTopicCache {
+    /// The topic behind `kafka_topic`, loading its stream on the first name that needs it.
+    ///
+    /// Later names that resolve to a stream already loaded, failed, or skipped reuse that
+    /// result. One `get_topics` call per distinct stream, including a stream that is missing.
+    /// A stream whose first name arrives at or after `deadline` is [`TopicLoad::NotStarted`]
+    /// and does not call Iggy. `api_name` is the handler in the deadline log line.
+    pub async fn lookup<'a>(
+        &'a mut self,
+        bridge: &IggyBridge,
+        kafka_topic: &str,
+        deadline: Instant,
+        api_name: &str,
+    ) -> TopicLoad<'a> {
+        let (stream, iggy_topic) = bridge.topic_identity(kafka_topic);
+        if !self.streams.contains_key(&stream) {
+            let load = load_stream(bridge, kafka_topic, &stream, deadline, api_name).await;
+            self.streams.insert(stream.clone(), load);
+        }
+        match self.streams.get(&stream) {
+            Some(StreamLoad::Ready(topics)) => topics
+                .get(&iggy_topic)
+                .map_or(TopicLoad::Missing, TopicLoad::Found),
+            Some(StreamLoad::Failed(error)) => TopicLoad::Failed(error),
+            Some(StreamLoad::NotStarted) => TopicLoad::NotStarted,
+            Some(StreamLoad::TimedOut) | None => TopicLoad::TimedOut,
+        }
+    }
+}
+
+async fn load_stream(
+    bridge: &IggyBridge,
+    kafka_topic: &str,
+    stream: &str,
+    deadline: Instant,
+    api_name: &str,
+) -> StreamLoad {
+    if Instant::now() >= deadline {
+        warn!(
+            resource = kafka_topic,
+            "{api_name} deadline passed before the topic lookup"
+        );
+        return StreamLoad::NotStarted;
+    }
+    match timeout_at(deadline, bridge.topics_in_stream(stream)).await {
+        Ok(Ok(topics)) => {
+            let ready = topics
+                .into_iter()
+                .map(|topic| {
+                    (
+                        topic.name,
+                        TopicConfigSnapshot {
+                            message_expiry: topic.message_expiry,
+                            options: topic.options,
+                        },
+                    )
+                })
+                .collect();
+            StreamLoad::Ready(ready)
+        }
+        Ok(Err(error)) => StreamLoad::Failed(error),
+        Err(_elapsed) => {
+            warn!(
+                resource = kafka_topic,
+                "{api_name}: this resource's bridge work exceeded the request deadline; \
+                 answering retriable instead of blocking further"
+            );
+            StreamLoad::TimedOut
+        }
     }
 }

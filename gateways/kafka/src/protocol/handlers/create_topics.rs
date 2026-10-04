@@ -38,6 +38,7 @@ use crate::protocol::api::{
     ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
+use crate::protocol::handlers::topic_config::{MAX_CONFIG_TOPICS, topic_cap_message};
 use crate::protocol::handlers::{
     decode_guarded, encode_message, handle_versioned_request, is_supported_version,
     respond_or_close, unsupported_version_response,
@@ -62,18 +63,6 @@ const DEFAULT_PARTITION_COUNT: u32 = 1;
 /// same rejection the real path would eventually get from the bridge, instead of reporting
 /// `NONE` for a partition count the real path can never actually create.
 const MAX_PARTITIONS_COUNT: u32 = 1000;
-
-/// Cap on distinct topic names one `CreateTopics` request may address through the bridge.
-///
-/// `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096) is a pre-decode `DoS` ceiling, not a usability
-/// recommendation: each non-duplicate requested name here costs up to ~4 Iggy round trips
-/// (`ensure_stream` + `create_topic`, plus a possible race-retry read on either) against the
-/// single lockstep `IggyClient` every Kafka connection on this gateway shares
-/// (`bridge/iggy_bridge/mod.rs`'s "Concurrency ceiling"). 100 keeps a worst-case batch's
-/// aggregate bridge cost small relative to that shared resource while remaining generous for any
-/// real admin batch. Duplicate names never count against this cap - they're rejected by
-/// [`find_duplicate_names`] before ever reaching the bridge.
-const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
 /// Bounds imposed on the request's own `timeout_ms` before it becomes the aggregate bridge-work
 /// deadline. That value is client-supplied and otherwise unchecked: `0` or negative would abort
@@ -135,17 +124,15 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         .map(|topic| &topic.name)
         .filter(|name| !duplicate_names.contains(*name))
         .collect();
-    if distinct_bridge_backed.len() > MAX_BRIDGE_BACKED_TOPICS {
+    if distinct_bridge_backed.len() > MAX_CONFIG_TOPICS {
         tracing::warn!(
             distinct_topics = distinct_bridge_backed.len(),
-            max = MAX_BRIDGE_BACKED_TOPICS,
+            max = MAX_CONFIG_TOPICS,
             "CreateTopics request addresses too many distinct topics; rejecting"
         );
-        // A server-imposed limit, not a malformed request - INVALID_REQUEST would blame the
+        // A server-imposed limit, not a malformed request. INVALID_REQUEST would blame the
         // client for a request Kafka itself would accept.
-        let message = StrBytes::from(format!(
-            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} distinct topics per CreateTopics request"
-        ));
+        let message = StrBytes::from(topic_cap_message("CreateTopics"));
         let results = req
             .topics
             .iter()

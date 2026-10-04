@@ -304,17 +304,10 @@ async fn describe_and_alter_configs_reject_unknown_nontopic_missing_and_invalid_
         false,
     )
     .await;
-    assert_eq!(unknown.results[0].error_code, ERROR_INVALID_CONFIG);
-    assert_eq!(unknown.results[0].configs.len(), 2);
-    assert_eq!(unknown.results[0].configs[1].name.as_str(), "no.such");
-    let message = unknown.results[0]
-        .error_message
-        .as_ref()
-        .map_or("", StrBytes::as_str);
-    assert!(
-        message.contains("no.such"),
-        "unknown-key message must name the key, matching AlterConfigs' own wording: {message}"
-    );
+    assert_eq!(unknown.results[0].error_code, ERROR_NONE);
+    assert!(unknown.results[0].error_message.is_none());
+    assert_eq!(unknown.results[0].configs.len(), 1);
+    assert_eq!(unknown.results[0].configs[0].name.as_str(), "retention.ms");
 
     let broker = describe(
         &state,
@@ -587,10 +580,10 @@ async fn describe_configs_rejects_every_occurrence_of_a_duplicate_resource_name(
     assert_eq!(described.results[1].error_code, ERROR_INVALID_REQUEST);
 }
 
-/// An alter that does not name `retention.ms` does not clear a previously set expiry.
+/// An empty alter list is not a reset. Kafka would replace the set; this gateway rejects it.
 #[tokio::test]
 #[serial]
-async fn alter_configs_with_no_configs_leaves_retention_unchanged() {
+async fn alter_configs_rejects_an_empty_list_and_leaves_retention_unchanged() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
@@ -612,7 +605,13 @@ async fn alter_configs_with_no_configs_leaves_retention_unchanged() {
         false,
     )
     .await;
-    assert_eq!(reset.responses[0].error_code, ERROR_NONE);
+    assert_eq!(reset.responses[0].error_code, ERROR_INVALID_CONFIG);
+    assert!(
+        reset.responses[0]
+            .error_message
+            .as_ref()
+            .is_some_and(|message| message.as_str().contains("empty"))
+    );
 
     let described = describe(
         &state,

@@ -12,9 +12,9 @@ do not read or write Iggy.
 ## What a describe returns
 
 A null or empty `configuration_keys` list returns both keys below. A non-empty
-list returns only the requested names, in request order. A name this gateway does
-not know is still returned, and that resource's error code is `INVALID_CONFIG`
-(40).
+list returns only the requested names this gateway knows, in request order. A
+name it does not know is omitted. The resource's error code stays `NONE` (0),
+and the known keys in that request are still returned.
 
 | Key | Value | Read only | Source |
 | --- | ----- | --------- | ------ |
@@ -75,8 +75,13 @@ Minutes and hours are not stored.
 If one resource sets more than one of the three names and the converted
 millisecond values differ, that resource is `INVALID_CONFIG` (40) and nothing
 is written. If they convert to the same millisecond count, one write is stored.
-A resource whose `configs` list does not name any of the three is left
-unchanged. Omitting them does not clear a previously set expiry.
+
+Kafka's `AlterConfigs` replaces a topic's full configuration. An empty `configs`
+list on that API is a reset to defaults. This gateway patches the named keys
+instead of replacing the set, so an empty list is `INVALID_CONFIG` (40) and
+writes nothing. A previously set expiry stays in place. A list that names only
+keys other than the three retention names fails for that key and also writes
+nothing.
 
 `cleanup.policy` and any other key, including `retention.mins`, are
 `INVALID_CONFIG` (40). They are not stored. Kafka has no `NOT_CONFIGURABLE`
@@ -120,6 +125,7 @@ Kafka topic name, not the Kafka name itself.
 | Resource type other than topic | `INVALID_REQUEST` (42) | Message is `only topic resources are supported`. Other resources in the batch still run |
 | Topic name fails the same rules as CreateTopics | `INVALID_TOPIC_EXCEPTION` (17) | The message is the validation reason and does not repeat the topic name |
 | Topic does not exist | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Checked before config keys, so a missing topic is not `INVALID_CONFIG` |
+| Empty `configs` list on alter | `INVALID_CONFIG` (40) | Kafka would replace the set, which is a reset. This gateway patches named keys, so an empty list is rejected and writes nothing |
 | More than 100 distinct topic names | `POLICY_VIOLATION` (44) | Every resource in the request |
 | A topic name repeated across resources | `INVALID_REQUEST` (42) | Every occurrence of the duplicate, not just the second one. Same choice CreateTopics makes for a repeated topic name |
 | Non-empty unknown tagged fields | `INVALID_REQUEST` (42) | Request-level tags fail every resource. A resource or config entry's own tags fail that resource. Empty tagged fields are the normal flexible encoding |

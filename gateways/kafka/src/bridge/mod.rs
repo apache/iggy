@@ -28,5 +28,7 @@ pub mod topic_map;
 
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig};
 pub use error::BridgeError;
-pub use iggy_bridge::{IggyBridge, KafkaTopicMetadata, TopicCreationOutcome, TopicTarget};
+pub use iggy_bridge::{
+    IggyBridge, KafkaTopicMetadata, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
+};
 pub use topic_map::{TopicMapping, TopicOverride};

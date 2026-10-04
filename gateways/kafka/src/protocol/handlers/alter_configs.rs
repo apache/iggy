@@ -28,7 +28,7 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge};
+use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
@@ -157,6 +157,7 @@ async fn alter_all(
     // picking a winner - the same choice CreateTopics makes for a repeated topic name.
     let duplicate_names = find_duplicate_names(topic_names.iter().copied());
 
+    let mut cache = StreamTopicCache::default();
     let mut responses = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
     for resource in &req.resources {
@@ -178,7 +179,15 @@ async fn alter_all(
             continue;
         }
 
-        let result = alter_one(state, bridge, resource, req.validate_only, deadline).await;
+        let result = alter_one(
+            state,
+            bridge,
+            &mut cache,
+            resource,
+            req.validate_only,
+            deadline,
+        )
+        .await;
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
@@ -190,6 +199,7 @@ async fn alter_all(
 async fn alter_one(
     state: &GatewayState,
     bridge: &IggyBridge,
+    cache: &mut StreamTopicCache,
     resource: &AlterConfigsResource,
     validate_only: bool,
     deadline: Instant,
@@ -225,28 +235,16 @@ async fn alter_one(
     // Existence is checked before config keys. A missing topic is
     // UNKNOWN_TOPIC_OR_PARTITION even when a key would also be invalid.
     // A deadline that has already passed must not start the lockstep Iggy call.
-    if Instant::now() >= deadline {
-        tracing::warn!(
-            resource = name,
-            "AlterConfigs deadline passed before the topic lookup"
-        );
-        return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
-    }
-    match tokio::time::timeout_at(deadline, bridge.get_kafka_topic(name)).await {
-        Ok(Ok(Some(_topic))) => {}
-        Ok(Ok(None)) => {
+    match cache.lookup(bridge, name, deadline, "AlterConfigs").await {
+        TopicLoad::Found(_) => {}
+        TopicLoad::Missing => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None);
         }
-        Ok(Err(error)) => {
-            let (code, message) = bridge_failure(&error, "AlterConfigs", "altering");
+        TopicLoad::Failed(error) => {
+            let (code, message) = bridge_failure(error, "AlterConfigs", "altering");
             return resource_error(resource, code, message);
         }
-        Err(_elapsed) => {
-            tracing::warn!(
-                resource = name,
-                "AlterConfigs: this resource's bridge work exceeded the request deadline; \
-                 answering retriable instead of blocking further"
-            );
+        TopicLoad::NotStarted | TopicLoad::TimedOut => {
             return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
         }
     }
@@ -266,10 +264,17 @@ async fn alter_one(
             );
         }
     };
-    // A resource that names no retention key has nothing to store. Omitting the key
-    // does not clear a previously set expiry or the remembered synonym names.
+    // Kafka's AlterConfigs replaces the whole set, so an empty list is a reset.
+    // This gateway patches named keys. Reporting success would hide that the
+    // previous expiry is still stored.
     let Some(planned) = planned else {
-        return resource_error(resource, ERROR_NONE, None);
+        return resource_error(
+            resource,
+            ERROR_INVALID_CONFIG,
+            Some(static_text(
+                "an empty configs list is rejected because this gateway patches named keys and does not replace the topic configuration",
+            )),
+        );
     };
 
     // `validate_only` already performed the existence read and the same key checks.
