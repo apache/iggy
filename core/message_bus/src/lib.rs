@@ -1484,7 +1484,7 @@ impl MessageBus for IggyMessageBus {
 
 /// Extract the owning shard from a client id.
 ///
-/// Shard 0 mints client ids as `(target_shard_id << 112) | seq`. The top 16
+/// Shard 0 mints client ids with `target_shard_id` in the top 16 bits. Those
 /// bits encode which shard's bus registry holds the connection; any shard
 /// that needs to reply to this client uses this accessor to decide between
 /// the fast path (local) and the slow path (forward via inter-shard).
@@ -1497,8 +1497,8 @@ pub const fn client_id_owning_shard(client_id: u128) -> u16 {
 /// Reserved client id stamped on server-generated auto-commit
 /// `StoreConsumerOffset` ops (a poll's `auto_commit` replicated for failover).
 ///
-/// Never belongs to a live connection: `mint_client_id` produces
-/// `(shard << 112) | seq` and no real shard is `u16::MAX`, so `u128::MAX` is
+/// Never belongs to a live connection: `mint_client_id` puts the shard in the
+/// top 16 bits and no real shard is `u16::MAX`, so `u128::MAX` is
 /// unreachable. The commit path recognises it and skips the (unwaited) reply,
 /// keeping an unrequested frame off a real client's lockstep stream. Nonzero,
 /// so it still satisfies the wire header's `client != 0` validation.

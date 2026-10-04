@@ -256,9 +256,9 @@ struct ClientEntry {
     /// its dedup history.
     watermark: u64,
     /// Partition-slice only: bit `i` set means request `watermark - i` has
-    /// committed, bit 0 being the watermark itself. A request below the
-    /// watermark with its bit clear is a reordered arrival still to execute,
-    /// not a duplicate; below the window everything reads as committed. Zero
+    /// committed, bit 0 being the watermark itself. A request in the retained
+    /// window with its bit clear has no commit recorded on this replica and
+    /// executes; below the window the outcome is unknown and refused. Zero
     /// on the metadata plane, whose reply ring plays this role.
     committed_window: u128,
     /// `request_checksum` of the watermark request; catches a client reusing
@@ -521,6 +521,21 @@ pub enum RequestStatus {
     EpochAhead { current: u64, received: u64 },
 }
 
+/// Result of [`ClientTable::check_slice_request`], the dedup check of a plane
+/// that mints no epoch and caches no replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceRequestStatus {
+    /// The table holds no commit for this id; proceed with consensus. Absence
+    /// of evidence, not proof that the id never committed.
+    New,
+    /// Marked committed in the retained window. Applied once already; must
+    /// not re-execute, and the caller synthesizes the reply.
+    Committed,
+    /// Below the retained window of a held entry, where no mark survives. The
+    /// outcome is unknown, so neither a success reply nor an execution is safe.
+    AgedOut,
+}
+
 /// What [`ClientTable::commit_reply`] did. Diagnostics only: the reply is
 /// shipped to the client either way, so a non-`Cached` outcome degrades dedup
 /// for one entry rather than failing the commit.
@@ -557,7 +572,8 @@ pub enum ClientTableMode {
 
 impl ClientTableMode {
     /// Keep committed replies so a duplicate replays the original bytes. Off:
-    /// duplicates answer [`RequestStatus::AlreadyApplied`] and the caller
+    /// [`ClientTable::check_slice_request`] proves duplicates through its
+    /// committed window ([`SliceRequestStatus::Committed`]) and the caller
     /// synthesizes the reply.
     #[must_use]
     pub const fn cache_replies(self) -> bool {
@@ -590,9 +606,9 @@ impl ClientTableMode {
 pub struct DedupWatermark {
     pub client: u128,
     /// Acting user the watermark belongs to. A different user committing under
-    /// the same client id resets the entry rather than inheriting it: the id is
-    /// client-supplied (or, for HTTP, re-minted after a logout), so it alone is
-    /// not an identity.
+    /// the same client id resets the entry rather than inheriting it: the
+    /// binary transports take the id from the client, so it alone is not an
+    /// identity.
     pub user_id: u32,
     /// Highest committed request number.
     pub watermark: u64,
@@ -608,18 +624,18 @@ pub struct DedupWatermark {
 /// A client that pipelines writes can see one of them refused transiently and
 /// replay it after later ids have committed, so "at or below the watermark"
 /// alone would absorb that replay as a duplicate and lose the write. The window
-/// records which ids under the watermark actually committed; an unmarked one
-/// inside it executes, while one that has aged out below it reads as committed
-/// and is absorbed with the operation's empty success.
+/// records which ids under the watermark this replica saw commit; an unmarked
+/// one inside it executes, while one that has aged out below it reads as
+/// [`SliceRequestStatus::AgedOut`] because its outcome is unknown.
 ///
 /// The width is in the CLIENT's request-id space, not in this group's writes:
 /// `ConsensusSession` mints from one counter across every partition, stream and
 /// metadata op, so a slice only ever sees the subset of those ids routed to it.
 /// Coverage in a client's own writes to one group is this width divided by the
 /// number of groups it interleaves, so 128 ids is around 16 writes per group
-/// across 8 partitions, and a replay held back longer than that is absorbed and
-/// lost. A wider bitmap divides by the same fanout: closing the gap needs
-/// per-group request numbering, which waits on the clients-table follow-up.
+/// across 8 partitions, and a replay held back longer than that can be refused
+/// with an unknown outcome. A wider bitmap divides by the same fanout: closing
+/// the gap needs per-group request numbering, which waits on the clients-table follow-up.
 pub const COMMITTED_WINDOW_BITS: u64 = 128;
 
 /// VSR client table: per-session fence epoch + request-watermark dedup.
@@ -644,11 +660,13 @@ pub const COMMITTED_WINDOW_BITS: u64 = 128;
 ///
 /// ## Plane
 ///
-/// This table is the metadata plane's. The partition plane runs the same
-/// watermark rule in its own per-group slices ([`ClientTableMode::PartitionSlice`],
-/// held by `partitions::IggyPartition::dedup`), which keep no reply ring and no
-/// epoch: partition prepares carry the VSR client id and request number but no
-/// session, so fencing a stale session waits on identity surviving reconnects.
+/// This table is the metadata plane's. The partition plane keeps its own
+/// per-group slices ([`ClientTableMode::PartitionSlice`], held by
+/// `partitions::IggyPartition::dedup`), checked by [`Self::check_slice_request`]
+/// against a committed window below the watermark rather than the watermark
+/// alone. The slices keep no reply ring and no epoch: partition prepares carry
+/// the VSR client id and request number but no session, so fencing a stale
+/// session waits on identity surviving reconnects.
 ///
 /// ## Tracking
 ///
@@ -1230,30 +1248,47 @@ impl ClientTable {
 
     /// Watermark-plus-window dedup check for a plane that mints no epoch.
     ///
-    /// `true` means `user_id` already committed this request under `client_id`,
-    /// so it must be answered rather than executed again: it is the watermark,
-    /// a marked id inside the [`COMMITTED_WINDOW_BITS`] window below it, or
-    /// anything older than the window. An unmarked id inside the window is a
-    /// reordered arrival (a transiently refused write replayed after its
-    /// successors committed) and reads as new. An entry another user left under
-    /// the same id is not evidence about this caller: the id alone is not an
-    /// identity (see [`DedupWatermark::user_id`]), so the request reads as new
-    /// and its commit resets the entry.
+    /// Only marked IDs in the retained window prove a committed request.
+    /// Unmarked IDs remain admissible within that window. Another user's
+    /// entry is not evidence about this caller and reads as new.
+    ///
+    /// The aged-out refusal covers one unknown outcome, not all of them. The
+    /// slice lives in memory only. It holds the commits this replica walked
+    /// since its boot and the entries a state-transfer install copied in
+    /// ([`Self::install_watermarks`]). A commit covered by neither, or one
+    /// whose entry was evicted, left no mark here, so its replay reads as new
+    /// and executes again.
     ///
     /// # Panics
-    /// If called on a table that fences epochs -- that plane must go through
-    /// [`Self::check_request`], which enforces the fence.
+    /// If called on a table that fences epochs, which must use
+    /// [`Self::check_request`].
     #[must_use]
-    pub fn is_duplicate(&self, client_id: u128, user_id: u32, request: u64) -> bool {
+    pub fn check_slice_request(
+        &self,
+        client_id: u128,
+        user_id: u32,
+        request: u64,
+    ) -> SliceRequestStatus {
         debug_assert!(
             !self.mode.fence_epoch(),
-            "is_duplicate: an epoch-fencing table must use check_request"
+            "check_slice_request: an epoch-fencing table must use check_request"
         );
         let Some(&slot_idx) = self.index.get(&client_id) else {
-            return false;
+            return SliceRequestStatus::New;
         };
         let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
-        entry.user_id == user_id && request <= entry.watermark && entry.window_has(request)
+        if entry.user_id != user_id || request > entry.watermark {
+            return SliceRequestStatus::New;
+        }
+        let below = entry.watermark - request;
+        if below >= COMMITTED_WINDOW_BITS {
+            return SliceRequestStatus::AgedOut;
+        }
+        if entry.committed_window & (1 << below) == 0 {
+            SliceRequestStatus::New
+        } else {
+            SliceRequestStatus::Committed
+        }
     }
 
     /// Record a committed request without a reply to cache.
@@ -1261,17 +1296,17 @@ impl ClientTable {
     /// The entry point for a plane that runs
     /// [`ClientTableMode::PartitionSlice`]: there is no register to create the
     /// entry, so the first committed request creates it, and there is no result
-    /// section worth retaining, so a later duplicate answers
-    /// [`RequestStatus::AlreadyApplied`] and the caller synthesizes the reply.
+    /// section worth retaining. [`Self::check_slice_request`] proves retained
+    /// duplicates and the caller synthesizes their reply.
     ///
     /// Idempotent and order-insensitive for one user: the watermark only rises
     /// and the window only gains bits, so replaying an already-folded op is a
     /// no-op and a state-transfer install followed by a re-walk of the same
     /// commits converges. A commit above the watermark shifts the window up by
-    /// the gap (ids that age out read as committed from then on); one below it
-    /// sets its bit. A commit by a DIFFERENT user under the same client id
-    /// replaces the entry outright: nothing observes a logout here, so this is
-    /// what stops the next holder of a re-minted id from having its first
+    /// the gap (ids that age out read as [`SliceRequestStatus::AgedOut`]);
+    /// one below it sets its bit. A commit by a DIFFERENT user under the same
+    /// client id replaces the entry outright: nothing observes a logout here, so this is
+    /// what stops the next holder of a reused id from having its first
     /// writes absorbed by the previous holder's watermark.
     ///
     /// # Panics
@@ -1716,9 +1751,6 @@ impl ClientTable {
     }
 
     /// Every registered client id, in slot order.
-    ///
-    /// Boot-time only: the id minter reseeds above the highest recovered
-    /// sequence so a post-restart mint cannot land on a recovered entry.
     pub fn client_ids(&self) -> impl Iterator<Item = u128> + '_ {
         self.slots
             .iter()
@@ -2138,14 +2170,6 @@ impl ClientEntry {
         }
     }
 
-    /// Whether `request` (at or below the watermark) is inside the window and
-    /// marked committed, or below the window entirely. Callers check
-    /// `request <= watermark` first.
-    const fn window_has(&self, request: u64) -> bool {
-        let below = self.watermark - request;
-        below >= COMMITTED_WINDOW_BITS || self.committed_window & (1 << below) != 0
-    }
-
     /// Latest committed reply (register or app op).
     ///
     /// # Panics
@@ -2207,6 +2231,7 @@ impl ClientEntry {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
+    use super::SliceRequestStatus::{AgedOut, Committed, New};
     use super::*;
     use iggy_binary_protocol::{Command, Operation};
 
@@ -3556,7 +3581,7 @@ mod tests {
         let table = slice(4096);
         assert_eq!(table.count(), 0);
         assert_eq!(table.slots.len(), 0, "slots must grow on demand");
-        assert!(!table.is_duplicate(7, SLICE_USER, 1));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 1), New);
     }
 
     #[test]
@@ -3566,9 +3591,9 @@ mod tests {
         let mut table = slice(4);
         table.commit_request(7, SLICE_USER, 5, 100);
 
-        assert!(table.is_duplicate(7, SLICE_USER, 5));
-        assert!(!table.is_duplicate(7, SLICE_USER, 4));
-        assert!(!table.is_duplicate(7, SLICE_USER, 6));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 5), Committed);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 4), New);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 6), New);
     }
 
     #[test]
@@ -3580,10 +3605,10 @@ mod tests {
         table.commit_request(7, SLICE_USER, 5, 100);
         table.commit_request(7, SLICE_USER, 9, 101);
 
-        assert!(table.is_duplicate(7, SLICE_USER, 5));
-        assert!(table.is_duplicate(7, SLICE_USER, 9));
-        assert!(!table.is_duplicate(7, SLICE_USER, 7));
-        assert!(!table.is_duplicate(7, SLICE_USER, 10));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 5), Committed);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 9), Committed);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 7), New);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 10), New);
     }
 
     #[test]
@@ -3605,13 +3630,13 @@ mod tests {
         table.commit_request(7, SLICE_USER, 1, 100);
         table.commit_request(7, SLICE_USER, 3, 101);
 
-        assert!(!table.is_duplicate(7, SLICE_USER, 2));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 2), New);
         table.commit_request(7, SLICE_USER, 2, 102);
 
-        assert!(table.is_duplicate(7, SLICE_USER, 2));
-        assert!(table.is_duplicate(7, SLICE_USER, 1));
-        assert!(table.is_duplicate(7, SLICE_USER, 3));
-        assert!(!table.is_duplicate(7, SLICE_USER, 4));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 2), Committed);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 1), Committed);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 3), Committed);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 4), New);
         assert_eq!(
             table.watermarks_sorted(),
             vec![DedupWatermark {
@@ -3625,18 +3650,23 @@ mod tests {
     }
 
     #[test]
-    fn given_partition_slice_when_id_ages_out_of_window_should_read_as_committed() {
-        // Below the window nothing is tracked, so the pre-window rule applies:
-        // absorbed. Inside it, an unmarked id stays admissible however the
-        // watermark moved.
+    fn given_partition_slice_when_id_ages_out_of_window_should_report_unknown_outcome() {
         let mut table = slice(4);
         table.commit_request(7, SLICE_USER, 1, 100);
         table.commit_request(7, SLICE_USER, 1 + COMMITTED_WINDOW_BITS + 10, 101);
 
-        assert!(table.is_duplicate(7, SLICE_USER, 1));
-        assert!(!table.is_duplicate(7, SLICE_USER, 1 + COMMITTED_WINDOW_BITS));
-        assert!(!table.is_duplicate(7, SLICE_USER, 12));
-        assert!(table.is_duplicate(7, SLICE_USER, 11));
+        for request in [1, 2, 11] {
+            assert_eq!(
+                table.check_slice_request(7, SLICE_USER, request),
+                AgedOut,
+                "aged-out request {request} must have an unknown outcome"
+            );
+        }
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 12), New);
+        assert_eq!(
+            table.check_slice_request(7, SLICE_USER, 1 + COMMITTED_WINDOW_BITS),
+            New
+        );
     }
 
     #[test]
@@ -3648,25 +3678,26 @@ mod tests {
 
         // 5 (bit 0), 2 (bit 3), 1 (bit 4) committed; 3 and 4 did not.
         assert_eq!(table.watermarks_sorted()[0].committed_window, 0b11001);
-        assert!(!table.is_duplicate(7, SLICE_USER, 3));
-        assert!(!table.is_duplicate(7, SLICE_USER, 4));
-        assert!(table.is_duplicate(7, SLICE_USER, 2));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 3), New);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 4), New);
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 2), Committed);
     }
 
     #[test]
     fn given_partition_slice_when_other_user_commits_under_same_id_should_reset() {
-        // The id is client-supplied (or re-minted after an HTTP logout), so the
-        // previous holder's watermark must not absorb the next holder's writes.
+        // The id is client-supplied, so the previous holder's watermark must
+        // not absorb the next holder's writes.
         let mut table = slice(4);
         table.commit_request(7, SLICE_USER, u64::MAX, 100);
 
-        assert!(!table.is_duplicate(7, OTHER_USER, 1));
+        assert_eq!(table.check_slice_request(7, OTHER_USER, 1), New);
         table.commit_request(7, OTHER_USER, 1, 101);
 
-        assert!(table.is_duplicate(7, OTHER_USER, 1));
-        assert!(!table.is_duplicate(7, OTHER_USER, 2));
-        assert!(
-            !table.is_duplicate(7, SLICE_USER, 5),
+        assert_eq!(table.check_slice_request(7, OTHER_USER, 1), Committed);
+        assert_eq!(table.check_slice_request(7, OTHER_USER, 2), New);
+        assert_eq!(
+            table.check_slice_request(7, SLICE_USER, 5),
+            New,
             "the previous holder's history is gone with the reset"
         );
         assert_eq!(table.count(), 1, "a reset reuses the slot");
@@ -3695,7 +3726,7 @@ mod tests {
         table.commit_request(1, SLICE_USER, 5, 10);
         table.commit_request(2, SLICE_USER, 1, 20);
 
-        assert!(!table.is_duplicate(1, SLICE_USER, 5));
+        assert_eq!(table.check_slice_request(1, SLICE_USER, 5), New);
     }
 
     #[test]
@@ -3731,12 +3762,13 @@ mod tests {
         table.install_watermarks([watermark(1, 4, 50), watermark(2, 7, 60)]);
 
         assert_eq!(table.count(), 2);
-        assert!(
-            !table.is_duplicate(9, SLICE_USER, 3),
+        assert_eq!(
+            table.check_slice_request(9, SLICE_USER, 3),
+            New,
             "install replaces rather than merges"
         );
-        assert!(table.is_duplicate(1, SLICE_USER, 4));
-        assert!(!table.is_duplicate(2, SLICE_USER, 8));
+        assert_eq!(table.check_slice_request(1, SLICE_USER, 4), Committed);
+        assert_eq!(table.check_slice_request(2, SLICE_USER, 8), New);
     }
 
     #[test]
@@ -3765,8 +3797,8 @@ mod tests {
             committed_window: 1,
         }]);
 
-        assert!(table.is_duplicate(1, OTHER_USER, 4));
-        assert!(!table.is_duplicate(1, SLICE_USER, 4));
+        assert_eq!(table.check_slice_request(1, OTHER_USER, 4), Committed);
+        assert_eq!(table.check_slice_request(1, SLICE_USER, 4), New);
     }
 
     #[test]
@@ -3786,7 +3818,7 @@ mod tests {
         table.install_watermarks(std::iter::empty());
 
         assert_eq!(table.count(), 0);
-        assert!(!table.is_duplicate(7, SLICE_USER, 5));
+        assert_eq!(table.check_slice_request(7, SLICE_USER, 5), New);
     }
 
     #[test]
@@ -3803,8 +3835,8 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "an epoch-fencing table must use check_request")]
-    fn given_metadata_table_when_is_duplicate_called_should_panic() {
-        let _ = ClientTable::new(4).is_duplicate(7, SLICE_USER, 1);
+    fn given_metadata_table_when_check_slice_request_called_should_panic() {
+        let _ = ClientTable::new(4).check_slice_request(7, SLICE_USER, 1);
     }
 
     #[cfg(debug_assertions)]

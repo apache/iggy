@@ -176,6 +176,10 @@ impl BridgeError {
 /// `UNKNOWN_SERVER_ERROR` instead - correctly fatal (retrying won't fix a wrong password), but
 /// without asserting a cause the Kafka client cannot act on. Produce logs them at `error!`
 /// (see [`BridgeError::is_bridge_login_rejected`]).
+#[expect(
+    clippy::match_same_arms,
+    reason = "aged-out requests must explicitly retain a non-retryable code"
+)]
 const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
     match err {
         IggyError::StreamIdNotFound(_)
@@ -194,6 +198,9 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
         IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
+        // The outcome was forgotten; a retry after client eviction could duplicate the write.
+        // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
+        IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
         // Not `ERROR_INVALID_PARTITIONS` (37): that code's own text, per `kafka-protocol`'s
         // table, is "Number of partitions is below 1" - the opposite condition from "too many"
         // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
@@ -387,6 +394,20 @@ mod tests {
         // unambiguous retriable set, or a caller could blindly retry a Produce into a duplicate.
         let err = BridgeError::Iggy(IggyError::TransientNotCommitted);
         assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
+
+    #[test]
+    fn request_too_old_maps_to_non_retryable_unknown_server_error() {
+        let err = BridgeError::Iggy(IggyError::RequestTooOld);
+        let code = err.to_kafka_error_code();
+
+        assert_eq!(code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert!(
+            !kafka_protocol::error::ResponseError::try_from_code(code)
+                .unwrap()
+                .is_retriable(),
+            "an aged-out request has an unknown outcome and must not be retried"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ use crate::offset_storage::{
     discard_offset_replacement, offset_replacement_id, persist_purge_generation,
     stage_offset_replacement,
 };
+use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::segment::Segment;
 use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::types::PartitionsConfig;
@@ -1627,39 +1628,13 @@ const MATERIALIZATION_MISSING: &str = "materialization.missing";
 /// # Errors
 /// Returns an error if the recovery fence cannot be published durably.
 pub async fn mark_materialization_missing(directory: &str, revision: u64) -> std::io::Result<()> {
-    let path = Path::new(directory).join(MATERIALIZATION_MISSING);
-    let temporary = Path::new(directory).join("materialization.missing.tmp");
-    let mut file = compio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)
-        .await
-        .note_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
-    file.write_all_at(revision.to_le_bytes().to_vec(), 0)
-        .await
-        .0?;
-    file.sync_all().await?;
-    compio::fs::rename(temporary, path).await?;
-    fsync_dir(directory).await
+    write_revision_record(directory, MATERIALIZATION_MISSING, revision).await
 }
 
 /// # Errors
 /// Returns an error if the recovery fence cannot be read or validated.
 pub async fn materialization_is_missing(directory: &str, revision: u64) -> std::io::Result<bool> {
-    match compio::fs::read(Path::new(directory).join(MATERIALIZATION_MISSING)).await {
-        Ok(bytes) => {
-            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid materialization fence",
-                )
-            })?;
-            Ok(u64::from_le_bytes(bytes) == revision)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+    Ok(read_revision_record(directory, MATERIALIZATION_MISSING).await? == Some(revision))
 }
 
 async fn clear_materialization_missing(directory: &str) -> std::io::Result<()> {

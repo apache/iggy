@@ -37,6 +37,11 @@ not. Before you open a PR you must be able to explain what every part of the cha
 and why, answer review questions about it yourself, and defend the design without going
 back to the tool for an answer. If you can't, the PR isn't ready.
 
+If an AI assistant helped you write the change, review it with the
+[`team-review-slim`](.claude/skills/team-review-slim/SKILL.md) skill before you open the PR.
+The skill can report false findings. Fix every finding that is correct and that applies to
+your change.
+
 While you're new to the project, please keep to **one open PR at a time**. Review takes
 longer than writing, so a queue of changes from one contributor holds up everyone else's.
 
@@ -63,6 +68,23 @@ for review.
 ### Single Purpose
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
+
+### Review Comments
+
+Respond to every review comment, so that the reviewer knows you read it. Any one of these
+is enough:
+
+- Resolve the conversation
+- React with 👍
+- Reply to the comment
+
+### Updating Your Branch
+
+Do not rebase your branch or merge `master` into it only to keep it up to date. Each push
+runs CI again on GitHub Actions runners that all Apache projects share. A maintainer
+updates the branch before the merge.
+
+If GitHub reports a merge conflict, or if a maintainer asks you to, update your branch.
 
 ### Quality Checks
 

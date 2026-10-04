@@ -232,8 +232,8 @@ pub fn install_client_conn<C: TransportConn>(
             bus.insert_client_meta(Rc::new(meta));
         }
         Err(rejected) => {
-            // Shard 0 mints client ids as `(target_shard << 112) | seq` with a
-            // monotonic `seq` starting at 1, so wrap requires 2^112 mints and
+            // Shard 0 mints client ids with a monotonic sequence that starts
+            // at 1 every boot, so wrap requires 2^48 mints and
             // a collision here is a bootstrap bug or a foreign id leaking
             // into the setup path. Flip `install_aborted` so the orphan
             // reader drops inbound frames instead of forwarding them via

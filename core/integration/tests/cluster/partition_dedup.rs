@@ -29,6 +29,7 @@
 //! for reading the log back, where it is the more honest observer.
 
 use bytes::{Bytes, BytesMut};
+use consensus::client_table::COMMITTED_WINDOW_BITS;
 use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
@@ -299,6 +300,9 @@ const TOTAL_SENDS: u64 = TESTED_CLIENT_SENDS + FILLER_SENDS;
 /// Replayed id: the tested client's watermark itself. Absorbing it requires an
 /// entry for that client, which only the transferred artifact can supply.
 const REPLAYED_REQUEST: u64 = TESTED_CLIENT_SENDS;
+/// The newest id the window has aged out: exactly one window width below the
+/// watermark.
+const AGED_OUT_REQUEST: u64 = REPLAYED_REQUEST - COMMITTED_WINDOW_BITS;
 
 /// Filler identity whose sends evict the tested client from the repair ring.
 const FILLER_CLIENT_ID: u128 = 0x0DED_F111_E400;
@@ -389,6 +393,13 @@ async fn given_transferred_dedup_slice_when_old_request_replays_should_absorb(
     assert_eq!(
         replayed, 0,
         "a replay of a transferred watermark is absorbed as a success"
+    );
+
+    let aged_out = send_reconnecting(addr, CLIENT_ID, AGED_OUT_REQUEST, FINAL_COMMIT_BUDGET).await;
+    assert_eq!(
+        aged_out,
+        IggyError::RequestTooOld.as_code(),
+        "the transferred window must reject an aged-out request with an unknown outcome"
     );
 
     // The count is the discriminator: an absorbed replay leaves it at
