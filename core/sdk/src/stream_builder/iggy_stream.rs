@@ -124,7 +124,7 @@ mod tests {
         let unconnected = IggyClient::default();
         assert!(matches!(
             IggyStream::build(&unconnected, &config).await,
-            Err(IggyError::InvalidConfiguration)
+            Err(IggyError::FeatureUnavailable)
         ));
         assert!(matches!(
             IggyStream::with_client_from_connection_string(
@@ -132,7 +132,7 @@ mod tests {
                 &config
             )
             .await,
-            Err(IggyError::InvalidConfiguration)
+            Err(IggyError::FeatureUnavailable)
         ));
     }
 }

@@ -123,12 +123,12 @@ mod tests {
         let unconnected = IggyClient::default();
         assert!(matches!(
             IggyStreamConsumer::build(&unconnected, &config).await,
-            Err(IggyError::InvalidConfiguration)
+            Err(IggyError::FeatureUnavailable)
         ));
         assert!(matches!(
             IggyStreamConsumer::with_client_from_url("iggy://user:secret@127.0.0.1:1", &config)
                 .await,
-            Err(IggyError::InvalidConfiguration)
+            Err(IggyError::FeatureUnavailable)
         ));
     }
 }

@@ -60,7 +60,7 @@ pub(crate) async fn build_iggy_consumer(
         ConsumerKind::ConsumerGroup => client.consumer_group(consumer_name, stream, topic)?,
         // Holds offsets only, it cannot poll. `IggyConsumerConfig::validate` refuses it, with a
         // log, before the entry points make any server call.
-        ConsumerKind::ExternalGroup => return Err(IggyError::InvalidConfiguration),
+        ConsumerKind::ExternalGroup => return Err(IggyError::FeatureUnavailable),
     }
     .auto_commit(auto_commit)
     .create_consumer_group_if_not_exists()

@@ -32,8 +32,8 @@
 //! Two more tests cover an offsets directory sync that does not succeed. When
 //! one consumer or group directory is gone, a state that recovery accepts, the
 //! purge must still record its generation. When the external group directory
-//! sync fails, the purge stays unrecorded across power loss, and the purge that
-//! boot runs again removes the bookmark that came back.
+//! sync fails, the purge asks for a fence and stays unrecorded across power
+//! loss, and the purge that boot runs again removes the bookmark that came back.
 //!
 //! The harness enters after message history has been reset. It uses production
 //! purge completion and consumer recovery with `SimStorage`, then polls through
@@ -556,10 +556,10 @@ fn given_missing_offset_directory_when_purge_completes_should_record_the_generat
     });
 }
 
-/// A failed offsets dir sync leaves the purge unrecorded. After a power loss the
-/// unsynced unlink is back, and the old generation tells the reconciler to purge
-/// again. Recording the purge anyway would keep that external group bookmark for
-/// good, because boot never clamps it.
+/// A failed offsets dir sync asks for a fence and records no purge. After a power
+/// loss the unsynced unlink is back, and the old generation tells the reconciler
+/// to purge again. Recording the purge anyway would keep that external group
+/// bookmark for good, because boot never clamps it.
 #[test]
 fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot() {
     block_on(async {
@@ -595,7 +595,7 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
             partition
                 .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
                 .await,
-            Err(PurgeError::GenerationNotRecorded(_))
+            Err(PurgeError::OffsetsNotDurable(_))
         ));
         assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
         drop(partition);

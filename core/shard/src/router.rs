@@ -1037,6 +1037,22 @@ where
                                  record failed; the reconciler re-issues it"
                             );
                         }
+                        Err(error @ partitions::PurgeError::OffsetsNotDurable(_)) => {
+                            // The chain is serviceable, but the unlinks of the
+                            // offset files may not be durable, and no retried
+                            // sync can prove them. Fence it like the arm below,
+                            // so the rebuild replaces those files.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition could not sync an offsets dir; fencing it for rebuild"
+                            );
+                            self.drop_partition_transfer_state(namespace, partition);
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
+                        }
                         Err(error @ partitions::PurgeError::Unserviceable(_)) => {
                             // Past the drain, so this group has no serviceable
                             // chain and the next append panics on

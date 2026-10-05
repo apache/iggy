@@ -64,10 +64,14 @@ use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
-/// Version 2: the external group count and section. `server-0.9.0` sends
-/// version 1, which has neither, so an artifact exchanged with a peer on that
-/// release fails with `UnsupportedVersion` instead of decoding 4 bytes out of
-/// place.
+/// Version 1 has no external group count and section. `server-0.9.0` reads and
+/// writes only this version, so the encoder keeps writing it while the external
+/// group section is empty, and a rolling upgrade can still transfer partitions
+/// in both directions.
+pub(crate) const CONSUMER_OFFSETS_VERSION_1: u8 = 1;
+/// Version 2 adds the external group count and section. It goes out only when
+/// that section holds an entry, and a `server-0.9.0` peer then fails with
+/// `UnsupportedVersion` instead of decoding 4 bytes out of place.
 pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 2;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
@@ -327,10 +331,20 @@ impl ConsumerOffsetsWire {
     /// {id u32, offset u64}xE | {client u128, watermark u64, latest_commit u64,
     /// user_id u32, committed_window u128}xD | checksum_present u8 |
     /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
-    /// XxHash3_64 trailer`. Little-endian throughout.
+    /// XxHash3_64 trailer`. Little-endian throughout. With no external group
+    /// offset the version is 1, and `external_group_count` and its section are
+    /// left out.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let sections = self.offset_sections();
+        let all_sections = self.offset_sections();
+        let (version, sections) = if self.external_groups.is_empty() {
+            (
+                CONSUMER_OFFSETS_VERSION_1,
+                &all_sections[..ConsumerKind::ExternalGroup.index()],
+            )
+        } else {
+            (CONSUMER_OFFSETS_VERSION, &all_sections[..])
+        };
         // Size exactly rather than guess; the reservation assert keeps the
         // arithmetic honest as fields are added.
         let reserved = CONSUMER_OFFSETS_MAGIC.len()
@@ -347,7 +361,7 @@ impl ConsumerOffsetsWire {
             + size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        out.push(CONSUMER_OFFSETS_VERSION);
+        out.push(version);
         out.extend_from_slice(&self.purge_generation.to_le_bytes());
         out.extend_from_slice(&self.next_offset.to_le_bytes());
         for entries in sections {
@@ -356,7 +370,7 @@ impl ConsumerOffsetsWire {
         }
         #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(self.dedup.len() as u32).to_le_bytes());
-        for (id, offset) in sections.into_iter().flatten() {
+        for (id, offset) in sections.iter().copied().flatten() {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&offset.to_le_bytes());
         }
@@ -406,14 +420,22 @@ impl ConsumerOffsetsWire {
         if magic != CONSUMER_OFFSETS_MAGIC {
             return Err(ConsumerOffsetsWireError::BadMagic);
         }
-        if version != CONSUMER_OFFSETS_VERSION {
+        if !matches!(
+            version,
+            CONSUMER_OFFSETS_VERSION_1 | CONSUMER_OFFSETS_VERSION
+        ) {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
         let purge_generation = cursor.u64()?;
         let next_offset = cursor.u64()?;
         let consumer_count = cursor.u32()?;
         let group_count = cursor.u32()?;
-        let external_group_count = cursor.u32()?;
+        // Version 1 has no count to read: its writer holds no external group offset.
+        let external_group_count = if version == CONSUMER_OFFSETS_VERSION_1 {
+            0
+        } else {
+            cursor.u32()?
+        };
         let dedup_count = cursor.u32()?;
         let consumers = Self::decode_section(&mut cursor, "consumers", consumer_count)?;
         let groups = Self::decode_section(&mut cursor, "groups", group_count)?;
@@ -603,7 +625,8 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::Truncated => write!(f, "consumer-offsets artifact is truncated"),
             Self::BadMagic => write!(
                 f,
-                "consumer-offsets artifact must use {} version {CONSUMER_OFFSETS_VERSION}",
+                "consumer-offsets artifact must use {} version {CONSUMER_OFFSETS_VERSION_1} \
+                 or {CONSUMER_OFFSETS_VERSION}",
                 String::from_utf8_lossy(&CONSUMER_OFFSETS_MAGIC)
             ),
             Self::TrailingBytes { extra } => write!(
@@ -614,7 +637,8 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::UnsupportedVersion { version } => write!(
                 f,
                 "consumer-offsets artifact version {version} is not understood \
-                 (this build speaks {CONSUMER_OFFSETS_VERSION})"
+                 (this build speaks {CONSUMER_OFFSETS_VERSION_1} and \
+                 {CONSUMER_OFFSETS_VERSION})"
             ),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
@@ -842,16 +866,16 @@ mod tests {
     }
 
     #[test]
-    fn given_entry_in_every_section_when_encoded_should_match_the_version_pin() {
-        // Nothing else fails when the layout changes and the version bump is
-        // forgotten, and a peer on the older release then reads the artifact
-        // out of place. One entry per section makes the length cover the
-        // header, every count field and every entry stride. Changing either
-        // number is the reminder to change the other.
-        const ENCODED_LEN: usize = 154;
-        const PINNED_VERSION: u8 = 2;
+    fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
+        // Nothing else fails when a layout changes and its version bump is
+        // forgotten, and a peer on another release then reads the artifact out
+        // of place. One entry per section makes each length cover the header,
+        // every count field and every entry stride. Changing a length is the
+        // reminder to change its version.
+        const VERSION_1_LEN: usize = 138;
+        const VERSION_2_LEN: usize = 154;
 
-        let wire = ConsumerOffsetsWire {
+        let with_external = ConsumerOffsetsWire {
             prepare_checksum: Some(1),
             checkpoint_prepare: Vec::new(),
             purge_generation: 0,
@@ -861,16 +885,72 @@ mod tests {
             external_groups: vec![(1, 0)],
             dedup: vec![dedup_entry(1, 0, 0)],
         };
+        let without_external = ConsumerOffsetsWire {
+            external_groups: Vec::new(),
+            ..with_external.clone()
+        };
 
+        for (wire, version, len) in [
+            (&without_external, CONSUMER_OFFSETS_VERSION_1, VERSION_1_LEN),
+            (&with_external, CONSUMER_OFFSETS_VERSION, VERSION_2_LEN),
+        ] {
+            let encoded = wire.encode();
+            assert_eq!(
+                (encoded[CONSUMER_OFFSETS_MAGIC.len()], encoded.len()),
+                (version, len),
+                "a consumer-offsets layout changed; bump its version with it"
+            );
+        }
         assert_eq!(
-            wire.encode().len(),
-            ENCODED_LEN,
-            "the consumer-offsets layout changed; bump CONSUMER_OFFSETS_VERSION with it"
+            (CONSUMER_OFFSETS_VERSION_1, CONSUMER_OFFSETS_VERSION),
+            (1, 2),
+            "a consumer-offsets version moved; confirm its layout moved with it"
         );
-        assert_eq!(
-            CONSUMER_OFFSETS_VERSION, PINNED_VERSION,
-            "CONSUMER_OFFSETS_VERSION moved; confirm the layout moved with it"
+    }
+
+    /// `server-0.9.0` writes version 1 with this layout. Decoding it has to give
+    /// the same table, and a table with no external group offset has to encode
+    /// to the same bytes, or every partition transfer between the two releases
+    /// fails during a rolling upgrade.
+    #[test]
+    fn given_server_0_9_0_artifact_when_decoded_and_encoded_again_should_match_it() {
+        let wire = ConsumerOffsetsWire {
+            prepare_checksum: Some(u128::MAX - 7),
+            checkpoint_prepare: vec![1, 2, 3],
+            ..table()
+        };
+        let mut released = Vec::new();
+        released.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        released.push(1);
+        released.extend_from_slice(&wire.purge_generation.to_le_bytes());
+        released.extend_from_slice(&wire.next_offset.to_le_bytes());
+        for count in [wire.consumers.len(), wire.groups.len(), wire.dedup.len()] {
+            released.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        }
+        for (id, offset) in wire.consumers.iter().chain(&wire.groups) {
+            released.extend_from_slice(&id.to_le_bytes());
+            released.extend_from_slice(&offset.to_le_bytes());
+        }
+        for entry in &wire.dedup {
+            released.extend_from_slice(&entry.client.to_le_bytes());
+            released.extend_from_slice(&entry.watermark.to_le_bytes());
+            released.extend_from_slice(&entry.latest_commit.to_le_bytes());
+            released.extend_from_slice(&entry.user_id.to_le_bytes());
+            released.extend_from_slice(&entry.committed_window.to_le_bytes());
+        }
+        released.push(1);
+        released.extend_from_slice(&wire.prepare_checksum.unwrap().to_le_bytes());
+        released.extend_from_slice(
+            &u32::try_from(wire.checkpoint_prepare.len())
+                .unwrap()
+                .to_le_bytes(),
         );
+        released.extend_from_slice(&wire.checkpoint_prepare);
+        let trailer = state_artifact_checksum(&released);
+        released.extend_from_slice(&trailer.to_le_bytes());
+
+        assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(wire.clone()));
+        assert_eq!(wire.encode(), released);
     }
 
     #[test]
@@ -1519,6 +1599,14 @@ pub enum PartitionInstallError {
         offer_next_offset: u64,
         local_next_offset: u64,
     },
+    /// The offer holds no segment, no message offset and no consumer offset,
+    /// while this replica holds committed consumer offsets, so installing it
+    /// would unlink them. Such an offer can come from a primary that lost its
+    /// directory, and a receiver that only holds external group offsets has
+    /// no message offset for [`Self::OfferRewindsDurableData`] to protect.
+    OfferErasesDurableOffsets {
+        local_offsets: usize,
+    },
     /// Consumer-offset staging failed before the segment swap, or finalizing a
     /// staged offset failed during it.
     OffsetPersistence {
@@ -1592,6 +1680,11 @@ impl fmt::Display for PartitionInstallError {
                 f,
                 "offer frontier {offer_next_offset} is below this replica's own next offset \
                  {local_next_offset}; installing it would rewind the offset space"
+            ),
+            Self::OfferErasesDurableOffsets { local_offsets } => write!(
+                f,
+                "offer holds no data while this replica holds {local_offsets} committed \
+                 consumer offsets; installing it would unlink them"
             ),
             Self::OffsetPersistence { path, source } => {
                 write!(f, "consumer offset persistence failed at {path}: {source}")
@@ -2751,6 +2844,23 @@ where
                 offer_next_offset: offsets_wire.next_offset,
                 local_next_offset,
             });
+        }
+        // The durable offset table has no frontier to compare, so the same
+        // rule keys on what each side holds. A replica that only holds external
+        // group offsets reads 0 above, and an offer that holds nothing at all
+        // would unlink every one of them.
+        let offer_holds_nothing = staged.is_empty()
+            && offsets_wire.next_offset == 0
+            && offsets_wire
+                .offset_sections()
+                .iter()
+                .all(|entries| entries.is_empty());
+        let local_offsets: usize = ConsumerKind::ALL
+            .into_iter()
+            .map(|kind| self.durable_consumer_offsets.count(kind))
+            .sum();
+        if !purge_advances && offer_holds_nothing && local_offsets > 0 {
+            return Err(PartitionInstallError::OfferErasesDurableOffsets { local_offsets });
         }
         staged.sort_unstable_by_key(|meta| meta.start_offset);
         for pair in staged.windows(2) {

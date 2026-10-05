@@ -50,7 +50,7 @@ pub struct IggyConsumerConfig {
     /// Members of the same consumer group use the same name.
     consumer_name: String,
     /// The type of consumer: `Consumer` or `ConsumerGroup`, the default. `ExternalGroup` only holds
-    /// offsets, so a consumer built with it fails with `InvalidConfiguration`.
+    /// offsets, so a consumer built with it fails with `FeatureUnavailable`, as a poll with it does.
     consumer_kind: ConsumerKind,
     /// Partition count when creating a topic.
     partitions_count: u32,
@@ -303,7 +303,7 @@ impl Validatable<IggyError> for IggyConsumerConfig {
                 "consumer_kind must be consumer or consumer_group: an external group only holds \
                  offsets and cannot poll"
             );
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::FeatureUnavailable);
         }
         Ok(())
     }
@@ -328,7 +328,7 @@ mod tests {
     fn given_external_group_kind_when_validated_should_refuse_it() {
         assert!(matches!(
             IggyConsumerConfig::with_external_group_kind().validate(),
-            Err(IggyError::InvalidConfiguration)
+            Err(IggyError::FeatureUnavailable)
         ));
         assert!(IggyConsumerConfig::default().validate().is_ok());
     }

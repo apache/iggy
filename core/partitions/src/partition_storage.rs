@@ -179,8 +179,10 @@ pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Resul
 /// # Errors
 ///
 /// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] when an existing offset
-/// directory cannot be enumerated. A stored offset past the offset space is clamped
-/// to `current_offset` (with a warning), not an error. External group offsets are
+/// directory cannot be enumerated, and
+/// [`PartitionRecoveryError::CreateOffsetsDirectory`] when the external group one
+/// cannot be created. A stored offset past the offset space is clamped to
+/// `current_offset` (with a warning), not an error. External group offsets are
 /// never clamped.
 pub async fn configure_consumer_offsets<B: MessageBus>(
     partition: &mut IggyPartition<B>,
@@ -214,8 +216,9 @@ pub async fn configure_consumer_offsets<B: MessageBus>(
 ///
 /// # Errors
 /// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] if an existing offset directory
-/// cannot be enumerated. Consumer recovery may already have seeded the partition
-/// when group recovery fails, so callers must discard a failed recovery.
+/// cannot be enumerated, and [`PartitionRecoveryError::CreateOffsetsDirectory`] if the
+/// external group one cannot be created. Consumer recovery may already have seeded the
+/// partition when group recovery fails, so callers must discard a failed recovery.
 #[allow(clippy::too_many_lines)]
 pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
     storage: &S,
@@ -300,15 +303,12 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     storage
         .create_directories(Path::new(&external_group_offsets_path))
         .await
-        .map_err(|_| PartitionRecoveryError::ConsumerOffsetsLoad {
-            consumer_kind: ConsumerKind::ExternalGroup.as_str(),
+        .map_err(|source| PartitionRecoveryError::CreateOffsetsDirectory {
             stream_id,
             topic_id,
             partition_id,
             path: external_group_offsets_path.clone(),
-            source: Box::new(IggyError::CannotCreateConsumerOffsetsDirectory(
-                external_group_offsets_path.clone(),
-            )),
+            source,
         })?;
     let recovered_external = load_partition_group_offsets(
         storage,
