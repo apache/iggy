@@ -27,7 +27,7 @@
 
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::group::state::{GroupState, Step};
 use crate::protocol::api::{ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
+pub use state::DescribeGroupsView;
 
 /// `DescribeGroups` / `ListGroups` state string for a group preparing a rebalance.
 pub const GROUP_STATE_PREPARING_REBALANCE: &str = "PreparingRebalance";
@@ -488,13 +489,27 @@ impl GroupCoordinator {
         state::leave_step(&mut groups, request, Instant::now())
     }
 
-    /// Snapshot of each named group, in request order. `None` means the group is not here.
+    /// Snapshot of each distinct group, in first-seen order. `None` means the group is not here.
     ///
-    /// Ticks each named group first, the same way every other request for that group does, so the
-    /// snapshot is the membership a heartbeat arriving now would see.
-    pub async fn describe_groups(&self, group_ids: &[StrBytes]) -> Vec<Option<GroupDescription>> {
+    /// Ids are deduped before the lock is taken. Under the lock each remaining group is ticked
+    /// once and, when the encoded response fits `max_frame_size`, snapshotted once. Encoding
+    /// happens after this returns. `ExceedsFrame` means the lengths already stored would not
+    /// fit, and no member snapshot was built.
+    pub async fn describe_groups(
+        &self,
+        group_ids: &[StrBytes],
+        version: i16,
+        max_frame_size: usize,
+    ) -> DescribeGroupsView {
+        let group_ids = distinct_group_ids(group_ids);
         let mut groups = self.groups.lock().await;
-        state::describe_groups(&mut groups, group_ids, Instant::now())
+        state::describe_groups(
+            &mut groups,
+            &group_ids,
+            version,
+            max_frame_size,
+            Instant::now(),
+        )
     }
 
     /// Every group currently in the map, ordered by group id.
@@ -520,6 +535,19 @@ impl GroupCoordinator {
 enum Parked<T> {
     Done(T),
     Wait(StrBytes, Instant, watch::Receiver<u64>),
+}
+
+/// First-seen order, one entry per id. `DescribeGroups` answers a repeated id once: a second
+/// snapshot of the same members would multiply the encoded response by the repeat count.
+pub(crate) fn distinct_group_ids(group_ids: &[StrBytes]) -> Vec<StrBytes> {
+    let mut seen = HashSet::with_capacity(group_ids.len());
+    let mut distinct = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        if seen.insert(group_id.clone()) {
+            distinct.push(group_id.clone());
+        }
+    }
+    distinct
 }
 
 fn park_outcome<T>(

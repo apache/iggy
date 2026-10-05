@@ -41,11 +41,12 @@ use crate::group::{
     SyncResult, owned_str,
 };
 use crate::protocol::api::{
-    ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID, ERROR_GROUP_MAX_SIZE_REACHED,
-    ERROR_ILLEGAL_GENERATION, ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID,
-    ERROR_INVALID_REQUEST, ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
-    ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID,
+    API_KEY_DESCRIBE_GROUPS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID,
+    ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION, ERROR_INCONSISTENT_GROUP_PROTOCOL,
+    ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST, ERROR_INVALID_SESSION_TIMEOUT,
+    ERROR_MEMBER_ID_REQUIRED, ERROR_NONE, ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID,
 };
+use crate::protocol::header::response_header_version;
 
 /// An Iggy name caps at 255 bytes and a Kafka group's offset key is `kafka.cg.<group>`, so a
 /// group id this gateway admits must leave room for that prefix (`docs/OFFSET_STORAGE.md`).
@@ -54,6 +55,15 @@ pub const MAX_GROUP_ID_BYTES: usize = 246;
 /// Protocol selection is polynomial in this count under the coordinator lock. Stock clients list
 /// one or two assignors.
 pub const MAX_PROTOCOLS_PER_MEMBER: usize = 16;
+
+/// Legacy Kafka strings are an `i16` length. `DescribeGroups` v0-v4 and `ListGroups` v0-v2 encode
+/// `protocol_type`, `member_id`, and (from v4) `group_instance_id` that way, and `kafka-protocol`
+/// refuses anything longer instead of writing it.
+const MAX_LEGACY_STRING_BYTES: usize = i16::MAX as usize;
+
+/// `generate_member_id` appends `-{uuid}`. A UUID's display form is 36 bytes, so the prefix has
+/// to leave this much room or the id itself will not fit a legacy string.
+const MEMBER_ID_SUFFIX_BYTES: usize = 1 + 36;
 
 /// Prefix for a generated member id when the client sent no `group_instance_id`. Kafka uses the
 /// header's `client_id`, which handlers do not receive.
@@ -183,6 +193,40 @@ impl Member {
             .iter()
             .find(|(candidate, _)| candidate == name)
             .map_or_else(Bytes::new, |(_, metadata)| metadata.clone())
+    }
+
+    fn metadata_len(&self, name: &StrBytes) -> usize {
+        self.protocols
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map_or(0, |(_, metadata)| metadata.len())
+    }
+
+    /// Encoded `DescribedGroupMember` size for `version`, without copying metadata or assignment.
+    fn described_len(
+        &self,
+        version: i16,
+        member_id: &StrBytes,
+        protocol_name: Option<&StrBytes>,
+    ) -> usize {
+        let flexible = version >= 5;
+        let mut total = kafka_string_len(flexible, member_id.len());
+        if version >= 4 {
+            total += kafka_nullable_string_len(
+                flexible,
+                self.group_instance_id.as_ref().map(|id| id.len()),
+            );
+        }
+        // `client_id` and `client_host` stay empty: the coordinator does not retain them.
+        total += kafka_string_len(flexible, 0);
+        total += kafka_string_len(flexible, 0);
+        let metadata_len = protocol_name.map_or(0, |name| self.metadata_len(name));
+        total += kafka_bytes_len(flexible, metadata_len);
+        total += kafka_bytes_len(flexible, self.assignment.len());
+        if flexible {
+            total += 1;
+        }
+        total
     }
 }
 
@@ -654,6 +698,38 @@ impl GroupState {
             members,
         }
     }
+
+    /// Encoded `DescribedGroup` size for `version`. Same fields [`Self::description`] copies,
+    /// priced from their lengths so the frame check does not have to build that snapshot first.
+    fn described_len(&self, version: i16, group_id: &StrBytes) -> usize {
+        let flexible = version >= 5;
+        let mut total = 2;
+        if version >= 6 {
+            total += kafka_nullable_string_len(true, None);
+        }
+        total += kafka_string_len(flexible, group_id.len());
+        total += kafka_string_len(flexible, self.phase.as_kafka_state().len());
+        total += kafka_string_len(flexible, self.protocol_type.len());
+        total += kafka_string_len(
+            flexible,
+            self.protocol_name.as_ref().map_or(0, |name| name.len()),
+        );
+        total += kafka_array_prefix(flexible, self.members.len());
+        for (member_id, member) in &self.members {
+            total = total.saturating_add(member.described_len(
+                version,
+                member_id,
+                self.protocol_name.as_ref(),
+            ));
+        }
+        if version >= 3 {
+            total += 4;
+        }
+        if flexible {
+            total += 1;
+        }
+        total
+    }
 }
 
 /// Tick every group and drop the ones that emptied, returning how many were reclaimed.
@@ -723,7 +799,7 @@ fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) ->
     if request.protocol_type.is_empty() || request.protocols.is_empty() {
         return Some(ERROR_INCONSISTENT_GROUP_PROTOCOL);
     }
-    if request.protocols.len() > MAX_PROTOCOLS_PER_MEMBER {
+    if request.protocols.len() > MAX_PROTOCOLS_PER_MEMBER || legacy_strings_too_long(request) {
         return Some(ERROR_INVALID_REQUEST);
     }
     // Names count too: they are retained alongside the metadata, and a request can carry many
@@ -741,6 +817,26 @@ fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) ->
         return Some(ERROR_INVALID_REQUEST);
     }
     None
+}
+
+/// `protocol_type`, a client-supplied `member_id`, and `group_instance_id` are echoed as legacy
+/// strings. When the member id is generated, the instance id is the prefix and the `-{uuid}`
+/// suffix has to fit in the same cap.
+fn legacy_strings_too_long(request: &JoinRequest) -> bool {
+    if request.protocol_type.len() > MAX_LEGACY_STRING_BYTES
+        || request.member_id.len() > MAX_LEGACY_STRING_BYTES
+    {
+        return true;
+    }
+    let Some(instance_id) = &request.group_instance_id else {
+        return false;
+    };
+    let limit = if request.member_id.is_empty() {
+        MAX_LEGACY_STRING_BYTES - MEMBER_ID_SUFFIX_BYTES
+    } else {
+        MAX_LEGACY_STRING_BYTES
+    };
+    instance_id.len() > limit
 }
 
 /// Make sure `request.group_id` exists and is ticked, returning whether this call created it.
@@ -1147,25 +1243,44 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
     }
 }
 
-/// One entry per `group_ids` element, after that group's usual expiry tick.
+/// What [`describe_groups`] decided under the coordinator lock.
+///
+/// `ExceedsFrame` means the encoded response, header included, would pass `max_frame_size`. No
+/// member snapshot was built: the lengths already stored on the group are enough to price it.
+pub enum DescribeGroupsView {
+    Groups(Vec<Option<GroupDescription>>),
+    ExceedsFrame { encoded_bytes: usize },
+}
+
+/// One entry per distinct id, first-seen order, after that group's usual expiry tick.
+///
+/// Ids are deduped before the tick, so a request that repeats one group does not walk it once
+/// per copy. The frame check runs on those lengths before [`GroupState::description`], which is
+/// what copies member metadata and assignments.
 pub fn describe_groups(
     groups: &mut Groups,
     group_ids: &[StrBytes],
+    version: i16,
+    max_frame_size: usize,
     now: Instant,
-) -> Vec<Option<GroupDescription>> {
-    let mut described = Vec::with_capacity(group_ids.len());
-    for group_id in group_ids {
-        if !tick_group(groups, group_id, now) {
-            described.push(None);
-            continue;
-        }
-        let Some(group) = groups.get(group_id) else {
-            described.push(None);
-            continue;
-        };
-        described.push(Some(group.description(group_id)));
+) -> DescribeGroupsView {
+    let group_ids = super::distinct_group_ids(group_ids);
+    for group_id in &group_ids {
+        tick_group(groups, group_id, now);
     }
-    described
+    let encoded_bytes = describe_frame_len(version, groups, &group_ids);
+    if encoded_bytes > max_frame_size {
+        return DescribeGroupsView::ExceedsFrame { encoded_bytes };
+    }
+    let described = group_ids
+        .iter()
+        .map(|group_id| {
+            groups
+                .get(group_id)
+                .map(|group| group.description(group_id))
+        })
+        .collect();
+    DescribeGroupsView::Groups(described)
 }
 
 /// Groups currently in the map, ordered by group id. Does not tick: see
@@ -1181,6 +1296,107 @@ pub fn list_groups(groups: &Groups) -> Vec<GroupListing> {
         .collect();
     listed.sort_by(|left, right| left.group_id.cmp(&right.group_id));
     listed
+}
+
+/// Header plus body, the length `send_response` writes and `read_frame` compares to
+/// `max_frame_size`. The 4-byte length prefix is not part of that value.
+fn describe_frame_len(version: i16, groups: &Groups, group_ids: &[StrBytes]) -> usize {
+    let mut total = kafka_response_header_len(API_KEY_DESCRIBE_GROUPS, version);
+    if version >= 1 {
+        total += 4;
+    }
+    total += kafka_array_prefix(version >= 5, group_ids.len());
+    for group_id in group_ids {
+        let group_bytes = groups.get(group_id).map_or_else(
+            || missing_described_len(version, group_id),
+            |group| group.described_len(version, group_id),
+        );
+        total = total.saturating_add(group_bytes);
+    }
+    if version >= 5 {
+        total += 1;
+    }
+    total
+}
+
+/// A group that is not in the map. v6 carries `GROUP_ID_NOT_FOUND` and `Group {id} not found.`;
+/// older versions encode error 0 and omit `error_message`. Matches `missing_group` in the handler.
+fn missing_described_len(version: i16, group_id: &StrBytes) -> usize {
+    let flexible = version >= 5;
+    let mut total = 2;
+    if version >= 6 {
+        let message_len = "Group ".len() + group_id.len() + " not found.".len();
+        total += kafka_string_len(true, message_len);
+    }
+    total += kafka_string_len(flexible, group_id.len());
+    total += kafka_string_len(flexible, "Dead".len());
+    total += kafka_string_len(flexible, 0);
+    total += kafka_string_len(flexible, 0);
+    total += kafka_array_prefix(flexible, 0);
+    if version >= 3 {
+        total += 4;
+    }
+    if flexible {
+        total += 1;
+    }
+    total
+}
+
+fn kafka_response_header_len(api_key: i16, version: i16) -> usize {
+    if response_header_version(api_key, version) >= 1 {
+        5
+    } else {
+        4
+    }
+}
+
+const fn unsigned_varint_len(value: u32) -> usize {
+    match value {
+        0x00..=0x7f => 1,
+        0x80..=0x3fff => 2,
+        0x4000..=0x001f_ffff => 3,
+        0x0020_0000..=0x0fff_ffff => 4,
+        _ => 5,
+    }
+}
+
+/// Length prefix of a compact string, compact bytes field, or compact array: the unsigned
+/// varint of `len + 1`.
+fn kafka_compact_prefix(len: usize) -> usize {
+    let wire = u32::try_from(len.saturating_add(1)).unwrap_or(u32::MAX);
+    unsigned_varint_len(wire)
+}
+
+fn kafka_string_len(flexible: bool, bytes: usize) -> usize {
+    if flexible {
+        kafka_compact_prefix(bytes) + bytes
+    } else {
+        2 + bytes
+    }
+}
+
+fn kafka_nullable_string_len(flexible: bool, bytes: Option<usize>) -> usize {
+    match bytes {
+        Some(bytes) => kafka_string_len(flexible, bytes),
+        None if flexible => 1,
+        None => 2,
+    }
+}
+
+fn kafka_bytes_len(flexible: bool, bytes: usize) -> usize {
+    if flexible {
+        kafka_compact_prefix(bytes) + bytes
+    } else {
+        4 + bytes
+    }
+}
+
+fn kafka_array_prefix(flexible: bool, count: usize) -> usize {
+    if flexible {
+        kafka_compact_prefix(count)
+    } else {
+        4
+    }
 }
 
 fn admit(
@@ -1252,7 +1468,15 @@ fn generate_member_id(group_instance_id: Option<&StrBytes>) -> StrBytes {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+    use kafka_protocol::messages::describe_groups_response::{
+        DescribedGroup, DescribedGroupMember,
+    };
+    use kafka_protocol::messages::{DescribeGroupsResponse, GroupId};
+    use kafka_protocol::protocol::Encodable;
+
     use super::*;
+    use crate::protocol::api::ERROR_GROUP_ID_NOT_FOUND;
 
     const GROUP: &str = "g";
 
@@ -1629,6 +1853,194 @@ mod tests {
             config.max_rebalance_timeout,
             "the value must be bounded for deadline purposes even though the join succeeds"
         );
+    }
+
+    /// `DescribeGroups` v0-v4 and `ListGroups` v0-v2 encode `protocol_type` as a legacy string.
+    /// Join v6 can carry one longer than `i16::MAX`, and storing it would make those responses
+    /// unencodable.
+    #[test]
+    fn given_a_protocol_type_past_the_legacy_string_cap_when_joining_should_reject_it() {
+        let config = config();
+        let mut groups = Groups::new();
+        let mut request = request("", &["range"]);
+        request.protocol_type = StrBytes::from_string("p".repeat(MAX_LEGACY_STRING_BYTES + 1));
+
+        let step = join_step(&mut groups, &config, &request, Instant::now());
+
+        assert_eq!(error_of(&step), ERROR_INVALID_REQUEST);
+        assert!(
+            groups.is_empty(),
+            "a protocol_type that cannot be echoed must not be stored"
+        );
+    }
+
+    /// The generated member id is `{group_instance_id}-{uuid}`. The suffix has to be inside the
+    /// same legacy-string cap, or `DescribeGroups` v0-v4 cannot encode `member_id`.
+    #[test]
+    fn given_an_instance_id_that_leaves_no_room_for_the_member_suffix_when_joining_should_reject_it()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let prefix_len = MAX_LEGACY_STRING_BYTES - MEMBER_ID_SUFFIX_BYTES;
+        let mut request = request("", &["range"]);
+        request.group_instance_id = Some(StrBytes::from_string("i".repeat(prefix_len + 1)));
+
+        let rejected = join_step(&mut groups, &config, &request, Instant::now());
+
+        assert_eq!(error_of(&rejected), ERROR_INVALID_REQUEST);
+        assert!(groups.is_empty());
+
+        request.group_instance_id = Some(StrBytes::from_string("i".repeat(prefix_len)));
+        let admitted = join_step(&mut Groups::new(), &config, &request, Instant::now());
+        assert_ne!(error_of_or_none(&admitted), Some(ERROR_INVALID_REQUEST));
+        assert_eq!(member_id_of(&admitted).len(), MAX_LEGACY_STRING_BYTES);
+    }
+
+    /// A client-supplied member id is not generated, so its own length is the cap. An instance
+    /// id that already has a member id is capped on its own, without reserving the suffix.
+    #[test]
+    fn given_a_member_id_past_the_legacy_string_cap_when_joining_should_reject_it() {
+        let config = config();
+        let mut groups = Groups::new();
+        let request = request(&"m".repeat(MAX_LEGACY_STRING_BYTES + 1), &["range"]);
+
+        let step = join_step(&mut groups, &config, &request, Instant::now());
+
+        assert_eq!(error_of(&step), ERROR_INVALID_REQUEST);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn given_a_known_member_id_and_a_max_legacy_instance_id_when_joining_should_not_reserve_the_suffix()
+     {
+        let config = config();
+        let mut groups = Groups::new();
+        let mut request = request("known-member", &["range"]);
+        request.group_instance_id =
+            Some(StrBytes::from_string("i".repeat(MAX_LEGACY_STRING_BYTES)));
+
+        let step = join_step(&mut groups, &config, &request, Instant::now());
+
+        assert_eq!(error_of(&step), ERROR_UNKNOWN_MEMBER_ID);
+    }
+
+    /// Repeating an id must not build a second snapshot, and a frame of 0 bytes must refuse
+    /// before that snapshot exists. The group stays: refusing the response is not a deletion.
+    #[test]
+    fn given_a_repeated_group_id_when_describing_should_tick_and_snapshot_it_once() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _ = join_step(&mut groups, &config, &request("", &["range"]), now);
+        let id = group_id();
+
+        let described = describe_groups(&mut groups, &[id.clone(), id.clone()], 0, usize::MAX, now);
+        let DescribeGroupsView::Groups(described) = described else {
+            panic!("a single small group fits any real frame");
+        };
+        assert_eq!(described.len(), 1);
+        assert!(described[0].is_some());
+
+        let refused = describe_groups(&mut groups, std::slice::from_ref(&id), 0, 0, now);
+        assert!(matches!(refused, DescribeGroupsView::ExceedsFrame { .. }));
+        assert!(
+            groups.contains_key(&id),
+            "closing the describe response must not drop the group"
+        );
+    }
+
+    /// The frame check has to match what `DescribeGroups` actually encodes, header included.
+    #[test]
+    fn given_a_described_group_when_pricing_the_frame_should_match_the_encoder() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _ = join_step(&mut groups, &config, &request("", &["range"]), now);
+        let id = group_id();
+        let missing = StrBytes::from_static_str("missing");
+
+        for version in 0..=6 {
+            for ids in [
+                vec![id.clone()],
+                vec![missing.clone()],
+                vec![id.clone(), missing.clone()],
+            ] {
+                let priced = describe_frame_len(version, &groups, &ids);
+                let DescribeGroupsView::Groups(described) =
+                    describe_groups(&mut groups, &ids, version, usize::MAX, now)
+                else {
+                    panic!("version {version} must fit");
+                };
+                let encoded = encode_described(version, &ids, &described);
+                let header = kafka_response_header_len(API_KEY_DESCRIBE_GROUPS, version);
+                assert_eq!(
+                    priced,
+                    header + encoded.len(),
+                    "version {version} ids {} priced {priced} encoded {}",
+                    ids.len(),
+                    header + encoded.len()
+                );
+            }
+        }
+    }
+
+    fn encoded_described_group(group: &GroupDescription) -> DescribedGroup {
+        DescribedGroup::default()
+            .with_group_id(GroupId(group.group_id.clone()))
+            .with_group_state(StrBytes::from_static_str(group.state))
+            .with_protocol_type(group.protocol_type.clone())
+            .with_protocol_data(group.protocol_name.clone().unwrap_or_default())
+            .with_members(
+                group
+                    .members
+                    .iter()
+                    .map(|member| {
+                        DescribedGroupMember::default()
+                            .with_member_id(member.member_id.clone())
+                            .with_group_instance_id(member.group_instance_id.clone())
+                            .with_member_metadata(member.metadata.clone())
+                            .with_member_assignment(member.assignment.clone())
+                    })
+                    .collect(),
+            )
+    }
+
+    fn missing_described(version: i16, group_id: &StrBytes) -> DescribedGroup {
+        let mut missing = DescribedGroup::default()
+            .with_group_id(GroupId(group_id.clone()))
+            .with_group_state(StrBytes::from_static_str("Dead"));
+        if version >= 6 {
+            missing = missing
+                .with_error_code(ERROR_GROUP_ID_NOT_FOUND)
+                .with_error_message(Some(StrBytes::from_string(format!(
+                    "Group {} not found.",
+                    group_id.as_str()
+                ))));
+        }
+        missing
+    }
+
+    fn encode_described(
+        version: i16,
+        ids: &[StrBytes],
+        described: &[Option<GroupDescription>],
+    ) -> Bytes {
+        let groups = ids
+            .iter()
+            .zip(described)
+            .map(|(group_id, group)| {
+                group.as_ref().map_or_else(
+                    || missing_described(version, group_id),
+                    encoded_described_group,
+                )
+            })
+            .collect();
+        let response = DescribeGroupsResponse::default().with_groups(groups);
+        let mut buf = BytesMut::new();
+        response
+            .encode(&mut buf, version)
+            .expect("described group encodes");
+        buf.freeze()
     }
 
     /// The cap has to measure everything a member retains. Protocol names are kept alongside the

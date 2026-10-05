@@ -56,6 +56,7 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_MEMBER_ID, GatewayState, handle_request_bounded,
 };
+use iggy_gateway_kafka::protocol::header::response_header_version;
 
 use codec::Decoder;
 use server::spawn_test_server_with_config;
@@ -77,14 +78,27 @@ const REBALANCE_TIMEOUT_MS: i32 = 20_000;
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
-    Arc::new(GatewayState::new(
+    Arc::new(owned_state(config, 8 * 1024 * 1024))
+}
+
+fn owned_state(config: GroupCoordinatorConfig, max_frame_size: usize) -> GatewayState {
+    GatewayState::new(
         BrokerAdvertise::default(),
         None,
-        8 * 1024 * 1024,
+        max_frame_size,
         false,
         0,
         GroupCoordinator::new(config, CancellationToken::new()),
-    ))
+    )
+}
+
+fn response_frame_len(api_key: i16, version: i16, body: &Bytes) -> usize {
+    let header = if response_header_version(api_key, version) >= 1 {
+        5
+    } else {
+        4
+    };
+    header + body.len()
 }
 
 /// A coordinator that completes a new group's first join immediately, so tests that are not
@@ -1759,6 +1773,150 @@ async fn given_an_unknown_group_when_describing_should_report_dead_without_creat
     let listed = list_groups(&state, 0, &[], &[]).await;
     assert_eq!(listed.error, ERROR_NONE);
     assert!(listed.groups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_repeated_group_ids_when_describing_should_answer_each_distinct_id_once() {
+    let state = test_state(immediate_config());
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    join(&state, 3, &join_params("", protocols)).await;
+
+    let described = describe(&state, 6, &[GROUP, "missing", GROUP, "missing"]).await;
+
+    assert_eq!(described.groups.len(), 2);
+    assert_eq!(described.groups[0].group_id, GROUP);
+    assert_eq!(described.groups[0].error, ERROR_NONE);
+    assert_eq!(described.groups[1].group_id, "missing");
+    assert_eq!(described.groups[1].state, "Dead");
+    assert_eq!(described.groups[1].error, ERROR_GROUP_ID_NOT_FOUND);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_describe_response_at_the_frame_cap_when_one_byte_over_should_close() {
+    let mut state = owned_state(immediate_config(), 8 * 1024 * 1024);
+    // Bigger than the shape guard's per-id charge, so a repeated id is not rejected as a
+    // malformed request before the response-size check can see that it is one group.
+    let blob = vec![b'x'; 400];
+    let protocols: &[(&str, &[u8])] = &[("range", blob.as_slice())];
+    join(&state, 3, &join_params("", protocols)).await;
+
+    let version = 0;
+    let encoded = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        version,
+        build_describe_groups_request(version, &[GROUP], false),
+    )
+    .await
+    .expect_response("DescribeGroups must answer");
+    let frame = response_frame_len(API_KEY_DESCRIBE_GROUPS, version, &encoded);
+    state.max_frame_size = frame;
+    let repeated = describe(&state, version, &[GROUP, GROUP]).await;
+    assert_eq!(
+        repeated.groups.len(),
+        1,
+        "a repeated id is one group, so it still fits the one-group frame"
+    );
+
+    state.max_frame_size = frame - 1;
+    assert!(
+        handle_request_bounded(
+            &state,
+            API_KEY_DESCRIBE_GROUPS,
+            version,
+            build_describe_groups_request(version, &[GROUP], false),
+        )
+        .await
+        .is_close(),
+        "DescribeGroups closes when the encoded frame would pass max_frame_size"
+    );
+
+    state.max_frame_size = frame;
+    let again = describe(&state, version, &[GROUP]).await;
+    assert_eq!(again.groups.len(), 1);
+    assert_eq!(again.groups[0].group_id, GROUP);
+    assert_ne!(again.groups[0].state, "Dead");
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_list_response_one_byte_past_the_frame_cap_when_listing_should_close() {
+    let mut state = owned_state(immediate_config(), 8 * 1024 * 1024);
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    join(&state, 3, &join_params("", protocols)).await;
+
+    let version = 0;
+    let encoded = handle_request_bounded(
+        &state,
+        API_KEY_LIST_GROUPS,
+        version,
+        build_list_groups_request(version, &[], &[]),
+    )
+    .await
+    .expect_response("ListGroups must answer");
+    let frame = response_frame_len(API_KEY_LIST_GROUPS, version, &encoded);
+
+    state.max_frame_size = frame - 1;
+    assert!(
+        handle_request_bounded(
+            &state,
+            API_KEY_LIST_GROUPS,
+            version,
+            build_list_groups_request(version, &[], &[]),
+        )
+        .await
+        .is_close(),
+        "ListGroups closes when the encoded frame would pass max_frame_size"
+    );
+
+    state.max_frame_size = frame;
+    let listed = list_groups(&state, version, &[], &[]).await;
+    assert_eq!(listed.groups.len(), 1);
+    assert_eq!(listed.groups[0].group_id, GROUP);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_truncated_describe_groups_body_when_handled_should_close_the_connection() {
+    let state = test_state(immediate_config());
+    let outcome = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        0,
+        Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one group
+            0x00, 0x02, // string length 2
+            b'g', // truncated
+        ]),
+    )
+    .await;
+
+    assert!(
+        outcome.is_close(),
+        "a truncated DescribeGroups body must close the connection"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_truncated_list_groups_body_when_handled_should_return_invalid_request() {
+    let state = test_state(immediate_config());
+    let response = handle_request_bounded(
+        &state,
+        API_KEY_LIST_GROUPS,
+        4,
+        Bytes::from_static(&[
+            0x02, // one states_filter entry
+            0x03, // compact string claims 2 bytes
+            b'x', // truncated
+        ]),
+    )
+    .await
+    .expect_response("ListGroups reports a decode failure as INVALID_REQUEST");
+    let mut decoder = Decoder::new(response);
+
+    assert_eq!(decoder.read_i32().unwrap(), 0);
+    assert_eq!(decoder.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+    assert_eq!(decoder.read_varint().unwrap(), 1);
+    assert_eq!(decoder.read_varint().unwrap(), 0);
+    assert_eq!(decoder.remaining(), 0);
 }
 
 // ── Over a real TCP listener ────────────────────────────────────────────────

@@ -31,7 +31,7 @@ use kafka_protocol::messages::{DescribeGroupsRequest, DescribeGroupsResponse, Gr
 use kafka_protocol::protocol::StrBytes;
 
 use crate::error::Result;
-use crate::group::{GroupDescription, MemberDescription};
+use crate::group::{DescribeGroupsView, GroupDescription, MemberDescription, distinct_group_ids};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ERROR_GROUP_ID_NOT_FOUND, ERROR_UNSUPPORTED_VERSION,
     GatewayState, HandleOutcome, is_supported_version,
@@ -73,20 +73,38 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             }
         };
 
-    let group_ids: Vec<StrBytes> = request
+    let requested: Vec<StrBytes> = request
         .groups
         .iter()
         .map(|group_id| group_id.0.clone())
         .collect();
-    let described = state.groups.describe_groups(&group_ids).await;
-    let groups = group_ids
-        .iter()
-        .zip(described)
-        .map(|(group_id, group)| {
-            group.map_or_else(|| missing_group(api_version, group_id), described_group)
-        })
-        .collect();
-    respond_or_close(encode_response(api_version, groups), "DescribeGroups")
+    // One result per distinct id. Repeating one group would otherwise copy its members into the
+    // response once per copy, and the shape guard only charges the id strings.
+    let group_ids = distinct_group_ids(&requested);
+    match state
+        .groups
+        .describe_groups(&group_ids, api_version, state.max_frame_size)
+        .await
+    {
+        DescribeGroupsView::ExceedsFrame { encoded_bytes } => {
+            tracing::warn!(
+                encoded_bytes,
+                max_frame_size = state.max_frame_size,
+                "DescribeGroups response would exceed max_frame_size; closing connection"
+            );
+            HandleOutcome::Close
+        }
+        DescribeGroupsView::Groups(described) => {
+            let groups = group_ids
+                .iter()
+                .zip(described)
+                .map(|(group_id, group)| {
+                    group.map_or_else(|| missing_group(api_version, group_id), described_group)
+                })
+                .collect();
+            respond_or_close(encode_response(api_version, groups), "DescribeGroups")
+        }
+    }
 }
 
 fn described_group(group: GroupDescription) -> DescribedGroup {

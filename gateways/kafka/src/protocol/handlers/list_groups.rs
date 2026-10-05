@@ -38,6 +38,7 @@ use crate::protocol::bounds_guard::validate_list_groups_shape;
 use crate::protocol::handlers::{
     decode_guarded, encode_message, respond_or_close, unsupported_version_response,
 };
+use crate::protocol::header::response_header_version;
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_GROUPS,
@@ -68,7 +69,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
-    let groups = state
+    let listings: Vec<GroupListing> = state
         .groups
         .list_groups()
         .await
@@ -77,8 +78,19 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             selected(&request.states_filter, group.state)
                 && selected(&request.types_filter, CLASSIC_GROUP_TYPE)
         })
-        .map(listed_group)
         .collect();
+    // `protocol_type` is echoed for every group. The shape guard never sees that list, so a
+    // coordinator holding many long types can still outgrow the frame. Price it before encode.
+    let encoded_bytes = list_response_frame_len(api_version, &listings);
+    if encoded_bytes > state.max_frame_size {
+        tracing::warn!(
+            encoded_bytes,
+            max_frame_size = state.max_frame_size,
+            "ListGroups response would exceed max_frame_size; closing connection"
+        );
+        return HandleOutcome::Close;
+    }
+    let groups = listings.into_iter().map(listed_group).collect();
     respond_or_close(encode_response(api_version, groups), "ListGroups")
 }
 
@@ -87,6 +99,68 @@ fn selected(filter: &[StrBytes], value: &str) -> bool {
         || filter
             .iter()
             .any(|wanted| wanted.as_str().trim().eq_ignore_ascii_case(value))
+}
+
+/// Header plus body, the length `send_response` writes and `read_frame` compares to
+/// `max_frame_size`.
+fn list_response_frame_len(version: i16, groups: &[GroupListing]) -> usize {
+    let flexible = version >= 3;
+    let mut total = if response_header_version(API_KEY_LIST_GROUPS, version) >= 1 {
+        5
+    } else {
+        4
+    };
+    if version >= 1 {
+        total += 4;
+    }
+    total += 2;
+    total += if flexible {
+        kafka_compact_prefix(groups.len())
+    } else {
+        4
+    };
+    for group in groups {
+        total = total.saturating_add(listed_group_len(version, group));
+    }
+    if flexible {
+        total += 1;
+    }
+    total
+}
+
+fn listed_group_len(version: i16, group: &GroupListing) -> usize {
+    let flexible = version >= 3;
+    let mut total = kafka_string_len(flexible, group.group_id.len());
+    total += kafka_string_len(flexible, group.protocol_type.len());
+    if version >= 4 {
+        total += kafka_string_len(true, group.state.len());
+    }
+    if version >= 5 {
+        total += kafka_string_len(true, CLASSIC_GROUP_TYPE.len());
+    }
+    if flexible {
+        total += 1;
+    }
+    total
+}
+
+fn kafka_compact_prefix(len: usize) -> usize {
+    let wire = u32::try_from(len.saturating_add(1)).unwrap_or(u32::MAX);
+    match wire {
+        0x00..=0x7f => 1,
+        0x80..=0x3fff => 2,
+        0x4000..=0x001f_ffff => 3,
+        0x0020_0000..=0x0fff_ffff => 4,
+        _ => 5,
+    }
+}
+
+fn kafka_string_len(flexible: bool, bytes: usize) -> usize {
+    if flexible {
+        kafka_compact_prefix(bytes) + bytes
+    } else {
+        2 + bytes
+    }
 }
 
 fn listed_group(group: GroupListing) -> ListedGroup {
