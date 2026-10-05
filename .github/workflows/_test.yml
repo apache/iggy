@@ -108,11 +108,13 @@ jobs:
       - name: Upload coverage to Codecov
         # test-storage-compat runs its own nextest invocation without llvm-cov,
         # so it emits no codecov.json. Uploading an empty report under the
-        # `rust` flag would read as a coverage drop on the PR.
+        # `rust` flag would read as a coverage drop on the PR. A test task that
+        # Cargo-Rail found no affected tests for writes no report either.
         if: >-
           startsWith(inputs.component, 'rust') &&
           startsWith(inputs.task, 'test-') &&
-          inputs.task != 'test-storage-compat'
+          inputs.task != 'test-storage-compat' &&
+          hashFiles('codecov.json') != ''
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
