@@ -17,8 +17,6 @@
 
 //! Metadata (API key 3).
 
-use std::collections::HashSet;
-
 use bytes::Bytes;
 use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
@@ -34,6 +32,7 @@ use crate::protocol::api::{
     is_supported_version, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_metadata_shape;
+use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -194,7 +193,7 @@ async fn resolve_requested_named_topics(
     bridge: &IggyBridge,
     names: &[StrBytes],
 ) -> Vec<TopicResult> {
-    let distinct = dedup_topic_names(names);
+    let distinct = dedup_first_seen(names);
     match tokio::time::timeout(REQUEST_DEADLINE, bridge.get_kafka_topics(&distinct)).await {
         Ok(Ok(resolved)) => resolved
             .into_iter()
@@ -355,17 +354,6 @@ const fn error_result(name: StrBytes, error_code: i16) -> TopicResult {
 
 /// Drops repeats, keeping first-seen order so a capped or timed-out response still answers a
 /// deterministic prefix of the request rather than an arbitrary hash-order subset.
-fn dedup_topic_names(names: &[StrBytes]) -> Vec<StrBytes> {
-    let mut seen = HashSet::with_capacity(names.len());
-    let mut distinct = Vec::with_capacity(names.len());
-    for name in names {
-        if seen.insert(name.as_str()) {
-            distinct.push(name.clone());
-        }
-    }
-    distinct
-}
-
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `response_version`.

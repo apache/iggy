@@ -46,7 +46,9 @@ use crate::protocol::api::{
     ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST, ERROR_INVALID_SESSION_TIMEOUT,
     ERROR_MEMBER_ID_REQUIRED, ERROR_NONE, ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID,
 };
+use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::header::response_header_version;
+use crate::protocol::wire_len::{kafka_compact_prefix, kafka_string_len};
 
 /// An Iggy name caps at 255 bytes and a Kafka group's offset key is `kafka.cg.<group>`, so a
 /// group id this gateway admits must leave room for that prefix (`docs/OFFSET_STORAGE.md`).
@@ -819,12 +821,18 @@ fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) ->
     None
 }
 
-/// `protocol_type`, a client-supplied `member_id`, and `group_instance_id` are echoed as legacy
-/// strings. When the member id is generated, the instance id is the prefix and the `-{uuid}`
-/// suffix has to fit in the same cap.
+/// `protocol_type`, a client-supplied `member_id`, `group_instance_id`, and each protocol
+/// `name` are echoed as legacy strings - the last of these by `DescribeGroups` v0-v4, which
+/// writes the stored group's selected protocol name as `protocol_data` with an i16 length, not
+/// by `JoinGroup` itself. When the member id is generated, the instance id is the prefix and the
+/// `-{uuid}` suffix has to fit in the same cap.
 fn legacy_strings_too_long(request: &JoinRequest) -> bool {
     if request.protocol_type.len() > MAX_LEGACY_STRING_BYTES
         || request.member_id.len() > MAX_LEGACY_STRING_BYTES
+        || request
+            .protocols
+            .iter()
+            .any(|(name, _)| name.len() > MAX_LEGACY_STRING_BYTES)
     {
         return true;
     }
@@ -1264,7 +1272,7 @@ pub fn describe_groups(
     max_frame_size: usize,
     now: Instant,
 ) -> DescribeGroupsView {
-    let group_ids = super::distinct_group_ids(group_ids);
+    let group_ids = dedup_first_seen(group_ids);
     for group_id in &group_ids {
         tick_group(groups, group_id, now);
     }
@@ -1347,31 +1355,6 @@ fn kafka_response_header_len(api_key: i16, version: i16) -> usize {
         5
     } else {
         4
-    }
-}
-
-const fn unsigned_varint_len(value: u32) -> usize {
-    match value {
-        0x00..=0x7f => 1,
-        0x80..=0x3fff => 2,
-        0x4000..=0x001f_ffff => 3,
-        0x0020_0000..=0x0fff_ffff => 4,
-        _ => 5,
-    }
-}
-
-/// Length prefix of a compact string, compact bytes field, or compact array: the unsigned
-/// varint of `len + 1`.
-fn kafka_compact_prefix(len: usize) -> usize {
-    let wire = u32::try_from(len.saturating_add(1)).unwrap_or(u32::MAX);
-    unsigned_varint_len(wire)
-}
-
-fn kafka_string_len(flexible: bool, bytes: usize) -> usize {
-    if flexible {
-        kafka_compact_prefix(bytes) + bytes
-    } else {
-        2 + bytes
     }
 }
 
@@ -1587,6 +1570,22 @@ mod tests {
             now,
         );
         assert_ne!(error_of_or_none(&at_cap), Some(ERROR_INVALID_REQUEST));
+    }
+
+    /// A single protocol name past `MAX_LEGACY_STRING_BYTES` fits easily under the aggregate
+    /// `max_member_blob_bytes` cap (64 KiB), so only `legacy_strings_too_long` catches it -
+    /// otherwise `DescribeGroups` v0-v4 would later fail to encode this name as `protocol_data`
+    /// (an i16-length legacy string) and close the connection for an already-stored group.
+    #[test]
+    fn given_an_overlong_protocol_name_when_joining_should_answer_invalid_request() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let long_name = "p".repeat(MAX_LEGACY_STRING_BYTES + 1);
+
+        let over_limit = join_step(&mut groups, &config, &request("", &[&long_name]), now);
+        assert_eq!(error_of(&over_limit), ERROR_INVALID_REQUEST);
+        assert!(groups.is_empty(), "a rejected join must not create a group");
     }
 
     fn request(member_id: &str, protocols: &[&str]) -> JoinRequest {

@@ -27,7 +27,7 @@
 
 mod state;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -501,11 +501,10 @@ impl GroupCoordinator {
         version: i16,
         max_frame_size: usize,
     ) -> DescribeGroupsView {
-        let group_ids = distinct_group_ids(group_ids);
         let mut groups = self.groups.lock().await;
         state::describe_groups(
             &mut groups,
-            &group_ids,
+            group_ids,
             version,
             max_frame_size,
             Instant::now(),
@@ -535,19 +534,6 @@ impl GroupCoordinator {
 enum Parked<T> {
     Done(T),
     Wait(StrBytes, Instant, watch::Receiver<u64>),
-}
-
-/// First-seen order, one entry per id. `DescribeGroups` answers a repeated id once: a second
-/// snapshot of the same members would multiply the encoded response by the repeat count.
-pub(crate) fn distinct_group_ids(group_ids: &[StrBytes]) -> Vec<StrBytes> {
-    let mut seen = HashSet::with_capacity(group_ids.len());
-    let mut distinct = Vec::with_capacity(group_ids.len());
-    for group_id in group_ids {
-        if seen.insert(group_id.clone()) {
-            distinct.push(group_id.clone());
-        }
-    }
-    distinct
 }
 
 fn park_outcome<T>(

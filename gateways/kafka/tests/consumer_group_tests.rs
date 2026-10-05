@@ -1839,7 +1839,7 @@ async fn given_a_describe_response_at_the_frame_cap_when_one_byte_over_should_cl
 }
 
 #[tokio::test(start_paused = true)]
-async fn given_a_list_response_one_byte_past_the_frame_cap_when_listing_should_close() {
+async fn given_a_list_response_one_byte_past_the_frame_cap_when_listing_should_truncate() {
     let mut state = owned_state(immediate_config(), 8 * 1024 * 1024);
     let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
     join(&state, 3, &join_params("", protocols)).await;
@@ -1855,17 +1855,15 @@ async fn given_a_list_response_one_byte_past_the_frame_cap_when_listing_should_c
     .expect_response("ListGroups must answer");
     let frame = response_frame_len(API_KEY_LIST_GROUPS, version, &encoded);
 
+    // One byte under what the one listed group needs: truncated to zero groups rather than
+    // closing the connection, since this is server-sized state outgrowing a client-chosen
+    // frame size, not a malformed request.
     state.max_frame_size = frame - 1;
+    let truncated = list_groups(&state, version, &[], &[]).await;
     assert!(
-        handle_request_bounded(
-            &state,
-            API_KEY_LIST_GROUPS,
-            version,
-            build_list_groups_request(version, &[], &[]),
-        )
-        .await
-        .is_close(),
-        "ListGroups closes when the encoded frame would pass max_frame_size"
+        truncated.groups.is_empty(),
+        "ListGroups truncates rather than closing when the encoded frame would pass \
+         max_frame_size"
     );
 
     state.max_frame_size = frame;
@@ -2102,6 +2100,78 @@ async fn tcp_leave_scenario(leave_version: i16) {
     assert_eq!(alone.members.len(), 1, "v{leave_version}");
 }
 
+/// The `given_a_running_group_when_describing_and_listing_*` tests above all drive
+/// `handle_request_bounded` directly, bypassing real TCP dispatch and response headers. This
+/// creates a live group through a real `JoinGroup`/`SyncGroup` round trip over one socket, then
+/// issues real `DescribeGroups` and `ListGroups` requests on that same connection and decodes
+/// their actual wire responses - the real-wire harness this crate already uses for `JoinGroup`/
+/// `SyncGroup`/`LeaveGroup` above, now covering the admin-view APIs those tests never reached.
+#[tokio::test]
+async fn given_a_live_group_over_tcp_should_describe_and_list_it_through_the_real_listener() {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
+        group: immediate_config(),
+        ..GatewayConfig::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    // KIP-394: the first join with no member id only allocates one and answers
+    // MEMBER_ID_REQUIRED; the member must rejoin with that id to actually complete the join.
+    let member = tcp_join(&mut stream, &join_params("", protocols))
+        .await
+        .member_id;
+    let joined = tcp_join(&mut stream, &join_params(&member, protocols)).await;
+    assert_eq!(joined.generation_id, 1);
+    write_request(
+        &mut stream,
+        API_KEY_SYNC_GROUP,
+        SYNC_VERSION,
+        2,
+        &build_sync_group_request(
+            SYNC_VERSION,
+            &SyncGroupParams {
+                group_id: GROUP,
+                generation_id: 1,
+                member_id: &member,
+                assignments: &[(member.as_str(), b"partitions-0")],
+                ..SyncGroupParams::default()
+            },
+        ),
+    )
+    .await;
+    let synced = read_sync(&mut stream).await;
+    assert_eq!(synced.assignment.as_ref(), b"partitions-0");
+
+    write_request(
+        &mut stream,
+        API_KEY_DESCRIBE_GROUPS,
+        6,
+        3,
+        &build_describe_groups_request(6, &[GROUP], false),
+    )
+    .await;
+    let described = read_describe_groups(&mut stream, 6).await;
+    assert_eq!(described.groups.len(), 1);
+    assert_eq!(described.groups[0].group_id, GROUP);
+    assert_eq!(described.groups[0].state, "Stable");
+    assert_eq!(described.groups[0].members.len(), 1);
+
+    write_request(
+        &mut stream,
+        API_KEY_LIST_GROUPS,
+        5,
+        4,
+        &build_list_groups_request(5, &[], &[]),
+    )
+    .await;
+    let listed = read_list_groups(&mut stream, 5).await;
+    assert!(
+        listed.groups.iter().any(|group| group.group_id == GROUP),
+        "the real-TCP DescribeGroups/SyncGroup group must also be visible to ListGroups"
+    );
+}
+
 async fn write_request(
     stream: &mut TcpStream,
     api_key: i16,
@@ -2141,4 +2211,16 @@ async fn read_sync(stream: &mut TcpStream) -> SyncResponse {
     let payload = read_response_frame(stream, 8 * 1024 * 1024).await;
     let (_, body) = parse_response_payload(API_KEY_SYNC_GROUP, SYNC_VERSION, payload);
     SyncResponse::decode(SYNC_VERSION, body)
+}
+
+async fn read_describe_groups(stream: &mut TcpStream, version: i16) -> DescribeResponse {
+    let payload = read_response_frame(stream, 8 * 1024 * 1024).await;
+    let (_, body) = parse_response_payload(API_KEY_DESCRIBE_GROUPS, version, payload);
+    DescribeResponse::decode(version, body)
+}
+
+async fn read_list_groups(stream: &mut TcpStream, version: i16) -> ListResponse {
+    let payload = read_response_frame(stream, 8 * 1024 * 1024).await;
+    let (_, body) = parse_response_payload(API_KEY_LIST_GROUPS, version, payload);
+    ListResponse::decode(version, body)
 }

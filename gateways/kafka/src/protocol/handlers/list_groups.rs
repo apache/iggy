@@ -39,6 +39,7 @@ use crate::protocol::handlers::{
     decode_guarded, encode_message, respond_or_close, unsupported_version_response,
 };
 use crate::protocol::header::response_header_version;
+use crate::protocol::wire_len::{kafka_compact_prefix, kafka_string_len};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_GROUPS,
@@ -80,16 +81,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         })
         .collect();
     // `protocol_type` is echoed for every group. The shape guard never sees that list, so a
-    // coordinator holding many long types can still outgrow the frame. Price it before encode.
-    let encoded_bytes = list_response_frame_len(api_version, &listings);
-    if encoded_bytes > state.max_frame_size {
-        tracing::warn!(
-            encoded_bytes,
-            max_frame_size = state.max_frame_size,
-            "ListGroups response would exceed max_frame_size; closing connection"
-        );
-        return HandleOutcome::Close;
-    }
+    // coordinator holding many long types can still outgrow the frame - truncate rather than
+    // close, since this is server-sized state, not a request the client chose (same approach as
+    // `metadata::truncate_all_topics_to_frame_budget` for the identical problem).
+    let listings = truncate_listings_to_frame_budget(api_version, listings, state.max_frame_size);
     let groups = listings.into_iter().map(listed_group).collect();
     respond_or_close(encode_response(api_version, groups), "ListGroups")
 }
@@ -99,6 +94,38 @@ fn selected(filter: &[StrBytes], value: &str) -> bool {
         || filter
             .iter()
             .any(|wanted| wanted.as_str().trim().eq_ignore_ascii_case(value))
+}
+
+/// Keeps as many listed groups as fit `max_frame_size`, dropping the rest rather than closing
+/// the connection - same approach as `metadata::truncate_all_topics_to_frame_budget` for the
+/// identical problem: this coordinator's own state, not a request the client chose, is what
+/// grew the response past the budget.
+fn truncate_listings_to_frame_budget(
+    version: i16,
+    mut listings: Vec<GroupListing>,
+    max_frame_size: usize,
+) -> Vec<GroupListing> {
+    let mut cumulative_bytes = list_response_frame_len(version, &[]);
+    let mut keep = listings.len();
+    for (index, group) in listings.iter().enumerate() {
+        let next = cumulative_bytes + listed_group_len(version, group);
+        if next > max_frame_size {
+            keep = index;
+            break;
+        }
+        cumulative_bytes = next;
+    }
+    if keep < listings.len() {
+        tracing::warn!(
+            total_groups = listings.len(),
+            kept_groups = keep,
+            max_frame_size,
+            "ListGroups response would exceed max_frame_size; truncating rather than closing \
+             the connection"
+        );
+        listings.truncate(keep);
+    }
+    listings
 }
 
 /// Header plus body, the length `send_response` writes and `read_frame` compares to
@@ -142,25 +169,6 @@ fn listed_group_len(version: i16, group: &GroupListing) -> usize {
         total += 1;
     }
     total
-}
-
-fn kafka_compact_prefix(len: usize) -> usize {
-    let wire = u32::try_from(len.saturating_add(1)).unwrap_or(u32::MAX);
-    match wire {
-        0x00..=0x7f => 1,
-        0x80..=0x3fff => 2,
-        0x4000..=0x001f_ffff => 3,
-        0x0020_0000..=0x0fff_ffff => 4,
-        _ => 5,
-    }
-}
-
-fn kafka_string_len(flexible: bool, bytes: usize) -> usize {
-    if flexible {
-        kafka_compact_prefix(bytes) + bytes
-    } else {
-        2 + bytes
-    }
 }
 
 fn listed_group(group: GroupListing) -> ListedGroup {

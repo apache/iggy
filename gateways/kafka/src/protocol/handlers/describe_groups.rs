@@ -31,12 +31,13 @@ use kafka_protocol::messages::{DescribeGroupsRequest, DescribeGroupsResponse, Gr
 use kafka_protocol::protocol::StrBytes;
 
 use crate::error::Result;
-use crate::group::{DescribeGroupsView, GroupDescription, MemberDescription, distinct_group_ids};
+use crate::group::{DescribeGroupsView, GroupDescription, MemberDescription};
 use crate::protocol::api::{
-    API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ERROR_GROUP_ID_NOT_FOUND, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, is_supported_version,
+    API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ERROR_GROUP_ID_NOT_FOUND, GatewayState,
+    HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_describe_groups_shape;
+use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::handlers::{
     decode_guarded, encode_message, respond_or_close, unsupported_version_response,
 };
@@ -55,8 +56,12 @@ const FIRST_ERROR_MESSAGE_VERSION: i16 = 6;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     if !is_supported_version(API_KEY_DESCRIBE_GROUPS, api_version) {
+        // No top-level error field to carry a code on, so this answers with an empty group
+        // list rather than a dedicated error response. Versions outside 0-6 fail in the
+        // encoder, which is what makes `unsupported_version_response` close the connection
+        // instead - a version this encoder accepts is not a version the firewall rejects.
         return unsupported_version_response(API_KEY_DESCRIBE_GROUPS, api_version, |version| {
-            encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
+            encode_response(version, Vec::new())
         });
     }
     let request =
@@ -80,7 +85,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         .collect();
     // One result per distinct id. Repeating one group would otherwise copy its members into the
     // response once per copy, and the shape guard only charges the id strings.
-    let group_ids = distinct_group_ids(&requested);
+    let group_ids = dedup_first_seen(&requested);
     match state
         .groups
         .describe_groups(&group_ids, api_version, state.max_frame_size)
@@ -147,14 +152,4 @@ fn missing_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
 pub fn encode_response(version: i16, groups: Vec<DescribedGroup>) -> Result<Bytes> {
     let response = DescribeGroupsResponse::default().with_groups(groups);
     encode_message(&response, version, 64)
-}
-
-/// # Errors
-///
-/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
-pub fn encode_error_response(version: i16, _error_code: i16) -> Result<Bytes> {
-    // No top-level error field. Versions outside 0-6 fail in the encoder, which is what makes
-    // `unsupported_version_response` close the connection. A version this encoder accepts is
-    // not a version the firewall rejects.
-    encode_response(version, Vec::new())
 }

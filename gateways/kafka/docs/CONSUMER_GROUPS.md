@@ -31,6 +31,10 @@ no members is removed. `Dead` is only the describe answer for an id that is not 
 none, so a quiet group stays listed until something else touches it. `DescribeGroups` does tick
 each named group, so it reports the membership a heartbeat would see.
 
+A group id repeated in one `DescribeGroups` request is answered once, not once per repeat: a
+second snapshot of the same members would otherwise multiply the encoded response by the repeat
+count.
+
 Member `client_id` and `client_host` are empty. The coordinator does not keep the request
 header's client id or the connection's peer address. `include_authorized_operations` is answered
 with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
