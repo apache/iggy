@@ -95,8 +95,20 @@ clients deploy together; mixed versions and rolling upgrades are unsupported.
 Peers verify protocol, release and storage-format identity before admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
-Protocol 0.11.1 is the coordinated release boundary. Intermediate development
-builds advertising that version are not a compatibility guarantee.
+
+This checkout uses development protocol 0.11.1. Finalize its version and minimum
+before the next stable release. Released `server-0.9.0` uses protocol 0.11.0 and
+accepts every 0.11.x patch. An incompatible release therefore needs a new minor
+protocol version, such as 0.12.0, for that released server to reject new clients
+before decoding their login.
+
+The protocol number is independent of server and SDK package versions. Its
+current and minimum values are maintained manually for stable releases. The
+client login gate checks the full inclusive range, including patch versions.
+Both bounds stay equal unless compatibility with older released protocols is
+explicitly supported. Edge builds require matching clients and servers, even
+when their protocol numbers match.
+
 An unsupported data directory is refused before WAL scanning or file changes.
 Replacing the binary does not migrate old data. Restore or migrate retained data
 only through a separately verified procedure; copying a format marker is not

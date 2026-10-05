@@ -17,8 +17,9 @@
 
 //! Binary protocol versioning.
 //!
-//! The wire version is an explicit packed semver, independent of crate
-//! releases. It is exchanged during the login/register
+//! The wire version is an explicit packed semver, maintained manually for
+//! stable Iggy releases and independent of server and SDK package versions.
+//! It is exchanged during the login/register
 //! handshake: clients send [`ClientVersionInfo`] as the body prefix of both
 //! login-register request shapes, the server gates on
 //! [`is_protocol_compatible`] before touching credentials and advertises
@@ -44,9 +45,8 @@
 //! value = major << 20 | minor << 10 | patch
 //! ```
 //!
-//! Integer order equals semver order. Under 0.x a minor bump may break
-//! the wire, so the gate is minor-scoped. Compatibility across minor versions
-//! after 1.0.0 requires changing the minimum-version calculation below.
+//! Integer order equals semver order. Every component participates in the
+//! compatibility check; a patch increment does not imply wire compatibility.
 //!
 //! ## `ClientVersionInfo` body prefix
 //!
@@ -67,11 +67,15 @@
 //!
 //! ## Login gate
 //!
-//! The server accepts a client when its packed version is
-//! `>= IGGY_PROTOCOL_VERSION_MIN` and its `major.minor` is `<=` the
-//! server's. The explicit minimum excludes older wire layouts, including
-//! patches that predate a required field. The upper bound ignores patch;
-//! newer patches of the same minor must preserve this layout.
+//! The server accepts a client when its packed version is in the inclusive
+//! range `IGGY_PROTOCOL_VERSION_MIN..=IGGY_PROTOCOL_VERSION`, including patch.
+//! Set both bounds manually for each stable release. Keep them equal unless
+//! every released protocol in a wider range is deliberately supported.
+//!
+//! Compatibility is defined between stable releases. Intermediate development
+//! and edge builds may share a protocol number while their layouts change;
+//! they require matching client and server builds. Such changes do not require
+//! a protocol bump for each commit.
 //!
 //! ## Rejection frame
 //!
@@ -95,24 +99,19 @@ const COMPONENT_BITS: u32 = 10;
 const COMPONENT_MAX: u32 = (1 << COMPONENT_BITS) - 1;
 const PATCH_MASK: u32 = COMPONENT_MAX;
 
-/// Current binary protocol version, independent of the crate's release version.
+/// Current development protocol version, independent of package versions.
 ///
 /// Version 0.11.1 requires the session-binding secret in login requests.
-/// Intermediate development builds with this version may use incompatible layouts;
-/// coordinated deployment requires matching clients and server binaries.
+/// Finalize this number and the minimum during stable release preparation.
+/// Released servers using protocol 0.11.0 accept every 0.11.x patch, so an
+/// incompatible release needs a new minor version for those servers to reject it.
 pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 1);
 
 /// Oldest protocol version this build accepts at login.
 /// Version 0.11.0 has no session-binding secret and is incompatible.
 ///
-/// Under 0.x this makes a server minor bump a client flag-day: every
-/// prior-minor client is rejected at login until MIN is widened. A rolling
-/// upgrade across a minor bump must either widen MIN (when the wire stayed
-/// compatible) or accept that old clients fail re-login -- decide per release.
-// TODO(hubcio): past 1.0.0 follow strict semver: major bump = incompatible,
-// minor/patch = compatible, so MIN derives from the current major instead
-// of the current minor. Under 0.x a minor bump may break the wire, so the
-// minor-scoped window is correct.
+/// Keep this equal to the current protocol unless compatibility with older
+/// released protocols has been verified. Decide the range per stable release.
 pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 11, 1);
 const _: () =
     assert!(IGGY_PROTOCOL_VERSION_MIN > 0 && IGGY_PROTOCOL_VERSION_MIN <= IGGY_PROTOCOL_VERSION);
@@ -120,12 +119,10 @@ const _: () =
 /// Range check used by the server-side login gate.
 ///
 /// Packed component order preserves semver ordering, so plain integer
-/// comparisons work. The upper bound ignores patch: newer patches of an
-/// accepted minor must preserve its wire layout.
+/// comparisons enforce both inclusive bounds, including patch versions.
 #[must_use]
 pub const fn is_protocol_compatible(client: u32) -> bool {
-    client >= IGGY_PROTOCOL_VERSION_MIN
-        && (client >> COMPONENT_BITS) <= (IGGY_PROTOCOL_VERSION >> COMPONENT_BITS)
+    client >= IGGY_PROTOCOL_VERSION_MIN && client <= IGGY_PROTOCOL_VERSION
 }
 
 /// Pack semver components: `major << 20 | minor << 10 | patch`.
@@ -261,7 +258,7 @@ mod tests {
     fn login_without_binding_secret_is_outside_the_compatible_window() {
         assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 0)));
         assert!(is_protocol_compatible(pack_protocol_version(0, 11, 1)));
-        assert!(is_protocol_compatible(pack_protocol_version(0, 11, 1023)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 1023)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 0)));
     }
 
@@ -280,15 +277,12 @@ mod tests {
     fn compatibility_range_boundaries() {
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN));
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION));
-        // Newer patches of the current minor preserve the wire layout.
-        assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION | PATCH_MASK));
-        // Next minor is outside the window.
-        assert!(!is_protocol_compatible(
-            ((IGGY_PROTOCOL_VERSION >> COMPONENT_BITS) + 1) << COMPONENT_BITS
-        ));
-        if IGGY_PROTOCOL_VERSION_MIN > 0 {
-            assert!(!is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN - 1));
-        }
+        assert!(
+            !is_protocol_compatible(IGGY_PROTOCOL_VERSION + 1),
+            "a newer patch must not pass the current release's protocol gate"
+        );
+        assert!(!is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN - 1));
+        assert!(!is_protocol_compatible(u32::MAX));
     }
 
     #[test]

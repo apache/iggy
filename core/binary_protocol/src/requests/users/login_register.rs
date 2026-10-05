@@ -85,9 +85,10 @@ impl ExposeSecret<[u8; BIND_SECRET_BYTES]> for BindSecret {
 /// by non-`vsr` builds against the legacy `iggy-server`) is untouched.
 /// The server speaks VSR framing only; a non-`vsr` SDK cannot log in to
 /// the server. Foreign-language SDKs (C++, C#, Python, Go, Java) adopt this
-/// shape, with their own `sdk_name`, when they wire VSR framing. Bump
-/// [`crate::version::IGGY_PROTOCOL_VERSION`] on any wire-incompatible
-/// change.
+/// shape, with their own `sdk_name`, when they wire VSR framing. Maintain
+/// [`crate::version::IGGY_PROTOCOL_VERSION`] and its minimum for stable
+/// releases according to [`crate::version`]. Intermediate edge builds may
+/// share a protocol number without compatible layouts.
 #[derive(Debug, Clone)]
 pub struct LoginRegisterRequest {
     pub version_info: ClientVersionInfo,

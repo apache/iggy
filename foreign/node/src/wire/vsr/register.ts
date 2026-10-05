@@ -30,8 +30,9 @@ export const SESSION_IDENTITY_BYTES = 32;
 
 /**
  * Packed protocol semver of the wire contract this port implements,
- * `pack(0, 11, 1)` per `core/binary_protocol/src/version.rs`. Bump together
- * with the Rust `IGGY_PROTOCOL_VERSION` on any wire-incompatible change.
+ * `pack(0, 11, 1)` per `core/binary_protocol/src/version.rs`. Update with the
+ * Rust constant during stable release preparation. Edge builds sharing this
+ * number are not guaranteed to have compatible layouts.
  */
 export const IGGY_PROTOCOL_VERSION = (0 << 20) | (11 << 10) | 1;
 

@@ -69,6 +69,28 @@ async fn given_incompatible_protocol_version_when_logging_in_should_receive_evic
 }
 
 #[iggy_harness]
+async fn given_out_of_range_version_with_no_credentials_when_logging_in_should_receive_incompatible_protocol(
+    harness: &TestHarness,
+) {
+    for protocol_version in [IGGY_PROTOCOL_VERSION_MIN - 1, IGGY_PROTOCOL_VERSION + 1] {
+        let body = ClientVersionInfo {
+            protocol_version,
+            sdk_name: WireName::new("rust-sdk").unwrap(),
+            sdk_version: WireName::new("0.0.1").unwrap(),
+        }
+        .to_bytes();
+
+        assert_login_evicted(
+            harness,
+            &body,
+            EVICTION_REASON_INCOMPATIBLE_PROTOCOL,
+            (IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN),
+        )
+        .await;
+    }
+}
+
+#[iggy_harness]
 async fn given_no_version_prefix_when_logging_in_should_receive_eviction(harness: &TestHarness) {
     // Empty body cannot hold a ClientVersionInfo prefix; the gate rejects it
     // as malformed, window bytes zero.

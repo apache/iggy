@@ -25,8 +25,9 @@ import (
 )
 
 // ProtocolVersion is the packed semver of the wire contract this codec
-// implements, 0.11.1 per core/binary_protocol/src/version.rs. Bump it together
-// with the Rust constant on any wire-incompatible change.
+// implements, 0.11.1 per core/binary_protocol/src/version.rs. Update it with
+// the Rust constant during stable release preparation. Edge builds sharing
+// this number are not guaranteed to have compatible layouts.
 var ProtocolVersion = packProtocolVersion(0, 11, 1)
 
 // packProtocolVersion packs a semver into the ten-bits-per-field layout the

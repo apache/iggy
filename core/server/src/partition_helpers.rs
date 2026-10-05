@@ -1343,12 +1343,12 @@ mod tests {
 
     #[compio::test]
     async fn given_uninitialized_singleton_when_booting_should_finish_initialization() {
-        assert_uninitialized_partition_recovers(1).await;
+        Box::pin(assert_uninitialized_partition_recovers(1)).await;
     }
 
     #[compio::test]
     async fn given_uninitialized_replica_when_booting_should_finish_initialization() {
-        assert_uninitialized_partition_recovers(REPLICAS).await;
+        Box::pin(assert_uninitialized_partition_recovers(REPLICAS)).await;
     }
 
     async fn assert_uninitialized_partition_recovers(replica_count: u8) {

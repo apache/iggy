@@ -20,11 +20,13 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use consensus::{Consensus, MetadataHandle};
+use futures::future::{Either, select};
 use iggy_binary_protocol::requests::system::{
     MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest, SessionIdentity,
 };
@@ -291,26 +293,30 @@ async fn retire_sessions<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Already-batched partition barriers can cover several identities. Drain
-    // their metadata finalizations within the same heartbeat budget.
-    let _ = shard::bus_timeout(&shard.bus, CONSUMER_SESSION_REPORT_TIMEOUT, async {
-        for _ in 0..MAX_LOGOUTS_PER_PASS {
-            let before = shard.plane.metadata().client_table.borrow().count();
-            retire_session(
-                shard,
-                liveness,
-                stop,
-                shutdown,
-                report_interval,
-                system_path,
-            )
-            .await;
-            if shard.plane.metadata().client_table.borrow().count() >= before {
+    let mut deadline = pin!(shard.bus.sleep(CONSUMER_SESSION_REPORT_TIMEOUT));
+    for _ in 0..MAX_LOGOUTS_PER_PASS {
+        let before = shard.plane.metadata().client_table.borrow().count();
+        let retirement = pin!(retire_session(
+            shard,
+            liveness,
+            stop,
+            shutdown,
+            report_interval,
+            system_path,
+        ));
+        match select(retirement, deadline.as_mut()).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), retirement)) => {
+                // Finalization can own an admitted WAL append. Canceling it
+                // strands that op and blocks subsequent metadata requests.
+                retirement.await;
                 break;
             }
         }
-    })
-    .await;
+        if shard.plane.metadata().client_table.borrow().count() >= before {
+            break;
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1534,6 +1540,79 @@ mod tests {
         assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
         tracker.receive(CLUSTER, Some(VIEW), &report(2), Instant::now(), TIMEOUT);
         assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
+    }
+
+    #[compio::test]
+    async fn given_retirement_budget_expires_during_finalization_when_logging_in_should_make_progress()
+     {
+        const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
+        let (_directory, shard) = shard_with_members(2).await;
+        let metadata = shard.plane.metadata();
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_capacity(3)
+            .unwrap();
+        for client_id in [CLIENT, CLIENT + 1] {
+            assert!(
+                metadata
+                    .client_table
+                    .borrow_mut()
+                    .end_session(client_id, 0, SESSION, SESSION)
+            );
+        }
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .find(|identity| identity.client_id == CLIENT)
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let revision = metadata
+            .mux_stm
+            .streams()
+            .read(|inner| inner.namespace_revision);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(consensus.view()));
+            tracker.reconcile_retirement(Some(identity), revision);
+            let progress = tracker.retirement.as_mut().unwrap();
+            progress.reported = true;
+            progress.reporters.insert(consensus.replica());
+        }
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        // Expire at the finalization's first I/O yield, after it claims an op.
+        shard.bus.instant_timers.set(true);
+        retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, "").await;
+        shard.bus.instant_timers.set(false);
+
+        metadata.resume_stranded_commits().await;
+        let login = compio::time::timeout(
+            LOGIN_TIMEOUT,
+            metadata.submit_register_in_process(CLIENT + 2, 0, [0x6b; 32]),
+        )
+        .await
+        .expect("a retirement deadline must not strand a prepare ahead of the next login")
+        .expect("finalization must release capacity for the new login");
+        assert_eq!(login.epoch, SESSION + 2);
+        assert_eq!(metadata.client_table.borrow().count(), 2);
+        assert!(metadata.client_table.borrow().get_epoch(CLIENT).is_none());
+        assert_eq!(
+            metadata
+                .client_table
+                .borrow()
+                .ended_sessions()
+                .next()
+                .map(|identity| identity.client_id),
+            Some(CLIENT + 1),
+            "the expired sweep must defer the next session's finalization"
+        );
+        assert_eq!(
+            consensus.commit_min(),
+            consensus.sequencer().current_sequence()
+        );
     }
 
     #[compio::test]
