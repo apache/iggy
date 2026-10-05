@@ -175,6 +175,11 @@ impl ServerHandle {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
     }
 
+    /// The stderr log when it holds a panic that can leave a dead task behind.
+    pub fn stderr_panic_report(&self) -> Option<String> {
+        super::common::stderr_panic_report(&self.stderr_path)
+    }
+
     /// True once this node has logged that its replica mesh is fully formed
     /// (connected to all expected peers). Cluster-only; a single-node server
     /// never emits the marker. Used by the cluster-readiness gate to ensure

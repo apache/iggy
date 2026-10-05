@@ -84,7 +84,7 @@ pub fn server_process_env_vars() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
-    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_", "IGGY_TEST_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
