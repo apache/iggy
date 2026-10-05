@@ -62,6 +62,15 @@ name: PR Triage Apply
 #   have no comment to react to and stay log-only.
 #
 # Lifecycle (pull_request_target):
+#   opened (draft or not)  -> comment and close the PR if its description
+#                             has no `Closes #N`, `Fixes #N`, `Resolves #N`
+#                             or `Relates to #N` line naming an issue, or if
+#                             a linked `good first issue` is not assigned to
+#                             its author; bots, authors with write access and
+#                             authors with 3+ merged PRs here are exempt, and
+#                             nothing below runs for a closed PR. A good
+#                             first issue PR that passes gets a note for
+#                             maintainers if its author has other PRs open
 #   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present);
 #                             unless the author has repo write access, post
 #                             a one-time welcome comment listing the triage
@@ -383,6 +392,50 @@ jobs:
               'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#pr-triage-commands) for details.',
             ].join('\n');
 
+            // Posted when a PR is closed on open for having no issue line,
+            // or for linking a good first issue not assigned to its author.
+            const ISSUE_CHECK_MARKER = '<!-- iggy-pr-triage-issue-check -->';
+            const GOOD_FIRST_ISSUE = 'good first issue';
+            // Authors with this many merged PRs here skip the issue check.
+            const REGULAR_CONTRIBUTOR_MERGED_PRS = 3;
+            const ISSUE_FIRST_LINK =
+              'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#issue-first).';
+            const missingIssueBody = [
+              ISSUE_CHECK_MARKER,
+              'This PR is closed because its description has no `Closes #N`, ' +
+                '`Fixes #N`, `Resolves #N` or `Relates to #N` line naming an issue.',
+              '',
+              'Every PR needs an issue that was assigned to you before work started. ' +
+                ISSUE_FIRST_LINK,
+            ].join('\n');
+            const unassignedBody = (issues) => [
+              ISSUE_CHECK_MARKER,
+              `This PR is closed because ${issues.map(n => `#${n}`).join(', ')} ` +
+                `${issues.length === 1 ? 'is' : 'are'} not assigned to you.`,
+              '',
+              'Good first issues are assigned before work starts. Comment on an issue, ' +
+                'wait for a maintainer to assign it to you, and then open a PR. ' +
+                ISSUE_FIRST_LINK,
+            ].join('\n');
+            // A note for maintainers, not a close: whether a second open PR
+            // is acceptable is their call.
+            const OTHER_PRS_MARKER = '<!-- iggy-pr-triage-other-open-prs -->';
+            const otherOpenPrsBody = (author, prs) => [
+              OTHER_PRS_MARKER,
+              `Note for maintainers: @${author} also has ${prs.map(n => `#${n}`).join(', ')} open. ` +
+                'New contributors are asked to keep one open PR at a time. ' +
+                'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).',
+            ].join('\n');
+            // A line starting with the keyword, so prose and the template's
+            // own examples inside its HTML comments do not count. The issue
+            // may be `#N`, a mistyped `##N`, this repo's issue URL, or either
+            // inside a Markdown link.
+            const ISSUE_URL = `https://github.com/${context.repo.owner}/${context.repo.repo}/issues/`
+              .replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+            const ISSUE_LINE_RE = new RegExp(
+              `^[ \\t]*(?:closes|fixes|resolves|relates[ \\t]+to):?[ \\t]+\\[?(?:#+|${ISSUE_URL})(\\d+)\\b`,
+              'gim');
+
             // Retry transient GitHub API failures so a single 502 cannot
             // abort a command. Transient = 5xx, 429, or a network error
             // with no HTTP status. Anything else (404, 403, 422) is not
@@ -607,6 +660,139 @@ jobs:
               }
             };
 
+            // When a new contributor opens a good first issue PR while other
+            // PRs of theirs are open, note it for maintainers. Best-effort,
+            // like the welcome: a failure only loses the note.
+            const noteOtherOpenPrs = async (author) => {
+              try {
+                const { data } = await withRetry(() =>
+                  github.rest.search.issuesAndPullRequests({
+                    q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:open author:${author}`,
+                    per_page: 20,
+                  }), `search open PRs ${author}`);
+                const others = data.items.map(i => i.number).filter(n => n !== prNumber);
+                if (others.length === 0) {
+                  return;
+                }
+                const existing = await withRetry(() => github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    per_page: 100,
+                  },
+                ), 'listComments');
+                if (existing.some(c => c.body && c.body.includes(OTHER_PRS_MARKER))) {
+                  return;
+                }
+                await withRetry(() => github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: otherOpenPrsBody(author, others),
+                }), 'other open PRs createComment');
+                core.info(`other open PRs: noted ${others.join(', ')}`);
+              } catch (e) {
+                core.warning(`other open PRs note failed: ${e.message}`);
+              }
+            };
+
+            // Close a just-opened PR whose description has no Closes, Fixes,
+            // Resolves or Relates to line naming an issue, or that links a good first
+            // issue not assigned to its author, after saying why. Returns
+            // true when the PR was closed. The issue numbers come from the
+            // description the PR was opened with, so the check does not
+            // depend on when GitHub indexes the links. Fails open: if a
+            // lookup or the comment fails the PR takes the normal path,
+            // because closing a valid PR with no explanation is worse than
+            // missing one.
+            const closeIfIssueCheckFails = async (author, prBody) => {
+              try {
+                // Regular contributors are trusted to link issues their own
+                // way, such as a heading or a PR split from another.
+                const { data: merged } = await withRetry(() =>
+                  github.rest.search.issuesAndPullRequests({
+                    q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${author}`,
+                    per_page: 1,
+                  }), `search merged PRs ${author}`);
+                if (merged.total_count >= REGULAR_CONTRIBUTOR_MERGED_PRS) {
+                  core.info(`issue check: skipped, ${author} has ${merged.total_count} merged PRs`);
+                  return false;
+                }
+                const text = (prBody || '').replace(/<!--[\s\S]*?-->/g, '');
+                const numbers = [...new Set(
+                  [...text.matchAll(ISSUE_LINE_RE)].map(m => Number(m[1])))];
+                const issues = [];
+                for (const number of numbers) {
+                  try {
+                    const { data } = await withRetry(() => github.rest.issues.get({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: number,
+                    }), `issues.get ${number}`);
+                    // The issues API also returns PRs; only issues count.
+                    if (!data.pull_request) {
+                      issues.push(data);
+                    }
+                  } catch (e) {
+                    if (e.status !== 404) {
+                      throw e;
+                    }
+                  }
+                }
+                const login = author.toLowerCase();
+                const unassigned = issues
+                  .filter(i => i.labels.some(l => (typeof l === 'string' ? l : l.name) === GOOD_FIRST_ISSUE))
+                  .filter(i => !(i.assignees || []).some(a => a.login.toLowerCase() === login))
+                  .map(i => i.number);
+                let body;
+                if (issues.length === 0) {
+                  body = missingIssueBody;
+                } else if (unassigned.length > 0) {
+                  body = unassignedBody(unassigned);
+                } else {
+                  const linksGoodFirstIssue = issues.some(i =>
+                    i.labels.some(l => (typeof l === 'string' ? l : l.name) === GOOD_FIRST_ISSUE));
+                  if (linksGoodFirstIssue) {
+                    await noteOtherOpenPrs(author);
+                  }
+                  return false;
+                }
+                // Marker scan so a manual re-run does not post twice.
+                const existing = await withRetry(() => github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    per_page: 100,
+                  },
+                ), 'listComments');
+                if (!existing.some(c => c.body && c.body.includes(ISSUE_CHECK_MARKER))) {
+                  await withRetry(() => github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    body,
+                  }), 'issue check createComment');
+                }
+                await withRetry(() => github.rest.pulls.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  state: 'closed',
+                }), 'issue check close');
+                core.info(issues.length === 0
+                  ? 'issue check: closed, no issue line'
+                  : `issue check: closed, ${author} not assigned to ${unassigned.join(', ')}`);
+                return true;
+              } catch (e) {
+                core.warning(`issue check failed: ${e.message}`);
+                return false;
+              }
+            };
+
             // ----- pull_request_target lifecycle -----
             if (eventName === 'pull_request_target') {
               const action = context.payload.action;
@@ -628,6 +814,19 @@ jobs:
               }
 
               if (action === 'opened' || action === 'ready_for_review') {
+                const author = pr.user && pr.user.login;
+                const authorIsBot = (pr.user && pr.user.type === 'Bot')
+                  || (author && /\[bot\]$/.test(author));
+                // A human author without write access, checked once on
+                // open for both the issue check and the welcome.
+                const isContributor = action === 'opened' && !!author
+                  && !authorIsBot && !(await hasWriteAccess(author));
+                // Runs on drafts too: opening a draft still claims the
+                // issue. ready_for_review is not checked, so the issue
+                // line and assignment are judged only as the PR opened.
+                if (isContributor && await closeIfIssueCheckFails(author, pr.body)) {
+                  return;
+                }
                 if (pr.draft) {
                   core.info('lifecycle: draft PR, no label');
                   return;
@@ -642,14 +841,11 @@ jobs:
                 // welcome targets human contributor onboarding and bots
                 // cannot drive triage commands anyway (gated by isBot).
                 if (action === 'opened') {
-                  const author = pr.user && pr.user.login;
-                  const authorIsBot = (pr.user && pr.user.type === 'Bot')
-                    || (author && /\[bot\]$/.test(author));
                   if (!author) {
                     core.info('welcome: skipped, PR has no author');
                   } else if (authorIsBot) {
                     core.info(`welcome: skipped, ${author} is a bot`);
-                  } else if (await hasWriteAccess(author)) {
+                  } else if (!isContributor) {
                     core.info(`welcome: skipped, ${author} has write access`);
                   } else {
                     await postWelcomeOnce();
