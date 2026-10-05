@@ -28,14 +28,15 @@ use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
     Consensus, DISCONNECT_LOGOUT_REQUEST_ID, EvictionContext, FatalReason, Pipeline, PipelineEntry,
-    Plane, PlaneIdentity, PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext,
-    RequestLogEvent, Sequencer, SessionEnd, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, apply_preflight_consensus_plane, build_eviction_message,
-    build_reply_message, build_reply_message_with, build_result_rejection_reply, emit_sim_event,
-    fatal, fence_old_prepare_by_commit, is_caught_up_primary,
-    panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
-    register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
-    send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
+    Plane, PlaneIdentity, PlaneKind, PreflightOutcome, PrepareRollback, Project,
+    RESERVED_CLIENT_ID, ReplicaLogContext, RequestLogEvent, Sequencer, SessionEnd, SimEventKind,
+    VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
+    build_eviction_message, build_reply_message, build_reply_message_with,
+    build_result_rejection_reply, emit_sim_event, fatal, fence_old_prepare_by_commit,
+    is_caught_up_primary, panic_if_hash_chain_would_break_in_same_view, peek_committable_head,
+    pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
+    request_preflight, send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
+    verify_prepare_integrity,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -2566,11 +2567,10 @@ where
     ///
     /// No client session exists, so this skips `request_preflight` (like
     /// the logout precedent) and uses the reserved internal `client` id
-    /// `0`: never registered, so the commit path's `get_epoch(0)` is
-    /// `None` and skips `commit_reply` (and its `assert!(client_id != 0)`),
-    /// while the preflight and register asserts never run. Delete is
-    /// idempotent, so the dropped dedup is harmless and a re-proposal on the
-    /// next tick is a no-op.
+    /// `0`: never registered, so `commit_reply` caches nothing for it
+    /// (`CommitReply::NoEntry`), while the preflight and register asserts
+    /// never run. Delete is idempotent, so the dropped dedup is harmless and
+    /// a re-proposal on the next tick is a no-op.
     ///
     /// # Errors
     /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
@@ -2620,7 +2620,7 @@ where
         // client-header validation in `prepare_request` / `Project::project`
         // (the in-process path `build_prepare_message` documents).
         let header = RoutedRequestHeader {
-            client: 0,
+            client: RESERVED_CLIENT_ID,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
@@ -3117,7 +3117,11 @@ where
             // the same socket. Sending both desyncs the SDK -- it reads
             // the first frame, fails to decode the typed body, and
             // leaves the second frame stuck in the socket buffer.
-            if !had_in_process_subscriber {
+            //
+            // A server-originated op has no socket either. Its entry loses the
+            // in-process sender after a view change or a boot re-pipeline, and
+            // a send to the reserved id only fails with a false error.
+            if !had_in_process_subscriber && prepare_header.client != RESERVED_CLIENT_ID {
                 wire_replies.push((event, reply));
             }
         }
@@ -4273,10 +4277,11 @@ fn resolve_acting_user_id(
         .map(Some)
 }
 
-/// Surface a non-`Cached` [`CommitReply`]. Both non-cached outcomes are
-/// expected under replica-local eviction, so they are diagnostics, never
-/// faults: the wire reply already shipped and only this entry's dedup is
-/// degraded.
+/// Surface a non-`Cached` [`CommitReply`]. The non-cached outcomes are
+/// expected under replica-local eviction, and `NoEntry` also marks a
+/// server-originated op whose client id never registers. So they are
+/// diagnostics, never faults: the reply path is unaffected and only this
+/// entry's dedup is degraded.
 fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
     match outcome {
         CommitReply::Cached => {}
@@ -4284,7 +4289,8 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
             target: "iggy.metadata.diag",
             client_id,
             op,
-            "commit_reply: client evicted while being prepared; reply shipped, cache skipped"
+            "commit_reply: no entry for the client (evicted while being prepared, or a \
+             server-originated op); reply shipped, cache skipped"
         ),
         CommitReply::SkippedRegression { stored, received } => warn!(
             target: "iggy.metadata.diag",
@@ -4930,6 +4936,102 @@ mod tests {
         fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
         fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    /// Bus that records the client id of every `send_to_client`.
+    #[derive(Debug, Default)]
+    struct ClientSendSpyBus {
+        client_sends: RefCell<Vec<u128>>,
+    }
+
+    #[allow(clippy::future_not_send)]
+    impl MessageBus for ClientSendSpyBus {
+        fn track_background(&self, _handle: JoinHandle<()>) {}
+        async fn send_to_client(
+            &self,
+            client_id: u128,
+            _data: impl Into<BusMessage>,
+        ) -> Result<(), SendError> {
+            self.client_sends.borrow_mut().push(client_id);
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    /// A view change or a boot re-pipeline rebuilds a pending expired-token
+    /// delete without its in-process sender. Committing it must not send a
+    /// reply to the reserved client id, which no connection owns.
+    #[compio::test]
+    async fn given_repipelined_server_originated_delete_when_committed_should_send_no_client_reply()
+    {
+        const USER: u32 = 7;
+        const TOKEN: &str = "expired";
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            ClientSendSpyBus::default(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            None,
+        );
+        let consensus = md.consensus.as_ref().unwrap();
+
+        let body = DeletePersonalAccessTokenRequest {
+            user_id: USER,
+            name: WireName::new(TOKEN).unwrap(),
+            only_if_expired: true,
+        }
+        .to_bytes();
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = build_prepare_message(
+            consensus,
+            &header,
+            Operation::DeletePersonalAccessToken,
+            &body,
+        );
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        md.on_ack(ack).await;
+
+        assert_eq!(consensus.commit_min(), 1, "the delete must commit");
+        assert!(
+            consensus.message_bus().client_sends.borrow().is_empty(),
+            "no connection owns the reserved client id, so nothing may be sent to it"
+        );
     }
 
     /// A replayed `CreatePersonalAccessToken` must be refused, not served from

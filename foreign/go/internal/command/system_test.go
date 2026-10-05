@@ -90,6 +90,7 @@ func TestEmptySystemCommandBodies(t *testing.T) {
 		{"GetClients", &GetClients{}},
 		{"GetClusterMetadata", &GetClusterMetadata{}},
 		{"GetStats", &GetStats{}},
+		{"GetMe", &GetMe{}},
 		{"Ping", &Ping{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

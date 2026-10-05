@@ -162,7 +162,7 @@ repos:
         name: skills (AI agent skill frontmatter + link check)
         entry: ./scripts/ci/skills.sh
         language: system
-        files: ^\.claude/skills/.*\.md$
+        always_run: true
         pass_filenames: false
 
       - id: taplo

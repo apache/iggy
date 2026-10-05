@@ -24,13 +24,16 @@ Iggy deduplicates on the partition plane, and did so before this gateway existed
 `(client_id, user_id, request)`. `client_id` is a `u128` the client generates, and `request` is a
 monotonic counter on the client's session. Each partition group holds a per-client watermark with
 a 128-bit `committed_window` under it. A request below the watermark with its bit clear is a
-reordered arrival still to execute. A request below the window reads as committed.
+reordered arrival still to execute. A request below the window is refused with `RequestTooOld`,
+because its outcome is unknown.
 `partition.dedup_clients_max` caps the distinct clients one partition tracks, at 4096 by default
 and 65536 at the ceiling.
 
 The shape is closer to Kafka's than it looks. A producer id with a per-partition sequence maps
-onto a session id with a request id. The window is also deeper than the five batches a Kafka
-producer keeps in flight.
+onto a session id with a request id. Under that mapping a request id is `base_sequence + 1` (see
+below), so it advances by each batch's record count and the window is 128 records deep, not 128
+batches. Four batches of 32 records fill it, one fewer than the five a Kafka producer keeps in
+flight.
 
 What breaks the mapping is the hop each side protects. Iggy's covers gateway to Iggy. Kafka's
 covers producer to gateway. A retrying producer sends a fresh Produce request, and the gateway
@@ -72,8 +75,10 @@ not deduplicated. That is still at-least-once, which the README states plainly.
 
 The alternative is a stable client id derived from the producer id. It deduplicates across a
 restart, and it is unsafe without also persisting the last request id per producer. Request ids
-restarting at 1 under a live watermark read as duplicates, so fresh writes are discarded. Silent
-loss is worse than duplicate delivery, so the fresh random id wins.
+restarting at 1 under a live watermark land below it. Inside the window, an id whose bit is set is
+absorbed as a duplicate and its fresh write is discarded, while an id whose bit is clear executes.
+An id below the window is refused with `RequestTooOld`. Silent loss is worse than duplicate
+delivery, so the fresh random id wins.
 
 ### Confirmed and not
 
@@ -83,9 +88,10 @@ thread on [#3545](https://github.com/apache/iggy/issues/3545) and in Discord.
 Two further readings are ours and are not confirmed yet. One session per producer is enough,
 rather than one per producer and partition, because the `ClientTable` is per partition group. The
 same request number on two partitions is two entries, so `request_id = base_sequence + 1` stays
-monotonic inside each. And the gateway has to preserve per-partition ordering per producer,
-because sequences advance by record count. A lower sequence arriving after a higher one lands
-below the watermark, outside the window, and reads as committed.
+monotonic inside each. And the gateway has to preserve per-partition ordering per producer, or
+records land out of order. A lower sequence arriving after a higher one lands below the watermark:
+inside the window, with its bit clear, it executes after its successor, and below the window it is
+refused with `RequestTooOld`.
 
 ## Options
 

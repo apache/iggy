@@ -1367,10 +1367,6 @@ class IggyClient:
         connection to close, but the heartbeat that `connect` started keeps
         sending pings until the client is dropped.
 
-        Known issue: `disconnect` then `connect` makes the client usable again
-        on TCP, QUIC and WebSocket, and WebSocket also accepts `connect` alone.
-        See https://github.com/apache/iggy/issues/4287.
-
         Raises:
             RuntimeError: If the client cannot be shut down.
         """

@@ -22,7 +22,8 @@ use std::time::Duration;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
+use tokio::time::{Instant, timeout_at};
 use tracing::info;
 
 use crate::bridge::config::IggyBridgeConfig;
@@ -34,6 +35,8 @@ mod offsets;
 mod produce;
 mod topics;
 
+use fetch::{FetchPool, LazyClient};
+pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
@@ -74,15 +77,46 @@ async fn with_request_timeout<T>(
         .map_err(BridgeError::Iggy)
 }
 
-/// Owns one connected `IggyClient` and resolves Kafka topics against it.
+/// How long a send may hold its slot: the SDK read deadline (30 s) plus a reconnect (15 s).
+const SLOT_LIMIT: Duration = Duration::from_secs(45);
+
+/// Runs `call` in a task that holds `slot` until `call` ends, then hands both back. `None` once
+/// `deadline` passes.
 ///
-/// One lockstep client serves every Kafka connection, so Iggy calls run one at a time. A pool is
-/// a TODO in `docs/SCOPE.md`.
+/// A call given up on keeps its slot until it ends, so the next call waits for the slot, not in
+/// the SDK queue. A `call` that stops itself sooner frees the slot while the SDK can still hold
+/// its connection, so it must leave that connection behind. See `LazyClient::until`.
+async fn in_slot<S: Send + 'static, T: Send + 'static>(
+    slot: S,
+    deadline: Instant,
+    call: impl Future<Output = T> + Send + 'static,
+) -> Option<(T, S)> {
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let done = call.await;
+        // The caller may have stopped waiting. The slot then goes back here.
+        let _ = sender.send((done, slot));
+    });
+    timeout_at(deadline, receiver).await.ok()?.ok()
+}
+
+/// Owns the connected `IggyClient`s and resolves Kafka topics against them.
+///
+/// One lockstep client serves Produce, Metadata and `CreateTopics` for every Kafka connection, so
+/// those Iggy calls run one at a time. Topic probes use a client of their own, and Fetch polls one
+/// per read slot. A Produce pool is a TODO in `docs/SCOPE.md`.
+///
+/// Each client signs in at the metadata leader, and a view change or a refused call can move it to
+/// another node. So in a cluster, two clients can read replicas that are not at the same offset.
 pub struct IggyBridge {
     client: Arc<IggyClient>,
     config: IggyBridgeConfig,
     /// One Produce send inside the SDK at a time. See `send_records`.
     send_slot: Arc<Semaphore>,
+    /// Fetch read slots, each with its own client. See `fetch_slot`.
+    fetch_pool: Arc<FetchPool>,
+    /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
+    probe_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -111,28 +145,15 @@ impl IggyBridge {
     /// to a wire response, never panic or unwrap, since an unreachable Iggy backend is an
     /// expected runtime condition, not a bug.
     pub async fn connect(config: IggyBridgeConfig) -> Result<Self, BridgeError> {
-        if config.address.trim().is_empty() {
-            return Err(BridgeError::InvalidConfig(
-                "Iggy address must not be empty".to_string(),
-            ));
-        }
-
-        let credentials =
-            Credentials::UsernamePassword(config.username.clone(), config.password.clone());
-        let client = IggyClientBuilder::new()
-            .with_tcp()
-            .with_server_address(config.address.clone())
-            .with_auto_sign_in(AutoLogin::Enabled(credentials))
-            .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
-            .build()
-            .map_err(BridgeError::Iggy)?;
-        with_request_timeout(client.connect()).await?;
+        let client = connect_client(&config).await?;
         info!("Iggy bridge connected to {}", config.address);
 
         Ok(Self {
             client: Arc::new(client),
             config,
             send_slot: Arc::new(Semaphore::new(1)),
+            fetch_pool: Arc::new(FetchPool::new()),
+            probe_client: LazyClient::default(),
         })
     }
 
@@ -173,8 +194,33 @@ impl IggyBridge {
     ///
     /// Returns [`BridgeError::Timeout`] if it takes longer than `REQUEST_TIMEOUT`. Returns
     /// [`BridgeError::Iggy`] if the underlying client reports a shutdown failure (e.g. the socket
-    /// was already in a state that rejects a clean shutdown).
+    /// was already in a state that rejects a clean shutdown). Every client is shut down even when
+    /// one fails, and the error is the first one.
     pub async fn close(self) -> Result<(), BridgeError> {
-        with_request_timeout(self.client.shutdown()).await
+        let fetch_clients = self.fetch_pool.close().await;
+        let probe_client = self.probe_client.close().await;
+        let shared_client = with_request_timeout(self.client.shutdown()).await;
+        fetch_clients.and(probe_client).and(shared_client)
     }
+}
+
+/// A client for `config`, connected and signed in. See [`IggyBridge::connect`].
+async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeError> {
+    if config.address.trim().is_empty() {
+        return Err(BridgeError::InvalidConfig(
+            "Iggy address must not be empty".to_string(),
+        ));
+    }
+
+    let credentials =
+        Credentials::UsernamePassword(config.username.clone(), config.password.clone());
+    let client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(config.address.clone())
+        .with_auto_sign_in(AutoLogin::Enabled(credentials))
+        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
+        .build()
+        .map_err(BridgeError::Iggy)?;
+    with_request_timeout(client.connect()).await?;
+    Ok(client)
 }

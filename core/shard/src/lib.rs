@@ -638,8 +638,9 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
     Ok(())
 }
 
-/// Starting point for [`IggyShard::next_forward_nonce`]: the low half
-/// of this boot's consensus incarnation.
+/// The low half of this boot's consensus incarnation: the starting point for
+/// [`IggyShard::next_forward_nonce`] and the boot field of every client id
+/// shard 0 mints ([`coordinator::ShardZeroCoordinator`]).
 ///
 /// Forward nonces are node-local and never persisted, so a counter that starts
 /// at zero every boot re-mints the exact sequence the previous boot used. A
@@ -648,10 +649,12 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
 /// incarnation is fresh per boot, which moves the whole sequence.
 ///
 /// Zero on shards owning no metadata consensus (they never forward) and
-/// wherever nothing set an incarnation, which degenerates to the unseeded
-/// sequence: no worse than before, and the shards that take it are test ones.
+/// wherever nothing set an incarnation. Production shard 0 always gets a
+/// nonzero nonce, since boot draws the incarnation at random with the low bit
+/// set. It must: the client ids shard 0 mints stay unique across boots only
+/// through this nonce.
 #[allow(clippy::cast_possible_truncation)]
-fn forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
+fn boot_nonce<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
     consensus.map_or(0, VsrConsensus::incarnation) as u64
 }
 
@@ -1462,7 +1465,7 @@ where
     /// Monotonic source of forwarding nonces. Node-local: the
     /// nonce only has to distinguish this node's own in-flight forwards, across
     /// its restarts as well as within one boot. Seeded by
-    /// [`forward_nonce_seed`].
+    /// [`boot_nonce`].
     forward_nonce: Cell<u64>,
 
     /// Channel senders to every shard, indexed by shard id.
@@ -1777,7 +1780,7 @@ where
             u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
-        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
+        let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let poll_completions =
@@ -2323,7 +2326,7 @@ where
         let (_tx, inbox) = channel(1);
         let (_reply_tx, reply_inbox) = channel(1);
         let metrics = crate::metrics::ShardMetrics::for_shard();
-        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
+        let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let host: Rc<dyn ShardHost> = Rc::new(NoopHost);
@@ -4359,19 +4362,19 @@ where
             .as_ref()
             .map(|state| (state.view, state.log_view));
         let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
-        let consensus::FreshGroupStart { join, seed_view } =
-            consensus::fresh_group_start(restarted, durable_view, created_view);
+        let consensus::FreshGroupStart {
+            join,
+            view_fallback,
+            seed_view,
+        } = consensus::fresh_group_start(restarted, durable_view, created_view);
 
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
-        if let Some((view, log_view)) = durable_view {
-            consensus.set_view(view);
-            consensus.set_log_view(log_view);
-            consensus.mark_superblock_durable(view, log_view);
-        } else if let Some(view) = seed_view {
-            consensus.set_view(view);
-            consensus.set_log_view(view);
-        }
+        consensus.restore_view(consensus::ViewRestore {
+            durable_view,
+            view_fallback,
+            seed_view,
+        });
         // A rebuilt replica cannot know the group's `(op, commit)`: the
         // partition journal is in-memory and segments carry no op numbers. So
         // in a cluster it joins quorum-invisible and asks the view's primary
@@ -4379,13 +4382,7 @@ where
         // `init` would set `Status::Normal` and arm the commit broadcast on
         // whichever replica is primary-by-index, the split-brain
         // `init_as_backup` exists to prevent.
-        match join {
-            consensus::JoinMode::ProbeAsBackup { .. } => {
-                consensus.init_as_backup();
-                consensus.begin_view_probe();
-            }
-            consensus::JoinMode::Init => consensus.init(),
-        }
+        consensus.join(join);
 
         let stats = Arc::new(PartitionStats::default());
         let mut partition = IggyPartition::with_in_memory_storage(
@@ -4660,8 +4657,9 @@ where
             };
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, suffix_body);
             // Every rejection path (wrong primary, old view, stale incarnation,
-            // below the commit floor, self-sent) returns no actions, and an
-            // adopted StartView always emits at least `CommitJournal`. That
+            // nothing above a Normal replica's head in its own view, below the
+            // commit point (commit_max), self-sent) returns no actions,
+            // and an adopted StartView always emits at least `CommitJournal`. That
             // makes emptiness the adoption signal -- and the arms below must
             // not fire on a StartView this replica did not adopt.
             let adopted = !actions.is_empty();
@@ -13583,11 +13581,14 @@ mod partition_ack_durability_tests {
         }
         sent.borrow_mut().clear();
         headers.reverse();
+        // A merge concludes a view change, so its StartView opens a newer view. View 3
+        // is led by replica 0 again; another view-0 StartView at the backup's head is
+        // a duplicate the backup ignores.
         dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(
             consensus,
             &partition,
             vec![VsrAction::SendStartView {
-                view: 0,
+                view: 3,
                 op: 2,
                 commit: 1,
                 incarnation: 0,

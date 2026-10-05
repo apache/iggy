@@ -150,7 +150,12 @@ impl BinaryTransport for WebSocketClient {
     }
 
     async fn set_state(&self, state: ClientState) {
-        *self.state.lock().await = state;
+        let mut current = self.state.lock().await;
+        // Shutdown is final: a later write, such as a disconnect or a lost
+        // connection, must not make the client usable again.
+        if *current != ClientState::Shutdown {
+            *current = state;
+        }
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
@@ -600,8 +605,13 @@ impl WebSocketClient {
         let settle_off_leader = context.settle_off_leader();
         let single_attempt = context.single_attempt();
         loop {
-            if self.get_state().await == ClientState::Connected {
-                return Ok(());
+            match self.get_state().await {
+                ClientState::Shutdown => {
+                    trace!("Cannot connect. Client is shutdown.");
+                    return Err(IggyError::ClientShutdown);
+                }
+                ClientState::Connected => return Ok(()),
+                _ => {}
             }
 
             let mut retry_count = 0;

@@ -54,6 +54,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -93,6 +94,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int CHANGE_PASSWORD_OPERATION = 144;
     private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int POLL_PARAMETERS_BYTES = 14;
+    private static final Duration TEST_POLL_TIMEOUT = Duration.ofSeconds(2);
+    // Longer than the retry interval, so a refusal is held before the poll deadline.
+    private static final Duration REFUSAL_HOLD_WINDOW = Duration.ofSeconds(1);
+    private static final Duration REFUSAL_HELD_AFTER = TEST_POLL_TIMEOUT.minus(REFUSAL_HOLD_WINDOW);
 
     @Test
     void shouldCancelAnAutoCommitWaitingForTopologyWithoutClosingCoordinator() throws Exception {
@@ -523,37 +528,59 @@ class AsyncIggyTcpClientTransientFailoverTest {
     @Test
     void shouldReturnNonAdmissionWhenEveryRoutingAttemptIsRefused() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
-        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
-                ServerSocket unusedPrimary = new ServerSocket(0, 4, loopback)) {
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
             AtomicInteger refusals = new AtomicInteger();
+            AtomicLong pollStartNanos = new AtomicLong();
+            CompletableFuture<Void> held = new CompletableFuture<>();
+            CompletableFuture<Void> release = new CompletableFuture<>();
             CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(
-                            OPERATION_NON_REPLICATED,
-                            clusterMetadata(
-                                    coordinatorSocket.getLocalPort(),
-                                    unusedPrimary.getLocalPort(),
-                                    coordinatorSocket.getLocalPort()));
-                }
                 if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
                     refusals.incrementAndGet();
+                    // The deadline has to find a refusal in flight. Instant refusals leave that
+                    // to the chance of where the deadline lands between two attempts.
+                    if (System.nanoTime() - pollStartNanos.get() > REFUSAL_HELD_AFTER.toNanos()) {
+                        awaitRelease(held, release);
+                    }
                     return Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED);
                 }
                 throw new IllegalStateException("Unexpected request: " + request);
             });
-            AsyncIggyTcpClient client = client(coordinatorSocket);
+            AsyncTcpConnection parent = connection(coordinatorSocket);
+            PollRouter router = new PollRouter(
+                    () -> parent,
+                    endpoint -> {
+                        throw new IllegalStateException("A refused route must not open a primary connection");
+                    },
+                    TEST_POLL_TIMEOUT);
+            MessagesTcpClient messages = new MessagesTcpClient(
+                    () -> parent, new ClientRoutingState(), router, () -> CompletableFuture.completedFuture(true));
             try {
-                client.connect().get(5, TimeUnit.SECONDS);
-                client.users().login("manual-user", "manual-password").get(5, TimeUnit.SECONDS);
-                assertThatThrownBy(() -> poll(client, Optional.of(0L), true).get(35, TimeUnit.SECONDS))
+                parent.connect().get(5, TimeUnit.SECONDS);
+                new UsersTcpClient(() -> parent)
+                        .login("manual-user", "manual-password")
+                        .get(5, TimeUnit.SECONDS);
+                // Read before poll() starts the deadline clock, so the hold begins before the deadline.
+                pollStartNanos.set(System.nanoTime());
+                assertThatThrownBy(() -> messages.pollMessages(
+                                        StreamId.of(1L),
+                                        TopicId.of(1L),
+                                        Optional.of(0L),
+                                        Consumer.group(7L),
+                                        PollingStrategy.next(),
+                                        1L,
+                                        true)
+                                .get(5, TimeUnit.SECONDS))
                         .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
                                 .isEqualTo(TRANSIENT_NOT_ACCEPTED));
                 assertThat(refusals).hasValueGreaterThan(1);
+                assertThat(held).isCompleted();
             } finally {
-                client.close().get(5, TimeUnit.SECONDS);
+                release.complete(null);
+                router.clearSession(parent).get(5, TimeUnit.SECONDS);
+                parent.close().get(5, TimeUnit.SECONDS);
             }
             coordinator.get(5, TimeUnit.SECONDS);
         }

@@ -297,9 +297,11 @@ for CreateTopics, and so on).
 | F5 | Oversized frame | Send 4-byte length > 8 MiB | Connection rejected/closed, no OOM |
 | F6 | Graceful shutdown | Ctrl+C on gateway | Log "shutdown requested", in-flight requests drain |
 
-### Category G — Real Kafka client (kcat)
+### Category G — Real Kafka client (kcat, Java console consumer)
 
-Requires `kcat` installed. Gateway does **not** implement SASL or full broker semantics — expect limited success.
+Requires `kcat` installed. SASL is off by default (`IGGY_KAFKA_SASL_ENABLED=false` - see Category S
+for the SASL-on flow) and the gateway does not implement full broker semantics — expect limited
+success. This category predates the bridge landing: G2/G3's "fails at metadata" framing assumes an unbridged gateway, and no longer holds with `IGGY_KAFKA_BRIDGE_ENABLED=true` against a topic that was actually created first. See Category I for the bridged, docker-compose flow.
 
 | ID | Test | Command | Expected (foundation) |
 | ---- | ------ | --------- | --------------------- |
@@ -325,6 +327,32 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | H5 | Transactional Produce | Send key 0 v3 with a non-null `transactional_id` and `acks=1` | `ec=35` per partition, **not** `ec=6`; connection stays open. With `acks=0`: no response, and the gateway closes the connection |
 | H6 | Transaction API keys | `send --host 127.0.0.1:9093 --api-key 24` (also 25, 26, 28) | Connection closes, no response bytes - they are never advertised |
 
+### Category I — Docker Compose quick start ([#3539](https://github.com/apache/iggy/issues/3539))
+
+Exercises the real compiled binaries the way an operator actually runs them - not `cargo run`
+against a locally-built binary, and not `KafkaGateway::run` in-process the way every automated
+suite except `tests/phase1_e2e_tests.rs` does.
+
+| ID | Test | Steps | Expected |
+| ---- | ------ | ------- | ---------- |
+| I1 | Stack comes up | `cd gateways/kafka && docker compose up --build` | Both containers start; gateway does not exit (it would if the bridge connect failed before the server's health check passed) |
+| I2 | Broker discovery | `kcat -b 127.0.0.1:9093 -L` | Broker listed, reachable |
+| I3 | Create + produce | Run the `kafka-python` snippet from README.md's Quick start | `create_topics` and `send(...).get()` both return without raising |
+| I4 | Read-back via Kafka Fetch | `kcat -b 127.0.0.1:9093 -C -t orders -o beginning -e` | The produced record's payload is printed - validates the actual Kafka Fetch path, not just Iggy's own side |
+| I5 | Volume persistence across a restart | `docker compose restart iggy-server`, wait for its health check to go healthy again, re-run I4's poll command | The same record is still readable after the container restarts against the same named volume |
+| I6 | Teardown | `docker compose down -v` | Both containers stop; volume removed |
+
+I5 is a graceful restart (`docker compose restart` sends SIGTERM, which flushes on the way down) -
+it checks that the named volume actually persists data across a container restart, not that a
+produced record survives an unclean crash. It has no automated equivalent yet.
+`tests/phase1_e2e_tests.rs` and every step above I5 only prove read-your-own-write on a live
+process (see README.md's Limitations, which also covers why this quick start's default topic
+durability is not crash-safe). Treat an I5 failure as a real regression, not a flake.
+
+Record wall-clock time from `git clone` to I3 passing - README.md's Quick start states a 15-minute
+target for a new contributor ([#3539](https://github.com/apache/iggy/issues/3539) acceptance
+criteria).
+
 ---
 
 ## 4. Validation reference
@@ -336,7 +364,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 | -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
 | 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection |
 | 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored) |
 | 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
@@ -414,8 +442,9 @@ kcat version (if used): ___________
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
 [ ] F1–F6  TCP / connection behavior
-[ ] G1–G8  Real clients (record errors for G2/G3)
+[ ] G1–G8  kcat / Java client (record errors for G2/G3)
 [ ] H1–H6  Adversarial input
+[ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist
