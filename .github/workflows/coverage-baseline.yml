@@ -591,37 +591,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Setup Bazel with cache
-        uses: ./.github/actions/utils/setup-cpp-with-cache
-
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Run C++ SDK tests with coverage
+        uses: ./.github/actions/cpp-bazel/pre-merge
         with:
-          save-cache: "false"
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.18
-        with:
-          tool: cargo-llvm-cov
-
-      # The e2e suite needs a live server; unit tests run standalone.
-      - name: Start Iggy server
-        id: iggy
-        uses: ./.github/actions/utils/server-start
-        with:
-          cargo-bin: iggy-server
-
-      - name: Run tests and generate coverage
-        run: |
-          cd foreign/cpp
-          ../../scripts/ci/cpp-coverage.sh
-
-      - name: Stop Iggy server
-        if: always()
-        uses: ./.github/actions/utils/server-stop
-        with:
-          pid-file: ${{ steps.iggy.outputs.pid_file }}
-          log-file: ${{ steps.iggy.outputs.log_file }}
+          task: test
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7.0.0

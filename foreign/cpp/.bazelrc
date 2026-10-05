@@ -44,7 +44,7 @@ common:ci --color=no
 common:ci --curses=no
 common:ci --announce_rc
 
-build:ci --config=debug
+build:ci --config=release
 build:ci --lockfile_mode=error
 
 test:ci --lockfile_mode=error

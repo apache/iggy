@@ -46,6 +46,7 @@ LLVM_BIN="$(rustc --print target-libdir)/../bin"
 LLVM_COV="$LLVM_BIN/llvm-cov"
 LLVM_PROFDATA="$LLVM_BIN/llvm-profdata"
 
+# --run_under overrides Bazel's profile path so Rust profiles do not replace GCC LCOV data.
 bazel coverage \
   --config=debug \
   --lockfile_mode=error \
