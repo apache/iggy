@@ -40,7 +40,9 @@ const SDK_SIDE_FAILURE: Duration = Duration::from_millis(500);
 /// A disconnect closes local resources only, so it must return well within
 /// this bound. On QUIC, a redial that lands inside the drain of the old
 /// connection blocks `disconnect()` in `endpoint.wait_idle()` for good, so the
-/// tests bound the call to fail instead of hang.
+/// tests bound the call to fail instead of hang. That redial depends on timing,
+/// and a connect already past the caller-intent check can still make it
+/// (problem 6 of #4287).
 const DISCONNECT_BOUND: Duration = Duration::from_secs(5);
 
 #[iggy_harness]
