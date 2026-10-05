@@ -1243,7 +1243,7 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
     }
 }
 
-/// What [`describe_groups`] decided under the coordinator lock.
+/// What `describe_groups` decided under the coordinator lock.
 ///
 /// `ExceedsFrame` means the encoded response, header included, would pass `max_frame_size`. No
 /// member snapshot was built: the lengths already stored on the group are enough to price it.
