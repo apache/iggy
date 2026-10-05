@@ -13,8 +13,9 @@
 Move sealed segment files from a partition's local directory to an object store (S3 and compatible
 stores first, GCS and Azure Blob behind the same abstraction) and serve them back through a local
 chunk cache, without changing what clients see. The partition primary uploads a segment once it
-seals, commits a per-partition `tiered_up_to_offset` watermark through the metadata plane, and
-every replica may then evict its local copy under a per-topic local retention policy. A tiered
+seals and commits a `tiered_up_to_offset` watermark to the partition's control log, a replicated
+log separate from the data log, where a small state machine applies it on every replica; each
+replica may then evict its local copy under a per-topic local retention policy. A tiered
 segment stays in the `SegmentedLog` with its metadata, its sparse index and a 128-byte `.remote`
 marker on local disk, so offset and timestamp resolution never touch the network. Total retention
 is evaluated on the primary over local and remote data together and replicated as the existing
@@ -39,9 +40,9 @@ The expected outcomes are:
 - Reads of tiered data served through a cache with one small object store request for a cold poll
   and none for a warm one.
 - A bucket layout that is self-describing enough to be the foundation for backups and restores.
-- The same worker, provider layer, key layout and cache reusable by any later storage mode.
+- The same tier service, provider layer, key layout and cache reusable by any later storage mode.
 
-This RFC targets the model Redpanda ships: a replicated local log stays the write path, the
+This RFC targets the following model: a replicated local log stays the write path, the
 acknowledgement never waits on object storage, and sealed segments are copied out afterwards. It
 does not propose a diskless architecture. Object-storage-first systems were surveyed for mechanics
 worth borrowing (see [Prior art](#prior-art)); the write path they use is rejected here because the
@@ -127,7 +128,7 @@ marker-only stem as a legitimate segment; a missing middle `.log` with no marker
 
 The read path resolves a `SegmentSource` per segment on the pump when it builds the poll plan. The
 off-pump walk reads local segments with `read_exact_at` as today, and remote segments through a
-chunk cache that a tier worker thread fills with ranged GETs. The walk crosses from a remote
+chunk cache that the shard's own tier tasks fill with ranged GETs. The walk crosses from a remote
 segment into a local one by continuing at byte zero of the next segment, whatever its source.
 
 All object store I/O lives in a new `core/tiered_storage` crate behind an `ObjectStore` trait, with
@@ -155,6 +156,17 @@ All verified on `master @ 285192450`.
   pass. Client-driven `DeleteSegments` already resolves a count to an offset and commits an internal
   `TruncatePartition` metadata op that raises `Partition.deleted_up_to_offset`; the reconciler
   enforces it per replica.
+- Segments contain only message batches. The partition's consensus log interleaves `SendMessages`
+  with control operations such as `StoreConsumerOffset`, but the flush path peeks each committed
+  entry's operation kind and writes only message batches to the `.log`; consumer offsets go to their
+  own files under `offsets/`, and the persisted-durability WAL keeps control-op bodies in its own
+  file. Message offsets are stamped on `SendMessages` batches independently of consensus op numbers,
+  so no control operation consumes a message offset and no offset translation exists or is needed.
+  There is no general state-machine facility on the partition plane yet; the metadata plane has one
+  (`StateHandler`, `collect_handlers!`, versioned snapshots) and already holds per-partition facts
+  such as `deleted_up_to_offset` and `purge_generation`. The partition journal is in memory with a
+  64 MiB evicted ring, so partition-plane state cannot be rebuilt by replaying the log after a
+  restart; consumer offsets persist their own files and ride state transfer as `ConsumerOffsetsWire`.
 - Disk polls are planned on the pump and executed as a detached compio task on the same thread,
   returning through a bounded completion lane under a 10 s `PARTITION_READ_TIMEOUT`. The walk reads
   chunks of 64 KiB to 1 MiB and continues into the next segment from byte zero.
@@ -233,11 +245,10 @@ concurrency scales with the upload backlog between one and `upload_concurrency`.
 local eviction is blocked because its floor lags is flagged as under local storage pressure and its
 uploads go to the head of the queue. A failed upload retries with backoff and blocks the floor.
 
-On success the shard submits `AdvanceTieredFloor { stream, topic, partition, up_to_offset }`, a new
-internal metadata operation (`Operation::AdvanceTieredFloor = 69`, next to `TruncatePartition = 68`).
-Its apply is monotonic and bumps `Streams::revision`. Submission from a non-zero shard to shard 0
-needs a `MetadataSubmit` variant; there is no client sequence to preserve, so the internal request
-id path is correct.
+On success the primary commits `AdvanceTieredFloor { up_to_offset }` to the partition's control
+log. Only the primary submits it, and a stale primary's command is rejected by the view of whichever
+group realizes that log, so no further fencing is needed. Every replica applies it through the
+partition state machine below.
 
 #### Every replica: local eviction
 
@@ -250,12 +261,31 @@ writes the marker, fsyncs the directory, unlinks the `.log`, flips `location` to
 cached fd via `reset_read_state`, and leaves `PartitionStats.size_bytes` untouched. A per-pass budget
 of 16 mirrors `SEGMENT_REMOVAL_BUDGET_PER_PASS`.
 
-#### Metadata plane
+#### Partition state machine
 
-`Partition` gains `tiered_up_to_offset: u64`, appended to `PartitionSnapshot` with
-`#[serde(default)]`, `SNAPSHOT_FORMAT_VERSION` 5 to 6, `PARTITION_FIELD_COUNT` 7 to 8. `PurgeTopic`
-and `PurgeStream` reset it to 0 alongside `deleted_up_to_offset`. An accessor
-`partition_tiered_floor` sits next to `partition_delete_watermark`.
+The floor lives in a replicated state machine fed by the partition's **control log**: a consensus
+sequence separate from the data log, so that segments and the data journal hold only user messages
+and control commands never enter the data path. This RFC does not fix how the control log is
+realized. A general partition state-machine facility, specified in its own RFC because queue
+semantics, log compaction and the key-value store need it as well, decides between one control
+group per shard carrying the commands of every partition that shard owns, and the metadata plane,
+which already is a separate control log holding per-partition facts. The floor advances at most
+once per uploaded segment, so it works with either; this RFC depends on the facility only for the
+command encoding, the apply hook, the local snapshot, state-transfer inclusion, and defined
+behaviour for a replica that meets a command it does not know.
+
+The tiered storage state machine holds one value, `tiered_up_to_offset`, and its apply is
+`max(current, up_to_offset)`, checked against the partition's committed end because the control log
+is not ordered with the data log. It holds no per-segment data on purpose: deterministic keys plus
+the local markers carry the segment list, so the snapshot stays a few bytes and is persisted in the
+partition superblock, whose payload has room, with a write on every apply. That snapshot is the
+floor's durable home; it is also carried in state transfer next to the consumer offsets, so a
+rebuilt replica never starts at zero. Purge resets the floor with the generation, and the eviction
+primitive reads it directly from the partition.
+
+`TruncatePartition` stays in the metadata plane, where it already ships. If the facility settles on
+the metadata plane, both watermarks share a log from the start; if it settles on per-shard control
+groups, migrating `TruncatePartition` is a follow-up amendment (see unresolved questions).
 
 ### Segment lifecycle
 
@@ -271,14 +301,13 @@ A segment never moves back from Remote to Sealed-local in the first delivery.
 
 #### Bounding how long data stays unuploaded
 
-Redpanda uploads a prefix of the open segment after one hour. Iggy cannot copy that: uploading part
-of the active segment would create objects that match no local file, and a replica cannot roll by
+Uploading part of the active segment would create objects that match no local file, and a replica cannot roll by
 its own clock because segment boundaries must be a function of the batches alone. The Iggy form is a
 replicated time roll: a per-topic `segment_max_age` option, and when the active segment's first batch
 is older than that, the primary appends a `RollSegment` control operation to the partition log.
 Control operations already flow through `commit_messages_inner`, so every replica seals at that
-operation and the segment uploads normally. Small segments produced this way are the reason Redpanda
-has an adjacent-segment merger; Iggy will need the same soon after.
+operation and the segment uploads normally. Small segments produced this way require an
+adjacent-segment merger, which will have to be implemented.
 
 ### Read path
 
@@ -291,11 +320,11 @@ has an adjacent-segment merger; Iggy will need the same soon after.
 A directory under the node's data path holds chunks of remote `.log` objects as
 `{partition_key}/{start:020}.log_chunks/{chunk_start}`. Chunk boundaries snap to batch boundaries:
 chunk `k` starts at the sparse index entry nearest to `k × chunk_size` (default 8 MiB), so a batch
-never costs two GETs. A miss sends `FetchChunk` to the tier worker, which reserves the bytes in the
-cache budget first, issues one ranged GET, writes a `.part` file, fsyncs it and renames it into
-place.
+never costs two GETs. A miss hands `FetchChunk` to the shard's tier service, which reserves the
+bytes in the cache budget first, issues one ranged GET, writes a `.part` file, fsyncs it and renames
+it into place.
 
-A cold poll does not wait for a whole chunk: the worker first fetches exactly the walk's range,
+A cold poll does not wait for a whole chunk: the tier service first fetches exactly the walk's range,
 64 KiB to 1 MiB, into a small cache file the walk reads immediately, and hydrates the surrounding
 chunk in the background.
 
@@ -308,16 +337,18 @@ head.
 
 Space is reserved before a download. The budget is the smaller of `size` and `size_percent` of the
 data disk, with an object-count cap. Eviction is LRU by access time down to 80 % of the budget, with
-at least 5 s between trims. The cache persists across restarts: the worker keeps an access-time
-table, saves it every 60 s and at shutdown, and at boot walks the directory on its own thread,
-deletes leftover `.part` files and reconciles the table. Downloads are rate-limited by a per-node
-token bucket (`fetch_bandwidth`).
+at least 5 s between trims. The cache is partitioned by shard, because a partition's chunks are
+only ever read by the shard that owns it, so each shard runs its own LRU and budget with no
+cross-shard coordination. The cache persists across restarts: each shard keeps an access-time table
+for its files, saves it every 60 s and at shutdown, and at boot walks its directory before serving,
+deletes leftover `.part` files and reconciles the table. Downloads are rate-limited by a per-shard
+token bucket derived from the node-level `fetch_bandwidth`.
 
 #### Indexes for remote segments
 
 `resolve_sealed_start` prefers the cached index, then the local `.index`. For a remote segment with
-no local index it asks the worker for the `.index` object, stores it under the canonical name, and
-proceeds. The 512 KiB residency cap applies unchanged.
+no local index it asks the tier service for the `.index` object, stores it under the canonical name,
+and proceeds. The 512 KiB residency cap applies unchanged.
 
 #### Latency, timeouts and errors
 
@@ -347,16 +378,29 @@ per partition after restart to re-establish its cursor.
 `PartitionStats.size_bytes` keeps meaning total retained bytes. Local bytes become a Prometheus
 gauge.
 
-### Tier worker and backends
+### Tier service and backends
 
-A small pool of tier worker OS threads (default 1) is spawned at boot next to the shard threads.
-Each runs its own compio runtime with io_uring, owns one HTTP client and one signer, and consumes
-crossfire `bounded_blocking_async` job channels: `UploadSegment`, `FetchChunk`, `FetchIndex`,
-`DeleteObjects`, `ListPrefix`. Each job carries a `futures::channel::oneshot` for its reply, the
-pattern `snapshot::collect` uses with a long-lived thread. Three queues are drained in strict
-priority: fetches for waiting polls, uploads for partitions under local storage pressure, ordinary
-uploads, then housekeeping. Housekeeping (object deletion, orphan sweep, verify pass, manifest
-upload) runs when the request rate has been below `housekeeping.idle_threshold_rps` for
+All tier work runs on the shard that owns the partition, as cooperative compio tasks, with no extra
+threads and no cross-thread channels. Each shard has one `TierService` (an `Rc`, like the
+thread-local `cyper` client the JWKS code already keeps) owning the HTTP client, the signer, the
+shard's slice of the cache, and the per-shard caps. Jobs are `UploadSegment`, `FetchChunk`,
+`FetchIndex`, `DeleteObjects` and `ListPrefix`; each runs as a detached task spawned the way disk
+polls are (`bus.spawn`), never inline in a frame handler, so the pump's `select_biased!` loop,
+including the consensus tick, keeps running between the task's awaits.
+
+Two rules keep a 1 GiB upload from delaying the pump. First, work is done in pieces: a segment is
+read and sent `upload_piece_size` (1 MiB) at a time, a chunk is written and hashed the same way, and
+every piece ends in a real I/O await (a `read_at`, a socket write) or, for CPU-only stretches such
+as hashing and decoding, in `yield_to_reactor()` from `server_common`, the one yield this runtime is
+known to honour. A bare self-wake such as `futures::pending!()` wedges the pump and is never used.
+Second, concurrency is capped per class with a small single-threaded semaphore written for this
+purpose: an `Rc<RefCell<_>>` holding a permit count and a FIFO of waiters, `acquire().await`
+returning an RAII permit released on drop, no atomics because nothing crosses threads. The same
+primitive with permits counted in bytes is the cache reservation (reserve before download) and the
+download token bucket. One semaphore per class gives the priority order the design needs: fetches
+for waiting polls hold their own permits and are never starved by uploads; uploads for partitions
+under local storage pressure are queued ahead of ordinary uploads; housekeeping runs only when the
+shard's request rate has been below `housekeeping.idle_threshold_rps` for
 `housekeeping.idle_timeout`, or once per `housekeeping.interval`, spending at most
 `housekeeping.request_quota` requests per run.
 
@@ -380,7 +424,7 @@ Three layers:
 
 1. The trait. Plain string keys, the aligned buffers the server already uses, one logical operation
    per method, and a typed error enum (`NotFound`, `PreconditionFailed`, `Throttled`, `Transport`,
-   `Auth`, `Malformed`). Retries, backoff and timeouts live above the trait in the worker.
+   `Auth`, `Malformed`). Retries, backoff and timeouts live above the trait in the tier service.
 2. The provider: a signer, a URL layout and a response parser, pure and sans-I/O, unit-tested against
    recorded fixtures.
 
@@ -394,7 +438,7 @@ Three layers:
 
    The S3 signer may be `rusty-s3` (sans-I/O, MIT/Apache-2.0) or hand-written SigV4; GCS and Azure
    signers are hand-written.
-3. The transport: one `cyper::Client` per worker thread over rustls, a connection pool per endpoint,
+3. The transport: one `cyper::Client` per shard over rustls, a connection pool per endpoint,
    connections idle longer than 5 s closed before reuse, a lease watchdog per request, and a boot
    self-configuration probe that picks virtual-host or path style and fails fast.
 
@@ -403,7 +447,7 @@ environment variables ship first; provider chains (IMDSv2 and STS web identity, 
 workload and VM identity) are each an HTTP call on the same transport, refreshed at 90 % of
 lifetime, with a rate-limited out-of-band refresh on 401 or 403.
 
-Every operation runs under a deadline tree (Redpanda's `retry_chain_node`): a retry is permitted
+Every operation runs under a deadline tree. A retry is permitted
 only while `now + backoff` stays inside the parent's deadline, and the remaining time is the
 per-request timeout. Backoff is exponential with jitter from 100 ms. Provider errors map to `retry`,
 `fail`, `not_found`, `auth` or `unsupported` before any retry logic sees them. Uploads retry within
@@ -413,11 +457,12 @@ a 90 s deadline per segment.
 
 - **State transfer.** The manifest gains a `REMOTE_CHAIN` artifact carrying all of a partition's
   markers (the manifest caps at 65536 entries, so one artifact rather than one per segment). The
-  receiver writes the markers and fetches indexes lazily. No segment bytes cross between replicas for
-  tiered data. `install_backup::link_tree` links markers; install and converge sweep `.remote`
+  receiver writes the markers and fetches indexes lazily, and the state machine's floor travels with
+  the offsets artifact the way consumer offsets do, so an installed replica never starts at floor
+  zero. No segment bytes cross between replicas for tiered data. `install_backup::link_tree` links markers; install and converge sweep `.remote`
   alongside `.log`, `.index` and `.anchor`.
-- **Purge and delete.** Purge bumps `purge_generation`, which changes the key prefix, and unlinks
-  markers with everything else. Objects of an old generation or a deleted topic are removed by an
+- **Purge and delete.** Purge bumps `purge_generation`, which changes the key prefix, resets the
+  state machine's floor to zero, and unlinks markers with everything else. Objects of an old generation or a deleted topic are removed by an
   orphan sweep on the metadata primary: it lists `{prefix}/{cluster_id}/` at incarnation
   granularity under a metadata revision snapshot and deletes any incarnation absent from metadata
   with `created_revision` below the snapshot.
@@ -435,14 +480,13 @@ a 90 s deadline per segment.
 [tiered_storage]
 enabled = false
 backend = "s3"
-worker_threads = 1
-upload_concurrency = 4
+upload_concurrency = 2               # per shard
+upload_piece_size = "1 MiB"          # read, hash and send unit; one yield per piece
 upload_loop_backoff_max = "10 s"
 segment_upload_timeout = "90 s"
-fetch_concurrency = 4
+fetch_concurrency = 4                # per shard
 fetch_timeout = "5 s"
-fetch_bandwidth = "unlimited"
-part_size = "64 MiB"
+fetch_bandwidth = "unlimited"        # per node, divided across shards
 connection_idle_timeout = "5 s"
 delete_batch_per_pass = 300
 delete_pending_per_partition = 5000
@@ -499,8 +543,8 @@ Topic options:
 ### Invariants
 
 1. A replica evicts a local segment only when `end_offset <= tiered_up_to_offset` as committed in
-   metadata, and the floor advances only after the primary observed a successful PUT of both
-   objects. No replica ever drops the last copy of committed data.
+   the partition's control log, and the floor advances only after the primary observed a successful
+   PUT of both objects. No replica ever drops the last copy of committed data.
 2. Object keys are unique per partition incarnation and purge generation, objects are immutable, and
    `.log` bytes are identical from any replica. A duplicate upload is a no-op.
 3. Local eviction never crosses the WAL checkpoint, the active segment, or a local sealed segment not
@@ -527,7 +571,8 @@ Topic options:
 | Crash between marker write and `.log` unlink | Boot sees both; treats the segment as local; eviction resumes without re-upload. |
 | Crash between unlink and directory fsync | Marker was fsynced first, so the `.log` either reappears or is gone with a valid marker. No hole. |
 | Object missing on GET | Below `deleted_up_to_offset`: retire locally and clamp forward. Otherwise data loss: fault the poll, raise a metric. |
-| Replica behind on metadata | Sees a lower floor and evicts less. Reads unaffected. |
+| Replica behind on the control log | Has not applied the latest floor yet, so it evicts less. Reads unaffected. |
+| Replica restarts or is rebuilt by state transfer | The floor is restored from the superblock or arrives with the offsets artifact; it never starts at zero, so nothing is re-uploaded or wrongly kept. |
 | Purge during an upload | Upload lands under the old generation prefix; floor submit rejected by the generation check; orphan sweep deletes. |
 | WAL still hard-links an evicted segment | Eviction stops at the WAL checkpoint; after it, unlinking the public name is what retention does today. |
 | Cache directory full | Fetch fails typed; poll replies transient; eviction is driven harder; gauge rises. |
@@ -542,13 +587,17 @@ Each phase is one reviewable PR or a short stack, in dependency order.
    acceptance, `install_backup` and quarantine handling, `evict_local_segments_up_to`,
    `SegmentSource` in the poll plan, the chunk cache with index-snapped boundaries, reservation and
    the persisted access-time table, all against the `fs` backend. Docker-free tests.
-2. **Metadata floor and reconciler.** `tiered_up_to_offset`, snapshot v6, `AdvanceTieredFloor`, the
-   `MetadataSubmit` path from owner shards, reconciler extension for remote segments in truncation
-   with deletion caps.
-3. **Tier worker and S3 provider.** Worker threads with priority queues, the `ObjectStore` trait, the
-   S3 provider over `cyper` with single streamed PUTs, unsigned payloads, conditional create, the
-   boot probe and the deadline-tree retry model, the `sim` backend, config, Prometheus counters.
-   Provider contract tests against `fs` and MinIO.
+2. **Partition state machine and the floor.** Depends on the partition state-machine facility
+   landing first, including its choice of control log. The `AdvanceTieredFloor` command and its
+   apply, the superblock-persisted floor, its inclusion in state transfer, the purge reset, and the
+   reconciler extension for remote segments in `TruncatePartition` enforcement with deletion caps. Tests: a partitions unit test that
+   the floor is monotone and survives a restart; a simulator scenario across view changes and purges.
+3. **Tier service and S3 provider.** The per-shard `TierService` with piece-wise tasks, the
+   single-threaded semaphore and its byte-counted variant, the `ObjectStore` trait, the S3 provider
+   over `cyper` with single streamed PUTs, unsigned payloads, conditional create, the boot probe and
+   the deadline-tree retry model, the `sim` backend, config, Prometheus counters including pump tick
+   latency. Provider contract tests against `fs` and MinIO; a shard test that a 1 GiB upload never
+   delays the tick beyond one piece.
 4. **End to end.** The upload loop, topic options, the local and total retention split, idle-gated
    housekeeping with primary object deletion and the orphan sweep, the download token bucket, the
    `REMOTE_CHAIN` artifact. Integration scenarios under `--features vsr`.
@@ -562,14 +611,17 @@ Each phase is one reviewable PR or a short stack, in dependency order.
 
 [drawbacks]: #drawbacks
 
-- A new metadata field and a snapshot format bump, plus one internal metadata operation per uploaded
-  segment per partition. At the default 1 GiB segment size this is negligible; at the 1 MiB minimum
-  with `segment_max_age` it could become chatty on many quiet partitions.
+- One command per uploaded segment in the partition's control log, and a dependency on a partition
+  state-machine facility, including the control log itself, that does not exist yet. At the default 1 GiB segment size the operation
+  rate is negligible; at the 1 MiB minimum with `segment_max_age` it could become chatty on many
+  quiet partitions.
 - A new crate with its own HTTP client, signers and provider parsers is code the project has to own
   and keep correct against three providers' quirks, where a vendor SDK would have absorbed them.
-- Worker threads step outside the strict thread-per-core model. Discussion #3312 favours keeping
-  uploads on the shard with cooperative yielding; this RFC argues compio lacks the scheduling groups
-  that make Redpanda's on-shard model safe, but it is a real divergence from the codebase's stance.
+- Tier work shares the shard's thread with producers and consumers, and compio has no scheduling
+  groups to cap its CPU share. Piece-wise work with explicit yields bounds how long the pump waits
+  for any one piece, and the per-shard caps bound how many pieces are in flight, but a shard with
+  many cold readers and a large upload backlog will give tiering more of its CPU than a
+  shares-based scheduler would.
 - The state-transfer manifest, boot recovery, purge, install backup and quarantine all learn about a
   new file type. Every one of those paths has crash-consistency rules that must be extended.
 - Cold reads add a latency mode clients have not seen before. A poll can now take tens to hundreds
@@ -587,40 +639,54 @@ Each phase is one reviewable PR or a short stack, in dependency order.
 
 Alternatives: every replica uploads (triples PUT traffic and egress), or each replica HEADs an
 object before evicting it (puts an object store round trip on a backup's housekeeping path and makes
-a store outage stall eviction cluster-wide). A replicated offset is one metadata op per uploaded
-segment and has the same shape as `deleted_up_to_offset`, which the reconciler already enforces.
+a store outage stall eviction cluster-wide). A replicated offset is one command per uploaded
+segment, applied on every replica by the same machinery.
 
-### Why not a manifest state machine in the partition log
+### Why the state machine holds one offset, not a manifest
 
-Redpanda replicates the full segment manifest as a Raft state machine inside the partition's own
-log and needs column-store compression and spillover manifests once it grows. Segment lifecycle
-operations were ruled out of Iggy's partition log when `DeleteSegments` was designed, and the
-metadata watermark plus local markers carry the same information for a live cluster. The cost is
-that a fresh replica learns its remote segments from a peer (via state transfer) rather than from
-the bucket, and restore-from-bucket needs the lazily uploaded manifest; both are accepted.
+This RFC puts the floor in a partition state machine and keeps per-segment data out of it: deterministic keys
+plus local markers carry the same information for a live cluster, so the snapshot stays a few bytes
+and fits in the superblock. The cost is that a fresh replica learns its remote segments from a peer
+(via state transfer) rather than from the bucket, and restore-from-bucket needs the lazily uploaded
+manifest; both are accepted.
+
+### Why a control log separate from the data log
+
+Putting the floor command into the partition's data group would work: segments would stay pure,
+because the flush already writes only message batches, and no offset translation would arise,
+because message offsets are independent of op numbers. What it would do is interleave control
+commands into the data journal and the data group's pipeline, which is harmless for one command per
+gigabyte and harmful for the high-rate state machines the facility exists to host, such as
+per-message delivery state. A separate control log keeps the data path for user messages only, at
+the price of cross-log ordering, which the floor tolerates by checking against the committed end at
+apply time.
+
+Between the two realizations, the metadata plane exists today and already holds `deleted_up_to_offset`
+and `purge_generation`, but a floor there needs a submit path from the owner shard to shard 0 and a
+reconciler pass to re-drive it, lags the data by a reconcile interval, and shares one cluster-wide
+group with everything else. A control group per shard applies on the owner shard with no hop and no
+lag and scales with shards. The floor's rate makes the choice immaterial for this RFC, so it is
+deferred to the facility RFC rather than decided here.
 
 ### Why an Iggy-owned object store abstraction
 
 OpenDAL's S3 and GCS paths are tokio-bound through reqwest, and every vendor SDK drags a second
-runtime into a server that runs none. The team ruled out third-party storage crates. Redpanda made
-the same choice and its stack (hand-written SigV4 and SharedKey, its own HTTP/1.1 client, a per-shard
-pool, credential refresh on shard 0) is the reference. Owning the abstraction also puts every
-provider under one contract test suite.
+runtime into a server that runs none. The team ruled out third-party storage crates. Other systems
+made the same choice (see [Prior art](#prior-art)): hand-written SigV4 and SharedKey signers, their
+own HTTP/1.1 client, a per-shard connection pool and credential refresh on one shard. Owning the
+abstraction also puts every provider under one contract test suite.
 
-### Why worker threads rather than on-shard uploads
+### Why on-shard tasks rather than worker threads
 
-Redpanda runs uploads on the shard, isolated by Seastar scheduling groups: uploads at 100 to 1000
-shares under a backlog controller, hydration at 500 below produce at 1000. compio has no scheduling
-groups, so on-shard uploads in Iggy would rely on cooperative yields and a byte budget per tick with
-no cap on total CPU share, on exactly the thread serving that partition's producers. Worker threads
-are the compio substitute. Fetches could move to the shard easily; uploads should still leave it.
-This is listed as an unresolved question because #3312 leans the other way.
-
-### Why single streamed PUTs
-
-Redpanda uploads segments as one streamed PUT and reserves multipart for objects it cannot write
-otherwise. Iggy's segment ceiling is 1 GiB, under the 5 GiB single-object limit, so multipart, ETag
-handling and the 5 MiB part floor leave the first delivery.
+compio has no scheduling groups, and discussion #3312 preferred staying on the shard with
+cooperative yielding to keep shared-nothing and core affinity. The repository already has the two
+primitives on-shard work needs: detached tasks that return through a completion lane, which is how
+disk polls run, and `yield_to_reactor()`, which state transfer already uses for exactly this kind of
+long walk. Worker threads would have needed cross-thread channels, a second client per thread, and
+a cache whose accounting lived off-shard, none of which exists today. And a cache partitioned by
+shard needs no coordination at all, since a partition's chunks are read only by its owner shard.
+The cost, a soft rather than hard cap on tiering's CPU share, is recorded under drawbacks and
+watched through a pump tick latency gauge.
 
 ### Why not a diskless architecture
 
@@ -649,9 +715,10 @@ not exist.
   HTTP client and signers; scheduling groups for CPU fairness; advisory local retention under a
   disk-space manager; a scrubber that records anomalies without repairing them. This RFC copies the
   upload loop shape, the cache admission and persistence, the retry deadline tree, the signing and
-  probing rules, and the per-pass deletion caps, and diverges on the manifest state machine, on
-  conditional PUTs (possible here because bytes are replica-identical), on stitching one poll across
-  remote and local segments, and on worker threads versus scheduling groups.
+  probing rules, and the per-pass deletion caps, and diverges on what the state machine holds (one
+  offset rather than the manifest), on conditional PUTs (possible here because bytes are replica-identical), on stitching one poll across
+  remote and local segments, and on explicit yields plus per-class semaphores standing in for
+  scheduling groups.
 - **Apache Kafka KIP-405** tiered storage and **Apache Pulsar** ledger offload: the same shape as
   this RFC, whole sealed units copied to per-partition objects with an index object beside them.
 - **KIP-1150 Diskless Topics** (accepted 2026-03-02) and Aiven's Inkless. KIP-1165 rejected merging
@@ -681,10 +748,9 @@ not exist.
 
 Open design decisions:
 
-- **Worker threads versus shard-side uploads.** #3312 prefers on-shard with cooperative yielding to
-  preserve shared-nothing and core affinity. This RFC argues that without scheduling groups a 1 GiB
-  upload on the shard cannot be kept from delaying the consensus tick. The provider stack is the
-  same either way.
+- **Piece size and caps.** `upload_piece_size`, `upload_concurrency` and `fetch_concurrency` bound
+  the pump's exposure to tier work. The defaults here are guesses to be measured against the pump
+  tick latency gauge under a cold-read storm plus an upload backlog on one shard.
 - **Generic or `dyn` for the shard-side handle.** The codebase removed `DynSuperblockStore` in
   favour of generics. A `TierClient` type parameter on `IggyPartitions` with a `NoTier` default is
   consistent with that; the alternative is an `Rc<dyn RemoteChunkSource>` confined to `poll_plan`.
@@ -699,8 +765,18 @@ Open design decisions:
 - **Whether the floor requires the `.index` upload or only the `.log`.** Redpanda tolerates an index
   upload failure because the reader rebuilds; requiring both blocks eviction on a transient failure
   for a segment whose data is already safe.
-- **Rolling upgrades.** A replica on the old binary that receives `AdvanceTieredFloor` needs defined
-  behaviour, and enabling tiering may have to wait until every node runs the new binary.
+- **Rolling upgrades.** A replica on the old binary that meets the `AdvanceTieredFloor` command in
+  the control log needs defined behaviour (ignore, refuse, or crash), and enabling
+  tiering may have to wait until every node runs the new binary. The general answer belongs to the
+  partition state-machine RFC.
+- **Two watermarks, possibly two logs.** `TruncatePartition` lives in the metadata plane today. If
+  the facility realizes the control log as per-shard groups, the consistent end state is both
+  watermarks in the control log, with `DeleteSegments` resolved and applied there; migrating it is a
+  follow-up amendment, not part of this RFC.
+- **The partition state-machine facility.** The control log's realization (a control group per shard
+  or the metadata plane), command encoding, the apply hook, the local snapshot, state-transfer
+  inclusion and unknown-command behaviour are specified in their own RFC; phase 2 here cannot start
+  before it lands.
 - **Self-healing from local copies.** When the verify pass finds a missing object, a backup may still
   hold the segment locally. Re-uploading from it automatically is cheap to specify here because
   segments are byte-identical; Redpanda only records the anomaly.
