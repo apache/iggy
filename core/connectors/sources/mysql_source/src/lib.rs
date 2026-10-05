@@ -61,6 +61,10 @@ const CURSOR_REGRESSION_ERROR_THRESHOLD: u32 = 3;
 /// `BATCH_RESULT_TIMEOUT` (30s) for the result, so this has to finish well inside it.
 const ACK_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// MySQL rejects a prepared statement with more placeholders than this (error 1390), and
+/// the mark/delete binds one per row of the batch.
+const MAX_CLEANUP_BATCH_SIZE: u32 = 65_535;
+
 /// How many mark/delete statements in a row may fail before the connector stops. The
 /// operations stay in the persisted state and run again on restart.
 const MAX_CONSECUTIVE_CLEANUP_FAILURES: u32 = 3;
@@ -85,6 +89,7 @@ pub struct MySqlSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MySqlSourceConfig {
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
     pub connection_string: SecretString,
@@ -495,6 +500,17 @@ impl Source for MySqlSource {
             ));
         }
 
+        if let Some(batch_size) = self.config.batch_size
+            && batch_size > MAX_CLEANUP_BATCH_SIZE
+            && self.cleanup_target().is_some()
+        {
+            return Err(Error::InitError(format!(
+                "batch_size {batch_size} exceeds {MAX_CLEANUP_BATCH_SIZE} with delete_after_read or \
+                 processed_column set, MySQL allows at most {MAX_CLEANUP_BATCH_SIZE} placeholders \
+                 in the statement that marks or deletes a batch"
+            )));
+        }
+
         if self.config.batch_size == Some(1)
             && self
                 .config
@@ -776,6 +792,18 @@ impl MySqlSource {
 
         let pool = MySqlPoolOptions::new()
             .max_connections(max_connections)
+            // `format_offset_value` escapes backslashes, which under NO_BACKSLASH_ESCAPES
+            // would reach MySQL as literal characters and filter on the wrong cursor.
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', '')",
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    Ok(())
+                })
+            })
             .connect(self.config.connection_string.expose_secret())
             .await
             .map_err(|e| Error::InitError(format!("Failed to connect to MySQL: {e}")))?;
@@ -1155,16 +1183,20 @@ impl MySqlSource {
     ) -> Result<String, Error> {
         let offset_value = self.effective_offset(last_offset).unwrap_or_default();
         let offset = format_offset_value(&offset_value, kind);
+        let quoted_table = quote_qualified_identifier(table)?;
+        let limit = batch_size.to_string();
         let now = Utc::now();
+        let now_unix = now.timestamp().to_string();
+        let now = now.to_rfc3339();
+        let replacements = [
+            ("$table", quoted_table.as_str()),
+            ("$offset", offset.as_str()),
+            ("$limit", limit.as_str()),
+            ("$now_unix", now_unix.as_str()),
+            ("$now", now.as_str()),
+        ];
 
-        let q = query
-            .replace("$table", &quote_qualified_identifier(table)?)
-            .replace("$offset", &offset)
-            .replace("$limit", &batch_size.to_string())
-            .replace("$now_unix", &now.timestamp().to_string())
-            .replace("$now", &now.to_rfc3339());
-
-        Ok(q)
+        Ok(substitute_query_tokens(query, &replacements))
     }
 
     /// The query is substituted as text and re-executed once per configured table on
@@ -1708,15 +1740,34 @@ impl MySqlSource {
             processed_ids: Vec::new(),
             max_offset: None,
         };
+        // Every row of a result set shares its columns, so the published key names are
+        // derived once per batch instead of once per row.
+        let column_names: Vec<String> = rows
+            .first()
+            .map(|row| {
+                row.columns()
+                    .iter()
+                    .map(|column| {
+                        if table_config.snake_case_columns {
+                            to_snake_case(column.name())
+                        } else {
+                            column.name().to_string()
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut ordering = OrderingGuard::new(tracking_column, kind, resume_from);
         for row in rows {
-            let processed = self.process_row(&row, &table_config).map_err(|e| {
-                error!(
-                    "Failed to decode row in table '{table}' (pk {}): {e}",
-                    pk_for_log(&row, table_config.pk_column)
-                );
-                e
-            })?;
+            let processed = self
+                .process_row(&row, &table_config, &column_names)
+                .map_err(|e| {
+                    error!(
+                        "Failed to decode row in table '{table}' (pk {}): {e}",
+                        pk_for_log(&row, table_config.pk_column)
+                    );
+                    e
+                })?;
 
             let Some(value) = processed.tracking_value else {
                 return Err(unusable_tracking_value(
@@ -1746,6 +1797,7 @@ impl MySqlSource {
         &self,
         row: &MySqlRow,
         config: &RowProcessingConfig,
+        column_names: &[String],
     ) -> Result<ProcessedRow, Error> {
         let mut row_pk: Option<PkValue> = None;
         let mut tracking_value: Option<String> = None;
@@ -1761,11 +1813,15 @@ impl MySqlSource {
                     extracted_payload =
                         Some(self.extract_payload_column(row, i, config.payload_format)?);
                 }
-                if name.eq_ignore_ascii_case(config.tracking_column) {
+                let is_tracking = name.eq_ignore_ascii_case(config.tracking_column);
+                let is_pk = name.eq_ignore_ascii_case(config.pk_column);
+                if is_tracking {
                     let value = extract_column_value(row, i)?;
                     tracking_value = column_value_as_string(row, i, &value)?;
-                }
-                if name.eq_ignore_ascii_case(config.pk_column) {
+                    if is_pk {
+                        row_pk = pk_value_from_decoded(row, i, &value)?;
+                    }
+                } else if is_pk {
                     row_pk = extract_pk_value(row, i)?;
                 }
             }
@@ -1789,21 +1845,16 @@ impl MySqlSource {
         }
 
         let mut data = serde_json::Map::new();
-        for (i, column) in row.columns().iter().enumerate() {
+        for ((i, column), column_name) in row.columns().iter().enumerate().zip(column_names) {
             let name = column.name();
-            let column_name = if config.snake_case_columns {
-                to_snake_case(name)
-            } else {
-                name.to_string()
-            };
             let value = extract_column_value(row, i)?;
             if name.eq_ignore_ascii_case(config.tracking_column) {
                 tracking_value = column_value_as_string(row, i, &value)?;
             }
             if name.eq_ignore_ascii_case(config.pk_column) {
-                row_pk = extract_pk_value(row, i)?;
+                row_pk = pk_value_from_decoded(row, i, &value)?;
             }
-            data.insert(column_name, value);
+            data.insert(column_name.clone(), value);
         }
 
         let payload = if config.include_metadata {
@@ -1844,23 +1895,43 @@ impl MySqlSource {
 /// else takes the string form MySQL parses back to the same value. Returns None
 /// only for a NULL pk, which a real primary key cannot be.
 fn extract_pk_value(row: &MySqlRow, column_index: usize) -> Result<Option<PkValue>, Error> {
-    let column = &row.columns()[column_index];
-    let type_name = column.type_info().name();
-    match type_name {
-        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
-            let bytes: Option<Vec<u8>> = row.try_get(column_index).map_err(|e| {
-                Error::InvalidRecordValue(format!(
-                    "primary key column '{}' (MySQL type '{type_name}'): {e}",
-                    column.name()
-                ))
-            })?;
-            Ok(bytes.map(PkValue::Bytes))
-        }
-        _ => {
-            let value = extract_column_value(row, column_index)?;
-            Ok(column_value_as_string(row, column_index, &value)?.map(PkValue::Text))
-        }
+    if is_binary_column(row, column_index) {
+        return binary_pk_value(row, column_index);
     }
+    let value = extract_column_value(row, column_index)?;
+    pk_value_from_decoded(row, column_index, &value)
+}
+
+/// Like `extract_pk_value` for a column the caller has already decoded, so the
+/// common key column is not decoded a second time per row.
+fn pk_value_from_decoded(
+    row: &MySqlRow,
+    column_index: usize,
+    value: &serde_json::Value,
+) -> Result<Option<PkValue>, Error> {
+    if is_binary_column(row, column_index) {
+        return binary_pk_value(row, column_index);
+    }
+    Ok(column_value_as_string(row, column_index, value)?.map(PkValue::Text))
+}
+
+fn is_binary_column(row: &MySqlRow, column_index: usize) -> bool {
+    matches!(
+        row.columns()[column_index].type_info().name(),
+        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB"
+    )
+}
+
+fn binary_pk_value(row: &MySqlRow, column_index: usize) -> Result<Option<PkValue>, Error> {
+    let column = &row.columns()[column_index];
+    let bytes: Option<Vec<u8>> = row.try_get(column_index).map_err(|e| {
+        Error::InvalidRecordValue(format!(
+            "primary key column '{}' (MySQL type '{}'): {e}",
+            column.name(),
+            column.type_info().name()
+        ))
+    })?;
+    Ok(bytes.map(PkValue::Bytes))
 }
 
 fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_json::Value, Error> {
@@ -2257,6 +2328,37 @@ fn format_offset_value(value: &str, kind: OffsetKind) -> String {
             .replace('\'', "''")
             .replace('\0', "\\0");
         format!("'{escaped}'")
+    }
+}
+
+fn substitute_query_tokens(query: &str, replacements: &[(&str, &str)]) -> String {
+    let mut result = String::with_capacity(query.len());
+    let mut remaining = query;
+
+    loop {
+        let mut next_replacement: Option<(usize, &str, &str)> = None;
+        for &(token, replacement) in replacements {
+            let Some(index) = remaining.find(token) else {
+                continue;
+            };
+            let is_earlier = match next_replacement {
+                Some((next_index, next_token, _)) => {
+                    index < next_index || (index == next_index && token.len() > next_token.len())
+                }
+                None => true,
+            };
+            if is_earlier {
+                next_replacement = Some((index, token, replacement));
+            }
+        }
+
+        let Some((index, token, replacement)) = next_replacement else {
+            result.push_str(remaining);
+            return result;
+        };
+        result.push_str(&remaining[..index]);
+        result.push_str(replacement);
+        remaining = &remaining[index + token.len()..];
     }
 }
 

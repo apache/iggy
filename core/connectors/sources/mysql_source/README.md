@@ -11,7 +11,7 @@ The MySQL source connector fetches data from MySQL databases and streams it to I
 - **Custom Queries**: Use custom SQL queries with parameter substitution
 - **Delete After Read**: Automatically delete rows after processing
 - **Mark as Processed**: Mark rows as processed using a boolean column
-- **Multiple Tables**: Monitor multiple tables simultaneously
+- **Multiple Tables**: Monitor multiple tables, polled one after another each cycle
 - **Batch Processing**: Fetch data in configurable batch sizes
 - **Offset Tracking**: Resume incremental polling from the last processed tracking value (see [Delivery semantics](#delivery-semantics))
 
@@ -49,7 +49,7 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 | `connection_string` | string | required | MySQL connection string (`mysql://user:pass@host:3306/db`) |
 | `tables` | array | required | List of tables to monitor |
 | `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
-| `batch_size` | u32 | `1000` | Max rows per poll; must be greater than 0, and greater than 1 when `custom_query` filters on `$offset` (see [Ordering is checked on the rows](#ordering-is-checked-on-the-rows)) |
+| `batch_size` | u32 | `1000` | Max rows per poll; must be greater than 0, greater than 1 when `custom_query` filters on `$offset`, and at most 65535 when `delete_after_read` or `processed_column` is set (see [Ordering is checked on the rows](#ordering-is-checked-on-the-rows)) |
 | `tracking_column` | string | required | Column for incremental polling; must be unique and monotonically increasing (see [Tracking Column Requirements](#tracking-column-requirements)) |
 | `initial_offset` | string | none | Starting value for tracking column |
 | `max_connections` | u32 | `10` | Max database connections |
@@ -537,7 +537,9 @@ Idempotent replay therefore depends on the row having a stable key, which the [u
 
 ### SQL Injection Protection
 
-In the connector-built query, all table names and column names are quoted with MySQL backtick syntax, and NUL bytes in identifiers are rejected. The `$offset` value is escaped the same way whether it's substituted into the `built_polling_query` or into a `custom_query` (single quotes doubled, backslashes escaped, NUL bytes stripped).
+In the connector-built query, all table names and column names are quoted with MySQL backtick syntax, and NUL bytes in identifiers are rejected. The `$offset` value is escaped the same way whether it's substituted into the `built_polling_query` or into a `custom_query` (single quotes doubled, backslashes escaped, NUL bytes escaped as `\0`).
+
+Every connection removes `NO_BACKSLASH_ESCAPES` from its session `sql_mode`, so that escaping means the same thing whatever the server's global mode is. Placeholders are substituted in a single pass, so text a substituted value happens to contain, such as a cursor holding `$limit`, is never substituted again.
 
 `custom_query` itself is raw, operator-supplied SQL — the connector only escapes the values it substitutes in (`$offset`), not the query text itself.
 
