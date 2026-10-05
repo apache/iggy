@@ -35,8 +35,10 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::group::{
-    GroupCoordinatorConfig, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult,
-    LeavingMember, LeftMember, SyncRequest, SyncResult, owned_str,
+    GROUP_STATE_COMPLETING_REBALANCE, GROUP_STATE_PREPARING_REBALANCE, GROUP_STATE_STABLE,
+    GroupCoordinatorConfig, GroupDescription, GroupListing, JoinRequest, JoinResult, JoinedMember,
+    LeaveRequest, LeaveResult, LeavingMember, LeftMember, MemberDescription, SyncRequest,
+    SyncResult, owned_str,
 };
 use crate::protocol::api::{
     ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID, ERROR_GROUP_MAX_SIZE_REACHED,
@@ -69,6 +71,16 @@ pub enum Phase {
     PreparingRebalance,
     CompletingRebalance,
     Stable,
+}
+
+impl Phase {
+    const fn as_kafka_state(self) -> &'static str {
+        match self {
+            Self::PreparingRebalance => GROUP_STATE_PREPARING_REBALANCE,
+            Self::CompletingRebalance => GROUP_STATE_COMPLETING_REBALANCE,
+            Self::Stable => GROUP_STATE_STABLE,
+        }
+    }
 }
 
 /// Outcome of one state-machine step: answer now, or park until `wake_at`.
@@ -619,6 +631,29 @@ impl GroupState {
         self.sync_deadline = None;
         self.bump();
     }
+
+    fn description(&self, group_id: &StrBytes) -> GroupDescription {
+        let protocol_name = self.protocol_name.clone();
+        let members = self
+            .members
+            .iter()
+            .map(|(member_id, member)| MemberDescription {
+                member_id: member_id.clone(),
+                group_instance_id: member.group_instance_id.clone(),
+                metadata: protocol_name
+                    .as_ref()
+                    .map_or_else(Bytes::new, |name| member.metadata_for(name)),
+                assignment: member.assignment.clone(),
+            })
+            .collect();
+        GroupDescription {
+            group_id: group_id.clone(),
+            state: self.phase.as_kafka_state(),
+            protocol_type: self.protocol_type.clone(),
+            protocol_name,
+            members,
+        }
+    }
 }
 
 /// Tick every group and drop the ones that emptied, returning how many were reclaimed.
@@ -1110,6 +1145,42 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
         error: ERROR_NONE,
         members,
     }
+}
+
+/// One entry per `group_ids` element, after that group's usual expiry tick.
+pub fn describe_groups(
+    groups: &mut Groups,
+    group_ids: &[StrBytes],
+    now: Instant,
+) -> Vec<Option<GroupDescription>> {
+    let mut described = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        if !tick_group(groups, group_id, now) {
+            described.push(None);
+            continue;
+        }
+        let Some(group) = groups.get(group_id) else {
+            described.push(None);
+            continue;
+        };
+        described.push(Some(group.description(group_id)));
+    }
+    described
+}
+
+/// Groups currently in the map, ordered by group id. Does not tick: see
+/// [`crate::group::GroupCoordinator::list_groups`].
+pub fn list_groups(groups: &Groups) -> Vec<GroupListing> {
+    let mut listed: Vec<GroupListing> = groups
+        .iter()
+        .map(|(group_id, group)| GroupListing {
+            group_id: group_id.clone(),
+            protocol_type: group.protocol_type.clone(),
+            state: group.phase.as_kafka_state(),
+        })
+        .collect();
+    listed.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+    listed
 }
 
 fn admit(

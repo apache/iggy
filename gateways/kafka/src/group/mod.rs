@@ -18,9 +18,9 @@
 //! In-memory coordinator for Kafka's classic consumer group protocol.
 //!
 //! [`GroupCoordinator`] owns every group this gateway instance coordinates and is the only
-//! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup` handlers
-//! translate wire messages into the request types here, and `state` holds the synchronous state
-//! machine those requests drive.
+//! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup`/
+//! `DescribeGroups`/`ListGroups` handlers translate wire messages into the request types here,
+//! and `state` holds the synchronous state machine those requests drive.
 //!
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
 //! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
@@ -39,6 +39,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::group::state::{GroupState, Step};
 use crate::protocol::api::{ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
+
+/// `DescribeGroups` / `ListGroups` state string for a group preparing a rebalance.
+pub const GROUP_STATE_PREPARING_REBALANCE: &str = "PreparingRebalance";
+/// `DescribeGroups` / `ListGroups` state string for a group waiting on `SyncGroup`.
+pub const GROUP_STATE_COMPLETING_REBALANCE: &str = "CompletingRebalance";
+/// `DescribeGroups` / `ListGroups` state string for a group whose assignment is in effect.
+pub const GROUP_STATE_STABLE: &str = "Stable";
 
 /// Kafka's own `group.min.session.timeout.ms` default.
 const DEFAULT_MIN_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
@@ -320,6 +327,36 @@ impl LeaveResult {
     }
 }
 
+/// One member as `DescribeGroups` reports it.
+#[derive(Debug, Clone)]
+pub struct MemberDescription {
+    pub member_id: StrBytes,
+    pub group_instance_id: Option<StrBytes>,
+    /// Subscription metadata for the group's selected protocol. Empty until a protocol is chosen.
+    pub metadata: Bytes,
+    pub assignment: Bytes,
+}
+
+/// One group as `ListGroups` reports it. Member blobs stay on the coordinator.
+#[derive(Debug, Clone)]
+pub struct GroupListing {
+    pub group_id: StrBytes,
+    pub protocol_type: StrBytes,
+    pub state: &'static str,
+}
+
+/// One group the coordinator currently holds, as `DescribeGroups` reports it.
+#[derive(Debug, Clone)]
+pub struct GroupDescription {
+    pub group_id: StrBytes,
+    /// One of the `GROUP_STATE_*` strings.
+    pub state: &'static str,
+    pub protocol_type: StrBytes,
+    /// Selected protocol name. `None` until the first join barrier completes.
+    pub protocol_name: Option<StrBytes>,
+    pub members: Vec<MemberDescription>,
+}
+
 /// The answer for one `LeavingMember`.
 #[derive(Debug, Clone)]
 pub struct LeftMember {
@@ -449,6 +486,24 @@ impl GroupCoordinator {
     pub async fn leave(&self, request: &LeaveRequest) -> LeaveResult {
         let mut groups = self.groups.lock().await;
         state::leave_step(&mut groups, request, Instant::now())
+    }
+
+    /// Snapshot of each named group, in request order. `None` means the group is not here.
+    ///
+    /// Ticks each named group first, the same way every other request for that group does, so the
+    /// snapshot is the membership a heartbeat arriving now would see.
+    pub async fn describe_groups(&self, group_ids: &[StrBytes]) -> Vec<Option<GroupDescription>> {
+        let mut groups = self.groups.lock().await;
+        state::describe_groups(&mut groups, group_ids, Instant::now())
+    }
+
+    /// Every group currently in the map, ordered by group id.
+    ///
+    /// Does not expire sessions. Expiry runs on the request that names a group; a list names
+    /// none, and sweeping every group here would open rebalances as a side effect of reading.
+    pub async fn list_groups(&self) -> Vec<GroupListing> {
+        let groups = self.groups.lock().await;
+        state::list_groups(&groups)
     }
 
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.

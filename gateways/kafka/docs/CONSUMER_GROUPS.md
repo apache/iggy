@@ -2,7 +2,9 @@
 
 What [#3541](https://github.com/apache/iggy/issues/3541) added: `FindCoordinator` (10),
 `JoinGroup` (11), `Heartbeat` (12) and `SyncGroup` (14), backed by an in-memory coordinator in
-`src/group/`. [#3543](https://github.com/apache/iggy/issues/3543) added `LeaveGroup` (13). This is Kafka's *classic* group protocol. Offsets are a separate concern and live
+`src/group/`. [#3543](https://github.com/apache/iggy/issues/3543) added `LeaveGroup` (13).
+[#3548](https://github.com/apache/iggy/issues/3548) added `DescribeGroups` (15) and `ListGroups`
+(16). This is Kafka's *classic* group protocol. Offsets are a separate concern and live
 in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 
 | API key | Name | Versions | Notes |
@@ -12,10 +14,27 @@ in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 | 12 | Heartbeat | 0-4 | Refreshes a session; `REBALANCE_IN_PROGRESS` is how a follower learns to rejoin |
 | 13 | LeaveGroup | 0-5 | Removes members; survivors' parked joins and syncs are released at once |
 | 14 | SyncGroup | 0-5 | Relays the leader's assignment blobs; a follower parks until the leader syncs |
+| 15 | DescribeGroups | 0-6 | Members, assignment and state. A group that is not here is `Dead`; v6 also returns `GROUP_ID_NOT_FOUND` (69) |
+| 16 | ListGroups | 0-5 | Groups currently on this coordinator. v4+ can filter by state, v5 by type `classic` |
 
 `kafka-protocol` can encode FindCoordinator v5 and v6 as well, and they are byte-identical to v4.
 They are not advertised because `SCOPE.md`'s governance model only admits a version once it has
 been manually tested.
+
+## Admin views
+
+`DescribeGroups` and `ListGroups` read the same in-memory map the join path writes. State strings
+are `PreparingRebalance`, `CompletingRebalance` and `Stable`. `Empty` is not stored: a group with
+no members is removed. `Dead` is only the describe answer for an id that is not in the map.
+
+`ListGroups` does not expire sessions. Expiry runs when a request names a group, and a list names
+none, so a quiet group stays listed until something else touches it. `DescribeGroups` does tick
+each named group, so it reports the membership a heartbeat would see.
+
+Member `client_id` and `client_host` are empty. The coordinator does not keep the request
+header's client id or the connection's peer address. `include_authorized_operations` is answered
+with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
+`classic`, which is the only protocol this coordinator runs.
 
 ## Assignment is the client's job
 

@@ -13,8 +13,9 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
-> `LeaveGroup` and `SyncGroup` are real, with real membership, rebalances, graceful leave and
-> session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
+> `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
+> rebalances, graceful leave, session expiry and admin views of that membership
+> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
 > Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
 > Offset commit and fetch are not implemented yet, so a consumer must use `assign()` with explicit
 > start offsets and `enable.auto.commit=false`. The Java client needs no `group.id`. librdkafka
