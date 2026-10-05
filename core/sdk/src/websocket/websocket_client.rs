@@ -477,7 +477,7 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
         *self
             .consensus_session
             .lock()
-            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+            .map_err(|_| IggyError::InvalidConfiguration)? = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
         self.poll_router.clear_session();
         Ok(())
@@ -555,9 +555,8 @@ impl WebSocketClient {
             })
     }
 
-    /// Whether an `AutoLogin` is configured on this client, which makes the
-    /// session after any connect the configured user's rather than whoever
-    /// signed in by hand.
+    /// Whether fallback `AutoLogin` credentials are configured. A remembered
+    /// successful sign-in takes precedence after reconnecting.
     pub(crate) fn auto_login_configured(&self) -> bool {
         matches!(self.config.auto_login, AutoLogin::Enabled(_))
     }
@@ -1242,7 +1241,7 @@ impl WebSocketClient {
                 let request = {
                     let mut session = consensus_session
                         .lock()
-                        .expect("consensus session mutex poisoned");
+                        .map_err(|_| IggyError::InvalidConfiguration)?;
                     crate::vsr::encode_contiguous_request(&mut session, code, &payload, &mut used_header)?
                 };
                 trace!(
@@ -1401,6 +1400,64 @@ mod tests {
         let mut frame = bytemuck::bytes_of(&header).to_vec();
         frame.extend_from_slice(body);
         stream.send(Message::Binary(frame.into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_poisoned_session_when_sending_or_resetting_should_return_configuration_error() {
+        const NO_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = WebSocketClient::create(Arc::new(WebSocketClientConfig {
+            server_address: listener.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (mut peer, connected) = tokio::join!(
+            async {
+                accept_async(listener.accept().await.unwrap().0)
+                    .await
+                    .unwrap()
+            },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let consensus_session = Arc::clone(&client.consensus_session);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _session = consensus_session.lock().unwrap();
+                panic!("poison the session for the regression test");
+            })
+            .is_err()
+        );
+
+        let mut header = None;
+        assert_eq!(
+            client
+                .send_raw_request(
+                    SEND_MESSAGES_CODE,
+                    Bytes::from_static(b"send"),
+                    false,
+                    &mut header,
+                )
+                .await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        assert!(header.is_none());
+        assert_eq!(
+            client.reset_vsr_session().await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        {
+            let session = consensus_session.lock().unwrap_err().into_inner();
+            assert_eq!(session.session(), Some(1));
+            assert_eq!(session.current_request_id(), 1);
+        }
+        assert!(
+            tokio::time::timeout(NO_REQUEST_TIMEOUT, peer.next())
+                .await
+                .is_err()
+        );
+        client.disconnect_transport().await.unwrap();
     }
 
     #[tokio::test]

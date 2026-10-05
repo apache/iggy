@@ -21,10 +21,10 @@
 //! the table's resource edges, the third across the request-id gaps a client
 //! that also produces leaves behind.
 //!
-//! 1. Capacity: a full table evicts the entry with the oldest commit. Eviction
-//!    keeps that client's request watermark (and the watermark's reply when the
-//!    ring still held it), so a client that was merely quiet re-registers and
-//!    its retry of an already-committed request id is answered, not re-executed.
+//! 1. Capacity: a full table refuses new clients without evicting existing
+//!    entries. A live client's watermark and cached replies survive registry
+//!    pressure, and matching re-registration preserves its epoch so committed
+//!    request retries replay instead of executing again.
 //! 2. Reply retention: an entry keeps `REPLY_RING_CAPACITY` replies whatever
 //!    they weigh and older ones for as long as they fit
 //!    `REPLY_RING_RETENTION_BYTES`, so a retry arriving more commits late than

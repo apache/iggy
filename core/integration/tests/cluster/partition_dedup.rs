@@ -49,7 +49,7 @@ use iggy_binary_protocol::{
 };
 use integration::harness::TestHarness;
 use integration::iggy_harness;
-use journal::partition_journal::PARTITION_WAL_BLOCK_SIZE;
+use journal::partition_journal::{FRONTIER_FILE_NAME, PARTITION_WAL_BLOCK_SIZE};
 use secrecy::SecretString;
 use std::mem::offset_of;
 use std::net::SocketAddr;
@@ -319,6 +319,8 @@ async fn given_reclaimed_wal_when_recovered_quorum_replays_should_return_the_ori
     const CHECKPOINT_OP: u64 = 2;
     const MESSAGES_PER_BATCH: u32 = 33;
     const PAYLOAD_BYTES: usize = 1024 * 1024;
+    const WAL_FRONTIER_SLOTS: usize = 2;
+    const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL3";
     const WAL_CHECKPOINT_OFFSET: usize = 48;
     const WAL_HEAD_OFFSET: usize = 72;
     let observer = harness.root_client_for_node(0).await.unwrap();
@@ -347,12 +349,22 @@ async fn given_reclaimed_wal_when_recovered_quorum_replays_should_return_the_ori
                 .node(node)
                 .data_path()
                 .join("streams/0/topics/0/partitions/0/prepares-1");
-            std::fs::read(directory.join("frontier")).is_ok_and(|bytes| {
+            std::fs::read(directory.join(FRONTIER_FILE_NAME)).is_ok_and(|bytes| {
+                assert_eq!(
+                    bytes.len(),
+                    WAL_FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE,
+                    "unexpected partition WAL frontier size on node {node}"
+                );
                 bytes
                     .as_chunks::<PARTITION_WAL_BLOCK_SIZE>()
                     .0
                     .iter()
                     .any(|slot| {
+                        assert_eq!(
+                            &slot[..WAL_FRONTIER_MAGIC.len()],
+                            WAL_FRONTIER_MAGIC,
+                            "unsupported partition WAL frontier format on node {node}"
+                        );
                         u64::from_le_bytes(
                             slot[WAL_CHECKPOINT_OFFSET..WAL_CHECKPOINT_OFFSET + size_of::<u64>()]
                                 .try_into()

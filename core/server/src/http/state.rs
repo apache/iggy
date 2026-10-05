@@ -30,9 +30,10 @@ use axum::response::Response;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
-use iggy_common::{ClusterMetadata, IggyTimestamp};
+use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
+use metadata::impls::metadata::StreamsFrontend;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -291,6 +292,7 @@ impl HttpInner {
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
+            self.ensure_active_user(user_id)?;
             let now = IggyTimestamp::now().to_secs();
             if let Some(session) = self.live_session(&key, now) {
                 return Ok(session);
@@ -338,6 +340,19 @@ impl HttpInner {
                 }
             }
         }
+    }
+
+    pub(in crate::http) fn ensure_active_user(&self, user_id: u32) -> Result<(), AuthError> {
+        let active = self.shard.plane.metadata().mux_stm.users().read(|users| {
+            users
+                .items
+                .get(user_id as usize)
+                .is_some_and(|user| user.status == UserStatus::Active)
+        });
+        if !active {
+            return Err(IggyError::Unauthenticated.into());
+        }
+        Ok(())
     }
 
     /// Highest metadata op `user_id` was told committed here; see
@@ -485,6 +500,8 @@ impl HttpInner {
         )
         .await
         .ok_or(AuthError::SessionUnavailable)?;
+        // Register and catch-up may yield to a user revocation.
+        self.ensure_active_user(user_id)?;
         let attachment = metadata
             .client_table
             .borrow_mut()

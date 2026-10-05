@@ -243,6 +243,11 @@ internal sealed class ConsensusSession
         var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
             "A replicated request requires a bound consensus session.");
 
+        if (_requestCounter == ulong.MaxValue)
+        {
+            throw VsrError.Exception(VsrError.REQUEST_ID_EXHAUSTED, "Request ID counter exhausted.");
+        }
+
         // Partition ops consume an id too: dedup needs each send to carry a distinct number, and the
         // metadata watermark tolerates the gaps.
         var requestId = _requestCounter;

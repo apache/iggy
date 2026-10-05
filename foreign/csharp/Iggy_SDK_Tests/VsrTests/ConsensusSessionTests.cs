@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Reflection;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Vsr;
 
@@ -116,6 +117,47 @@ public sealed class ConsensusSessionTests
         var error = Assert.Throws<IggyInvalidStatusCodeException>(() => session.Resolve(VsrOperation.CreateStream));
 
         Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+    }
+
+    [Theory]
+    [InlineData((byte)VsrOperation.CreateStream)]
+    [InlineData((byte)VsrOperation.SendMessages)]
+    public void NextRequestId_ExhaustionPreservesIdentityAndRejectsLocally(byte operation)
+    {
+        var bindSecret = Enumerable.Range(0, LoginRegister.BIND_SECRET_BYTES)
+            .Select(value => (byte)value).ToArray();
+        var session = new ConsensusSession(1, 10, bindSecret);
+        var clientId = session.ClientId;
+        var generation = session.Generation;
+        var counter = typeof(ConsensusSession).GetField("_requestCounter",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(counter);
+        counter.SetValue(session, ulong.MaxValue - 1);
+
+        var lastFrame = session.Resolve((VsrOperation)operation);
+        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue - 1, 10), lastFrame);
+        Assert.Equal(ulong.MaxValue, session.RequestCounter);
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            SessionFrame? issued = null;
+            var error = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            {
+                issued = session.Resolve((VsrOperation)operation);
+            });
+
+            Assert.Null(issued);
+            Assert.Equal(VsrError.REQUEST_ID_EXHAUSTED, error.StatusCode);
+            Assert.False(error.FromServer);
+            Assert.Equal(ulong.MaxValue, session.RequestCounter);
+            Assert.Equal(clientId, session.ClientId);
+            Assert.Equal(10UL, session.Session);
+            Assert.Equal(generation, session.Generation);
+            Assert.Equal(bindSecret, session.BindSecret);
+        }
+
+        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue, 10), session.Resolve(VsrOperation.NonReplicated));
+        Assert.Equal(ulong.MaxValue, session.RequestCounter);
     }
 
     [Fact]

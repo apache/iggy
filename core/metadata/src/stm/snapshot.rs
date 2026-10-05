@@ -80,6 +80,10 @@ pub enum SnapshotError {
     Serialize(rmp_serde::encode::Error),
     /// Deserialization failed.
     Deserialize(rmp_serde::decode::Error),
+    /// The embedded client table contains invalid sessions or retry receipts.
+    ClientTable(consensus::client_table::ClientTableDecodeError),
+    /// Committed retry protection is absent from the snapshot.
+    MissingClientTable,
     /// I/O error during snapshot persist/load.
     Io(std::io::Error),
     /// I/O error during a specific stage of snapshot persistence.
@@ -105,7 +109,7 @@ pub enum SnapshotError {
     UnsupportedFormatVersion { found: u32, expected: u32 },
     /// A state-transfer descriptor's frontiers contradict its artifacts: a
     /// `commit_op` below the snapshot the same offer ships, or a client-table
-    /// frontier above that commit point. Both are impossible from a
+    /// frontier outside the snapshot-to-commit range. Both are impossible from a
     /// caught-up-primary offer, so the install is refused and the receiver falls
     /// back to journal repair rather than moving its frontiers off a bad
     /// manifest.
@@ -138,6 +142,8 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::Serialize(e) => write!(f, "snapshot serialization failed: {e}"),
             Self::Deserialize(e) => write!(f, "snapshot deserialization failed: {e}"),
+            Self::ClientTable(e) => write!(f, "snapshot client table is invalid: {e}"),
+            Self::MissingClientTable => write!(f, "snapshot client table is missing"),
             Self::Io(e) => write!(f, "snapshot I/O error: {e}"),
             Self::Persist { stage, source } => {
                 write!(f, "snapshot persist failed at {stage:?} stage: {source}")
@@ -182,8 +188,10 @@ impl std::error::Error for SnapshotError {
         match self {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
+            Self::ClientTable(e) => Some(e),
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
             Self::ChecksumMismatch { .. }
+            | Self::MissingClientTable
             | Self::InvalidTrailer
             | Self::Truncated { .. }
             | Self::UnsupportedFormatVersion { .. }

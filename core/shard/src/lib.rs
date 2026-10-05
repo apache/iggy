@@ -4090,28 +4090,6 @@ where
         true
     }
 
-    /// Admit a `PartitionSubmit`: same gates as the [`MessageBag::Request`]
-    /// arm, but every refusal answers on `reply` instead of the bus, and the
-    /// admitted request carries an in-process reply channel down to the
-    /// pipeline entry so its committed reply comes back here rather than
-    /// being routed by `header.client`.
-    #[allow(clippy::future_not_send)]
-    pub async fn on_partition_submit(
-        &self,
-        request: Message<RoutedRequestHeader>,
-        reply: Sender<Option<Message<GenericHeader>>>,
-    ) where
-        B: MessageBus + 'static,
-        MJ: JournalHandle,
-        <MJ as JournalHandle>::Target:
-            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-        M: RestorableMetadataStm,
-        T: ShardsTable,
-    {
-        self.dispatch_partition_submit(request, reply, None, None)
-            .await;
-    }
-
     /// Single entry point for first and re-delivered partition submits.
     /// Session and operation checks precede parking. Partition readiness and
     /// metadata fences are rechecked when the owning partition materializes.

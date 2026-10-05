@@ -46,6 +46,7 @@ internal static class VsrError
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;
     internal const int SESSION_MISMATCH = 14004;
+    internal const int REQUEST_ID_EXHAUSTED = 14005;
 
     /// <summary>A failure the client raised itself, before or instead of a server verdict.</summary>
     internal static IggyInvalidStatusCodeException Exception(int code, string message)

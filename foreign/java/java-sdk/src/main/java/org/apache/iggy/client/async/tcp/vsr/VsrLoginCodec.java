@@ -41,8 +41,9 @@ final class VsrLoginCodec {
      * Packed wire protocol version this codec targets:
      * {@code major << 20 | minor << 10 | patch}, 10 bits per field.
      * Keep in sync with {@code core/binary_protocol/src/version.rs}, independently
-     * of the crate release. The server enforces its minimum wire version and rejects
-     * newer major.minor versions.
+     * of the crate release. The server accepts the inclusive range from its minimum
+     * protocol version through its current version, including patch components.
+     * Versions outside this range, including newer patches, are rejected.
      */
     static final int PROTOCOL_VERSION = (11 << 10) | 1; // 0.11.1
 

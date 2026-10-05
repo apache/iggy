@@ -53,14 +53,10 @@ pub enum PreflightOutcome {
     /// not-caught-up primary). The caller sends a `TransientNotCommitted` reply
     /// so the client replays immediately instead of waiting out its read-timeout.
     NotReady,
-    /// Absorbed with nothing to send: stale/gap retry or a client-bug newer
-    /// session. Replaying the same `request_id` cannot help, so stay silent.
-    Drop,
     /// Terminal: the request will never be executed and no cached reply
     /// exists, so the caller answers with this `IggyError` code. Distinct from
-    /// [`Self::Drop`] in that the client learns immediately instead of waiting
-    /// out its read timeout, and from [`Self::NotReady`] in that a replay of
-    /// the same `request_id` cannot change the answer.
+    /// [`Self::NotReady`] in that replaying the same `request_id` cannot change
+    /// the answer.
     Reject(u32),
 }
 
@@ -147,7 +143,7 @@ where
         RequestStatus::Duplicate(cached_reply) => {
             PreflightOutcome::Replay(cached_reply.into_wire_bytes())
         }
-        // Session evicted under capacity pressure. The catch-up gate makes this
+        // Unknown client id or restarted session. The catch-up gate makes this
         // replica authoritative for its own committed session state, which is
         // what an eviction frame reports.
         RequestStatus::NoSession => PreflightOutcome::Evict(EvictionReason::NoSession),
@@ -238,13 +234,11 @@ where
         }
         // The wire-ingress plane has no per-request transport context to build a
         // correlated `TransientNotCommitted` reply (that lives on the in-process
-        // home-shard path); stay silent here as before. NotReady and Drop both
-        // mean "do not dispatch"; the difference (explicit retry frame) only
-        // applies where the request header is in scope.
+        // home-shard path); stay silent here as before.
         // `Reject` needs the request header to build a correlated reply, which
         // only the home-shard path holds; it degrades to silence here for the
         // same reason NotReady does.
-        PreflightOutcome::NotReady | PreflightOutcome::Drop | PreflightOutcome::Reject(_) => false,
+        PreflightOutcome::NotReady | PreflightOutcome::Reject(_) => false,
     }
 }
 

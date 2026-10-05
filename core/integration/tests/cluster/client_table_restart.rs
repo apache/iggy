@@ -437,11 +437,9 @@ async fn commit_request_header(
 /// keep presenting the old identity, round-robin across every node, until one
 /// commits (or serves the cached reply for) the request.
 ///
-/// The re-login is the resume, and it is a rebind: the ownership-gated
-/// Register commits, the recovered entry's fence moves to that register's op,
-/// the login reply hands back the NEW epoch. Continuation frames must stamp
-/// it -- the pre-restart epoch is a fenced zombie from here on. Watermark and
-/// reply ring survive the rebind, which is what the dedup assertion rests on.
+/// A matching Register authenticates the replacement connection while
+/// preserving the recovered epoch, watermark, and reply ring. Continuation
+/// frames keep that epoch so retries still find the original receipts.
 /// There is deliberately NO way to rebind without credentials -- an unbound
 /// transport that merely presents `(client, session)` gets the empty-reply
 /// fail-fast (see `given_unauthenticated_resume_*`).
@@ -467,9 +465,7 @@ pub(super) async fn resume_request(
             sleep(RETRY_PAUSE).await;
             continue;
         };
-        // Re-authenticate on the fresh connection. The rebind commits a
-        // Register, so the epoch strictly advances past the pre-restart one
-        // (op-derived; regression would mean the fence can be replayed into).
+        // Keep the epoch so continuation retries use the recovered receipt identity.
         let resumed = match login_on(&mut stream, CLIENT_ID).await {
             Some(resumed) => {
                 assert!(

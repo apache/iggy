@@ -51,7 +51,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// that frees up goes to a waiting socket between two writes.
 const WRITE_PAUSE: Duration = Duration::from_millis(500);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// The head field of a frontier slot in `journal::partition_journal::JournalState`.
+const WAL_FRONTIER_SLOTS: usize = 2;
+const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL3";
+/// The head field in the checked `IGGYWAL3` frontier slot layout.
 const WAL_HEAD_OFFSET: usize = 72;
 
 /// How a test writes the offset of a new consumer.
@@ -137,13 +139,22 @@ async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, writ
         .expect("send messages");
     let frontier = partition_frontier(harness.server(), stream.id, topic.id);
     let before = std::fs::read(&frontier).expect("read the WAL frontier after sending");
-    assert_eq!(before.len(), 2 * PARTITION_WAL_BLOCK_SIZE);
+    assert_eq!(
+        before.len(),
+        WAL_FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE,
+        "unexpected partition WAL frontier size"
+    );
     assert!(
         before
             .as_chunks::<PARTITION_WAL_BLOCK_SIZE>()
             .0
             .iter()
             .all(|slot| {
+                assert_eq!(
+                    &slot[..WAL_FRONTIER_MAGIC.len()],
+                    WAL_FRONTIER_MAGIC,
+                    "unsupported partition WAL frontier format"
+                );
                 u64::from_le_bytes(
                     slot[WAL_HEAD_OFFSET..WAL_HEAD_OFFSET + size_of::<u64>()]
                         .try_into()

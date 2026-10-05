@@ -898,6 +898,15 @@ where
             .await
     }
 
+    /// Open prepare history for every disk partition, including replicated topics.
+    ///
+    /// `prepares-{created_revision}/` holds `prepares-{generation}.wal`, the
+    /// published `frontier`, and `segment-{generation}-{start_offset}.log` hard
+    /// links retaining message bodies. Replicated sends still incur buffered WAL
+    /// writes and link bookkeeping, but do not require an fsync before acknowledgement.
+    /// Persisted messages, persisted consumer offsets and session retirement request
+    /// sync barriers; checkpoints also sync before reclaiming history.
+    ///
     /// A supplied WAL has already had its receipt checkpoint restored before
     /// segment recovery; opening it again must not repeat that disk scan.
     ///
@@ -910,12 +919,12 @@ where
         group_commit_delay: std::time::Duration,
         recovered: Option<(Rc<PartitionPersistence>, Vec<Message<PrepareHeader>>)>,
     ) -> Result<(), IggyError> {
-        let directory = self
+        let partition_directory = self
             .partition_dir
             .as_ref()
             .ok_or(IggyError::CannotReadFile)?;
-        let directory =
-            std::path::Path::new(directory).join(format!("prepares-{}", self.created_revision));
+        let directory = std::path::Path::new(partition_directory)
+            .join(format!("prepares-{}", self.created_revision));
         if recovered.is_none()
             && self.consensus.replica_count() > 1
             && !self.consensus.recovery_election_allowed()
@@ -927,13 +936,13 @@ where
                     IggyError::CannotSyncFile
                 })?;
         }
-        if let Some(directory) = &self.partition_dir {
-            self.materialization_missing =
-                crate::state_transfer::materialization_is_missing(directory, self.created_revision)
-                    .await
-                    .map_err(|_| IggyError::CannotReadFile)?;
-            self.ensure_materialization_recovery();
-        }
+        self.materialization_missing = crate::state_transfer::materialization_is_missing(
+            partition_directory,
+            self.created_revision,
+        )
+        .await
+        .map_err(|_| IggyError::CannotReadFile)?;
+        self.ensure_materialization_recovery();
         let restore_receipts = recovered.is_none();
         let (persistence, prepares) = if let Some(recovered) = recovered {
             recovered

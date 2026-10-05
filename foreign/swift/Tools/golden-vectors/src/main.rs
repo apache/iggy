@@ -52,7 +52,6 @@ use iggy_binary_protocol::requests::personal_access_tokens::*;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
-use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
     UpdateTopicRequest,

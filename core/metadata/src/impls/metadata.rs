@@ -608,16 +608,13 @@ fn require_shard_zero<'a, T>(
 /// exact session and rebalances its memberships; `FinalizeSession` removes it after
 /// partition retirement. Every other op applies to the state
 /// machine and caches the reply for at-most-once dedup. `fire_notifier` runs the
-/// post-commit hook (a no-op during reconstruction, before it is wired). Does not
-/// advance `commit_min`; the caller owns that counter.
+/// post-commit hook (a no-op during reconstruction, before it is wired). Returns
+/// the committed reply without advancing `commit_min`; the caller owns that counter.
 ///
-/// `table_mutations_allowed` gates the CLIENT-TABLE half only; the state
-/// machine always applies. After a state transfer the two artifacts sit at
-/// different frontiers -- the snapshot at `S`, the transferred table at
-/// `C >= S` -- so the tail replay over `(S, commit_max]` must run every state
-/// machine effect (they are above the snapshot) while skipping table effects at
-/// or below `C` (they are already in the transferred table). Pass `true`
-/// wherever no transfer is in play.
+/// `table_mutations_allowed` gates table updates only. Passing `false` requires
+/// the table to retain the session identities needed by state-machine effects.
+/// Live state transfer instead passes its separate replay table with `true`:
+/// the newer protection table may already have finalized those identities.
 ///
 /// # Panics
 /// If a committed op fails to apply, which is a decode/corruption bug, since a
@@ -630,7 +627,8 @@ pub fn apply_committed_prepare<M>(
     table_mutations_allowed: bool,
     fire_notifier: impl Fn(Operation),
     prepare: Message<PrepareHeader>,
-) where
+) -> Message<ReplyHeader>
+where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -682,7 +680,7 @@ pub fn apply_committed_prepare<M>(
         mux_stm
             .streams()
             .refresh_consumer_group_session(header.client, epoch);
-        return;
+        return build_reply_message(&header, &bytes::Bytes::new());
     }
     if header.operation == Operation::Logout {
         let ended = if table_mutations_allowed {
@@ -709,7 +707,7 @@ pub fn apply_committed_prepare<M>(
                 iggy_common::IggyTimestamp::from(header.timestamp),
             );
         }
-        return;
+        return build_reply_message(&header, &bytes::Bytes::new());
     }
     if header.operation == Operation::FinalizeSession {
         let identity = SessionIdentity::decode_from(prepare.body()).unwrap_or_else(|_| {
@@ -721,7 +719,7 @@ pub fn apply_committed_prepare<M>(
         if table_mutations_allowed {
             client_table.borrow_mut().finalize_session(identity);
         }
-        return;
+        return build_reply_message(&header, &bytes::Bytes::new());
     }
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
@@ -732,16 +730,14 @@ pub fn apply_committed_prepare<M>(
             header.op
         );
     });
-    if table_mutations_allowed && let Some(user_id) = apply.revoked_user {
-        for identity in client_table
-            .borrow_mut()
-            .end_user_sessions(user_id, header.op)
-        {
-            mux_stm.streams().remove_consumer_group_member(
-                identity.client_id,
-                iggy_common::IggyTimestamp::from(header.timestamp),
-            );
-        }
+    if let Some(user_id) = apply.revoked_user {
+        apply_user_revocation(
+            mux_stm,
+            client_table,
+            table_mutations_allowed,
+            user_id,
+            &header,
+        );
     }
     fire_notifier(header.operation);
     let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
@@ -749,12 +745,41 @@ pub fn apply_committed_prepare<M>(
     });
     if table_mutations_allowed
         && header.client != RESERVED_CLIENT_ID
+        && !message_bus::is_auto_commit_client(header.client)
         && header.operation != Operation::CompleteConsumerGroupRevocation
     {
-        let outcome = client_table
-            .borrow_mut()
-            .commit_reply(header.client, header.user_id, reply);
+        let outcome =
+            client_table
+                .borrow_mut()
+                .commit_reply(header.client, header.user_id, reply.clone());
         log_commit_reply_outcome(outcome, header.client, header.op);
+    }
+    reply
+}
+
+fn apply_user_revocation<M: StreamsFrontend>(
+    mux_stm: &M,
+    client_table: &RefCell<ClientTable>,
+    table_mutations_allowed: bool,
+    user_id: u32,
+    header: &PrepareHeader,
+) {
+    if table_mutations_allowed {
+        client_table
+            .borrow_mut()
+            .end_user_sessions(user_id, header.op);
+    }
+    // A transferred table may already contain this end marker while the
+    // streams snapshot still needs the matching membership release.
+    let table = client_table.borrow();
+    for identity in table.ended_sessions().filter(|identity| {
+        identity.metadata_watermark == header.op
+            && table.get_user_id(identity.client_id) == Some(user_id)
+    }) {
+        mux_stm.streams().remove_consumer_group_member(
+            identity.client_id,
+            iggy_common::IggyTimestamp::from(header.timestamp),
+        );
     }
 }
 
@@ -858,9 +883,13 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     commit_notifier: RefCell<Option<CommitNotifier>>,
     /// Client-table mutations at or below this op are already reflected in a
     /// state-transferred table, so the tail-repair commit walk must skip
-    /// them (re-running `commit_register` would double-bump epochs). `0`
+    /// them to preserve newer receipts and incarnations. `0`
     /// outside state transfer (no op is skipped). Monotone per install.
     client_table_frontier: Cell<u64>,
+    /// Session history at the state machine's replay frontier. The transferred
+    /// protection table can have already forgotten sessions whose membership
+    /// effects still need replaying. Dropped once replay reaches that table.
+    replay_client_table: RefCell<Option<RefCell<ClientTable>>>,
     /// Last built [`StateTransferOffer`], shared by every requester of the same
     /// snapshot generation. Rebuilding per request re-reads and re-decodes the
     /// whole snapshot on shard 0's pump, and hands each requester its own
@@ -943,6 +972,7 @@ where
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
             client_table_frontier: Cell::new(0),
+            replay_client_table: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
             prepare_gap_drops: Cell::new(0),
             partitions_max: Cell::new(0),
@@ -1068,11 +1098,47 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     }
 
     /// Client-table mutations at or below the frontier are already in the
-    /// state-transferred table; the commit walk skips them (re-running
-    /// `commit_register` would double-bump epochs). STM effects still apply
-    /// -- the frontier fences the TABLE only.
+    /// state-transferred protection table. Replay uses a separate table at the
+    /// state machine's frontier until it catches up.
     const fn client_table_mutation_allowed(&self, op: u64) -> bool {
         op > self.client_table_frontier.get()
+    }
+
+    fn apply_prepare(&self, prepare: Message<PrepareHeader>) -> Message<ReplyHeader>
+    where
+        M: StreamsFrontend
+            + StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = crate::stm::result::ApplyReply,
+                Error = IggyError,
+            >,
+    {
+        let op = prepare.header().op;
+        if self.client_table_mutation_allowed(op) {
+            return apply_committed_prepare(
+                &*self.mux_stm,
+                &self.client_table,
+                true,
+                |operation| self.fire_commit_notifier(operation),
+                prepare,
+            );
+        }
+        let history = self.replay_client_table.borrow();
+        let table = history
+            .as_ref()
+            .expect("transferred history must retain its replay table");
+        let reply = apply_committed_prepare(
+            &*self.mux_stm,
+            table,
+            true,
+            |operation| self.fire_commit_notifier(operation),
+            prepare,
+        );
+        drop(history);
+        if op == self.client_table_frontier.get() {
+            self.replay_client_table.borrow_mut().take();
+        }
+        reply
     }
 
     /// Raise the forced-checkpoint margin to cover a configured
@@ -1873,7 +1939,7 @@ where
         // built from one caught-up-primary read in `state_transfer_offer`.
         // Refuse rather than install, which drops the caller back to journal
         // repair with the local state untouched.
-        if commit_op < snapshot_seq || table_frontier > commit_op {
+        if commit_op < snapshot_seq || table_frontier < snapshot_seq || table_frontier > commit_op {
             tracing::error!(
                 snapshot_seq,
                 commit_op,
@@ -1943,6 +2009,34 @@ where
         // assert with the damage already durable.
         let local_applied = consensus.commit_min();
         let snapshot_ahead = snapshot_seq > local_applied;
+
+        let snapshot_table = if snapshot_ahead {
+            let table = snapshot
+                .snapshot()
+                .client_table
+                .clone()
+                .ok_or(SnapshotError::MissingClientTable)?;
+            Some(ClientTable::from_snapshot(table).map_err(SnapshotError::ClientTable)?)
+        } else {
+            None
+        };
+        let protection_frontier = table_frontier.max(self.client_table_frontier.get());
+        let replay_table = if snapshot_ahead && protection_frontier > snapshot_seq {
+            snapshot_table
+        } else if !snapshot_ahead
+            && table_frontier > local_applied
+            && self.replay_client_table.borrow().is_none()
+        {
+            let local_table = self.client_table.borrow();
+            Some(if local_table.capacity_committed() {
+                ClientTable::from_snapshot(local_table.to_snapshot())
+                    .map_err(SnapshotError::ClientTable)?
+            } else {
+                ClientTable::new(local_table.capacity())
+            })
+        } else {
+            None
+        };
 
         if snapshot_ahead && let Some(journal) = &self.journal {
             // Discard the WAL suffix above the incoming floor BEFORE anything
@@ -2025,6 +2119,10 @@ where
                 "transferred snapshot at or below the local applied frontier; \
                  keeping the local state machine"
             );
+        }
+
+        if snapshot_ahead || replay_table.is_some() {
+            *self.replay_client_table.borrow_mut() = replay_table.map(RefCell::new);
         }
 
         // Commits can advance while the install awaits. A prior transfer may
@@ -2237,9 +2335,6 @@ where
                 code,
             )
             .into_generic())),
-            // Client-bug shapes (future epoch, id reused for a different
-            // operation): replaying cannot help, so the home shard stays silent.
-            PreflightOutcome::Drop => Some(Err(MetadataSubmitError::Canceled)),
         }
     }
 
@@ -3097,20 +3192,6 @@ where
             if !head_is_ours {
                 continue;
             }
-            if self.client_table_mutation_allowed(prepare_header.op)
-                && let Err(error) = self
-                    .client_table
-                    .borrow_mut()
-                    .commit_capacity(prepare_header.retry_capacity as usize)
-            {
-                fatal(
-                    FatalReason::UnreconcilableLogFrontier,
-                    &format!(
-                        "invalid committed metadata retry capacity at op={}: {error}",
-                        prepare_header.op
-                    ),
-                );
-            }
 
             let mut entry = consensus
                 .pop_committed_prepare()
@@ -3136,65 +3217,7 @@ where
             // Sync-only — this is what makes pop/apply/advance atomic on
             // the single-threaded shard and keeps the head revalidation
             // sound.
-            let reply = if matches!(
-                prepare_header.operation,
-                Operation::Register | Operation::Logout | Operation::FinalizeSession
-            ) {
-                apply_committed_prepare(
-                    &*self.mux_stm,
-                    &self.client_table,
-                    self.client_table_mutation_allowed(prepare_header.op),
-                    |_| {},
-                    prepare,
-                );
-                build_reply_message(&prepare_header, &bytes::Bytes::new())
-            } else {
-                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
-                // only; a business rejection commits as a deterministic no-op
-                // whose `code` rides the reply body, replayed on retry.
-                let apply = gated_apply(&*self.mux_stm, prepare).unwrap_or_else(|err| {
-                    panic!(
-                        "on_ack: committed metadata op={} failed to apply: {err}",
-                        prepare_header.op
-                    );
-                });
-                if self.client_table_mutation_allowed(prepare_header.op)
-                    && let Some(user_id) = apply.revoked_user
-                {
-                    for identity in self
-                        .client_table
-                        .borrow_mut()
-                        .end_user_sessions(user_id, prepare_header.op)
-                    {
-                        self.mux_stm.streams().remove_consumer_group_member(
-                            identity.client_id,
-                            iggy_common::IggyTimestamp::from(prepare_header.timestamp),
-                        );
-                    }
-                }
-                // Post-commit notifier (e.g. partition reconciler
-                // wake-up). Filtering by operation is the
-                // recipient's responsibility.
-                self.fire_commit_notifier(prepare_header.operation);
-                let reply =
-                    build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
-                        apply.write_reply_body(dst);
-                    });
-                // Transferred protection already covers ops at or below its
-                // frontier; newer client receipts must be retained before reply.
-                if self.client_table_mutation_allowed(prepare_header.op)
-                    && prepare_header.client != RESERVED_CLIENT_ID
-                    && prepare_header.operation != Operation::CompleteConsumerGroupRevocation
-                {
-                    let outcome = self.client_table.borrow_mut().commit_reply(
-                        prepare_header.client,
-                        prepare_header.user_id,
-                        reply.clone(),
-                    );
-                    log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
-                }
-                reply
-            };
+            let reply = self.apply_prepare(prepare);
             consensus.advance_commit_min(prepare_header.op);
             // Paired with the counter bump, and before the reply leaves: a
             // client that holds this reply may re-home onto any shard and read,
@@ -4000,17 +4023,9 @@ where
             // after replicated commits, not only quorum-acked ones reached via
             // `on_ack` on the primary.
             //
-            // Table mutations are skipped at or below the state-transfer
-            // frontier: those ops are already reflected in the transferred
-            // table, while their state-machine effects still have to replay
-            // (the snapshot sits at a lower op).
-            apply_committed_prepare(
-                &*self.mux_stm,
-                &self.client_table,
-                self.client_table_mutation_allowed(header.op),
-                |operation| self.fire_commit_notifier(operation),
-                prepare,
-            );
+            // The replay table follows the snapshot while the transferred table
+            // retains newer protection for client admission.
+            self.apply_prepare(prepare);
             consensus.advance_commit_min(op);
             self.advance_applied_frontier(op);
             debug!("commit_journal: committed op={op}");
@@ -4717,24 +4732,16 @@ mod tests {
         );
     }
 
-    /// Minimal committed `Register` reply for `ClientTable::commit_register`,
-    /// which reads only `client` and `commit` (the assigned session).
     fn register_reply(client: u128, session: u64) -> Message<ReplyHeader> {
-        let header_size = size_of::<ReplyHeader>();
-        let mut reply = Message::<ReplyHeader>::new(header_size);
-        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
-            &mut reply.as_mut_slice()[..header_size],
+        build_reply_message(
+            &PrepareHeader {
+                client,
+                op: session,
+                operation: Operation::Register,
+                ..Default::default()
+            },
+            &bytes::Bytes::new(),
         )
-        .expect("zeroed bytes are a valid ReplyHeader");
-        *header = ReplyHeader {
-            client,
-            request: 0,
-            commit: session,
-            command: Command::Reply,
-            operation: Operation::Register,
-            ..Default::default()
-        };
-        reply
     }
 
     #[test]
@@ -6720,56 +6727,136 @@ mod tests {
     async fn given_user_revocation_when_committed_should_release_group_memberships() {
         const CLIENT: u128 = 1;
         const USER: u32 = 7;
-        let (_directory, metadata) = metadata_with_group_member(CLIENT).await;
-        metadata.mux_stm.users().ensure_root_user("root", "hash");
-        let consensus = metadata.consensus.as_ref().unwrap();
-        let request = RoutedRequestHeader::default();
-        for user_id in 1..=USER {
-            let create = CreateUserRequest {
-                username: WireName::new(format!("user-{user_id}")).unwrap(),
-                password: "hash".to_owned(),
-                status: UserStatus::Active.as_code(),
-                permissions: None,
-                options: WireOptions::empty(),
-            };
-            metadata
-                .mux_stm
-                .update(build_prepare_message(
+        for (transferred, finalized, primary, snapshot_ahead) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            let (_directory, mut metadata) = metadata_with_group_member(CLIENT).await;
+            metadata.mux_stm.users().ensure_root_user("root", "hash");
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let request = RoutedRequestHeader::default();
+            for user_id in 1..=USER {
+                let create = CreateUserRequest {
+                    username: WireName::new(format!("user-{user_id}")).unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                };
+                metadata
+                    .mux_stm
+                    .update(build_prepare_message(
+                        consensus,
+                        &request,
+                        Operation::CreateUser,
+                        &create.to_bytes(),
+                    ))
+                    .unwrap();
+            }
+            let mut snapshot =
+                <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, consensus.commit_min(), 1)
+                    .unwrap();
+            snapshot.snapshot_mut().client_table =
+                Some(metadata.client_table.borrow().to_snapshot());
+            let deletion = consensus::seal_prepare_capacity(
+                build_prepare_message(
                     consensus,
                     &request,
-                    Operation::CreateUser,
-                    &create.to_bytes(),
-                ))
-                .unwrap();
-        }
-        let deletion = consensus::seal_prepare_capacity(
-            build_prepare_message(
-                consensus,
-                &request,
-                Operation::DeleteUser,
-                &DeleteUserRequest {
-                    user_id: WireIdentifier::numeric(USER),
+                    Operation::DeleteUser,
+                    &DeleteUserRequest {
+                        user_id: WireIdentifier::numeric(USER),
+                    }
+                    .to_bytes(),
+                ),
+                metadata.client_table_capacity(),
+            );
+            let mut tail = vec![deletion];
+            if transferred {
+                let mut table =
+                    ClientTable::decode(&metadata.client_table.borrow().encode()).unwrap();
+                let ended = table.end_user_sessions(USER, tail[0].header().op);
+                if finalized {
+                    assert!(table.finalize_session(ended[0]));
+                    consensus.sequencer().set_sequence(tail[0].header().op);
+                    tail.push(consensus::seal_prepare_capacity(
+                        build_prepare_message(
+                            consensus,
+                            &request,
+                            Operation::FinalizeSession,
+                            &ended[0].to_bytes(),
+                        ),
+                        metadata.client_table_capacity(),
+                    ));
                 }
-                .to_bytes(),
-            ),
-            metadata.client_table_capacity(),
-        );
-        apply_committed_prepare(
-            &*metadata.mux_stm,
-            &metadata.client_table,
-            true,
-            |_| {},
-            deletion,
-        );
-        assert_eq!(metadata.client_table.borrow().ended_sessions().count(), 1);
-        assert!(
-            metadata
-                .mux_stm
-                .streams()
-                .consumer_group_memberships(CLIENT)
-                .is_empty(),
-            "revoked sessions must release their consumer assignments"
-        );
+                let frontier = tail.last().unwrap().header().op;
+                if snapshot_ahead {
+                    let journal = metadata.journal.take();
+                    metadata = metadata_plane();
+                    metadata.journal = journal;
+                }
+                metadata
+                    .install_state_transfer(&snapshot.encode().unwrap(), table, frontier, frontier)
+                    .await
+                    .unwrap();
+            }
+            let transferred_bytes = transferred.then(|| metadata.client_table.borrow().encode());
+            let consensus = metadata.consensus.as_ref().unwrap();
+            for prepare in tail {
+                let op = prepare.header().op;
+                if primary {
+                    consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+                    metadata
+                        .journal
+                        .as_ref()
+                        .unwrap()
+                        .handle()
+                        .append(prepare)
+                        .await
+                        .unwrap();
+                    metadata.resume_stranded_commits().await;
+                } else {
+                    metadata
+                        .journal
+                        .as_ref()
+                        .unwrap()
+                        .handle()
+                        .append(prepare)
+                        .await
+                        .unwrap();
+                    consensus.advance_commit_max(op);
+                    metadata.commit_journal().await;
+                }
+            }
+            if let Some(expected) = transferred_bytes {
+                assert_eq!(
+                    metadata.client_table.borrow().encode(),
+                    expected,
+                    "tail replay must preserve transferred retry protection"
+                );
+            }
+            assert_eq!(
+                metadata.client_table.borrow().ended_sessions().count(),
+                usize::from(!finalized)
+            );
+            assert!(
+                metadata.replay_client_table.borrow().is_none(),
+                "replay state must be released after catch-up"
+            );
+            assert!(
+                metadata
+                    .mux_stm
+                    .streams()
+                    .consumer_group_memberships(CLIENT)
+                    .is_empty(),
+                "revoked sessions must release their consumer assignments: transferred={transferred} finalized={finalized} primary={primary} snapshot_ahead={snapshot_ahead} committed={}",
+                consensus.commit_min()
+            );
+        }
     }
 
     #[test]
@@ -7193,10 +7280,8 @@ mod tests {
         let metadata = metadata_plane();
         let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
         table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
-        let snapshot = <IggySnapshot as Snapshot>::create(&TestMux::default(), SESSION, 1)
-            .unwrap()
-            .encode()
-            .unwrap();
+        let mut snapshot =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), SESSION, 1).unwrap();
         let mut older_table = None;
         for (client, epoch) in [
             (CLIENT, SESSION),
@@ -7216,10 +7301,14 @@ mod tests {
             table
                 .commit_register(client, USER, [0x5a; 32], reply)
                 .unwrap();
+            if epoch == SESSION {
+                snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            }
             if epoch == OLDER_FRONTIER {
                 older_table = Some(ClientTable::decode(&table.encode()).unwrap());
             }
         }
+        let snapshot = snapshot.encode().unwrap();
         let expected_table = table.encode();
         metadata
             .install_state_transfer(&snapshot, table, TABLE_FRONTIER, TABLE_FRONTIER)
@@ -7442,19 +7531,43 @@ mod tests {
 
         // A donor mux fills the snapshot the way a serving primary would, so
         // the restore path sees populated sections rather than a bare envelope.
-        let snapshot_bytes =
-            <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
-                .expect("donor snapshot builds")
-                .encode()
-                .expect("donor snapshot encodes");
-        md.install_state_transfer(
-            &snapshot_bytes,
-            ClientTable::new(CLIENTS_TABLE_MAX),
-            0,
-            SNAPSHOT_SEQ,
-        )
-        .await
-        .expect("install succeeds");
+        for missing in [true, false] {
+            for frontier in [SNAPSHOT_SEQ, SNAPSHOT_SEQ + 1] {
+                let mut invalid_snapshot =
+                    <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                        .unwrap();
+                if !missing {
+                    let mut table = ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot();
+                    table.capacity = 0;
+                    invalid_snapshot.snapshot_mut().client_table = Some(table);
+                }
+                assert!(matches!(
+                    md.install_state_transfer(
+                        &invalid_snapshot.encode().unwrap(),
+                        ClientTable::new(CLIENTS_TABLE_MAX),
+                        frontier,
+                        frontier
+                    )
+                    .await,
+                    Err(SnapshotError::MissingClientTable | SnapshotError::ClientTable(_))
+                ));
+                assert_eq!(
+                    journal_handle.last_op(),
+                    Some(3),
+                    "invalid protection must not truncate the WAL"
+                );
+                assert_eq!(consensus.commit_min(), 0);
+                assert_eq!(md.client_table.borrow().get_epoch(CLIENT), Some(SESSION));
+            }
+        }
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut snapshot = <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+            .expect("donor snapshot builds");
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        let snapshot_bytes = snapshot.encode().expect("donor snapshot encodes");
+        md.install_state_transfer(&snapshot_bytes, table, SNAPSHOT_SEQ, SNAPSHOT_SEQ)
+            .await
+            .expect("install succeeds");
 
         assert_eq!(
             journal_handle.last_op(),

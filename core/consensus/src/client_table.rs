@@ -1215,6 +1215,13 @@ impl ClientTable {
             return Ok(cached.clone());
         }
         let cached = CachedReply::from(reply);
+        // A lower request does not acknowledge the watermark's result.
+        if let Some(pinned) = entry.ring.back()
+            && header.request < entry.watermark
+        {
+            entry.latest_commit = pinned.header().commit;
+            return Ok(cached);
+        }
         entry.ring.clear();
         entry.latest_commit = cached.header().commit;
         entry.ring.push_back(cached.clone());
@@ -1826,8 +1833,12 @@ impl ClientEntry {
         if header.request != self.watermark
             || header.commit != self.latest_commit
             || self.ended_op.is_some_and(|ended| {
-                ended != self.latest_commit
-                    || header.operation != iggy_binary_protocol::Operation::Logout
+                ended < self.latest_commit
+                    || (ended == self.latest_commit
+                        && !matches!(
+                            header.operation,
+                            Operation::Logout | Operation::UpdateUser | Operation::DeleteUser
+                        ))
             })
         {
             return false;
@@ -2174,6 +2185,7 @@ mod tests {
             "future epoch",
             "watermark",
             "end marker",
+            "regressing end marker",
             "foreign receipt",
         ] {
             let mut snapshot = valid.clone();
@@ -2183,6 +2195,7 @@ mod tests {
                 "future epoch" => entry.epoch = 31,
                 "watermark" => entry.watermark = 6,
                 "end marker" => entry.ended_op = Some(30),
+                "regressing end marker" => entry.ended_op = Some(29),
                 "foreign receipt" => {
                     entry.reply = make_reply_with_checksum(2, 5, 30, 0xbeef)
                         .as_slice()
@@ -2199,6 +2212,65 @@ mod tests {
             );
         }
         assert!(ClientTable::from_snapshot(valid).is_ok());
+    }
+
+    #[test]
+    fn given_revoked_user_when_recovered_should_preserve_tombstones_and_receipts() {
+        const CLIENT: u128 = 7;
+        const EPOCH: u64 = 10;
+        const END: u64 = 40;
+        let secret = [0x5a; BIND_SECRET_BYTES];
+        for self_revocation in [
+            None,
+            Some(Operation::UpdateUser),
+            Some(Operation::DeleteUser),
+        ] {
+            let mut table = ClientTable::new(1);
+            table
+                .commit_register(
+                    CLIENT,
+                    TEST_USER_ID,
+                    bind_verifier(CLIENT, TEST_USER_ID, &secret),
+                    make_register_reply(CLIENT, EPOCH),
+                )
+                .unwrap();
+            let attachment = table.attach_session(CLIENT, EPOCH, TEST_USER_ID).unwrap();
+            let mut receipt = make_reply_for(CLIENT, 5, END - 1);
+            assert_eq!(
+                table.commit_reply(CLIENT, TEST_USER_ID, receipt.clone()),
+                CommitReply::Cached
+            );
+            let ended = table.end_user_sessions(TEST_USER_ID, END);
+            assert_eq!(ended.len(), 1);
+            if let Some(operation) = self_revocation {
+                receipt = make_reply_for(CLIENT, 6, END).transmute_header(|old, header| {
+                    *header = old;
+                    header.operation = operation;
+                });
+                assert_eq!(
+                    table.commit_reply(CLIENT, TEST_USER_ID, receipt.clone()),
+                    CommitReply::Cached
+                );
+            }
+            assert!(!attachment.is_valid());
+            for mut restored in [
+                ClientTable::from_snapshot(table.to_snapshot()).unwrap(),
+                ClientTable::decode(&table.encode()).unwrap(),
+            ] {
+                assert_eq!(restored.ended_sessions().collect::<Vec<_>>(), ended);
+                assert_eq!(
+                    restored.get_reply(CLIENT).unwrap().as_bytes(),
+                    receipt.as_slice()
+                );
+                assert!(restored.bind_session(CLIENT, EPOCH, &secret).is_err());
+                assert!(matches!(
+                    restored.check_request(CLIENT, EPOCH, 7, Operation::SendMessages),
+                    RequestStatus::NoSession
+                ));
+                assert!(restored.finalize_session(ended[0]));
+                assert_eq!(restored.count(), 0);
+            }
+        }
     }
 
     /// Register client 1 (register commit stamped at op 10). Returns
@@ -2942,6 +3014,58 @@ mod tests {
             ),
             RequestStatus::Duplicate(_)
         ));
+    }
+
+    #[test]
+    fn given_pinned_receipt_when_lower_request_commits_should_preserve_retry_result() {
+        const CLIENT: u128 = 7;
+        const SESSION: u64 = 42;
+        const PINNED_REQUEST: u64 = 5;
+        const PINNED_COMMIT: u64 = 100;
+        const REORDERED_REQUEST: u64 = 3;
+        let mut table = slice(1);
+        let pinned = make_reply_with_checksum(CLIENT, PINNED_REQUEST, PINNED_COMMIT, 0xabcd);
+        table
+            .commit_partition_reply(TEST_USER_ID, SESSION, pinned.clone())
+            .unwrap();
+        let reordered =
+            make_reply_with_checksum(CLIENT, REORDERED_REQUEST, PINNED_COMMIT + 1, 0xef01);
+        for _ in 0..2 {
+            let committed = table
+                .commit_partition_reply(TEST_USER_ID, SESSION, reordered.clone())
+                .unwrap();
+            assert_eq!(committed.as_bytes(), reordered.as_slice());
+            assert_eq!(table.watermarks_sorted()[0].latest_commit, PINNED_COMMIT);
+            let mut restored = slice(1);
+            restored
+                .install_watermarks(1, table.watermarks_sorted())
+                .unwrap();
+            for retained in [&table, &restored] {
+                let RequestStatus::Duplicate(cached) = retained.check_partition_request(
+                    CLIENT,
+                    TEST_USER_ID,
+                    SESSION,
+                    PINNED_REQUEST,
+                    Operation::SendMessages,
+                ) else {
+                    panic!("the higher request lost its pinned receipt");
+                };
+                assert_eq!(cached.as_bytes(), pinned.as_slice());
+                assert!(matches!(
+                    retained.check_partition_request(
+                        CLIENT,
+                        TEST_USER_ID,
+                        SESSION,
+                        REORDERED_REQUEST,
+                        Operation::SendMessages,
+                    ),
+                    RequestStatus::AlreadyApplied {
+                        request: REORDERED_REQUEST,
+                        watermark: PINNED_REQUEST
+                    }
+                ));
+            }
+        }
     }
 
     #[test]

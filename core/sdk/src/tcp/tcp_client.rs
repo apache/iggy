@@ -395,7 +395,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
         *self
             .consensus_session
             .lock()
-            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+            .map_err(|_| IggyError::InvalidConfiguration)? = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
         self.poll_router.clear_session();
         Ok(())
@@ -1044,21 +1044,15 @@ impl TcpClient {
         Ok(())
     }
 
-    /// Whether an `AutoLogin` is configured on this client, which makes the
-    /// session after any connect the configured user's rather than whoever
-    /// signed in by hand.
+    /// Whether fallback `AutoLogin` credentials are configured. A remembered
+    /// successful sign-in takes precedence after reconnecting.
     pub(crate) fn auto_login_configured(&self) -> bool {
         matches!(self.config.auto_login, AutoLogin::Enabled(_))
     }
 
-    /// Credentials to sign in with after connecting: the configured ones, or
-    /// else the ones a manual sign-in on this client succeeded with. A manual
-    /// sign-in is otherwise less reconnectable than a configured one, which
-    /// is a surprising difference between two ways of doing the same thing.
-    ///
-    /// A password change this client committed for the configured user is
-    /// applied on top: the configured password will never work again, and every
-    /// later reconnect would otherwise fail `InvalidCredentials`.
+    /// Credentials from the last successful sign-in, falling back to configured
+    /// `AutoLogin` when none are remembered. Committed username and password
+    /// changes are applied to the configured fallback.
     async fn sign_in_credentials(&self) -> Option<Credentials> {
         // The sign-in that last succeeded, whoever ran it: a client is whoever
         // it last signed in as, so a reconnect restores the session the caller
@@ -1590,9 +1584,9 @@ impl TcpClient {
                 }
                 None => {
                     let encoded = {
-                        let mut consensus_session = consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned");
+                        let Ok(mut consensus_session) = consensus_session.lock() else {
+                            return (None, Err(IggyError::InvalidConfiguration));
+                        };
                         crate::vsr::encode_request_header(&mut consensus_session, code, &payload)
                     };
                     match encoded {
@@ -1681,7 +1675,7 @@ impl TcpClient {
                     match crate::vsr::decode_response_split(&response_header, body)
                         .map_err(|error| retry_outcome.observe(error))
                     {
-                        Err(error) if !retry_transient || code == BIND_SESSION_CODE => return Err(error),
+                        Err(error) if !retry_transient => return Err(error),
                         // `TransientNotCommitted`: the op's outcome is unknown
                         // (e.g. a view change canceled it in flight) -- ONLY a
                         // same-session replay of the same request id is safe
@@ -2015,6 +2009,53 @@ mod tests {
                 .unwrap();
             Client::shutdown(&client).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn given_poisoned_session_when_sending_or_resetting_should_return_configuration_error() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let (listener, address) = live_endpoint().await;
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let consensus_session = Arc::clone(&client.consensus_session);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _session = consensus_session.lock().unwrap();
+                panic!("poison the session for the regression test");
+            })
+            .is_err()
+        );
+
+        let deadline = tokio::time::Instant::now() + TEST_BUDGET;
+        let (header, result) = client
+            .send_raw_vsr_attempt(
+                SEND_MESSAGES_CODE,
+                Bytes::from_static(b"send"),
+                None,
+                deadline,
+                deadline,
+                false,
+            )
+            .await;
+        assert!(header.is_none());
+        assert_eq!(result, Err(IggyError::InvalidConfiguration));
+        assert_eq!(
+            client.reset_vsr_session().await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        {
+            let session = consensus_session.lock().unwrap_err().into_inner();
+            assert_eq!(session.session(), Some(1));
+            assert_eq!(session.current_request_id(), 1);
+        }
+        let mut byte = [0];
+        assert_eq!(
+            peer.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        client.disconnect_transport().await.unwrap();
     }
 
     #[tokio::test]

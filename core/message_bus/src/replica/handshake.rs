@@ -36,8 +36,8 @@
 //! cannot MAC one id and announce another), but the MAC key is a single
 //! cluster-wide PSK-derived subkey, not a per-replica key, so any PSK
 //! holder can mint a valid MAC for any (smaller) replica id - there is
-//! no anti-Sybil guarantee. With auth disabled the acceptor stays in
-//! legacy mode: the `ReplicaHello` id is trusted unverified.
+//! no anti-Sybil guarantee. With auth disabled the `ReplicaHello` id is
+//! trusted unverified after the build-identity check.
 //!
 //! Enabling auth is a coordinated-restart change, and not the only one:
 //! the consensus `cluster_id` is derived from the cluster name
@@ -114,23 +114,22 @@ pub struct ReplicaTlsCtx {
 }
 
 /// Run the acceptor half on a delegated inbound stream and return the
-/// verified peer id.
+/// compatible peer id.
 ///
-/// Reads the 256 B `ReplicaHello` frame, enforces command + cluster
-/// match and the directional rule, then (when `auth` is configured)
-/// runs the acceptor side of the mutual MAC handshake with `binding`
+/// Reads the 256 B `ReplicaHello` frame, enforces command, cluster and
+/// build-identity matches and the directional rule, then (when `auth` is
+/// configured) runs the acceptor side of the mutual MAC handshake with `binding`
 /// folded into every MAC (the TLS exporter on a TLS link, see
-/// [`ChannelBinding`]). With `auth = None` the acceptor stays in legacy
-/// mode and returns the announced id unverified.
+/// [`ChannelBinding`]). With `auth = None` it sends a build-identity
+/// challenge and returns the announced id without authenticating it.
 ///
 /// The dialer (the peer) holds the strictly lower id; this acceptor
 /// holds the higher id (see the directional rule). The transcript
 /// therefore binds `dialer_id = peer_id`, `acceptor_id = self_id`.
 ///
-/// On a rejection an authenticated, still-waiting dialer is answered
-/// with a nonzero-status `build_challenge_message` (see `reject`) so
-/// it learns the cause from its own logs rather than seeing a bare
-/// connection close.
+/// Command, cluster, build-identity and direction rejections send a
+/// nonzero-status `ReplicaChallenge`, including when auth is disabled.
+/// Missing-nonce and post-challenge failures close without a response.
 ///
 /// # Errors
 ///
@@ -150,7 +149,8 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let header = msg.header();
     let peer_id = header.replica;
     let has_nonce = auth::has_nonce(&header.reserved_command);
-    // Both authenticated and unauthenticated peers read the build-gate response.
+    // Modern peers read the build-gate response even with auth disabled.
+    // Legacy unauthenticated peers discard the challenge in consensus dispatch.
 
     if header.command != Command::ReplicaHello {
         return reject(
@@ -215,9 +215,6 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     };
 
     if !has_nonce {
-        // Auth is enabled and enforced: a legacy (no-nonce) peer is rejected.
-        // No reject frame: a legacy dialer delegates its fd without reading a
-        // response.
         return reject(
             stream,
             our_cluster,
@@ -297,9 +294,9 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
 ///
 /// Logs and returns `Err(())` on any failure; the caller drops the
 /// stream and the shard-0 periodic sweep retries once the pending-dial
-/// entry clears. With `auth = None` it sends a single plaintext
-/// `ReplicaHello`. `binding` is folded into every MAC; both ends must
-/// derive it from the same channel (see [`ChannelBinding`]).
+/// entry clears. With `auth = None` it sends `ReplicaHello` and waits
+/// for a compatible build-identity challenge. `binding` is folded into every
+/// MAC; both ends must derive it from the same channel (see [`ChannelBinding`]).
 ///
 /// The dialer holds the strictly lower id, the acceptor the higher; the
 /// transcript binds `dialer_id = self_id`, `acceptor_id = peer_id`. If
@@ -418,10 +415,11 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
 
 /// Log a rejected handshake with its `reason` and, when `nack` is set, send a
 /// best-effort reject [`build_challenge_message`] (a `ReplicaChallenge` with a
-/// nonzero status and no nonce/MAC) so an authenticated, still-waiting dialer
-/// learns the cause. `nack` is false for legacy (no-nonce) and post-challenge
-/// rejects, whose peer is not reading a response (a frame would reach its VSR
-/// reader instead). Always returns `Err` so callers `return`.
+/// nonzero status and no nonce/MAC) so a waiting dialer learns the cause.
+/// Early validation rejects send a frame even to legacy unauthenticated
+/// peers, whose consensus dispatch safely discards the unexpected challenge.
+/// Missing-nonce and post-challenge rejects set `nack` to false.
+/// Always returns `Err` so callers `return`.
 #[allow(clippy::future_not_send, clippy::similar_names)]
 async fn reject<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
@@ -481,8 +479,8 @@ fn build_challenge_message(
 
 /// Build a `ReplicaHello` frame announcing this replica's id and `cluster_id`.
 /// When `nonce_d` is set it is placed in `reserved_command[0..32]` to open
-/// the authenticated handshake; otherwise the frame is the legacy plaintext
-/// announce.
+/// the authenticated handshake; otherwise the caller adds only the build
+/// identity for the unauthenticated exchange.
 fn build_hello_message(
     cluster_id: u128,
     replica_id: u8,

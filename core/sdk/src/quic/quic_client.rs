@@ -483,7 +483,7 @@ impl iggy_common::VsrSessionControl for QuicClient {
         *self
             .consensus_session
             .lock()
-            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+            .map_err(|_| IggyError::InvalidConfiguration)? = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
         self.poll_router.clear_session();
         Ok(())
@@ -567,9 +567,8 @@ impl QuicClient {
             })
     }
 
-    /// Whether an `AutoLogin` is configured on this client, which makes the
-    /// session after any connect the configured user's rather than whoever
-    /// signed in by hand.
+    /// Whether fallback `AutoLogin` credentials are configured. A remembered
+    /// successful sign-in takes precedence after reconnecting.
     pub(crate) fn auto_login_configured(&self) -> bool {
         matches!(self.config.auto_login, AutoLogin::Enabled(_))
     }
@@ -1096,8 +1095,8 @@ impl QuicClient {
                     }
                     None => {
                         let mut session = consensus_session
-                        .lock()
-                        .expect("consensus session mutex poisoned");
+                            .lock()
+                            .map_err(|_| IggyError::InvalidConfiguration)?;
                         crate::vsr::encode_request_header(&mut session, code, &payload)?.0
                     }
                 };
@@ -1317,6 +1316,68 @@ mod tests {
         send.write_all(body).await.unwrap();
         send.finish().unwrap();
         send.stopped().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_poisoned_session_when_sending_or_resetting_should_return_configuration_error() {
+        const NO_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let consensus_session = Arc::clone(&client.consensus_session);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _session = consensus_session.lock().unwrap();
+                panic!("poison the session for the regression test");
+            })
+            .is_err()
+        );
+
+        let mut header = None;
+        assert_eq!(
+            client
+                .send_raw_request(
+                    SEND_MESSAGES_CODE,
+                    Bytes::from_static(b"send"),
+                    false,
+                    &mut header,
+                )
+                .await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        assert!(header.is_none());
+        assert_eq!(
+            client.reset_vsr_session().await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        {
+            let session = consensus_session.lock().unwrap_err().into_inner();
+            assert_eq!(session.session(), Some(1));
+            assert_eq!(session.current_request_id(), 1);
+        }
+        assert!(
+            tokio::time::timeout(NO_REQUEST_TIMEOUT, peer.accept_bi())
+                .await
+                .is_err()
+        );
+        client.disconnect_transport().await.unwrap();
     }
 
     #[tokio::test]
