@@ -215,7 +215,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
-            false,
             Rc::clone(&bus),
             &partitions,
         )

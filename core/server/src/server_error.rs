@@ -37,8 +37,6 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot fingerprint the server artifact: {0}")]
-    BinaryIdentity(#[source] std::io::Error),
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
     #[error("failed to load server config")]
@@ -187,6 +185,19 @@ pub enum ServerError {
         dir: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to read or write partition retirement fence at {dir}: {source}")]
+    PartitionRetirementFenceIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is durably fenced for session retirement"
+    )]
+    PartitionRetirementFenced {
+        namespace_raw: u64,
+        created_revision: u64,
     },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's

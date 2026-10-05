@@ -30,9 +30,13 @@ pub struct SessionIdentity {
     pub metadata_watermark: u64,
 }
 
+impl SessionIdentity {
+    pub const ENCODED_SIZE: usize = 32;
+}
+
 impl WireEncode for SessionIdentity {
     fn encoded_size(&self) -> usize {
-        32
+        Self::ENCODED_SIZE
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -50,7 +54,7 @@ impl WireDecode for SessionIdentity {
                 session: read_u64_le(buf, 16)?,
                 metadata_watermark: read_u64_le(buf, 24)?,
             },
-            32,
+            Self::ENCODED_SIZE,
         ))
     }
 }

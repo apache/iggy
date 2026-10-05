@@ -60,6 +60,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{error, warn};
 
+const PARTITION_INITIALIZATION_DIR: &str = "partition-initialization";
+const RETIREMENT_FENCE_FILE: &str = "retirement.fence";
+
 /// Open the durable superblock for one partition's consensus group and read
 /// back the last recorded VSR state.
 ///
@@ -179,10 +182,46 @@ pub async fn load_partition_or_fence(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
-    allow_bootstrap: bool,
     bus: Rc<IggyMessageBus>,
     partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
 ) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let created_revision = partition_metadata.created_revision;
+    match partition_retirement_fence(&config.get_system_path(), namespace).await {
+        Ok(Some(recorded)) if recorded > created_revision => return Ok(None),
+        Ok(Some(recorded)) if recorded == created_revision => {
+            warn!(
+                namespace_raw = namespace.inner(),
+                created_revision, "partition remains offline under its durable retirement fence"
+            );
+            partitions.fence(namespace, created_revision);
+            return Ok(None);
+        }
+        Err(ref error @ ServerError::PartitionRetirementFenceIo { ref source, .. })
+            if source.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            error!(%error, namespace_raw = namespace.inner(), "unreadable retirement fence; refusing partition");
+            partitions.fence(namespace, created_revision);
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let initialization_dir = partition_initialization_path(&config.get_system_path(), namespace);
+    match partitions::read_created_revision(&initialization_dir).await {
+        Ok(Some(recorded)) if recorded > created_revision => return Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
+            error!(%source, namespace_raw = namespace.inner(), "unreadable initialization record; refusing partition");
+            partitions.fence(namespace, created_revision);
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(ServerError::PartitionCreatedRevisionIo {
+                dir: PathBuf::from(initialization_dir),
+                source,
+            });
+        }
+        Ok(_) => {}
+    }
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let directory = config.get_partition_path(stream_id, topic_id, namespace.partition_id());
@@ -192,7 +231,6 @@ pub async fn load_partition_or_fence(
             dir: PathBuf::from(&directory),
             source,
         })?;
-    let created_revision = partition_metadata.created_revision;
     let revision_io = |source| ServerError::PartitionCreatedRevisionIo {
         dir: PathBuf::from(&directory),
         source,
@@ -269,7 +307,7 @@ pub async fn load_partition_or_fence(
                 "cannot tell which incarnation this partition directory belongs to; \
                  tombstoning the partition instead of serving it"
             );
-            partitions.tombstone(namespace);
+            partitions.fence(namespace, created_revision);
             return Ok(None);
         }
         Err(source) => return Err(revision_io(source)),
@@ -303,7 +341,6 @@ pub async fn load_partition_or_fence(
         cluster_id,
         self_replica_id,
         replica_count,
-        allow_bootstrap,
         Rc::clone(&bus),
     ))
     .await
@@ -388,7 +425,7 @@ pub async fn load_partition_or_fence(
                      segment files in place and tombstoning it instead of serving it \
                      empty"
                 );
-                partitions.tombstone(namespace);
+                partitions.fence(namespace, created_revision);
                 return Ok(None);
             }
             if replica_count > 1 {
@@ -437,7 +474,7 @@ pub async fn load_partition_or_fence(
                         "failed to quarantine the refused segment files; leaving this \
                          partition tombstoned rather than rebuilding over them"
                     );
-                    partitions.tombstone(namespace);
+                    partitions.fence(namespace, created_revision);
                     return Ok(None);
                 }
             }
@@ -451,7 +488,6 @@ pub async fn load_partition_or_fence(
                 cluster_id,
                 self_replica_id,
                 replica_count,
-                false,
                 partition_metadata.created_view,
                 Rc::clone(&bus),
             ))
@@ -495,7 +531,7 @@ pub async fn load_partition_or_fence(
                  partition instead of serving it"
             );
             partition_stats.zero_out_all();
-            partitions.tombstone(namespace);
+            partitions.fence(namespace, created_revision);
             Ok(None)
         }
         Err(error) => Err(error),
@@ -513,12 +549,14 @@ async fn load_partition(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
-    allow_bootstrap: bool,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
+    let first_initialization =
+        partition_needs_initialization(config, namespace, partition_metadata.created_revision)
+            .await?;
     // (view, log_view) come from the group's durable superblock when present;
     // a present but unverifiable record already refused boot inside
     // `open_partition_superblock`.
@@ -573,7 +611,7 @@ async fn load_partition(
             join,
         },
     );
-    consensus.set_recovery_election_allowed(allow_bootstrap);
+    consensus.set_recovery_election_allowed(first_initialization);
 
     // No prepare-timestamp floor is restored here: the partition consensus
     // journal is non-durable today, so there is no persisted head to observe
@@ -608,6 +646,7 @@ async fn load_partition(
     let recovered_persistence = {
         let directory = wal_directory.clone();
         if replica_count == 1
+            && !first_initialization
             && !journal::PartitionPrepareJournal::has_published_frontier(&directory)
                 .await
                 .map_err(&wal_error)?
@@ -617,7 +656,7 @@ async fn load_partition(
                 "existing singleton partition is missing its prepare WAL frontier",
             )));
         }
-        if replica_count > 1 && !allow_bootstrap {
+        if replica_count > 1 && !first_initialization {
             PartitionPersistence::fence_missing_history(
                 &directory,
                 partition_metadata.created_revision,
@@ -713,6 +752,13 @@ async fn load_partition(
             .reanchor_to_offset_frontier(partitions_config)
             .await
             .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+    }
+    if let Err(error) =
+        record_partition_initialization(config, namespace, partition_metadata.created_revision)
+            .await
+    {
+        partition.stats.zero_out_all();
+        return Err(error);
     }
     Ok(partition)
 }
@@ -877,21 +923,44 @@ pub async fn build_partition_fresh(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
-    allow_bootstrap: bool,
     created_view: u32,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
+    if partition_retirement_fence(&config.get_system_path(), namespace)
+        .await?
+        .is_some_and(|recorded| recorded >= created_revision)
+    {
+        return Err(ServerError::PartitionRetirementFenced {
+            namespace_raw: namespace.inner(),
+            created_revision,
+        });
+    }
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
+    let first_initialization =
+        partition_needs_initialization(config, namespace, created_revision).await?;
 
-    // Sampled BEFORE the hierarchy create: a pre-existing partition directory
-    // is the marker of a prior life (the .log inside may legitimately be
-    // empty -- committed-but-unflushed data dies with the journal), while a
-    // genuinely fresh create finds nothing.
     let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
-    let restarted =
-        replica_count > 1 && (!allow_bootstrap || std::fs::metadata(&partition_dir).is_ok());
+    let restarted = replica_count > 1 && !first_initialization;
+    if replica_count == 1 && !first_initialization {
+        let directory = Path::new(&partition_dir).join(format!("prepares-{created_revision}"));
+        if !journal::PartitionPrepareJournal::has_published_frontier(&directory)
+            .await
+            .map_err(|source| ServerError::PartitionPrepareWalIo {
+                dir: directory.clone(),
+                source,
+            })?
+        {
+            return Err(ServerError::PartitionPrepareWalIo {
+                dir: directory,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "initialized singleton partition is missing its prepare WAL frontier",
+                ),
+            });
+        }
+    }
     create_partition_file_hierarchy(stream_id, topic_id, partition_id, partitions_config)
         .await
         .map_err(|source| {
@@ -928,18 +997,9 @@ pub async fn build_partition_fresh(
     )
     .await?;
 
-    // A partition directory that already exists here is a rebuild over a
-    // fenced chain (`load_partition_or_fence` quarantined the refused segment
-    // files and kept the superblock; every other prior life is hydrated by
-    // that loader before reaching this builder), not a fresh create: this
-    // replica's group state died with the process, so claiming view-0
-    // primaryship would heartbeat
-    // commit_min=0 at peers that hold the committed log (racing their
-    // election). Join as a quorum-invisible backup and probe for the
-    // current view instead; journal repair re-materializes the data from a
-    // peer, byte-identical by the deterministic-roll/replicated-ciphertext
-    // design. A truly fresh create keeps the plain init: every group needs
-    // its view-0 primary to exist.
+    // The external initialization record, including after directory loss,
+    // distinguishes a prior participant from a fresh group member. Prior
+    // participants probe before counting toward quorums.
     let durable_view = recovered_state
         .as_ref()
         .map(|state| (state.view, state.log_view));
@@ -990,7 +1050,7 @@ pub async fn build_partition_fresh(
     let mut partition = IggyPartition::new(stats, consensus);
     partition
         .consensus()
-        .set_recovery_election_allowed(allow_bootstrap);
+        .set_recovery_election_allowed(first_initialization);
     partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
@@ -1092,7 +1152,107 @@ pub async fn build_partition_fresh(
     }
 
     open_partition_persistence(&mut partition, config, None).await?;
+    if let Err(error) = record_partition_initialization(config, namespace, created_revision).await {
+        partition.stats.zero_out_all();
+        return Err(error);
+    }
     Ok(partition)
+}
+
+fn partition_initialization_path(system_path: &str, namespace: IggyNamespace) -> String {
+    format!(
+        "{system_path}/{PARTITION_INITIALIZATION_DIR}/{}",
+        namespace.inner()
+    )
+}
+
+pub async fn partition_retirement_fence(
+    system_path: &str,
+    namespace: IggyNamespace,
+) -> Result<Option<u64>, ServerError> {
+    let directory = partition_initialization_path(system_path, namespace);
+    partitions::read_revision_record(&directory, RETIREMENT_FENCE_FILE)
+        .await
+        .map_err(|source| ServerError::PartitionRetirementFenceIo {
+            dir: PathBuf::from(directory),
+            source,
+        })
+}
+
+/// A failed incarnation may stop retaining session receipts only once it can
+/// no longer rejoin with those receipts missing after a restart.
+pub async fn record_partition_retirement_fence(
+    system_path: &str,
+    namespace: IggyNamespace,
+    created_revision: u64,
+) -> Result<(), ServerError> {
+    if partition_retirement_fence(system_path, namespace)
+        .await?
+        .is_some_and(|recorded| recorded >= created_revision)
+    {
+        let directory = partition_initialization_path(system_path, namespace);
+        return persist_partition_hierarchy(&directory, system_path).await;
+    }
+    let directory = partition_initialization_path(system_path, namespace);
+    create_dir_all(&directory)
+        .await
+        .map_err(|source| ServerError::PartitionRetirementFenceIo {
+            dir: PathBuf::from(&directory),
+            source,
+        })?;
+    persist_partition_hierarchy(&directory, system_path).await?;
+    partitions::write_revision_record(&directory, RETIREMENT_FENCE_FILE, created_revision)
+        .await
+        .map_err(|source| ServerError::PartitionRetirementFenceIo {
+            dir: PathBuf::from(directory),
+            source,
+        })
+}
+
+async fn partition_needs_initialization(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    created_revision: u64,
+) -> Result<bool, ServerError> {
+    let directory = partition_initialization_path(&config.get_system_path(), namespace);
+    let recorded = partitions::read_created_revision(&directory)
+        .await
+        .map_err(|source| ServerError::PartitionCreatedRevisionIo {
+            dir: PathBuf::from(&directory),
+            source,
+        })?;
+    if recorded.is_some_and(|revision| revision > created_revision) {
+        return Err(ServerError::PartitionCreatedRevisionIo {
+            dir: PathBuf::from(directory),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "partition initialization belongs to a newer metadata incarnation",
+            ),
+        });
+    }
+    Ok(recorded != Some(created_revision))
+}
+
+/// Publish outside the partition directory before this incarnation can serve.
+/// An absent directory can then be distinguished from lost initialized history.
+async fn record_partition_initialization(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    created_revision: u64,
+) -> Result<(), ServerError> {
+    if !partition_needs_initialization(config, namespace, created_revision).await? {
+        let directory = partition_initialization_path(&config.get_system_path(), namespace);
+        return persist_partition_hierarchy(&directory, &config.get_system_path()).await;
+    }
+    let directory = partition_initialization_path(&config.get_system_path(), namespace);
+    create_dir_all(&directory)
+        .await
+        .map_err(|source| ServerError::PartitionCreatedRevisionIo {
+            dir: PathBuf::from(&directory),
+            source,
+        })?;
+    persist_partition_hierarchy(&directory, &config.get_system_path()).await?;
+    record_created_revision(&directory, created_revision).await
 }
 
 /// Record which incarnation `partition_dir` belongs to; see
@@ -1182,6 +1342,132 @@ mod tests {
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
+    async fn given_uninitialized_singleton_when_booting_should_finish_initialization() {
+        assert_uninitialized_partition_recovers(1).await;
+    }
+
+    #[compio::test]
+    async fn given_uninitialized_replica_when_booting_should_finish_initialization() {
+        assert_uninitialized_partition_recovers(REPLICAS).await;
+    }
+
+    async fn assert_uninitialized_partition_recovers(replica_count: u8) {
+        const REVISION: u64 = 7;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for interrupted in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            let partitions = solo_partitions(&config);
+            let directory = config.get_partition_path(1, 1, 0);
+            if interrupted {
+                create_partition_file_hierarchy(1, 1, 0, partitions.config())
+                    .await
+                    .unwrap();
+                record_created_revision(&directory, REVISION).await.unwrap();
+                open_partition_superblock(
+                    &directory,
+                    ReplicaIdentity {
+                        cluster: CLUSTER,
+                        replica_id: 0,
+                        replica_count,
+                    },
+                    0,
+                )
+                .await
+                .unwrap();
+            }
+            let recovered = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), REVISION, 0),
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                replica_count,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap()
+            .expect("a partition that never initialized must finish its committed creation");
+            assert!(
+                !recovered.requires_state_transfer(),
+                "first initialization has no missing history to transfer; interrupted={interrupted}"
+            );
+            assert!(
+                journal::PartitionPrepareJournal::has_published_frontier(
+                    &Path::new(&directory).join(format!("prepares-{REVISION}"))
+                )
+                .await
+                .unwrap()
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_initialized_partition_when_directory_lost_should_preserve_recovery_fence() {
+        const REVISION: u64 = 7;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for replica_count in [1, REPLICAS] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            let partitions = solo_partitions(&config);
+            let initialized = build_partition_fresh(
+                &config,
+                partitions.config(),
+                namespace,
+                Arc::new(PartitionStats::default()),
+                REVISION,
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                replica_count,
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap();
+            drop(initialized);
+            std::fs::remove_dir_all(config.get_partition_path(1, 1, 0)).unwrap();
+            let recovered = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), REVISION, 0),
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                0,
+                replica_count,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap();
+            if replica_count == 1 {
+                assert!(
+                    recovered.is_none(),
+                    "a singleton must not hide lost history"
+                );
+            } else {
+                assert!(recovered.unwrap().requires_state_transfer());
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_initialized_singleton_when_rebuilding_lost_directory_should_refuse() {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        drop(build_solo_partition(&config).await.unwrap());
+        std::fs::remove_dir_all(config.get_partition_path(1, 1, 0)).unwrap();
+        assert!(
+            build_solo_partition(&config).await.is_err(),
+            "reconciliation must not bypass the initialized partition's missing-history fence"
+        );
+    }
+
+    #[compio::test]
     async fn given_uncertified_view_when_loading_or_rebuilding_should_persist_creation_floor() {
         const CREATED_VIEW: u32 = 2;
         let namespace = IggyNamespace::new(1, 1, 0);
@@ -1205,7 +1491,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                true,
                 CREATED_VIEW,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1239,7 +1524,6 @@ mod tests {
                     CLUSTER,
                     REPLICA,
                     REPLICAS,
-                    false,
                     Rc::new(IggyMessageBus::new(0)),
                 )
                 .await
@@ -1254,7 +1538,6 @@ mod tests {
                     CLUSTER,
                     REPLICA,
                     REPLICAS,
-                    true,
                     CREATED_VIEW,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1308,7 +1591,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                false,
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1336,7 +1618,6 @@ mod tests {
                     CLUSTER,
                     REPLICA,
                     REPLICAS,
-                    true,
                     CREATED_VIEW,
                     Rc::new(IggyMessageBus::new(0)),
                 )
@@ -1378,7 +1659,6 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
-            false,
             Rc::new(IggyMessageBus::new(0)),
         )
         .await;
@@ -1399,7 +1679,6 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
-            false,
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
         )
@@ -1494,6 +1773,75 @@ mod tests {
                 .await
                 .is_some(),
             "once metadata names the directory's incarnation, it loads"
+        );
+    }
+
+    #[compio::test]
+    async fn given_retirement_fence_when_restarting_should_require_a_new_incarnation() {
+        const REVISION: u64 = 7;
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        drop(build_incarnation(&config, REVISION, 0).await);
+        record_partition_retirement_fence(&config.get_system_path(), namespace, REVISION)
+            .await
+            .unwrap();
+        for directory_lost in [false, true] {
+            if directory_lost {
+                std::fs::remove_dir_all(config.get_partition_path(1, 1, 0)).unwrap();
+            }
+            let partitions = solo_partitions(&config);
+            assert!(
+                load_incarnation(&config, &partitions, REVISION, 0)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(partitions.failed_revision(&namespace), Some(REVISION));
+            assert!(matches!(
+                build_partition_fresh(
+                    &config,
+                    &solo_partitions_config(&config),
+                    namespace,
+                    Arc::new(PartitionStats::default()),
+                    REVISION,
+                    TopicRuntimeOptions::default(),
+                    CLUSTER,
+                    REPLICA,
+                    REPLICAS,
+                    0,
+                    Rc::new(IggyMessageBus::new(0)),
+                )
+                .await,
+                Err(ServerError::PartitionRetirementFenced { .. })
+            ));
+        }
+        drop(build_incarnation(&config, REVISION + 1, 0).await);
+        assert!(
+            load_incarnation(&config, &solo_partitions(&config), REVISION + 1, 0)
+                .await
+                .is_some()
+        );
+    }
+
+    #[compio::test]
+    async fn given_corrupt_retirement_fence_when_restarting_should_refuse_partition() {
+        const REVISION: u64 = 7;
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        drop(build_incarnation(&config, REVISION, 0).await);
+        let directory = partition_initialization_path(&config.get_system_path(), namespace);
+        std::fs::write(Path::new(&directory).join(RETIREMENT_FENCE_FILE), b"torn").unwrap();
+        let partitions = solo_partitions(&config);
+        assert!(
+            load_incarnation(&config, &partitions, REVISION, 0)
+                .await
+                .is_none()
+        );
+        assert!(
+            record_partition_retirement_fence(&config.get_system_path(), namespace, REVISION)
+                .await
+                .is_err()
         );
     }
 
@@ -1612,7 +1960,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                true,
                 CREATED_VIEW,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1677,7 +2024,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                false,
                 Rc::new(IggyMessageBus::new(0)),
             )
             .await
@@ -1756,7 +2102,6 @@ mod tests {
                 CLUSTER,
                 0,
                 1,
-                false,
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1808,7 +2153,6 @@ mod tests {
                 CLUSTER,
                 0,
                 1,
-                false,
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -1854,7 +2198,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                true,
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -1933,7 +2276,6 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
-            false,
             Rc::new(IggyMessageBus::new(0)),
         )
         .await
@@ -1977,7 +2319,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                true,
                 0,
                 Rc::new(IggyMessageBus::new(0)),
             )
@@ -2013,7 +2354,6 @@ mod tests {
                 CLUSTER,
                 REPLICA,
                 REPLICAS,
-                false,
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
             )
@@ -2102,7 +2442,6 @@ mod tests {
             CLUSTER,
             0,
             1,
-            true,
             0,
             Rc::new(IggyMessageBus::new(0)),
         )
@@ -2147,7 +2486,6 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
-            true,
             created_view,
             Rc::new(IggyMessageBus::new(0)),
         )
@@ -2194,7 +2532,6 @@ mod tests {
             CLUSTER,
             REPLICA,
             REPLICAS,
-            false,
             Rc::new(IggyMessageBus::new(0)),
             partitions,
         )
@@ -2343,7 +2680,6 @@ mod tests {
             CLUSTER,
             0,
             1,
-            false,
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
         )

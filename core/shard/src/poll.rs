@@ -143,6 +143,20 @@ where
         reply: Sender<PartitionReadReply>,
     ) {
         let partitions = self.plane.partitions();
+        if matches!(read, PartitionRead::SessionRetired { .. }) {
+            let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
+                partitions
+                    .with_partition(&namespace, |partition| {
+                        partition.fatal().map(|_| partition.created_revision())
+                    })
+                    .flatten()
+            });
+            if let Some(created_revision) = failed_revision {
+                let _ = reply
+                    .try_send(PartitionReadReply::SessionRetirementFailed { created_revision });
+                return;
+            }
+        }
         let rejected = partitions
             .with_partition(&namespace, |partition| {
                 if partition.requires_state_transfer() {

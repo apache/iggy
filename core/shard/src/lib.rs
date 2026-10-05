@@ -388,6 +388,11 @@ pub enum PartitionRead {
 pub enum PartitionReadReply {
     Primary(u8),
     SessionRetired(bool),
+    /// Permanent failure of this incarnation. It is not a retirement proof
+    /// until the caller durably fences the incarnation against future serving.
+    SessionRetirementFailed {
+        created_revision: u64,
+    },
     Poll {
         fragments: PollFragments,
         current_offset: u64,
@@ -2108,7 +2113,12 @@ where
         namespace: IggyNamespace,
         read: PartitionRead,
     ) -> Option<PartitionReadReply> {
-        let Some(target) = self.shards_table.shard_for(namespace) else {
+        let target = self.shards_table.shard_for(namespace).or_else(|| {
+            matches!(read, PartitionRead::SessionRetired { .. }).then(|| {
+                crate::shards_table::calculate_shard_assignment(&namespace, self.shard_count)
+            })
+        });
+        let Some(target) = target else {
             tracing::warn!(
                 shard = self.id,
                 namespace_raw = namespace.inner(),

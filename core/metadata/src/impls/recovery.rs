@@ -345,6 +345,10 @@ pub struct RecoveredMetadata<M> {
 /// `clients_table_max` sizes a fresh registry. Recovery preserves the
 /// checkpoint's committed capacity.
 ///
+/// `on_replayed_session` receives registration, logout, and user-revocation
+/// effects. For revocation, `client` and `session` identify each affected
+/// session; the operation, op, and timestamp still name the committed user mutation.
+///
 /// `identity` is what this replica expects its own durable superblock to carry, and
 /// a mismatch refuses boot ([`RecoveryError::SuperblockIdentityMismatch`]). Its
 /// `replica_count == 1` also marks a single-replica cluster: the quorum is 1/1, so
@@ -676,6 +680,18 @@ where
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
         let reply = mux_stm.gated_update(entry)?;
+        if let Some(user_id) = reply.revoked_user {
+            for identity in client_table.end_user_sessions(user_id, header.op) {
+                on_replayed_session(
+                    &mux_stm,
+                    &PrepareHeader {
+                        client: identity.client_id,
+                        session: identity.session,
+                        ..*header
+                    },
+                );
+            }
+        }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
             && header.operation != Operation::CompleteConsumerGroupRevocation
@@ -837,10 +853,17 @@ fn verify_checkpoint_pairing(
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::impls::metadata::checkpoint_checksum;
+    use crate::impls::metadata::{StreamsFrontend, checkpoint_checksum};
     use crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION;
+    use crate::stm::stream::Streams;
+    use crate::stm::user::Users;
     use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command, Operation};
+    use iggy_binary_protocol::requests::users::{
+        CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
+    };
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_common::UserStatus;
     use journal::Journal;
     use server_common::iobuf::Owned;
     use tempfile::tempdir;
@@ -1574,6 +1597,120 @@ mod tests {
             "replay must hand the logged-out client to the group-removal hook"
         );
         assert_eq!(recovered.last_applied_op, Some(2));
+    }
+
+    #[compio::test]
+    async fn given_revoked_user_when_replaying_wal_should_restore_ended_sessions() {
+        const CLIENT: u128 = 0x1337;
+        const ROOT_CLIENT: u128 = CLIENT + 1;
+        const USER: u32 = 1;
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        for operation in [Operation::DeleteUser, Operation::UpdateUser] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let create = CreateUserRequest {
+                username: WireName::new("user").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            let revocation = if operation == Operation::DeleteUser {
+                DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes()
+            } else {
+                UpdateUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    username: None,
+                    status: Some(UserStatus::Inactive.as_code()),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes()
+            };
+            let mut parent = 0;
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                for (op, operation, body, client, user_id) in [
+                    (
+                        1,
+                        Operation::Register,
+                        bytes::Bytes::from_static(&[0x5a; 32]),
+                        ROOT_CLIENT,
+                        0,
+                    ),
+                    (2, Operation::CreateUser, create, ROOT_CLIENT, 0),
+                    (
+                        3,
+                        Operation::Register,
+                        bytes::Bytes::from_static(&[0x5a; 32]),
+                        CLIENT,
+                        USER,
+                    ),
+                    (4, operation, revocation, ROOT_CLIENT, 0),
+                ] {
+                    let mut prepare = make_prepare(op, body.len());
+                    prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                    let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.operation = operation;
+                            header.client = client;
+                            header.user_id = user_id;
+                            header.session = 1;
+                            header.request = if operation == Operation::Register {
+                                0
+                            } else {
+                                op
+                            };
+                            header.parent = parent;
+                            header.checksum_body =
+                                u128::from(iggy_common::calculate_checksum(&body));
+                        },
+                    ));
+                    parent = prepare.header().checksum;
+                    journal.append(prepare).await.unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let revoked = std::cell::RefCell::new(Vec::new());
+            let recovered = recover::<UserStm>(
+                directory.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |stm| {
+                    stm.users().ensure_root_user("root", "hash");
+                },
+                |_, header| {
+                    if header.operation == operation {
+                        revoked
+                            .borrow_mut()
+                            .push((header.client, header.session, header.op));
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.last_applied_op, Some(4));
+            assert_eq!(recovered.client_table.get_epoch(CLIENT), None);
+            assert_eq!(recovered.client_table.get_epoch(ROOT_CLIENT), Some(1));
+            assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
+            let ended: Vec<_> = recovered.client_table.ended_sessions().collect();
+            assert_eq!(
+                ended,
+                vec![iggy_binary_protocol::requests::system::SessionIdentity {
+                    client_id: CLIENT,
+                    session: 3,
+                    metadata_watermark: 4,
+                }]
+            );
+        }
     }
 
     #[test]

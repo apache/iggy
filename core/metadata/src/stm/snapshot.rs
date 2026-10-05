@@ -49,7 +49,9 @@ use crate::stm::user::UsersSnapshot;
 /// field.
 ///
 /// Version 7: session protection no longer stores a payload fingerprint.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 7;
+///
+/// Version 8: streams persist the revision of their partition incarnations.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 8;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -566,7 +568,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 7;
+        const PINNED_VERSION: u32 = 8;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -590,6 +592,7 @@ mod tests {
         // actually grows need their own pins.
         const TOPIC_FIELD_COUNT: u32 = 11;
         const STREAM_FIELD_COUNT: u32 = 6;
+        const STREAMS_FIELD_COUNT: u32 = 3;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
@@ -667,6 +670,18 @@ mod tests {
             rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
             STREAM_FIELD_COUNT,
             "StreamSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let streams = StreamsSnapshot {
+            items: vec![(0, stream)],
+            revision: 1,
+            namespace_revision: 1,
+        };
+        let encoded = rmp_serde::to_vec(&streams).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            STREAMS_FIELD_COUNT,
+            "StreamsSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
 
         let user = crate::stm::user::UserSnapshot {
@@ -803,6 +818,7 @@ mod tests {
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
             revision: 0,
+            namespace_revision: 0,
             items: vec![(
                 0,
                 StreamSnapshot {
@@ -922,6 +938,7 @@ mod tests {
 
         let streams_snap = StreamsSnapshot {
             revision: 0,
+            namespace_revision: 0,
             items: vec![
                 (
                     0,

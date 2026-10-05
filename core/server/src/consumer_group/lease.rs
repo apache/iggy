@@ -77,6 +77,8 @@ impl RetirementProgress {
     }
 }
 
+type RetirementNamespaces = Rc<[(IggyNamespace, u64)]>;
+
 /// Bounded by the session registry, independent of heartbeat volume.
 #[derive(Default)]
 pub struct ConsumerGroupLiveness {
@@ -88,7 +90,8 @@ pub struct ConsumerGroupLiveness {
     pub(super) report_offset: usize,
     pub(super) report_incomplete: bool,
     pub(super) retirement: Option<RetirementProgress>,
-    pub(super) retirement_namespaces: Option<(u64, Rc<[IggyNamespace]>)>,
+    pub(super) retirement_namespaces: Option<(u64, RetirementNamespaces)>,
+    pub(super) retirement_fences: BTreeMap<IggyNamespace, u64>,
 }
 
 impl ConsumerGroupLiveness {

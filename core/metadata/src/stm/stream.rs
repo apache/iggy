@@ -853,6 +853,9 @@ define_state! {
         // it onto each new Partition::created_revision. Deterministic across
         // replicas: same ops, same order.
         pub revision: u64,
+        // Retirement proofs survive truncation and purge, but not a changed
+        // set of partition incarnations.
+        pub namespace_revision: u64,
         // Total pending cooperative revocations across all groups, recomputed
         // once per commit by `post_apply`. The consensus tick reads it O(1)
         // every 10ms instead of walking every stream/topic/group/member to
@@ -2163,6 +2166,7 @@ impl StateHandler for DeleteStreamRequest {
         state.items.remove(stream_id);
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
+        state.namespace_revision = state.revision;
         // The dropped stream may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
@@ -2274,6 +2278,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         // monotonic revision and stamp every new partition with it.
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
+        state.namespace_revision = state.revision;
 
         // Share one `Arc<TopicStats>` across both left-right buffers via the
         // registry, parented to the stream's shared `Arc<StreamStats>`. The id
@@ -2493,6 +2498,7 @@ impl StateHandler for DeleteTopicRequest {
             .stats_registry
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
+        state.namespace_revision = state.revision;
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
@@ -2612,6 +2618,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
 
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
+        state.namespace_revision = state.revision;
 
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
@@ -2681,6 +2688,7 @@ impl StateHandler for DeletePartitionsRequest {
                 .stats_registry
                 .remove_partitions(stream_id, topic_id, &removed_ids);
             state.revision = state.revision.wrapping_add(1);
+            state.namespace_revision = state.revision;
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -2699,6 +2707,7 @@ pub struct StreamsSnapshot {
     /// `#[serde(default)]` so older snapshots restore at revision 0.
     #[serde(default)]
     pub revision: u64,
+    pub namespace_revision: u64,
 }
 
 impl Snapshotable for Streams {
@@ -2777,6 +2786,7 @@ impl Snapshotable for Streams {
             StreamsSnapshot {
                 items,
                 revision: inner.revision,
+                namespace_revision: inner.namespace_revision,
             }
         })
     }
@@ -2921,6 +2931,7 @@ impl StreamsInner {
             index,
             items,
             revision: snapshot.revision,
+            namespace_revision: snapshot.namespace_revision,
             // Recomputed from the restored groups just below.
             pending_revocations_count: 0,
             consumer_group_members: AHashMap::new(),

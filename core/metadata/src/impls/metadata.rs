@@ -732,6 +732,17 @@ pub fn apply_committed_prepare<M>(
             header.op
         );
     });
+    if table_mutations_allowed && let Some(user_id) = apply.revoked_user {
+        for identity in client_table
+            .borrow_mut()
+            .end_user_sessions(user_id, header.op)
+        {
+            mux_stm.streams().remove_consumer_group_member(
+                identity.client_id,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+            );
+        }
+    }
     fire_notifier(header.operation);
     let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
         apply.write_reply_body(dst);
@@ -3147,6 +3158,20 @@ where
                         prepare_header.op
                     );
                 });
+                if self.client_table_mutation_allowed(prepare_header.op)
+                    && let Some(user_id) = apply.revoked_user
+                {
+                    for identity in self
+                        .client_table
+                        .borrow_mut()
+                        .end_user_sessions(user_id, prepare_header.op)
+                    {
+                        self.mux_stm.streams().remove_consumer_group_member(
+                            identity.client_id,
+                            iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                        );
+                    }
+                }
                 // Post-commit notifier (e.g. partition reconciler
                 // wake-up). Filtering by operation is the
                 // recipient's responsibility.
@@ -4480,7 +4505,7 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
-    use iggy_binary_protocol::requests::users::CreateUserRequest;
+    use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
     use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::{
@@ -6689,6 +6714,134 @@ mod tests {
             metadata.mux_stm.streams().consumer_group_session(CLIENT),
             Some(epoch)
         );
+    }
+
+    #[compio::test]
+    async fn given_user_revocation_when_committed_should_release_group_memberships() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = 7;
+        let (_directory, metadata) = metadata_with_group_member(CLIENT).await;
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let request = RoutedRequestHeader::default();
+        for user_id in 1..=USER {
+            let create = CreateUserRequest {
+                username: WireName::new(format!("user-{user_id}")).unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            metadata
+                .mux_stm
+                .update(build_prepare_message(
+                    consensus,
+                    &request,
+                    Operation::CreateUser,
+                    &create.to_bytes(),
+                ))
+                .unwrap();
+        }
+        let deletion = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &request,
+                Operation::DeleteUser,
+                &DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes(),
+            ),
+            metadata.client_table_capacity(),
+        );
+        apply_committed_prepare(
+            &*metadata.mux_stm,
+            &metadata.client_table,
+            true,
+            |_| {},
+            deletion,
+        );
+        assert_eq!(metadata.client_table.borrow().ended_sessions().count(), 1);
+        assert!(
+            metadata
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(CLIENT)
+                .is_empty(),
+            "revoked sessions must release their consumer assignments"
+        );
+    }
+
+    #[test]
+    fn given_rejected_or_older_user_deletion_when_applying_should_preserve_newer_sessions() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 100;
+        const USER: u32 = 1;
+        for (frontier, acting_user) in [(SESSION, 0), (0, u32::MAX)] {
+            let metadata = metadata_plane();
+            metadata.mux_stm.users().ensure_root_user("root", "hash");
+            let consensus = metadata.consensus.as_ref().unwrap();
+            let request = RoutedRequestHeader::default();
+            let create = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            metadata
+                .mux_stm
+                .update(build_prepare_message(
+                    consensus,
+                    &request,
+                    Operation::CreateUser,
+                    &create.to_bytes(),
+                ))
+                .unwrap();
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, SESSION))
+                .unwrap();
+            metadata.client_table_frontier.set(frontier);
+            let request = RoutedRequestHeader {
+                user_id: acting_user,
+                ..request
+            };
+            let deletion = build_prepare_message(
+                consensus,
+                &request,
+                Operation::DeleteUser,
+                &DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes(),
+            )
+            .transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.retry_capacity = u32::try_from(metadata.client_table_capacity()).unwrap();
+            });
+            apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                metadata.client_table_mutation_allowed(deletion.header().op),
+                |_| {},
+                consensus::seal_prepare_checksum(deletion),
+            );
+            assert_eq!(
+                metadata.client_table.borrow().get_epoch(CLIENT),
+                Some(SESSION)
+            );
+            assert_eq!(metadata.client_table.borrow().ended_sessions().count(), 0);
+            assert_eq!(
+                metadata
+                    .mux_stm
+                    .users()
+                    .read(|users| users.items.get(USER as usize).is_some()),
+                acting_user != 0,
+                "only the authorized deletion updates the state machine"
+            );
+        }
     }
 
     #[allow(clippy::future_not_send)]

@@ -92,9 +92,9 @@ completion contracts.
 
 This release changes protocol and storage formats. Servers and compatible
 clients deploy together; mixed versions and rolling upgrades are unsupported.
-Peers verify protocol, release and executable identity before admission.
-Deploy the same executable artifact to every replica; stripped or independently
-rebuilt binaries have different identities even when their release matches.
+Peers verify protocol, release and storage-format identity before admission.
+Executable packaging does not affect that identity, so stripping or rebuilding
+the same compatible release does not by itself prevent a replica from joining.
 Protocol 0.11.1 is the coordinated release boundary. Intermediate development
 builds advertising that version are not a compatibility guarantee.
 An unsupported data directory is refused before WAL scanning or file changes.
@@ -155,18 +155,40 @@ There is no automatic in-place migration for below-floor log certificates. Do no
 view numbers or delete superblocks or WAL directories to bypass the refusal:
 an empty history could then replace committed data during a view change.
 
-A recovered partition with no durable prepare-WAL frontier is also fenced as
-missing history. This includes a crash before its first frontier was published:
-the remaining files cannot prove that the partition never accepted a write.
-If every replica is in this state, none can supply the history needed to elect
-a partition primary. Restarting the replicas does not clear the fence.
+Before a partition can serve, initialization publishes its incarnation in
+`partition-initialization/<namespace>/created.revision` under the system data
+directory. This atomic record remains outside the partition directory, including
+after that directory is lost. Preserve it with metadata and partition backups.
+Storage format `IGGY-DURABLE-SESSIONS-3` requires this initialization contract;
+older data directories are refused before mutation.
+
+Retirement also writes `retirement.fence` in that external namespace directory
+before counting a permanently failed partition as retired. The fence names the
+failed incarnation and keeps it offline on subsequent boots, even if its
+partition directory is replaced. Healthy partitions and new logins can continue.
+If the fence cannot be persisted, the session remains retained and retirement
+retries. Temporary teardown tombstones and state transfer do not qualify as
+permanent failures.
+
+Partition retirement barriers batch up to 128 ended sessions per commit. Each
+session still requires retirement reports covering every allocated partition
+from a common replica quorum before metadata releases its registry slot. Segment
+deletion and purge do not invalidate those reports; changes to partition
+incarnations do. Metadata snapshot format 8 persists that separate revision.
+
+A committed partition that has never initialized on this replica can finish
+initialization after a crash, including when all replicas stopped before their
+first WAL frontiers were published. An initialized partition with no durable
+prepare-WAL frontier remains fenced as missing history. A singleton refuses to
+serve it; a replicated partition requires history from a healthy peer. If every
+replica lost initialized history, restarting does not clear the fence.
 
 Preserve the files and restore a verified consistent backup or use a validated
 recovery procedure. If the partition is independently known to be empty, or its
 data may be discarded, delete and recreate it through the metadata API. This
 creates a new partition incarnation and removes the old data. Missing files
 alone are not evidence that discarding that data is safe. Do not create a WAL
-frontier or remove the recovery fence manually.
+frontier or remove initialization records or recovery fences manually.
 
 ## Systemd integration
 

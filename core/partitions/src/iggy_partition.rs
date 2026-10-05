@@ -59,7 +59,7 @@ use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::requests::system::SessionIdentity;
+use iggy_binary_protocol::requests::system::{RetireSessionsRequest, SessionIdentity};
 use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
@@ -719,6 +719,11 @@ where
         self.required_metadata_frontier = self.required_metadata_frontier.max(created_revision);
     }
 
+    #[must_use]
+    pub const fn created_revision(&self) -> u64 {
+        self.created_revision
+    }
+
     /// A report covers only an applied barrier on a serving replica. WAL replay
     /// or the paired checkpoint must restore this floor before admission.
     #[must_use]
@@ -734,8 +739,11 @@ where
 
     fn pending_session_retirement(&self, client_id: u128, session: u64) -> bool {
         let matches_identity = |body: &[u8]| {
-            SessionIdentity::decode_from(body).is_ok_and(|identity| {
-                identity.client_id == client_id && identity.session == session
+            RetireSessionsRequest::decode_from(body).is_ok_and(|request| {
+                request
+                    .identities
+                    .iter()
+                    .any(|identity| identity.client_id == client_id && identity.session == session)
             })
         };
         self.consensus.with_pipeline(|pipeline| {
@@ -4524,7 +4532,7 @@ where
             // Retirement and the retiring identity must never occupy the same
             // pipeline. Otherwise a later commit could recreate its receipt.
             let retirement_conflict = if message.header().operation == Operation::RetireSession {
-                let Ok(identity) = SessionIdentity::decode_from(message.body()) else {
+                let Ok(retirement) = RetireSessionsRequest::decode_from(message.body()) else {
                     Self::send_partition_deny_or_log(
                         consensus,
                         message.header(),
@@ -4535,8 +4543,10 @@ where
                     .await;
                     return;
                 };
-                consensus.pending_request(identity.client_id).is_some()
-                    || self.pending_session_retirement(identity.client_id, identity.session)
+                retirement.identities.iter().any(|identity| {
+                    consensus.pending_request(identity.client_id).is_some()
+                        || self.pending_session_retirement(identity.client_id, identity.session)
+                })
             } else {
                 !is_auto_commit_client(client_id)
                     && self.pending_session_retirement(client_id, message.header().session)
@@ -5716,12 +5726,12 @@ where
 
         match header.operation {
             Operation::RetireSession => {
-                let identity = SessionIdentity::decode_from(message.body())
+                let retirement = RetireSessionsRequest::decode_from(message.body())
                     .map_err(|_| IggyError::InvalidCommand)?;
-                if identity.client_id == 0
-                    || is_auto_commit_client(identity.client_id)
-                    || identity.session == 0
-                    || identity.metadata_watermark < identity.session
+                if retirement
+                    .identities
+                    .iter()
+                    .any(|identity| is_auto_commit_client(identity.client_id))
                 {
                     return Err(IggyError::InvalidCommand);
                 }
@@ -6493,10 +6503,12 @@ where
         let committed_batch_stats = self.resolve_committed_batch_stats(&drained);
         let mut retirements = Vec::new();
         for (entry, batch_stats) in drained.iter().zip(&committed_batch_stats) {
+            let configured_capacity =
+                (!self.dedup.capacity_committed()).then(|| self.dedup.capacity());
             let retirement = (entry.header.operation == Operation::RetireSession)
                 .then(|| {
                     let prepare = self.log.journal().inner.repair_entry(entry.header.op)?;
-                    SessionIdentity::decode_from(
+                    RetireSessionsRequest::decode_from(
                         prepare
                             .as_slice()
                             .get(iggy_binary_protocol::HEADER_SIZE..)?,
@@ -6522,6 +6534,16 @@ where
                     operation: Some(entry.header.operation),
                 });
                 return;
+            }
+            if let Some(configured_capacity) = configured_capacity
+                && configured_capacity != self.dedup.capacity()
+            {
+                warn!(
+                    namespace_raw,
+                    configured_capacity,
+                    committed_capacity = self.dedup.capacity(),
+                    "partition retry capacity is fixed by committed state; ignoring local configuration"
+                );
             }
             if let Some(identity) = retirement {
                 retirements.push((entry.header.op, identity));
@@ -6661,12 +6683,14 @@ where
         let mut retirements = retirements.into_iter().peekable();
         for (mut entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
             let prepare_header = entry.header;
-            if let Some((_, identity)) = retirements.next_if(|(op, _)| *op == prepare_header.op) {
-                self.dedup
-                    .forget_session(identity.client_id, identity.session);
-                self.required_metadata_frontier = self
-                    .required_metadata_frontier
-                    .max(identity.metadata_watermark);
+            if let Some((_, retirement)) = retirements.next_if(|(op, _)| *op == prepare_header.op) {
+                for identity in retirement.identities {
+                    self.dedup
+                        .forget_session(identity.client_id, identity.session);
+                    self.required_metadata_frontier = self
+                        .required_metadata_frontier
+                        .max(identity.metadata_watermark);
+                }
             }
             // Fold the committed request into this group's dedup slice. Runs on
             // EVERY replica, not just the one that replies, so a promoted
@@ -9390,7 +9414,7 @@ mod tests {
     use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
     use crate::iggy_index_reader::IggyIndexReader;
     use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
@@ -10391,7 +10415,22 @@ mod tests {
         namespace: IggyNamespace,
         identity: SessionIdentity,
     ) -> Message<RoutedRequestHeader> {
-        let body = identity.to_bytes();
+        retire_sessions_request(namespace, &[identity])
+    }
+
+    fn retire_sessions_request(
+        namespace: IggyNamespace,
+        identities: &[SessionIdentity],
+    ) -> Message<RoutedRequestHeader> {
+        let mut body = BytesMut::new();
+        for identity in identities {
+            identity.encode(&mut body);
+        }
+        let watermark = identities
+            .iter()
+            .map(|identity| identity.metadata_watermark)
+            .max()
+            .unwrap();
         let size = size_of::<RoutedRequestHeader>() + body.len();
         let mut request = Message::<RoutedRequestHeader>::new(size).transmute_header(
             |_, header: &mut RoutedRequestHeader| {
@@ -10400,14 +10439,67 @@ mod tests {
                 header.cluster = TEST_CLUSTER;
                 header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
                 header.session = 1;
-                header.request = identity.metadata_watermark;
-                header.metadata_watermark = identity.metadata_watermark;
+                header.request = watermark;
+                header.metadata_watermark = watermark;
                 header.group = namespace.inner();
                 header.size = u32::try_from(size).unwrap();
             },
         );
         request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
         request
+    }
+
+    #[compio::test]
+    async fn given_ended_sessions_when_retiring_batch_should_use_one_partition_commit() {
+        const LIVE_CLIENT: u128 = 3;
+        let (mut partition, _) = recording_partition_at(0, 3);
+        for client_id in 1..=LIVE_CLIENT {
+            let mut send = checksumless_send_request(partition.namespace(), 1).transmute_header(
+                |header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.client = client_id;
+                },
+            );
+            send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+            partition.on_request(send, None).await;
+        }
+        partition.consensus.advance_commit_max(3);
+        partition.commit_journal(&repair_config()).await;
+        let identities = [
+            SessionIdentity {
+                client_id: 1,
+                session: 1,
+                metadata_watermark: 10,
+            },
+            SessionIdentity {
+                client_id: 2,
+                session: 1,
+                metadata_watermark: 11,
+            },
+        ];
+        partition
+            .on_request(
+                retire_sessions_request(partition.namespace(), &identities),
+                None,
+            )
+            .await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), 4);
+        partition.consensus.advance_commit_max(4);
+        partition.commit_journal(&repair_config()).await;
+        assert!(partition.fatal().is_none());
+        assert_eq!(
+            partition.dedup.count(),
+            1,
+            "one barrier must retire both ended sessions"
+        );
+        assert!(
+            partition.dedup.contains(LIVE_CLIENT),
+            "active sessions keep their retry receipts"
+        );
+        for identity in identities {
+            assert!(partition.session_retired(identity));
+        }
     }
 
     #[compio::test]
@@ -10561,9 +10653,13 @@ mod tests {
             session: 1,
             metadata_watermark: 10,
         };
+        let second_identity = SessionIdentity {
+            client_id: 3,
+            ..identity
+        };
         partition
             .on_request(
-                retire_session_request(partition.namespace(), identity),
+                retire_sessions_request(partition.namespace(), &[identity, second_identity]),
                 None,
             )
             .await;
@@ -10573,7 +10669,12 @@ mod tests {
                 .with_pipeline(LocalPipeline::request_queue_len),
             1
         );
-        let mut target = checksumless_send_request(partition.namespace(), 1);
+        let mut target = checksumless_send_request(partition.namespace(), 1).transmute_header(
+            |old, header: &mut RoutedRequestHeader| {
+                *header = old;
+                header.client = second_identity.client_id;
+            },
+        );
         target.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
             .copy_from_slice(&build_segment_record(partition.namespace(), 0));
         partition.on_request(target, None).await;

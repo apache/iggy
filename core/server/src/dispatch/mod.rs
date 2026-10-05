@@ -830,16 +830,20 @@ mod tests {
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply, test_shard,
+        FIRST_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply, request_message,
+        test_shard,
     };
+    use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE,
     };
-    use iggy_binary_protocol::requests::users::UpdateUserRequest;
+    use iggy_binary_protocol::requests::users::{
+        CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
+    };
     use iggy_binary_protocol::{EvictionHeader, ReplyHeader};
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireOptions};
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
@@ -929,6 +933,184 @@ mod tests {
                 assert!(sessions.borrow().get_session(TRANSPORT).is_none());
             }
         }
+    }
+
+    #[compio::test]
+    async fn given_deleted_user_when_id_reused_should_reject_retained_session() {
+        for primary in [false, true] {
+            assert_revoked_user_cannot_resume(Operation::DeleteUser, primary).await;
+        }
+    }
+
+    #[compio::test]
+    async fn given_deactivated_user_when_reactivated_should_reject_retained_session() {
+        for primary in [false, true] {
+            assert_revoked_user_cannot_resume(Operation::UpdateUser, primary).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_revoked_user_cannot_resume(operation: Operation, primary: bool) {
+        const CLIENT: u128 = 10;
+        const TRANSPORT: u128 = 20;
+        const SESSION: u64 = 2;
+        const USER: u32 = 1;
+        const ROOT_CLIENT: u128 = CLIENT + 1;
+        const SECRET: [u8; 32] = [0x5a; 32];
+        let bus = SpyBus::default();
+        let directory = tempfile::tempdir().unwrap();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        let shard = Rc::new(shard);
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        let create = CreateUserRequest {
+            username: WireName::new("original").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let created = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                0,
+                1,
+                &create.to_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(created.code, 0);
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                USER,
+                bind_verifier(CLIENT, USER, &SECRET),
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        metadata.applied_frontier().advance(SESSION);
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+        let identity = SessionIdentity {
+            client_id: CLIENT,
+            session: SESSION,
+            metadata_watermark: SESSION,
+        };
+        complete_session_binding(
+            &shard,
+            &sessions,
+            TRANSPORT,
+            identity,
+            BindSecret::new(Box::new(SECRET)),
+        )
+        .await
+        .unwrap();
+        let body = if operation == Operation::DeleteUser {
+            DeleteUserRequest {
+                user_id: WireIdentifier::numeric(USER),
+            }
+            .to_bytes()
+        } else {
+            UpdateUserRequest {
+                user_id: WireIdentifier::numeric(USER),
+                username: None,
+                status: Some(UserStatus::Inactive.as_code()),
+                options: WireOptions::empty(),
+            }
+            .to_bytes()
+        };
+        if primary {
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(ROOT_CLIENT, 0, SECRET, register_reply(ROOT_CLIENT, 1))
+                .unwrap();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            consensus.restore_commit_state(SESSION, SESSION);
+            consensus.sequencer().set_sequence(SESSION);
+            let request = request_message(operation, ROOT_CLIENT, 1, 1, &body).transmute_header(
+                |old, header: &mut RoutedRequestHeader| {
+                    *header = old;
+                    header.metadata_watermark = SESSION;
+                },
+            );
+            metadata.submit_request_in_process(request).await.unwrap();
+        } else {
+            let revocation = prepare_message(operation, 0, 3, &body).transmute_header(
+                |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                    *header = old;
+                    header.op = 3;
+                },
+            );
+            metadata::apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                |_| {},
+                consensus::seal_prepare_checksum(revocation),
+            );
+        }
+        let old_binding = sessions.borrow().get_session(TRANSPORT);
+        let restore = if operation == Operation::DeleteUser {
+            prepare_message(
+                Operation::CreateUser,
+                0,
+                4,
+                &CreateUserRequest {
+                    username: WireName::new("replacement").unwrap(),
+                    ..create
+                }
+                .to_bytes(),
+            )
+        } else {
+            prepare_message(
+                Operation::UpdateUser,
+                0,
+                4,
+                &UpdateUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    username: None,
+                    status: Some(UserStatus::Active.as_code()),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            )
+        };
+        assert_eq!(metadata.mux_stm.update(restore).unwrap().code, 0);
+        assert!(metadata.mux_stm.users().read(|users| {
+            users
+                .items
+                .get(USER as usize)
+                .is_some_and(|user| user.status == UserStatus::Active)
+        }));
+        let outcome = complete_session_binding(
+            &shard,
+            &sessions,
+            TRANSPORT,
+            identity,
+            BindSecret::new(Box::new(SECRET)),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(IggyError::Unauthenticated)),
+            "committed {operation:?} must reject the old secret after restoring user id {USER}: {outcome:?}"
+        );
+        assert!(
+            old_binding.is_none(),
+            "committed {operation:?} must invalidate an already authenticated connection"
+        );
+        assert_eq!(metadata.client_table.borrow().ended_sessions().count(), 1);
     }
 
     /// A test shard wired to its own lanes (the held sender feeds them),

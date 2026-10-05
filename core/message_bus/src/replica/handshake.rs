@@ -69,11 +69,9 @@ use iggy_binary_protocol::{Command, HEADER_SIZE};
 use iggy_common::IggyError;
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
-use std::io::Read;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tracing::{debug, warn};
 
 /// Identity and auth parameters the owning shard needs to run a
@@ -535,32 +533,73 @@ fn with_identity(
     })
 }
 
-/// Exact release, protocol, and executable identity for coordinated deployment.
-/// # Errors
-/// Returns an error if the running executable cannot be opened or read.
-pub fn binary_identity(release: &str) -> std::io::Result<[u8; auth::IDENTITY_LEN]> {
-    static ARTIFACT: OnceLock<std::io::Result<[u8; auth::IDENTITY_LEN]>> = OnceLock::new();
-    const READ_BYTES: usize = 32 * 1024;
-    let artifact = ARTIFACT.get_or_init(|| {
-        let mut file = std::fs::File::open(std::env::current_exe()?)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut bytes = vec![0; READ_BYTES];
-        loop {
-            let count = file.read(&mut bytes)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&bytes[..count]);
-        }
-        Ok(*hasher.finalize().as_bytes())
-    });
-    let artifact = artifact
-        .as_ref()
-        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
-    let mut hasher = blake3::Hasher::new_derive_key("apache.iggy replica identity v1");
+/// Protocol, release and storage identity, independent of executable packaging.
+#[must_use]
+pub fn binary_identity(release: &str, storage_format: &[u8]) -> [u8; auth::IDENTITY_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key("apache.iggy replica identity v2");
     hasher.update(&iggy_binary_protocol::IGGY_PROTOCOL_VERSION.to_le_bytes());
     hasher.update(&(release.len() as u64).to_le_bytes());
     hasher.update(release.as_bytes());
-    hasher.update(artifact);
-    Ok(*hasher.finalize().as_bytes())
+    hasher.update(&(storage_format.len() as u64).to_le_bytes());
+    hasher.update(storage_format);
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::binary_identity;
+    use std::io::Write;
+    use std::process::Command;
+
+    #[test]
+    fn given_identical_release_when_executable_bytes_differ_should_keep_peer_identity() {
+        const OUTPUT_ENV: &str = "IGGY_TEST_PEER_IDENTITY_OUTPUT";
+        const RELEASE: &str = "test-release";
+        let identity = binary_identity(RELEASE, b"test-storage");
+        if let Some(output) = std::env::var_os(OUTPUT_ENV) {
+            std::fs::write(output, identity).unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("identity-probe");
+        let output = directory.path().join("identity");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        // Trailing bytes change the artifact digest without changing the ELF program.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&executable)
+            .unwrap()
+            .write_all(b"different packaging")
+            .unwrap();
+        let probe = Command::new(executable)
+            .args([
+                "--exact",
+                "replica::handshake::tests::given_identical_release_when_executable_bytes_differ_should_keep_peer_identity",
+            ])
+            .env(OUTPUT_ENV, &output)
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "identity probe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(
+            std::fs::read(output).unwrap(),
+            identity,
+            "packaging bytes must not make compatible replicas reject each other"
+        );
+    }
+
+    #[test]
+    fn given_different_release_or_storage_when_identifying_peers_should_reject_mixing() {
+        let identity = binary_identity("release-1", b"storage-1");
+        assert_ne!(identity, binary_identity("release-2", b"storage-1"));
+        assert_ne!(identity, binary_identity("release-1", b"storage-2"));
+        assert_ne!(
+            binary_identity("release", b"-storage"),
+            binary_identity("release-", b"storage")
+        );
+    }
 }

@@ -123,6 +123,9 @@ pub async fn read_created_revision(partition_dir: &str) -> std::io::Result<Optio
 
 /// Durably replace the 8-byte little-endian record `name` in `directory`: write
 /// a temporary sibling, sync it, rename it over the record, sync the directory.
+///
+/// # Errors
+/// Returns the underlying open, write, rename, or synchronization error.
 pub async fn write_revision_record(
     directory: &str,
     name: &str,
@@ -148,6 +151,9 @@ pub async fn write_revision_record(
 
 /// Read the 8-byte little-endian record `name` in `directory`, `None` when it
 /// is absent.
+///
+/// # Errors
+/// Returns an I/O error or `InvalidData` if the record is not exactly eight bytes.
 pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Result<Option<u64>> {
     let path = Path::new(directory).join(name);
     match compio::fs::read(&path)

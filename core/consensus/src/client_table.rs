@@ -688,6 +688,27 @@ impl ClientTable {
         false
     }
 
+    /// Revoke a principal's bindings while retaining receipts until ordered retirement.
+    pub fn end_user_sessions(
+        &mut self,
+        user_id: u32,
+        ended_op: u64,
+    ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
+        let mut ended = Vec::new();
+        for entry in self.slots.iter_mut().flatten() {
+            if entry.user_id == user_id && entry.ended_op.is_none() {
+                entry.ended_op = Some(ended_op);
+                entry.attachment = None;
+                ended.push(iggy_binary_protocol::requests::system::SessionIdentity {
+                    client_id: entry.client_id,
+                    session: entry.epoch,
+                    metadata_watermark: ended_op,
+                });
+            }
+        }
+        ended
+    }
+
     /// Retain the exact Logout result before ending its session.
     ///
     /// # Errors

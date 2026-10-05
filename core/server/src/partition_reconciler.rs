@@ -659,11 +659,15 @@ async fn reconcile_additions(
             // delete that failed leaves the tombstone standing with no
             // `ConfirmRemove` behind it -- the same permanent fence the in-map
             // branch above escapes, told apart by the same signal.
-            if ctx.has_pending_delete_failure(ns) {
+            if ctx.has_pending_delete_failure(ns)
+                || partitions
+                    .failed_revision(&ns)
+                    .is_some_and(|failed| failed < epoch)
+            {
                 trace!(
                     shard = shard_id,
                     ns_raw = ns.inner(),
-                    "additions: ns tombstoned before materialisation with a failed disk delete; re-driving teardown"
+                    "additions: removing fenced files of a superseded or incompletely deleted incarnation"
                 );
                 tear_down_owned_partition(ctx, ns, counters).await;
                 continue;
@@ -777,13 +781,6 @@ async fn reconcile_additions(
                 ctx.cluster_id,
                 ctx.self_replica_id,
                 ctx.replica_count,
-                created_revision
-                    > ctx
-                        .shard
-                        .plane
-                        .metadata()
-                        .applied_frontier()
-                        .recovered_revision(),
                 Rc::clone(&ctx.shard.bus),
                 partitions,
             )
@@ -799,13 +796,6 @@ async fn reconcile_additions(
                 ctx.cluster_id,
                 ctx.self_replica_id,
                 ctx.replica_count,
-                created_revision
-                    > ctx
-                        .shard
-                        .plane
-                        .metadata()
-                        .applied_frontier()
-                        .recovered_revision(),
                 created_view,
                 Rc::clone(&ctx.shard.bus),
             )
@@ -2328,7 +2318,6 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
-            true,
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -2360,7 +2349,6 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
-            true,
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -3362,6 +3350,15 @@ mod tests {
         let partition_root = ctx.config.get_partition_path(0, 0, 0);
         assert!(std::path::Path::new(&partition_root).exists());
 
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-wedge",
+            vec![assignment(0, 1)],
+        );
+
         // Reconstruct the post-failed-teardown state: tombstone set +
         // shards_table row gone + a `FailureCause::Delete` record, but the
         // partition still in the map and its directory still on disk (the
@@ -3568,6 +3565,47 @@ mod tests {
         assert!(!partitions.is_tombstoned(&ns));
     }
 
+    #[compio::test]
+    async fn given_retirement_fence_when_topic_recreated_between_passes_should_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "old", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let old_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| inner.revision);
+        shard.plane.partitions().fence(namespace, old_revision);
+        crate::partition_helpers::record_partition_retirement_fence(
+            &ctx.config.get_system_path(),
+            namespace,
+            old_revision,
+        )
+        .await
+        .unwrap();
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "new",
+            vec![assignment(0, 1)],
+        );
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(!shard.plane.partitions().is_tombstoned(&namespace));
+        assert!(
+            shard.plane.partitions().contains(&namespace),
+            "a fence for the deleted incarnation must not strand its replacement"
+        );
+    }
+
     /// The sibling guard: while the namespace is STILL in the committed
     /// target, the fenced-ghost sweep must not touch it -- only an operator
     /// delete authorises destroying the bytes the fence guards. (The
@@ -3674,6 +3712,15 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         assert!(partitions.contains(&ns));
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-defer-skip",
+            vec![assignment(0, 1)],
+        );
 
         // Post-successful-teardown, pre-drain state: fenced, unlinked, and a
         // `ConfirmRemove` queued but not yet applied. `ns` is still in the

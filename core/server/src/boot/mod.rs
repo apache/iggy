@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-DURABLE-SESSIONS-2\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-DURABLE-SESSIONS-3\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -298,9 +298,6 @@ pub fn bootstrap(
     install_default_crypto_provider();
     validate_root_credentials_env(&config)?;
     warm_dummy_password_hash();
-    // Hash the executable before shard runtimes start doing asynchronous work.
-    message_bus::replica::handshake::binary_identity(crate::VERSION)
-        .map_err(ServerError::BinaryIdentity)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -533,8 +530,10 @@ async fn shard_main(
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
-        binary_identity: message_bus::replica::handshake::binary_identity(crate::VERSION)
-            .map_err(ServerError::BinaryIdentity)?,
+        binary_identity: message_bus::replica::handshake::binary_identity(
+            crate::VERSION,
+            STORAGE_FORMAT,
+        ),
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,
@@ -1040,6 +1039,7 @@ async fn shard_main(
         let cleaner_shard = Rc::clone(&shard);
         let interval = config.consumer_group.heartbeat_interval.get_duration();
         let timeout = config.consumer_group.session_timeout.get_duration();
+        let system_path = config.get_system_path();
         let handle = compio::runtime::spawn(async move {
             crate::consumer_group::liveness::run(
                 cleaner_shard,
@@ -1047,6 +1047,7 @@ async fn shard_main(
                 stop_rx,
                 interval,
                 timeout,
+                system_path,
             )
             .await;
         });
