@@ -3265,9 +3265,9 @@ mod tests {
         sim.register_client_with_primary(&client);
         let delayed = client.send_messages(namespace, &[Bytes::from_static(b"delayed")]);
         let later = client.send_messages(namespace, &[Bytes::from_static(b"later")]);
-        let committed =
+        let later_receipt =
             submit_and_wait_for_reply(&mut sim, client.client_id(), 0, later.deep_copy());
-        assert_eq!(committed.header().status, 0);
+        assert_eq!(later_receipt.header().status, 0);
         let committed =
             submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delayed.deep_copy());
         assert_eq!(committed.header().status, 0);
@@ -3276,10 +3276,17 @@ mod tests {
             expected.commit_offset, 1,
             "both reordered requests must append"
         );
-        for (replay, expected_status) in [(delayed, 0), (later, IggyError::RequestTooOld.as_code())]
+        for (replay, expected_status) in [(delayed, IggyError::RequestTooOld.as_code()), (later, 0)]
         {
             let duplicate = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, replay);
             assert_eq!(duplicate.header().status, expected_status);
+            if expected_status == 0 {
+                assert_eq!(
+                    duplicate.as_slice(),
+                    later_receipt.as_slice(),
+                    "the lower request must preserve the higher request's original receipt"
+                );
+            }
             assert_eq!(
                 sim.offsets(0, namespace),
                 Some(expected),
