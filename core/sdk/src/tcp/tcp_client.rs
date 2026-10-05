@@ -656,6 +656,10 @@ impl TcpClient {
                         trace!("Client is already connecting.");
                         return Ok(());
                     }
+                    _ if self.disconnected_by_caller.load(Ordering::SeqCst) => {
+                        trace!("Cannot connect. The caller disconnected the client.");
+                        return Err(IggyError::NotConnected);
+                    }
                     _ => *state = ClientState::Connecting,
                 }
             }
@@ -1713,6 +1717,7 @@ mod tests {
     use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
     use iggy_binary_protocol::{Command, HEADER_SIZE, Operation, ReplyHeader};
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
@@ -2992,6 +2997,23 @@ mod tests {
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = TcpClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
         );
     }
 }

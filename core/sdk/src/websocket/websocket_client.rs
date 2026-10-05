@@ -622,6 +622,10 @@ impl WebSocketClient {
                     return Err(IggyError::ClientShutdown);
                 }
                 ClientState::Connected => return Ok(()),
+                _ if self.disconnected_by_caller.load(Ordering::SeqCst) => {
+                    trace!("Cannot connect. The caller disconnected the client.");
+                    return Err(IggyError::NotConnected);
+                }
                 _ => {}
             }
 
@@ -1248,6 +1252,7 @@ const fn is_login_register_code(code: u32) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn a_roster_hop_does_not_enter_the_reconnect_ladder() {
@@ -1405,5 +1410,22 @@ mod tests {
 
         let client = client.unwrap();
         assert_eq!(client.config.server_address, "localhost:8092");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = WebSocketClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
+        );
     }
 }
