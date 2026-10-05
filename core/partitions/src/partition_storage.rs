@@ -247,7 +247,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     let recovered_consumers = load_partition_consumer_offsets(
         storage,
         &consumer_offsets_path,
-        "consumer",
+        ConsumerKind::Consumer.as_str(),
         stream_id,
         topic_id,
         partition_id,
@@ -301,7 +301,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
         .create_directories(Path::new(&external_group_offsets_path))
         .await
         .map_err(|_| PartitionRecoveryError::ConsumerOffsetsLoad {
-            consumer_kind: "external group",
+            consumer_kind: ConsumerKind::ExternalGroup.as_str(),
             stream_id,
             topic_id,
             partition_id,
@@ -838,11 +838,7 @@ async fn load_partition_group_offsets<S: DurableStorage>(
             Ok(RecoveredOffsets::default())
         }
         Err(source) => Err(PartitionRecoveryError::ConsumerOffsetsLoad {
-            consumer_kind: if kind == ConsumerKind::ExternalGroup {
-                "external group"
-            } else {
-                "consumer group"
-            },
+            consumer_kind: kind.as_str(),
             stream_id,
             topic_id,
             partition_id,

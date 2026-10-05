@@ -29,17 +29,21 @@
 //! both offset policies. An external group is never polled, so its bookmark is
 //! read directly. Boot never clamps it, so a resurrected one would survive.
 //!
-//! A third test purges after one consumer or group directory is gone, a state
-//! that recovery accepts. The purge must still record its generation.
+//! Two more tests cover an offsets directory sync that does not succeed. When
+//! one consumer or group directory is gone, a state that recovery accepts, the
+//! purge must still record its generation. When the external group directory
+//! sync fails, the purge stays unrecorded across power loss, and the purge that
+//! boot runs again removes the bookmark that came back.
 //!
 //! The harness enters after message history has been reset. It uses production
 //! purge completion and consumer recovery with `SimStorage`, then polls through
 //! the real `Next` path. Message recovery is narrower than server boot: a helper
 //! replays a durable journal into a new partition. No partition memory survives
-//! recovery. These controls do not inject sync failures or exercise purge retries.
+//! recovery. The two controls inject no sync failures. A retry within one
+//! process runs through `IggyPartition::purge`, so the partition crate tests it.
 
 use super::tests::owned_prepare;
-use super::{Crash, SimStorage};
+use super::{Crash, FaultMode, SimStorage, StorageOperation};
 use configs::server::ServerConfig;
 use consensus::{LocalPipeline, Sequencer, VsrConsensus};
 use futures::executor::block_on;
@@ -54,7 +58,7 @@ use partitions::offset_storage::{
 };
 use partitions::{
     IggyPartition, IggyPartitions, Partition, PartitionPathLayout, PartitionsConfig, PollingArgs,
-    PollingConsumer, configure_consumer_offsets_with_storage,
+    PollingConsumer, PurgeError, configure_consumer_offsets_with_storage,
 };
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -549,5 +553,80 @@ fn given_missing_offset_directory_when_purge_completes_should_record_the_generat
                 &format!("{kind:?}: a deleted bookmark must not return after power loss"),
             );
         }
+    });
+}
+
+/// A failed offsets dir sync leaves the purge unrecorded. After a power loss the
+/// unsynced unlink is back, and the old generation tells the reconciler to purge
+/// again. Recording the purge anyway would keep that external group bookmark for
+/// good, because boot never clamps it.
+#[test]
+fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot() {
+    block_on(async {
+        // A clean run locates the external group directory sync, and an
+        // identical run then fails exactly that operation.
+        let traced = PurgeStorageHarness::with_stored_progress(Durability::Replicated).await;
+        let mut partition = traced.empty_partition();
+        traced.recover_progress(&mut partition, STORED_OFFSET).await;
+        traced.storage.clear_trace();
+        partition
+            .complete_purge_with_storage(&traced.storage, NEW_GENERATION)
+            .await
+            .expect("the traced purge completes");
+        let external_dir_sync = traced
+            .storage
+            .trace()
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| **operation == StorageOperation::DirectorySync)
+            .nth(ConsumerKind::ExternalGroup.index())
+            .map(|(index, _)| index)
+            .expect("one offsets dir sync per kind");
+
+        let harness = PurgeStorageHarness::with_stored_progress(Durability::Replicated).await;
+        let mut partition = harness.empty_partition();
+        harness
+            .recover_progress(&mut partition, STORED_OFFSET)
+            .await;
+        harness
+            .storage
+            .fail_at(external_dir_sync, FaultMode::Before);
+        assert!(matches!(
+            partition
+                .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+                .await,
+            Err(PurgeError::GenerationNotRecorded(_))
+        ));
+        assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
+        drop(partition);
+
+        harness.storage.crash(Crash::PowerLoss);
+        let mut recovered = harness.empty_partition();
+        harness
+            .recover_progress(&mut recovered, STORED_OFFSET)
+            .await;
+        assert_eq!(
+            recovered.applied_purge_generation(),
+            OLD_GENERATION,
+            "the purge must still be owed after power loss"
+        );
+        let group_id = u32::try_from(GROUP_ID).expect("group id fits u32");
+        assert_eq!(
+            recovered.external_group_offset(group_id),
+            Some(STORED_OFFSET),
+            "the unlink that its failed sync left behind comes back"
+        );
+
+        // The purge that boot runs again removes it for good.
+        recovered
+            .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+            .await
+            .expect("the purge at boot completes");
+        drop(recovered);
+        harness.storage.crash(Crash::PowerLoss);
+        let mut purged = harness.empty_partition();
+        harness.recover_progress(&mut purged, 0).await;
+        assert_eq!(purged.applied_purge_generation(), NEW_GENERATION);
+        assert_bookmarks(&purged, None, "the purge at boot must clear every bookmark");
     });
 }

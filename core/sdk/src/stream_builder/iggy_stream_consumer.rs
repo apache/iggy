@@ -17,7 +17,7 @@
 
 use crate::clients::client::IggyClient;
 use crate::clients::consumer::IggyConsumer;
-use crate::prelude::{IggyError, SystemClient};
+use crate::prelude::{IggyError, SystemClient, Validatable};
 use crate::stream_builder::{IggyConsumerConfig, build};
 use tracing::trace;
 
@@ -40,6 +40,8 @@ impl IggyStreamConsumer {
         client: &IggyClient,
         config: &IggyConsumerConfig,
     ) -> Result<IggyConsumer, IggyError> {
+        config.validate()?;
+
         trace!("Check if client is connected");
         if client.ping().await.is_err() {
             return Err(IggyError::NotConnected);
@@ -70,6 +72,8 @@ impl IggyStreamConsumer {
         connection_string: &str,
         config: &IggyConsumerConfig,
     ) -> Result<(IggyClient, IggyConsumer), IggyError> {
+        config.validate()?;
+
         trace!("Build and connect iggy client");
         let client = build::build_iggy_client(connection_string).await?;
 
@@ -104,5 +108,27 @@ impl IggyStreamConsumer {
         let client = build::build_iggy_client(connection_string).await?;
 
         Ok(client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn given_external_group_kind_when_building_should_refuse_before_any_server_call() {
+        let config = IggyConsumerConfig::with_external_group_kind();
+
+        // Neither client can reach a server, so any other error proves a call was attempted.
+        let unconnected = IggyClient::default();
+        assert!(matches!(
+            IggyStreamConsumer::build(&unconnected, &config).await,
+            Err(IggyError::InvalidConfiguration)
+        ));
+        assert!(matches!(
+            IggyStreamConsumer::with_client_from_url("iggy://user:secret@127.0.0.1:1", &config)
+                .await,
+            Err(IggyError::InvalidConfiguration)
+        ));
     }
 }

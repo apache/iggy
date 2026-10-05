@@ -1021,9 +1021,10 @@ where
                         Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
                             // NOT fenced: the wipe ran and a fresh chain is
                             // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
+                            // the durable record failed, which leaves
+                            // `applied_purge_generation` unmoved and the
+                            // reconciler re-issuing the purge, which redoes
+                            // only the record.
                             // Same pacing argument as the frontier deferral
                             // above; the caches already describe wiped bytes.
                             self.drop_partition_transfer_state(namespace, partition);

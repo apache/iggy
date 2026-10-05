@@ -2146,14 +2146,21 @@ where
                 .retain(|start_offset, _| live.contains_key(start_offset));
         }
 
-        // An empty chain at frontier 0 is still served. The `NothingCommitted`
-        // gate above already refused a primary that committed nothing, and ops
-        // can commit without a message: an external group stores and deletes
-        // offsets on a partition that never took one. A backup behind the repair
-        // floor has no other way past those ops. A receiver that holds data
-        // refuses the empty chain anyway (`OfferRewindsDurableData` in
-        // `install_state_transfer`) unless a committed purge advances.
+        // An empty chain at frontier 0 tells the receiver to unlink its own, so
+        // serve it only when a recorded purge says the emptiness is the truth.
+        // Offset-only ops, such as external group commits, move the commit
+        // floor without a message, so a replica holding zero bytes passes the
+        // `NothingCommitted` gate above. Its empty chain would let a receiver at
+        // frontier 0 claim a history that neither replica holds.
+        // `install_state_transfer`'s `purge_advances` check re-decides the purge
+        // against the metadata plane and refuses the rest.
         let offsets_wire = self.offsets_wire_snapshot()?;
+        if segments.is_empty()
+            && offsets_wire.next_offset == 0
+            && offsets_wire.purge_generation == 0
+        {
+            return Err(PartitionTransferUnavailable::NothingCommitted);
+        }
         let offsets_bytes = Rc::new(offsets_wire.encode());
         let offsets_entry = consensus::StateArtifact::for_bytes(
             artifact_kind::CONSUMER_OFFSETS,
@@ -3461,6 +3468,9 @@ where
         // and this install just re-seeded that counter and recorded it durably
         // before the swap.
         self.purge_deferred = false;
+        // The chain an unrecorded purge reset is gone, so a purge still owed
+        // here has to run whole.
+        self.unrecorded_purge_generation = None;
 
         if let Some(persistence) = &self.persistence {
             let prepare = (!offsets_wire.checkpoint_prepare.is_empty())
@@ -3570,6 +3580,9 @@ where
         self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
         while self.log.retire_front().is_some() {}
+        // Same as a completed install: no chain an unrecorded purge reset
+        // survives this, so a purge still owed here has to run whole.
+        self.unrecorded_purge_generation = None;
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
         self.consumer_offsets.pin().clear();

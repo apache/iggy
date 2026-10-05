@@ -95,7 +95,9 @@ impl Consumer {
     /// Creates a new `ExternalGroup` from the `Identifier` of an Iggy consumer group.
     ///
     /// For offset calls only: no membership check, no range check, never polled, and no hold on
-    /// retention. Deleting the group deletes its offsets.
+    /// retention. Deleting the group deletes its offsets. A poll with it returns
+    /// [`IggyError::FeatureUnavailable`], and so does every call over HTTP, because the REST API
+    /// cannot name a consumer kind.
     pub fn external_group(id: Identifier) -> Self {
         Self {
             kind: ConsumerKind::ExternalGroup,

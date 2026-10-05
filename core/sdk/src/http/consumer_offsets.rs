@@ -113,3 +113,61 @@ pub(crate) fn refuse_external_group(consumer: &Consumer) -> Result<(), IggyError
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::{MessageClient, PollingStrategy};
+
+    /// Nothing listens on this port, so a call that reached the network would fail with a
+    /// transport error instead.
+    const UNREACHABLE_API: &str = "http://127.0.0.1:1";
+
+    #[tokio::test]
+    async fn given_external_group_when_calling_over_http_should_refuse_before_sending() {
+        let client = HttpClient::new(UNREACHABLE_API).unwrap();
+        let group = Consumer::external_group(Identifier::numeric(1).unwrap());
+        let stream = Identifier::numeric(1).unwrap();
+        let topic = Identifier::numeric(1).unwrap();
+
+        assert!(matches!(
+            client
+                .store_consumer_offset(&group, &stream, &topic, Some(0), 5)
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .get_consumer_offset(&group, &stream, &topic, Some(0))
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .delete_consumer_offset(&group, &stream, &topic, Some(0))
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .poll_messages(
+                    &stream,
+                    &topic,
+                    Some(0),
+                    &group,
+                    &PollingStrategy::next(),
+                    1,
+                    false
+                )
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+    }
+
+    #[test]
+    fn given_plain_consumer_when_guarded_should_pass() {
+        let consumer = Consumer::new(Identifier::numeric(1).unwrap());
+
+        assert!(refuse_external_group(&consumer).is_ok());
+    }
+}

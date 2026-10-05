@@ -58,7 +58,8 @@ pub(crate) async fn build_iggy_consumer(
     let mut builder = match consumer_kind {
         ConsumerKind::Consumer => client.consumer(consumer_name, stream, topic, partition)?,
         ConsumerKind::ConsumerGroup => client.consumer_group(consumer_name, stream, topic)?,
-        // Holds offsets only, it cannot poll.
+        // Holds offsets only, it cannot poll. `IggyConsumerConfig::validate` refuses it, with a
+        // log, before the entry points make any server call.
         ConsumerKind::ExternalGroup => return Err(IggyError::InvalidConfiguration),
     }
     .auto_commit(auto_commit)

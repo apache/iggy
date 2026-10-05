@@ -18,11 +18,12 @@
 use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
 use crate::prelude::{
     ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration,
-    PollingStrategy,
+    PollingStrategy, Validatable,
 };
 use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::error;
 
 const DEFAULT_PARTITION_ID: u32 = 0;
 
@@ -48,7 +49,8 @@ pub struct IggyConsumerConfig {
     create_topic_if_not_exists: bool,
     /// Members of the same consumer group use the same name.
     consumer_name: String,
-    /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
+    /// The type of consumer: `Consumer` or `ConsumerGroup`, the default. `ExternalGroup` only holds
+    /// offsets, so a consumer built with it fails with `InvalidConfiguration`.
     consumer_kind: ConsumerKind,
     /// Partition count when creating a topic.
     partitions_count: u32,
@@ -292,9 +294,44 @@ impl IggyConsumerConfig {
     }
 }
 
+impl Validatable<IggyError> for IggyConsumerConfig {
+    /// Refuses a configuration that no consumer can poll with, before any call reaches the server.
+    fn validate(&self) -> Result<(), IggyError> {
+        if self.consumer_kind == ConsumerKind::ExternalGroup {
+            error!(
+                consumer_kind = %self.consumer_kind,
+                "consumer_kind must be consumer or consumer_group: an external group only holds \
+                 offsets and cannot poll"
+            );
+            return Err(IggyError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl IggyConsumerConfig {
+    /// The default configuration with the one kind that no consumer can poll with.
+    pub(crate) fn with_external_group_kind() -> Self {
+        Self {
+            consumer_kind: ConsumerKind::ExternalGroup,
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_external_group_kind_when_validated_should_refuse_it() {
+        assert!(matches!(
+            IggyConsumerConfig::with_external_group_kind().validate(),
+            Err(IggyError::InvalidConfiguration)
+        ));
+        assert!(IggyConsumerConfig::default().validate().is_ok());
+    }
 
     #[test]
     fn should_be_equal() {
