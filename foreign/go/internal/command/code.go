@@ -48,6 +48,7 @@ const (
 	SendMessagesCode          Code = 101
 	GetPollRoutingCode        Code = 103
 	PollMessagesOnPrimaryCode Code = 104
+	GetSendContextCode        Code = 105
 	GetOffsetCode             Code = 120
 	StoreOffsetCode           Code = 121
 	DeleteConsumerOffsetCode  Code = 122

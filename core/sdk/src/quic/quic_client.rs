@@ -23,7 +23,8 @@ use crate::leader_aware::{
 use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::prelude::AutoLogin;
 use crate::session::ConsensusSession;
-use crate::vsr::retain_replay_header;
+use crate::vsr::{RetainedRequest, retain_replay_header};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
@@ -143,15 +144,19 @@ impl BinaryTransport for QuicClient {
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.write_offset(self, code, payload).await
+        self.poll_router
+            .write_offset(self, code, payload, context)
+            .await
     }
 
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.poll(self, request).await
+        self.poll_router.poll(self, request, context).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -172,12 +177,19 @@ impl BinaryTransport for QuicClient {
         }
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
         if is_poll_routing_code(code) {
-            return self.send_poll_request(code, payload).await;
+            return self
+                .send_poll_request_with_context(code, payload, context)
+                .await;
         }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-        let mut header = None;
+        let mut header = RetainedRequest::new(context);
         let mut result = self
             .send_raw_retaining_header(code, payload.clone(), &mut header)
             .await;
@@ -552,8 +564,14 @@ impl PollTransport for QuicClient {
         Ok(client)
     }
 
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        self.send_raw_request(code, payload, false, &mut None).await
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, false, &mut RetainedRequest::new(context))
+            .await
     }
 }
 
@@ -1036,7 +1054,7 @@ impl QuicClient {
         &self,
         code: u32,
         payload: Bytes,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
     ) -> Result<Bytes, IggyError> {
         self.send_raw_request(code, payload, true, header).await
     }
@@ -1046,7 +1064,7 @@ impl QuicClient {
         code: u32,
         payload: Bytes,
         retry_transient: bool,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
     ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
@@ -1085,29 +1103,16 @@ impl QuicClient {
                     return Err(IggyError::NotConnected);
                 };
 
-                let request_header = match preencoded {
-                    Some(header) => {
-                        let session = consensus_session
-                            .lock()
-                            .map_err(|_| IggyError::InvalidConfiguration)?;
-                        crate::vsr::validate_retained_header(&header, &session)?;
-                        header
-                    }
-                    None => {
-                        let mut session = consensus_session
-                            .lock()
-                            .map_err(|_| IggyError::InvalidConfiguration)?;
-                        crate::vsr::encode_request_header(&mut session, code, &payload)?.0
-                    }
+                let mut request_header = {
+                    let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                    used_header.encode(&mut session, code, &payload)?
                 };
-                used_header = Some(request_header);
                 trace!(
                     "Sending a QUIC VSR request of size {} with code: {code}",
                     request_header.size
                 );
                 // Replays retain the exact identity so committed receipts resolve
                 // uncertain attempts. Silence alone does not authorize a replay.
-                let header_bytes = bytemuck::bytes_of(&request_header);
                 let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
                 // `TransientNotAccepted` gets a short same-connection window
                 // only: past it the refusal is a verdict about who leads, not
@@ -1120,7 +1125,9 @@ impl QuicClient {
                     deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
                 };
                 let mut retry_outcome = crate::vsr::RetryOutcome::default();
+                let mut lifecycle_retry_interval = NOT_READY_RETRY_INTERVAL;
                 loop {
+                    let header_bytes = bytemuck::bytes_of(&request_header);
                     let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                         error!("Failed to open a bidirectional stream: {error}");
                         IggyError::QuicError
@@ -1155,6 +1162,16 @@ impl QuicClient {
                     {
                         Ok(reply) => return Ok(reply),
                         Err(error) if !retry_transient => return Err(error),
+                        Err(IggyError::LifecycleBusy) if tokio::time::Instant::now() + lifecycle_retry_interval < deadline => {
+                            used_header.header = None;
+                            request_header = {
+                                let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                                used_header.encode(&mut session, code, &payload)?
+                            };
+                            tokio::time::sleep(lifecycle_retry_interval).await;
+                            lifecycle_retry_interval = (lifecycle_retry_interval * 2).min(crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL);
+                        }
+
                         // `TransientNotCommitted` = the server replied with an
                         // explicit retry frame with an outcome that may still
                         // be resolving (not-caught-up / in-flight /
@@ -1350,19 +1367,19 @@ mod tests {
             .is_err()
         );
 
-        let mut header = None;
+        let mut request = crate::vsr::RetainedRequest::default();
         assert_eq!(
             client
                 .send_raw_request(
                     SEND_MESSAGES_CODE,
                     Bytes::from_static(b"send"),
                     false,
-                    &mut header,
+                    &mut request,
                 )
                 .await,
             Err(IggyError::InvalidConfiguration)
         );
-        assert!(header.is_none());
+        assert!(request.header.is_none());
         assert_eq!(
             client.reset_vsr_session().await,
             Err(IggyError::InvalidConfiguration)
@@ -1412,7 +1429,10 @@ mod tests {
         .unwrap()
         .0;
         let connection_guard = client.connection.lock().await;
-        let mut retained = Some(retained);
+        let mut retained = RetainedRequest {
+            header: Some(retained),
+            ..Default::default()
+        };
         let attempt = client.send_raw_request(SEND_MESSAGES_CODE, payload, false, &mut retained);
         tokio::pin!(attempt);
         tokio::select! {

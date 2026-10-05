@@ -748,6 +748,11 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .await
         .expect("send_messages: send_messages should work");
 
+    assert_unauthorized(
+        client.get_topic(&stream_id, &topic_id).await,
+        "send_messages: get_topic",
+    );
+
     // Cannot poll messages
     assert_unauthorized(
         client

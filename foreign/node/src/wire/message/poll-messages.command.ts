@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { Id } from '../identifier.utils.js';
+import { idKey, type Id } from '../identifier.utils.js';
 import type {
   CommandResponse,
   ClientProvider,
@@ -27,6 +27,7 @@ import {
 } from '../offset/offset.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError, responseError } from '../error.utils.js';
+import { EMPTY_PARTITION_CONTEXT } from '../vsr/header.js';
 import {
   SYNC_GROUP,
   type ConsumerGroupAssignment,
@@ -123,9 +124,6 @@ export const POLL_MESSAGES = {
   }
 };
 
-const idKey = (id: Id): string =>
-  typeof id === 'number' ? `number:${id}` : `string:${id}`;
-
 const groupKey = ({ streamId, topicId, consumer }: PollMessages): string =>
   `${idKey(streamId)}\0${idKey(topicId)}\0` +
   `${consumer.kind}:${idKey(consumer.id)}`;
@@ -202,6 +200,7 @@ const pollConsumerGroup = async (
     if (cursor.partitions.length === 0)
       return {
         partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
         currentOffset: 0n,
         count: 0,
         messages: []
@@ -233,6 +232,7 @@ const pollConsumerGroup = async (
   }
   return {
     partitionId: NO_ASSIGNED_PARTITION,
+    context: EMPTY_PARTITION_CONTEXT,
     currentOffset: 0n,
     count: 0,
     messages: []

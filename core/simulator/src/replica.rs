@@ -36,8 +36,8 @@ use server::boot::ServerHost;
 use server::shell::ShellShardHandle;
 use server_common::crypto;
 use server_common::sharding::{METADATA_GROUP, ShardId};
+use shard::ShardHost;
 use shard::shards_table::PapayaShardsTable;
-use shard::{NoopHost, ShardHost};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -118,11 +118,9 @@ fn load_local_checkpoint(data_dir: &std::path::Path) -> Option<(IggySnapshot, u1
 /// shard routes through the same `dispatch` -> inbox -> pump path as
 /// production instead of the old `without_inbox` bypass.
 ///
-/// `shell` selects the shard host. Off is the fast path: the inert
-/// [`NoopHost`], so the simulator drives raw client frames straight into
-/// `IggyShard::on_message`. On wires the server's real host (via
-/// [`ServerHost::new`]), exactly as production does, so a client request
-/// runs as a task concurrent with the pump.
+/// `shell` selects client admission. Raw clients enter `IggyShard::on_message`;
+/// shell clients run the production dispatch task concurrently with the pump.
+/// Both modes use the server host for internal ownership/lifecycle completions.
 ///
 /// Mirrors the server bootstrap's single-writer metadata: the consensus
 /// group, journal, snapshot, and the only writable metadata STM live on
@@ -415,18 +413,14 @@ pub fn new_shard(
     // - Test missed heartbeats and failed disconnect Logout by advancing virtual
     //   time, without calling expiry cleanup directly. Verify partition reassignment,
     //   saved offsets, and preservation of live or reconnected consumers.
-    let host: Rc<dyn ShardHost> = if shell {
-        Rc::new(ServerHost::new(
-            &SharedSimOutbox(Rc::clone(bus)),
-            &shard_handle,
-            Arc::new(ServerConfig::default()),
-            // Default-config PAT cap, like the system config above, so sim
-            // ingress admits exactly what a default-configured server does.
-            PersonalAccessTokenConfig::default().max_tokens_per_user,
-        ))
-    } else {
-        Rc::new(NoopHost)
-    };
+    let host: Rc<dyn ShardHost> = Rc::new(ServerHost::new(
+        &SharedSimOutbox(Rc::clone(bus)),
+        &shard_handle,
+        Arc::new(ServerConfig::default()),
+        // Default-config PAT cap, like the system config above, so sim
+        // ingress admits exactly what a default-configured server does.
+        PersonalAccessTokenConfig::default().max_tokens_per_user,
+    ));
 
     let shard = Rc::new(
         shard::IggyShard::new(
@@ -453,8 +447,7 @@ pub fn new_shard(
         .expect("sim mesh senders are built in canonical order"),
     );
 
-    // Late-bind the host's self-reference. Harmless shell-off: `NoopHost`
-    // never upgrades it.
+    // The host needs the finished shard for internal completion submissions.
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     (shard, metadata_bundle)
 }

@@ -16,7 +16,6 @@
 // under the License.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -53,7 +52,10 @@ use server_common::iobuf::Owned;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
-use super::test_support::{PollTestMetadata, partition_with_messages, partitions_config};
+use super::test_support::{
+    PollTestMetadata, install_group_owner, partition_with_messages,
+    partition_with_messages_at_revision, partitions_config,
+};
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
@@ -61,6 +63,7 @@ use crate::{
     PartitionRead, PartitionReadReply, Receiver, ReplicaTopology, ShardFrame, ShardIdentity,
     TaggedSender, channel, shard_channel,
 };
+use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
 
 #[compio::test]
 #[allow(clippy::too_many_lines)]
@@ -88,7 +91,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
     ] {
         let namespace = IggyNamespace::new(0, 0, 0);
         let bus = Rc::new(IggyMessageBus::new(0));
-        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let (mut partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
@@ -101,8 +104,20 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         ));
         for (group_id, client_id) in [(GROUP, CLIENT), (GROUP + 1, OTHER_CLIENT)] {
             let mut group = ConsumerGroup::new(group_id, Arc::from(format!("group-{group_id}")));
-            group.members.insert(ConsumerGroupMember::new(0, client_id));
-            group.rebalance_members(&[0]);
+            let mut member = ConsumerGroupMember::new(0, client_id);
+            member.session = Some(1);
+            group.members.insert(member);
+            group.rebalance_members(&topic.partitions, group_id, 1);
+            let assignment = &group.assignments[&0];
+            let pending = assignment.pending.unwrap();
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            let op = install_group_owner(&mut partition, &config, installation).await;
+            assert!(group.complete_revocation(0, &installation, op));
             topic.consumer_groups.insert(group_id, group);
         }
         stream.topics.insert(topic);
@@ -153,11 +168,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                     group.map_or(PollingConsumer::Consumer(USER as usize, 0), |group| {
                         PollingConsumer::ConsumerGroup(usize::try_from(group).unwrap(), 0)
                     }),
-                    &PollingArgs {
-                        strategy: PollingStrategy::first(),
-                        count: 1,
-                        auto_commit: true,
-                    },
+                    &PollingArgs::new(PollingStrategy::first(), 1, true),
                 )
                 .expect("the group has an unread message");
             let result = plan.execute_resident();
@@ -167,12 +178,14 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             Change::Logout => {
                 table.end_session(CLIENT, USER, table.get_epoch(CLIENT).unwrap(), 100);
             }
-            Change::Leave => streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default()),
+            Change::Leave => {
+                streams.remove_consumer_group_member(CLIENT, IggyTimestamp::default(), 0);
+            }
             Change::OtherLeave => {
-                streams.remove_consumer_group_member(OTHER_CLIENT, IggyTimestamp::default());
+                streams.remove_consumer_group_member(OTHER_CLIENT, IggyTimestamp::default(), 0);
             }
             Change::MissingLeave => {
-                streams.remove_consumer_group_member(OTHER_CLIENT + 1, IggyTimestamp::default());
+                streams.remove_consumer_group_member(OTHER_CLIENT + 1, IggyTimestamp::default(), 0);
             }
             Change::Rejoin => apply_poll_metadata(
                 &owner,
@@ -182,8 +195,8 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                     topic_id: WireIdentifier::numeric(0),
                     group_id: WireIdentifier::numeric(u32::try_from(GROUP).unwrap()),
                     client_id: CLIENT,
-                    in_flight: Vec::new(),
-                    session: None,
+
+                    session: 1,
                 }
                 .to_bytes(),
             ),
@@ -247,6 +260,7 @@ fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: 
     let mut message = Message::<PrepareHeader>::new(size);
     let header = PrepareHeader {
         command: Command::Prepare,
+        op: 100,
         operation,
         size: u32::try_from(size).unwrap(),
         ..Default::default()
@@ -263,7 +277,7 @@ fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: 
 #[allow(clippy::too_many_lines)]
 async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_admission() {
     const PARENT: u128 = 41;
-    const DATA_CLIENT: u128 = 51;
+    const DATA_CLIENT: u128 = PARENT;
     const USER: u32 = 7;
     const GROUP: u64 = 7;
     #[derive(Clone, Copy, Debug)]
@@ -293,7 +307,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
     ] {
         let namespace = IggyNamespace::new(0, 0, 1);
         let bus = Rc::new(IggyMessageBus::new(0));
-        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let (mut partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
@@ -308,14 +322,32 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
             ));
         }
         let mut group = ConsumerGroup::new(GROUP, Arc::from("offset-group"));
-        group.members.insert(ConsumerGroupMember::new(0, PARENT));
-        group.rebalance_members(&[0, 1]);
+        let mut member = ConsumerGroupMember::new(0, PARENT);
+        member.session = Some(1);
+        group.members.insert(member);
+        group.rebalance_members(&topic.partitions, 10, 1);
+        for partition_id in [0, 1] {
+            let assignment = &group.assignments[&partition_id];
+            let pending = assignment.pending.unwrap();
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: GROUP,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            let op = if partition_id == 1 {
+                install_group_owner(&mut partition, &config, installation).await
+            } else {
+                2
+            };
+            assert!(group.complete_revocation(partition_id, &installation, op));
+        }
         if matches!(change, Change::PendingRevocation) {
-            group
-                .members
-                .insert(ConsumerGroupMember::new(1, PARENT + 1));
-            group.rebalance_cooperative(&[0, 1], &HashSet::from([1]), 1);
-            assert_eq!(group.pending_revocations().len(), 1);
+            let mut member = ConsumerGroupMember::new(1, PARENT + 1);
+            member.session = Some(2);
+            group.members.insert(member);
+            group.rebalance_members(&topic.partitions, 11, 2);
+            assert!(group.assignments[&1].pending.is_some());
         }
         topic.consumer_groups.insert(GROUP, group);
         stream.topics.insert(topic);
@@ -379,6 +411,9 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                 cluster: 1,
                 group: namespace.inner(),
                 client: DATA_CLIENT,
+                partition_incarnation: 1,
+                owner_generation: 1,
+                metadata_watermark: 10,
                 user_id: USER,
                 session: 1,
                 request: 1,
@@ -416,7 +451,9 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                     )
                     .unwrap();
             }
-            Change::Leave => streams.remove_consumer_group_member(PARENT, IggyTimestamp::default()),
+            Change::Leave => {
+                streams.remove_consumer_group_member(PARENT, IggyTimestamp::default(), 0);
+            }
             Change::Delete => apply_poll_metadata(
                 &owner,
                 Operation::DeleteTopic,
@@ -464,11 +501,11 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
         if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
             assert_eq!(
                 partition.consensus().sequencer().current_sequence(),
-                if admitted { 2 } else { 1 },
+                if admitted { 3 } else { 2 },
                 "{change:?}"
             );
             if admitted {
-                partition.consensus().advance_commit_max(2);
+                partition.consensus().advance_commit_max(3);
                 partition.commit_journal(&config).await;
             }
         }
@@ -522,15 +559,12 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     );
     let bus = Rc::new(IggyMessageBus::new(0));
     let old_payloads = ["old zero", "old one", "old two"];
-    let (old_partition, config) = partition_with_messages(&bus, namespace, &old_payloads).await;
+    let (mut old_partition, config) = partition_with_messages(&bus, namespace, &old_payloads).await;
+    install_test_group_owner(&mut old_partition, &config, group_id).await;
     let (owner, _owner_sender) = owner_with_inbox(&bus, config, namespace);
     let partitions = owner.plane.partitions();
     partitions.insert(namespace, old_partition);
-    let poll_args = PollingArgs {
-        strategy: PollingStrategy::offset(0),
-        count: 3,
-        auto_commit: true,
-    };
+    let poll_args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
 
     // Read the committed old batch but hold its result before owner acceptance.
     // Resident bytes make the release ordering explicit without disk timing.
@@ -549,7 +583,9 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     // old offset fits the current partition would wrongly accept this result.
     // The pump has not started, so no partition borrow can span replacement.
     let fresh_payloads = ["fresh zero", "fresh one", "fresh two"];
-    let (replacement, _) = partition_with_messages(&bus, namespace, &fresh_payloads).await;
+    let (mut replacement, replacement_config) =
+        partition_with_messages_at_revision(&bus, namespace, &fresh_payloads, 2).await;
+    install_test_group_owner(&mut replacement, &replacement_config, group_id).await;
     drop(
         partitions
             .remove(&namespace)
@@ -631,6 +667,7 @@ async fn given_pending_group_read_when_partition_is_replaced_should_reject_stale
     let PartitionReadReply::Poll {
         fragments,
         current_offset,
+        ..
     } = fresh_replies
         .try_recv()
         .expect("owner processed the fresh completion")
@@ -673,7 +710,8 @@ async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_b
     );
     let bus = Rc::new(IggyMessageBus::new(0));
     let payloads = ["first completion", "second completion"];
-    let (partition, config) = partition_with_messages(&bus, namespace, &payloads).await;
+    let (mut partition, config) = partition_with_messages(&bus, namespace, &payloads).await;
+    install_test_group_owner(&mut partition, &config, group_id).await;
     let (owner, owner_sender) = owner_with_inbox(&bus, config, namespace);
     let partitions = owner.plane.partitions();
     partitions.insert(namespace, partition);
@@ -692,11 +730,7 @@ async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_b
             .build_poll_snapshot(
                 &namespace,
                 consumer,
-                &PollingArgs {
-                    strategy: PollingStrategy::offset(offset),
-                    count: 1,
-                    auto_commit: false,
-                },
+                &PollingArgs::new(PollingStrategy::offset(offset), 1, false),
             )
             .expect("fixture partition has a read snapshot");
         assert!(!plan.needs_off_pump_io());
@@ -1252,11 +1286,7 @@ fn queue_resident_poll(
         .build_poll_snapshot(
             &namespace,
             PollingConsumer::Consumer(1, 0),
-            &PollingArgs {
-                strategy: PollingStrategy::offset(0),
-                count: 1,
-                auto_commit: false,
-            },
+            &PollingArgs::new(PollingStrategy::offset(0), 1, false),
         )
         .expect("fixture has a read snapshot");
     assert!(!plan.needs_off_pump_io());
@@ -1282,6 +1312,7 @@ fn assert_single_message_reply(replies: &Receiver<PartitionReadReply>) {
     let PartitionReadReply::Poll {
         fragments,
         current_offset,
+        ..
     } = replies.try_recv().expect("owner replied to the completion")
     else {
         panic!("the fixture's read should succeed");
@@ -1313,4 +1344,23 @@ impl Wake for PumpWakeObserver {
     fn wake_by_ref(self: &Arc<Self>) {
         self.notified.store(true, Ordering::Relaxed);
     }
+}
+
+#[allow(clippy::future_not_send)]
+async fn install_test_group_owner(
+    partition: &mut partitions::IggyPartition<Rc<IggyMessageBus>>,
+    config: &PartitionsConfig,
+    group_id: u64,
+) {
+    let installation = InstallConsumerGroupOwnerRequest {
+        incarnation: partition.created_revision(),
+        group_id,
+        owner: iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner {
+            client_id: 1,
+            session: 1,
+            generation: 1,
+        },
+        metadata_op: 1,
+    };
+    install_group_owner(partition, config, installation).await;
 }

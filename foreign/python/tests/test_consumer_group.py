@@ -911,7 +911,7 @@ class TestConsumerGroup:
                 consumer.get_last_consumed_offset(current_partition_id)
                 == received_messages[-1].offset()
             )
-            assert consumer.get_last_stored_offset(current_partition_id) == 0
+            assert consumer.get_last_stored_offset(current_partition_id) is None
         finally:
             shutdown_event.set()
             await consume

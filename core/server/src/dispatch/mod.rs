@@ -686,13 +686,11 @@ async fn handle_client_request<B, MJ, S, SB>(
                     return;
                 }
             };
-            // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
-            // partition count for Join) before replication; see `crate::consumer_group`.
-            let request = match maybe_rewrite_consumer_group_request(shard, request).await {
+            // Attach the authenticated member identity to consumer-group
+            // Join/Leave before replication; see `crate::consumer_group`.
+            let request = match maybe_rewrite_consumer_group_request(request) {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
-                    // Preserve transient recovery rejection so the client can
-                    // retry the join once partition state is available.
                     send_pre_consensus_deny(
                         shard,
                         transport_client_id,

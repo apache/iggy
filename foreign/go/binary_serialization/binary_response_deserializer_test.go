@@ -30,6 +30,7 @@ func buildFetchPayload(payloadBody []byte) []byte {
 	buf := binary.LittleEndian.AppendUint32(nil, 1)
 	buf = binary.LittleEndian.AppendUint64(buf, 0)
 	buf = binary.LittleEndian.AppendUint32(buf, 1)
+	buf = append(buf, make([]byte, iggcon.PartitionContextSize)...)
 	return appendBatchRecord(buf, 0, 0, 0, batchFrame{payload: payloadBody})
 }
 

@@ -19,11 +19,13 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
@@ -44,9 +46,15 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     private static final byte ACK_QUORUM = 1;
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final PartitionContexts storeContexts;
 
     public ConsumerOffsetsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this.connectionSupplier = connectionSupplier;
+        this.storeContexts = new PartitionContexts(
+                connectionSupplier,
+                CommandCode.ConsumerOffset.GET_ROUTING.getValue(),
+                PollRouter.ATTACHMENT_BYTES,
+                false);
     }
 
     private AsyncTcpConnection connection() {
@@ -56,12 +64,8 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     @Override
     public CompletableFuture<Void> storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
-        var payload = BytesSerializer.toBytes(consumer);
-        payload.writeBytes(BytesSerializer.toBytes(streamId));
-        payload.writeBytes(BytesSerializer.toBytes(topicId));
-        payload.writeBytes(BytesSerializer.toBytes(partitionId));
-        payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
-        payload.writeByte(ACK_QUORUM);
+        var target = offsetTarget(consumer, streamId, topicId, partitionId);
+        var payload = storePayload(target.copy(), offset);
 
         log.debug(
                 "Storing consumer offset - Stream: {}, Topic: {}, Partition: {}, Consumer: {}, Offset: {}",
@@ -71,20 +75,33 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 consumer,
                 offset);
 
+        return storeContexts
+                .send(CommandCode.ConsumerOffset.STORE.getValue(), payload, target, target.readableBytes())
+                .thenAccept(ByteBuf::release);
+    }
+
+    @Override
+    public CompletableFuture<Void> storeConsumerOffset(
+            StreamId streamId,
+            TopicId topicId,
+            Long partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            PartitionContext context) {
+        var payload = storePayload(offsetTarget(consumer, streamId, topicId, Optional.of(partitionId)), offset);
         return connection()
-                .send(CommandCode.ConsumerOffset.STORE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                });
+                .send(
+                        CommandCode.ConsumerOffset.STORE.getValue(),
+                        payload,
+                        0,
+                        new AsyncTcpConnection.TransientFailoverState(context))
+                .thenAccept(ByteBuf::release);
     }
 
     @Override
     public CompletableFuture<Optional<ConsumerOffsetInfo>> getConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
-        var payload = BytesSerializer.toBytes(consumer);
-        payload.writeBytes(BytesSerializer.toBytes(streamId));
-        payload.writeBytes(BytesSerializer.toBytes(topicId));
-        payload.writeBytes(BytesSerializer.toBytes(partitionId));
+        var payload = offsetTarget(consumer, streamId, topicId, partitionId);
 
         log.debug(
                 "Getting consumer offset - Stream: {}, Topic: {}, Partition: {}, Consumer: {}",
@@ -106,5 +123,20 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                         response.release();
                     }
                 });
+    }
+
+    private static ByteBuf offsetTarget(
+            Consumer consumer, StreamId streamId, TopicId topicId, Optional<Long> partitionId) {
+        var target = BytesSerializer.toBytes(consumer);
+        target.writeBytes(BytesSerializer.toBytes(streamId));
+        target.writeBytes(BytesSerializer.toBytes(topicId));
+        target.writeBytes(BytesSerializer.toBytes(partitionId));
+        return target;
+    }
+
+    private static ByteBuf storePayload(ByteBuf target, BigInteger offset) {
+        target.writeBytes(BytesSerializer.toBytesAsU64(offset));
+        target.writeByte(ACK_QUORUM);
+        return target;
     }
 }

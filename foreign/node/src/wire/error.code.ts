@@ -87,6 +87,9 @@ export const translateErrorCode = (code: number): string => {
     case '84': return "Invalid number value";
     case '85': return "Request is below the deduplication window; outcome unknown, resending may duplicate the write";
 
+    case '87': return "The partition history is no longer available; this request cannot execute again";
+    case '88': return "A committed lifecycle operation prevents this mutation. Retry as a new request.";
+
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
 
@@ -148,6 +151,7 @@ export const translateErrorCode = (code: number): string => {
     case '2020': return "Topic directory: {0} not found";
     case '2021': return "Too many topics";
     case '2022': return "Partitions limit reached, raise [metadata] partitions_max";
+    case '2023': return "Partition resizing is disabled for this fixed topic";
 
     // TOPIC
     case '3000': return "Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}";

@@ -147,7 +147,7 @@ public sealed class PrimaryPollingTests
 
         Assert.Equal(metadataReads, cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE));
         Assert.Equal(standalone ? 2 : 0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(standalone ? 0 : 1, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
         if (!standalone)
         {
@@ -506,7 +506,7 @@ public sealed class PrimaryPollingTests
             TestContext.Current.CancellationToken);
 
         Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
         Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
     }
 
@@ -518,7 +518,7 @@ public sealed class PrimaryPollingTests
 
     private static byte[] Batch(MockRequest request)
     {
-        var body = new byte[16];
+        var body = new byte[40];
         BinaryPrimitives.WriteUInt32LittleEndian(body, Partition(request));
         return Reply(request.Operation, body);
     }
@@ -583,7 +583,9 @@ public sealed class PrimaryPollingTests
                     BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(16), request.Session);
                     BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(24), 1);
                     var body = new List<byte>(attachment);
-                    WriteNode(body, Primaries[Partition(request)].Port, false);
+                    body.AddRange(new byte[24]);
+                    WriteNode(body, Primaries.Length == 0 ? Coordinator.Port : Primaries[Partition(request)].Port,
+                        Primaries.Length == 0);
                     return Reply(request.Operation, body.ToArray());
                 }
 

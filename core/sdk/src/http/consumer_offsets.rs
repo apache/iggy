@@ -23,10 +23,31 @@ use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo};
+use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, ConsumerPosition};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        refuse_external_group(consumer)?;
+        self.put(
+            &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+            &StoreConsumerOffset {
+                consumer: consumer.clone(),
+                partition_id: Some(position.partition_id),
+                offset: position.offset,
+                context: Some(position.context),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -42,6 +63,7 @@ impl ConsumerOffsetClient for HttpClient {
                 consumer: consumer.clone(),
                 partition_id,
                 offset,
+                context: None,
             },
         )
         .await?;
@@ -117,7 +139,7 @@ pub(crate) fn refuse_external_group(consumer: &Consumer) -> Result<(), IggyError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{MessageClient, PollingStrategy};
+    use iggy_common::{MessageClient, PartitionContext, PollingStrategy};
 
     /// Nothing listens on this port, so a call that reached the network would fail with a
     /// transport error instead.
@@ -133,6 +155,21 @@ mod tests {
         assert!(matches!(
             client
                 .store_consumer_offset(&group, &stream, &topic, Some(0), 5)
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .store_consumer_position(
+                    &group,
+                    &stream,
+                    &topic,
+                    ConsumerPosition {
+                        partition_id: 0,
+                        offset: 5,
+                        context: PartitionContext::default(),
+                    },
+                )
                 .await,
             Err(IggyError::FeatureUnavailable)
         ));

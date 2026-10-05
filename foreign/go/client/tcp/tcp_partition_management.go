@@ -51,7 +51,7 @@ func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Id
 }
 
 func (c *IggyTcpClient) invalidateTopicCache(streamId, topicId iggcon.Identifier) {
-	c.topics.invalidatePartitionsCount(newTopicKey(streamId, topicId))
+	c.topics.invalidate(newTopicKey(streamId, topicId))
 }
 
 func (c *IggyTcpClient) dropTopicCache(streamId, topicId iggcon.Identifier) {

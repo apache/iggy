@@ -116,7 +116,7 @@ func pollRoutingReply(t *testing.T, read request, endpoint string, watermark uin
 	node, err := decoded.Nodes[0].MarshalBinary()
 	require.NoError(t, err)
 	parent := consumerSession{client: read.clientID(), session: read.sessionID(), watermark: watermark}
-	return replyFrame(vsr.OperationNonReplicated, append(parent.bytes(), node...))
+	return replyFrame(vsr.OperationNonReplicated, append(append(parent.bytes(), make([]byte, iggcon.PartitionContextSize)...), node...))
 }
 
 func pollPrimaryPartition(ctx context.Context, client *IggyTcpClient, partition uint32) (*iggcon.PolledMessage, error) {
@@ -438,7 +438,7 @@ func TestPrimaryPoll_RetirementDuringAttachmentIsNotCallerCancellation(t *testin
 		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
 	require.NoError(t, err)
 	key := string(payload[:len(payload)-pollParametersSize])
-	route, err := fixture.client.pollRoute(context.Background(), key, payload)
+	route, err := fixture.client.consumerRoute(context.Background(), key, payload, command.GetPollRoutingCode)
 	require.NoError(t, err)
 	completed := make(chan error, 1)
 	go func() {
@@ -618,7 +618,7 @@ func TestPrimaryPoll_UnknownTopologyCanRecoverAsStandalone(t *testing.T) {
 	assert.False(t, fixture.client.clustered.Load())
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
 	assert.Equal(t, 2, requestCount(fixture.coordinator.recorded(), command.GetClusterMetadataCode))
-	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
+	assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetPollRoutingCode))
 	assert.Zero(t, fixture.primaries[0].connections())
 }
 
@@ -736,7 +736,9 @@ func TestPrimaryPoll_InvalidBindingDoesNotPollAndRetiresConnection(t *testing.T)
 	}
 }
 
-func TestPrimaryPoll_PlainConsumerRoutesAndNonAutoCommitStaysOnCoordinator(t *testing.T) {
+// A backup refuses every poll, so a clustered poll without auto-commit routes
+// to the primary as well.
+func TestPrimaryPoll_PlainConsumerAndNonAutoCommitPollsRoute(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, nil, nil)
 	stream, topic, group := groupConsumer(t)
 	consumer := iggcon.NewSingleConsumer(group.Id)
@@ -750,8 +752,8 @@ func TestPrimaryPoll_PlainConsumerRoutesAndNonAutoCommitStaysOnCoordinator(t *te
 	_, err = fixture.client.PollMessages(context.Background(), stream, topic, consumer,
 		iggcon.NextPollingStrategy(), 1, false, &partition)
 	require.NoError(t, err)
-	assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
-	assert.Equal(t, 2, requestCount(fixture.primaries[0].recorded(), command.PollMessagesOnPrimaryCode))
+	assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+	assert.Equal(t, 3, requestCount(fixture.primaries[0].recorded(), command.PollMessagesOnPrimaryCode))
 }
 
 func TestPrimaryPoll_WarmRouteDoesNotWaitForCoordinatorIOAndColdRouteHonorsDeadline(t *testing.T) {
@@ -866,4 +868,81 @@ func TestPrimaryPoll_PoolEvictsIdleConnectionsAfterEndpointChurn(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, retired)
+}
+
+// Partition replies never age a cached route, so only the refusal itself can
+// retire the context it was stamped from.
+func TestCoordinatorRequests_RefetchTheRouteAfterARefusedContext(t *testing.T) {
+	stream, topic, group := groupConsumer(t)
+	consumer := iggcon.NewSingleConsumer(group.Id)
+	partition := uint32(1)
+	tests := []struct {
+		name    string
+		routing command.Code
+		call    func(*IggyTcpClient) error
+	}{
+		{"poll", command.GetPollRoutingCode, func(client *IggyTcpClient) error {
+			_, err := client.PollMessages(context.Background(), stream, topic, consumer,
+				iggcon.NextPollingStrategy(), 1, false, &partition)
+			return err
+		}},
+		{"store offset", command.GetOffsetRoutingCode, func(client *IggyTcpClient) error {
+			return client.StoreConsumerOffset(context.Background(), consumer, stream, topic, 7, &partition)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			routes := uint64(0)
+			server := serve(serverConn, func(_ int, read request) []byte {
+				switch {
+				case read.code() == uint32(test.routing):
+					// Each route names a newer incarnation, so a request shows
+					// which route it was stamped from.
+					routes++
+					answer := pollRoutingReply(t, read, "127.0.0.1:8090", read.sessionID())
+					binary.LittleEndian.PutUint64(answer[vsr.HeaderSize+consumerSessionSize:], routes)
+					return answer
+				case read.incarnation() == 1:
+					return statusReplyFrame(read.operation(), uint32(ierror.HistoryUnavailableCode), nil)
+				case read.operation() == vsr.OperationStoreConsumerOffset:
+					return replyFrame(vsr.OperationStoreConsumerOffset, resultSection())
+				default:
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(partition))
+				}
+			})
+
+			require.ErrorIs(t, test.call(client), ierror.ErrHistoryUnavailable)
+			require.NoError(t, test.call(client), "the refused context must not be stamped again")
+			assert.Equal(t, 2, requestCount(server.recorded(), test.routing))
+		})
+	}
+}
+
+// A context read at store time would let an offset polled before the
+// partition was recreated commit into the new incarnation.
+func TestStoreConsumerPosition_StampsTheContextOfThePoll(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationStoreConsumerOffset, resultSection())
+	})
+	stream, topic, consumer := groupConsumer(t)
+	polled := iggcon.PartitionContext{
+		Incarnation:     5,
+		OwnerGeneration: 3,
+		MetadataOp:      9,
+	}
+	position := iggcon.ConsumerPosition{PartitionId: 4, Offset: 42, Context: polled}
+
+	require.NoError(t, client.StoreConsumerPosition(context.Background(), consumer, stream, topic, position))
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 1, "a position needs no routing request")
+	var stamped iggcon.PartitionContext
+	require.NoError(t, stamped.UnmarshalBinary(recorded[0].header[frameOffsetContext:frameOffsetContext+iggcon.PartitionContextSize]))
+	assert.Equal(t, polled, stamped)
+	want, err := (&command.StoreConsumerOffsetRequest{StreamId: stream, TopicId: topic, Consumer: consumer,
+		Offset: position.Offset, PartitionId: &position.PartitionId}).MarshalBinary()
+	require.NoError(t, err)
+	assert.Equal(t, want, recorded[0].payload)
 }

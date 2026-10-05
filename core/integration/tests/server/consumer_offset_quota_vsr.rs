@@ -327,6 +327,7 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         )))
         .bearer_auth(&http.token)
         .json(&StoreConsumerOffset {
+            context: None,
             consumer: Consumer::new(Identifier::numeric(6).expect("consumer identifier")),
             partition_id: Some(PARTITION_ID),
             offset: 0,

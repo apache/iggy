@@ -23,10 +23,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
+use metadata::impls::metadata::StreamsFrontend;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
@@ -354,8 +357,9 @@ pub(in crate::http) async fn partition_write_replicated(
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
+    context: Option<PartitionContext>,
 ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
-    partition_write(state, session, operation, body, &mut None).await
+    partition_write(state, session, operation, body, context, &mut None).await
 }
 
 async fn partition_write(
@@ -363,6 +367,7 @@ async fn partition_write(
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
+    context: Option<PartitionContext>,
     dispatched: &mut Option<oneshot::Sender<Result<(), PartitionWriteError>>>,
 ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
     let deadline = Instant::now() + PARTITION_WRITE_REPLY_TIMEOUT;
@@ -373,6 +378,21 @@ async fn partition_write(
         session.client_id,
     )
     .map_err(PartitionWriteError::Rejected)?;
+    let attachment = session.attachment.borrow().clone();
+    let captured = crate::dispatch::partition::capture_offset_attachment(
+        state.shard.plane.metadata().mux_stm.streams(),
+        server_common::sharding::IggyNamespace::from_raw(namespace),
+        body,
+        session.client_id,
+        attachment,
+        operation,
+    )
+    .map_err(PartitionWriteError::Rejected)?;
+    let context = context.unwrap_or_else(|| {
+        captured
+            .metadata
+            .context(state.shard.plane.metadata().applied_frontier().get())
+    });
     let gate = session.partition_gate(namespace);
     // The group retains one receipt per session. Keep its lane occupied through
     // the reply wait, including when NoAck has already returned after dispatch.
@@ -399,6 +419,12 @@ async fn partition_write(
         request_id,
         body,
     );
+    let message = message.transmute_header(|header, routed: &mut RoutedRequestHeader| {
+        *routed = header;
+        routed.partition_incarnation = context.incarnation;
+        routed.owner_generation = context.owner_generation;
+        routed.minimum_metadata_op = context.metadata_op;
+    });
     let (guard, receiver) = state
         .shard
         .bus
@@ -454,8 +480,15 @@ pub(in crate::http) async fn produce_unacked(
     let (sent, dispatched) = oneshot::channel();
     compio::runtime::spawn(async move {
         let mut sent = Some(sent);
-        let result =
-            partition_write(&state, &session, Operation::SendMessages, &body, &mut sent).await;
+        let result = partition_write(
+            &state,
+            &session,
+            Operation::SendMessages,
+            &body,
+            None,
+            &mut sent,
+        )
+        .await;
         if let Some(sent) = sent {
             let _ = sent.send(result.map(|_| ()));
         } else if let Err(error) = result {

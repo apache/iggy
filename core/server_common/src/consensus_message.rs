@@ -1611,7 +1611,7 @@ mod tests {
     // non-replicated op code lives in `reserved[0..4]`) and unset only the
     // routing fields, whatever bytes the client sent in that tail.
     #[test]
-    fn into_routed_keeps_reserved_prefix_and_unsets_group() {
+    fn into_routed_keeps_client_context_and_clears_routing_fields() {
         const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
 
         let mut owned = header_bytes(Command::Request, 256);
@@ -1636,6 +1636,15 @@ mod tests {
             "the client-sent reserved tail must not leak into `group`"
         );
         assert_eq!(header.metadata_watermark, 0);
+        assert_eq!(
+            header.partition_incarnation,
+            client_header.partition_incarnation
+        );
+        assert_eq!(header.owner_generation, client_header.owner_generation);
+        assert_eq!(
+            header.minimum_metadata_op,
+            client_header.minimum_metadata_op
+        );
         assert_eq!(header.client, client_header.client);
         assert_eq!(header.operation, client_header.operation);
         assert_eq!(header.session, client_header.session);

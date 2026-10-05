@@ -19,6 +19,9 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Mappers;
+using Apache.Iggy.Utils;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
@@ -32,6 +35,7 @@ internal static class MockFrames
     internal const int REQUEST_ID_OFFSET = 168;
     internal const int REQUEST_OPERATION_OFFSET = 176;
     internal const int REQUEST_RESERVED_OFFSET = 196;
+    internal const int REQUEST_CONTEXT_OFFSET = 200;
     internal const int REPLY_REQUEST_ID_OFFSET = 200;
     internal const int REPLY_OPERATION_OFFSET = 208;
     internal const int REPLY_STATUS_OFFSET = 216;
@@ -50,6 +54,23 @@ internal static class MockFrames
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
+        if (request.Code == CommandCodes.GET_SEND_CONTEXT_CODE)
+        {
+            var context = new byte[24];
+            BinaryPrimitives.WriteUInt64LittleEndian(context, 17);
+            BinaryPrimitives.WriteUInt64LittleEndian(context.AsSpan(16), 1);
+            return Reply(OPERATION_NON_REPLICATED, context);
+        }
+        if (request.Code is CommandCodes.GET_POLL_ROUTING_CODE or CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE)
+        {
+            var route = new byte[56];
+            BinaryPrimitives.WriteUInt128LittleEndian(route, request.ClientId);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(16), request.Session);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(24), 1);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(32), 17);
+            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(48), 1);
+            return Reply(OPERATION_NON_REPLICATED, route);
+        }
         if (request.Code == BIND_SESSION_CODE)
         {
             return Reply(OPERATION_NON_REPLICATED, RegisterBody(request.Session)[4..]);
@@ -99,6 +120,7 @@ internal readonly record struct MockRequest(byte Operation, int Code, ulong Requ
 {
     internal UInt128 ClientId { get; init; }
     internal ulong Session { get; init; }
+    internal PartitionContext Context { get; init; }
     internal byte[] Body { get; init; } = [];
 }
 
@@ -220,6 +242,7 @@ internal sealed class MockNode : IDisposable
                 {
                     ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(128)),
                     Session = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(184)),
+                    Context = BinaryMapper.MapPartitionContext(header.AsSpan(REQUEST_CONTEXT_OFFSET)),
                     Body = body
                 };
                 lock (_recorded)

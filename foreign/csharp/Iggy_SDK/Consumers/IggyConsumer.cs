@@ -53,6 +53,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
+    private readonly ConcurrentDictionary<uint, PartitionContext> _lastPolledContext = new();
     private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
@@ -236,6 +237,8 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Manually stores the consumer offset for a specific partition.
     ///     Use this when auto-commit is disabled or when you need manual offset control.
+    ///     The offset is stored under the context of the partition's last poll, so the server refuses it when the
+    ///     partition was deleted and recreated since then or moved to another member of the consumer group.
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
@@ -247,7 +250,16 @@ public partial class IggyConsumer : IAsyncDisposable
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
         CancellationToken ct = default)
     {
-        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
+        if (_lastPolledContext.TryGetValue(partitionId, out var context))
+        {
+            await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId,
+                context, ct);
+        }
+        else
+        {
+            await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId,
+                ct);
+        }
 
         if (resetLastPolled)
         {
@@ -434,6 +446,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 return;
             }
 
+            _lastPolledContext[messages.PartitionId] = messages.Context;
             var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId,
                 out var lastPolledPartitionOffset);
 

@@ -1247,20 +1247,49 @@ pub(in crate::http) async fn poll_messages(
             // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
-    let reply = SendWrapper::new(
-        state
-            .shard
-            .partition_read(namespace, PartitionRead::Poll { consumer, args }),
-    )
+    let metadata = state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, None, HTTP_READ_CLIENT_ID)
+        .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?;
+    let context = metadata.context(state.shard.plane.metadata().applied_frontier().get());
+    if let Some(requested) = query.strategy.context {
+        if requested.incarnation != context.incarnation {
+            return Err(ReadError::Rejected(IggyError::HistoryUnavailable));
+        }
+        // TCP parity: a group poll already got the re-sync sentinel at resolve
+        // above, so this poll has no group and names group 0, as TCP does.
+        if requested.owner_generation != context.owner_generation {
+            return Err(ReadError::Rejected(
+                IggyError::ConsumerGroupPartitionNotOwned(0, partition_id),
+            ));
+        }
+        if requested.metadata_op > context.metadata_op {
+            return Err(ReadError::Rejected(IggyError::TransientNotAccepted));
+        }
+    }
+    let reply = SendWrapper::new(state.shard.partition_read(
+        namespace,
+        PartitionRead::Poll {
+            consumer,
+            args,
+            metadata: Some(metadata),
+        },
+    ))
     .await;
     match reply {
         Some(PartitionReadReply::Poll {
+            context,
             fragments,
             current_offset,
         }) => {
             let body = build_polled_messages_body(
                 partition_id,
                 current_offset,
+                context,
                 fragments,
                 state.shard.plane.partitions().config().encryptor.as_deref(),
             )
@@ -1395,6 +1424,7 @@ pub(in crate::http) async fn send_messages(
                 &identity.session,
                 Operation::SendMessages,
                 &body,
+                None,
             ))
             .await?;
             let policy = policy.map_or(iggy_common::Durability::Replicated, |policy| {
@@ -1457,6 +1487,7 @@ pub(in crate::http) async fn store_consumer_offset(
         &identity.session,
         Operation::StoreConsumerOffset,
         &body,
+        command.context,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1500,6 +1531,7 @@ pub(in crate::http) async fn delete_consumer_offset(
         &identity.session,
         Operation::DeleteConsumerOffset,
         &body,
+        None,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)

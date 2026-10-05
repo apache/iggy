@@ -142,7 +142,7 @@ public sealed class GroupPollingTests
 
     private static byte[] EmptyBatchBody(uint partitionId)
     {
-        var body = new byte[16];
+        var body = new byte[40];
         BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(0, 4), partitionId);
 
         return body;

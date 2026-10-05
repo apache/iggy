@@ -54,6 +54,16 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
     namespace: IggyNamespace,
     payloads: &[&str],
 ) -> (IggyPartition<B>, PartitionsConfig) {
+    partition_with_messages_at_revision(bus, namespace, payloads, 1).await
+}
+
+#[allow(clippy::future_not_send)]
+pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
+    bus: &B,
+    namespace: IggyNamespace,
+    payloads: &[&str],
+    created_revision: u64,
+) -> (IggyPartition<B>, PartitionsConfig) {
     let cluster_id = 1;
     let replica_id = 0;
     let replica_count = 3;
@@ -73,6 +83,7 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
         consensus,
         segment_size,
     ));
+    partition.set_created_revision(created_revision);
     partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
         durability: iggy_common::Durability::Persisted,
         consumer_offset_durability: iggy_common::Durability::Persisted,
@@ -101,6 +112,7 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
             session: 1,
             request: 1,
             group: namespace.inner(),
+            partition_incarnation: created_revision,
             ..Default::default()
         })
         .expect("encode append request");
@@ -117,4 +129,38 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
     assert_eq!(partition.offsets().commit_offset, payloads.len() as u64 - 1);
 
     (*partition, config)
+}
+
+#[allow(clippy::future_not_send)]
+pub(super) async fn install_group_owner<B: MessageBus + Clone>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    installation: iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest,
+) -> u64 {
+    let body = iggy_binary_protocol::WireEncode::to_bytes(&installation);
+    let size = size_of::<RoutedRequestHeader>() + body.len();
+    let mut message = server_common::Message::<RoutedRequestHeader>::new(size);
+    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    let message = message.transmute_header::<RoutedRequestHeader>(|_, header| {
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::InstallConsumerGroupOwner,
+            client: u128::MAX,
+            session: 1,
+            request: installation.metadata_op,
+            size: u32::try_from(size).unwrap(),
+            partition_incarnation: installation.incarnation,
+            metadata_watermark: installation.metadata_op,
+            ..Default::default()
+        };
+    });
+    partition.on_request(message, None).await;
+    let op = partition.consensus().sequencer().current_sequence();
+    partition.consensus().advance_commit_max(op);
+    partition.commit_journal(config).await;
+    assert_eq!(
+        partition.installed_consumer_group_owner(&installation),
+        Some(op)
+    );
+    op
 }

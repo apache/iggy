@@ -67,6 +67,7 @@ pub use traits::{IggyServerDependent, Restartable, TestBinary};
 
 pub use helpers::{
     USER_PASSWORD, assert_clean_system, create_user, delete_user, login_root, login_user,
+    wait_for_consumer_group_assignment,
 };
 
 pub use fixture::TestFixture;

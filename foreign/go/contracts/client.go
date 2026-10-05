@@ -123,10 +123,10 @@ type Client interface {
 	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
 	//
-	// Clustered auto-commit polls use persistent partition-primary connections
-	// while the coordinator retains group membership. Only explicit refusal
-	// before admission is retried. ErrTransientNotCommitted, or cancellation
-	// after sending a poll, can mean the offset advanced without a reply.
+	// Clustered polls use persistent partition-primary connections while the
+	// coordinator retains group membership. Only explicit refusal before
+	// admission is retried. ErrTransientNotCommitted, or cancellation after
+	// sending an auto-commit poll, can mean the offset advanced without a reply.
 	// These polls are never replayed automatically after an unknown outcome.
 	// Servers must support primary routing and consumer-session attachment.
 	//
@@ -156,6 +156,7 @@ type Client interface {
 
 	// StoreConsumerOffset store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	// The partition context is read at store time, so a polled offset belongs in StoreConsumerPosition.
 	StoreConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -163,6 +164,18 @@ type Client interface {
 		topicId Identifier,
 		offset uint64,
 		partitionId *uint32,
+	) error
+
+	// StoreConsumerPosition stores a polled position under the partition context of its poll.
+	// A store that outlives an incarnation or owner change fails with ErrHistoryUnavailable or
+	// ErrConsumerGroupPartitionNotOwned instead of committing into the new incarnation.
+	// Authentication is required, and the permission to poll the messages.
+	StoreConsumerPosition(
+		ctx context.Context,
+		consumer Consumer,
+		streamId Identifier,
+		topicId Identifier,
+		position ConsumerPosition,
 	) error
 
 	// GetConsumerOffset get the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
@@ -360,5 +373,7 @@ type Client interface {
 
 	// SendBinaryRequest sends a command code and payload and returns the raw response body.
 	// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+	// It stamps no partition context, so the server refuses message sends, polls and
+	// consumer offset writes with ierror.ErrHistoryUnavailable. Use the typed methods for those.
 	SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error)
 }

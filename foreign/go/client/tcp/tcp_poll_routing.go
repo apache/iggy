@@ -43,6 +43,7 @@ const (
 
 // Primary polls have no deduplication key, including within one VSR session.
 type singlePollExchange struct{}
+type capturedPartitionContext struct{}
 
 type pollExchangeState struct {
 	written  bool
@@ -91,6 +92,7 @@ func (s consumerSession) bytes() []byte {
 }
 
 type pollRoute struct {
+	context  iggcon.PartitionContext
 	endpoint string
 	parent   consumerSession
 }
@@ -192,13 +194,19 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 		}
 	}
 
+	var captured *iggcon.PartitionContext
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		route, err := c.pollRoute(ctx, key, payload)
+		route, err := c.consumerRoute(ctx, key, payload, command.GetPollRoutingCode)
 		var response []byte
 		if err == nil {
+			if captured == nil {
+				value := route.context
+				captured = &value
+			}
+			route.context = *captured
 			response, err = c.pollOnRoute(ctx, key, payload, route)
 		}
 		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
@@ -323,7 +331,7 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	if !c.pollParentCurrent(route.parent) {
 		return nil, ierror.ErrTransientNotAccepted
 	}
-	response, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.PollMessagesOnPrimaryCode), payload)
+	response, state, err := slot.client.sendPollRequest(context.WithValue(exchangeCtx, capturedPartitionContext{}, route.context), uint32(command.PollMessagesOnPrimaryCode), payload)
 	err = slot.exchangeError(ctx, state, err)
 	if errors.Is(err, ierror.ErrTransientNotAccepted) {
 		slot.attached = false
@@ -349,7 +357,7 @@ func (c *IggyTcpClient) pollParentCurrent(parent consumerSession) bool {
 	return c.matchesPollParent(parent) && parent.watermark >= c.metadataWatermark.Load()
 }
 
-func (c *IggyTcpClient) pollRoute(ctx context.Context, key string, payload []byte) (pollRoute, error) {
+func (c *IggyTcpClient) consumerRoute(ctx context.Context, key string, payload []byte, code command.Code) (pollRoute, error) {
 	c.polls.mu.Lock()
 	route, cached := c.polls.routes[key]
 	c.polls.mu.Unlock()
@@ -358,7 +366,7 @@ func (c *IggyTcpClient) pollRoute(ctx context.Context, key string, payload []byt
 	}
 	// This control command can recover a failed coordinator, but its one-exchange
 	// sendFrame path never moves a healthy coordinator after partition refusal.
-	body, err := c.SendBinaryRequest(ctx, uint32(command.GetPollRoutingCode), payload)
+	body, err := c.SendBinaryRequest(ctx, uint32(code), payload)
 	if err != nil {
 		return pollRoute{}, err
 	}
@@ -383,17 +391,22 @@ func (c *IggyTcpClient) pollRoute(ctx context.Context, key string, payload []byt
 }
 
 func decodePollRoute(body []byte) (pollRoute, error) {
-	if len(body) < consumerSessionSize {
+	if len(body) < consumerSessionSize+iggcon.PartitionContextSize {
 		return pollRoute{}, ierror.ErrInvalidCommand
 	}
 	var node iggcon.ClusterNode
-	if err := node.UnmarshalBinary(body[consumerSessionSize:]); err != nil {
+	if err := node.UnmarshalBinary(body[consumerSessionSize+iggcon.PartitionContextSize:]); err != nil {
 		return pollRoute{}, err
 	}
 	if node.Endpoints.Tcp == 0 {
 		return pollRoute{}, ierror.ErrFeatureUnavailable
 	}
+	var partitionContext iggcon.PartitionContext
+	if err := partitionContext.UnmarshalBinary(body[consumerSessionSize : consumerSessionSize+iggcon.PartitionContextSize]); err != nil {
+		return pollRoute{}, err
+	}
 	return pollRoute{
+		context:  partitionContext,
 		endpoint: net.JoinHostPort(strings.Trim(node.IP, "[]"), strconv.Itoa(int(node.Endpoints.Tcp))),
 		parent: consumerSession{
 			client:    vsr.ClientID{Lo: binary.LittleEndian.Uint64(body), Hi: binary.LittleEndian.Uint64(body[8:])},

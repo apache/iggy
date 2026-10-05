@@ -19,6 +19,7 @@ package tcp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"log/slog"
 
@@ -63,7 +64,7 @@ func (c *IggyTcpClient) SendMessages(
 			// The cached count pointed this send at a partition the server
 			// does not have, so the topic was likely recreated smaller.
 			// Nothing else invalidates a count another client changed.
-			c.topics.invalidatePartitionsCount(newTopicKey(streamId, topicId))
+			c.topics.invalidate(newTopicKey(streamId, topicId))
 		}
 		return nil, err
 	}
@@ -139,7 +140,7 @@ func (c *IggyTcpClient) PollMessages(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
-	if autoCommit && !c.topologyKnown.Load() {
+	if !c.topologyKnown.Load() {
 		if _, err := c.GetClusterMetadata(ctx); err != nil {
 			return nil, err
 		}
@@ -172,10 +173,10 @@ func (c *IggyTcpClient) pollPartition(
 		Count:       count,
 		PartitionId: partitionId,
 	}
-	routed := autoCommit && c.clustered.Load()
+	// Only the partition primary serves a poll, with or without auto-commit.
 	var buffer []byte
 	var err error
-	if routed {
+	if c.clustered.Load() {
 		buffer, err = c.pollPrimary(ctx, request)
 	} else {
 		buffer, err = c.do(ctx, request)
@@ -185,4 +186,70 @@ func (c *IggyTcpClient) pollPartition(
 	}
 
 	return binaryserialization.DeserializeFetchMessagesResponse(buffer, c.MessageCompression)
+}
+
+// capturePartitionContext attaches the partition context the command must
+// carry. It also returns the key of the cached route that context came from,
+// or an empty key when it came from no route.
+func (c *IggyTcpClient) capturePartitionContext(ctx context.Context, cmd command.Command) (context.Context, string, error) {
+	if _, captured := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); captured {
+		return ctx, "", nil
+	}
+	var routeCommand command.Command
+	routeCode := command.GetPollRoutingCode
+	switch request := cmd.(type) {
+	case *command.SendMessages:
+		if request.Partitioning.Kind != iggcon.PartitionIdKind || len(request.Partitioning.Value) != 4 {
+			return ctx, "", ierror.ErrInvalidCommand
+		}
+		stream, err := request.StreamId.MarshalBinary()
+		if err != nil {
+			return ctx, "", err
+		}
+		topic, err := request.TopicId.MarshalBinary()
+		if err != nil {
+			return ctx, "", err
+		}
+		key := topicKey{stream: string(stream), topic: string(topic)}
+		partition := binary.LittleEndian.Uint32(request.Partitioning.Value)
+		captured, cached := c.topics.partitionContext(key, partition)
+		if !cached {
+			payload := append(append(stream, topic...), request.Partitioning.Value...)
+			response, err := c.SendBinaryRequest(ctx, uint32(command.GetSendContextCode), payload)
+			if err != nil {
+				return ctx, "", err
+			}
+			if err := captured.UnmarshalBinary(response); err != nil {
+				return ctx, "", err
+			}
+			c.topics.setPartitionContext(key, partition, captured)
+		}
+		return context.WithValue(ctx, capturedPartitionContext{}, captured), "", nil
+	case *command.PollMessages:
+		routeCommand = request
+	case *command.StoreConsumerOffsetRequest:
+		routeCommand = &command.GetConsumerOffset{StreamId: request.StreamId, TopicId: request.TopicId,
+			Consumer: request.Consumer, PartitionId: request.PartitionId}
+		routeCode = command.GetOffsetRoutingCode
+	case *command.DeleteConsumerOffset:
+		routeCommand = &command.GetConsumerOffset{StreamId: request.StreamId, TopicId: request.TopicId,
+			Consumer: request.Consumer, PartitionId: request.PartitionId}
+		routeCode = command.GetOffsetRoutingCode
+	default:
+		return ctx, "", nil
+	}
+	payload, err := routeCommand.MarshalBinary()
+	if err != nil {
+		return ctx, "", err
+	}
+	keyBytes := payload
+	if routeCode == command.GetPollRoutingCode {
+		keyBytes = payload[:len(payload)-pollParametersSize]
+	}
+	key := string([]byte{byte(routeCode)}) + string(keyBytes)
+	route, err := c.consumerRoute(ctx, key, payload, routeCode)
+	if err != nil {
+		return ctx, "", err
+	}
+	return context.WithValue(ctx, capturedPartitionContext{}, route.context), key, nil
 }

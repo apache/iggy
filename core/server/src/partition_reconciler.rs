@@ -153,30 +153,26 @@
 //! cannot help; it needs a distinct "retry here shortly" code that does not move
 //! the client.
 //!
-//! TODO(krishna): replicated traffic is deliberately exempt from the incarnation
-//! fence, since a backup must apply whatever the primary admitted.
-//! `PrepareHeader` carries no incarnation, so a backup still holding a prior one
-//! cannot tell that an arriving prepare belongs to its replacement. Parked
-//! prepares are covered by the epoch stamp above; one arriving against an
-//! already-materialised stale incarnation is not. Closing it needs a wire-level
-//! discriminator, like `checkpoint_id` on every prepare
-//! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
 use crate::partition_helpers::{build_partition_fresh, load_partition_or_fence};
-use crate::shell::ServerShard;
+use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
+use consensus::Consensus;
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::FutureExt;
 use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
 use iggy_binary_protocol::{
-    AckLevel, Command, Operation, ReplyHeader, RoutedRequestHeader, WireConsumer, WireEncode,
-    WireIdentifier,
+    AckLevel, Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireConsumer,
+    WireEncode, WireIdentifier,
 };
-use iggy_common::{ConsumerGroupId, ConsumerKind, IggyTimestamp};
+use iggy_common::{ConsumerKind, IggyTimestamp};
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleFence};
 use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::{delete_partitions_from_disk, read_created_revision};
 use server_common::Message;
@@ -425,6 +421,11 @@ struct PassCounters {
     /// acted on is not answered: aging answers requests, discarding also
     /// destroys prepares.
     parked_reclaimed: usize,
+    /// Lifecycle fences this replica has not reported complete. Counted so the
+    /// pass does not arm the fast-skip: a fence applies, or its primary changes,
+    /// without a `Streams::revision` bump, so an armed skip would strand the
+    /// fence submission or the completion report.
+    lifecycle_fences_pending: usize,
     /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
     /// so the pass does not arm the fast-skip: the pump's drop clears the
     /// tombstone and re-wakes us without bumping `Streams::revision`, so an
@@ -448,6 +449,7 @@ impl PassCounters {
             + self.cg_offsets_completed
             + self.cg_offsets_pending
             + self.trims_pending
+            + self.lifecycle_fences_pending
             + self.deferred
             + self.parked_reclaimed
             + self.already_staged
@@ -474,7 +476,11 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // a timeout fires on wall-clock and a drain on partition-offset state, and
     // neither bumps `Streams::revision`, so the skip would otherwise starve an
     // idle group's pending revocations forever. Cheap no-op when none pending.
-    reconcile_pending_revocations(ctx);
+    reconcile_pending_revocations(
+        &ctx.shard,
+        IggyTimestamp::now().as_micros(),
+        ctx.config.consumer_group.rebalancing_timeout.as_micros(),
+    );
 
     // Fast-skip: committed partition set unchanged since the last
     // fully-converged pass and no backoff retry due, so the O(N) diff is
@@ -517,6 +523,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_parked_frames(ctx, &mut counters);
     reconcile_consumer_group_offsets(ctx, &mut counters);
     reconcile_segment_truncations(ctx, &mut counters);
+    counters.lifecycle_fences_pending += reconcile_partition_lifecycles(&ctx.shard);
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -546,6 +553,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             already_staged = counters.already_staged,
             parked_reclaimed = counters.parked_reclaimed,
             trims_pending = counters.trims_pending,
+            lifecycle_fences_pending = counters.lifecycle_fences_pending,
             cg_offsets_pending = counters.cg_offsets_pending,
             "partition reconciler pass complete"
         );
@@ -1069,8 +1077,8 @@ async fn tear_down_owned_partition(
 fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let live_groups = snapshot_topic_live_groups(ctx);
     let partitions = ctx.shard.plane.partitions();
-    let owned: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
-    for namespace in owned {
+    let namespaces: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
+    for namespace in namespaces {
         if ctx
             .group_offset_cleanup_inflight
             .borrow()
@@ -1096,7 +1104,31 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
         // reconciler. Unprocessed keys keep the partition's dirty flag armed.
         let mut tickets = Vec::with_capacity(dead.len().min(GROUP_OFFSET_DELETES_PER_PASS));
         for (kind, consumer_id) in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
-            let request = group_offset_delete_request(namespace, kind, consumer_id);
+            let context = partitions
+                .with_partition(&namespace, |partition| {
+                    let owner_generation = if kind == ConsumerKind::ConsumerGroup {
+                        let owner = partition.consumer_group_owner(u64::from(consumer_id))?;
+                        if !owner.is_unassigned() {
+                            return None;
+                        }
+                        owner.generation
+                    } else {
+                        0
+                    };
+                    Some(
+                        iggy_binary_protocol::primitives::partition_history::PartitionContext {
+                            incarnation: partition.created_revision(),
+                            owner_generation,
+                            metadata_op: ctx.shard.plane.metadata().applied_frontier().get(),
+                        },
+                    )
+                })
+                .flatten();
+            let Some(context) = context else {
+                counters.cg_offsets_pending += 1;
+                continue;
+            };
+            let request = group_offset_delete_request(namespace, kind, consumer_id, context);
             if let Ok(ticket) = ctx.shard.partition_submit(namespace, request) {
                 counters.cg_offsets_submitted += 1;
                 tickets.push(ticket);
@@ -1104,7 +1136,10 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
                 counters.cg_offsets_pending += 1;
             }
         }
-        if tickets.is_empty() {
+        let retirement_ticket =
+            consumer_group_retirement_request(ctx, namespace, *next_group_id, live)
+                .and_then(|request| ctx.shard.partition_submit(namespace, request).ok());
+        if tickets.is_empty() && retirement_ticket.is_none() {
             continue;
         }
         ctx.group_offset_cleanup_inflight
@@ -1120,6 +1155,9 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
                     .map(|ticket| shard.await_partition_submit(ticket)),
             )
             .await;
+            if let Some(ticket) = retirement_ticket {
+                shard.await_partition_submit(ticket).await;
+            }
             let count = replies
                 .into_iter()
                 .flatten()
@@ -1143,10 +1181,56 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
     }
 }
 
+fn consumer_group_retirement_request(
+    ctx: &ReconcilerCtx,
+    namespace: IggyNamespace,
+    next_group_id: u64,
+    live: &AHashSet<u64>,
+) -> Option<Message<RoutedRequestHeader>> {
+    let catalog = ctx
+        .shard
+        .plane
+        .partitions()
+        .with_partition(&namespace, |partition| {
+            if !partition.consensus().is_primary()
+                || !partition.consensus().is_normal()
+                || !partition.has_retirable_consumer_group_owners(|id| {
+                    id >= next_group_id || live.contains(&id)
+                })
+            {
+                return None;
+            }
+            let mut live_group_ids: Vec<_> = live.iter().copied().collect();
+            live_group_ids.sort_unstable();
+            Some(
+                iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest {
+                    incarnation: partition.created_revision(),
+                    metadata_op: ctx.shard.plane.metadata().applied_frontier().get(),
+                    next_group_id,
+                    live_group_ids,
+                },
+            )
+        })
+        .flatten()?;
+    let context = iggy_binary_protocol::primitives::partition_history::PartitionContext {
+        incarnation: catalog.incarnation,
+        owner_generation: 0,
+        metadata_op: catalog.metadata_op,
+    };
+    Some(partition_maintenance_request(
+        namespace,
+        Operation::RetireConsumerGroupOwners,
+        &catalog.to_bytes(),
+        context,
+        1,
+    ))
+}
+
 fn group_offset_delete_request(
     namespace: IggyNamespace,
     kind: ConsumerKind,
     consumer_id: u32,
+    context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
 ) -> Message<RoutedRequestHeader> {
     let body = DeleteConsumerOffsetRequest {
         consumer: WireConsumer {
@@ -1163,82 +1247,113 @@ fn group_offset_delete_request(
         ack: AckLevel::Quorum,
     }
     .to_bytes();
+    partition_maintenance_request(
+        namespace,
+        Operation::DeleteConsumerOffset,
+        &body,
+        context,
+        1,
+    )
+}
+
+fn partition_maintenance_request(
+    namespace: IggyNamespace,
+    operation: Operation,
+    body: &[u8],
+    context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
+    request_id: u64,
+) -> Message<RoutedRequestHeader> {
     let size = size_of::<RoutedRequestHeader>() + body.len();
     let mut request = Message::<RoutedRequestHeader>::new(size);
-    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
     request.transmute_header(|_, header: &mut RoutedRequestHeader| {
         *header = RoutedRequestHeader {
             command: Command::Request,
-            operation: Operation::DeleteConsumerOffset,
-            size: u32::try_from(size).expect("offset request fits u32"),
+            operation,
+            size: u32::try_from(size).expect("maintenance request fits u32"),
             client: AUTO_COMMIT_CLIENT_ID,
             session: 1,
-            request: 1,
+            request: request_id,
             group: namespace.inner(),
+            partition_incarnation: context.incarnation,
+            owner_generation: context.owner_generation,
+            minimum_metadata_op: context.metadata_op,
+            metadata_watermark: context.metadata_op,
             ..Default::default()
         };
     })
 }
 
-/// Complete cooperative consumer-group revocations whose source member has
-/// drained the partition (`committed >= last_polled`), was never polled, or
-/// timed out. Reads pending revocations from metadata + local partition offset
-/// state, then submits a `CompleteRevocation` op to shard 0 (the metadata
-/// consensus owner). Idempotent + fire-and-forget: a not-yet-completable or
-/// transiently-failed revocation is retried next pass.
-#[allow(clippy::cast_possible_truncation)]
-fn reconcile_pending_revocations(ctx: &ReconcilerCtx) {
-    let streams = ctx.shard.plane.metadata().mux_stm.streams();
-    // O(1) fast-skip before the walk: `consumer_group_pending_revocations`
-    // allocates a vec and walks every stream/topic/group/member, and the
-    // reconciler hits this every tick. `has_pending_revocations` reads the
-    // maintained counter, so the common (nothing-pending) case pays nothing.
+/// Only the partition primary decides drain and orders installation. Any local
+/// replica may relay matching committed installation evidence to metadata.
+pub fn reconcile_pending_revocations<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    now: u64,
+    timeout: u64,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let streams = metadata.mux_stm.streams();
     if !streams.has_pending_revocations() {
         return;
     }
-    let pending = streams.consumer_group_pending_revocations();
-    if pending.is_empty() {
-        return;
-    }
-    let partitions = ctx.shard.plane.partitions();
-    let now = IggyTimestamp::now().as_micros();
-    let timeout = ctx.config.consumer_group.rebalancing_timeout.as_micros();
-    for (stream_id, topic_id, group_id, source_client_id, partition_id, created_at) in pending {
-        let ns = IggyNamespace::new(stream_id as usize, topic_id as usize, partition_id as usize);
-        // The partition lives on its owner shard; only that shard's reconciler
-        // can read its offsets. Other shards skip (the owner completes it).
-        let Some(partition) = partitions.get_by_ns(&ns) else {
-            continue;
-        };
-        let key = ConsumerGroupId(group_id as usize);
-        let last_polled = partition
-            .last_polled_offsets
-            .pin()
-            .get(&key)
-            .map(|offset| offset.offset.load(std::sync::atomic::Ordering::Relaxed));
-        let committed = partition
-            .consumer_group_offsets
-            .pin()
-            .get(&key)
-            .map(|offset| offset.offset.load(std::sync::atomic::Ordering::Relaxed));
-        let timed_out = now.saturating_sub(created_at) >= timeout;
-        // None: never polled -> nothing in flight, hand off now. Some(polled):
-        // only safe once the source committed what it was served (or timeout).
-        let completable =
-            last_polled.is_none_or(|polled| committed.is_some_and(|c| c >= polled) || timed_out);
-        if !completable {
+    let transitions = streams.consumer_group_pending_revocations();
+    let partitions = shard.plane.partitions();
+    for transition in transitions {
+        if streams.lifecycle_blocks_consumer(
+            transition.stream_id as usize,
+            transition.topic_id as usize,
+            Some(transition.installation.group_id),
+        ) {
             continue;
         }
-        let (reply, _rx) = shard::channel::<Option<u64>>(1);
-        ctx.shard
-            .forward_metadata_submit(MetadataSubmit::CompleteRevocation {
-                stream_id,
-                topic_id,
-                group_id,
-                source_client_id,
-                partition_id,
+        let namespace = IggyNamespace::new(
+            transition.stream_id as usize,
+            transition.topic_id as usize,
+            transition.partition_id as usize,
+        );
+        let Some(partition) = partitions.get_by_ns(&namespace) else {
+            continue;
+        };
+        if let Some(partition_op) =
+            partition.installed_consumer_group_owner(&transition.installation)
+        {
+            let (reply, _receiver) = shard::channel::<Option<u64>>(1);
+            shard.forward_metadata_submit(MetadataSubmit::CompleteRevocation {
+                stream_id: transition.stream_id,
+                topic_id: transition.topic_id,
+                partition_id: transition.partition_id,
+                installation: transition.installation,
+                partition_op,
                 reply,
             });
+            continue;
+        }
+        let consensus = partition.consensus();
+        if !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || partition.created_revision() != transition.installation.incarnation
+        {
+            continue;
+        }
+        let drained = transition.source.is_some_and(|source| {
+            partition.consumer_group_drained(transition.installation.group_id, source)
+        });
+        if !transition.skip_drain && !drained && now.saturating_sub(transition.created_at) < timeout
+        {
+            continue;
+        }
+        submit_partition_fence(
+            shard,
+            namespace,
+            LifecycleFence::Owner(transition.installation),
+        );
     }
 }
 
@@ -1426,6 +1541,104 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounter
     }
 }
 
+/// A report relays committed local evidence. Only the partition primary orders a fence.
+#[must_use]
+pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> usize
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let mut pending = 0;
+    let metadata = shard.plane.metadata();
+    let partitions = shard.plane.partitions();
+    for intent in metadata.mux_stm.streams().pending_lifecycles() {
+        for target in intent
+            .partitions
+            .iter()
+            .filter(|target| target.partition_op.is_none())
+        {
+            let namespace = IggyNamespace::new(
+                intent.stream_id as usize,
+                target.topic_id as usize,
+                target.partition_id as usize,
+            );
+            let Some(partition) = partitions.get_by_ns(&namespace) else {
+                continue;
+            };
+            pending += 1;
+            let installed = match target.fence {
+                LifecycleFence::History(transition) => {
+                    partition.installed_history_transition(&transition)
+                }
+                LifecycleFence::Owner(installation) => {
+                    partition.installed_consumer_group_owner(&installation)
+                }
+            };
+            if let Some(partition_op) = installed {
+                shard.forward_metadata_submit(MetadataSubmit::CompleteLifecycle(
+                    CompleteLifecycleRequest {
+                        metadata_op: intent.context.metadata_op,
+                        stream_id: intent.stream_id,
+                        topic_id: target.topic_id,
+                        partition_id: target.partition_id,
+                        partition_op,
+                    },
+                ));
+            } else {
+                submit_partition_fence(shard, namespace, target.fence);
+            }
+        }
+    }
+    pending
+}
+
+fn submit_partition_fence<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    fence: LifecycleFence,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(partition) = shard.plane.partitions().get_by_ns(&namespace) else {
+        return;
+    };
+    let consensus = partition.consensus();
+    if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+        return;
+    }
+    if let LifecycleFence::Owner(installation) = fence
+        && partition.consumer_group_owner_admitted(&installation)
+    {
+        return;
+    }
+    let (operation, metadata_op, body) = match fence {
+        LifecycleFence::History(transition) => (
+            Operation::TransitionPartitionHistory,
+            transition.metadata_op,
+            transition.to_bytes(),
+        ),
+        LifecycleFence::Owner(installation) => (
+            Operation::InstallConsumerGroupOwner,
+            installation.metadata_op,
+            installation.to_bytes(),
+        ),
+    };
+    let context = iggy_binary_protocol::primitives::partition_history::PartitionContext {
+        incarnation: partition.created_revision(),
+        owner_generation: 0,
+        metadata_op: shard.plane.metadata().applied_frontier().get(),
+    };
+    let request = partition_maintenance_request(namespace, operation, &body, context, metadata_op);
+    let _ = shard.partition_submit(namespace, request);
+}
+
 pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
     let shard_id = shard.id;
     let handler = Rc::new(move || {
@@ -1442,10 +1655,10 @@ mod tests {
         FailureCause, FailureRecord, PassCounters, ReconcilerCtx, TargetPartition,
         build_partition_fresh, current_revision, delete_partitions_from_disk,
         fetch_partition_build_inputs, reconcile_additions, reconcile_consumer_group_offsets,
-        reconcile_once,
+        reconcile_once, reconcile_pending_revocations,
     };
     use configs::server::ServerConfig;
-    use consensus::{MetadataHandle, PartitionsHandle};
+    use consensus::{MetadataHandle, PartitionsHandle, Sequencer};
     use iggy_binary_protocol::codec::WireEncode;
     use iggy_binary_protocol::primitives::identifier::WireName;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1669,6 +1882,7 @@ mod tests {
         };
         mux.update(build_prepare(op, Operation::DeleteTopic, &req))
             .expect("DeleteTopic apply succeeds");
+        seed_completed_lifecycles(mux);
     }
 
     fn seed_delete_stream(mux: &TestMux, op: u64, stream_id: u32) {
@@ -1677,6 +1891,7 @@ mod tests {
         };
         mux.update(build_prepare(op, Operation::DeleteStream, &req))
             .expect("DeleteStream apply succeeds");
+        seed_completed_lifecycles(mux);
     }
 
     fn seed_create_consumer_group(
@@ -1711,6 +1926,7 @@ mod tests {
         };
         mux.update(build_prepare(op, Operation::DeleteConsumerGroup, &req))
             .expect("DeleteConsumerGroup apply succeeds");
+        seed_completed_lifecycles(mux);
     }
 
     fn seed_join_consumer_group(
@@ -1727,11 +1943,98 @@ mod tests {
             topic_id: WireIdentifier::numeric(topic_id),
             group_id: WireIdentifier::numeric(group_id),
             client_id,
-            in_flight: Vec::new(),
-            session: None,
+
+            session: 1,
         };
         mux.update(build_prepare(op, Operation::JoinConsumerGroup, &req))
             .expect("JoinConsumerGroup apply succeeds");
+        seed_installed_owners(mux);
+    }
+
+    // Reconciliation fixtures start after metadata has accepted the partition
+    // primary's reports. Tests of the installation protocol drive partition logs.
+    fn seed_completed_lifecycles(mux: &TestMux) {
+        for intent in mux.streams().pending_lifecycles() {
+            for target in intent.partitions {
+                mux.update(build_prepare(
+                    intent.context.metadata_op,
+                    Operation::CompleteLifecycle,
+                    &metadata::stm::lifecycle::CompleteLifecycleRequest {
+                        metadata_op: intent.context.metadata_op,
+                        stream_id: intent.stream_id,
+                        topic_id: target.topic_id,
+                        partition_id: target.partition_id,
+                        partition_op: 1,
+                    },
+                ))
+                .unwrap();
+            }
+        }
+    }
+
+    fn seed_installed_owners(mux: &TestMux) {
+        for transition in mux.streams().consumer_group_pending_revocations() {
+            mux.update(build_prepare(
+                transition.installation.metadata_op,
+                Operation::CompleteConsumerGroupRevocation,
+                &metadata::stm::consumer_group::CompleteConsumerGroupRevocationRequest {
+                    stream_id: WireIdentifier::numeric(transition.stream_id),
+                    topic_id: WireIdentifier::numeric(transition.topic_id),
+                    partition_id: transition.partition_id,
+                    installation: transition.installation,
+                    partition_op: 1,
+                },
+            ))
+            .unwrap();
+        }
+    }
+
+    async fn install_deleted_group_owner(shard: &Rc<TestShard>, namespace: IggyNamespace) {
+        let partitions = shard.plane.partitions();
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        let installation =
+            iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest {
+                incarnation: partition.created_revision(),
+                group_id: 0,
+                owner: iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner {
+                    generation: 1,
+                    ..Default::default()
+                },
+                metadata_op: 4,
+            };
+        let body = installation.to_bytes();
+        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size);
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        let request = request.transmute_header(|_, header| {
+            *header = RoutedRequestHeader {
+                command: Command::Request,
+                operation: Operation::InstallConsumerGroupOwner,
+                size: u32::try_from(size).unwrap(),
+                client: message_bus::AUTO_COMMIT_CLIENT_ID,
+                session: 1,
+                request: installation.metadata_op,
+                group: namespace.inner(),
+                partition_incarnation: installation.incarnation,
+                metadata_watermark: installation.metadata_op,
+                ..Default::default()
+            };
+        });
+        partition.on_request(request, None).await;
+        let op = partition.consensus().sequencer().current_sequence();
+        assert!(op > 0);
+        partition.consensus().advance_commit_max(op);
+        compio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                partition.commit_journal(partitions.config()).await;
+                if partition.installed_consumer_group_owner(&installation) == Some(op) {
+                    break;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     fn test_config(tmp: &TempDir) -> ServerConfig {
@@ -1872,6 +2175,21 @@ mod tests {
             }
         }
         ops
+    }
+
+    /// Take the partition writes submitted to a test shard, in arrival order.
+    fn drain_partition_submits(lanes: &TestLanes) -> Vec<Message<RoutedRequestHeader>> {
+        let mut requests = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::PartitionSubmit {
+                request,
+                ..
+            }) = frame
+            {
+                requests.push(request);
+            }
+        }
+        requests
     }
 
     fn make_ctx(
@@ -2950,18 +3268,33 @@ mod tests {
                 let parent = partition.consensus().last_prepare_checksum();
                 let group = partition.consensus().group();
                 let cluster = partition.consensus().cluster();
-                let prepare = build_prepare(op, Operation::StoreConsumerOffset, &served)
-                    .transmute_header(|old, header| {
-                        *header = old;
-                        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
-                        header.session = 1;
-                        header.request = op;
-                        header.parent = parent;
-                        header.group = group;
-                        header.cluster = cluster;
-                        header.checksum = header.identity_checksum();
-                    });
-                partition.apply_repaired_prepare(prepare).await;
+                let body = served.to_bytes();
+                let mut body = body.to_vec();
+                body.extend_from_slice(&0_u64.to_le_bytes());
+                let total = size_of::<PrepareHeader>() + body.len();
+                let mut prepare = Message::<PrepareHeader>::new(total);
+                prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+                let incarnation = partition.created_revision();
+                let prepare = prepare.transmute_header(|old, header| {
+                    *header = old;
+                    header.command = Command::Prepare;
+                    header.operation = Operation::StoreConsumerOffset;
+                    header.size = u32::try_from(total).unwrap();
+                    header.op = op;
+                    header.partition_incarnation = incarnation;
+                    header.retry_capacity =
+                        u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
+                    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                    header.session = 1;
+                    header.request = op;
+                    header.parent = parent;
+                    header.group = group;
+                    header.cluster = cluster;
+                    header.checksum = header.identity_checksum();
+                });
+                partition
+                    .apply_repaired_prepare(consensus::seal_prepare_checksum(prepare))
+                    .await;
                 if op < 8 {
                     partition.consensus().advance_commit_max(op);
                     partition.commit_journal(partitions.config()).await;
@@ -3468,6 +3801,7 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
+        install_deleted_group_owner(&shard, namespace).await;
         shard
             .plane
             .partitions()
@@ -3517,6 +3851,50 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_admitted_owner_install_when_revocations_reconcile_should_not_resubmit_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "revocation-stream");
+        seed_topic(&mux, 2, 0, "revocation-topic", vec![assignment(0, 1)]);
+        seed_create_consumer_group(&mux, 3, 0, 0, "group");
+        mux.update(build_prepare(
+            4,
+            Operation::JoinConsumerGroup,
+            &metadata::stm::consumer_group::JoinConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+                client_id: 100,
+                session: 1,
+            },
+        ))
+        .expect("JoinConsumerGroup apply succeeds");
+        let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
+        let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        drain_partition_submits(&inbox);
+        let now = iggy_common::IggyTimestamp::now().as_micros();
+
+        reconcile_pending_revocations(&shard, now, rebalancing_timeout);
+        let mut submitted = drain_partition_submits(&inbox);
+        assert_eq!(submitted.len(), 1, "the revocation submits its install");
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&IggyNamespace::new(0, 0, 0))
+            .unwrap();
+        partition.on_request(submitted.remove(0), None).await;
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
+
+        reconcile_pending_revocations(&shard, now, rebalancing_timeout);
+        assert!(
+            drain_partition_submits(&inbox).is_empty(),
+            "an admitted install must not be submitted again"
+        );
+    }
+
+    #[compio::test]
     async fn given_lagging_group_metadata_when_reconciling_should_wait_for_proven_deletion() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3527,6 +3905,7 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
+        install_deleted_group_owner(&shard, namespace).await;
         shard
             .plane
             .partitions()
@@ -3707,6 +4086,12 @@ mod tests {
         .expect("CreatePartitions apply succeeds");
         assert_eq!(
             assigned(&mux),
+            vec![0, 1],
+            "new partition waits for installation"
+        );
+        seed_installed_owners(&mux);
+        assert_eq!(
+            assigned(&mux),
             vec![0, 1, 2],
             "added partition must be reassigned to the member"
         );
@@ -3722,6 +4107,7 @@ mod tests {
             },
         ))
         .expect("DeletePartitions apply succeeds");
+        seed_completed_lifecycles(&mux);
         assert_eq!(
             assigned(&mux),
             vec![0, 1],
@@ -3765,7 +4151,9 @@ mod tests {
 
         // Client 100 disconnects.
         mux.streams()
-            .remove_consumer_group_member(100, iggy_common::IggyTimestamp::default());
+            .remove_consumer_group_member(100, iggy_common::IggyTimestamp::default(), 6);
+        assert_eq!(assigned(200), Some(vec![1]));
+        seed_installed_owners(&mux);
 
         assert_eq!(
             assigned(100),

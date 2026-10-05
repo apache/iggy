@@ -37,6 +37,7 @@ func TestTopicCache_DropStreamForgetsEveryTopicUnderTheStream(t *testing.T) {
 	for _, key := range []topicKey{doomed, doomedSibling, survivor} {
 		cache.setPartitionsCount(key, 4)
 		cache.nextBalanced(key, 4)
+		cache.setPartitionContext(key, 1, iggcon.PartitionContext{OwnerGeneration: 7})
 	}
 
 	cache.dropStream("doomed")
@@ -45,9 +46,13 @@ func TestTopicCache_DropStreamForgetsEveryTopicUnderTheStream(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = cache.partitionsCount(doomedSibling)
 	assert.False(t, ok)
+	_, ok = cache.partitionContext(doomedSibling, 1)
+	assert.False(t, ok)
 	count, ok := cache.partitionsCount(survivor)
 	assert.True(t, ok, "topics of other streams stay cached")
 	assert.Equal(t, uint32(4), count)
+	_, ok = cache.partitionContext(survivor, 1)
+	assert.True(t, ok, "contexts of other streams stay cached")
 	assert.Equal(t, uint32(1), cache.nextBalanced(survivor, 4),
 		"the surviving cursor keeps its position")
 	assert.Equal(t, uint32(0), cache.nextBalanced(doomed, 4),
@@ -56,7 +61,7 @@ func TestTopicCache_DropStreamForgetsEveryTopicUnderTheStream(t *testing.T) {
 
 func TestDeleteStream_DropsTheCachedTopicsOfTheStream(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.operation() == vsr.OperationSendMessages:
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())

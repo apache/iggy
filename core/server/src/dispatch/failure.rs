@@ -474,6 +474,7 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         metadata_consensus(&shard).advance_commit_max(COMMIT);
+        shard.plane.metadata().advance_applied_frontier(COMMIT);
         (bus, shard)
     }
 

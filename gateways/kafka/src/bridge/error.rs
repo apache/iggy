@@ -415,17 +415,19 @@ mod tests {
     }
 
     #[test]
-    fn request_too_old_maps_to_non_retryable_unknown_server_error() {
-        let err = BridgeError::Iggy(IggyError::RequestTooOld);
-        let code = err.to_kafka_error_code();
+    fn unavailable_request_history_maps_to_non_retryable_unknown_server_error() {
+        for error in [IggyError::RequestTooOld, IggyError::HistoryUnavailable] {
+            let error = BridgeError::Iggy(error);
+            let code = error.to_kafka_error_code();
 
-        assert_eq!(code, ERROR_UNKNOWN_SERVER_ERROR);
-        assert!(
-            !kafka_protocol::error::ResponseError::try_from_code(code)
-                .unwrap()
-                .is_retriable(),
-            "an aged-out request has an unknown outcome and must not be retried"
-        );
+            assert_eq!(code, ERROR_UNKNOWN_SERVER_ERROR, "{error}");
+            assert!(
+                !kafka_protocol::error::ResponseError::try_from_code(code)
+                    .unwrap()
+                    .is_retriable(),
+                "unavailable request history must not authorize replay: {error}"
+            );
+        }
     }
 
     #[test]

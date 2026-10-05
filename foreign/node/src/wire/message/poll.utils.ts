@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionContext } from "../vsr/header.js";
 import { type Id } from "../identifier.utils.js";
 import { type ValueOf, reverseRecord } from "../../type.utils.js";
 import { toDate } from "../serialize.utils.js";
@@ -228,6 +229,8 @@ export type Message = {
  * Response from a poll messages command.
  */
 export type PollMessagesResponse = {
+  /** Partition incarnation, owner generation and metadata op the reply carries */
+  context: PartitionContext;
   /** Partition the messages came from */
   partitionId: number;
   /** Current offset in the partition */
@@ -351,10 +354,13 @@ export const deserializePollMessages = (r: Buffer, pos = 0) => {
   const partitionId = r.readUInt32LE(pos);
   const currentOffset = r.readBigUInt64LE(pos + 4);
   const count = r.readUInt32LE(pos + 12);
-  const messages = deserializeMessages(r, pos + 16);
+  const context = deserializePartitionContext(r, pos + 16);
+  const messages = deserializeMessages(r, pos + 16 + PARTITION_CONTEXT_SIZE);
+  if (messages.length !== count) throw new Error("poll response count does not match its messages");
 
   return {
     partitionId,
+    context,
     currentOffset,
     count,
     messages,

@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.ConsumerGroupsClientBaseTest;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.message.Message;
@@ -29,6 +30,7 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 
@@ -38,6 +40,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
+
+    private static final Duration ASSIGNMENT_TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration ASSIGNMENT_POLL_INTERVAL = Duration.ofMillis(10);
 
     @Override
     protected IggyBaseClient getClient() {
@@ -71,7 +76,7 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
     }
 
     @Test
-    void shouldSyncConsumerGroupAssignmentAfterJoin() {
+    void shouldSyncConsumerGroupAssignmentAfterJoin() throws InterruptedException {
         // given
         setUpStreamAndTopic();
         var group = consumerGroupsClient.createConsumerGroup(STREAM_NAME, TOPIC_NAME, "consumer-group-42");
@@ -79,11 +84,9 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
 
         // when
         consumerGroupsClient.joinConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
-        var assignment = consumerGroupsClient.syncConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
+        var assignment = awaitPartitionAssignment(groupId);
 
-        // then — the only member owns the topic's single partition
-        assertThat(assignment).isPresent();
-        assertThat(assignment.get().partitions()).hasSize(1);
+        assertThat(assignment.partitions()).hasSize(1);
     }
 
     @Test
@@ -101,17 +104,17 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
     }
 
     @Test
-    void shouldPollAsGroupMemberWithoutExplicitPartition() {
+    void shouldPollAsGroupMemberWithoutExplicitPartition() throws InterruptedException {
         // given
         setUpStreamAndTopic();
         var group = consumerGroupsClient.createConsumerGroup(STREAM_NAME, TOPIC_NAME, "consumer-group-42");
         ConsumerId groupId = ConsumerId.of(group.id());
         consumerGroupsClient.joinConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
+        awaitPartitionAssignment(groupId);
         client.messages()
                 .sendMessages(
                         STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("group message")));
 
-        // when — the partition is selected client-side from the synced assignment
         var polledMessages = client.messages()
                 .pollMessages(
                         STREAM_NAME,
@@ -145,5 +148,18 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
                                 10L,
                                 false))
                 .isInstanceOf(IggyResourceNotFoundException.class);
+    }
+
+    private ConsumerGroupAssignment awaitPartitionAssignment(ConsumerId groupId) throws InterruptedException {
+        long deadline = System.nanoTime() + ASSIGNMENT_TIMEOUT.toNanos();
+        Optional<ConsumerGroupAssignment> assignment;
+        do {
+            assignment = consumerGroupsClient.syncConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
+            if (assignment.isPresent() && !assignment.get().partitions().isEmpty()) {
+                return assignment.get();
+            }
+            Thread.sleep(ASSIGNMENT_POLL_INTERVAL.toMillis());
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("Consumer-group ownership was not installed: " + assignment);
     }
 }

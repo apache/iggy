@@ -608,6 +608,7 @@ where
 /// Every default is a build constant: these knobs stopped being config-derived
 /// when the `[system.*]` keys became topic options, so the catalog reads them
 /// straight from `iggy_common`.
+#[allow(clippy::too_many_lines)]
 fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
     Ok(vec![
         OptionDescriptor {
@@ -662,6 +663,13 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             kind: HeaderKind::String.as_code(),
             default_value: Bytes::from_static(b"replicated"),
             description: "Explicit offset completion: replicated or persisted. Independently defaults to replicated. Poll auto-commit remains asynchronous. In replicated groups, persisted offsets also enable WAL references to segment bodies, retaining their inodes by hard link until reclamation, even with replicated message durability. Full body sizes count against partition.wal_bytes_max.".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::PARTITION_RESIZE_POLICY)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"mutable"),
+            description: "Immutable after creation: mutable permits partition addition/deletion without a bounded cutover or per-key ordering across layouts; fixed rejects both. Retention and topic deletion remain destructive.".to_string(),
         },
         OptionDescriptor {
             key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)
@@ -828,7 +836,15 @@ where
             partitions: topic
                 .partitions
                 .iter()
-                .map(|partition| partition_response(streams, stream_id, topic_id, partition))
+                .map(|partition| {
+                    partition_response(
+                        streams,
+                        stream_id,
+                        topic_id,
+                        partition,
+                        shard.plane.metadata().applied_frontier().get(),
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     })
@@ -925,6 +941,7 @@ fn partition_response(
     stream_id: usize,
     topic_id: usize,
     partition: &metadata::stm::stream::Partition,
+    metadata_op: u64,
 ) -> Result<PartitionResponse, IggyError> {
     // Per-partition counters live in the shared stats registry (one `Arc`
     // across all shards and both left-right buffers).
@@ -963,6 +980,11 @@ fn partition_response(
         current_offset,
         size_bytes,
         messages_count,
+        context: iggy_binary_protocol::primitives::partition_history::PartitionContext {
+            incarnation: partition.created_revision,
+            owner_generation: 0,
+            metadata_op,
+        },
     })
 }
 
@@ -1026,7 +1048,7 @@ mod tests {
         let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0, 0);
 
         // Registry miss: the owning shard has not started building.
-        let predicted = partition_response(&streams, 0, 0, &partition).expect("response builds");
+        let predicted = partition_response(&streams, 0, 0, &partition, 0).expect("response builds");
         assert_eq!(predicted.segments_count, 1);
         assert_eq!(predicted.messages_count, 0);
 
@@ -1037,14 +1059,14 @@ mod tests {
         let stats = streams
             .stats_registry
             .partition(0, 0, &partition, topic_stats);
-        let mid_build = partition_response(&streams, 0, 0, &partition).expect("response builds");
+        let mid_build = partition_response(&streams, 0, 0, &partition, 0).expect("response builds");
         assert_eq!(mid_build.segments_count, 1);
 
         // Materialized: the real counters answer from here on.
         stats.increment_segments_count(1);
         stats.increment_messages_count(7);
         stats.increment_size_bytes(64);
-        let live = partition_response(&streams, 0, 0, &partition).expect("response builds");
+        let live = partition_response(&streams, 0, 0, &partition, 0).expect("response builds");
         assert_eq!(live.segments_count, 1);
         assert_eq!(live.messages_count, 7);
         assert_eq!(live.size_bytes, 64);

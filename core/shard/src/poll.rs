@@ -171,6 +171,14 @@ where
                             .metadata
                             .matches_partition(self.shards_table.epoch_for(namespace));
                 }
+                if let PartitionRead::Poll {
+                    metadata: Some(metadata),
+                    ..
+                } = &read
+                {
+                    return !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace));
+                }
                 false
             })
             .unwrap_or(matches!(read, PartitionRead::PollOnPrimary { .. }));
@@ -185,7 +193,14 @@ where
                 consumer,
                 args,
                 attachment,
-            } => (PartitionRead::Poll { consumer, args }, Some(attachment)),
+            } => (
+                PartitionRead::Poll {
+                    consumer,
+                    args,
+                    metadata: None,
+                },
+                Some(attachment),
+            ),
             read => (read, None),
         };
         let result = match read {
@@ -208,7 +223,7 @@ where
                     }
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
-            PartitionRead::Poll { consumer, args }
+            PartitionRead::Poll { consumer, args, .. }
             | PartitionRead::PollOnPrimary { consumer, args, .. } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
                     None => PartitionReadReply::NotFound,
@@ -288,9 +303,6 @@ where
                         committed,
                     }
                 }),
-            PartitionRead::ClearGroupLastPolled { group_id } => partitions
-                .clear_group_last_polled(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |()| PartitionReadReply::Ack),
             PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
                 .segment_delete_resolution(&namespace, count)
                 .map_or(
@@ -351,6 +363,7 @@ where
         let consumer_kind = result.consumer_kind();
         match partitions.complete_poll(&namespace, result) {
             Ok(PollCompletion {
+                context,
                 fragments,
                 current_offset,
                 replication,
@@ -359,6 +372,7 @@ where
                 // queued. Release the reply before waiting for replication.
                 // A poll reply does not acknowledge a durable offset commit.
                 let _ = reply.try_send(PartitionReadReply::Poll {
+                    context,
                     fragments,
                     current_offset,
                 });

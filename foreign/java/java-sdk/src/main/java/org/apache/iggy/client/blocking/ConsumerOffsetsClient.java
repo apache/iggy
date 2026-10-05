@@ -23,6 +23,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.Optional;
@@ -36,6 +37,19 @@ public interface ConsumerOffsetsClient {
 
     void storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset);
+
+    /**
+     * Stores a consumer offset fenced by the context its messages were polled with.
+     * The server refuses the store once the partition incarnation or its owner has
+     * changed, so an offset from an older incarnation never lands in a newer one.
+     */
+    void storeConsumerOffset(
+            StreamId streamId,
+            TopicId topicId,
+            Long partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            PartitionContext context);
 
     default Optional<ConsumerOffsetInfo> getConsumerOffset(
             Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {

@@ -169,12 +169,19 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                 };
                 let _ = reply.try_send(committed);
             }
+            shard::MetadataSubmit::CompleteLifecycle(request) => {
+                let _ = shard
+                    .plane
+                    .metadata()
+                    .submit_complete_lifecycle_in_process(request)
+                    .await;
+            }
             shard::MetadataSubmit::CompleteRevocation {
                 stream_id,
                 topic_id,
-                group_id,
-                source_client_id,
                 partition_id,
+                installation,
+                partition_op,
                 reply,
             } => {
                 let commit = shard
@@ -183,9 +190,9 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .submit_complete_revocation_in_process(
                         stream_id,
                         topic_id,
-                        group_id,
-                        source_client_id,
                         partition_id,
+                        installation,
+                        partition_op,
                     )
                     .await
                     .ok();

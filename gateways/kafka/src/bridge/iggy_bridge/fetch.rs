@@ -452,6 +452,7 @@ mod tests {
             current_offset,
             size: IggyByteSize::from(size),
             messages_count,
+            context: iggy::prelude::PartitionContext::default(),
         }
     }
 

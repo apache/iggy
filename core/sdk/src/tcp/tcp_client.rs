@@ -29,13 +29,14 @@ use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
-use crate::vsr::retain_replay_header;
+use crate::vsr::{RetainedRequest, retain_replay_header};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
 };
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 #[cfg(test)]
 use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
@@ -196,15 +197,19 @@ impl BinaryTransport for TcpClient {
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.write_offset(self, code, payload).await
+        self.poll_router
+            .write_offset(self, code, payload, context)
+            .await
     }
 
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.poll(self, request).await
+        self.poll_router.poll(self, request, context).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -225,11 +230,18 @@ impl BinaryTransport for TcpClient {
         }
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
         if is_poll_routing_code(code) {
-            return self.send_poll_request(code, payload).await;
+            return self
+                .send_poll_request_with_context(code, payload, context)
+                .await;
         }
-        let mut header = None;
+        let mut header = RetainedRequest::new(context);
         let result = self
             .send_raw_retaining_header(
                 code,
@@ -525,10 +537,22 @@ impl PollTransport for TcpClient {
         Ok(client)
     }
 
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
         let now = tokio::time::Instant::now();
         let (_, result) = self
-            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT, false)
+            .send_raw_vsr_attempt(
+                code,
+                payload,
+                RetainedRequest::new(context),
+                now,
+                now + RESPONSE_READ_TIMEOUT,
+                false,
+            )
             .await;
         if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
             self.set_state(ClientState::Disconnected).await;
@@ -1362,7 +1386,7 @@ impl TcpClient {
         &self,
         code: u32,
         payload: Bytes,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
         previous_error: &IggyError,
     ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
@@ -1412,7 +1436,7 @@ impl TcpClient {
                     true,
                 )
                 .await;
-            *header = encoded.or(*header);
+            header.header = encoded.or(header.header);
             match result {
                 Err(IggyError::TransientNotAccepted)
                     if tokio::time::Instant::now() < overall_deadline
@@ -1545,7 +1569,7 @@ impl TcpClient {
         &self,
         code: u32,
         payload: Bytes,
-        preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
+        mut preencoded: RetainedRequest,
         transient_deadline: tokio::time::Instant,
         read_deadline: tokio::time::Instant,
         retry_transient: bool,
@@ -1572,39 +1596,21 @@ impl TcpClient {
             // pipeline-full / view-change cancel) lets us resend the SAME
             // request on the SAME connection with no reconnect and the session
             // intact.
-            let request_header = match preencoded {
-                Some(header) => {
-                    let Ok(session) = consensus_session.lock() else {
-                        return (Some(header), Err(IggyError::InvalidConfiguration));
-                    };
-                    if let Err(error) = crate::vsr::validate_retained_header(&header, &session) {
-                        return (Some(header), Err(error));
-                    }
-                    header
-                }
-                None => {
-                    let encoded = {
-                        let Ok(mut consensus_session) = consensus_session.lock() else {
-                            return (None, Err(IggyError::InvalidConfiguration));
-                        };
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)
-                    };
-                    match encoded {
-                        Ok((header, request_size)) => {
-                            trace!(
-                                "Sending a TCP VSR request of size {request_size} with code: {code}"
-                            );
-                            header
-                        }
-                        Err(error) => return (None, Err(error)),
-                    }
+            let mut request_header = {
+                let Ok(mut session) = consensus_session.lock() else {
+                    return (preencoded.header, Err(IggyError::InvalidConfiguration));
+                };
+                match preencoded.encode(&mut session, code, &payload) {
+                    Ok(header) => header,
+                    Err(error) => return (preencoded.header, Err(error)),
                 }
             };
-            let header_bytes = bytemuck::bytes_of(&request_header);
             let mut frame_complete = false;
             let mut retry_outcome = crate::vsr::RetryOutcome::default();
+            let mut lifecycle_retry_interval = NOT_READY_RETRY_INTERVAL;
             let outcome = async {
                 loop {
+                    let header_bytes = bytemuck::bytes_of(&request_header);
                     frame_complete = false;
                     stream.write(header_bytes).await?;
                     if !payload.is_empty() {
@@ -1676,6 +1682,16 @@ impl TcpClient {
                         .map_err(|error| retry_outcome.observe(error))
                     {
                         Err(error) if !retry_transient => return Err(error),
+                        Err(IggyError::LifecycleBusy) if tokio::time::Instant::now() + lifecycle_retry_interval < read_deadline => {
+                            preencoded.header = None;
+                            request_header = {
+                                let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                                preencoded.encode(&mut session, code, &payload)?
+                            };
+                            tokio::time::sleep(lifecycle_retry_interval).await;
+                            lifecycle_retry_interval = (lifecycle_retry_interval * 2).min(crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL);
+                        }
+
                         // `TransientNotCommitted`: the op's outcome is unknown
                         // (e.g. a view change canceled it in flight) -- ONLY a
                         // same-session replay of the same request id is safe
@@ -1754,7 +1770,10 @@ fn tls_server_name(server_address: &str) -> String {
 mod tests {
     use super::*;
     use crate::vsr::replay_after_session_reset_is_safe;
-    use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::codes::{
+        GET_ME_CODE, JOIN_CONSUMER_GROUP_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE,
+    };
+    use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
     use iggy_binary_protocol::requests::system::BindSessionRequest;
     use iggy_binary_protocol::responses::users::LoginRegisterResponse;
     use iggy_binary_protocol::{
@@ -2033,7 +2052,7 @@ mod tests {
             .send_raw_vsr_attempt(
                 SEND_MESSAGES_CODE,
                 Bytes::from_static(b"send"),
-                None,
+                crate::vsr::RetainedRequest::default(),
                 deadline,
                 deadline,
                 false,
@@ -2079,7 +2098,10 @@ mod tests {
         let attempt = client.send_raw_vsr_attempt(
             SEND_MESSAGES_CODE,
             payload,
-            Some(retained),
+            RetainedRequest {
+                header: Some(retained),
+                context: PartitionContext::default(),
+            },
             deadline,
             deadline,
             false,
@@ -2113,16 +2135,19 @@ mod tests {
         Client::connect(&*client).await.unwrap();
         client.bind_vsr_session(1).await.unwrap();
         let payload = Bytes::from_static(b"uncertain-send");
-        let mut retained = Some(
-            crate::vsr::encode_request_header(
-                &mut client.consensus_session.lock().unwrap(),
-                SEND_MESSAGES_CODE,
-                &payload,
-            )
-            .unwrap()
-            .0,
-        );
-        let original = retained.unwrap();
+        let mut retained = RetainedRequest {
+            header: Some(
+                crate::vsr::encode_request_header(
+                    &mut client.consensus_session.lock().unwrap(),
+                    SEND_MESSAGES_CODE,
+                    &payload,
+                )
+                .unwrap()
+                .0,
+            ),
+            context: PartitionContext::default(),
+        };
+        let original = retained.header.unwrap();
         let peer_client = Arc::clone(&client);
         let (finished, mut finish) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
@@ -2176,7 +2201,110 @@ mod tests {
             "an ambiguous send was reissued under a new identity"
         );
         assert_eq!(result.unwrap_err(), IggyError::TransientNotCommitted);
-        assert_eq!(retained.unwrap().client, original.client);
+        assert_eq!(retained.header.unwrap().client, original.client);
+    }
+
+    #[tokio::test]
+    async fn given_committed_lifecycle_refusal_when_retried_should_use_a_fresh_request_id() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let (listener, address) = live_endpoint().await;
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let context = PartitionContext {
+            incarnation: 17,
+            owner_generation: 3,
+            metadata_op: 4,
+        };
+        let payload = Bytes::from_static(b"join-body");
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (first, body) = read_test_request(&mut stream).await;
+            assert_eq!(first.operation, Operation::JoinConsumerGroup);
+            assert_eq!(body, b"join-body");
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            answer_test_request(&mut stream, &first, 0, &rejection).await;
+            let (second, retry_body) = read_test_request(&mut stream).await;
+            assert_ne!(second.request, first.request);
+            assert_eq!(second.client, first.client);
+            assert_eq!(second.session, first.session);
+            assert_eq!(second.partition_incarnation, first.partition_incarnation);
+            assert_eq!(second.owner_generation, first.owner_generation);
+            assert_eq!(second.minimum_metadata_op, first.minimum_metadata_op);
+            assert_eq!(first.partition_incarnation, context.incarnation);
+            assert_eq!(first.owner_generation, context.owner_generation);
+            assert_eq!(first.minimum_metadata_op, context.metadata_op);
+            assert_eq!(retry_body, body);
+            let mut success = 0u32.to_le_bytes().to_vec();
+            success.extend_from_slice(b"joined");
+            answer_test_request(&mut stream, &second, 0, &success).await;
+        });
+        let deadline = tokio::time::Instant::now() + TEST_BUDGET;
+        let (_, result) = tokio::time::timeout(
+            TEST_BUDGET,
+            client.send_raw_vsr_attempt(
+                JOIN_CONSUMER_GROUP_CODE,
+                payload,
+                RetainedRequest {
+                    header: None,
+                    context,
+                },
+                deadline,
+                deadline,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), Bytes::from_static(b"joined"));
+        peer.await.unwrap();
+        Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_lasting_lifecycle_refusal_when_retried_should_back_off() {
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        // A pause doubling from 50 ms fits five attempts into the budget, a fixed one twenty.
+        const MAX_ATTEMPTS: usize = 5;
+        let (listener, address) = live_endpoint().await;
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            let mut attempts = 0;
+            let mut header = [0; HEADER_SIZE];
+            while stream.read_exact(&mut header).await.is_ok() {
+                attempts += 1;
+                let request: RequestHeader =
+                    bytemuck::checked::try_pod_read_unaligned(&header).unwrap();
+                answer_test_request(&mut stream, &request, 0, &rejection).await;
+            }
+            attempts
+        });
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let deadline = tokio::time::Instant::now() + RETRY_BUDGET;
+
+        let (_, result) = client
+            .send_raw_vsr_attempt(
+                JOIN_CONSUMER_GROUP_CODE,
+                Bytes::new(),
+                RetainedRequest::default(),
+                deadline,
+                deadline,
+                true,
+            )
+            .await;
+
+        Client::shutdown(&client).await.unwrap();
+        assert_eq!(result.unwrap_err(), IggyError::LifecycleBusy);
+        let attempts = peer.await.unwrap();
+        assert!(
+            attempts <= MAX_ATTEMPTS,
+            "{attempts} retries each committed another lifecycle refusal"
+        );
     }
 
     #[tokio::test]
@@ -2226,7 +2354,7 @@ mod tests {
                 client.send_raw_vsr_attempt(
                     SEND_MESSAGES_CODE,
                     Bytes::new(),
-                    None,
+                    RetainedRequest::default(),
                     now,
                     now + READ_BUDGET,
                     true,
@@ -2262,7 +2390,7 @@ mod tests {
         let mut exchange = Box::pin(client.send_raw_vsr_attempt(
             GET_ME_CODE,
             Bytes::new(),
-            None,
+            RetainedRequest::default(),
             tokio::time::Instant::now(),
             deadline,
             false,

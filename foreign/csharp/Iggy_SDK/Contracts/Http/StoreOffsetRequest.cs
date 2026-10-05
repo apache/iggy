@@ -27,6 +27,7 @@ internal sealed class StoreOffsetRequest
     public Consumer ConsumerId { get; init; }
     public uint? PartitionId { get; init; }
     public ulong Offset { get; init; }
+    public PartitionContext? Context { get; init; }
 
     public StoreOffsetRequest(Consumer consumer, uint? partitionId, ulong offset)
     {

@@ -51,9 +51,10 @@ Codes absent from the SDK command table use `Operation::NonReplicated` and
 carry the command code in the request header's reserved field. The server
 remains authoritative for classifying or rejecting extension commands.
 
-Sends encode `Partitioning.PartitionId`, `Partitioning.Balanced` or
-`Partitioning.MessageKey` in the payload. The server resolves the target
-partition at admission.
+Sends always carry an explicit partition id. The client resolves
+`Partitioning.Balanced` round-robin and `Partitioning.MessageKey` as XXH32
+(seed 0) of the key modulo the topic's partition count, as the Rust SDK does.
+The count is cached per topic and read again after a refused send.
 
 VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 

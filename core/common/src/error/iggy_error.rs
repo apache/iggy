@@ -178,6 +178,10 @@ pub enum IggyError {
         "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
     )]
     RequestTooOld = 85,
+    #[error("The partition history is no longer available; this request cannot execute again")]
+    HistoryUnavailable = 87,
+    #[error("A committed lifecycle operation prevents this mutation. Retry as a new request.")]
+    LifecycleBusy = 88,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -292,6 +296,8 @@ pub enum IggyError {
     TooManyTopics = 2021,
     #[error("Partitions limit reached, raise [metadata] partitions_max")]
     PartitionsLimitReached = 2022,
+    #[error("Partition resizing is disabled for this fixed topic")]
+    PartitionResizeDisabled = 2023,
     #[error("Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}")]
     CannotCreatePartition(usize, usize, usize) = 3000,
     #[error(
@@ -651,6 +657,14 @@ mod tests {
         assert_eq!(error.as_code(), 2022);
         assert_eq!(IggyError::from_code(2022), error);
         assert_eq!(IggyError::from_code_as_string(2022), error.as_string());
+    }
+
+    #[test]
+    fn partition_resize_disabled_round_trips_by_code() {
+        let error = IggyError::PartitionResizeDisabled;
+        assert_eq!(error.as_code(), 2023);
+        assert_eq!(IggyError::from_code(2023), error);
+        assert_eq!(IggyError::from_code_as_string(2023), error.as_string());
     }
 
     #[test]

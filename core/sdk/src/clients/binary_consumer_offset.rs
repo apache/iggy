@@ -19,10 +19,24 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError};
 
 #[async_trait]
 impl ConsumerOffsetClient for IggyClient {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        self.client
+            .read()
+            .await
+            .store_consumer_position(consumer, stream_id, topic_id, position)
+            .await
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,

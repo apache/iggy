@@ -37,6 +37,7 @@ import org.apache.iggy.message.PartitioningKind;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.TopicDetails;
@@ -81,16 +82,17 @@ public class MessagesTcpClient implements MessagesClient {
      */
     private static final Duration ROUTING_CACHE_REFRESH = Duration.ofSeconds(5);
 
-    private final Supplier<AsyncTcpConnection> connectionSupplier;
     private final ClientRoutingState routingState;
     private final TopicsClient topicsClient;
     private final ConsumerGroupsClient consumerGroupsClient;
     private final PollRouter pollRouter;
     private final Supplier<CompletableFuture<Boolean>> clustered;
+    private final PartitionContexts sendContexts;
+    private final PartitionContexts pollContexts;
 
     /**
      * Creates a low-level client on the supplied connection without primary routing.
-     * Use {@code Iggy.tcpClientBuilder()} for clustered auto-commit polling so the
+     * Use {@code Iggy.tcpClientBuilder()} for clustered polling so the
      * coordinator retains group membership while data connections reach primaries.
      */
     public MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
@@ -106,16 +108,18 @@ public class MessagesTcpClient implements MessagesClient {
             ClientRoutingState routingState,
             PollRouter pollRouter,
             Supplier<CompletableFuture<Boolean>> clustered) {
-        this.connectionSupplier = connectionSupplier;
         this.routingState = routingState;
         this.topicsClient = new TopicsTcpClient(connectionSupplier);
         this.consumerGroupsClient = new ConsumerGroupsTcpClient(connectionSupplier);
         this.pollRouter = pollRouter;
         this.clustered = clustered;
-    }
-
-    private AsyncTcpConnection connection() {
-        return connectionSupplier.get();
+        this.sendContexts =
+                new PartitionContexts(connectionSupplier, CommandCode.Messages.GET_SEND_CONTEXT.getValue(), 0, true);
+        this.pollContexts = new PartitionContexts(
+                connectionSupplier,
+                CommandCode.Messages.GET_POLL_ROUTING.getValue(),
+                PollRouter.ATTACHMENT_BYTES,
+                false);
     }
 
     @Override
@@ -174,7 +178,7 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        CompletableFuture<ByteBuf> sent = sendPoll(payload, autoCommit);
+        CompletableFuture<ByteBuf> sent = sendPoll(payload);
         CompletableFuture<PolledMessages> result = sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readPolledMessages(response);
@@ -190,9 +194,9 @@ public class MessagesTcpClient implements MessagesClient {
         return result;
     }
 
-    private CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, boolean autoCommit) {
-        if (!autoCommit || pollRouter == null) {
-            return connection().send(CommandCode.Messages.POLL.getValue(), payload);
+    private CompletableFuture<ByteBuf> sendPoll(ByteBuf payload) {
+        if (pollRouter == null) {
+            return sendPlainPoll(payload);
         }
         PollCancellation cancellation = new PollCancellation();
         CompletableFuture<ByteBuf> result = clustered
@@ -203,9 +207,7 @@ public class MessagesTcpClient implements MessagesClient {
                         return CompletableFuture.<ByteBuf>failedFuture(
                                 error != null ? error : new CancellationException());
                     }
-                    CompletableFuture<ByteBuf> sent = isClustered
-                            ? pollRouter.poll(payload)
-                            : connection().send(CommandCode.Messages.POLL.getValue(), payload);
+                    CompletableFuture<ByteBuf> sent = isClustered ? pollRouter.poll(payload) : sendPlainPoll(payload);
                     cancellation.track(sent);
                     return sent;
                 })
@@ -216,6 +218,14 @@ public class MessagesTcpClient implements MessagesClient {
             }
         });
         return result;
+    }
+
+    private CompletableFuture<ByteBuf> sendPlainPoll(ByteBuf payload) {
+        return pollContexts.send(
+                CommandCode.Messages.POLL.getValue(),
+                payload,
+                payload.retainedDuplicate(),
+                payload.readableBytes() - PollRouter.POLL_PARAMETERS_BYTES);
     }
 
     @Override
@@ -257,7 +267,12 @@ public class MessagesTcpClient implements MessagesClient {
             writeAndRelease(payload, toBytes(partitioning));
             payload.writeIntLE(messages.size());
             encodeMessagesBatchInto(payload, messages);
-            sent = connection().send(CommandCode.Messages.SEND.getValue(), payload);
+            var contextPayload = Unpooled.buffer();
+            writeAndRelease(contextPayload, toBytes(streamId));
+            writeAndRelease(contextPayload, toBytes(topicId));
+            contextPayload.writeBytes(partitioning.value());
+            sent = sendContexts.send(
+                    CommandCode.Messages.SEND.getValue(), payload, contextPayload, contextPayload.readableBytes());
         } catch (RuntimeException | Error error) {
             payload.release();
             throw error;
@@ -397,7 +412,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     private static PolledMessages emptyPolledMessages() {
-        return new PolledMessages(0L, BigInteger.ZERO, 0L, List.of());
+        return new PolledMessages(0L, BigInteger.ZERO, 0L, List.of(), PartitionContext.EMPTY);
     }
 
     private CompletableFuture<Partitioning> resolvePartitioning(

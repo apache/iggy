@@ -75,7 +75,7 @@ impl RequestHeader {
         } else {
             u128::from(XxHash3_64::oneshot(payload))
         };
-        let mut reserved = [0; 60];
+        let mut reserved = [0; 4];
         if operation == Operation::NonReplicated {
             reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
         }
@@ -123,7 +123,7 @@ mod tests {
             header.request_checksum,
             u128::from(XxHash3_64::oneshot(&payload))
         );
-        assert_eq!(header.reserved, [0; 60]);
+        assert_eq!(header.reserved, [0; 4]);
     }
 
     #[test]

@@ -482,6 +482,7 @@ async fn given_consumer_offset_when_stored_and_deleted_should_round_trip(harness
 
     let offsets_path = "/streams/http-offsets/topics/offsets/consumer-offsets";
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 1,
@@ -598,6 +599,7 @@ async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harn
         "produce must commit"
     );
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 0,
@@ -706,6 +708,7 @@ async fn given_out_of_range_consumer_offset_when_storing_should_reject_400_fast(
     // Offset 5 runs past the committed tail (offset 1), so it is out of range.
     let offsets_path = "/streams/http-store-range/topics/offsets/consumer-offsets";
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 5,

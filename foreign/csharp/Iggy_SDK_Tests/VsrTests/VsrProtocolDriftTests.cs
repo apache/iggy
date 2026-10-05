@@ -81,6 +81,9 @@ public sealed class VsrProtocolDriftTests
         Assert.Equal(VsrHeader.REQUEST_OPERATION_OFFSET, offsets["operation"]);
         Assert.Equal(VsrHeader.REQUEST_SESSION_OFFSET, offsets["session"]);
         Assert.Equal(VsrHeader.REQUEST_RESERVED_OFFSET, offsets["reserved"]);
+        Assert.Equal(VsrHeader.REQUEST_INCARNATION_OFFSET, offsets["partition_incarnation"]);
+        Assert.Equal(VsrHeader.REQUEST_OWNER_GENERATION_OFFSET, offsets["owner_generation"]);
+        Assert.Equal(VsrHeader.REQUEST_METADATA_OP_OFFSET, offsets["minimum_metadata_op"]);
 
         // A routing group reintroduced on the client header would shift every field
         // after it and silently reinstate a derivation this SDK no longer performs.

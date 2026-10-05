@@ -17,12 +17,12 @@
 
 use crate::{
     ClientState, Credentials, DiagnosticEvent, Identifier, IggyError, NonZeroIggyDuration,
+    PartitionContext,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::WireEncode;
-use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
@@ -36,30 +36,43 @@ pub trait BinaryTransport {
     /// Sets the state of the client.
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>
+    where
+        Self: Sync,
+    {
+        self.send_raw_with_context(code, payload, PartitionContext::default())
+            .await
+    }
+    /// Send with a captured partition incarnation and owner. Every retry must retain it.
+    /// A history refusal after an uncertain attempt must return
+    /// `TransientNotCommitted`, so callers cannot refresh and repeat that write.
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError>;
     /// Route a store or delete offset request while retaining the membership connection.
+    /// Every retry keeps a captured `context`. Without one, the request takes the context
+    /// its route reports.
     async fn send_offset_write_with_response(
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError>
     where
-        Self: Sync,
-    {
-        self.send_raw_with_response(code, payload).await
-    }
+        Self: Sync;
+
     /// Transports may route an auto-commit poll without moving the connection
     /// that owns consumer-group membership.
     async fn send_poll_with_response(
         &self,
         request: &PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError>
     where
-        Self: Sync,
-    {
-        self.send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
-            .await
-    }
+        Self: Sync;
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve

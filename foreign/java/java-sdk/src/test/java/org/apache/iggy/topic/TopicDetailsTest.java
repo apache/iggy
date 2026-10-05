@@ -20,6 +20,7 @@
 package org.apache.iggy.topic;
 
 import org.apache.iggy.partition.Partition;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
@@ -43,7 +44,8 @@ class TopicDetailsTest {
                 1L,
                 Map.of(),
                 Map.of());
-        var partitions = List.of(new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE));
+        var partitions = List.of(
+                new Partition(1L, BigInteger.TEN, 2L, BigInteger.ZERO, "size", BigInteger.ONE, PartitionContext.EMPTY));
 
         var topicDetails = new TopicDetails(topic, partitions);
 

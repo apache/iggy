@@ -56,7 +56,10 @@ impl<B: BinaryClient> TopicClient for B {
             return Ok(None);
         }
         let wire_resp = super::decode_response::<GetTopicResponse>(&response)?;
-        Ok(Some(TopicDetails::try_from(wire_resp)?))
+        let details = TopicDetails::try_from(wire_resp)?;
+        self.consumer_group_state()
+            .set_topic_partitions(stream_id, topic_id, &details.partitions);
+        Ok(Some(details))
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
@@ -145,6 +148,7 @@ impl<B: BinaryClient> TopicClient for B {
             .to_bytes(),
         )
         .await?;
+        self.consumer_group_state().invalidate_topic_discovery();
         Ok(())
     }
 }

@@ -108,6 +108,11 @@ fn build_server_config(log_config: &LogRotationTestConfig) -> TestServerConfig {
         "IGGY_LOGGING_RETENTION".to_string(),
         format!("{}", log_config.retention),
     );
+    // The log generator performs hundreds of durable partition deletions.
+    extra_envs.insert(
+        "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL".to_string(),
+        "100ms".to_string(),
+    );
 
     TestServerConfig::builder().extra_envs(extra_envs).build()
 }

@@ -102,6 +102,10 @@ where
                 | Operation::TruncatePartition
                 | Operation::FinalizeSession
                 | Operation::RetireSession
+                | Operation::CompleteLifecycle
+                | Operation::TransitionPartitionHistory
+                | Operation::InstallConsumerGroupOwner
+                | Operation::RetireConsumerGroupOwners
                 | Operation::CreateStream
                 | Operation::UpdateStream
                 | Operation::DeleteStream
@@ -391,7 +395,7 @@ mod tests {
     use iggy_binary_protocol::codes::{
         BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
         GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
-        GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
+        GET_POLL_ROUTING_CODE, GET_SEND_CONTEXT_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
         LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
         LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
         SYNC_CONSUMER_GROUP_CODE,
@@ -464,6 +468,7 @@ mod tests {
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
             (BIND_SESSION_CODE, invalid_command, invalid_command),
             (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
+            (GET_SEND_CONTEXT_CODE, invalid_command, invalid_command),
             (
                 POLL_MESSAGES_ON_PRIMARY_CODE,
                 invalid_command,

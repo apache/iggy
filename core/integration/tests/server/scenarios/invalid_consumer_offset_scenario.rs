@@ -18,7 +18,7 @@
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::IggyError;
-use integration::harness::{TestHarness, assert_clean_system};
+use integration::harness::{TestHarness, assert_clean_system, wait_for_consumer_group_assignment};
 
 const STREAM_NAME: &str = "test-stream-offsets";
 const TOPIC_NAME: &str = "test-topic-offsets";
@@ -114,7 +114,18 @@ async fn initialize(client: &IggyClient, stream: &Identifier, topic: &Identifier
         )
         .await;
     match join_result {
-        Ok(_) => true,
+        Ok(_) => {
+            wait_for_consumer_group_assignment(
+                client,
+                stream,
+                topic,
+                &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+                1,
+                super::CONVERGENCE_TIMEOUT,
+            )
+            .await;
+            true
+        }
         Err(e) => {
             assert_eq!(e.as_code(), IggyError::FeatureUnavailable.as_code());
             false

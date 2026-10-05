@@ -582,7 +582,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     redirection for the handshake, and reconnecting from underneath it would recurse.
     /// </remarks>
     private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
-        CancellationToken token, bool allowRedirect = true)
+        CancellationToken token, bool allowRedirect = true, PartitionContext context = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -610,7 +610,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
                 var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
-                    clearSensitiveReply, token);
+                    clearSensitiveReply, token, context);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
 
@@ -783,7 +783,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
+        PartitionContext context = default)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -795,7 +796,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                clearSensitiveReply, token);
+                clearSensitiveReply, token, context: context);
         }
         finally
         {

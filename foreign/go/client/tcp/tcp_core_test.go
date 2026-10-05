@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +44,12 @@ func TestExchange_RejectsANilContext(t *testing.T) {
 
 	_, err := client.SendBinaryRequest(nil, uint32(command.PingCode), nil) //nolint:staticcheck
 	assert.ErrorIs(t, err, ierror.ErrNilContext)
+}
+
+func TestPing_RejectsANilContext(t *testing.T) {
+	client, _ := newPipeClient(t)
+
+	assert.ErrorIs(t, client.Ping(nil), ierror.ErrNilContext) //nolint:staticcheck
 }
 
 func TestExchange_ReportsAContextThatIsAlreadyDone(t *testing.T) {
@@ -399,7 +406,7 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 	confirmations = binary.LittleEndian.AppendUint32(confirmations, 2)
 	confirmations = binary.LittleEndian.AppendUint32(confirmations, 1)
 	confirmations = binary.LittleEndian.AppendUint64(confirmations, 42)
-	server := serve(serverConn, func(_ int, _ request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationSendMessages, confirmations)
 	})
 
@@ -415,17 +422,18 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 	}, response.Confirmations)
 
 	recorded := server.recorded()
-	require.Len(t, recorded, 1)
-	assert.Equal(t, vsr.OperationSendMessages, recorded[0].operation())
-	assert.Equal(t, uint32(1), recorded[0].partitionID(t))
-	assert.Equal(t, uint64(1), recorded[0].requestID(),
+	require.Len(t, recorded, 2)
+	assert.Equal(t, uint32(command.GetSendContextCode), recorded[0].code())
+	assert.Equal(t, vsr.OperationSendMessages, recorded[1].operation())
+	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
+	assert.Equal(t, uint64(1), recorded[1].requestID(),
 		"a partition request reads the watermark without consuming it")
 }
 
 func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	client.config.reconnection.enabled = false
-	serve(serverConn, func(_ int, _ request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		// The server answers a replicated request on a dead session with an
 		// empty status-0 reply. Nothing was written, so reading it as a
 		// successful send would silently drop the batch.
@@ -442,7 +450,7 @@ func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 
 func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 	})
 
@@ -462,7 +470,7 @@ func zeroConfirmations() []byte {
 
 func TestSendMessages_DegradesAnUnreadableConfirmationBody(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		// The batch already committed, so a decode failure must not surface as
 		// an error a caller would retry into a duplicate write.
 		return replyFrame(vsr.OperationSendMessages, []byte{1, 0, 0, 0, 0xFF})
@@ -479,7 +487,7 @@ func TestSendMessages_DegradesAnUnreadableConfirmationBody(t *testing.T) {
 
 func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
@@ -496,15 +504,16 @@ func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T)
 	require.NoError(t, err)
 
 	recorded := server.recorded()
-	require.Len(t, recorded, 2)
+	require.Len(t, recorded, 3)
 	assert.Equal(t, uint32(command.GetTopicCode), recorded[0].code())
+	assert.Equal(t, uint32(command.GetSendContextCode), recorded[1].code())
 	// 0x0D3FE0E1 modulo four partitions.
-	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
+	assert.Equal(t, uint32(1), recorded[2].partitionID(t))
 }
 
 func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
@@ -537,9 +546,57 @@ func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 	assert.Equal(t, 1, metadataRequests, "the partition count is cached after the first read")
 }
 
+// The partition refuses a stale context before admission, so one resend of
+// the same frame under a fresh context cannot write the batch twice.
+func TestSendMessages_CachesTheContextAndRefreshesItOnceAfterARefusal(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	client.MessageCompression = iggcon.MESSAGE_COMPRESSION_S2
+	var served, accepted atomic.Uint64
+	server := serve(serverConn, func(_ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetSendContextCode):
+			body := make([]byte, iggcon.PartitionContextSize)
+			binary.LittleEndian.PutUint64(body, served.Load())
+			return replyFrame(vsr.OperationNonReplicated, body)
+		case read.incarnation() != accepted.Load():
+			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.HistoryUnavailableCode), nil)
+		default:
+			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
+		}
+	})
+	// The encoder compresses payloads of 32 bytes or more in place, so a second
+	// encode of this batch changes the frame.
+	message, err := iggcon.NewIggyMessage([]byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"))
+	require.NoError(t, err)
+	send := func(servedIncarnation, acceptedIncarnation uint64) error {
+		served.Store(servedIncarnation)
+		accepted.Store(acceptedIncarnation)
+		_, err := client.SendMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+			iggcon.PartitionId(1), []iggcon.IggyMessage{message})
+		return err
+	}
+
+	require.NoError(t, send(1, 1))
+	require.NoError(t, send(1, 1))
+	require.NoError(t, send(2, 2), "a stale cached context is refreshed once")
+	require.ErrorIs(t, send(3, 4), ierror.ErrHistoryUnavailable, "a refreshed context is not refreshed again")
+
+	recorded := server.recorded()
+	assert.Equal(t, 3, requestCount(recorded, command.GetSendContextCode))
+	var sends []request
+	for _, read := range recorded {
+		if read.operation() == vsr.OperationSendMessages {
+			sends = append(sends, read)
+		}
+	}
+	require.Len(t, sends, 6)
+	assert.Equal(t, uint64(2), sends[3].incarnation())
+	assert.Equal(t, sends[2].payload, sends[3].payload, "the resend must not encode the batch again")
+}
+
 func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, _ request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationSendMessages, nil)
 	})
 

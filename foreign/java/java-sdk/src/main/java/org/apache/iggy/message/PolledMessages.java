@@ -19,7 +19,10 @@
 
 package org.apache.iggy.message;
 
+import org.apache.iggy.partition.PartitionContext;
+
 import java.math.BigInteger;
 import java.util.List;
 
-public record PolledMessages(Long partitionId, BigInteger currentOffset, Long count, List<Message> messages) {}
+public record PolledMessages(
+        Long partitionId, BigInteger currentOffset, Long count, List<Message> messages, PartitionContext context) {}

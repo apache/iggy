@@ -28,51 +28,65 @@
 
 use crate::stm::StateHandler;
 use crate::stm::id_slab::IdSlab;
+use crate::stm::lifecycle::LifecycleAction;
 use crate::stm::result::{
     ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult, JoinConsumerGroupResult,
     LeaveConsumerGroupResult,
 };
-use crate::stm::stream::StreamsInner;
+use crate::stm::stream::{Partition, StreamsInner};
 use bytes::Bytes;
 
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::WireIdentifier;
-use iggy_binary_protocol::codec::{
-    WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le, read_u128_le,
-};
+use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le, read_u128_le};
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
+use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A partition being cooperatively handed off from this member to `target`.
-///
-/// The source keeps polling/committing it until the handoff completes (the
-/// consumer drains what it polled, or the revocation times out), so an
-/// in-flight batch is never lost mid-rebalance.
-#[derive(Debug, Clone)]
-pub struct PendingRevocation {
-    pub partition_id: usize,
-    /// Slab key of the member the partition moves to once completed.
-    pub target_member: usize,
-    /// Monotonic micros when the revocation was created, for timeout.
+/// A desired owner remains inactive until its exact partition installation is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingOwnership {
+    pub owner: ConsumerGroupOwner,
+    pub metadata_op: u64,
     pub created_at: u64,
+    pub skip_drain: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerGroupAssignment {
+    pub incarnation: u64,
+    pub owner: Option<ConsumerGroupOwner>,
+    pub pending: Option<PendingOwnership>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumerGroupOwnershipTransition {
+    pub stream_id: u32,
+    pub topic_id: u32,
+    pub partition_id: u32,
+    pub source: Option<ConsumerGroupOwner>,
+    pub installation: InstallConsumerGroupOwnerRequest,
+    pub created_at: u64,
+    pub skip_drain: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
     pub id: usize,
     pub client_id: u128,
-    /// Retained independently of client-table capacity eviction. None for legacy snapshots.
+    /// Retained independently of client-table capacity eviction.
     pub session: Option<u64>,
     pub partitions: Vec<usize>,
-    /// Partitions marked for cooperative handoff away from this member but not
-    /// yet moved. The member still owns them (poll + commit) until completion.
-    pub pending_revocations: Vec<PendingRevocation>,
+    /// Derived from the authoritative assignments. Polls stop while offsets drain.
+    pub pending_revocations: Vec<usize>,
 }
 
 impl ConsumerGroupMember {
@@ -106,11 +120,7 @@ impl ConsumerGroupMember {
     /// the member's partition count), so the linear scan beats a set.
     #[must_use]
     pub fn is_pollable(&self, partition_id: usize) -> bool {
-        self.partitions.contains(&partition_id)
-            && !self
-                .pending_revocations
-                .iter()
-                .any(|revocation| revocation.partition_id == partition_id)
+        self.partitions.contains(&partition_id) && !self.pending_revocations.contains(&partition_id)
     }
 }
 
@@ -125,6 +135,7 @@ pub struct ConsumerGroup {
     pub generation: u64,
     pub name: Arc<str>,
     pub members: IdSlab<ConsumerGroupMember>,
+    pub assignments: BTreeMap<usize, ConsumerGroupAssignment>,
 }
 
 impl ConsumerGroup {
@@ -135,269 +146,249 @@ impl ConsumerGroup {
             generation: 0,
             name,
             members: IdSlab::new(),
+            assignments: BTreeMap::new(),
         }
     }
 
-    /// Redistribute the topic's current partitions round-robin across members.
-    /// Reads the live partition set each call, so it reflects repartitions and
-    /// bumps the generation on any membership change.
-    ///
-    /// Deliberately asymmetric with the join path (`rebalance_cooperative`):
-    /// this clears partitions and pending revocations with no cooperative
-    /// drain, so a member's in-flight (polled-but-uncommitted) partitions move
-    /// immediately and the new owner re-reads that range. That redelivery is
-    /// exactly what the join path avoids via pending revocations -- but the
-    /// callers here (leave, remove-member on disconnect, repartition) are cases
-    /// where the departing member cannot drain anyway, so an eager move is
-    /// correct and the redelivery is benign under at-least-once.
-    pub fn rebalance_members(&mut self, partition_ids: &[usize]) {
+    /// Metadata chooses successors; only a durable partition installation activates them.
+    pub fn rebalance_members(&mut self, partitions: &[Partition], metadata_op: u64, now: u64) {
         self.generation += 1;
-
-        let member_count = self.members.len();
-        let member_keys: Vec<usize> = self.members.iter().map(|(id, _)| id).collect();
-        for &member_id in &member_keys {
-            if let Some(member) = self.members.get_mut(member_id) {
-                member.partitions.clear();
-                member.pending_revocations.clear();
-            }
-        }
-
-        if member_count == 0 {
-            return;
-        }
-
-        for (i, &partition_id) in partition_ids.iter().enumerate() {
-            let target = i % member_count;
-            if let Some(&member_id) = member_keys.get(target)
-                && let Some(member) = self.members.get_mut(member_id)
-            {
-                member.partitions.push(partition_id);
-            }
-        }
-    }
-
-    /// Cooperative rebalance (on member join): assign unassigned partitions to
-    /// idle members immediately, and mark each over-assigned member's excess as
-    /// pending revocation toward an idle member -- the partition only moves once
-    /// the source's consumer drains it (see the reconciler) or it times out, so
-    /// no in-flight batch is dropped. `now` is the replicated op timestamp
-    /// (micros), kept identical across replicas for deterministic apply.
-    #[allow(clippy::too_many_lines)]
-    pub fn rebalance_cooperative(
-        &mut self,
-        partition_ids: &[usize],
-        in_flight: &std::collections::HashSet<usize>,
-        now: u64,
-    ) {
-        self.generation += 1;
-
-        let member_count = self.members.len();
-        if member_count == 0 || partition_ids.is_empty() {
-            return;
-        }
-
-        let mut assigned: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (_, member) in &self.members {
-            for &partition_id in &member.partitions {
-                assigned.insert(partition_id);
-            }
-        }
-
-        // Step 1: hand unassigned partitions straight to idle members.
-        let unassigned: Vec<usize> = partition_ids
-            .iter()
-            .copied()
-            .filter(|partition_id| !assigned.contains(partition_id))
-            .collect();
-        if !unassigned.is_empty() {
-            let idle: Vec<usize> = self
-                .members
-                .iter()
-                .filter(|(_, member)| member.partitions.is_empty())
-                .map(|(slab_id, _)| slab_id)
-                .collect();
-            if !idle.is_empty() {
-                for (i, partition_id) in unassigned.into_iter().enumerate() {
-                    let slab_id = idle[i % idle.len()];
-                    if let Some(member) = self.members.get_mut(slab_id) {
-                        member.partitions.push(partition_id);
-                    }
-                }
-            }
-        }
-
-        // Step 2: mark excess on over-assigned members as pending revocation.
-        let partition_count = partition_ids.len();
-        let fair_share = partition_count / member_count;
-        let remainder = partition_count % member_count;
-
-        let revocation_targets: std::collections::HashSet<usize> = self
+        let members: Vec<(u128, u64)> = self
             .members
             .iter()
-            .flat_map(|(_, member)| {
+            .filter_map(|(_, member)| {
+                member
+                    .session
+                    .filter(|session| *session != 0)
+                    .map(|session| (member.client_id, session))
+            })
+            .collect();
+        let partition_ids: std::collections::BTreeSet<usize> =
+            partitions.iter().map(|partition| partition.id).collect();
+        self.assignments
+            .retain(|partition_id, _| partition_ids.contains(partition_id));
+        let desired_members = self.balanced_member_indices(partitions, &members);
+        for (index, partition) in partitions.iter().enumerate() {
+            let incarnation = partition.created_revision;
+            let (client_id, session) =
+                desired_members[index].map_or((0, 0), |index| members[index]);
+            let desired = ConsumerGroupOwner {
+                client_id,
+                session,
+                generation: self.generation,
+            };
+            let assignment =
+                self.assignments
+                    .entry(partition.id)
+                    .or_insert(ConsumerGroupAssignment {
+                        incarnation,
+                        owner: None,
+                        pending: None,
+                    });
+            if assignment.incarnation != incarnation {
+                assignment.incarnation = incarnation;
+                assignment.owner = None;
+                assignment.pending = None;
+            }
+            let same_member = |owner: ConsumerGroupOwner| {
+                owner.client_id == client_id && owner.session == session
+            };
+            if let Some(pending) = assignment.pending {
+                if same_member(pending.owner) {
+                    continue;
+                }
+            } else if assignment.owner.is_some_and(same_member)
+                || (assignment.owner.is_none() && desired.is_unassigned())
+            {
+                continue;
+            }
+            let skip_drain = assignment
+                .owner
+                .is_none_or(|owner| !members.contains(&(owner.client_id, owner.session)));
+            assignment.pending = Some(PendingOwnership {
+                owner: desired,
+                metadata_op,
+                created_at: now,
+                skip_drain,
+            });
+        }
+        self.rebuild_member_assignments();
+    }
+
+    pub fn complete_revocation(
+        &mut self,
+        partition_id: usize,
+        installation: &InstallConsumerGroupOwnerRequest,
+        partition_op: u64,
+    ) -> bool {
+        if installation.group_id != self.id || partition_op == 0 {
+            return false;
+        }
+        let Some(assignment) = self.assignments.get_mut(&partition_id) else {
+            return false;
+        };
+        let Some(pending) = assignment.pending else {
+            return false;
+        };
+        if assignment.incarnation != installation.incarnation
+            || pending.owner != installation.owner
+            || pending.metadata_op != installation.metadata_op
+        {
+            return false;
+        }
+        let previous = assignment.owner;
+        assignment.owner = (!pending.owner.is_unassigned()).then_some(pending.owner);
+        assignment.pending = None;
+        self.generation += 1;
+        for (_, member) in &mut self.members {
+            if previous.is_some_and(|owner| {
+                owner.client_id == member.client_id && Some(owner.session) == member.session
+            }) {
+                member
+                    .partitions
+                    .retain(|assigned| *assigned != partition_id);
                 member
                     .pending_revocations
-                    .iter()
-                    .map(|revocation| revocation.target_member)
-            })
-            .collect();
-        let idle: Vec<usize> = self
-            .members
-            .iter()
-            .filter(|(slab_id, member)| {
-                member.partitions.is_empty() && !revocation_targets.contains(slab_id)
-            })
-            .map(|(slab_id, _)| slab_id)
-            .collect();
-        if idle.is_empty() {
-            return;
-        }
-
-        // Pass 1: collect excess (round-robin into idle members in pass 2 so a
-        // single over-assigned member's excess spreads evenly, not all to one).
-        let member_keys: Vec<usize> = self.members.iter().map(|(slab_id, _)| slab_id).collect();
-        let mut members_with_remainder = remainder;
-        let mut all_excess: Vec<(usize, usize)> = Vec::new();
-        for &slab_id in &member_keys {
-            let Some(member) = self.members.get(slab_id) else {
-                continue;
-            };
-            let pending: std::collections::HashSet<usize> = member
-                .pending_revocations
-                .iter()
-                .map(|revocation| revocation.partition_id)
-                .collect();
-            let effective: Vec<usize> = member
-                .partitions
-                .iter()
-                .copied()
-                .filter(|partition_id| !pending.contains(partition_id))
-                .collect();
-            let max_allowed = if members_with_remainder > 0 {
-                fair_share + 1
-            } else {
-                fair_share
-            };
-            if effective.len() <= max_allowed {
-                if effective.len() > fair_share {
-                    members_with_remainder = members_with_remainder.saturating_sub(1);
-                }
-                continue;
+                    .retain(|pending| *pending != partition_id);
             }
-            let excess_count = effective.len() - max_allowed;
-            if members_with_remainder > 0 && effective.len() > fair_share {
-                members_with_remainder = members_with_remainder.saturating_sub(1);
+            if pending.owner.client_id == member.client_id
+                && Some(pending.owner.session) == member.session
+            {
+                member.partitions.push(partition_id);
+                member.partitions.sort_unstable();
             }
-            for partition_id in effective.into_iter().rev().take(excess_count) {
-                all_excess.push((partition_id, slab_id));
-            }
-        }
-
-        // Pass 2: distribute the collected excess round-robin over idle members.
-        // An in-flight partition (the source polled but hasn't committed it) is
-        // pending-revoked so the source can drain it first; a never-polled or
-        // already-drained partition has nothing in flight, so it moves now.
-        for (i, (partition_id, source_slab)) in all_excess.into_iter().enumerate() {
-            let target_slab = idle[i % idle.len()];
-            if in_flight.contains(&partition_id) {
-                if let Some(source) = self.members.get_mut(source_slab) {
-                    source.pending_revocations.push(PendingRevocation {
-                        partition_id,
-                        target_member: target_slab,
-                        created_at: now,
-                    });
-                }
-            } else {
-                if let Some(source) = self.members.get_mut(source_slab) {
-                    source.partitions.retain(|&p| p != partition_id);
-                }
-                if let Some(target) = self.members.get_mut(target_slab) {
-                    target.partitions.push(partition_id);
-                }
-            }
-        }
-    }
-
-    /// Complete a pending revocation: move `partition_id` from the member with
-    /// `source_client_id` to its recorded target. Bumps the generation so both
-    /// clients re-sync. Returns `false` if no such pending revocation exists
-    /// (already completed / stale) or the target member is gone.
-    pub fn complete_revocation(&mut self, source_client_id: u128, partition_id: usize) -> bool {
-        let Some(source_slab) = self
-            .members
-            .iter()
-            .find(|(_, member)| member.client_id == source_client_id)
-            .map(|(slab_id, _)| slab_id)
-        else {
-            return false;
-        };
-        let Some(source) = self.members.get_mut(source_slab) else {
-            return false;
-        };
-        let Some(pos) = source
-            .pending_revocations
-            .iter()
-            .position(|revocation| revocation.partition_id == partition_id)
-        else {
-            return false;
-        };
-        let revocation = source.pending_revocations.remove(pos);
-        source.partitions.retain(|&p| p != partition_id);
-        if let Some(target) = self.members.get_mut(revocation.target_member) {
-            target.partitions.push(partition_id);
-            self.generation += 1;
-        } else {
-            // Target gone: full rebalance recovers a consistent assignment.
-            let mut all: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for (_, member) in &self.members {
-                for &p in &member.partitions {
-                    all.insert(p);
-                }
-            }
-            all.insert(partition_id);
-            let mut partition_ids: Vec<usize> = all.into_iter().collect();
-            partition_ids.sort_unstable();
-            self.rebalance_members(&partition_ids);
         }
         true
     }
 
-    /// `(source_client_id, partition_id, created_at)` for every pending
-    /// revocation in this group, for the reconciler's completion check.
-    #[must_use]
-    pub fn pending_revocations(&self) -> Vec<(u128, usize, u64)> {
-        self.members
+    /// Replaces this group's entries in `pending_revocations` with its open transitions.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn index_pending_revocations(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        pending_revocations: &mut BTreeMap<
+            (usize, usize, u64, usize),
+            ConsumerGroupOwnershipTransition,
+        >,
+    ) {
+        pending_revocations
+            .extract_if(
+                (stream_id, topic_id, self.id, 0)..=(stream_id, topic_id, self.id, usize::MAX),
+                |_, _| true,
+            )
+            .for_each(drop);
+        for (&partition_id, assignment) in &self.assignments {
+            let Some(pending) = assignment.pending else {
+                continue;
+            };
+            pending_revocations.insert(
+                (stream_id, topic_id, self.id, partition_id),
+                ConsumerGroupOwnershipTransition {
+                    stream_id: stream_id as u32,
+                    topic_id: topic_id as u32,
+                    partition_id: partition_id as u32,
+                    source: assignment.owner,
+                    installation: InstallConsumerGroupOwnerRequest {
+                        incarnation: assignment.incarnation,
+                        group_id: self.id,
+                        owner: pending.owner,
+                        metadata_op: pending.metadata_op,
+                    },
+                    created_at: pending.created_at,
+                    skip_drain: pending.skip_drain,
+                },
+            );
+        }
+    }
+
+    fn balanced_member_indices(
+        &self,
+        partitions: &[Partition],
+        members: &[(u128, u64)],
+    ) -> Vec<Option<usize>> {
+        let mut loads = vec![0usize; members.len()];
+        let mut desired_members: Vec<Option<usize>> = partitions
             .iter()
-            .flat_map(|(_, member)| {
-                member.pending_revocations.iter().map(move |revocation| {
-                    (
-                        member.client_id,
-                        revocation.partition_id,
-                        revocation.created_at,
-                    )
-                })
+            .map(|partition| {
+                let assignment = self.assignments.get(&partition.id)?;
+                if assignment.incarnation != partition.created_revision {
+                    return None;
+                }
+                let owner = assignment
+                    .pending
+                    .map(|pending| pending.owner)
+                    .or(assignment.owner)?;
+                let index = members
+                    .iter()
+                    .position(|member| *member == (owner.client_id, owner.session))?;
+                loads[index] += 1;
+                Some(index)
             })
-            .collect()
+            .collect();
+        if !members.is_empty() {
+            let fair_share = partitions.len() / members.len();
+            let mut capacities = vec![fair_share; members.len()];
+            let mut ranked_members: Vec<usize> = (0..members.len()).collect();
+            ranked_members.sort_by_key(|index| std::cmp::Reverse(loads[*index]));
+            for index in ranked_members
+                .into_iter()
+                .take(partitions.len() % members.len())
+            {
+                capacities[index] += 1;
+            }
+            for desired in desired_members.iter_mut().rev() {
+                if let Some(index) = *desired
+                    && loads[index] > capacities[index]
+                {
+                    loads[index] -= 1;
+                    *desired = None;
+                }
+            }
+            for desired in &mut desired_members {
+                if desired.is_none()
+                    && let Some(index) = loads
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, load)| **load < capacities[*index])
+                        .min_by_key(|(_, load)| **load)
+                        .map(|(index, _)| index)
+                {
+                    loads[index] += 1;
+                    *desired = Some(index);
+                }
+            }
+        }
+        desired_members
+    }
+
+    fn rebuild_member_assignments(&mut self) {
+        for (_, member) in &mut self.members {
+            member.partitions.clear();
+            member.pending_revocations.clear();
+            for (&partition_id, assignment) in &self.assignments {
+                if assignment.owner.is_some_and(|owner| {
+                    owner.client_id == member.client_id && Some(owner.session) == member.session
+                }) {
+                    member.partitions.push(partition_id);
+                    if assignment.pending.is_some() {
+                        member.pending_revocations.push(partition_id);
+                    }
+                }
+            }
+        }
     }
 }
 
-/// Replicated `JoinConsumerGroup`, enriched by the primary's home shard.
-///
-/// The wire request carries only identifiers; the apply needs the client id
-/// (which member is joining) and can't read it from the consensus header. The
-/// home shard also gathers `in_flight` -- the group's partitions with
-/// uncommitted polled data -- so the cooperative rebalance pending-revokes only
-/// those and hands off never-polled/drained partitions immediately (the apply
-/// has no partition-plane access to classify them itself).
+/// Replicated join enriched with the authenticated member identity.
+/// Drain decisions belong to the partition's installed owner.
 #[derive(Debug, Clone)]
 pub struct JoinConsumerGroupRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
     pub group_id: WireIdentifier,
     pub client_id: u128,
-    pub in_flight: Vec<u32>,
-    /// Authenticated bind epoch, absent only in legacy records. `PrepareHeader` does not retain it.
-    pub session: Option<u64>,
+    pub session: u64,
 }
 
 impl WireEncode for JoinConsumerGroupRequest {
@@ -405,10 +396,8 @@ impl WireEncode for JoinConsumerGroupRequest {
         self.stream_id.encoded_size()
             + self.topic_id.encoded_size()
             + self.group_id.encoded_size()
-            + 16
-            + 4
-            + self.in_flight.len() * 4
-            + self.session.map_or(0, |_| size_of::<u64>())
+            + size_of::<u128>()
+            + size_of::<u64>()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -416,16 +405,7 @@ impl WireEncode for JoinConsumerGroupRequest {
         self.topic_id.encode(buf);
         self.group_id.encode(buf);
         buf.put_u128_le(self.client_id);
-        // `encoded_size` + the loop below use the true length, so a silent
-        // clamp here would desync the count header from the body. `in_flight`
-        // is bounded by the topic's partition count, so this never fires.
-        buf.put_u32_le(u32::try_from(self.in_flight.len()).expect("in_flight count fits u32"));
-        for partition_id in &self.in_flight {
-            buf.put_u32_le(*partition_id);
-        }
-        if let Some(session) = self.session {
-            buf.put_u64_le(session);
-        }
+        buf.put_u64_le(self.session);
     }
 }
 
@@ -437,34 +417,20 @@ impl WireDecode for JoinConsumerGroupRequest {
         let (group_id, n) = WireIdentifier::decode(&buf[pos..])?;
         pos += n;
         let client_id = read_u128_le(buf, pos)?;
-        pos += 16;
-        let count = read_u32_le(buf, pos)? as usize;
-        pos += 4;
-        // Cap against the bytes actually left: `count` is read straight off a
-        // replicated prepare, so an unbounded `with_capacity` would let a
-        // corrupt/bit-rotted count (near u32::MAX) allocate gigabytes and abort
-        // every backup that applies it.
-        let mut in_flight =
-            Vec::with_capacity(bounded_capacity(count, buf.len().saturating_sub(pos), 4));
-        for _ in 0..count {
-            in_flight.push(read_u32_le(buf, pos)?);
-            pos += 4;
+        pos += size_of::<u128>();
+        let session = read_u64_le(buf, pos)?;
+        pos += size_of::<u64>();
+        if client_id == 0 || session == 0 || pos != buf.len() {
+            return Err(iggy_binary_protocol::WireError::Validation(
+                "invalid consumer group member identity or trailing bytes".into(),
+            ));
         }
-        // Old WAL records end after in_flight; new joins retain the request epoch.
-        let session = if pos == buf.len() {
-            None
-        } else {
-            let session = read_u64_le(buf, pos)?;
-            pos += size_of::<u64>();
-            Some(session).filter(|&epoch| epoch != 0)
-        };
         Ok((
             Self {
                 stream_id,
                 topic_id,
                 group_id,
                 client_id,
-                in_flight,
                 session,
             },
             pos,
@@ -536,6 +502,10 @@ impl StateHandler for CreateConsumerGroupRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
             return ApplyReply::err(CreateConsumerGroupResult::TopicNotFound);
         };
+        if state.lifecycle_blocks_consumer(stream_id, topic_id, None) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
+
         let Some(topic) = state
             .items
             .get_mut(stream_id)
@@ -601,6 +571,25 @@ impl StateHandler for DeleteConsumerGroupRequest {
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
             return ApplyReply::err(DeleteConsumerGroupResult::ConsumerGroupNotFound);
         };
+        let Ok(wire_group_id) = u32::try_from(group_id) else {
+            return ApplyReply::err(iggy_common::IggyError::InvalidCommand.as_code());
+        };
+        if let Some(reply) = state.begin_lifecycle(
+            stream_id,
+            Some(topic_id),
+            LifecycleAction::DeleteConsumerGroup {
+                group_id: wire_group_id,
+            },
+        ) {
+            return reply;
+        }
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(DeleteConsumerGroupResult::TopicNotFound);
+        };
         let Some(group) = topic.consumer_groups.remove(&group_id) else {
             return ApplyReply::err(DeleteConsumerGroupResult::ConsumerGroupNotFound);
         };
@@ -627,6 +616,16 @@ impl StateHandler for JoinConsumerGroupRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
             return ApplyReply::err(JoinConsumerGroupResult::TopicNotFound);
         };
+
+        let group_id = state
+            .items
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
+            .and_then(|topic| topic.resolve_group_id(&self.group_id));
+        if state.lifecycle_blocks_consumer(stream_id, topic_id, group_id) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
+
         let Some(topic) = state
             .items
             .get_mut(stream_id)
@@ -637,9 +636,6 @@ impl StateHandler for JoinConsumerGroupRequest {
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
             return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
         };
-        // Snapshot the live partition ids before taking a mutable borrow of the
-        // group (both borrow the topic).
-        let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
             return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
         };
@@ -649,22 +645,28 @@ impl StateHandler for JoinConsumerGroupRequest {
             .iter_mut()
             .find(|(_, member)| member.client_id == self.client_id);
         if let Some((_, member)) = already {
-            member.session = self.session.or(member.session);
+            let session = Some(self.session);
+            if member.session != session {
+                member.session = session;
+                group.rebalance_members(
+                    &topic.partitions,
+                    state.apply_context.metadata_op,
+                    timestamp.as_micros(),
+                );
+                state.recompute_consumer_group_metadata();
+            }
             return ApplyReply::ok(Bytes::new());
         }
         let member_key = group
             .members
             .insert(ConsumerGroupMember::new(0, self.client_id));
         group.members[member_key].id = member_key;
-        group.members[member_key].session = self.session;
-        // Cooperative handoff using the home-shard-gathered `in_flight` set:
-        // never-polled/drained excess moves to the new member immediately (so a
-        // fresh group distributes synchronously at join), while partitions with
-        // uncommitted in-flight data are pending-revoked for the reconciler to
-        // complete once the source drains them (or on timeout).
-        let in_flight: std::collections::HashSet<usize> =
-            self.in_flight.iter().map(|&p| p as usize).collect();
-        group.rebalance_cooperative(&partition_ids, &in_flight, timestamp.as_micros());
+        group.members[member_key].session = Some(self.session);
+        group.rebalance_members(
+            &topic.partitions,
+            state.apply_context.metadata_op,
+            timestamp.as_micros(),
+        );
         state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
@@ -672,11 +674,7 @@ impl StateHandler for JoinConsumerGroupRequest {
 
 impl StateHandler for LeaveConsumerGroupRequest {
     type State = StreamsInner;
-    fn apply(
-        &self,
-        state: &mut StreamsInner,
-        _timestamp: iggy_common::IggyTimestamp,
-    ) -> ApplyReply {
+    fn apply(&self, state: &mut StreamsInner, timestamp: iggy_common::IggyTimestamp) -> ApplyReply {
         // Same level-by-level resolution as Join, surfacing a loud rejection
         // instead of the old silent-OK no-op when a level is gone.
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -685,6 +683,16 @@ impl StateHandler for LeaveConsumerGroupRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
             return ApplyReply::err(LeaveConsumerGroupResult::TopicNotFound);
         };
+
+        let group_id = state
+            .items
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
+            .and_then(|topic| topic.resolve_group_id(&self.group_id));
+        if state.lifecycle_blocks_consumer(stream_id, topic_id, group_id) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
+
         let Some(topic) = state
             .items
             .get_mut(stream_id)
@@ -695,7 +703,6 @@ impl StateHandler for LeaveConsumerGroupRequest {
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
             return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
-        let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
             return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
@@ -712,7 +719,11 @@ impl StateHandler for LeaveConsumerGroupRequest {
             return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound);
         };
         group.members.remove(key);
-        group.rebalance_members(&partition_ids);
+        group.rebalance_members(
+            &topic.partitions,
+            state.apply_context.metadata_op,
+            timestamp.as_micros(),
+        );
         state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
@@ -747,11 +758,7 @@ impl WireDecode for RemoveConsumerGroupMemberRequest {
 
 impl StateHandler for RemoveConsumerGroupMemberRequest {
     type State = StreamsInner;
-    fn apply(
-        &self,
-        state: &mut StreamsInner,
-        _timestamp: iggy_common::IggyTimestamp,
-    ) -> ApplyReply {
+    fn apply(&self, state: &mut StreamsInner, timestamp: iggy_common::IggyTimestamp) -> ApplyReply {
         let mut any_removed = false;
         for (_, stream) in &mut state.items {
             for (_, topic) in &mut stream.topics {
@@ -761,15 +768,13 @@ impl StateHandler for RemoveConsumerGroupMemberRequest {
                         .iter()
                         .find(|(_, m)| m.client_id == self.client_id)
                         .map(|(key, _)| key);
-                    // Collect the partition set only when this group actually
-                    // holds the member. This runs on every logout inside the
-                    // no-await commit critical section on every replica, so the
-                    // alloc stays out of the common (no-match) path.
                     if let Some(key) = member_key {
-                        let partition_ids: Vec<usize> =
-                            topic.partitions.iter().map(|p| p.id).collect();
                         group.members.remove(key);
-                        group.rebalance_members(&partition_ids);
+                        group.rebalance_members(
+                            &topic.partitions,
+                            state.apply_context.metadata_op,
+                            timestamp.as_micros(),
+                        );
                         any_removed = true;
                     }
                 }
@@ -784,52 +789,61 @@ impl StateHandler for RemoveConsumerGroupMemberRequest {
     }
 }
 
-/// Reconciler-originated completion of a pending cooperative revocation.
-///
-/// Moves `partition_id` from the member `source_client_id` to its recorded
-/// target, once the source consumer has drained the partition (committed up to
-/// what it polled) or the revocation timed out.
+/// Durable partition evidence for one exact pending ownership transition.
 #[derive(Debug, Clone)]
 pub struct CompleteConsumerGroupRevocationRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
-    pub group_id: u64,
-    pub source_client_id: u128,
     pub partition_id: u32,
+    pub installation: InstallConsumerGroupOwnerRequest,
+    pub partition_op: u64,
 }
 
 impl WireEncode for CompleteConsumerGroupRevocationRequest {
     fn encoded_size(&self) -> usize {
-        self.stream_id.encoded_size() + self.topic_id.encoded_size() + 8 + 16 + 4
+        self.stream_id.encoded_size()
+            + self.topic_id.encoded_size()
+            + size_of::<u32>()
+            + self.installation.encoded_size()
+            + size_of::<u64>()
     }
-
     fn encode(&self, buf: &mut BytesMut) {
         self.stream_id.encode(buf);
         self.topic_id.encode(buf);
-        buf.put_u64_le(self.group_id);
-        buf.put_u128_le(self.source_client_id);
         buf.put_u32_le(self.partition_id);
+        self.installation.encode(buf);
+        buf.put_u64_le(self.partition_op);
     }
 }
 
 impl WireDecode for CompleteConsumerGroupRevocationRequest {
-    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+    fn decode_from(buf: &[u8]) -> Result<Self, iggy_binary_protocol::WireError> {
+        let (request, consumed) = Self::decode(buf)?;
+        if consumed != buf.len() || request.partition_op == 0 {
+            return Err(iggy_binary_protocol::WireError::Validation(
+                "invalid ownership completion length or partition operation".into(),
+            ));
+        }
+        Ok(request)
+    }
+
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::error::WireError> {
         let (stream_id, mut pos) = WireIdentifier::decode(buf)?;
-        let (topic_id, n) = WireIdentifier::decode(&buf[pos..])?;
-        pos += n;
-        let group_id = read_u64_le(buf, pos)?;
-        pos += 8;
-        let source_client_id = read_u128_le(buf, pos)?;
-        pos += 16;
+        let (topic_id, consumed) = WireIdentifier::decode(&buf[pos..])?;
+        pos += consumed;
         let partition_id = read_u32_le(buf, pos)?;
-        pos += 4;
+        pos += size_of::<u32>();
+        let (installation, consumed) = InstallConsumerGroupOwnerRequest::decode(&buf[pos..])?;
+        pos += consumed;
+        let partition_op = read_u64_le(buf, pos)?;
+        pos += size_of::<u64>();
         Ok((
             Self {
                 stream_id,
                 topic_id,
-                group_id,
-                source_client_id,
                 partition_id,
+                installation,
+                partition_op,
             },
             pos,
         ))
@@ -843,18 +857,37 @@ impl StateHandler for CompleteConsumerGroupRevocationRequest {
         state: &mut StreamsInner,
         _timestamp: iggy_common::IggyTimestamp,
     ) -> ApplyReply {
-        let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return ApplyReply::ok(Bytes::new());
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return ApplyReply::ok(Bytes::new());
+        };
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
             return ApplyReply::ok(Bytes::new());
         };
         let completed = topic
             .consumer_groups
-            .get_mut(&self.group_id)
+            .get_mut(&self.installation.group_id)
             .is_some_and(|group| {
-                group.complete_revocation(self.source_client_id, self.partition_id as usize)
+                group.complete_revocation(
+                    self.partition_id as usize,
+                    &self.installation,
+                    self.partition_op,
+                )
             });
         if completed {
             state.revision = state.revision.wrapping_add(1);
-            state.recompute_consumer_group_metadata();
+            state.pending_revocations.remove(&(
+                stream_id,
+                topic_id,
+                self.installation.group_id,
+                self.partition_id as usize,
+            ));
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -870,17 +903,34 @@ pub struct RefreshConsumerGroupSessionRequest {
 impl StateHandler for RefreshConsumerGroupSessionRequest {
     type State = StreamsInner;
 
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         if let Some(memberships) = state.consumer_group_members.get(&self.client_id) {
             for &(stream_id, topic_id, group_id, member_id) in memberships {
-                if let Some(member) = state
+                let Some(topic) = state
                     .items
                     .get_mut(stream_id)
                     .and_then(|stream| stream.topics.get_mut(topic_id))
-                    .and_then(|topic| topic.consumer_groups.get_mut(&group_id))
-                    .and_then(|group| group.members.get_mut(member_id))
-                {
+                else {
+                    continue;
+                };
+                let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
+                    continue;
+                };
+                let Some(member) = group.members.get_mut(member_id) else {
+                    continue;
+                };
+                if member.session != Some(self.session) {
                     member.session = Some(self.session);
+                    group.rebalance_members(
+                        &topic.partitions,
+                        state.apply_context.metadata_op,
+                        timestamp.as_micros(),
+                    );
+                    group.index_pending_revocations(
+                        stream_id,
+                        topic_id,
+                        &mut state.pending_revocations,
+                    );
                 }
             }
         }
@@ -888,112 +938,73 @@ impl StateHandler for RefreshConsumerGroupSessionRequest {
     }
 }
 
-/// Consumer group member snapshot representation for serialization.
-///
-/// Snapshots are encoded by `rmp_serde::to_vec` as **positional arrays** (no
-/// field-name map), so `#[serde(default)]` only fills a missing **trailing**
-/// element -- a new field is back/forward-compatible only if appended last. A
-/// field inserted mid-struct shifts every later position and corrupts decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupMemberSnapshot {
     pub id: usize,
     pub client_id: u128,
-    pub partitions: Vec<usize>,
-    /// `(partition_id, target_member_slab, created_at_micros)` per pending
-    /// cooperative revocation. Trailing + `serde(default)` so a snapshot that
-    /// predates this field still decodes (the default fills the absent
-    /// trailing element).
-    #[serde(default)]
-    pub pending_revocations: Vec<(usize, usize, u64)>,
-    #[serde(default)]
     pub session: Option<u64>,
 }
 
-/// Consumer group snapshot representation for serialization (nested under the
-/// topic snapshot). Positional array, same trailing-only rule as
-/// [`ConsumerGroupMemberSnapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupSnapshot {
     pub id: u64,
-    // No `serde(default)`: `generation` is not the trailing field, so a default
-    // could not fill it positionally anyway, and every consumer-group snapshot
-    // (new with co-located groups) always writes it.
     pub generation: u64,
     pub name: String,
     pub members: Vec<(usize, ConsumerGroupMemberSnapshot)>,
+    pub assignments: BTreeMap<usize, ConsumerGroupAssignment>,
 }
 
 impl ConsumerGroupSnapshot {
     #[must_use]
     pub fn from_group(group: &ConsumerGroup) -> Self {
-        let members = group
-            .members
-            .iter()
-            .map(|(member_id, member)| {
-                (
-                    member_id,
-                    ConsumerGroupMemberSnapshot {
-                        id: member.id,
-                        client_id: member.client_id,
-                        session: member.session,
-                        partitions: member.partitions.clone(),
-                        pending_revocations: member
-                            .pending_revocations
-                            .iter()
-                            .map(|revocation| {
-                                (
-                                    revocation.partition_id,
-                                    revocation.target_member,
-                                    revocation.created_at,
-                                )
-                            })
-                            .collect(),
-                    },
-                )
-            })
-            .collect();
         Self {
             id: group.id,
             generation: group.generation,
             name: group.name.to_string(),
-            members,
+            members: group
+                .members
+                .iter()
+                .map(|(member_id, member)| {
+                    (
+                        member_id,
+                        ConsumerGroupMemberSnapshot {
+                            id: member.id,
+                            client_id: member.client_id,
+                            session: member.session,
+                        },
+                    )
+                })
+                .collect(),
+            assignments: group.assignments.clone(),
         }
     }
 
     #[must_use]
     pub fn into_group(self) -> ConsumerGroup {
-        let members: IdSlab<ConsumerGroupMember> = self
-            .members
-            .into_iter()
-            .map(|(member_key, member_snap)| {
-                (
-                    member_key,
-                    ConsumerGroupMember {
-                        id: member_snap.id,
-                        client_id: member_snap.client_id,
-                        session: member_snap.session,
-                        partitions: member_snap.partitions,
-                        pending_revocations: member_snap
-                            .pending_revocations
-                            .into_iter()
-                            .map(
-                                |(partition_id, target_member, created_at)| PendingRevocation {
-                                    partition_id,
-                                    target_member,
-                                    created_at,
-                                },
-                            )
-                            .collect(),
-                    },
-                )
-            })
-            .collect();
-        ConsumerGroup {
+        let mut group = ConsumerGroup {
             id: self.id,
             generation: self.generation,
-            name: Arc::from(self.name.as_str()),
-            members,
-        }
+            name: Arc::from(self.name),
+            members: self
+                .members
+                .into_iter()
+                .map(|(key, member)| {
+                    (
+                        key,
+                        ConsumerGroupMember {
+                            id: member.id,
+                            client_id: member.client_id,
+                            session: member.session,
+                            partitions: Vec::new(),
+                            pending_revocations: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+            assignments: self.assignments,
+        };
+        group.rebuild_member_assignments();
+        group
     }
 }
 
@@ -1011,6 +1022,208 @@ mod tests {
     use iggy_common::IggyTimestamp;
 
     #[test]
+    fn given_balanced_owners_when_fourth_member_joins_should_move_only_three_partitions() {
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        let partitions: Vec<_> = (0..12)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        let complete = |group: &mut ConsumerGroup| {
+            let pending: Vec<_> = group
+                .assignments
+                .iter()
+                .filter_map(|(&id, assignment)| {
+                    let pending = assignment.pending?;
+                    Some((
+                        id,
+                        InstallConsumerGroupOwnerRequest {
+                            incarnation: assignment.incarnation,
+                            group_id: group.id,
+                            owner: pending.owner,
+                            metadata_op: pending.metadata_op,
+                        },
+                    ))
+                })
+                .collect();
+            for (id, installation) in pending {
+                assert!(group.complete_revocation(id, &installation, 1));
+            }
+        };
+        for id in 0..3 {
+            let mut member = ConsumerGroupMember::new(id, id as u128 + 1);
+            member.session = Some(id as u64 + 1);
+            group.members.insert(member);
+            group.rebalance_members(&partitions, id as u64 + 10, 100);
+            complete(&mut group);
+        }
+        assert!(
+            group
+                .members
+                .iter()
+                .all(|(_, member)| member.partitions.len() == 4)
+        );
+        let before = group.assignments.clone();
+        let mut member = ConsumerGroupMember::new(3, 4);
+        member.session = Some(4);
+        group.members.insert(member);
+        group.rebalance_members(&partitions, 20, 200);
+        assert_eq!(
+            group
+                .assignments
+                .values()
+                .filter(|assignment| assignment.pending.is_some())
+                .count(),
+            3
+        );
+        for (&id, assignment) in &group.assignments {
+            assert_eq!(assignment.owner, before[&id].owner);
+        }
+        complete(&mut group);
+        assert!(
+            group
+                .members
+                .iter()
+                .all(|(_, member)| member.partitions.len() == 3)
+        );
+        let before = group.assignments.clone();
+        group.members.remove(3);
+        group.rebalance_members(&partitions, 30, 300);
+        assert_eq!(
+            group
+                .assignments
+                .values()
+                .filter(|assignment| assignment.pending.is_some())
+                .count(),
+            3
+        );
+        for (&id, assignment) in &group.assignments {
+            if assignment.pending.is_none() {
+                assert_eq!(assignment.owner, before[&id].owner);
+            }
+        }
+        complete(&mut group);
+        assert!(
+            group
+                .members
+                .iter()
+                .all(|(_, member)| member.partitions.len() == 4)
+        );
+    }
+
+    #[test]
+    fn given_durable_owner_when_reassigned_should_fence_superseded_installations() {
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        let mut first = ConsumerGroupMember::new(0, 7);
+        first.session = Some(11);
+        group.members.insert(first);
+        let mut partitions: Vec<_> = (0..2)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        group.rebalance_members(&partitions, 12, 100);
+        assert_eq!(group.members[0].partitions, [] as [usize; 0]);
+        for partition_id in 0..2 {
+            let assignment = &group.assignments[&partition_id];
+            let pending = assignment.pending.unwrap();
+            assert!(pending.skip_drain);
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: group.id,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            assert!(group.complete_revocation(partition_id, &installation, 1));
+        }
+        let unchanged = group.assignments[&0].owner;
+        let old_owner = group.assignments[&1].owner;
+        let mut second = ConsumerGroupMember::new(1, 8);
+        second.session = Some(13);
+        group.members.insert(second);
+        group.rebalance_members(&partitions, 14, 200);
+        assert_eq!(group.assignments[&0].owner, unchanged);
+        assert!(group.assignments[&0].pending.is_none());
+        assert_eq!(group.assignments[&1].owner, old_owner);
+        assert_eq!(group.members[0].pollable_partitions(), [0]);
+        assert_eq!(group.members[1].partitions, [] as [usize; 0]);
+        let assignment = &group.assignments[&1];
+        let pending = assignment.pending.unwrap();
+        assert!(!pending.skip_drain);
+        let superseded = InstallConsumerGroupOwnerRequest {
+            incarnation: assignment.incarnation,
+            group_id: group.id,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        group.rebalance_members(&partitions, 15, 300);
+        assert_eq!(group.assignments[&1].pending, Some(pending));
+        group.members.remove(1);
+        group.rebalance_members(&partitions, 16, 400);
+        assert!(!group.complete_revocation(1, &superseded, 2));
+        let replacement = group.assignments[&1].pending.unwrap();
+        assert_eq!(replacement.owner.client_id, old_owner.unwrap().client_id);
+        assert!(replacement.owner.generation > superseded.owner.generation);
+        let mut installation = InstallConsumerGroupOwnerRequest {
+            incarnation: superseded.incarnation,
+            group_id: group.id,
+            owner: replacement.owner,
+            metadata_op: replacement.metadata_op,
+        };
+        installation.metadata_op -= 1;
+        assert!(!group.complete_revocation(1, &installation, 3));
+        installation.metadata_op += 1;
+        assert!(group.complete_revocation(1, &installation, 3));
+        assert!(!group.complete_revocation(1, &superseded, 2));
+        assert_eq!(group.members[0].pollable_partitions(), [0, 1]);
+
+        partitions[1].created_revision += 1;
+        group.rebalance_members(&partitions, 17, 500);
+        assert_eq!(group.assignments[&0].owner, unchanged);
+        assert!(group.assignments[&1].owner.is_none());
+        assert!(group.assignments[&1].pending.unwrap().skip_drain);
+        assert!(!group.complete_revocation(1, &installation, 3));
+        group.members.remove(0);
+        group.rebalance_members(&partitions, 18, 600);
+        for (&partition_id, assignment) in &group.assignments.clone() {
+            let pending = assignment.pending.unwrap();
+            assert!(pending.owner.is_unassigned());
+            assert!(pending.skip_drain);
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: group.id,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            assert!(group.complete_revocation(partition_id, &installation, 4));
+            assert!(group.assignments[&partition_id].owner.is_none());
+        }
+    }
+
+    #[test]
+    fn given_session_refresh_when_rebalancing_should_index_revocations_like_full_rebuild() {
+        const CLIENT: u128 = 7;
+        const OTHER: u128 = 8;
+        const SESSION: u64 = 11;
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "first").code, 0);
+        assert_eq!(create_group(&mut state, "second").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        assert_eq!(join(&mut state, 0, 0, 1, OTHER).code, 0);
+        state.apply_context.metadata_op += 1;
+        let refresh = RefreshConsumerGroupSessionRequest {
+            client_id: CLIENT,
+            session: SESSION,
+        };
+        assert_eq!(
+            StateHandler::apply(&refresh, &mut state, IggyTimestamp::now()).code,
+            0
+        );
+        let refreshed = state.pending_revocations.clone();
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(refreshed[&(0, 0, 0, 0)].installation.owner.session, SESSION);
+        assert_eq!(refreshed[&(0, 0, 1, 0)].installation.owner.client_id, OTHER);
+        state.recompute_consumer_group_metadata();
+        assert_eq!(state.pending_revocations, refreshed);
+    }
+
+    #[test]
     fn session_refresh_index_tracks_membership_removal_and_rejoin() {
         const CLIENT: u128 = 7;
         const OTHER: u128 = 8;
@@ -1025,7 +1238,7 @@ mod tests {
         assert_eq!(leave(&mut state, 0, 0, 0, CLIENT).code, 0);
         assert_eq!(state.consumer_group_members[&CLIENT].len(), 1);
         assert_eq!(
-            StateHandler::apply(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
                 &DeleteConsumerGroupRequest {
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
@@ -1039,7 +1252,7 @@ mod tests {
         );
         assert!(!state.consumer_group_members.contains_key(&CLIENT));
         assert_eq!(
-            StateHandler::apply(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
                 &RemoveConsumerGroupMemberRequest { client_id: OTHER },
                 &mut state,
                 IggyTimestamp::now(),
@@ -1050,7 +1263,12 @@ mod tests {
         assert!(state.consumer_group_members.is_empty());
         assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
         let streams = Streams::from(state);
-        streams.refresh_consumer_group_session(CLIENT, 11);
+        streams.refresh_consumer_group_session(
+            CLIENT,
+            11,
+            11,
+            iggy_common::IggyTimestamp::default(),
+        );
         assert_eq!(streams.consumer_group_session(CLIENT), Some(11));
         assert_eq!(streams.consumer_group_session(OTHER), None);
     }
@@ -1063,7 +1281,7 @@ mod tests {
             assert_eq!(create_group(&mut state, "group").code, 0);
             assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
             let reply = if delete_stream {
-                StateHandler::apply(
+                crate::stm::lifecycle::apply_with_lifecycle_completion(
                     &DeleteStreamRequest {
                         stream_id: WireIdentifier::numeric(0),
                     },
@@ -1071,7 +1289,7 @@ mod tests {
                     IggyTimestamp::now(),
                 )
             } else {
-                StateHandler::apply(
+                crate::stm::lifecycle::apply_with_lifecycle_completion(
                     &DeleteTopicRequest {
                         stream_id: WireIdentifier::numeric(0),
                         topic_id: WireIdentifier::numeric(0),
@@ -1101,15 +1319,25 @@ mod tests {
         restored.restore_in_place(original.to_snapshot());
         for streams in [boot, Streams::from(restored)] {
             for epoch in [11, 12, 13] {
-                streams.refresh_consumer_group_session(CLIENT, epoch);
-                streams.refresh_consumer_group_session(u128::MAX, epoch);
+                streams.refresh_consumer_group_session(
+                    CLIENT,
+                    epoch,
+                    epoch,
+                    iggy_common::IggyTimestamp::default(),
+                );
+                streams.refresh_consumer_group_session(
+                    u128::MAX,
+                    epoch,
+                    epoch,
+                    iggy_common::IggyTimestamp::default(),
+                );
                 assert!(streams.read(|inner| {
                     let topic = &inner.items[0].topics[0];
                     for group in topic.consumer_groups.values() {
                         for (_, member) in &group.members {
                             assert_eq!(
                                 member.session,
-                                (member.client_id == CLIENT).then_some(epoch)
+                                Some(if member.client_id == CLIENT { epoch } else { 1 })
                             );
                         }
                     }
@@ -1120,65 +1348,70 @@ mod tests {
     }
 
     #[test]
-    fn member_session_snapshot_round_trip_preserves_fence_and_reads_legacy_members() {
+    fn given_pending_ownership_when_restoring_snapshot_should_preserve_inactive_successor() {
         const CLIENT: u128 = 7;
         const SESSION: u64 = 11;
         let mut group = ConsumerGroup::new(0, Arc::from("group"));
         let mut member = ConsumerGroupMember::new(0, CLIENT);
         member.session = Some(SESSION);
-        member.partitions.push(2);
         group.members.insert(member);
-        let snapshot = ConsumerGroupSnapshot::from_group(&group);
-        let encoded = rmp_serde::to_vec(&snapshot).unwrap();
-        let restored = rmp_serde::from_slice::<ConsumerGroupSnapshot>(&encoded)
+        let partition = Partition::new(2, 1, IggyTimestamp::from(1), 1, 0);
+        group.rebalance_members(&[partition], 12, 1);
+        let encoded = rmp_serde::to_vec(&ConsumerGroupSnapshot::from_group(&group)).unwrap();
+        let mut restored = rmp_serde::from_slice::<ConsumerGroupSnapshot>(&encoded)
             .unwrap()
             .into_group();
         assert_eq!(restored.members[0].session, Some(SESSION));
+        assert_eq!(restored.members[0].partitions, [] as [usize; 0]);
+        assert_eq!(restored.assignments, group.assignments);
+        let assignment = &restored.assignments[&2];
+        let pending = assignment.pending.unwrap();
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: assignment.incarnation,
+            group_id: restored.id,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        assert!(!restored.complete_revocation(2, &installation, 0));
+        assert_eq!(restored.members[0].partitions, [] as [usize; 0]);
+        assert!(restored.complete_revocation(2, &installation, 21));
         assert_eq!(restored.members[0].partitions, [2]);
+        let encoded = rmp_serde::to_vec(&ConsumerGroupSnapshot::from_group(&restored)).unwrap();
+        let restored = rmp_serde::from_slice::<ConsumerGroupSnapshot>(&encoded)
+            .unwrap()
+            .into_group();
+        assert_eq!(restored.members[0].partitions, [2]);
+        assert!(restored.assignments[&2].pending.is_none());
 
-        let legacy = rmp_serde::to_vec(&(
-            0usize,
-            CLIENT,
-            vec![2usize],
-            Vec::<(usize, usize, u64)>::new(),
-        ))
-        .unwrap();
-        let restored = rmp_serde::from_slice::<ConsumerGroupMemberSnapshot>(&legacy).unwrap();
-        assert_eq!(restored.session, None);
-        assert_eq!(restored.client_id, CLIENT);
-        assert_eq!(restored.partitions, [2]);
+        let legacy = rmp_serde::to_vec(&(0usize, CLIENT, vec![2usize])).unwrap();
+        assert!(rmp_serde::from_slice::<ConsumerGroupMemberSnapshot>(&legacy).is_err());
     }
 
     #[test]
-    fn replicated_join_preserves_session_and_decodes_legacy_payloads() {
-        let mut join = JoinConsumerGroupRequest {
+    fn replicated_join_requires_exact_live_session_identity() {
+        let join = JoinConsumerGroupRequest {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
             group_id: WireIdentifier::numeric(0),
             client_id: 7,
-            in_flight: vec![1, 2],
-            session: None,
+            session: 11,
         };
-        let legacy = join.to_bytes();
-        assert_eq!(
-            JoinConsumerGroupRequest::decode_from(&legacy)
-                .unwrap()
-                .session,
-            None
-        );
-        join.session = Some(11);
         let encoded = join.to_bytes();
         let decoded = JoinConsumerGroupRequest::decode_from(&encoded).unwrap();
+        assert_eq!(decoded.client_id, join.client_id);
         assert_eq!(decoded.session, join.session);
-        assert_eq!(decoded.in_flight, join.in_flight);
-        for length in legacy.len() + 1..encoded.len() {
+        for length in 0..encoded.len() {
             assert!(JoinConsumerGroupRequest::decode_from(&encoded[..length]).is_err());
         }
+        let mut invalid = encoded.to_vec();
+        invalid.push(0);
+        assert!(JoinConsumerGroupRequest::decode_from(&invalid).is_err());
+        invalid = encoded.to_vec();
+        let end = invalid.len();
+        invalid[end - size_of::<u64>()..].fill(0);
+        assert!(JoinConsumerGroupRequest::decode_from(&invalid).is_err());
     }
 
-    // Groups co-locate in the topic node, so an apply resolves its parent through
-    // `topic_mut`. Build a `StreamsInner` holding stream 0 / topic 0 via the same
-    // handlers the commit path drives.
     fn streams_with_topic() -> StreamsInner {
         let mut inner = StreamsInner::new();
         let _ = StateHandler::apply(
@@ -1226,14 +1459,15 @@ mod tests {
         group: u32,
         client_id: u128,
     ) -> ApplyReply {
+        state.apply_context.metadata_op += 1;
         StateHandler::apply(
             &JoinConsumerGroupRequest {
                 stream_id: WireIdentifier::numeric(stream),
                 topic_id: WireIdentifier::numeric(topic),
                 group_id: WireIdentifier::numeric(group),
                 client_id,
-                in_flight: Vec::new(),
-                session: None,
+
+                session: 1,
             },
             state,
             IggyTimestamp::now(),

@@ -133,6 +133,23 @@ internal sealed class BinaryFactory
         return payload;
     }
 
+    /// <summary>One partition record of a topic details reply: 40 bytes of counters, then the 24-byte context.</summary>
+    internal static byte[] CreatePartitionPayload(uint id, ulong createdAt, uint segmentsCount, ulong currentOffset,
+        ulong sizeBytes, ulong messagesCount, PartitionContext context)
+    {
+        var payload = new byte[40 + PartitionContext.ENCODED_SIZE];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), segmentsCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), currentOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(24), sizeBytes);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(32), messagesCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(40), context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(48), context.OwnerGeneration);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(56), context.MetadataOp);
+        return payload;
+    }
+
     /// <summary>
     ///     One options entry: <c>[key_kind][key_len:u32][key][value_kind][value_len:u32][value]</c>. The kinds are
     ///     taken as raw wire codes so a test can encode a code this SDK has no name for.

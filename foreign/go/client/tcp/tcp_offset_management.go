@@ -22,6 +22,7 @@ import (
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
@@ -55,6 +56,20 @@ func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon
 		Offset:      offset,
 		Consumer:    consumer,
 		PartitionId: partitionId,
+	})
+	return err
+}
+
+func (c *IggyTcpClient) StoreConsumerPosition(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, position iggcon.ConsumerPosition) error {
+	if ctx == nil {
+		return ierror.ErrNilContext
+	}
+	_, err := c.do(context.WithValue(ctx, capturedPartitionContext{}, position.Context), &command.StoreConsumerOffsetRequest{
+		StreamId:    streamId,
+		TopicId:     topicId,
+		Offset:      position.Offset,
+		Consumer:    consumer,
+		PartitionId: &position.PartitionId,
 	})
 	return err
 }

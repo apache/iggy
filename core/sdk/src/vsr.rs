@@ -25,6 +25,11 @@ use iggy_binary_protocol::consensus::{
 use iggy_common::{IggyError, eviction_reason_to_error};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// Each retry of a [`IggyError::LifecycleBusy`] refusal is a new request that commits another
+/// refusal, so the pause between retries doubles up to this cap.
+pub(crate) const LIFECYCLE_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A later refusal cannot establish whether an earlier attempt committed.
 #[derive(Default)]
@@ -47,6 +52,7 @@ impl RetryOutcome {
             && matches!(
                 error,
                 IggyError::TransientNotAccepted
+                    | IggyError::HistoryUnavailable
                     | IggyError::Unauthorized
                     | IggyError::Unauthenticated
                     | IggyError::StaleClient
@@ -61,20 +67,46 @@ impl RetryOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RetainedRequest {
+    pub(crate) header: Option<RequestHeader>,
+    pub(crate) context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
+}
+
+impl RetainedRequest {
+    pub(crate) const fn new(
+        context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
+    ) -> Self {
+        Self {
+            header: None,
+            context,
+        }
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        session: &mut ConsensusSession,
+        code: u32,
+        payload: &Bytes,
+    ) -> Result<RequestHeader, IggyError> {
+        if let Some(header) = self.header {
+            validate_retained_header(&header, session)?;
+            return Ok(header);
+        }
+        let mut header = encode_request_header(session, code, payload)?.0;
+        self.context.stamp(&mut header);
+        self.header = Some(header);
+        Ok(header)
+    }
+}
+
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,
     payload: &Bytes,
-    retained_header: &mut Option<RequestHeader>,
+    retained_header: &mut RetainedRequest,
 ) -> Result<Bytes, IggyError> {
-    let header = match *retained_header {
-        Some(header) => {
-            validate_retained_header(&header, session)?;
-            header
-        }
-        None => encode_request_header(session, code, payload)?.0,
-    };
-    *retained_header = Some(header);
+    let header = retained_header.encode(session, code, payload)?;
     let total_size = header.size as usize;
     let mut request = BytesMut::with_capacity(total_size);
     request.put_slice(bytemuck::bytes_of(&header));
@@ -169,7 +201,7 @@ pub(crate) fn resume_error_is_retryable(error: &IggyError) -> bool {
 /// A resumed session can replay its exact request. A replacement session can
 /// replay only an operation whose outcome proves it was never admitted.
 pub(crate) fn retain_replay_header(
-    header: &mut Option<RequestHeader>,
+    header: &mut RetainedRequest,
     session: &Mutex<ConsensusSession>,
     code: u32,
     error: &IggyError,
@@ -177,7 +209,7 @@ pub(crate) fn retain_replay_header(
     let session = session
         .lock()
         .map_err(|_| IggyError::InvalidConfiguration)?;
-    if header.as_ref().is_some_and(|header| {
+    if header.header.as_ref().is_some_and(|header| {
         header.client == session.client_id()
             && (header.session == session.session().unwrap_or(0)
                 || header.operation == Operation::Register)
@@ -185,7 +217,7 @@ pub(crate) fn retain_replay_header(
         return Ok(());
     }
     if replay_after_session_reset_is_safe(code, error) {
-        *header = None;
+        header.header = None;
         Ok(())
     } else {
         Err(IggyError::TransientNotCommitted)
@@ -412,18 +444,17 @@ mod tests {
     }
 
     #[test]
-    fn an_authorization_denial_preserves_an_earlier_uncertain_outcome() {
-        for initial in [IggyError::TransientNotCommitted, IggyError::Disconnected] {
-            let mut outcome = RetryOutcome::for_reconnect(SEND_MESSAGES_CODE, &initial);
-            assert_eq!(
-                outcome.observe(IggyError::Unauthorized),
-                IggyError::TransientNotCommitted
-            );
+    fn later_refusals_preserve_an_earlier_uncertain_outcome() {
+        for refusal in [IggyError::Unauthorized, IggyError::HistoryUnavailable] {
+            for initial in [IggyError::TransientNotCommitted, IggyError::Disconnected] {
+                let mut outcome = RetryOutcome::for_reconnect(SEND_MESSAGES_CODE, &initial);
+                assert_eq!(
+                    outcome.observe(refusal.clone()),
+                    IggyError::TransientNotCommitted
+                );
+            }
+            assert_eq!(RetryOutcome::default().observe(refusal.clone()), refusal);
         }
-        assert_eq!(
-            RetryOutcome::default().observe(IggyError::Unauthorized),
-            IggyError::Unauthorized
-        );
     }
 
     #[test]
@@ -447,7 +478,7 @@ mod tests {
             &mut session,
             LOGIN_REGISTER_CODE,
             &request.to_bytes(),
-            &mut None,
+            &mut RetainedRequest::default(),
         )
         .unwrap();
         session.bind(42).unwrap();
@@ -457,7 +488,7 @@ mod tests {
             &mut session,
             LOGIN_REGISTER_CODE,
             &request.to_bytes(),
-            &mut None,
+            &mut RetainedRequest::default(),
         )
         .unwrap();
         let header = decode_request_header(&bytes);
@@ -562,12 +593,20 @@ mod tests {
         }
         .to_bytes();
 
-        let first =
-            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload, &mut None)
-                .unwrap();
-        let second =
-            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload, &mut None)
-                .unwrap();
+        let first = encode_contiguous_request(
+            &mut session,
+            CREATE_STREAM_CODE,
+            &payload,
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
+        let second = encode_contiguous_request(
+            &mut session,
+            CREATE_STREAM_CODE,
+            &payload,
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
 
         assert_eq!(decode_request_header(&first).request, 1);
         assert_eq!(decode_request_header(&second).request, 2);
@@ -582,9 +621,13 @@ mod tests {
         session.bind(99).unwrap();
         let payload = Bytes::from_static(b"payload");
 
-        let metadata =
-            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload, &mut None)
-                .unwrap();
+        let metadata = encode_contiguous_request(
+            &mut session,
+            CREATE_STREAM_CODE,
+            &payload,
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         // Hashed against the framed body rather than the `payload` the encoder was
         // handed, so a slice mistake between what is stamped and what is sent fails
         // here instead of reaching the server's `verify_request_checksum`.
@@ -593,13 +636,22 @@ mod tests {
             u128::from(calculate_checksum(&metadata[HEADER_SIZE..])),
         );
 
-        let partition =
-            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload, &mut None)
-                .unwrap();
+        let partition = encode_contiguous_request(
+            &mut session,
+            SEND_MESSAGES_CODE,
+            &payload,
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         assert_eq!(decode_request_header(&partition).request_checksum, 0);
 
-        let ping =
-            encode_contiguous_request(&mut session, PING_CODE, &Bytes::new(), &mut None).unwrap();
+        let ping = encode_contiguous_request(
+            &mut session,
+            PING_CODE,
+            &Bytes::new(),
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         assert_eq!(decode_request_header(&ping).request_checksum, 0);
     }
 
@@ -612,12 +664,20 @@ mod tests {
         session.bind(99).unwrap();
         let payload = Bytes::from_static(b"batch");
 
-        let first =
-            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload, &mut None)
-                .unwrap();
-        let second =
-            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload, &mut None)
-                .unwrap();
+        let first = encode_contiguous_request(
+            &mut session,
+            SEND_MESSAGES_CODE,
+            &payload,
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
+        let second = encode_contiguous_request(
+            &mut session,
+            SEND_MESSAGES_CODE,
+            &payload,
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         assert_eq!(decode_request_header(&first).request, 1);
         assert_eq!(decode_request_header(&second).request, 2);
 
@@ -630,7 +690,7 @@ mod tests {
             &mut session,
             CREATE_STREAM_CODE,
             &metadata_payload,
-            &mut None,
+            &mut RetainedRequest::default(),
         )
         .unwrap();
         assert_eq!(decode_request_header(&metadata).request, 3);
@@ -640,8 +700,13 @@ mod tests {
     fn ping_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99).unwrap();
-        let bytes =
-            encode_contiguous_request(&mut session, PING_CODE, &Bytes::new(), &mut None).unwrap();
+        let bytes = encode_contiguous_request(
+            &mut session,
+            PING_CODE,
+            &Bytes::new(),
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
@@ -660,9 +725,13 @@ mod tests {
     fn logout_uses_replicated_logout_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99).unwrap();
-        let bytes =
-            encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new(), &mut None)
-                .unwrap();
+        let bytes = encode_contiguous_request(
+            &mut session,
+            LOGOUT_USER_CODE,
+            &Bytes::new(),
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::Logout);
@@ -674,9 +743,13 @@ mod tests {
     fn read_only_request_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99).unwrap();
-        let bytes =
-            encode_contiguous_request(&mut session, GET_STREAM_CODE, &Bytes::new(), &mut None)
-                .unwrap();
+        let bytes = encode_contiguous_request(
+            &mut session,
+            GET_STREAM_CODE,
+            &Bytes::new(),
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
@@ -704,8 +777,13 @@ mod tests {
 
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99).unwrap();
-        let bytes = encode_contiguous_request(&mut session, UNKNOWN_CODE, &Bytes::new(), &mut None)
-            .unwrap();
+        let bytes = encode_contiguous_request(
+            &mut session,
+            UNKNOWN_CODE,
+            &Bytes::new(),
+            &mut RetainedRequest::default(),
+        )
+        .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);

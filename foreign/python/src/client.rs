@@ -708,6 +708,8 @@ impl IggyClient {
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so a newer server key can be set from this build.
+    ///         `{"partition_resize_policy": "fixed"}` makes the server reject
+    ///         later partition creation and deletion on this topic.
     ///
     /// Every option left as `None` resolves against the server default at
     /// admission.
@@ -776,6 +778,7 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             raw: options.unwrap_or_default(),
+            partition_resize_policy: None,
         };
 
         let stream = Identifier::try_from(stream)?;

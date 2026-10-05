@@ -18,13 +18,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { uuidv7, uuidv4 } from "uuidv7";
+import type { CommandResponse, RawClient } from "../../client/client.type.js";
 import {
   SEND_MESSAGES,
+  sendMessages,
   type SendMessages,
   type SendMessagesConfirmation,
 } from "./send-messages.command.js";
 import { HeaderValue, HeaderKeyFactory } from "./header.utils.js";
-import { DeserializeError } from "../error.utils.js";
+import { Partitioning, PartitionKind } from "./partitioning.utils.js";
+import { COMMAND_CODE } from "../command.code.js";
+import { DeserializeError, responseError } from "../error.utils.js";
 
 const SUCCESS = 0;
 
@@ -266,5 +270,85 @@ describe("SendMessages", () => {
       );
     });
 
+  });
+});
+
+const topicBody = (partitionsCount: number): Buffer => {
+  const body = Buffer.alloc(50 + 1 + 4 + 4 + partitionsCount * 64);
+  body.writeUInt32LE(partitionsCount, 12);
+  body.writeUInt8(1, 49);
+  body.write("t", 50);
+  return body;
+};
+
+const sendClient = (partitionsCount: number, refuseFirstSend = false) => {
+  const sent: { code: number, payload: Buffer }[] = [];
+  const client = {
+    sendCommand: async (code: number, payload: Buffer): Promise<CommandResponse> => {
+      sent.push({ code, payload });
+      if (code === COMMAND_CODE.SendMessages && refuseFirstSend) {
+        refuseFirstSend = false;
+        throw responseError(code, 87);
+      }
+      return response(code === COMMAND_CODE.GetTopic ? topicBody(partitionsCount) : Buffer.alloc(0));
+    }
+  } as unknown as RawClient;
+  return { client, sent };
+};
+
+const sentPartitions = (sent: { code: number, payload: Buffer }[]) =>
+  sent.filter(({ code }) => code === COMMAND_CODE.SendMessages).map(({ payload }) => {
+    assert.equal(payload[16], PartitionKind.PartitionId);
+    return payload.readUInt32LE(18);
+  });
+
+const countOf = (sent: { code: number }[], code: number) =>
+  sent.filter((entry) => entry.code === code).length;
+
+const request = { streamId: 1, topicId: 2, messages: [{ payload: "m" }] };
+
+describe("SendMessages partition resolution", () => {
+  it("resolves Balanced sends round-robin from one topic read", async () => {
+    const { client, sent } = sendClient(3);
+    const send = sendMessages(async () => client);
+    for (let index = 0; index < 4; index += 1) await send(request);
+    assert.deepEqual(sentPartitions(sent), [0, 1, 2, 0]);
+    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 1);
+  });
+
+  it("hashes MessageKey sends with XXH32 seed 0 like the Rust SDK", async () => {
+    const { client, sent } = sendClient(4);
+    const send = sendMessages(async () => client);
+    await send({ ...request, partition: Partitioning.MessageKey("abc") });
+    for (let key = 0; key < 64; key += 1)
+      await send({ ...request, partition: Partitioning.MessageKey(`key-${key}`) });
+    const [first, ...rest] = sentPartitions(sent);
+    assert.equal(first, 0x32D153FF % 4); // XXH32("abc", 0)
+    assert.ok(rest.every((partition) => partition >= 0 && partition < 4));
+  });
+
+  it("reads the partition count again after a refused send", async () => {
+    const { client, sent } = sendClient(2, true);
+    const send = sendMessages(async () => client);
+    await assert.rejects(send(request));
+    await send(request);
+    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 2);
+  });
+
+  it("holds the raw client across the topic read and the send", async () => {
+    const { client, sent } = sendClient(2);
+    let held = false;
+    client.hold = () => {
+      held = true;
+      return () => { held = false; };
+    };
+    const sendCommand = client.sendCommand;
+    client.sendCommand = (code, payload) => {
+      assert.equal(held, true);
+      return sendCommand(code, payload);
+    };
+    await sendMessages(async () => client)(request);
+    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 1);
+    assert.equal(held, false);
   });
 });

@@ -23,6 +23,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.Optional;
@@ -61,6 +62,27 @@ public interface ConsumerOffsetsClient {
      */
     CompletableFuture<Void> storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset);
+
+    /**
+     * Stores a consumer offset fenced by the context its messages were polled with.
+     * The server refuses the store once the partition incarnation or its owner has
+     * changed, so an offset from an older incarnation never lands in a newer one.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param partitionId The partition the messages were polled from
+     * @param consumer The consumer
+     * @param offset The offset to store
+     * @param context The {@link org.apache.iggy.message.PolledMessages#context()} of that poll
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    CompletableFuture<Void> storeConsumerOffset(
+            StreamId streamId,
+            TopicId topicId,
+            Long partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            PartitionContext context);
 
     /**
      * Gets a consumer offset asynchronously.

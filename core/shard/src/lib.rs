@@ -83,6 +83,7 @@ use std::future::Future;
 use std::rc::Rc;
 #[cfg(feature = "simulator")]
 use std::sync::Arc;
+use std::time::Duration;
 
 pub type ShardPlane<B, J, S, M, SB = PingPongSuperblock> =
     MuxPlane<variadic!(IggyMetadata<VsrConsensus<B>, J, S, M, SB>, IggyPartitions<B, SB>)>;
@@ -279,6 +280,11 @@ pub enum MetadataSubmit {
         request: Message<GenericHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
     },
+    /// A shard's partition reconciler reports the committed partition fence of
+    /// one lifecycle target to shard 0, which proposes it through metadata
+    /// consensus with no client session. Fire-and-forget and idempotent: the
+    /// reconciler resends while the intent stays pending.
+    CompleteLifecycle(metadata::stm::lifecycle::CompleteLifecycleRequest),
     /// A shard's partition reconciler asks shard 0 to complete a cooperative
     /// consumer-group revocation (the source drained the partition or it timed
     /// out). Server-originated: shard 0 proposes it through metadata consensus
@@ -287,9 +293,9 @@ pub enum MetadataSubmit {
     CompleteRevocation {
         stream_id: u32,
         topic_id: u32,
-        group_id: u64,
-        source_client_id: u128,
         partition_id: u32,
+        installation: iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest,
+        partition_op: u64,
         reply: Sender<Option<u64>>,
     },
 }
@@ -353,6 +359,7 @@ pub enum PartitionRead {
     Poll {
         consumer: PollingConsumer,
         args: PollingArgs,
+        metadata: Option<metadata::stm::stream::PollMetadata>,
     },
     ConsumerOffset {
         consumer: PollingConsumer,
@@ -366,15 +373,6 @@ pub enum PartitionRead {
     /// in-flight partition (committed < last-polled) from a never-polled/drained
     /// one. `group_id` is the monotonic consumer-group id (offset key).
     GroupOffsetState {
-        group_id: u64,
-    },
-    /// Drop the group's ephemeral `last_polled` mark on this partition. The
-    /// join-time gather issues this when it finds an uncommitted `last_polled`
-    /// for a partition no live member owns: the residue of a since-removed
-    /// member (reconnect). Clearing it stops a later join in the same restart
-    /// from misreading the dead mark as a live in-flight hold. `group_id` is the
-    /// monotonic consumer-group id (offset key).
-    ClearGroupLastPolled {
         group_id: u64,
     },
     /// Resolve a client `DeleteSegments` count into a concrete truncation
@@ -396,6 +394,7 @@ pub enum PartitionReadReply {
         created_revision: u64,
     },
     Poll {
+        context: iggy_binary_protocol::primitives::partition_history::PartitionContext,
         fragments: PollFragments,
         current_offset: u64,
     },
@@ -417,8 +416,6 @@ pub enum PartitionReadReply {
         last_polled: Option<u64>,
         committed: Option<u64>,
     },
-    /// Acknowledges a [`PartitionRead::ClearGroupLastPolled`].
-    Ack,
     /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
     /// truncation offset, or `None` when the partition has no sealed segments
     /// to delete. `lagging` means this replica has not converged on the
@@ -1870,6 +1867,11 @@ where
     /// in-process.
     pub fn set_superblock_wedged_fatal_failures(&self, failures: u64) {
         self.superblock_wedged_fatal_failures.set(failures);
+    }
+
+    /// Bound running file jobs in pump ticks. Zero disables the deadline.
+    pub fn set_partition_io_timeout(&self, timeout: Duration) {
+        self.partition_io.set_timeout(timeout);
     }
 
     /// Override the serving-side resident payload budget from configuration.
@@ -4445,6 +4447,7 @@ where
             partitions.config().segment_size,
         );
         partition.enable_ideal_storage();
+        partition.set_created_revision(epoch);
         let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
             inner
                 .items
@@ -7728,6 +7731,11 @@ where
         let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
+                if fatal.is_none() {
+                    fatal = partitions
+                        .get_io_owner(&namespace)
+                        .and_then(|owner| owner.fatal().cloned());
+                }
                 continue;
             };
             // Ahead of the fence check and every `continue` below: the count is
@@ -7859,6 +7867,7 @@ where
                 });
                 if repair_finished {
                     partition.repair = None;
+                    partition.transfer_rearm = None;
                     tracing::info!(
                         shard = self.id,
                         namespace_raw = namespace.inner(),
@@ -8156,6 +8165,9 @@ where
                         if partition.transfer.is_none()
                             && partition.consensus().state_transfer_stage()
                                 == consensus::StateTransferStage::Idle
+                            && (partition.requires_state_transfer()
+                                || partition.consensus().commit_min()
+                                    < partition.consensus().commit_max())
                         {
                             Some(peer)
                         } else {
@@ -13474,81 +13486,84 @@ mod partition_ack_durability_tests {
 
     #[compio::test]
     async fn start_view_ack_waits_for_partition_wal_completion() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "iggy-start-view-wal-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let consensus =
-            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
-        consensus.init();
-        consensus.mark_superblock_durable(0, 0);
-        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
-            Arc::new(PartitionStats::default()),
-            consensus,
-            IggyByteSize::from(1024 * 1024),
-        );
-        partition.set_partition_dir(directory.to_string_lossy().into_owned());
-        partition.set_runtime_options(TopicRuntimeOptions {
-            consumer_offset_durability: Durability::Persisted,
-            ..TopicRuntimeOptions::default()
-        });
-        partition.open_persistence().await.unwrap();
-        let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
-            |_, header: &mut PrepareHeader| {
-                header.command = Command::Prepare;
-                header.operation = Operation::StoreConsumerOffset;
-                header.cluster = 1;
-                header.group = 42;
-                header.op = 1;
-                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
-                header.checksum = header.identity_checksum();
-            },
-        );
-        partition
-            .log
-            .journal()
-            .inner
-            .append(prepare.into_frozen())
-            .await
-            .unwrap();
-        partition.consensus().sequencer().set_sequence(1);
-        dispatch_partition_journal_actions(
-            partition.consensus(),
-            &partition,
-            &[VsrAction::SendPrepareOk {
-                view: 0,
-                from_op: 1,
-                to_op: 1,
-                target: 0,
-                group: 42,
-            }],
-        )
-        .await;
-        let mut acknowledgments = Vec::new();
-        partition
-            .consensus()
-            .drain_loopback_into(&mut acknowledgments);
-        assert!(
-            acknowledgments.is_empty(),
-            "StartView must not bypass the WAL barrier"
-        );
-        for _ in 0..100 {
-            compio::runtime::time::sleep(Duration::from_millis(10)).await;
-            partition.drive_persistence().await;
+        for durability in [Durability::Replicated, Durability::Persisted] {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "iggy-start-view-wal-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let consensus =
+                VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+            consensus.init();
+            consensus.mark_superblock_durable(0, 0);
+            let mut partition: IggyPartition<IggyMessageBus> =
+                IggyPartition::with_in_memory_storage(
+                    Arc::new(PartitionStats::default()),
+                    consensus,
+                    IggyByteSize::from(1024 * 1024),
+                );
+            partition.set_partition_dir(directory.to_string_lossy().into_owned());
+            partition.set_runtime_options(TopicRuntimeOptions {
+                consumer_offset_durability: durability,
+                ..TopicRuntimeOptions::default()
+            });
+            partition.open_persistence().await.unwrap();
+            let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
+                .transmute_header(|_, header: &mut PrepareHeader| {
+                    header.command = Command::Prepare;
+                    header.operation = Operation::StoreConsumerOffset;
+                    header.cluster = 1;
+                    header.group = 42;
+                    header.op = 1;
+                    header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                    header.checksum = header.identity_checksum();
+                });
+            partition
+                .log
+                .journal()
+                .inner
+                .append(prepare.into_frozen())
+                .await
+                .unwrap();
+            partition.consensus().sequencer().set_sequence(1);
+            dispatch_partition_journal_actions(
+                partition.consensus(),
+                &partition,
+                &[VsrAction::SendPrepareOk {
+                    view: 0,
+                    from_op: 1,
+                    to_op: 1,
+                    target: 0,
+                    group: 42,
+                }],
+            )
+            .await;
+            let mut acknowledgments = Vec::new();
             partition
                 .consensus()
                 .drain_loopback_into(&mut acknowledgments);
-            if !acknowledgments.is_empty() {
-                break;
+            assert_eq!(
+                acknowledgments.len(),
+                usize::from(durability == Durability::Replicated),
+                "replicated acks require WAL admission; persisted acks also wait for durability"
+            );
+            for _ in 0..100 {
+                compio::runtime::time::sleep(Duration::from_millis(10)).await;
+                partition.drive_persistence().await;
+                partition
+                    .consensus()
+                    .drain_loopback_into(&mut acknowledgments);
+                if !acknowledgments.is_empty() {
+                    break;
+                }
             }
+            assert_eq!(acknowledgments.len(), 1);
+            drop(partition);
+            std::fs::remove_dir_all(directory).unwrap();
         }
-        assert_eq!(acknowledgments.len(), 1);
-        drop(partition);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -27,6 +27,8 @@ import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT } from '../wire/index.js';
 import { UPDATE_USER } from '../wire/user/update-user.command.js';
 import { CHANGE_PASSWORD } from '../wire/user/change-password.command.js';
 import { POLL_MESSAGES } from '../wire/message/poll-messages.command.js';
+import { SEND_MESSAGES } from '../wire/message/send-messages.command.js';
+import { Partitioning } from '../wire/message/partitioning.utils.js';
 import { PollingStrategy } from '../wire/message/poll.utils.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { readWireName } from '../wire/vsr/index.js';
@@ -37,6 +39,7 @@ import {
   EVICTION_OFFSET,
   EvictionReason,
   HEADER_SIZE,
+  PARTITION_CONTEXT_SIZE,
   REPLY_OFFSET,
   REQUEST_OFFSET
 } from '../wire/vsr/header.js';
@@ -46,6 +49,7 @@ import { CommandResponseStream } from './client.socket.js';
 import type { ClientConfig, CommandResponse } from './client.type.js';
 
 const TEST_SESSION = 42n;
+const HISTORY_UNAVAILABLE = 87;
 const TLS_CERTIFICATE = readFileSync(
   new URL('../../../../core/certs/iggy_cert.pem', import.meta.url)
 );
@@ -254,6 +258,10 @@ const singleNodeHandler = (port: number): FrameHandler =>
       );
       return;
     }
+    if (code === COMMAND_CODE.GetPollRouting || code === COMMAND_CODE.GetConsumerOffsetRouting) {
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame, port, 1n)));
+      return;
+    }
     socket.write(replyFrame(operation));
   };
 
@@ -312,7 +320,7 @@ const routingBody = (request: Buffer, port: number, watermark: bigint): Buffer =
   attachment.writeBigUInt64LE(watermark, 24);
   const metadata = singleNodeMetadataBody(port);
   const nodeOffset = 4 + metadata.readUInt32LE(0) + 4;
-  return Buffer.concat([attachment, metadata.subarray(nodeOffset)]);
+  return Buffer.concat([attachment, Buffer.alloc(24), metadata.subarray(nodeOffset)]);
 };
 
 const countCommand = (server: VsrTestServer, code: number): number =>
@@ -370,6 +378,32 @@ const startPollCluster = async (
       await Promise.all([coordinator.close(), primary.close()]);
     }
   };
+};
+
+const explicitSend = SEND_MESSAGES.serialize({
+  streamId: 1, topicId: 2, messages: [{ payload: 'message' }], partition: Partitioning.PartitionId(3)
+});
+
+const contextServer = async (state: {
+  live: bigint, refuseAll: boolean, contextStatus: number, onSend?: () => void
+}) => {
+  const server: VsrTestServer = await startVsrServer((frame, socket) => {
+    if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages) {
+      state.onSend?.();
+      const sent = frame.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation);
+      socket.write(replyFrame(Operation.SendMessages, Buffer.alloc(0),
+        !state.refuseAll && sent === state.live ? 0 : HISTORY_UNAVAILABLE));
+      return;
+    }
+    if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetSendContext) {
+      const context = Buffer.alloc(PARTITION_CONTEXT_SIZE);
+      context.writeBigUInt64LE(state.live, 0);
+      socket.write(replyFrame(Operation.NonReplicated, context, state.contextStatus));
+      return;
+    }
+    singleNodeHandler(server.port)(frame, socket);
+  });
+  return server;
 };
 
 describe('primary auto-commit polling', () => {
@@ -443,17 +477,18 @@ describe('primary auto-commit polling', () => {
     });
   }
 
-  it('preserves manual-commit and standalone poll paths', async () => {
+  it('routes manual-commit polls to the primary and keeps the standalone path', async () => {
     const cluster = await startPollCluster();
     const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
     const standalone = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
     try {
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(false));
       await standalone.sendCommand(POLL_MESSAGES.code, groupPollPayload());
-      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), 1);
-      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 0);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), 0);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), 1);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), 1);
       assert.equal(countCommand(server, COMMAND_CODE.PollMessages), 1);
-      assert.equal(countCommand(server, COMMAND_CODE.GetPollRouting), 0);
+      assert.equal(countCommand(server, COMMAND_CODE.GetPollRouting), 1);
     } finally {
       standalone.destroy();
       await cluster.close();
@@ -609,7 +644,7 @@ describe('primary auto-commit polling', () => {
           await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata), reads);
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), standalone ? 2 : 0);
-          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), standalone ? 0 : 1);
+          assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPollRouting), standalone ? 2 : 1);
           assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessagesOnPrimary), standalone ? 0 : 2);
           assert.equal(resets, 0);
         } finally {
@@ -2252,7 +2287,7 @@ describe('VSR client socket', () => {
     }
   );
 
-  for (const refusal of [58, 41, 40, 30]) {
+  for (const refusal of [58, 41, 40, 30, 87]) {
   it(`keeps an uncertain write uncertain after a later refusal ${refusal}`, async () => {
     const EXPIRED_REQUEST_TIME = 30_001;
     let now = 0;
@@ -2296,6 +2331,90 @@ describe('VSR client socket', () => {
     }
   });
   }
+
+  it('reuses a send context and refreshes it once after a history refusal', async () => {
+    const state = { live: 1n, refuseAll: false, contextStatus: 0 };
+    const server = await contextServer(state);
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    const incarnations = () => server.frames
+      .filter((frame) => frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages)
+      .map((frame) => frame.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation));
+    try {
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      assert.equal(countCommand(server, COMMAND_CODE.GetSendContext), 1);
+      state.live = 2n;
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      assert.equal(countCommand(server, COMMAND_CODE.GetSendContext), 2);
+      assert.deepEqual(incarnations(), [1n, 1n, 1n, 2n]);
+      state.refuseAll = true;
+      await assert.rejects(() => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
+        (error: unknown) => error instanceof ResponseError &&
+          error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === HISTORY_UNAVAILABLE);
+      assert.equal(countCommand(server, COMMAND_CODE.GetSendContext), 3);
+      assert.equal(incarnations().length, 6);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('reports a refused context query as an error of the send', async () => {
+    const server = await contextServer({ live: 1n, refuseAll: false, contextStatus: 2010 });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await assert.rejects(() => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
+        (error: unknown) => error instanceof ResponseError &&
+          error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === 2010);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('keeps an eviction during the send context query typed', async () => {
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetSendContext) {
+        socket.write(evictionFrame(EvictionReason.NoSession));
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await assert.rejects(() => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
+        (error: unknown) => error instanceof VsrEvictionError && error.errorCode === 40);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('surfaces a history refusal the remaining budget cannot refresh', async () => {
+    const realNow = Date.now;
+    const deadline = realNow() + 30_000;
+    let offset = 0;
+    const server = await contextServer({
+      live: 1n, refuseAll: true, contextStatus: 0,
+      // 10ms of budget left when the refusal comes back: too little to carry a
+      // context query and another send.
+      onSend: () => { offset = deadline - realNow() - 10; }
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      Date.now = () => realNow() + offset;
+      await assert.rejects(
+        () => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline }),
+        (error: unknown) => error instanceof ResponseError &&
+          error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === HISTORY_UNAVAILABLE);
+      assert.equal(countCommand(server, COMMAND_CODE.GetSendContext), 1);
+    } finally {
+      Date.now = realNow;
+      client.destroy();
+      await server.close();
+    }
+  });
 
   it('shares token authentication between concurrent callers', async () => {
     const server = await startVsrServer(

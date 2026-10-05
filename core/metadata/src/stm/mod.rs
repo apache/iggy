@@ -18,11 +18,13 @@
 pub mod authz;
 pub mod consumer_group;
 pub mod id_slab;
+pub mod lifecycle;
 pub mod mux;
 pub mod result;
 pub mod snapshot;
 pub mod stream;
 pub mod user;
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::Either;
 use left_right::{Absorb, ReadHandle, ReadHandleFactory, WriteHandle};
 use std::cell::Cell;
@@ -30,6 +32,27 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 pub use left_right::ReadHandleFactory as LeftRightFactory;
+
+/// Identity of the committed operation driving a metadata transition.
+/// The Streams revision is an incarnation counter and cannot replace `metadata_op`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct ApplyContext {
+    pub metadata_op: u64,
+    pub client_id: u128,
+    pub session: u64,
+    pub request: u64,
+}
+
+impl From<&PrepareHeader> for ApplyContext {
+    fn from(header: &PrepareHeader) -> Self {
+        Self {
+            metadata_op: header.op,
+            client_id: header.client,
+            session: header.session,
+            request: header.request,
+        }
+    }
+}
 
 pub struct WriteCell<T, O>
 where
@@ -308,6 +331,7 @@ macro_rules! define_state {
                     $field_vis $field_name: $field_type,
                 )*
                 pub(crate) last_result: Option<$crate::stm::result::ApplyReply>,
+                pub(crate) apply_context: $crate::stm::ApplyContext,
             }
 
             impl [<$state Inner>] {
@@ -403,10 +427,10 @@ macro_rules! collect_handlers {
             #[derive(Debug, Clone)]
             pub enum [<$state Command>] {
                 $(
-                    $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
+                    $operation([<$operation Request>], ::iggy_common::IggyTimestamp, $crate::stm::ApplyContext),
                 )*
                 $($(
-                    $internal([<$internal Request>], ::iggy_common::IggyTimestamp),
+                    $internal([<$internal Request>], ::iggy_common::IggyTimestamp, $crate::stm::ApplyContext),
                 )*)?
                 /// Replace the whole state from a snapshot section, in place.
                 /// Never parsed off the wire (state transfer installs it via
@@ -429,9 +453,9 @@ macro_rules! collect_handlers {
                     // Both scalars copied out of one header read. `header()`
                     // re-validates the bit pattern on each call, and the borrow has
                     // to end before the pass-through arm can move `input` on.
-                    let (operation, timestamp) = {
+                    let (operation, timestamp, context) = {
                         let header = input.header();
-                        (header.operation, header.timestamp)
+                        (header.operation, header.timestamp, $crate::stm::ApplyContext::from(header))
                     };
 
                     match operation {
@@ -443,7 +467,7 @@ macro_rules! collect_handlers {
                                 let cmd = [<$operation Request>]::decode_from(input.body())
                                     .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
                                 let ts = ::iggy_common::IggyTimestamp::from(timestamp);
-                                Ok(Either::Left([<$state Command>]::$operation(cmd, ts)))
+                                Ok(Either::Left([<$state Command>]::$operation(cmd, ts, context)))
                             },
                         )*
                         _ => Ok(Either::Right(input)),
@@ -455,12 +479,14 @@ macro_rules! collect_handlers {
                 fn dispatch(&mut self, cmd: &[<$state Command>]) {
                     self.last_result = Some(match cmd {
                         $(
-                            [<$state Command>]::$operation(payload, ts) => {
+                            [<$state Command>]::$operation(payload, ts, context) => {
+                                self.apply_context = *context;
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
                         $($(
-                            [<$state Command>]::$internal(payload, ts) => {
+                            [<$state Command>]::$internal(payload, ts, context) => {
+                                self.apply_context = *context;
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*)?

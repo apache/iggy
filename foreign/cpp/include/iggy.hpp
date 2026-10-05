@@ -2678,6 +2678,9 @@ constexpr std::string_view to_string(const Durability durability) {
  * unset to use the server default. Use SetRawEntries() for supported options
  * that do not yet have a typed setter. When both specify the same option, the
  * typed setting takes precedence.
+ *
+ * For example, the entry `partition_resize_policy` set to `fixed` makes the
+ * server reject later partition creation and deletion on this topic.
  */
 class TopicCreateOptions final {
   public:

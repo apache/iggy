@@ -45,6 +45,7 @@ impl<B: BinaryClient> PartitionClient for B {
             .to_bytes(),
         )
         .await?;
+        self.consumer_group_state().invalidate_topic_discovery();
         Ok(())
     }
 
@@ -67,6 +68,7 @@ impl<B: BinaryClient> PartitionClient for B {
             .to_bytes(),
         )
         .await?;
+        self.consumer_group_state().invalidate_topic_discovery();
         Ok(())
     }
 }

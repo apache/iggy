@@ -32,6 +32,7 @@ import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 
@@ -48,16 +49,19 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Keeps the membership-owning coordinator separate from auto-commit data polls.
+ * Keeps the membership-owning coordinator separate from data polls, which only
+ * the partition primary serves.
  * Polls have no deduplication key; only explicit non-admission permits replay.
  */
 final class PollRouter {
+    static final int POLL_PARAMETERS_BYTES = 14;
+    /** The session identity that leads every routing reply, before its partition context. */
+    static final int ATTACHMENT_BYTES = 32;
+
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
-    private static final int POLL_PARAMETERS_BYTES = 14;
-    private static final int ATTACHMENT_BYTES = 32;
     private static final long RETRY_INTERVAL_MILLIS = 50;
 
     private final Supplier<AsyncTcpConnection> coordinator;
@@ -191,7 +195,7 @@ final class PollRouter {
 
     private Route decodeRoute(AsyncTcpConnection parent, Poll poll, ByteBuf response) {
         try {
-            if (response.readableBytes() < ATTACHMENT_BYTES) {
+            if (response.readableBytes() < ATTACHMENT_BYTES + PartitionContext.ENCODED_SIZE) {
                 throw new IggyClientException("Truncated primary poll session attachment");
             }
             Attachment attachment = new Attachment(
@@ -201,6 +205,7 @@ final class PollRouter {
             if (generation != parent.sessionGeneration()) {
                 throw new IggyClientException("Parent session changed while decoding a poll route");
             }
+            var context = BytesDeserializer.readPartitionContext(response);
             var node = BytesDeserializer.readClusterNode(response);
             if (response.isReadable() || node.endpoints().tcp() == 0) {
                 throw new IggyClientException("Invalid TCP primary poll routing response");
@@ -212,7 +217,8 @@ final class PollRouter {
                         attachment.withWatermark(metadataWatermark),
                         parent,
                         generation,
-                        bindSecret);
+                        bindSecret,
+                        context);
                 if (routes.size() >= MAX_ROUTES) {
                     routes.clear();
                 }
@@ -352,7 +358,12 @@ final class PollRouter {
             if (data == null || attached == null) {
                 return CompletableFuture.failedFuture(notAccepted());
             }
-            return data.sendPrimaryPoll(Unpooled.wrappedBuffer(poll.payload), attached.generation)
+            synchronized (poll) {
+                if (poll.context == null) {
+                    poll.context = route.context;
+                }
+            }
+            return data.sendPrimaryPoll(Unpooled.wrappedBuffer(poll.payload), attached.generation, poll.context)
                     .whenComplete((response, error) -> {
                         if (error != null) {
                             if (isNotAccepted(error)) {
@@ -442,6 +453,7 @@ final class PollRouter {
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
         private volatile Slot activeSlot;
+        private PartitionContext context;
         private boolean retryingRefusal;
 
         private Poll(String key, byte[] payload, Duration pollTimeout) {
@@ -488,7 +500,8 @@ final class PollRouter {
             Attachment attachment,
             AsyncTcpConnection parent,
             long generation,
-            byte[] bindSecret) {}
+            byte[] bindSecret,
+            PartitionContext context) {}
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
         private Attachment {

@@ -358,6 +358,14 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
+        uint partitionId, PartitionContext context, CancellationToken token = default)
+    {
+        var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
+        await SendAckAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, token, context);
+    }
+
+    /// <inheritdoc />
     public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
         uint? partitionId, CancellationToken token = default)
     {
@@ -1368,17 +1376,52 @@ public sealed partial class TcpMessageStream : IIggyClient
         return e is InvalidCertificatePathException;
     }
 
-    private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)
+    private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token,
+        PartitionContext? context = null)
     {
-        using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, body, token: token);
+        using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, body, token: token, capturedContext: context);
     }
 
     private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLoginOnReconnect = true, CancellationToken token = default)
+        bool autoLoginOnReconnect = true, CancellationToken token = default, PartitionContext? capturedContext = null)
+    {
+        var query = TryBuildContextQuery(code, body.Span);
+        if (query is null)
+        {
+            return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, capturedContext ?? default, token);
+        }
+
+        // The server refuses a replaced incarnation before admission, so a send can go out once more as a new request.
+        var refreshAvailable = capturedContext is null && code == CommandCodes.SEND_MESSAGES_CODE;
+        while (true)
+        {
+            var context = capturedContext ?? await GetPartitionContextAsync(query, token);
+            try
+            {
+                return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, context, token);
+            }
+            catch (Exception error)
+            {
+                ForgetPartitionContext(query);
+                if (!refreshAvailable || error is not IggyInvalidStatusCodeException
+                    {
+                        FromServer: true, StatusCode: VsrError.HISTORY_UNAVAILABLE
+                    })
+                {
+                    throw;
+                }
+
+                refreshAvailable = false;
+            }
+        }
+    }
+
+    private async Task<IMemoryOwner<byte>> SendWithReconnectAsync(int code, ReadOnlyMemory<byte> body,
+        bool autoLoginOnReconnect, PartitionContext context, CancellationToken token)
     {
         try
         {
-            return await SendRawAsync(code, body, token);
+            return await SendRawAsync(code, body, token, context: context);
         }
         catch (Exception e) when (IsLostConnection(e) && !IsConnecting && !_disposed)
         {
@@ -1404,7 +1447,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 throw;
             }
 
-            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token);
+            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token, context);
         }
     }
 
@@ -1417,7 +1460,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLogin, CancellationToken token)
+        bool autoLogin, CancellationToken token, PartitionContext context)
     {
         var currentTime = DateTimeOffset.UtcNow;
         await _connectionSemaphore.WaitAsync(token);
@@ -1428,7 +1471,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 && _lastConnectionTime > currentTime)
             {
                 _logger.LogInformation("Connection already established, sending payload");
-                return await SendRawAsync(code, body, token);
+                return await SendRawAsync(code, body, token, context: context);
             }
 
             SetConnectionState(ConnectionState.Disconnected);
@@ -1439,7 +1482,7 @@ public sealed partial class TcpMessageStream : IIggyClient
 
             await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
 
-            return await SendRawAsync(code, body, token);
+            return await SendRawAsync(code, body, token, context: context);
         }
         finally
         {

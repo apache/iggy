@@ -456,6 +456,7 @@ async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_fo
     let offsets_path = format!("/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/consumer-offsets");
     let consumer_id = Identifier::numeric(1).expect("valid consumer id");
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(consumer_id),
         partition_id: Some(PARTITION_ID),
         offset: 0,

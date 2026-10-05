@@ -28,11 +28,12 @@ use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
 use bytes::BytesMut;
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::codes::SEND_MESSAGES_CODE;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
+use iggy_binary_protocol::codes::{GET_SEND_CONTEXT_CODE, SEND_MESSAGES_CODE};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    GetSendContextRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 
@@ -42,10 +43,6 @@ const GROUP_POLL_MAX_ATTEMPTS: usize = 2;
 
 fn group_cache_key(stream_id: &Identifier, topic_id: &Identifier, group_id: &Identifier) -> String {
     format!("{stream_id}|{topic_id}|{group_id}")
-}
-
-fn topic_cache_key(stream_id: &Identifier, topic_id: &Identifier) -> String {
-    format!("{stream_id}|{topic_id}")
 }
 
 /// Sync the requesting member's assignment from the coordinator into the
@@ -112,16 +109,15 @@ async fn topic_partition_count<B: BinaryClient>(
     stream_id: &Identifier,
     topic_id: &Identifier,
 ) -> Result<u32, IggyError> {
-    let key = topic_cache_key(stream_id, topic_id);
-    if let Some(count) = client.consumer_group_state().partition_count(&key) {
+    if let Some(count) = client
+        .consumer_group_state()
+        .partition_count(stream_id, topic_id)
+    {
         return Ok(count);
     }
     let details = TopicClient::get_topic(client, stream_id, topic_id)
         .await?
         .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
-    client
-        .consumer_group_state()
-        .set_partition_count(key, details.partitions_count);
     Ok(details.partitions_count)
 }
 
@@ -142,10 +138,9 @@ async fn resolve_partitioning<B: BinaryClient>(
                     stream_id.clone(),
                 ));
             }
-            let key = topic_cache_key(stream_id, topic_id);
             let partition = client
                 .consumer_group_state()
-                .next_balanced_partition(&key, count);
+                .next_balanced_partition(stream_id, topic_id, count);
             Ok(Partitioning::partition_id(partition))
         }
         PartitioningKind::MessagesKey => {
@@ -209,7 +204,10 @@ async fn poll_group_messages<B: BinaryClient>(
             count,
             auto_commit,
         };
-        match client.send_poll_with_response(&request).await {
+        match client
+            .send_poll_with_response(&request, strategy.context)
+            .await
+        {
             Ok(response) => {
                 let polled = PolledMessages::from_bytes(response)?;
                 // The coordinator can't yet signal a generation fence as a typed
@@ -225,9 +223,12 @@ async fn poll_group_messages<B: BinaryClient>(
                 }
                 return Ok(polled);
             }
-            Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
+            Err(error @ IggyError::ConsumerGroupPartitionNotOwned(..)) => {
                 client.consumer_group_state().invalidate_assignment(&key);
                 sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
+                if strategy.context.is_some() {
+                    return Err(error);
+                }
             }
             Err(error) => return Err(error),
         }
@@ -331,7 +332,7 @@ impl<B: BinaryClient> MessageClient for B {
             count,
             auto_commit,
         };
-        let response = self.send_poll_with_response(&req).await?;
+        let response = self.send_poll_with_response(&req, strategy.context).await?;
         PolledMessages::from_bytes(response)
     }
 
@@ -357,6 +358,15 @@ impl<B: BinaryClient> MessageClient for B {
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
         let wire_partitioning = partitioning_to_wire(partitioning)?;
+        let partition_id = u32::from_le_bytes(
+            partitioning
+                .value
+                .as_slice()
+                .try_into()
+                .map_err(|_| IggyError::InvalidCommand)?,
+        );
+        let state = self.consumer_group_state();
+        let mut context = state.partition_context(stream_id, topic_id, partition_id);
         // The producer owns message ids now that batches ride the wire
         // verbatim: a zero id is minted here, before the frame checksum
         // covers it.
@@ -394,10 +404,41 @@ impl<B: BinaryClient> MessageClient for B {
             }
             _ => IggyError::InvalidCommand,
         })?;
-        let response = self
-            .send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
-            .await?;
-        Ok(committed_send_confirmations(&response))
+        let payload = buf.freeze();
+        let mut refresh_available = true;
+        loop {
+            let captured = if let Some(context) = context {
+                context
+            } else {
+                let request = GetSendContextRequest {
+                    stream_id: wire_stream_id.clone(),
+                    topic_id: wire_topic_id.clone(),
+                    partition_id,
+                };
+                let response = self
+                    .send_raw_with_response(GET_SEND_CONTEXT_CODE, request.to_bytes())
+                    .await?;
+                let context = super::decode_response::<PartitionContext>(&response)?;
+                state.set_partition_context(stream_id, topic_id, partition_id, context);
+                context
+            };
+            match self
+                .send_raw_with_context(SEND_MESSAGES_CODE, payload.clone(), captured)
+                .await
+            {
+                Ok(response) => return Ok(committed_send_confirmations(&response)),
+                Err(IggyError::HistoryUnavailable) => {
+                    state.invalidate_topic(stream_id, topic_id);
+                    if refresh_available {
+                        refresh_available = false;
+                        context = None;
+                        continue;
+                    }
+                    return Err(IggyError::HistoryUnavailable);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

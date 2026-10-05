@@ -128,6 +128,10 @@ pub trait MessageClient {
     /// implies uniqueness. Confirmation follows VSR quorum commit. Persisted
     /// message durability also requires recoverable stable-storage copies on
     /// the quorum.
+    ///
+    /// Binary clients refresh the partition context once after a definitive
+    /// `HistoryUnavailable` (87) refusal. A refusal after an uncertain send
+    /// keeps its original context and returns `TransientNotCommitted` (57).
     async fn send_messages(
         &self,
         stream_id: &Identifier,

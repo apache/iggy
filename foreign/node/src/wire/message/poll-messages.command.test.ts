@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { describe, it } from 'node:test';
+import { EMPTY_PARTITION_CONTEXT } from '../vsr/header.js';
 import type {
   CommandResponse,
   RawClient
@@ -58,7 +59,7 @@ const pollResponse = (
   partitionId: number,
   count = 0
 ): CommandResponse => {
-  const data = Buffer.alloc(16);
+  const data = Buffer.alloc(40);
   data.writeUInt32LE(partitionId, 0);
   data.writeBigUInt64LE(0n, 4);
   data.writeUInt32LE(count, 12);
@@ -179,6 +180,7 @@ describe('VSR consumer-group polling', () => {
       await pollMessages(async () => client)(groupRequest),
       {
         partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
         currentOffset: 0n,
         count: 0,
         messages: []
@@ -302,6 +304,7 @@ describe('VSR consumer-group polling', () => {
       await pollMessages(async () => client)(groupRequest),
       {
         partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
         currentOffset: 0n,
         count: 0,
         messages: []

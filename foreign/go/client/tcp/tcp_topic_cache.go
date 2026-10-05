@@ -42,12 +42,15 @@ func encodedStream(streamId iggcon.Identifier) string {
 	return string(stream)
 }
 
-// topicCache holds what a send needs to pick a partition without a metadata
-// round trip per batch.
+// topicCache holds what a send needs to pick a partition and stamp its
+// context without a metadata round trip per batch.
 type topicCache struct {
 	mtx              sync.Mutex
 	partitionsCounts map[topicKey]uint32
 	balancedCursors  map[topicKey]uint32
+	// Contexts survive a reconnect: a stale one costs one refused send and a
+	// refresh, never a write into the wrong incarnation.
+	contexts map[topicKey]map[uint32]iggcon.PartitionContext
 }
 
 func (c *topicCache) partitionsCount(key topicKey) (uint32, bool) {
@@ -66,10 +69,32 @@ func (c *topicCache) setPartitionsCount(key topicKey, count uint32) {
 	c.partitionsCounts[key] = count
 }
 
-func (c *topicCache) invalidatePartitionsCount(key topicKey) {
+func (c *topicCache) partitionContext(key topicKey, partition uint32) (iggcon.PartitionContext, bool) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	captured, ok := c.contexts[key][partition]
+	return captured, ok
+}
+
+func (c *topicCache) setPartitionContext(key topicKey, partition uint32, captured iggcon.PartitionContext) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.contexts == nil {
+		c.contexts = make(map[topicKey]map[uint32]iggcon.PartitionContext)
+	}
+	if c.contexts[key] == nil {
+		c.contexts[key] = make(map[uint32]iggcon.PartitionContext)
+	}
+	c.contexts[key][partition] = captured
+}
+
+// invalidate forgets the partition count and contexts of a topic, so the next
+// send rereads them. The balanced cursor survives.
+func (c *topicCache) invalidate(key topicKey) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	delete(c.partitionsCounts, key)
+	delete(c.contexts, key)
 }
 
 func (c *topicCache) drop(key topicKey) {
@@ -77,6 +102,7 @@ func (c *topicCache) drop(key topicKey) {
 	defer c.mtx.Unlock()
 	delete(c.partitionsCounts, key)
 	delete(c.balancedCursors, key)
+	delete(c.contexts, key)
 }
 
 // dropStream forgets every topic cached under the encoded stream identifier,
@@ -92,6 +118,11 @@ func (c *topicCache) dropStream(stream string) {
 	for key := range c.balancedCursors {
 		if key.stream == stream {
 			delete(c.balancedCursors, key)
+		}
+	}
+	for key := range c.contexts {
+		if key.stream == stream {
+			delete(c.contexts, key)
 		}
 	}
 }

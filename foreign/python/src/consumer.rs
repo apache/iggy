@@ -59,17 +59,15 @@ pub struct IggyConsumer {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyConsumer {
-    /// Get the last consumed offset for the given partition, or `None` while that partition
-    /// is untracked. Polling starts tracking a partition at `0`, so `0` also means
-    /// "seen, nothing consumed yet".
+    /// Get the last offset handed over for this partition, or `None` until a message
+    /// from the partition has been consumed.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_consumed_offset(partition_id)
     }
 
-    /// Get the last stored offset for the given partition, or `None` while that partition is
-    /// untracked. Polling starts tracking a partition at `0`, so `0` also means
-    /// "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
+    /// Get the last offset successfully stored for this partition, or `None` until
+    /// this consumer has stored one. Polling under `AutoCommit.Disabled()` leaves it unset.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_stored_offset(partition_id)

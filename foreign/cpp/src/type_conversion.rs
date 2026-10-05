@@ -619,6 +619,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             },
             durability,
             consumer_offset_durability,
+            partition_resize_policy: None,
             messages_required_to_save: if options.has_messages_required_to_save {
                 Some(options.messages_required_to_save)
             } else {

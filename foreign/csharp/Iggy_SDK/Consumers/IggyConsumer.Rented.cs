@@ -143,6 +143,7 @@ public partial class IggyConsumer
                 return;
             }
 
+            _lastPolledContext[rental.PartitionId] = rental.Context;
             var hasLastOffset = _lastPolledOffset.TryGetValue(rental.PartitionId, out var lastPolledPartitionOffset);
 
             var currentOffset = 0ul;

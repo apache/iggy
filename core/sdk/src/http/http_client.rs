@@ -346,8 +346,8 @@ impl HttpClient {
                     StatusCode::UNAUTHORIZED => Err(IggyError::Unauthenticated),
                     StatusCode::FORBIDDEN => Err(IggyError::Unauthorized),
                     StatusCode::NOT_FOUND => Err(IggyError::ResourceNotFound(reason)),
-                    _ if is_request_too_old_body(&reason) => Err(IggyError::RequestTooOld),
-                    _ => Err(IggyError::HttpResponseError(status.as_u16(), reason)),
+                    _ => Err(terminal_retry_error(&reason)
+                        .unwrap_or_else(|| IggyError::HttpResponseError(status.as_u16(), reason))),
                 }
             }
         }
@@ -377,16 +377,16 @@ struct RefreshToken {
     token: String,
 }
 
-/// True when an error body is the server's JSON error whose `id` is the
-/// `RequestTooOld` code. The producer stops retrying on that error, so it must
-/// not reach the caller as a plain `HttpResponseError`.
-fn is_request_too_old_body(body: &str) -> bool {
+/// Preserve terminal retry errors so producers cannot turn them into new writes.
+fn terminal_retry_error(body: &str) -> Option<IggyError> {
     #[derive(Deserialize)]
     struct ErrorId {
         id: u32,
     }
-    serde_json::from_str::<ErrorId>(body)
-        .is_ok_and(|error| error.id == IggyError::RequestTooOld.as_code())
+    let id = serde_json::from_str::<ErrorId>(body).ok()?.id;
+    [IggyError::RequestTooOld, IggyError::HistoryUnavailable]
+        .into_iter()
+        .find(|error| error.as_code() == id)
 }
 
 /// Unit tests for HttpClient.
@@ -394,6 +394,17 @@ fn is_request_too_old_body(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_history_errors_survive_http_decoding() {
+        for error in [IggyError::RequestTooOld, IggyError::HistoryUnavailable] {
+            let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
+            assert_eq!(terminal_retry_error(&body), Some(error));
+        }
+        for body in ["", "unavailable", r#"{"id":500}"#, r#"{"id":"87"}"#] {
+            assert_eq!(terminal_retry_error(body), None);
+        }
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {

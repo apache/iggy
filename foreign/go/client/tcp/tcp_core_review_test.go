@@ -286,7 +286,7 @@ func TestTopicCache_ClearCountsKeepsTheBalancedCursors(t *testing.T) {
 
 func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
 			return statusReplyFrame(vsr.OperationSendMessages,
 				uint32(ierror.PartitionNotFoundCode), nil)

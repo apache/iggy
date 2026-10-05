@@ -45,7 +45,9 @@ public enum Durability: String, Sendable, Hashable, CaseIterable {
 /// resolves against the server's defaults at admission.
 ///
 /// `raw` carries keys this SDK has no typed field for, as strings the server
-/// parses, so a newer server's option costs no SDK change.
+/// parses, so a newer server's option costs no SDK change. For example,
+/// `["partition_resize_policy": "fixed"]` makes the server reject later
+/// partition creation and deletion on this topic.
 public struct TopicCreateOptions: Sendable, Hashable {
     /// Number of partitions the topic starts with. A field of the create
     /// command rather than an option key; nil means 1, the server's

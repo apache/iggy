@@ -34,3 +34,4 @@ export {
 } from './wire/error.utils.js';
 export { ProtocolFrameError } from './client/client.frame.js';
 export { VsrEvictionError } from './wire/vsr/reply.js';
+export type { PartitionContext } from './wire/vsr/header.js';

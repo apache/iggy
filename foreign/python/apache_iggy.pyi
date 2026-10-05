@@ -1482,6 +1482,8 @@ class IggyClient:
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so a newer server key can be set from this build.
+                `{"partition_resize_policy": "fixed"}` makes the server reject
+                later partition creation and deletion on this topic.
 
         Every option left as `None` resolves against the server default at
         admission.
@@ -1906,15 +1908,13 @@ class IggyConsumer:
         self, partition_id: builtins.int
     ) -> builtins.int | None:
         r"""
-        Get the last consumed offset for the given partition, or `None` while that partition
-        is untracked. Polling starts tracking a partition at `0`, so `0` also means
-        "seen, nothing consumed yet".
+        Get the last offset handed over for this partition, or `None` until a message
+        from the partition has been consumed.
         """
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
-        Get the last stored offset for the given partition, or `None` while that partition is
-        untracked. Polling starts tracking a partition at `0`, so `0` also means
-        "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
+        Get the last offset successfully stored for this partition, or `None` until
+        this consumer has stored one. Polling under `AutoCommit.Disabled()` leaves it unset.
         """
     def name(self) -> builtins.str:
         r"""

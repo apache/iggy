@@ -72,6 +72,9 @@ public enum IggyErrorCode {
      * resending can duplicate the write.
      */
     REQUEST_TOO_OLD(85),
+    HISTORY_UNAVAILABLE(87),
+    /** A committed lifecycle operation prevents this mutation. Retry as a new request. */
+    LIFECYCLE_BUSY(88),
 
     // Client errors
     CLIENT_NOT_FOUND(100),
@@ -96,6 +99,7 @@ public enum IggyErrorCode {
     INVALID_REPLICATION_FACTOR(2018),
     TOO_MANY_TOPICS(2021),
     PARTITIONS_LIMIT_REACHED(2022),
+    PARTITION_RESIZE_DISABLED(2023),
 
     // Partition errors
     PARTITION_NOT_FOUND(3007),

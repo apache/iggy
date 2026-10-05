@@ -85,6 +85,7 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
     let address = harness.node(leader).tcp_addr().expect("leader TCP address");
     let mut raw = raw_tcp::connect_to(address).await;
     let session = raw_tcp::register_root(&mut raw, RAW_CLIENT_ID).await;
+    let context = raw_tcp::partition_context(&client, &stream, &topic, PARTITION_ID).await;
     let wire_stream = WireIdentifier::Numeric(stream_details.id);
     let wire_topic = WireIdentifier::Numeric(topic_details.id);
     let raw_consumer_id = 41;
@@ -98,13 +99,14 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         ack: AckLevel::NoAck,
     }
     .to_bytes();
-    let store_header = raw_tcp::request_header(
+    let mut store_header = raw_tcp::request_header(
         Operation::StoreConsumerOffset,
         RAW_CLIENT_ID,
         session,
         1,
         store.len(),
     );
+    context.stamp(&mut store_header);
     let (reply, _) = raw_tcp::exchange(&mut raw, &store_header, &store).await;
     assert_eq!(raw_tcp::reply_status(&reply), 0);
     wait_for_file_state(
@@ -124,13 +126,14 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         ack: AckLevel::NoAck,
     }
     .to_bytes();
-    let delete_header = raw_tcp::request_header(
+    let mut delete_header = raw_tcp::request_header(
         Operation::DeleteConsumerOffset,
         RAW_CLIENT_ID,
         session,
         2,
         delete.len(),
     );
+    context.stamp(&mut delete_header);
     let (reply, _) = raw_tcp::exchange(&mut raw, &delete_header, &delete).await;
     assert_eq!(raw_tcp::reply_status(&reply), 0);
     wait_for_file_state(
@@ -200,6 +203,10 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
             .join_consumer_group(&stream, &topic, &group)
             .await
             .expect("join group");
+        integration::harness::wait_for_consumer_group_assignment(
+            &client, &stream, &topic, &group, 1, WAIT,
+        )
+        .await;
         client
             .store_consumer_offset(
                 &Consumer::group(group.clone()),

@@ -330,11 +330,24 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
+    public Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
         uint? partitionId, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new StoreOffsetRequest(consumer, partitionId, offset),
-            _jsonSerializerOptions);
+        return PutOffsetAsync(streamId, topicId, new StoreOffsetRequest(consumer, partitionId, offset), token);
+    }
+
+    /// <inheritdoc />
+    public Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
+        uint partitionId, PartitionContext context, CancellationToken token = default)
+    {
+        return PutOffsetAsync(streamId, topicId,
+            new StoreOffsetRequest(consumer, partitionId, offset) { Context = context }, token);
+    }
+
+    private async Task PutOffsetAsync(Identifier streamId, Identifier topicId, StoreOffsetRequest request,
+        CancellationToken token)
+    {
+        var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response

@@ -60,6 +60,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -106,6 +107,7 @@ public class AsyncTcpConnection {
     private static final int STALE_CLIENT = 30;
     private static final int UNAUTHENTICATED = 40;
     private static final int UNAUTHORIZED = 41;
+    private static final int HISTORY_UNAVAILABLE = 87;
     private static final int REGISTER_RESPONSE_MIN_BYTES = 17;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
@@ -483,12 +485,12 @@ public class AsyncTcpConnection {
         return callerFuture;
     }
 
-    CompletableFuture<ByteBuf> sendPrimaryPoll(ByteBuf payload, long sessionGeneration) {
+    CompletableFuture<ByteBuf> sendPrimaryPoll(ByteBuf payload, long sessionGeneration, PartitionContext context) {
         return send(
                 CommandCode.Messages.POLL_ON_PRIMARY.getValue(),
                 payload,
                 0,
-                new TransientFailoverState(),
+                new TransientFailoverState(context),
                 sessionGeneration);
     }
 
@@ -564,6 +566,7 @@ public class AsyncTcpConnection {
                         requestDeadlineNanos,
                         holdLeaseUntilResponse,
                         requiredSessionGeneration,
+                        failoverState,
                         authError));
     }
 
@@ -595,6 +598,7 @@ public class AsyncTcpConnection {
             long requestDeadlineNanos,
             boolean holdLeaseUntilResponse,
             long requiredSessionGeneration,
+            TransientFailoverState failoverState,
             Throwable authError) {
         try {
             if (authError != null) {
@@ -609,7 +613,7 @@ public class AsyncTcpConnection {
                         IggyServerException.fromTcpResponse(TRANSIENT_NOT_ACCEPTED, new byte[0]));
                 return;
             }
-            sendFrame(channel, payload, commandCode, responseFuture, requestDeadlineNanos);
+            sendFrame(channel, payload, commandCode, responseFuture, requestDeadlineNanos, failoverState);
         } finally {
             if (!holdLeaseUntilResponse) {
                 releaseChannel(channel);
@@ -716,13 +720,7 @@ public class AsyncTcpConnection {
             callerFuture.completeExceptionally(retryError);
             return;
         }
-        retry.whenComplete((response, error) -> {
-            if (error != null) {
-                callerFuture.completeExceptionally(error);
-            } else {
-                completeWithResponse(callerFuture, response);
-            }
-        });
+        retry.whenComplete((response, error) -> completeWithResponse(callerFuture, response, error));
     }
 
     private CompletableFuture<ByteBuf> sendAuthenticationFrame(
@@ -732,7 +730,12 @@ public class AsyncTcpConnection {
             ByteBuf binding = vsrEncoder.bindSession(channel.alloc());
             CompletableFuture<ByteBuf> bindingFuture = new CompletableFuture<>();
             sendFrame(
-                    channel, binding, CommandCode.System.BIND_SESSION.getValue(), bindingFuture, requestDeadlineNanos);
+                    channel,
+                    binding,
+                    CommandCode.System.BIND_SESSION.getValue(),
+                    bindingFuture,
+                    requestDeadlineNanos,
+                    new TransientFailoverState());
             return bindingFuture
                     .handle((response, error) -> {
                         if (error == null) {
@@ -758,7 +761,7 @@ public class AsyncTcpConnection {
                     .thenCompose(Function.identity());
         }
         CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
-        sendFrame(channel, payload, commandCode, loginFuture, requestDeadlineNanos);
+        sendFrame(channel, payload, commandCode, loginFuture, requestDeadlineNanos, new TransientFailoverState());
         return loginFuture;
     }
 
@@ -839,14 +842,15 @@ public class AsyncTcpConnection {
             ByteBuf payload,
             int commandCode,
             CompletableFuture<ByteBuf> responseFuture,
-            long requestDeadlineNanos) {
+            long requestDeadlineNanos,
+            TransientFailoverState failoverState) {
         try {
             VsrResponseHandler handler = channel.pipeline().get(VsrResponseHandler.class);
             if (handler == null) {
                 throw new IggyClientException("Channel missing VsrResponseHandler");
             }
 
-            ByteBuf frame = vsrEncoder.encode(channel.alloc(), commandCode, payload);
+            ByteBuf frame = vsrEncoder.encode(channel.alloc(), commandCode, payload, failoverState.context);
             long nowNanos = System.nanoTime();
             long deadlineNanos = nowNanos + TRANSIENT_RETRY_BUDGET.toNanos();
             long notAcceptedDeadlineNanos =
@@ -860,6 +864,7 @@ public class AsyncTcpConnection {
                     deadlineNanos,
                     notAcceptedDeadlineNanos,
                     commandCode,
+                    failoverState.retryContextDiscovery,
                     false);
         } catch (RuntimeException e) {
             responseFuture.completeExceptionally(e);
@@ -883,6 +888,7 @@ public class AsyncTcpConnection {
             long deadlineNanos,
             long notAcceptedDeadlineNanos,
             int commandCode,
+            boolean retryContextDiscovery,
             boolean uncertain) {
         if (requestDeadlineNanos - System.nanoTime() <= 0) {
             IggyTimeoutException timeout = responseTimeout(commandCode);
@@ -911,7 +917,13 @@ public class AsyncTcpConnection {
         attempt.whenComplete((response, error) -> {
             IggyServerException serverError = findServerError(error);
             boolean nextUncertain = uncertain || isUncertainOutcome(serverError);
-            if (shouldRetryTransient(commandCode, error, deadlineNanos, notAcceptedDeadlineNanos, nextUncertain)
+            if (shouldRetryTransient(
+                            commandCode,
+                            error,
+                            deadlineNanos,
+                            notAcceptedDeadlineNanos,
+                            retryContextDiscovery,
+                            nextUncertain)
                     && channel.isActive()) {
                 try {
                     channel.eventLoop()
@@ -925,6 +937,7 @@ public class AsyncTcpConnection {
                                             deadlineNanos,
                                             notAcceptedDeadlineNanos,
                                             commandCode,
+                                            retryContextDiscovery,
                                             nextUncertain),
                                     TRANSIENT_RETRY_INTERVAL_MS,
                                     TimeUnit.MILLISECONDS);
@@ -956,6 +969,7 @@ public class AsyncTcpConnection {
 
     private static boolean isUnadmittedRefusal(long code) {
         return code == TRANSIENT_NOT_ACCEPTED
+                || code == HISTORY_UNAVAILABLE
                 || code == UNAUTHORIZED
                 || code == UNAUTHENTICATED
                 || code == STALE_CLIENT;
@@ -976,7 +990,7 @@ public class AsyncTcpConnection {
         return null;
     }
 
-    private static IggyServerException findServerError(Throwable error) {
+    static IggyServerException findServerError(Throwable error) {
         Throwable cause = error;
         while (cause != null) {
             if (cause instanceof IggyServerException serverError) {
@@ -990,6 +1004,14 @@ public class AsyncTcpConnection {
     private static void releaseIfPresent(ByteBuf payload) {
         if (payload != null) {
             payload.release();
+        }
+    }
+
+    static void completeWithResponse(CompletableFuture<ByteBuf> future, ByteBuf response, Throwable error) {
+        if (error != null) {
+            future.completeExceptionally(error);
+        } else {
+            completeWithResponse(future, response);
         }
     }
 
@@ -1019,8 +1041,15 @@ public class AsyncTcpConnection {
     }
 
     private static boolean shouldRetryTransient(
-            int commandCode, Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos, boolean uncertain) {
-        if (isPollRoutingCode(commandCode) || !(error instanceof IggyServerException serverError)) {
+            int commandCode,
+            Throwable error,
+            long deadlineNanos,
+            long notAcceptedDeadlineNanos,
+            boolean retryContextDiscovery,
+            boolean uncertain) {
+        // Context discovery precedes any admitted poll, including plain polls without a router.
+        if ((isPollRoutingCode(commandCode) && !retryContextDiscovery)
+                || !(error instanceof IggyServerException serverError)) {
             return false;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED
@@ -1226,8 +1255,22 @@ public class AsyncTcpConnection {
     record AuthenticationSnapshot(int commandCode, ByteBuf payload) {}
 
     static final class TransientFailoverState {
-
+        private final PartitionContext context;
+        private final boolean retryContextDiscovery;
         private final Set<ConnectionInfo> visitedTargets = new HashSet<>();
+
+        TransientFailoverState() {
+            this(PartitionContext.EMPTY);
+        }
+
+        TransientFailoverState(PartitionContext context) {
+            this(context, false);
+        }
+
+        TransientFailoverState(PartitionContext context, boolean retryContextDiscovery) {
+            this.context = context;
+            this.retryContextDiscovery = retryContextDiscovery;
+        }
 
         Set<ConnectionInfo> visitedTargets() {
             return visitedTargets;

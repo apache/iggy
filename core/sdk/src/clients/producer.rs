@@ -1112,6 +1112,7 @@ mod tests {
         for error in [
             IggyError::Disconnected,
             IggyError::TransientNotCommitted,
+            IggyError::HistoryUnavailable,
             IggyError::EmptyResponse,
             IggyError::Unauthenticated,
             IggyError::Unauthorized,
@@ -1141,9 +1142,35 @@ mod tests {
                 let request =
                     bytemuck::checked::try_pod_read_unaligned::<RequestHeader>(&header_bytes)
                         .unwrap();
-                assert_eq!(request.operation, Operation::SendMessages);
                 let mut body = vec![0u8; usize::try_from(request.size).unwrap() - HEADER_SIZE];
                 stream.read_exact(&mut body).await.unwrap();
+                if request.operation == Operation::NonReplicated {
+                    assert_eq!(
+                        u32::from_le_bytes(request.reserved),
+                        iggy_binary_protocol::codes::GET_SEND_CONTEXT_CODE
+                    );
+                    let response =
+                        iggy_binary_protocol::primitives::partition_history::PartitionContext {
+                            incarnation: 7,
+                            owner_generation: 0,
+                            metadata_op: 11,
+                        };
+                    let body = iggy_binary_protocol::WireEncode::to_bytes(&response);
+                    let reply = ReplyHeader {
+                        command: Command::Reply,
+                        operation: request.operation,
+                        size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
+                        ..Default::default()
+                    };
+                    stream.write_all(bytemuck::bytes_of(&reply)).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                    continue;
+                }
+                assert_eq!(request.operation, Operation::SendMessages);
+                assert_eq!(
+                    (request.partition_incarnation, request.minimum_metadata_op),
+                    (7, 11)
+                );
                 requests.push(request.request);
                 let reply = ReplyHeader {
                     command: Command::Reply,

@@ -17,7 +17,10 @@
 
 use crate::{IggyMessage, IggyMessageHeader, error::IggyError};
 use bytes::Bytes;
+use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchMessageHeader};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -29,6 +32,8 @@ use tracing::error;
 /// - `messages`: the collection of messages.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolledMessages {
+    /// Partition incarnation and owner captured by the accepted poll.
+    pub context: PartitionContext,
     /// The identifier of the partition. An empty reply can carry a sentinel instead of a real
     /// id: [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION) for a consumer-group member
     /// that holds no partitions, or
@@ -46,6 +51,7 @@ pub struct PolledMessages {
 impl PolledMessages {
     pub fn empty() -> Self {
         Self {
+            context: PartitionContext::default(),
             partition_id: 0,
             current_offset: 0,
             count: 0,
@@ -55,7 +61,7 @@ impl PolledMessages {
 }
 
 impl PolledMessages {
-    /// Decode a `PollMessages` response body: the 16-byte prefix followed by
+    /// Decode a `PollMessages` response body: the 40-byte prefix followed by
     /// the served batch records (`[256B batch header][frames]`, deltas
     /// resolved against the stamped bases).
     ///
@@ -63,28 +69,18 @@ impl PolledMessages {
     /// [`IggyError::InvalidNumberEncoding`] on a short prefix;
     /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record.
     pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
-        if bytes.len() < 16 {
-            return Err(IggyError::InvalidNumberEncoding);
-        }
-        let partition_id = u32::from_le_bytes(
-            bytes[0..4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let current_offset = u64::from_le_bytes(
-            bytes[4..12]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let count = u32::from_le_bytes(
-            bytes[12..16]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-
-        let messages = messages_from_batches(bytes.slice(16..), count)?;
+        let (header, consumed) = PollMessagesResponseHeader::decode(&bytes)
+            .map_err(|_| IggyError::InvalidNumberEncoding)?;
+        let PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        } = header;
+        let messages = messages_from_batches(bytes.slice(consumed..), count)?;
 
         Ok(Self {
+            context,
             partition_id,
             current_offset,
             count,
@@ -97,7 +93,9 @@ impl PolledMessages {
 /// values. Payload and user-header `Bytes` are zero-copy slices of the
 /// response buffer.
 fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, IggyError> {
-    let mut messages = Vec::with_capacity(count as usize);
+    let mut messages = Vec::with_capacity(
+        (count as usize).min(buffer.len() / iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE),
+    );
     let mut position = 0usize;
     while position < buffer.len() {
         let batch = BatchHeader::decode(&buffer[position..]).map_err(|decode_error| {
@@ -150,5 +148,8 @@ fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, 
         position = batch_end;
     }
 
+    if messages.len() != count as usize {
+        return Err(IggyError::InvalidMessagePayloadLength);
+    }
     Ok(messages)
 }

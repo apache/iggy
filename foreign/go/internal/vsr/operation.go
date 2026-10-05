@@ -37,6 +37,7 @@ const (
 	OperationCompleteConsumerGroupRevocation Operation = 67
 	OperationTruncatePartition               Operation = 68
 	OperationFinalizeSession                 Operation = 70
+	OperationCompleteLifecycle               Operation = 71
 
 	OperationCreateStream              Operation = 128
 	OperationUpdateStream              Operation = 129
@@ -59,10 +60,13 @@ const (
 	OperationJoinConsumerGroup         Operation = 148
 	OperationLeaveConsumerGroup        Operation = 149
 
-	OperationSendMessages         Operation = 160
-	OperationStoreConsumerOffset  Operation = 161
-	OperationDeleteConsumerOffset Operation = 162
-	OperationRetireSession        Operation = 166
+	OperationSendMessages               Operation = 160
+	OperationStoreConsumerOffset        Operation = 161
+	OperationDeleteConsumerOffset       Operation = 162
+	OperationRetireSession              Operation = 166
+	OperationInstallConsumerGroupOwner  Operation = 167
+	OperationTransitionPartitionHistory Operation = 168
+	OperationRetireConsumerGroupOwners  Operation = 169
 )
 
 // Band boundaries. The internal band is never client-sent.
@@ -84,6 +88,7 @@ var allOperations = []Operation{
 	OperationCompleteConsumerGroupRevocation,
 	OperationTruncatePartition,
 	OperationFinalizeSession,
+	OperationCompleteLifecycle,
 	OperationCreateStream,
 	OperationUpdateStream,
 	OperationDeleteStream,
@@ -108,6 +113,9 @@ var allOperations = []Operation{
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
 	OperationRetireSession,
+	OperationInstallConsumerGroupOwner,
+	OperationTransitionPartitionHistory,
+	OperationRetireConsumerGroupOwners,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -186,7 +194,7 @@ func IsKnownOperation(operation Operation) bool {
 // IsInternal reports whether the operation belongs to the replica-internal
 // band, which a client never sends.
 func IsInternal(operation Operation) bool {
-	return operation == OperationRetireSession || operation >= internalBandStart && operation < metadataBandStart
+	return operation == OperationRetireSession || operation == OperationInstallConsumerGroupOwner || operation == OperationTransitionPartitionHistory || operation == OperationRetireConsumerGroupOwners || operation >= internalBandStart && operation < metadataBandStart
 }
 
 // IsMetadata reports whether the operation replicates through the metadata

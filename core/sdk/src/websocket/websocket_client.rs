@@ -22,10 +22,11 @@ use crate::leader_aware::{
 };
 use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::session::ConsensusSession;
-use crate::vsr::retain_replay_header;
+use crate::vsr::{RetainedRequest, retain_replay_header};
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
 use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::TransportProtocol;
 use rustls::{ClientConfig, pki_types::pem::PemObject};
 
@@ -137,15 +138,19 @@ impl BinaryTransport for WebSocketClient {
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.write_offset(self, code, payload).await
+        self.poll_router
+            .write_offset(self, code, payload, context)
+            .await
     }
 
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.poll(self, request).await
+        self.poll_router.poll(self, request, context).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -166,12 +171,19 @@ impl BinaryTransport for WebSocketClient {
         }
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
         if is_poll_routing_code(code) {
-            return self.send_poll_request(code, payload).await;
+            return self
+                .send_poll_request_with_context(code, payload, context)
+                .await;
         }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-        let mut header = None;
+        let mut header = RetainedRequest::new(context);
         let mut result = self
             .send_raw_retaining_header(code, payload.clone(), &mut header)
             .await;
@@ -540,8 +552,14 @@ impl PollTransport for WebSocketClient {
         Ok(client)
     }
 
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        self.send_raw_request(code, payload, false, &mut None).await
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, false, &mut RetainedRequest::new(context))
+            .await
     }
 }
 
@@ -1133,7 +1151,7 @@ impl WebSocketClient {
         &self,
         code: u32,
         payload: Bytes,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
     ) -> Result<Bytes, IggyError> {
         self.send_raw_request(code, payload, true, header).await
     }
@@ -1142,7 +1160,7 @@ impl WebSocketClient {
         &self,
         code: u32,
         payload: Bytes,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
         original_error: &IggyError,
         deadline: tokio::time::Instant,
     ) -> Result<Bytes, IggyError> {
@@ -1197,7 +1215,7 @@ impl WebSocketClient {
         code: u32,
         payload: Bytes,
         retry_transient: bool,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
     ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
@@ -1238,7 +1256,7 @@ impl WebSocketClient {
                 // `TransientNotCommitted` answer (the server could not commit yet)
                 // lets us resend the SAME request on the SAME connection with no
                 // reconnect and the session intact. Bounded by RESPONSE_READ_TIMEOUT.
-                let request = {
+                let mut request = {
                     let mut session = consensus_session
                         .lock()
                         .map_err(|_| IggyError::InvalidConfiguration)?;
@@ -1262,6 +1280,7 @@ impl WebSocketClient {
                 };
                 let mut frame_complete = false;
                 let mut retry_outcome = crate::vsr::RetryOutcome::default();
+                let mut lifecycle_retry_interval = NOT_READY_RETRY_INTERVAL;
                 let outcome = async {
                     loop {
                         frame_complete = false;
@@ -1311,6 +1330,16 @@ impl WebSocketClient {
                             .map_err(|error| retry_outcome.observe(error))
                         {
                             Err(error) if !retry_transient => return Err(error),
+                        Err(IggyError::LifecycleBusy) if tokio::time::Instant::now() + lifecycle_retry_interval < retry_deadline => {
+                            used_header.header = None;
+                            request = {
+                                let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                                crate::vsr::encode_contiguous_request(&mut session, code, &payload, &mut used_header)?
+                            };
+                            tokio::time::sleep(lifecycle_retry_interval).await;
+                            lifecycle_retry_interval = (lifecycle_retry_interval * 2).min(crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL);
+                        }
+
                             Err(IggyError::TransientNotAccepted)
                                 if tokio::time::Instant::now() >= not_accepted_deadline =>
                             {
@@ -1430,19 +1459,19 @@ mod tests {
             .is_err()
         );
 
-        let mut header = None;
+        let mut request = crate::vsr::RetainedRequest::default();
         assert_eq!(
             client
                 .send_raw_request(
                     SEND_MESSAGES_CODE,
                     Bytes::from_static(b"send"),
                     false,
-                    &mut header,
+                    &mut request,
                 )
                 .await,
             Err(IggyError::InvalidConfiguration)
         );
-        assert!(header.is_none());
+        assert!(request.header.is_none());
         assert_eq!(
             client.reset_vsr_session().await,
             Err(IggyError::InvalidConfiguration)
@@ -1488,7 +1517,10 @@ mod tests {
         .unwrap()
         .0;
         let stream_guard = client.stream.lock().await;
-        let mut retained = Some(retained);
+        let mut retained = RetainedRequest {
+            header: Some(retained),
+            ..Default::default()
+        };
         let attempt = client.send_raw_request(SEND_MESSAGES_CODE, payload, false, &mut retained);
         tokio::pin!(attempt);
         tokio::select! {

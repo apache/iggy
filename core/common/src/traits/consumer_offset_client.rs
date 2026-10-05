@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use crate::{Consumer, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer offset module.
@@ -25,6 +25,19 @@ use async_trait::async_trait;
 /// [`IggyError::FeatureUnavailable`] there.
 #[async_trait]
 pub trait ConsumerOffsetClient {
+    /// Commit a captured position without substituting a newer incarnation or owner.
+    /// Authentication and permission to poll messages are required.
+    /// Returns [`IggyError::HistoryUnavailable`] (87) for a deleted or replaced incarnation,
+    /// [`IggyError::ConsumerGroupPartitionNotOwned`] (5009) for a lost owner,
+    /// or [`IggyError::TooManyConsumerOffsets`] (3024) at the new-key limit.
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError>;
+
     /// Store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.

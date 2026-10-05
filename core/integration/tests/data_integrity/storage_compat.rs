@@ -1262,6 +1262,9 @@ async fn assert_topic_recovered(
         segment_size: seed.segment_size.and(recovered.segment_size),
         durability: recovered.durability,
         consumer_offset_durability: recovered.consumer_offset_durability,
+        partition_resize_policy: seed
+            .partition_resize_policy
+            .and(recovered.partition_resize_policy),
         messages_required_to_save: seed
             .messages_required_to_save
             .and(recovered.messages_required_to_save),

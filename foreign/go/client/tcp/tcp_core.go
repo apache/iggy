@@ -415,6 +415,13 @@ func (c *IggyTcpClient) write(payload []byte) (int, error) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	captured, route, err := c.capturePartitionContext(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 
@@ -428,11 +435,30 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 		return nil, err
 	}
 
-	return c.exchange(ctx, uint32(cmd.Code()), frame)
+	response, err := c.exchange(captured, uint32(cmd.Code()), frame)
+	if err != nil && route != "" {
+		// A partition reply never raises the metadata watermark that ages a
+		// route, so without this drop a refused context is stamped again.
+		c.polls.dropRoute(route)
+	}
+	send, ok := cmd.(*command.SendMessages)
+	if !ok || !errors.Is(err, ierror.ErrHistoryUnavailable) {
+		return response, err
+	}
+	// The partition refused the context before admission, so one resend of
+	// this frame under a fresh context cannot write the batch twice. The frame
+	// is not encoded again, because encoding compresses the payloads in place.
+	c.topics.invalidate(newTopicKey(send.StreamId, send.TopicId))
+	if captured, _, err = c.capturePartitionContext(ctx, cmd); err != nil {
+		return nil, err
+	}
+	return c.exchange(captured, uint32(cmd.Code()), frame)
 }
 
 // SendBinaryRequest sends a command code and payload and returns the raw response body.
 // Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+// It stamps no partition context, so the server refuses message sends, polls and
+// consumer offset writes with ierror.ErrHistoryUnavailable. Use the typed methods for those.
 func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
 	if isSessionControlCode(code) {
 		return nil, ierror.ErrInvalidCommand
@@ -800,6 +826,9 @@ func (c *IggyTcpClient) attempt(
 		if err := vsr.StampRequestHeader(c.session, code, frame); err != nil {
 			return nil, false, generation, &localPreconditionError{err}
 		}
+		if captured, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
+			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), captured)
+		}
 		stamped = true
 	}
 
@@ -911,6 +940,7 @@ func (c *IggyTcpClient) exchangeLocked(
 			uncertain = true
 		}
 		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) ||
+			errors.Is(err, ierror.ErrHistoryUnavailable) ||
 			errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) ||
 			errors.Is(err, ierror.ErrUnauthorized)) {
 			c.handleReplyFailureLocked(err)
