@@ -335,7 +335,7 @@ Arguments:
 
 Options:
   -k, --kind <KIND>
-          Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group
+          Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy
 
           Possible values:
           - consumer:       `Consumer` represents a regular consumer
@@ -373,7 +373,8 @@ Arguments:
   <OFFSET>        Offset to set
 
 Options:
-  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group [default: consumer] [possible values: consumer, consumer-group, external-group]
+  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy [default: consumer] [possible values:
+                     consumer, consumer-group, external-group]
   -h, --help         Print help (see more with '--help')
 "#,
             ),

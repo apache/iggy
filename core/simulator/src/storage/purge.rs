@@ -29,6 +29,9 @@
 //! both offset policies. An external group is never polled, so its bookmark is
 //! read directly. Boot never clamps it, so a resurrected one would survive.
 //!
+//! A third test purges after one consumer or group directory is gone, a state
+//! that recovery accepts. The purge must still record its generation.
+//!
 //! The harness enters after message history has been reset. It uses production
 //! purge completion and consumer recovery with `SimStorage`, then polls through
 //! the real `Next` path. Message recovery is narrower than server boot: a helper
@@ -157,6 +160,17 @@ impl PurgeStorageHarness {
             .await
             .unwrap();
         self.storage.sync_directory(&directory).await.unwrap();
+    }
+
+    /// Remove the offset directory of `kind` and make its absence durable. A power
+    /// loss leaves the same state when `offsets/` never synced the directory entry.
+    async fn remove_offset_directory(&self, kind: ConsumerKind) {
+        let directory = self.offset_directory(kind);
+        self.storage.remove_tree(&directory).await.unwrap();
+        self.storage
+            .sync_directory(directory.parent().unwrap())
+            .await
+            .unwrap();
     }
 
     /// Journal five messages at offsets 0 through 4 without touching offset directories.
@@ -488,6 +502,52 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
             harness
                 .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
                 .await;
+        }
+    });
+}
+
+/// Recovery loads a missing consumer or group directory as empty and does not
+/// create it again, so a purge can find one gone. A missing directory holds no
+/// unlink to make durable. The purge must still record its generation, or every
+/// re-issued purge fails the same way and the replica withholds `PrepareOk`.
+#[test]
+fn given_missing_offset_directory_when_purge_completes_should_record_the_generation() {
+    block_on(async {
+        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            let harness = PurgeStorageHarness::with_stored_progress(Durability::Replicated).await;
+            harness.remove_offset_directory(kind).await;
+            let mut partition = harness.empty_partition();
+            harness
+                .recover_progress(&mut partition, STORED_OFFSET)
+                .await;
+
+            partition
+                .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{kind:?}: purge must record its generation: {error}")
+                });
+            assert_eq!(
+                partition.applied_purge_generation(),
+                NEW_GENERATION,
+                "{kind:?}: purge must advance the applied generation"
+            );
+            drop(partition);
+
+            // The other directories must still sync, so no bookmark returns.
+            harness.storage.crash(Crash::PowerLoss);
+            let mut recovered = harness.empty_partition();
+            harness.recover_progress(&mut recovered, 0).await;
+            assert_eq!(
+                recovered.applied_purge_generation(),
+                NEW_GENERATION,
+                "{kind:?}: the purge marker must survive power loss"
+            );
+            assert_bookmarks(
+                &recovered,
+                None,
+                &format!("{kind:?}: a deleted bookmark must not return after power loss"),
+            );
         }
     });
 }

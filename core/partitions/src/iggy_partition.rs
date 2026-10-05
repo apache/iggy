@@ -7924,11 +7924,11 @@ where
     /// a storage harness exercise the same failure behavior as the server.
     ///
     /// # Errors
-    /// Returns [`PurgeError::GenerationNotRecorded`] if an offset directory
-    /// cannot be synced or the completion marker cannot be persisted. Cleanup
-    /// is not rolled back, the applied generation remains unchanged, and the
-    /// flag that defers prepare acknowledgements is set. The normal purge path
-    /// manages that flag when retrying.
+    /// Returns [`PurgeError::GenerationNotRecorded`] if an existing offset
+    /// directory cannot be synced or the completion marker cannot be
+    /// persisted. Cleanup is not rolled back, the applied generation remains
+    /// unchanged, and the flag that defers prepare acknowledgements is set.
+    /// The normal purge path manages that flag when retrying.
     #[allow(clippy::too_many_lines)]
     pub async fn complete_purge_with_storage<S: DurableStorage>(
         &mut self,
@@ -7989,18 +7989,25 @@ where
         // the reconciler re-issues the purge.
         let mut offset_dirs_synced = true;
         for dir in self.consumer_offset_dirs.iter().flatten() {
-            if let Err(error) = storage.sync_directory(Path::new(dir)).await {
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = namespace.inner(),
-                    generation,
-                    dir = %dir,
-                    %error,
-                    "purge could not fsync an offsets dir; its generation stays unrecorded \
-                     until a re-issued purge syncs it"
-                );
-                offset_dirs_synced = false;
+            match storage.sync_directory(Path::new(dir)).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Recovery accepts a missing directory, and a directory
+                    // that is gone holds no unlink to make durable.
+                }
+                Err(error) => {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = namespace.inner(),
+                        generation,
+                        dir = %dir,
+                        %error,
+                        "purge could not fsync an offsets dir; its generation stays unrecorded \
+                         until a re-issued purge syncs it"
+                    );
+                    offset_dirs_synced = false;
+                }
             }
         }
         self.durable_consumer_offsets.clear();

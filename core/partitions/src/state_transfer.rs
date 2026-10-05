@@ -64,7 +64,11 @@ use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 1;
+/// Version 2: the external group count and section. `server-0.9.0` sends
+/// version 1, which has neither, so an artifact exchanged with a peer on that
+/// release fails with `UnsupportedVersion` instead of decoding 4 bytes out of
+/// place.
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 2;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -834,6 +838,38 @@ mod tests {
             Err(ConsumerOffsetsWireError::UnsupportedVersion {
                 version: CONSUMER_OFFSETS_VERSION + 1,
             })
+        );
+    }
+
+    #[test]
+    fn given_entry_in_every_section_when_encoded_should_match_the_version_pin() {
+        // Nothing else fails when the layout changes and the version bump is
+        // forgotten, and a peer on the older release then reads the artifact
+        // out of place. One entry per section makes the length cover the
+        // header, every count field and every entry stride. Changing either
+        // number is the reminder to change the other.
+        const ENCODED_LEN: usize = 154;
+        const PINNED_VERSION: u8 = 2;
+
+        let wire = ConsumerOffsetsWire {
+            prepare_checksum: Some(1),
+            checkpoint_prepare: Vec::new(),
+            purge_generation: 0,
+            next_offset: 0,
+            consumers: vec![(1, 0)],
+            groups: vec![(1, 0)],
+            external_groups: vec![(1, 0)],
+            dedup: vec![dedup_entry(1, 0, 0)],
+        };
+
+        assert_eq!(
+            wire.encode().len(),
+            ENCODED_LEN,
+            "the consumer-offsets layout changed; bump CONSUMER_OFFSETS_VERSION with it"
+        );
+        assert_eq!(
+            CONSUMER_OFFSETS_VERSION, PINNED_VERSION,
+            "CONSUMER_OFFSETS_VERSION moved; confirm the layout moved with it"
         );
     }
 
