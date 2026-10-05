@@ -74,7 +74,8 @@ changed() {
 # iteration's paths.
 for gate in "${GATES[@]}"; do
   case "$gate" in
-    rust) paths=(core gateways Cargo.toml Cargo.lock rust-toolchain.toml .cargo) ;;
+    # .config holds the nextest and Cargo-Rail policy every Rust test run reads.
+    rust) paths=(core gateways Cargo.toml Cargo.lock rust-toolchain.toml .cargo .config) ;;
     java) paths=(foreign/java) ;;
     csharp) paths=(foreign/csharp) ;;
     python) paths=(foreign/python) ;;
