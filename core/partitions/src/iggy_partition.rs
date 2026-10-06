@@ -13089,6 +13089,115 @@ mod tests {
         }
     }
 
+    /// A due checkpoint starts at `commit_min`, so until it is pending a
+    /// dispatched Replicated commit waits for its body write.
+    #[compio::test]
+    async fn a_due_checkpoint_holds_dispatched_replicated_commits_at_the_written_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, replies, config, parent) =
+            partition_with_committed_send(root.path(), iggy_common::Durability::Replicated, 3)
+                .await;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let second = checksummed_segment_prepare(2, parent, 1, b"second");
+        let header = *second.header();
+        persistence
+            .append(second.clone().into_frozen(), false)
+            .unwrap();
+        // Hold the writer so that the second body stays unwritten.
+        assert!(persistence.start());
+        partition.consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(header));
+        });
+        partition
+            .append_repaired_send_messages(second)
+            .await
+            .unwrap();
+        partition.consensus.advance_commit_max(header.op);
+
+        persistence.request_checkpoint();
+        partition.commit_journal(&config).await;
+        assert!(partition.fatal().is_none());
+        assert_eq!(
+            partition.consensus.commit_min(),
+            header.op - 1,
+            "a due checkpoint must hold commits at the written head"
+        );
+        assert_eq!(replies.borrow().len(), 1);
+
+        partition.checkpoint_persistence(&config).await;
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none());
+        assert!(partition.persistence_checkpoint_pending());
+        partition.commit_journal(&config).await;
+        assert_eq!(
+            partition.consensus.commit_min(),
+            header.op,
+            "a pending checkpoint must let commits pass the writer"
+        );
+        assert_eq!(replies.borrow().len(), 2);
+
+        Rc::clone(&persistence).run().await;
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none());
+        assert_eq!(persistence.checkpoint_op(), header.op - 1);
+        assert_eq!(partition.log.journal().inner.resident_count(), 0);
+    }
+
+    /// A dispatched checkpoint covers `commit_min`, which may lead the writer.
+    /// It flushes every body through that op first, so it waits for the writer.
+    #[compio::test]
+    async fn a_dispatched_checkpoint_waits_for_the_writer_before_covering_a_body() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, replies, config, parent) =
+            partition_with_committed_send(root.path(), iggy_common::Durability::Replicated, 3)
+                .await;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let second = checksummed_segment_prepare(2, parent, 1, b"second");
+        let header = *second.header();
+        persistence
+            .append(second.clone().into_frozen(), false)
+            .unwrap();
+        // Hold the writer so that the second body stays unwritten.
+        assert!(persistence.start());
+        partition.consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(header));
+        });
+        partition
+            .append_repaired_send_messages(second)
+            .await
+            .unwrap();
+        partition.consensus.advance_commit_max(header.op);
+        partition.commit_journal(&config).await;
+        assert_eq!(partition.consensus.commit_min(), header.op);
+        assert_eq!(replies.borrow().len(), 2);
+
+        persistence.request_checkpoint();
+        partition.checkpoint_persistence(&config).await;
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none());
+        assert!(
+            !partition.persistence_checkpoint_pending(),
+            "a checkpoint must not cover an unwritten body"
+        );
+        assert_eq!(partition.log.journal().inner.resident_count(), 1);
+
+        Rc::clone(&persistence).run().await;
+        settle_partition_io(&mut partition, &config).await;
+        persistence.drain().await.unwrap();
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none());
+        assert_eq!(partition.log.journal().inner.resident_count(), 0);
+        assert_eq!(persistence.checkpoint_op(), header.op);
+    }
+
     #[compio::test]
     async fn committed_offset_writes_wait_out_a_pending_checkpoint() {
         const CLIENT: u128 = 42;
