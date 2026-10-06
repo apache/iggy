@@ -73,7 +73,9 @@ const RETRY_CHECKPOINT_PREFIX: &str = "receipts-";
 const RETRY_CHECKPOINT_SUFFIX: &str = ".checkpoint";
 const RETRY_CHECKPOINT_TEMP_SUFFIX: &str = ".checkpoint.tmp";
 const RETRY_CHECKPOINT_BYTES_MAX: usize = journal::partition_journal::PREPARE_BYTES_MAX
-    + ConsumerKind::COUNT * CONSUMER_OFFSETS_ENTRIES_MAX as usize * (size_of::<u32>() + size_of::<u64>())
+    + ConsumerKind::COUNT
+        * CONSUMER_OFFSETS_ENTRIES_MAX as usize
+        * (size_of::<u32>() + size_of::<u64>())
     + CLIENTS_TABLE_SLOT_MAX * (DEDUP_ENTRY_LEN + PARTITION_RECEIPT_BYTES_MAX)
     + size_of::<PrepareHeader>();
 
@@ -975,18 +977,14 @@ mod tests {
             );
         }
         assert_eq!(
-            CONSUMER_OFFSETS_VERSION,
-            4,
+            CONSUMER_OFFSETS_VERSION, 4,
             "a consumer-offsets version moved; confirm its layout moved with it"
         );
     }
 
-    /// `server-0.9.0` writes version 1 with this layout. Decoding it has to give
-    /// the same table, and a table with no external group offset has to encode
-    /// to the same bytes, or every partition transfer between the two releases
-    /// fails during a rolling upgrade.
+    /// Legacy artifacts omit session-qualified receipts and cannot restore retry protection.
     #[test]
-    fn given_server_0_9_0_artifact_when_decoded_and_encoded_again_should_match_it() {
+    fn given_server_0_9_0_artifact_when_decoded_should_reject() {
         let wire = ConsumerOffsetsWire {
             prepare_checksum: Some(u128::MAX - 7),
             checkpoint_prepare: vec![1, 2, 3],
@@ -1022,8 +1020,10 @@ mod tests {
         let trailer = state_artifact_checksum(&released);
         released.extend_from_slice(&trailer.to_le_bytes());
 
-        assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(wire.clone()));
-        assert_eq!(wire.encode(), released);
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&released),
+            Err(ConsumerOffsetsWireError::UnsupportedVersion { version: 1 })
+        );
     }
 
     #[test]

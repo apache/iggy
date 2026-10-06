@@ -11218,12 +11218,7 @@ mod tests {
             std::fs::create_dir_all(&directory).unwrap();
             let mut partition = partition_at_view(0, 0);
             partition.set_partition_dir(directory.to_string_lossy().into_owned());
-            let consumers = directory.join("offsets/consumers");
-            let groups = directory.join("offsets/groups");
-            std::fs::create_dir_all(&consumers).unwrap();
-            std::fs::create_dir_all(&groups).unwrap();
-            partition.consumer_offsets_path = Some(consumers.to_string_lossy().into_owned());
-            partition.consumer_group_offsets_path = Some(groups.to_string_lossy().into_owned());
+            set_offset_dirs_under(&mut partition, &directory);
             partition.runtime_options.durability = iggy_common::Durability::Persisted;
             partition.open_persistence().await.unwrap();
             partition.log.retire_front().unwrap();
@@ -11293,6 +11288,7 @@ mod tests {
                     next_offset: 2,
                     consumers: Vec::new(),
                     groups: Vec::new(),
+                    external_groups: Vec::new(),
                     dedup: partition.dedup.watermarks_sorted(),
                 };
                 partition
@@ -13763,6 +13759,7 @@ mod tests {
                 .into_owned(),
         );
         let wire = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: partition.dedup().capacity(),
             purge_generation: 1,
             external_groups: vec![(8, 0), (9, 1 << 40)],
             ..Default::default()
@@ -13989,6 +13986,10 @@ mod tests {
         origin.consensus().sequencer().set_sequence(1);
         origin.consensus().advance_commit_max(1);
         origin.consensus().advance_commit_min(1);
+        origin
+            .dedup_mut()
+            .commit_capacity(consensus::CLIENTS_TABLE_MAX)
+            .unwrap();
         let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
         let (mut receiver, _) = recording_partition_at(1, 3);
         receiver.set_partition_dir(receiver_directory.path().to_string_lossy().into_owned());
@@ -14033,7 +14034,10 @@ mod tests {
         let offset_file = directory.path().join("offsets/external_groups/7");
         assert!(offset_file.exists());
 
-        let nothing = crate::state_transfer::ConsumerOffsetsWire::default();
+        let nothing = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: receiver.dedup().capacity(),
+            ..Default::default()
+        };
         let refused = receiver
             .install_state_transfer(&repair_config(), 5, Vec::new(), &nothing.encode(), 0)
             .await;
@@ -14054,7 +14058,7 @@ mod tests {
 
         let purged = crate::state_transfer::ConsumerOffsetsWire {
             purge_generation: 1,
-            ..crate::state_transfer::ConsumerOffsetsWire::default()
+            ..nothing
         };
         receiver
             .install_state_transfer(&repair_config(), 5, Vec::new(), &purged.encode(), 1)
@@ -15614,7 +15618,8 @@ mod tests {
     async fn given_full_offset_table_when_storing_new_id_should_reject_before_replication() {
         let (mut partition, sent_to_clients) = recording_partition();
         let directory = tempfile::tempdir().unwrap();
-        partition.consumer_offsets_path = Some(directory.path().to_string_lossy().into_owned());
+        partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] =
+            Some(directory.path().to_string_lossy().into_owned());
         partition.set_consumer_offsets_max(1);
         partition.stats.increment_messages_count(1);
 
@@ -15657,7 +15662,8 @@ mod tests {
     async fn given_full_offset_table_when_updating_existing_id_should_succeed() {
         let (mut partition, _) = recording_partition();
         let directory = tempfile::tempdir().unwrap();
-        partition.consumer_offsets_path = Some(directory.path().to_string_lossy().into_owned());
+        partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] =
+            Some(directory.path().to_string_lossy().into_owned());
         partition.set_consumer_offsets_max(1);
         partition.stats.increment_messages_count(1);
         for request_id in 1..=2 {
@@ -15688,7 +15694,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, replies) = recording_partition();
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-        partition.consumer_offsets_path = Some(
+        partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] = Some(
             directory
                 .path()
                 .join("consumers")
@@ -18387,7 +18393,10 @@ mod tests {
         partition.unrecorded_purge_generation = Some(1);
         partition.purge_deferred = true;
 
-        let offer = crate::state_transfer::ConsumerOffsetsWire::default();
+        let offer = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: partition.dedup().capacity(),
+            ..Default::default()
+        };
         partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &offer.encode(), 1)
             .await
