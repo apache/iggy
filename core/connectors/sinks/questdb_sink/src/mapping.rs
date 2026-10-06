@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use iggy_connector_sdk::{ConsumedMessage, Payload};
-use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
+use questdb::ingress::{Buffer, ColumnName, TimestampMicros, TimestampNanos};
 use simd_json::OwnedValue;
 use simd_json::prelude::{ValueAsArray, ValueAsObject};
 use simd_json::value::StaticNode;
@@ -75,23 +75,35 @@ impl TimestampUnit {
         }
     }
 
-    fn to_nanos(self, value: i64) -> i64 {
+    /// `None` when the value cannot be expressed in nanoseconds, which for
+    /// `Auto` also catches a magnitude that was bucketed as a coarser unit than
+    /// it really is: multiplying it up overflows rather than quietly saturating
+    /// to a timestamp centuries away.
+    fn to_nanos(self, value: i64) -> Option<i64> {
         match self {
-            Self::Seconds => value.saturating_mul(1_000_000_000),
-            Self::Millis => value.saturating_mul(1_000_000),
-            Self::Micros => value.saturating_mul(1_000),
-            Self::Nanos => value,
-            // Thresholds are the epoch value of roughly 2001 in each unit, so a
-            // present-day timestamp lands in exactly one bucket.
-            Self::Auto => match value.abs() {
+            Self::Seconds => value.checked_mul(1_000_000_000),
+            Self::Millis => value.checked_mul(1_000_000),
+            Self::Micros => value.checked_mul(1_000),
+            Self::Nanos => Some(value),
+            // Each threshold is the point above which a value cannot be the
+            // smaller unit any more: 1e11 seconds is far past any plausible
+            // date, so such a value is milliseconds, and so on. `unsigned_abs`
+            // rather than `abs` because `i64::MIN` has no positive counterpart.
+            Self::Auto => match value.unsigned_abs() {
                 0..=99_999_999_999 => Self::Seconds.to_nanos(value),
                 100_000_000_000..=99_999_999_999_999 => Self::Millis.to_nanos(value),
                 100_000_000_000_000..=99_999_999_999_999_999 => Self::Micros.to_nanos(value),
-                _ => value,
+                _ => Some(value),
             },
         }
     }
 }
+
+/// QuestDB's column-name limit. The client enforces it on the buffer from the
+/// server's `cairo.max.file.name.length`, whose default this matches; a server
+/// configured lower will refuse a name this accepts, which the caller recovers
+/// from as an ordinary rejection.
+const MAX_COLUMN_NAME_LEN: usize = 127;
 
 /// A message that could not be turned into a row. The batch continues; the
 /// caller counts and logs these.
@@ -137,26 +149,172 @@ pub struct RowContext<'a> {
 }
 
 impl Mapping {
-    /// Appends one row. On `Err` the buffer is rewound to the row boundary, so
-    /// a rejected message never leaves a half-written row behind.
+    /// Appends one row.
+    ///
+    /// The message is validated in full before the first write, so a rejected
+    /// message is skipped without ever having touched the buffer. Rolling a
+    /// half-written row back instead would mean a marker per row, and on the
+    /// QWP/WebSocket path setting a marker clones every table buffered so far,
+    /// which makes building a batch quadratic in its length.
     pub fn append_row(
         &self,
         buffer: &mut Buffer,
         message: &ConsumedMessage,
         context: RowContext<'_>,
     ) -> Result<(), RowError> {
-        buffer.set_marker()?;
-        match self.append_row_inner(buffer, message, context) {
-            Ok(()) => {
-                buffer.clear_marker();
-                Ok(())
+        self.validate_row(message)?;
+        self.append_row_inner(buffer, message, context)
+    }
+
+    /// Rejects every record the write path would refuse, on the same terms, so
+    /// that `append_row_inner` can only fail on a client error. Keep the two in
+    /// step: a check that exists only in the write path can abandon a partial
+    /// row.
+    fn validate_row(&self, message: &ConsumedMessage) -> Result<(), RowError> {
+        let fields = self.payload_object(message)?;
+
+        // QuestDB resolves column names case-insensitively, so two fields that
+        // differ only in case are one column and the second value would be
+        // dropped without a word. The reserved set is the names this connector
+        // writes itself, which would collide the same way.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut columns = 0usize;
+        for reserved in self.reserved_columns() {
+            seen.insert(reserved.to_ascii_lowercase());
+            columns += 1;
+        }
+
+        match fields {
+            Some(fields) => {
+                for (name, value) in fields {
+                    if self.is_timestamp_field(name) {
+                        continue;
+                    }
+                    if self.symbol_columns.contains(name.as_str()) {
+                        // A symbol has to be scalar. Dropping a structured
+                        // value silently would also mean that listing a field
+                        // in `symbol_columns` quietly discards data the default
+                        // path would have kept as JSON text.
+                        if !is_symbol_scalar(value) {
+                            if matches!(value, OwnedValue::Static(StaticNode::Null)) {
+                                continue;
+                            }
+                            return Err(RowError::Invalid(format!(
+                                "column {name} is listed in symbol_columns but its value is not a scalar"
+                            )));
+                        }
+                        self.claim_column(name.as_str(), &mut seen, &mut columns)?;
+                        continue;
+                    }
+                    if matches!(value, OwnedValue::Static(StaticNode::Null)) {
+                        // Encoded by omitting the column, so it claims nothing.
+                        continue;
+                    }
+                    self.claim_column(name.as_str(), &mut seen, &mut columns)?;
+                    self.validate_column(name.as_str(), value)?;
+                }
             }
-            Err(error) => {
-                // Best effort: if the rewind itself fails the buffer is
-                // unusable and the flush will surface it.
-                let _ = buffer.rewind_to_marker();
-                Err(error)
+            None => {
+                self.validate_payload_text(message)?;
+                columns += 1;
             }
+        }
+
+        if self.include_headers
+            && let Some(headers) = message.headers.as_ref()
+        {
+            for key in headers.keys() {
+                let column = format!("header_{}", key.to_string_value());
+                self.claim_column(&column, &mut seen, &mut columns)?;
+            }
+        }
+
+        // Every QuestDB row needs at least one symbol or column before its
+        // designated timestamp; `at` is refused otherwise.
+        if columns == 0 {
+            return Err(RowError::Invalid(
+                "row would have no columns, so QuestDB cannot accept it".to_owned(),
+            ));
+        }
+
+        self.validate_timestamp(fields)
+    }
+
+    /// Column names this connector emits itself for every row.
+    fn reserved_columns(&self) -> impl Iterator<Item = &'static str> {
+        [
+            ("stream", self.include_stream_column),
+            ("topic", self.include_topic_column),
+            ("partition_id", self.include_partition_column),
+            ("offset", self.include_offset_column),
+        ]
+        .into_iter()
+        .filter_map(|(name, included)| included.then_some(name))
+    }
+
+    /// Records that `name` will occupy a column, rejecting a case-insensitive
+    /// collision with one already claimed.
+    fn claim_column(
+        &self,
+        name: &str,
+        seen: &mut HashSet<String>,
+        columns: &mut usize,
+    ) -> Result<(), RowError> {
+        validate_name(name)?;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(RowError::Invalid(format!(
+                "column {name} collides with another column of this row; QuestDB matches column names case-insensitively"
+            )));
+        }
+        *columns += 1;
+        Ok(())
+    }
+
+    fn validate_column(&self, name: &str, value: &OwnedValue) -> Result<(), RowError> {
+        // A null is encoded by omitting the column, so the name is never used.
+        if matches!(value, OwnedValue::Static(StaticNode::Null)) {
+            return Ok(());
+        }
+        validate_name(name)?;
+        match value {
+            OwnedValue::String(text) if self.uuid_columns.contains(name) => parse_uuid(text)
+                .map(|_| ())
+                .ok_or_else(|| RowError::Invalid(format!("column {name} is not a valid UUID"))),
+            OwnedValue::Array(items) => validate_array(name, items),
+            OwnedValue::Object(_) => simd_json::to_string(value)
+                .map(|_| ())
+                .map_err(|_| RowError::Invalid(format!("column {name} is not serializable"))),
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_timestamp(
+        &self,
+        fields: Option<&simd_json::owned::Object>,
+    ) -> Result<(), RowError> {
+        if self.timestamp_source != TimestampSource::Payload {
+            return Ok(());
+        }
+        let field = self
+            .timestamp_field
+            .as_deref()
+            .ok_or_else(|| RowError::Invalid("timestamp_field is not set".to_owned()))?;
+        let raw = fields
+            .and_then(|fields| fields.get(field))
+            .ok_or_else(|| RowError::Invalid(format!("timestamp field {field} is missing")))?;
+        let number = timestamp_number(raw)
+            .ok_or_else(|| RowError::Invalid(format!("timestamp field {field} is not a number")))?;
+        // The designated timestamp is refused below zero, and the conversion to
+        // nanoseconds has to happen here for the sign to be the one the buffer
+        // will see.
+        match self.timestamp_unit.to_nanos(number) {
+            None => Err(RowError::Invalid(format!(
+                "timestamp field {field} is out of range for its unit"
+            ))),
+            Some(nanos) if nanos < 0 => Err(RowError::Invalid(format!(
+                "timestamp field {field} is before the Unix epoch"
+            ))),
+            Some(_) => Ok(()),
         }
     }
 
@@ -237,6 +395,21 @@ impl Mapping {
                 .map(Some)
                 .ok_or_else(|| RowError::Invalid("JSON payload is not an object".to_owned())),
             _ => Ok(None),
+        }
+    }
+
+    /// The same check [`Self::payload_text`] performs, without building the
+    /// string it would return. A `String` payload is UTF-8 by construction, so
+    /// those variants need no check at all.
+    fn validate_payload_text(&self, message: &ConsumedMessage) -> Result<(), RowError> {
+        match &message.payload {
+            Payload::Text(_) | Payload::Proto(_) => Ok(()),
+            Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
+                std::str::from_utf8(bytes)
+                    .map(|_| ())
+                    .map_err(|_| RowError::Invalid("payload is not valid UTF-8".to_owned()))
+            }
+            Payload::Json(_) => Ok(()),
         }
     }
 
@@ -343,7 +516,12 @@ impl Mapping {
                 let number = timestamp_number(raw).ok_or_else(|| {
                     RowError::Invalid(format!("timestamp field {field} is not a number"))
                 })?;
-                buffer.at(TimestampNanos::new(self.timestamp_unit.to_nanos(number)))?;
+                let nanos = self.timestamp_unit.to_nanos(number).ok_or_else(|| {
+                    RowError::Invalid(format!(
+                        "timestamp field {field} is out of range for its unit"
+                    ))
+                })?;
+                buffer.at(TimestampNanos::new(nanos))?;
             }
         }
         Ok(())
@@ -369,6 +547,18 @@ fn timestamp_number(value: &OwnedValue) -> Option<i64> {
     }
 }
 
+/// Whether `value` is something [`scalar_to_symbol`] would render, without
+/// rendering it. Validation only needs the answer, and this runs per symbol
+/// field per row.
+fn is_symbol_scalar(value: &OwnedValue) -> bool {
+    matches!(
+        value,
+        OwnedValue::Static(
+            StaticNode::Bool(_) | StaticNode::I64(_) | StaticNode::U64(_) | StaticNode::F64(_)
+        ) | OwnedValue::String(_)
+    )
+}
+
 fn scalar_to_symbol(value: &OwnedValue) -> Option<String> {
     match value {
         OwnedValue::Static(StaticNode::Null) => None,
@@ -378,6 +568,68 @@ fn scalar_to_symbol(value: &OwnedValue) -> Option<String> {
         OwnedValue::Static(StaticNode::F64(number)) => Some(number.to_string()),
         OwnedValue::String(text) => Some(text.clone()),
         _ => None,
+    }
+}
+
+/// Defers to the client's own character rule so the two cannot drift, and adds
+/// the length limit, which `ColumnName` does not carry: it lives on the buffer,
+/// so without this an over-long name is only refused once the row is half
+/// written.
+fn validate_name(name: &str) -> Result<(), RowError> {
+    if name.len() > MAX_COLUMN_NAME_LEN {
+        return Err(RowError::Invalid(format!(
+            "column {name} is longer than the {MAX_COLUMN_NAME_LEN} characters QuestDB allows"
+        )));
+    }
+    ColumnName::new(name)
+        .map(|_| ())
+        .map_err(|error| RowError::Invalid(format!("column {name} is not a valid name: {error}")))
+}
+
+/// Mirrors the shape checks in [`append_array`] without writing anything.
+fn validate_array(name: &str, items: &[OwnedValue]) -> Result<(), RowError> {
+    let not_numeric = || RowError::Invalid(format!("column {name} is not a numeric array"));
+    // QuestDB arrays are rectangular: every sibling must have the same length,
+    // or the client refuses the whole frame.
+    let ragged = || RowError::Invalid(format!("column {name} is not a rectangular array"));
+    match array_depth(items) {
+        1 => flat_array(items).map(|_| ()).ok_or_else(not_numeric),
+        2 => {
+            let mut width = None;
+            for item in items {
+                let values = item
+                    .as_array()
+                    .and_then(|values| flat_array(values))
+                    .ok_or_else(not_numeric)?;
+                if *width.get_or_insert(values.len()) != values.len() {
+                    return Err(ragged());
+                }
+            }
+            Ok(())
+        }
+        3 => {
+            let mut rows = None;
+            let mut width = None;
+            for item in items {
+                let outer = item.as_array().ok_or_else(not_numeric)?;
+                if *rows.get_or_insert(outer.len()) != outer.len() {
+                    return Err(ragged());
+                }
+                for nested in outer {
+                    let values = nested
+                        .as_array()
+                        .and_then(|values| flat_array(values))
+                        .ok_or_else(not_numeric)?;
+                    if *width.get_or_insert(values.len()) != values.len() {
+                        return Err(ragged());
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(RowError::Invalid(format!(
+            "column {name} exceeds the supported array nesting depth of 3"
+        ))),
     }
 }
 
@@ -405,10 +657,10 @@ fn append_array(buffer: &mut Buffer, name: &str, items: &[OwnedValue]) -> Result
         3 => {
             let mut cubes = Vec::with_capacity(items.len());
             for item in items {
-                let mut rows = Vec::new();
                 let outer = item.as_array().ok_or_else(|| {
                     RowError::Invalid(format!("column {name} is not a numeric array"))
                 })?;
+                let mut rows = Vec::with_capacity(outer.len());
                 for nested in outer {
                     let values = nested.as_array().and_then(|values| flat_array(values));
                     rows.push(values.ok_or_else(|| {
@@ -492,12 +744,20 @@ mod tests {
 
     use super::*;
 
-    /// `Buffer::new` yields an ILP buffer, which is what makes these tests
-    /// possible: ILP is inspectable through `as_bytes`, so the exact wire
-    /// output can be asserted. The `Buffer` API, the symbol-before-column
-    /// state machine and the marker/rewind path are shared with QWP. Only
-    /// `column_uuid` and typed arrays are QWP-only, so those are covered by
-    /// the integration suite instead.
+    /// The buffer production actually writes into. Prefer it for anything that
+    /// could depend on columnar behaviour: it pins one type per column for the
+    /// buffer's lifetime, resolves names case-insensitively and silently keeps
+    /// the first write when a column is repeated in a row. The ILP buffer has
+    /// none of those rules, so a test that needs them cannot use `buffer()`.
+    fn qwp_buffer() -> Buffer {
+        Buffer::qwp_ws_with_max_name_len(MAX_COLUMN_NAME_LEN)
+    }
+
+    /// `Buffer::new` yields an ILP buffer, which is what makes the rendering
+    /// assertions possible: ILP is inspectable through `as_bytes`, so the exact
+    /// wire output can be asserted, while the QWP buffer exposes nothing. Use it
+    /// only where the assertion is about what was written rather than about
+    /// columnar rules, and see `qwp_buffer` for the rest.
     /// V1 is the all-text InfluxDB-compatible encoding. V2 and V3 write
     /// doubles as binary, which would make `as_bytes` unreadable here.
     fn buffer() -> Buffer {
@@ -704,10 +964,10 @@ mod tests {
     }
 
     #[test]
-    fn given_mid_row_failure_when_appending_should_rewind_and_keep_batch_usable() {
-        // The bad UUID is reached only after the table, a symbol and a column
-        // are already encoded, so this exercises the rewind rather than an
-        // up-front rejection.
+    fn given_mid_row_failure_when_appending_should_leave_the_buffer_untouched() {
+        // The bad UUID sits after fields that would already have been encoded,
+        // so this pins the guarantee that validation runs before any write
+        // rather than being rolled back afterwards.
         let mut mapping = mapping();
         mapping.symbol_columns.insert("side".to_owned());
         mapping.uuid_columns.insert("trade_id".to_owned());
@@ -733,7 +993,7 @@ mod tests {
         assert_eq!(
             rendered(&buffer),
             after_good,
-            "rejected row must be rewound exactly"
+            "rejected row must not reach the buffer"
         );
 
         // The buffer is still usable for the next record.
@@ -745,6 +1005,212 @@ mod tests {
             )
             .unwrap();
         assert_eq!(buffer.row_count(), 2);
+    }
+
+    #[test]
+    fn given_field_name_the_client_rejects_when_appending_should_reject_the_row() {
+        // A dot is illegal in a column name. Validating names up front turns
+        // what the client would raise mid-row into an ordinary row rejection,
+        // so the rest of the batch still flushes.
+        let mapping = mapping();
+        let mut buffer = buffer();
+
+        let error = mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"price.usd":1.0}"#),
+                context(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+        assert_eq!(buffer.row_count(), 0);
+
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"price":2.0}"#), context())
+            .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    /// Each of these reached the QuestDB client as a write-time failure before
+    /// validation covered it, and a client failure costs the batch a rebuild
+    /// rather than just the row. They are grouped so a regression in any one of
+    /// them is visible as a change of error kind, not only of message.
+    #[test]
+    fn given_inputs_the_client_would_refuse_when_appending_should_reject_the_row() {
+        let long_name = "a".repeat(MAX_COLUMN_NAME_LEN + 1);
+        let cases: &[(&str, Mapping, String)] = &[
+            (
+                "name longer than the column limit",
+                mapping(),
+                format!(r#"{{"{long_name}":1}}"#),
+            ),
+            (
+                "array rows of differing length",
+                mapping(),
+                r#"{"m":[[1,2],[3]]}"#.to_owned(),
+            ),
+            (
+                "array planes of differing length",
+                mapping(),
+                r#"{"m":[[[1,2]],[[3,4],[5,6]]]}"#.to_owned(),
+            ),
+        ];
+
+        for (label, mapping, payload) in cases {
+            let mut buffer = qwp_buffer();
+            let error = mapping
+                .append_row(&mut buffer, &json_message(payload), context())
+                .unwrap_err();
+            assert!(
+                matches!(error, RowError::Invalid(_)),
+                "{label} should be an up-front rejection, got {error:?}"
+            );
+            assert_eq!(buffer.row_count(), 0, "{label} must not write a row");
+        }
+    }
+
+    #[test]
+    fn given_payload_timestamp_out_of_range_when_appending_should_reject_the_row() {
+        let mut mapping = mapping();
+        mapping.timestamp_source = TimestampSource::Payload;
+        mapping.timestamp_field = Some("ts".to_owned());
+
+        // Negative, and the extreme that used to panic in `abs`.
+        for payload in [
+            r#"{"ts":-1,"price":1.0}"#,
+            r#"{"ts":-9223372036854775808,"price":1.0}"#,
+        ] {
+            let error = mapping
+                .append_row(&mut qwp_buffer(), &json_message(payload), context())
+                .unwrap_err();
+            assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+        }
+
+        // 1972 in milliseconds looks like seconds, and scaling it up overflows.
+        // Reported rather than saturated to a date centuries away.
+        let error = mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"ts":63072000000,"price":1.0}"#),
+                context(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn given_column_name_collision_when_appending_should_reject_the_row() {
+        // QuestDB matches column names case-insensitively, so each of these is
+        // one column receiving two values. The client keeps the first and
+        // discards the second without reporting it.
+        let with_stream_column = || {
+            let mut mapping = mapping();
+            mapping.include_stream_column = true;
+            mapping
+        };
+        let against_the_stream_symbol = || {
+            let mut mapping = with_stream_column();
+            mapping.symbol_columns.insert("stream".to_owned());
+            mapping
+        };
+
+        let cases: &[(&str, Mapping, &str)] = &[
+            (
+                "payload field against the stream column",
+                with_stream_column(),
+                r#"{"stream":"web","price":1.0}"#,
+            ),
+            (
+                "payload field against the stream symbol",
+                against_the_stream_symbol(),
+                r#"{"stream":"web"}"#,
+            ),
+            (
+                "two fields differing only in case",
+                with_stream_column(),
+                r#"{"Price":1.0,"price":2.0}"#,
+            ),
+        ];
+
+        for (label, mapping, payload) in cases {
+            let error = mapping
+                .append_row(&mut qwp_buffer(), &json_message(payload), context())
+                .unwrap_err();
+            assert!(
+                matches!(error, RowError::Invalid(_)),
+                "{label} should be rejected rather than silently deduped, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_non_scalar_in_a_symbol_column_when_appending_should_reject_the_row() {
+        // Without this the value is dropped and the row still counts as written,
+        // so declaring a field as a symbol would quietly discard data the
+        // default path keeps as JSON text.
+        let mut mapping = mapping();
+        mapping.symbol_columns.insert("region".to_owned());
+
+        for payload in [
+            r#"{"region":{"code":"eu"},"price":1.0}"#,
+            r#"{"region":["eu","west"],"price":1.0}"#,
+        ] {
+            let error = mapping
+                .append_row(&mut qwp_buffer(), &json_message(payload), context())
+                .unwrap_err();
+            assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+        }
+
+        // A null symbol stays an omission rather than becoming a rejection.
+        mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"region":null,"price":1.0}"#),
+                context(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn given_row_with_no_columns_when_appending_should_reject_the_row() {
+        // Every QuestDB row needs a column before its designated timestamp.
+        let mut mapping = mapping();
+        mapping.include_stream_column = false;
+        mapping.include_topic_column = false;
+        mapping.timestamp_source = TimestampSource::Payload;
+        mapping.timestamp_field = Some("ts".to_owned());
+
+        let error = mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"ts":1700000000}"#),
+                context(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn given_ordinary_rows_when_appending_to_the_production_buffer_should_succeed() {
+        // The guard for the checks above: they must not reject valid rows.
+        let mut mapping = mapping();
+        mapping.symbol_columns.insert("region".to_owned());
+        mapping.include_stream_column = true;
+        mapping.include_topic_column = true;
+
+        for payload in [
+            r#"{"region":"eu","price":1.0}"#,
+            r#"{"price":1.0,"missing":null}"#,
+            r#"{"m":[[1,2],[3,4]]}"#,
+            r#"{"nested":{"a":1},"price":2.0}"#,
+        ] {
+            let mut buffer = qwp_buffer();
+            mapping
+                .append_row(&mut buffer, &json_message(payload), context())
+                .unwrap_or_else(|error| panic!("{payload} was rejected: {error:?}"));
+            assert_eq!(buffer.row_count(), 1, "{payload} did not write a row");
+        }
     }
 
     #[test]
@@ -769,6 +1235,30 @@ mod tests {
             "{}",
             rendered(&buffer)
         );
+    }
+
+    #[test]
+    fn given_structureless_payload_with_bad_header_name_when_appending_should_reject_the_row() {
+        // Headers are written for structureless payloads too, so validation
+        // has to reach them on that path as well as the field path.
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"unused":1}"#);
+        message.payload = Payload::Text("body".to_owned());
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::from_raw(HeaderKind::String, b"a.b").unwrap(),
+            HeaderValue::from_raw(HeaderKind::String, b"v").unwrap(),
+        );
+        message.headers = Some(headers);
+        let mut buffer = buffer();
+
+        let error = mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+        assert_eq!(buffer.row_count(), 0);
     }
 
     #[test]
@@ -879,18 +1369,37 @@ mod tests {
     fn given_auto_unit_when_converting_should_pick_bucket_by_magnitude() {
         // 2026-09-04T12:00:00Z in each unit maps to the same nanosecond value.
         let nanos = 1_788_523_200_000_000_000i64;
-        assert_eq!(TimestampUnit::Auto.to_nanos(1_788_523_200), nanos);
-        assert_eq!(TimestampUnit::Auto.to_nanos(1_788_523_200_000), nanos);
-        assert_eq!(TimestampUnit::Auto.to_nanos(1_788_523_200_000_000), nanos);
-        assert_eq!(TimestampUnit::Auto.to_nanos(nanos), nanos);
+        assert_eq!(TimestampUnit::Auto.to_nanos(1_788_523_200), Some(nanos));
+        assert_eq!(TimestampUnit::Auto.to_nanos(1_788_523_200_000), Some(nanos));
+        assert_eq!(
+            TimestampUnit::Auto.to_nanos(1_788_523_200_000_000),
+            Some(nanos)
+        );
+        assert_eq!(TimestampUnit::Auto.to_nanos(nanos), Some(nanos));
     }
 
     #[test]
     fn given_explicit_unit_when_converting_should_ignore_magnitude() {
-        assert_eq!(TimestampUnit::Seconds.to_nanos(1), 1_000_000_000);
-        assert_eq!(TimestampUnit::Millis.to_nanos(1), 1_000_000);
-        assert_eq!(TimestampUnit::Micros.to_nanos(1), 1_000);
-        assert_eq!(TimestampUnit::Nanos.to_nanos(1), 1);
+        assert_eq!(TimestampUnit::Seconds.to_nanos(1), Some(1_000_000_000));
+        assert_eq!(TimestampUnit::Millis.to_nanos(1), Some(1_000_000));
+        assert_eq!(TimestampUnit::Micros.to_nanos(1), Some(1_000));
+        assert_eq!(TimestampUnit::Nanos.to_nanos(1), Some(1));
+    }
+
+    #[test]
+    fn given_i64_min_when_converting_should_not_panic() {
+        // `abs` has no positive counterpart for `i64::MIN` and panics under
+        // overflow checks, so the bucket test uses `unsigned_abs`. The value
+        // falls through as nanoseconds and is refused later for being negative.
+        assert_eq!(TimestampUnit::Auto.to_nanos(i64::MIN), Some(i64::MIN));
+    }
+
+    #[test]
+    fn given_millis_below_the_seconds_threshold_when_auto_should_not_saturate() {
+        // 1972-01-01 in milliseconds is small enough to look like seconds.
+        // Multiplying it up overflows, which is reported rather than saturating
+        // to a timestamp centuries in the future.
+        assert_eq!(TimestampUnit::Auto.to_nanos(63_072_000_000), None);
     }
 
     #[test]
