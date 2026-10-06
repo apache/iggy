@@ -373,7 +373,12 @@ For a tiered topic the cleaner on the primary evaluates `leading_expired_end` an
 watermark advances. The reconciler's truncate enforcement handles remote segments (unlink marker and
 index, `retire_front`, decrement stats). On the primary it additionally deletes objects at or below
 the watermark, idempotently, bounded per pass (300) and per partition pending (5000), with one LIST
-per partition after restart to re-establish its cursor.
+per partition after restart to re-establish its cursor. Deletion is two-phase with a grace period:
+an object becomes deletable only `delete_grace` (60 s) after the watermark that retired it was
+committed, and no housekeeping job deletes any object younger than `delete_grace`, whatever the
+reason. The grace closes the window in which a cold poll that resolved a key just before the
+truncation would meet a 404, and it protects a freshly uploaded object whose floor command has not
+landed yet from every sweep.
 
 `PartitionStats.size_bytes` keeps meaning total retained bytes. Local bytes become a Prometheus
 gauge.
@@ -470,9 +475,11 @@ a 90 s deadline per segment.
   remote set changed, at most every 60 s. It is a derived artifact, never the source of truth for a
   live cluster; it exists so a partition can be restored into an empty cluster by reading one object
   and planting markers.
-- **Verify pass.** A housekeeping job HEADs every key below the floor and records misses per
-  partition. Missing objects above `deleted_up_to_offset` are data loss and are never repaired
-  automatically.
+- **Verify pass.** A housekeeping job HEADs every key below the floor, records misses per partition,
+  and compares the checksum recorded in each object's user metadata with the marker's
+  `log_checksum`, so a divergent or corrupted upload is reported as an anomaly instead of being
+  found by a reader. Missing or mismatched objects above `deleted_up_to_offset` are data loss and are
+  never repaired automatically.
 
 ### Configuration
 
@@ -490,6 +497,7 @@ fetch_bandwidth = "unlimited"        # per node, divided across shards
 connection_idle_timeout = "5 s"
 delete_batch_per_pass = 300
 delete_pending_per_partition = 5000
+delete_grace = "60 s"                # no object is deleted sooner than this after it became deletable
 default_local_retention_age = "1 d"
 default_local_retention_size = "unlimited"
 
@@ -565,7 +573,7 @@ Topic options:
 
 | Failure | Behaviour |
 | --- | --- |
-| Store unreachable during upload | Retry with backoff; floor stays; eviction waits; producers and consumers unaffected; stalled gauge rises. |
+| Store unreachable during upload | Retry with backoff; floor stays; eviction waits; producers and consumers unaffected; stalled gauge rises. Local data overshoots the local envelope until the store returns, and the overshoot is reported as a gauge; the only hard limit is the disk. |
 | Store unreachable during a cold poll | Transient reply after `fetch_timeout`; SDK retries; warm data keeps serving. |
 | Primary dies mid-upload | New primary re-uploads; identical bytes and conditional PUT make it idempotent. |
 | Crash between marker write and `.log` unlink | Boot sees both; treats the segment as local; eviction resumes without re-upload. |
@@ -602,7 +610,10 @@ Each phase is one reviewable PR or a short stack, in dependency order.
    housekeeping with primary object deletion and the orphan sweep, the download token bucket, the
    `REMOTE_CHAIN` artifact. Integration scenarios under `--features vsr`.
 5. **Upload age bound and the bucket as an archive.** The replicated time roll, lazy manifests under
-   `meta/`, shallow restore, the verify pass, GCS and Azure providers.
+   `meta/`, shallow restore, the verify pass, GCS and Azure providers. Anything that watches
+   manifests, restore included, detects change by ETag: one LIST of a `meta/` prefix returns the
+   ETag of every partition manifest under it (1000 keys per page), and a conditional GET with
+   `If-None-Match` costs a 304 when nothing changed.
 6. **Later.** Adjacent-segment merger, read-replica topics, stats wire fields, CLI and Web UI
    visibility, rehydration so tiering can be turned off, compression at upload with chunk framing,
    advisory local retention once a disk-space manager exists.
@@ -721,6 +732,15 @@ not exist.
   scheduling groups.
 - **Apache Kafka KIP-405** tiered storage and **Apache Pulsar** ledger offload: the same shape as
   this RFC, whole sealed units copied to per-partition objects with an index object beside them.
+- **Rivet's SQLite storage engine** (July 2026) and its cold-tier code: a replicated hot tier with
+  commits in low milliseconds, S3 never on the write path, 256 KiB chunks offloaded after 7 idle days
+  and rehydrated on a miss, the cold tier doubling as the backup. Its cold tier used immutable keys
+  carrying a content hash, kept leases and watermarks in the metadata store rather than in S3, and
+  deleted in two phases with a grace period. Borrowed: the deletion grace period and the checksum
+  comparison in the verify pass. Its October 2026 broker replacement, per-node S3 logs with a
+  conditionally written head object and change detection by ETag from one LIST, supplies the ETag
+  polling used for manifests here; its listing cost grows with the square of the node count, which is
+  why LIST stays off every hot path in this RFC.
 - **KIP-1150 Diskless Topics** (accepted 2026-03-02) and Aiven's Inkless. KIP-1165 rejected merging
   shared WAL objects and converts diskless data into ordinary KIP-405 segments through a returned
   per-partition leader, which is the strongest external signal that per-partition segment objects
@@ -783,6 +803,12 @@ Open design decisions:
 - **Encryption of objects at rest.** Bucket-side encryption headers, encryption before upload with a
   cluster-owned key, or nothing documented. The choice decides whether the chunk cache holds
   plaintext and whether key rotation touches old objects.
+- **The segment checksum in the object key.** Keys are offset-only and rely on byte-identical
+  replicas plus the conditional PUT. Putting `log_checksum` into the key, as Rivet's cold tier does
+  with a content hash, turns a violation of the byte-identical invariant into two objects for one
+  offset, which the verify pass can detect, instead of a silent overwrite or a 412. The cost is that
+  an object can no longer be found by offset alone: a reader needs the marker or a LIST of the
+  offset prefix. The verify pass's checksum comparison covers most of the benefit without the cost.
 - Defaults to measure rather than argue: the chunk size (8 MiB here, 16 MiB in Redpanda),
   `readahead_max`, and the recommended `segment_size` for tiered topics, all against S3 in-region.
 - Whether backups may upload when the primary is stalled (this RFC says no; failover re-uploads
@@ -799,7 +825,8 @@ Out of scope for this RFC, addressable later independently of it:
 - Restore and mount: with the lazily uploaded manifest under `meta/`, restoring a partition into an
   empty cluster is a shallow recovery that plants markers and an empty active segment at
   `last_offset + 1`, with a topic manifest beside it carrying the topic's options.
-- Read-replica topics that re-read another cluster's manifest and serve it read-only.
+- Read-replica topics that follow another cluster's manifests and serve them read-only, polling by
+  ETag rather than downloading each manifest on an interval.
 - Adjacent-segment merging, required once the replicated time roll produces small segments.
 - Compression at rest and log compaction, both of which interact with uploaded objects and are
   tracked on the roadmap separately.
