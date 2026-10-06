@@ -122,8 +122,8 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
 ///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
 ///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
-///    client that has been shut down cannot reconnect. Note, if `auto-login` is configured, the client
-///    will reconnect automatically and undo the disconnect.
+///    client that has been shut down cannot reconnect. The disconnect holds until the next
+///    [`connect()`]: requests fail and nothing reconnects in the background, even with `auto-login`.
 ///
 /// # Examples
 ///
@@ -934,27 +934,24 @@ impl IggyClient {
 
 impl Drop for IggyClient {
     fn drop(&mut self) {
-        let heartbeat_handle = self
-            .heartbeat_handle
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(handle) = heartbeat_handle {
+        if let Some(handle) = self.take_heartbeat() {
             handle.abort();
         }
     }
 }
 
-#[async_trait]
-impl Client for IggyClient {
-    async fn connect(&self) -> Result<(), IggyError> {
-        let heartbeat_interval;
-        {
-            let client = self.client.read().await;
-            client.connect().await?;
-            heartbeat_interval = client.heartbeat_interval().await;
-        }
+impl IggyClient {
+    /// Connects again after a leader redirect without clearing the caller's
+    /// `disconnect()`: one that lands during the redirect holds, and the
+    /// transport refuses the reconnect.
+    pub(crate) async fn reconnect_after_redirect(&self) -> Result<(), IggyError> {
+        self.client.read().await.reconnect_keeping_intent().await?;
+        self.start_heartbeat().await;
+        Ok(())
+    }
 
+    async fn start_heartbeat(&self) {
+        let heartbeat_interval = self.client.read().await.heartbeat_interval().await;
         let mut heartbeat_handle = self
             .heartbeat_handle
             .lock()
@@ -963,7 +960,7 @@ impl Client for IggyClient {
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
         {
-            return Ok(());
+            return;
         }
 
         drop(heartbeat_handle.take());
@@ -990,10 +987,36 @@ impl Client for IggyClient {
                 sleep(heartbeat_interval.get_duration()).await
             }
         }));
+    }
+
+    fn take_heartbeat(&self) -> Option<JoinHandle<()>> {
+        self.heartbeat_handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+#[async_trait]
+impl Client for IggyClient {
+    async fn connect(&self) -> Result<(), IggyError> {
+        self.client.read().await.connect().await?;
+        self.start_heartbeat().await;
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // HTTP keeps no connection, so its disconnect changes nothing and the
+        // heartbeat keeps running.
+        let is_http = matches!(&*self.client.read().await, ClientWrapper::Http(_));
+        // A heartbeat ping on a disconnected client only logs errors, and on
+        // QUIC a redial it starts during the disconnect blocks the call. The
+        // aborted task is awaited, so a reconnect it owned is over before the
+        // transport tears down. `connect` starts the heartbeat again.
+        if !is_http && let Some(handle) = self.take_heartbeat() {
+            handle.abort();
+            let _ = handle.await;
+        }
         self.client.read().await.disconnect().await
     }
 

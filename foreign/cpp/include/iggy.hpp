@@ -3392,9 +3392,9 @@ class IggyBlockingClient final {
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
      *
-     * @note Disconnect() does not stop the existing heartbeat task. With
-     *       automatic login configured, a heartbeat may reconnect and
-     *       authenticate the client in the background.
+     * @note The disconnect holds until the next Connect(): requests fail and
+     *       nothing reconnects the client in the background, even with
+     *       automatic login configured.
      * @note The HTTP transport is stateless and treats this operation as a
      *       no-op.
      * @throws IggyException if the client cannot disconnect cleanly.

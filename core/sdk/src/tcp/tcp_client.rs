@@ -110,6 +110,11 @@ pub struct TcpClient {
     /// Set once a sign-in on this client has gone looking for the roster, so
     /// that read happens once (see [`TcpClient::learn_roster_once`]).
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Credentials a sign-in on this client succeeded with, so a reconnect --
     /// onto this node or, after a failover, another one -- can re-establish
     /// the session instead of surfacing `Unauthenticated`. Cleared on logout.
@@ -168,10 +173,12 @@ impl Default for TcpClient {
 #[async_trait]
 impl Client for TcpClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         TcpClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
         // An explicit disconnect is caller intent, like a logout: the session
         // it ends must not be resurrected by the next reconnect, so the
         // remembered sign-in goes with it. Involuntary drops (a dead socket,
@@ -225,6 +232,12 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if self.caller_disconnected() {
+            return Err(match self.get_state().await {
+                ClientState::Shutdown => IggyError::ClientShutdown,
+                _ => IggyError::NotConnected,
+            });
+        }
         if is_poll_routing_code(code) {
             return self.send_poll_request(code, payload).await;
         }
@@ -582,6 +595,7 @@ impl TcpClient {
             current_server_address: Mutex::new(server_address),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             configured_password: Mutex::new(None),
             configured_username: Mutex::new(None),
             session_credentials: Mutex::new(None),
@@ -593,7 +607,7 @@ impl TcpClient {
         })
     }
 
-    async fn connect(&self) -> Result<(), IggyError> {
+    pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         self.connect_with_settlement(false).await
     }
 
@@ -645,6 +659,10 @@ impl TcpClient {
                         trace!("Client is already connecting.");
                         return Ok(());
                     }
+                    _ if self.caller_disconnected() => {
+                        trace!("Cannot connect. The caller disconnected the client.");
+                        return Err(IggyError::NotConnected);
+                    }
                     _ => *state = ClientState::Connecting,
                 }
             }
@@ -688,8 +706,19 @@ impl TcpClient {
                     sleep(remaining.get_duration()).await;
                 }
 
+                if self.caller_disconnected() {
+                    self.fail_connect().await;
+                    return Err(IggyError::NotConnected);
+                }
+
                 info!("{NAME} client is connecting to server: {server_address}...");
                 match self.establish_bounded(&server_address, &candidates).await {
+                    // Dropped before it is installed: the caller disconnected
+                    // while it was being dialed.
+                    Ok(_) if self.caller_disconnected() => {
+                        self.fail_connect().await;
+                        return Err(IggyError::NotConnected);
+                    }
                     Ok(connection) => {
                         let dialed = server_address.clone();
                         // The endpoint that answered is where this client now
@@ -747,6 +776,11 @@ impl TcpClient {
                     continue;
                 }
                 candidate = 0;
+
+                if self.caller_disconnected() {
+                    self.fail_connect().await;
+                    return Err(IggyError::NotConnected);
+                }
 
                 // An unreadable CA file, a domain that will not parse: no
                 // endpoint answered and at least one said why in a way that a
@@ -1225,6 +1259,13 @@ impl TcpClient {
         self.publish_event(DiagnosticEvent::Disconnected).await;
     }
 
+    /// A reconnect sweep checks this before each dial, before each retry pause
+    /// and before it signs in: once the caller disconnects, nothing in the
+    /// sweep may bring the client back.
+    fn caller_disconnected(&self) -> bool {
+        self.disconnected_by_caller.load(Ordering::SeqCst)
+    }
+
     /// [`Self::establish`], bounded while other endpoints are queued behind
     /// this one (see `FAILOVER_DIAL_TIMEOUT`). The bound covers the handshake
     /// as well as the connect: a peer that accepts TCP and then never answers
@@ -1283,7 +1324,9 @@ impl TcpClient {
             // sweep is doing. Tearing it down under the sweep would re-mint the
             // client id the sign-in in flight is binding and take the stream it
             // just installed.
-            ClientState::Connecting => {
+            // A `Connecting` that no sweep owns, such as one left by an aborted
+            // heartbeat, is torn down like any other state.
+            ClientState::Connecting if self.connect_coordinator.is_active() => {
                 trace!("Not disconnecting; a connect is already in flight.");
                 return Ok(());
             }
@@ -1699,9 +1742,12 @@ fn tls_server_name(server_address: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::codes::{
+        GET_ME_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
+    };
     use iggy_binary_protocol::{Command, HEADER_SIZE, Operation, ReplyHeader};
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
@@ -2981,6 +3027,120 @@ mod tests {
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = TcpClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
+        );
+    }
+
+    fn auto_login_client(server_address: String) -> TcpClient {
+        TcpClient::create(Arc::new(TcpClientConfig {
+            server_address,
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "iggy".into(),
+            )),
+            reconnection: TcpClientReconnectionConfig {
+                enabled: true,
+                max_retries: None,
+                interval: NonZeroIggyDuration::from_str("50ms").expect("duration"),
+                // The sweep checks the disconnect between pauses, so a zero
+                // pause keeps this test about the check, not the pacing.
+                reestablish_after: IggyDuration::new(Duration::ZERO),
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client")
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_a_reconnect_sweep_ends_the_sweep() {
+        let (listener, address) = live_endpoint().await;
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // Accept, then hang up: every sign-in fails on the socket, so
+                // with unlimited retries the sweep only ends on a disconnect.
+                drop(stream);
+            }
+        });
+        let client = Arc::new(auto_login_client(address));
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { TcpClient::connect(&client).await }
+        });
+        while accepts.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        Client::disconnect(&*client).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), sweep)
+            .await
+            .expect("the sweep must end after the disconnect")
+            .expect("the sweep task must not panic");
+        let accepts_after_end = accepts.load(Ordering::SeqCst);
+        sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            matches!(result, Err(IggyError::NotConnected)),
+            "got {result:?}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            accepts_after_end,
+            "nothing may redial after the sweep ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_after_an_explicit_disconnect_fails_without_a_dial() {
+        let (listener, address) = live_endpoint().await;
+        let client = auto_login_client(address);
+        Client::disconnect(&client).await.unwrap();
+
+        let ping = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.send_raw_with_response(PING_CODE, Bytes::new()),
+        )
+        .await
+        .expect("a refused request must not wait");
+
+        assert!(matches!(ping, Err(IggyError::NotConnected)), "got {ping:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "the request must not dial"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_after_a_shutdown_keeps_reporting_the_shutdown() {
+        let client = auto_login_client("127.0.0.1:8090".to_string());
+        Client::shutdown(&client).await.unwrap();
+        Client::disconnect(&client).await.unwrap();
+
+        let ping = client.send_raw_with_response(PING_CODE, Bytes::new()).await;
+
+        assert!(
+            matches!(ping, Err(IggyError::ClientShutdown)),
+            "got {ping:?}"
         );
     }
 }

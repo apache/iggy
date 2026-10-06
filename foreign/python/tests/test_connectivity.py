@@ -43,8 +43,8 @@ from .utils import (
 def binary_transport_configs(auto_login: AutoLogin | None = None) -> list:
     """Return a config for every transport that holds a connection.
 
-    Auto-login is disabled by default: with credentials to replay, a ping sent
-    while disconnected reconnects on its own instead of failing.
+    Auto-login is disabled by default, so a test opts in only when it checks
+    the auto-login behavior.
 
     TCP and QUIC wait out `reestablish_after` before they connect again, so the
     configs set it to zero to keep the reconnect cases fast.
@@ -275,17 +275,20 @@ class TestLifecycle:
         binary_transport_configs(AutoLogin.username_password("iggy", "iggy")),
     )
     @pytest.mark.asyncio
-    async def test_disconnected_client_with_auto_login_signs_in_on_reconnect(
+    async def test_auto_login_client_stays_disconnected_until_connect(
         self, config: TcpConfig | WebSocketConfig | QuicConfig
     ):
-        """Test a client with auto-login credentials signs in again on connect."""
+        """Test an auto-login client stays disconnected, then signs in on connect."""
         client = IggyClient(config)
         await client.connect()
         await wait_for_ping(client)
 
         await client.disconnect()
-        await client.connect()
 
+        with pytest.raises(RuntimeError):
+            await client.ping()
+
+        await client.connect()
         await client.get_streams()
 
     @pytest.mark.parametrize("config", binary_transport_configs())
