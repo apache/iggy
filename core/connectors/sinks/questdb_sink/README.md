@@ -77,12 +77,19 @@ multi-host failover, is configured through the connect string. See the
 ### Batch sizing
 
 `batch_size` bounds rows; `max_flush_bytes` bounds bytes. Both matter, because
-QWP caps a single frame at the smaller of `max_buf_size` and the
-store-and-forward segment payload capacity, roughly 2 MiB with the default
-4 MiB segments. The row API does not split an oversized buffer, so a batch of
-wide rows that exceeds the cap is rejected whole and every row in it is lost.
-The byte bound flushes early to keep that from happening. Raise it only
-alongside `sf_max_segment_bytes` in the connect string.
+QWP caps a single frame at the smallest of `max_buf_size`, the maximum batch
+size the server advertises, and the store-and-forward segment payload capacity,
+roughly 4 MiB with the default 4 MiB segments. The row API does not split an
+oversized buffer, so a batch of wide rows that exceeds the cap is rejected whole.
+The byte bound flushes early to keep that from happening.
+
+The margin between the 1 MB default and that cap is deliberate and wider than
+one row. The buffer length the bound is measured against is a local estimate on
+this transport, not the encoded frame size: it does not account for the
+connection-scoped symbol dictionary, which a frame may have to carry in full.
+Raise the bound only alongside `sf_max_segment_bytes` in the connect string, and
+expect a server advertising a smaller batch size to refuse a frame before the
+bound fires.
 
 ## Store-and-forward
 
@@ -96,11 +103,12 @@ connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sen
 ```
 
 This matters more here than it does for other hosts. The connectors runtime
-commits consumer offsets before `consume()` runs and discards its return value
-([#2928](https://github.com/apache/iggy/issues/2928),
-[#2927](https://github.com/apache/iggy/issues/2927)), so a failed batch cannot
-be replayed from Apache Iggy. Once `flush()` returns, store-and-forward owns the
-rows independently of the consumer offset.
+commits consumer offsets before `consume()` runs
+([#2928](https://github.com/apache/iggy/issues/2928)) and does not replay a
+batch the sink reports as failed
+([#2927](https://github.com/apache/iggy/issues/2927)), so a failed batch cannot
+be recovered from Apache Iggy. Once `flush()` returns, store-and-forward owns
+the rows independently of the consumer offset.
 
 The parent of `sf_dir` must already exist. The connector does not create paths
 recursively and does not expand `~`.
@@ -120,9 +128,12 @@ under `<sf_dir>/<sender_id>-ingest-*/`.
   `tls_verify=unsafe_off` disables verification and is for controlled test
   environments only.
 - **Durable ACK**: `request_durable_ack=on` in the connect string plus
-  `ack_level = "durable"`. This needs replication configured on the server. On a
-  node without WAL shipping the rows are accepted but the durable watermark
-  never advances, so every flush waits out `flush_timeout`.
+  `ack_level = "durable"`. Both are required and the connector refuses to start
+  with only one, because QuestDB rejects a durable wait that the connect string
+  did not ask for, which would fail every batch while the rows themselves landed.
+  This also needs replication configured on the server: on a node without WAL
+  shipping the rows are accepted but the durable watermark never advances, so no
+  flush is ever acknowledged within `flush_timeout`.
 
 ### Choosing an ack level
 
@@ -189,21 +200,25 @@ Two further rules keep a retry from duplicating data:
   against a server without replication configured is exactly this case: the rows
   land and only the watermark fails to advance.
 - **A retryable code is not sufficient on its own.** The client sets `in_doubt`
-  when delivery is unknown and documents that `FailoverRetry` can carry it, so
-  the connector requires `in_doubt() == false` as well.
+  when delivery is unknown, so the connector requires `in_doubt() == false` as
+  well. On the row API this sink uses, a publish failure is always reported as
+  not delivered, so the guard is a safeguard against a future change rather than
+  a condition that fires today.
 
 The classification decides how a batch is reported: whether it is counted as
-failed, and how loudly it is logged. It does not yet decide whether the batch is
-retried, because the runtime discards `consume()`'s return value at the FFI
-boundary ([#2927](https://github.com/apache/iggy/issues/2927)). Once that is
-fixed the same classification starts driving retries, with no change needed
-here.
+failed, and how loudly it is logged. The runtime reads the return value, logs
+the failure and counts it in `iggy_connector_errors_total`, and leaves the
+run out of `messages_processed`. It does not yet decide whether the batch is
+retried, because the runtime does not replay a failed batch
+([#2927](https://github.com/apache/iggy/issues/2927)). Once that is fixed the
+same classification starts driving retries, with no change needed here.
 
 ### Rejected records
 
 **A rejected record is lost, and its log line is the only trace of it.** The
 runtime commits the consumer offset before `consume()` runs
-([#2928](https://github.com/apache/iggy/issues/2928)) and discards the result
+([#2928](https://github.com/apache/iggy/issues/2928)) and does not replay a
+batch the sink reports as failed
 ([#2927](https://github.com/apache/iggy/issues/2927)), so the connector can
 neither replay the record nor stop the pipeline. There is no dead-letter queue:
 the connectors SDK gives a sink no way to produce back into Apache Iggy, and by
@@ -212,37 +227,50 @@ the transform chain, so the original bytes no longer exist to preserve. A
 dead-letter topic belongs in the runtime, where those bytes are still available
 and one implementation would serve every sink.
 
-**Rejections are not visible in the runtime's Prometheus metrics.** The runtime
-counts every message it hands across the FFI as processed, and increments
-`iggy_connector_errors_total` only for drops it performs itself, such as decode
-and transform failures. A record the sink rejects is therefore counted as a
-success: `errors_total` stays at zero while `messages_processed` overcounts.
+**Per-record rejections are not visible in the runtime's Prometheus metrics.**
+The runtime increments `iggy_connector_errors_total` for drops it performs
+itself, such as decode and transform failures, and for a batch whose FFI call
+returns a failure status. A batch that flushes successfully after dropping some
+rows returns success, so every message in it counts as processed: `errors_total`
+stays at zero while `messages_processed` overcounts by the number rejected.
 
-This is not fixable from the plugin. A sink is a separate shared library with no
-handle on the runtime's metrics, and its `consume()` return value is discarded
-at the FFI boundary in any case. Closing it needs a change in
-`core/connectors/sdk` — either a metrics callback alongside the existing
-`LogCallback`, or an FFI return carrying the written and rejected counts.
+This is not fixable from the plugin. A sink is a separate shared library with
+no handle on the runtime's metrics, and its `consume()` return value is a single
+status for the whole batch, with no room for per-row counts. Closing it needs a
+change in `core/connectors/sdk`, either a metrics callback alongside the
+existing `LogCallback`, or an FFI return carrying the written and rejected
+counts.
 
 Until then, **alert on the connector's logs rather than on
 `iggy_connector_errors_total`**. Every rejection is logged at `error` with the
 stream, topic, partition, offset and message ID.
 
-Rejections come in two granularities, and only one of them names a record:
+Rejections come in three kinds, and only the first two name a record:
 
-- **Client-side, before the wire.** A payload that is not a JSON object, a
-  malformed UUID string, an array nested past three dimensions, a missing
-  timestamp field. These are caught while the row is being built, so the exact
-  record is known. Each one is logged at `error` with its stream, topic,
-  partition, offset, and message ID, and the row is rewound out of the buffer so
-  the rest of the batch still flushes. At most 20 per batch are logged
-  individually, followed by one summary line.
-- **Server-side, at flush.** QuestDB acknowledges and rejects whole frames, not
-  rows: a rejection carries frame sequence numbers (`from_fsn` / `to_fsn`), not a
-  row index. When the server refuses a frame the connector reports the failure
-  for the **batch** and cannot attribute it to a record. Isolating the offending
-  row would require bisecting the batch across fresh connections, since a
-  terminal rejection latches the sender. That is not implemented.
+- **Validated before the wire.** A payload that is not a JSON object, a
+  malformed UUID, a non-rectangular or too deeply nested array, a missing or
+  out-of-range timestamp field, a name QuestDB will not accept or that collides
+  with another column of the same row, a non-scalar value in a `symbol_columns`
+  field, or a row that would have no columns at all. Each record is validated in
+  full before anything is written, so the exact record is known and the rest of
+  the batch is unaffected. Each is logged at `error` with its stream, topic,
+  partition, offset and message ID. At most 20 per batch are logged individually,
+  followed by one summary line.
+- **Refused by the client at write time.** Some rules are only knowable to the
+  buffer. The important one is column type: QuestDB pins a column's type to
+  whatever the first row defined it as, so a later record disagreeing cannot be
+  judged from that record alone. JSON has one number type, so a producer writing
+  `2` and `2.5` for the same field reaches this on ordinary data. The connector
+  rebuilds the rows buffered since the last flush without the offending record
+  and flushes them, which keeps the cost to that one record. Past a few
+  recoveries in one batch it stops and fails the batch instead, on the grounds
+  that the records are fighting each other rather than one being bad.
+- **Rejected by the server, at flush.** QuestDB acknowledges and rejects whole
+  frames, not rows: a rejection carries frame sequence numbers
+  (`from_fsn` / `to_fsn`), not a row index. The connector reports the failure for
+  the **batch** and cannot attribute it to a record. The structured detail is
+  logged separately, including the rejections the client retries by itself, which
+  are the only early warning that a server is pushing back.
 
 Set `log_rejected_payload = true` to include a truncated payload in the
 client-side log lines, at the cost of writing user data to the log.
