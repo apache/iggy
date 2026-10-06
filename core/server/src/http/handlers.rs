@@ -840,7 +840,7 @@ pub(in crate::http) async fn create_stream(
         &state,
         &identity.session,
         Operation::CreateStream,
-        &body,
+        body,
     ))
     .await?;
     Ok(Json(decode_stream_details(&payload)?))
@@ -875,7 +875,7 @@ pub(in crate::http) async fn update_stream(
         &state,
         &identity.session,
         Operation::UpdateStream,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -896,7 +896,7 @@ pub(in crate::http) async fn delete_stream(
         &state,
         &identity.session,
         Operation::DeleteStream,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -917,7 +917,7 @@ pub(in crate::http) async fn purge_stream(
         &state,
         &identity.session,
         Operation::PurgeStream,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1016,7 +1016,7 @@ pub(in crate::http) async fn create_topic(
         &state,
         &identity.session,
         Operation::CreateTopic,
-        &body,
+        body,
     ))
     .await?;
     Ok(Json(decode_topic_details(&payload)?))
@@ -1085,7 +1085,7 @@ pub(in crate::http) async fn update_topic(
         &state,
         &identity.session,
         Operation::UpdateTopic,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1108,7 +1108,7 @@ pub(in crate::http) async fn delete_topic(
         &state,
         &identity.session,
         Operation::DeleteTopic,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1132,7 +1132,7 @@ pub(in crate::http) async fn purge_topic(
         &state,
         &identity.session,
         Operation::PurgeTopic,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1170,7 +1170,7 @@ pub(in crate::http) async fn create_partitions(
         &state,
         &identity.session,
         Operation::CreatePartitions,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::OK)
@@ -1198,7 +1198,7 @@ pub(in crate::http) async fn delete_partitions(
         &state,
         &identity.session,
         Operation::DeletePartitions,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1232,7 +1232,7 @@ pub(in crate::http) async fn delete_segments(
         &state,
         &identity.session,
         Operation::DeleteSegments,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1383,10 +1383,10 @@ pub(in crate::http) async fn get_consumer_offset(
 /// legacy server accepts (partitioning + base64 messages); stream and topic
 /// come from the path.
 ///
-/// Data plane, not control plane: the batch rides the partition group's own
-/// consensus (at-least-once, no dedup, no session gate - concurrent produces
-/// on one credential are legal), and the committed reply comes back through
-/// the session's in-process reply slot rather than a submit return value.
+/// The batch rides partition consensus under a server-generated request ID.
+/// Each caller POST is a new mutation; repeated POSTs do not automatically
+/// deduplicate. Awaited writes on one token queue behind the session's data
+/// gate, and the committed reply reaches its in-process reply slot.
 /// The default answers 201 with the completed message durability only
 /// after the quorum commit, with the commit's per-partition confirmations as
 /// the body; `?ack=none` answers 202 + `Iggy-Durability: none` immediately
@@ -1447,7 +1447,7 @@ pub(in crate::http) async fn send_messages(
             Ok((StatusCode::CREATED, durability, Json(confirmations)).into_response())
         }
         ProduceAck::None => {
-            SendWrapper::new(produce_unacked(&state, &identity.session, &body)).await?;
+            SendWrapper::new(produce_unacked(&state, &identity.session, body)).await?;
             Ok((
                 StatusCode::ACCEPTED,
                 [(DURABILITY_HEADER, HeaderValue::from_static(DURABILITY_NONE))],
@@ -1490,26 +1490,13 @@ pub(in crate::http) async fn store_consumer_offset(
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();
-    let consumer_kind = command.consumer.kind;
-    let result = SendWrapper::new(partition_write_replicated(
+    SendWrapper::new(partition_write_replicated(
         &state,
         &identity.session,
         Operation::StoreConsumerOffset,
         &body,
     ))
-    .await;
-    if matches!(
-        &result,
-        Err(PartitionWriteError::Rejected(
-            IggyError::TooManyConsumerOffsets
-        ))
-    ) {
-        state
-            .shard
-            .metrics()
-            .record_consumer_offset_denied(consumer_kind);
-    }
-    result?;
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1585,7 +1572,7 @@ pub(in crate::http) async fn create_cg(
         &state,
         &identity.session,
         Operation::CreateConsumerGroup,
-        &body,
+        body,
     ))
     .await?;
     Ok(Json(decode_consumer_group_details(&payload)?))
@@ -1611,7 +1598,7 @@ pub(in crate::http) async fn delete_cg(
         &state,
         &identity.session,
         Operation::DeleteConsumerGroup,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1644,7 +1631,7 @@ pub(in crate::http) async fn create_user(
         &state,
         &identity.session,
         Operation::CreateUser,
-        &body,
+        body,
     ))
     .await?;
     Ok(Json(decode_user_details(&payload)?))
@@ -1683,7 +1670,7 @@ pub(in crate::http) async fn update_user(
         &state,
         &identity.session,
         Operation::UpdateUser,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1704,7 +1691,7 @@ pub(in crate::http) async fn delete_user(
         &state,
         &identity.session,
         Operation::DeleteUser,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1739,7 +1726,7 @@ pub(in crate::http) async fn change_password(
         &state,
         &identity.session,
         Operation::ChangePassword,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1763,7 +1750,7 @@ pub(in crate::http) async fn update_permissions(
         &state,
         &identity.session,
         Operation::UpdatePermissions,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1828,7 +1815,7 @@ pub(in crate::http) async fn create_pat(
         &state,
         &identity.session,
         Operation::CreatePersonalAccessToken,
-        &body,
+        body,
     ))
     .await?;
     // Reject a committed business error before splicing the secret; the success
@@ -1858,7 +1845,7 @@ pub(in crate::http) async fn delete_pat(
         &state,
         &identity.session,
         Operation::DeletePersonalAccessToken,
-        &body,
+        body,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)

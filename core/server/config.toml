@@ -858,11 +858,13 @@ prepare_queue_depth = 32
 # restore the previous value to recover.
 journal_slots = 1024
 
-# Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
-# virtual clients and HTTP sessions together) hold live session state at once.
-# When full, the client whose last commit is oldest is evicted and its next
-# request re-registers. The HTTP session cap tracks this at half, so raising
-# it lifts both. Must be between 2 and 65536.
+# Initial capacity of the metadata session registry, shared by binary clients
+# and HTTP sessions. Live and unretired sessions occupy slots. A full registry
+# refuses new sessions; it never evicts retry protection. The first committed
+# operation fixes the capacity, so changing this value does not resize an
+# existing registry after restart or transfer. The HTTP cache cap uses half
+# the configured value, but cannot raise the committed registry limit.
+# Must be between 2 and 65536.
 clients_table_max = 8192
 
 # Cap on the partitions of all streams and topics. A request to create a
@@ -891,9 +893,10 @@ partitions_max = 0
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
-# In replicated groups, either persisted policy enables WAL references to segment bodies, retained by hard link until reclamation.
-# This includes replicated messages with persisted offsets. Full message payloads count against wal_bytes_max.
-# Their barriers can also persist co-batched messages. Only replicated/replicated stays off this WAL.
+# Every disk-backed partition uses a WAL for recovery and retries.
+# WAL references retain segment bodies by hard link until reclamation.
+# Full message payloads count against wal_bytes_max under both durability policies.
+# Persistence barriers can also persist co-batched messages.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
 # "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
@@ -926,21 +929,22 @@ partitions_max = 0
 # Fenced files remain available for diagnosis. Recovery must not replace an acknowledged durable history with an empty healthy partition.
 # Metadata and partition journals verify their own integrity and recovery frontiers independently of sparse indexes.
 
-# Per-partition active WAL and queued/in-flight prepare budget when either
-# topic policy is persisted. A 4 KiB multiple, from 128 MiB + 8 KiB to 4 GiB.
+# Per-partition active WAL and queued/in-flight prepare budget under both
+# durability policies. A 4 KiB multiple, from 128 MiB + 8 KiB to 4 GiB.
 # The minimum accommodates the retained commit-point prepare and a maximum-size successor.
-# Checkpointing begins at half the byte budget or 1024 dirty files.
+# Checkpointing starts at half the byte budget.
+# Explicit requests or 1024 dirty files can trigger checkpointing sooner.
 # File barriers run with at most 16 concurrent operations. Temporary rewrites need extra disk
 # space. Lowering this budget preserves existing history and blocks new writes
 # until recovery and checkpointing reclaim enough space.
-# Checkpoints synchronize changed files through the partition writer. Other
-# partitions continue while this partition defers materialized commit application.
+# Checkpoints synchronize changed files through the partition writer. Preparing
+# indexes and receipts still awaits I/O in the owning shard pump.
 # The HTTP metrics endpoint exposes per-shard partition_wal_* byte gauges and
 # completed batch, prepare, checkpoint and error counters.
 # partition_wal_retained_bytes plus queued_bytes and in_flight_bytes measures budget usage;
 # partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
-# partition_wal_prepares over partition_wal_batches is the prepares per durable group, and
-# partition_wal_group_commit_waits counts the groups that actually took the optional wait
+# partition_wal_prepares_total over partition_wal_batches_total is the prepares per durable group, and
+# partition_wal_group_commit_waits_total counts the groups that actually took the optional wait
 # below, so a delay that never fires is distinguishable from one that fires and buys nothing.
 wal_bytes_max = "256 MiB"
 
@@ -968,11 +972,12 @@ validate_checksum = true
 # u128 bitset, and this depth bounds that suffix.
 prepare_queue_depth = 32
 
-# Distinct clients each partition group tracks request watermarks for, so a
-# retried produce or consumer-offset write is answered instead of committing a
-# second time. At capacity the client whose newest commit is oldest is evicted;
-# that client's next replay re-executes, exactly as it would have before dedup
-# existed, so under-sizing degrades rather than breaks. Must be > 0 and <= 65536.
+# Initial capacity for session-qualified retry protection in each partition.
+# Live and unretired sessions occupy slots. A full table refuses new writers
+# with TransientNotAccepted; it never evicts existing protection. Ended sessions
+# release slots only after ordered retirement. The first committed operation
+# fixes the capacity, so changing this value does not resize an existing group
+# after restart or transfer. Must be > 0 and <= 65536.
 #
 # Unlike [metadata] clients_table_max, this budget is PER GROUP, so worst-case
 # memory scales with partition count. Size it to the producers one partition

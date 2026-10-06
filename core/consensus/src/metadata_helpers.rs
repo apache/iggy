@@ -23,6 +23,7 @@ use crate::client_table::{ClientTable, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
 use iggy_binary_protocol::{
     EvictionHeader, EvictionReason, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
+    Operation, PrepareHeader,
 };
 use iggy_common::IggyError;
 use message_bus::MessageBus;
@@ -52,14 +53,10 @@ pub enum PreflightOutcome {
     /// not-caught-up primary). The caller sends a `TransientNotCommitted` reply
     /// so the client replays immediately instead of waiting out its read-timeout.
     NotReady,
-    /// Absorbed with nothing to send: stale/gap retry or a client-bug newer
-    /// session. Replaying the same `request_id` cannot help, so stay silent.
-    Drop,
     /// Terminal: the request will never be executed and no cached reply
     /// exists, so the caller answers with this `IggyError` code. Distinct from
-    /// [`Self::Drop`] in that the client learns immediately instead of waiting
-    /// out its read timeout, and from [`Self::NotReady`] in that a replay of
-    /// the same `request_id` cannot change the answer.
+    /// [`Self::NotReady`] in that replaying the same `request_id` cannot change
+    /// the answer.
     Reject(u32),
 }
 
@@ -71,8 +68,7 @@ pub enum PreflightOutcome {
 /// message-plane paths fall back to [`apply_preflight_consensus_plane`].
 ///
 /// `session` is the wire `session` field, which carries the entry's fence
-/// epoch; `request_checksum` is the request's integrity stamp (zero =
-/// unstamped, disables the reuse check).
+/// epoch. Retry bodies do not affect identity; the operation must match.
 ///
 /// ## What the catch-up gate below does and does not establish
 ///
@@ -94,7 +90,7 @@ pub fn request_preflight<B, P>(
     client_id: u128,
     session: u64,
     request: u64,
-    request_checksum: u128,
+    operation: Operation,
 ) -> PreflightOutcome
 where
     B: MessageBus,
@@ -102,7 +98,17 @@ where
 {
     // In-flight dedup: a live prepare from this client absorbs the retry.
     // Pump delivers the reply at commit.
-    if consensus.pipeline_has_message_from_client(client_id) {
+    if let Some((pending_session, pending_request, pending_operation)) =
+        consensus.pending_request(client_id)
+    {
+        if pending_request != request {
+            return PreflightOutcome::Reject(IggyError::TransientNotAccepted.as_code());
+        }
+        if pending_session != session
+            || pending_operation.request_operation() != operation.request_operation()
+        {
+            return PreflightOutcome::Reject(IggyError::InvalidCommand.as_code());
+        }
         tracing::debug!(
             client_id,
             request,
@@ -131,13 +137,13 @@ where
 
     let status = client_table
         .borrow()
-        .check_request(client_id, session, request, request_checksum);
+        .check_request(client_id, session, request, operation);
     match status {
         // Frozen-backed cache -> refcount handoff to the home shard, no copy.
         RequestStatus::Duplicate(cached_reply) => {
             PreflightOutcome::Replay(cached_reply.into_wire_bytes())
         }
-        // Session evicted under capacity pressure. The catch-up gate makes this
+        // Unknown client id or restarted session. The catch-up gate makes this
         // replica authoritative for its own committed session state, which is
         // what an eviction frame reports.
         RequestStatus::NoSession => PreflightOutcome::Evict(EvictionReason::NoSession),
@@ -163,18 +169,15 @@ where
                 received,
                 "request_preflight: ignoring future epoch (client bug)"
             );
-            PreflightOutcome::Drop
+            PreflightOutcome::Reject(IggyError::InvalidCommand.as_code())
         }
-        // Same request id, different request bytes: replaying the cached
-        // reply would answer the wrong request, and re-executing would
-        // double-apply. Loud drop; the client must fix its numbering.
-        RequestStatus::ChecksumMismatch { request } => {
+        RequestStatus::OperationMismatch { request } => {
             tracing::error!(
                 client_id,
                 request,
                 "request_preflight: request id reused for a different operation (client bug)"
             );
-            PreflightOutcome::Drop
+            PreflightOutcome::Reject(IggyError::InvalidCommand.as_code())
         }
         // Applied once, original reply aged out of the ring: refuse
         // re-execution, and say so. Re-executing would double-apply and no
@@ -189,7 +192,7 @@ where
                 watermark,
                 "request_preflight: duplicate whose reply aged out of the ring, refusing"
             );
-            PreflightOutcome::Reject(IggyError::RequestAlreadyApplied.as_code())
+            PreflightOutcome::Reject(IggyError::RequestTooOld.as_code())
         }
         RequestStatus::New => PreflightOutcome::Dispatch,
     }
@@ -231,92 +234,61 @@ where
         }
         // The wire-ingress plane has no per-request transport context to build a
         // correlated `TransientNotCommitted` reply (that lives on the in-process
-        // home-shard path); stay silent here as before. NotReady and Drop both
-        // mean "do not dispatch"; the difference (explicit retry frame) only
-        // applies where the request header is in scope.
+        // home-shard path); stay silent here as before.
         // `Reject` needs the request header to build a correlated reply, which
         // only the home-shard path holds; it degrades to silence here for the
         // same reason NotReady does.
-        PreflightOutcome::NotReady | PreflightOutcome::Drop | PreflightOutcome::Reject(_) => false,
+        PreflightOutcome::NotReady | PreflightOutcome::Reject(_) => false,
     }
 }
 
-/// Register preflight: dedup for `Register`.
-///
-/// # Returns
-/// `true` -> dispatch. `false` -> absorbed (`AlreadyRegistered` replays cache;
-/// in-flight register silently dropped).
-#[allow(clippy::future_not_send)]
+/// Authenticate a registration replay before reserving a new session slot.
 pub fn register_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_table: &RefCell<ClientTable>,
     client_id: u128,
     user_id: u32,
-) -> bool
+    verifier_body: &[u8],
+    request_checksum: u128,
+) -> PreflightOutcome
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    // In-flight dedup.
-    if consensus.pipeline_has_message_from_client(client_id) {
-        tracing::debug!(client_id, "register_preflight: in-flight prepare, drop");
-        return false;
-    }
-
-    // Catch-up gate: new primary may have inherited Register(client, op=N)
-    // committed in WAL but not yet applied. Without the gate this dispatches a
-    // second register, which commits at a later op -> the entry's fence moves
-    // past the one the first register's reply handed the client, fencing a live
-    // client for no reason. SDK retry recovers post-catch-up.
     if !is_caught_up_primary(consensus) {
-        tracing::debug!(
-            client_id,
-            is_primary = consensus.is_primary(),
-            is_normal = consensus.is_normal(),
-            is_transferring = consensus.is_transferring(),
-            commit_min = consensus.commit_min(),
-            commit_max = consensus.commit_max(),
-            "register_preflight: not caught up, drop"
-        );
-        return false;
+        return PreflightOutcome::NotReady;
     }
-
-    // OWNERSHIP GATE. `commit_register`'s rebind branch overwrites the entry's
-    // `user_id`, and `resolve_acting_user_id` resolves authority for every
-    // replicated op from that field, so admitting a register for an entry
-    // another user owns would hand the caller that user's authority. Refuse by
-    // dropping it: this runs on the wire ingress and on the promotion of a
-    // queued register, neither of which has a caller to return a typed error
-    // to. The in-process submit checks the same condition first and does
-    // return one (`ClientIdOwnedByAnotherUser`), so a client that reaches here
-    // and is dropped retries into that terminal answer.
-    //
-    // Correct to decide here because the catch-up gate above already
-    // established this replica as authoritative for session truth.
-    if let Some(owner) = client_table.borrow().get_user_id(client_id)
-        && owner != user_id
-    {
-        tracing::warn!(
-            client_id,
-            presented_user = user_id,
-            entry_owner = owner,
-            "register_preflight: dropping register for an entry owned by another user"
-        );
-        return false;
+    let Ok(verifier) = verifier_body.try_into() else {
+        return PreflightOutcome::Reject(IggyError::InvalidCommand.as_code());
+    };
+    let table = client_table.borrow();
+    match table.registered_session(client_id, user_id, verifier) {
+        Ok(Some(epoch)) => {
+            let header = PrepareHeader {
+                cluster: consensus.cluster(),
+                view: consensus.view(),
+                operation: Operation::Register,
+                client: client_id,
+                op: epoch,
+                request_checksum,
+                user_id,
+                ..Default::default()
+            };
+            PreflightOutcome::Replay(
+                crate::build_reply_message(&header, &bytes::Bytes::new())
+                    .into_generic()
+                    .into_frozen(),
+            )
+        }
+        Err(_) => PreflightOutcome::Reject(IggyError::Unauthenticated.as_code()),
+        Ok(None) if consensus.pipeline_has_message_from_client(client_id) => {
+            PreflightOutcome::NotReady
+        }
+        Ok(None) if !consensus.has_retry_capacity(&table, client_id) => {
+            PreflightOutcome::Reject(IggyError::TransientNotAccepted.as_code())
+        }
+        Ok(None) => PreflightOutcome::Dispatch,
     }
-
-    // Past the gates, every Register dispatches -- including one whose client
-    // already holds an entry. A bind is a fencing event: `commit_register`'s
-    // rebind branch bumps the entry's epoch, which is what fences the previous
-    // holder of this session (the design's zombie fencing). Absorbing a
-    // re-register here would return the old epoch un-bumped and leave two live
-    // holders sharing a fence. The cost is that a stale Register retransmit
-    // also commits and fences the live holder, who recovers with one
-    // re-register round trip (the rebind branch preserves the watermark, so
-    // no dedup history is lost). Stream transports do not duplicate frames
-    // within a connection, and the in-flight scan above absorbs concurrent
-    // duplicates, so that path is foreign-client-only.
-    true
 }
 
 /// Stamping context for [`EvictionHeader`]. Filled once from
@@ -467,10 +439,15 @@ pub async fn send_eviction_to_client<B, P>(
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::client_table::{REGISTER_REQUEST_ID, REPLY_RING_RETENTION_BYTES};
-    use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
-    use iggy_binary_protocol::{Command, Operation, ReplyHeader};
+    use crate::impls::{ConsensusClock, FixedClock};
+    use crate::{CLIENTS_TABLE_MAX, LocalPipeline, RequestEntry};
+    use iggy_binary_protocol::{
+        Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader,
+    };
     use message_bus::{BusMessage, SendError};
 
     /// Acting user for register fixtures; these tests exercise preflight /
@@ -528,7 +505,7 @@ mod tests {
     // the entry's epoch. Absorbing here would leave two live holders sharing
     // one fence (the inert-fence bug).
     #[test]
-    fn register_preflight_dispatches_rebind_for_registered_client() {
+    fn register_preflight_replays_original_session_for_registered_client() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         consensus.init();
         let client_table = fresh_client_table();
@@ -537,7 +514,8 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], initial_reply)
+            .unwrap();
         // Progress past registration; a rebind must dispatch regardless.
         let app_reply = synthesize_send_messages_reply(&consensus, client_id, 1, 18);
         client_table
@@ -545,8 +523,18 @@ mod tests {
             .commit_reply(client_id, ACTING_USER_ID, app_reply);
 
         assert!(
-            register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID),
-            "rebind must dispatch so commit_register bumps the fence epoch"
+            matches!(
+                register_preflight(
+                    &consensus,
+                    &client_table,
+                    client_id,
+                    ACTING_USER_ID,
+                    &[0x5a; 32],
+                    0
+                ),
+                PreflightOutcome::Replay(_)
+            ),
+            "a login retry must recover the original session"
         );
         let sends = consensus.message_bus().client_sends.borrow();
         assert!(sends.is_empty(), "preflight itself sends nothing");
@@ -569,7 +557,7 @@ mod tests {
                 client_id,
                 10, // epoch (wire session field)
                 1,  // request
-                0,  // request_checksum (unstamped)
+                Operation::SendMessages,
             ),
             client_id,
         ));
@@ -588,6 +576,109 @@ mod tests {
         assert_eq!(header.client, client_id);
     }
 
+    #[test]
+    fn request_preflight_preserves_pending_operation_and_session() {
+        const CLIENT: u128 = 0xCAFE;
+        const SESSION: u64 = 10;
+        const REQUEST: u64 = 1;
+        const REQUEST_CHECKSUM: u128 = 0xAA;
+        const CLOCK_MICROS: u64 = 1_000;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            0,
+            ClientSpyBus::new(),
+            LocalPipeline::new(),
+            ConsensusClock::new(Rc::new(FixedClock(CLOCK_MICROS))),
+        );
+        consensus.init();
+        let client_table = fresh_client_table();
+        let mut message = Message::<RoutedRequestHeader>::new(HEADER_SIZE);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(message.as_mut_slice())
+                .unwrap();
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::CreateStream,
+            client: CLIENT,
+            session: SESSION,
+            request: REQUEST,
+            request_checksum: REQUEST_CHECKSUM,
+            size: u32::try_from(HEADER_SIZE).unwrap(),
+            ..Default::default()
+        };
+        consensus
+            .push_queued_request(RequestEntry::new(message))
+            .unwrap();
+
+        assert!(matches!(
+            request_preflight(
+                &consensus,
+                &client_table,
+                CLIENT,
+                SESSION,
+                REQUEST,
+                Operation::CreateStream,
+            ),
+            PreflightOutcome::NotReady
+        ));
+        for (session, request, operation, expected) in [
+            (
+                SESSION + 1,
+                REQUEST,
+                Operation::CreateStream,
+                IggyError::InvalidCommand,
+            ),
+            (
+                SESSION,
+                REQUEST,
+                Operation::DeleteStream,
+                IggyError::InvalidCommand,
+            ),
+            (
+                SESSION,
+                REQUEST + 1,
+                Operation::CreateStream,
+                IggyError::TransientNotAccepted,
+            ),
+        ] {
+            assert!(matches!(
+                request_preflight(&consensus, &client_table, CLIENT, session, request, operation),
+                PreflightOutcome::Reject(code) if code == expected.as_code()
+            ));
+        }
+        assert_eq!(consensus.request_queue_len(), 1);
+        let queued_request = consensus.pop_queued_request().unwrap();
+        assert_eq!(
+            queued_request.message.header().request_checksum,
+            REQUEST_CHECKSUM
+        );
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(PrepareHeader {
+                command: Command::Prepare,
+                operation: Operation::CreateTopicWithAssignments,
+                client: CLIENT,
+                session: SESSION,
+                request: REQUEST,
+                op: 1,
+                ..Default::default()
+            }));
+        });
+        assert!(matches!(
+            request_preflight(
+                &consensus,
+                &client_table,
+                CLIENT,
+                SESSION,
+                REQUEST,
+                Operation::CreateTopic,
+            ),
+            PreflightOutcome::NotReady
+        ));
+        assert_eq!(consensus.pipeline_len(), 1);
+    }
+
     // Zombie fencing: a request stamped with a pre-rebind epoch gets a
     // terminal SessionTooLow eviction.
     #[test]
@@ -602,16 +693,25 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], initial_reply)
+            .unwrap();
         let rebind_reply = synthesize_register_reply(&consensus, client_id, 25);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, rebind_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], rebind_reply)
+            .unwrap();
 
         // Zombie still stamping epoch 1: fenced.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            request_preflight(&consensus, &client_table, client_id, 1, 1, 0),
+            request_preflight(
+                &consensus,
+                &client_table,
+                client_id,
+                1,
+                1,
+                Operation::SendMessages,
+            ),
             client_id,
         ));
         assert!(!result, "Fenced short-circuits");
@@ -642,12 +742,20 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], initial_reply)
+            .unwrap();
 
         // Client claims epoch 99 (> 1), client bug.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            request_preflight(&consensus, &client_table, client_id, 99, 1, 0),
+            request_preflight(
+                &consensus,
+                &client_table,
+                client_id,
+                99,
+                1,
+                Operation::SendMessages,
+            ),
             client_id,
         ));
         assert!(!result, "EpochAhead short-circuits");
@@ -676,7 +784,7 @@ mod tests {
                 client_id,
                 10, // epoch (wire session field)
                 1,  // request
-                0,  // request_checksum (unstamped)
+                Operation::SendMessages,
             ),
             client_id,
         ));
@@ -704,7 +812,8 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], initial_reply)
+            .unwrap();
         for (request, commit) in [(3u64, 98u64), (5, 100)] {
             let reply = synthesize_send_messages_reply(&consensus, client_id, request, commit);
             client_table
@@ -714,7 +823,14 @@ mod tests {
 
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            request_preflight(&consensus, &client_table, client_id, epoch, 3, 0),
+            request_preflight(
+                &consensus,
+                &client_table,
+                client_id,
+                epoch,
+                3,
+                Operation::SendMessages,
+            ),
             client_id,
         ));
         assert!(!result, "duplicate short-circuits");
@@ -741,7 +857,8 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], initial_reply)
+            .unwrap();
         // Enough replies to exhaust the retention budget, so request 1's is
         // certain to have been dropped.
         let requests = (REPLY_RING_RETENTION_BYTES / size_of::<ReplyHeader>() + 8) as u64;
@@ -753,13 +870,20 @@ mod tests {
                 .commit_reply(client_id, ACTING_USER_ID, reply);
         }
 
-        let outcome = request_preflight(&consensus, &client_table, client_id, epoch, 1, 0);
+        let outcome = request_preflight(
+            &consensus,
+            &client_table,
+            client_id,
+            epoch,
+            1,
+            Operation::SendMessages,
+        );
         assert!(
             matches!(
                 outcome,
-                PreflightOutcome::Reject(code) if code == IggyError::RequestAlreadyApplied.as_code()
+                PreflightOutcome::Reject(code) if code == IggyError::RequestTooOld.as_code()
             ),
-            "expected a terminal RequestAlreadyApplied refusal"
+            "expected a terminal RequestTooOld refusal"
         );
     }
 
@@ -781,15 +905,29 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 17);
         client_table
             .borrow_mut()
-            .commit_register(client_id, OWNER, initial_reply);
+            .commit_register(client_id, OWNER, [0x5a; 32], initial_reply)
+            .unwrap();
 
         assert!(
-            !register_preflight(&consensus, &client_table, client_id, IMPOSTOR),
+            matches!(
+                register_preflight(
+                    &consensus,
+                    &client_table,
+                    client_id,
+                    IMPOSTOR,
+                    &[0x5a; 32],
+                    0
+                ),
+                PreflightOutcome::Reject(40)
+            ),
             "a register for another user's entry must not dispatch"
         );
         assert!(
-            register_preflight(&consensus, &client_table, client_id, OWNER),
-            "the owner's own rebind must still dispatch"
+            matches!(
+                register_preflight(&consensus, &client_table, client_id, OWNER, &[0x5a; 32], 0),
+                PreflightOutcome::Replay(_)
+            ),
+            "the owner must recover the original session"
         );
         assert_eq!(
             client_table.borrow().get_user_id(client_id),
@@ -813,13 +951,21 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, 5);
         client_table
             .borrow_mut()
-            .commit_register(client_id, ACTING_USER_ID, initial_reply);
+            .commit_register(client_id, ACTING_USER_ID, [0x5a; 32], initial_reply)
+            .unwrap();
         let advanced = synthesize_send_messages_reply(&consensus, client_id, 2, 99);
         client_table
             .borrow_mut()
             .commit_reply(client_id, ACTING_USER_ID, advanced);
 
-        let outcome = request_preflight(&consensus, &client_table, client_id, epoch, 9, 0);
+        let outcome = request_preflight(
+            &consensus,
+            &client_table,
+            client_id,
+            epoch,
+            9,
+            Operation::SendMessages,
+        );
         assert!(
             matches!(outcome, PreflightOutcome::Dispatch),
             "watermark jump must dispatch"
@@ -843,8 +989,18 @@ mod tests {
         let client_table = fresh_client_table();
         let client_id: u128 = 0xC0DE;
 
-        let result = register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID);
-        assert!(!result, "register dispatch must short-circuit");
+        let result = register_preflight(
+            &consensus,
+            &client_table,
+            client_id,
+            ACTING_USER_ID,
+            &[0x5a; 32],
+            0,
+        );
+        assert!(
+            matches!(result, PreflightOutcome::NotReady),
+            "register dispatch must wait for metadata"
+        );
 
         let sends = consensus.message_bus().client_sends.borrow();
         assert!(sends.is_empty(), "silent drop until catch-up");
@@ -890,8 +1046,18 @@ mod tests {
         let client_table = fresh_client_table();
         let client_id: u128 = 0xC0DE;
 
-        let result = register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID);
-        assert!(result, "New client proceeds through consensus");
+        let result = register_preflight(
+            &consensus,
+            &client_table,
+            client_id,
+            ACTING_USER_ID,
+            &[0x5a; 32],
+            0,
+        );
+        assert!(
+            matches!(result, PreflightOutcome::Dispatch),
+            "New client proceeds through consensus"
+        );
 
         let sends = consensus.message_bus().client_sends.borrow();
         assert!(sends.is_empty(), "no reply for New client");

@@ -549,7 +549,10 @@ impl StateHandler for UpdateUserRequest {
         // Patch, never replace: keys the client did not send keep their
         // current value, so a client that predates a key cannot erase it.
         user.options.extend(updated_options);
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            revoked_user: (user.status != UserStatus::Active).then_some(user_id as UserId),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -590,7 +593,10 @@ impl StateHandler for DeleteUserRequest {
                 .permissioner
                 .delete_permissions_for_user(user_id as UserId);
         }
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            revoked_user: Some(user_id as UserId),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 

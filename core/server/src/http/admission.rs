@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! In-flight admission for awaited partition writes: the per-session /
+//! In-flight admission for partition writes, including detached `NoAck` replies: the per-session /
 //! shard-global budget guard. Coupled to the router body cap because the shard
 //! inbox is one shared bounded channel, so admission is correctness-adjacent.
 
@@ -37,10 +37,11 @@ const MAX_IN_FLIGHT_WRITES_PER_SESSION: u32 = 32;
 /// consensus. The budget therefore bounds both starvation terms: budget x
 /// `max_request_size` bounds the worst-case buffered bytes, and budget x
 /// per-request CPU bounds how far admitted HTTP work can delay the consensus
-/// pump. `?ack=none` produces are admitted through the same caps: they install
-/// no reply slot and never await a commit, but they still park inside dispatch
-/// for the routable-wait budget while pinning their buffered body, so leaving
-/// them uncapped would bypass both terms. A session that saturates its own cap
+/// pump. `?ack=none` returns to the caller after dispatch, while a detached task
+/// retains the reply slot, partition gate and admission guard until a reply or
+/// deadline. Its 202 response does not acknowledge admission or commit. Holding
+/// the budget through that wait prevents `NoAck` traffic from bypassing these
+/// limits. A session that saturates its own cap
 /// reads its own 429 before it can spill onto the shared budget.
 const MAX_IN_FLIGHT_WRITES_GLOBAL: u32 = 128;
 

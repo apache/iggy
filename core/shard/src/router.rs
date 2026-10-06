@@ -852,17 +852,8 @@ where
                 // `route_typed`). Every refusal answers on `reply`, so the
                 // awaiting shard never waits out its budget on a decision
                 // already made.
-                if let Some(attachment) = attachment
-                    && let Err(error) = self.validate_offset_attachment(&request, &attachment)
-                {
-                    let deny = consensus::build_deny_reply_from_request_header(
-                        request.header(),
-                        error.as_code(),
-                    );
-                    let _ = reply.try_send(Some(deny.into_generic()));
-                } else {
-                    self.on_partition_submit(request, reply).await;
-                }
+                self.dispatch_partition_submit(request, reply, None, attachment)
+                    .await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
@@ -883,8 +874,11 @@ where
             }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    partition.on_persistence_completed(completion).await;
+                let partitions = self.plane.partitions();
+                if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                    partition
+                        .on_persistence_completed(completion, partitions.config())
+                        .await;
                 }
             }
             LifecycleFrame::ReconcileApply => {

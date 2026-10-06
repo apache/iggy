@@ -335,7 +335,7 @@ pub struct PacketSimulator {
 
 /// One past the highest [`Command`] discriminant, sizing [`COMMAND_LABELS`] and
 /// the delivery counters. Raising it is part of adding a command.
-pub const COMMAND_COUNT_MAX: usize = 31;
+pub const COMMAND_COUNT_MAX: usize = 32;
 
 /// Names for each [`Command`] discriminant, so a coverage report reads as
 /// protocol rather than as integers. Indexed by discriminant; the trailing
@@ -372,6 +372,7 @@ pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
     "ForwardLogout",
     "ForwardLogoutResult",
     "ConsumerSessionHeartbeat",
+    "SessionRetirementProgress",
 ];
 
 const _: () = {

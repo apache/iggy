@@ -126,6 +126,8 @@ public enum IggyErrorCode {
 
     // VSR protocol errors
     INCOMPATIBLE_PROTOCOL_VERSION(14003),
+    SESSION_MISMATCH(14004),
+    REQUEST_ID_EXHAUSTED(14005),
 
     // Unknown error code
     UNKNOWN(-1);

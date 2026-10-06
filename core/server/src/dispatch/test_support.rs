@@ -310,6 +310,8 @@ pub fn prepare_message(
             client,
             request,
             user_id: 0,
+            session: 1,
+            retry_capacity: u32::try_from(consensus::CLIENTS_TABLE_MAX).unwrap(),
             group: server_common::sharding::METADATA_GROUP,
             ..Default::default()
         };

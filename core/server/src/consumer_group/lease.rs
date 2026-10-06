@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Volatile, primary-owned leases for persisted consumer-group memberships.
+//! Volatile, primary-owned leases for registered logical sessions.
 //! A new primary and each newly observed session get a full timeout. Only
 //! server-observed connections renew leases, never recovered client-table rows.
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use iggy_binary_protocol::{ConsumerSession, ConsumerSessionHeartbeatHeader, WireDecode};
+use iggy_binary_protocol::requests::system::SessionIdentity;
+use iggy_binary_protocol::{Command, ConsumerSession, ConsumerSessionHeartbeatHeader, WireDecode};
 use server_common::Message;
+use server_common::sharding::IggyNamespace;
 use tracing::{debug, warn};
 
 #[derive(Debug)]
@@ -32,23 +36,96 @@ pub(super) struct Lease {
     pub(super) last_seen: Instant,
 }
 
-/// Bounded by the current consumer-group members, independent of heartbeat volume.
+pub struct SessionActivity {
+    session: ConsumerSession,
+    last_seen: Cell<Instant>,
+}
+
+impl SessionActivity {
+    pub(crate) fn new(session: ConsumerSession) -> Self {
+        Self {
+            session,
+            last_seen: Cell::new(Instant::now()),
+        }
+    }
+
+    pub(crate) fn touch(&self) {
+        self.last_seen.set(Instant::now());
+    }
+}
+
+pub(super) struct RetirementProgress {
+    pub(super) identity: SessionIdentity,
+    pub(super) revision: u64,
+    pub(super) cursor: usize,
+    pub(super) complete: bool,
+    pub(super) reported: bool,
+    last_report: Option<Instant>,
+    pub(super) reporters: BTreeSet<u8>,
+}
+
+impl RetirementProgress {
+    pub(super) fn report_due(&mut self, now: Instant, interval: Duration) -> bool {
+        if self
+            .last_report
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return false;
+        }
+        self.last_report = Some(now);
+        true
+    }
+}
+
+type RetirementNamespaces = Rc<[(IggyNamespace, u64)]>;
+
+/// Bounded by the session registry, independent of heartbeat volume.
 #[derive(Default)]
 pub struct ConsumerGroupLiveness {
     view: Option<u32>,
+    local_sessions: BTreeMap<u128, Weak<SessionActivity>>,
     pub(super) leases: BTreeMap<u128, Lease>,
     pub(super) last_incomplete: Option<Instant>,
     pub(super) last_incomplete_warning: Option<Instant>,
     pub(super) report_offset: usize,
     pub(super) report_incomplete: bool,
+    pub(super) retirement: Option<RetirementProgress>,
+    pub(super) retirement_namespaces: Option<(u64, RetirementNamespaces)>,
+    pub(super) retirement_fences: BTreeMap<IggyNamespace, u64>,
 }
 
 impl ConsumerGroupLiveness {
+    pub(crate) fn observe_local_session(&mut self, activity: &Rc<SessionActivity>) {
+        self.local_sessions
+            .retain(|_, activity| activity.strong_count() != 0);
+        self.local_sessions
+            .insert(activity.session.client_id, Rc::downgrade(activity));
+    }
+
+    pub(super) fn local_activity(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+    ) -> Vec<ConsumerSession> {
+        let mut sessions = Vec::new();
+        self.local_sessions.retain(|_, activity| {
+            let Some(activity) = activity.upgrade() else {
+                return false;
+            };
+            if now.saturating_duration_since(activity.last_seen.get()) < timeout {
+                sessions.push(activity.session);
+            }
+            true
+        });
+        sessions
+    }
+
     pub(super) fn observe_view(&mut self, view: Option<u32>) {
         if self.view != view {
             self.leases.clear();
             self.last_incomplete = None;
             self.last_incomplete_warning = None;
+            self.retirement = None;
             self.view = view;
         }
     }
@@ -84,6 +161,33 @@ impl ConsumerGroupLiveness {
         }
     }
 
+    pub(super) fn reconcile_retirement(
+        &mut self,
+        identity: Option<SessionIdentity>,
+        revision: u64,
+    ) {
+        if self.retirement.as_ref().map(|progress| progress.identity) != identity {
+            self.retirement = identity.map(|identity| RetirementProgress {
+                identity,
+                revision,
+                cursor: 0,
+                complete: true,
+                reported: false,
+                last_report: None,
+                reporters: BTreeSet::new(),
+            });
+        } else if let Some(progress) = &mut self.retirement
+            && progress.revision != revision
+        {
+            progress.revision = revision;
+            progress.cursor = 0;
+            progress.complete = true;
+            progress.reported = false;
+            progress.last_report = None;
+            progress.reporters.clear();
+        }
+    }
+
     pub(super) fn defer_expiry(&mut self, now: Instant, timeout: Duration, replica: u8) {
         // Recovered memberships do not identify their hosting replica. Until
         // every reporting node can enumerate its clients, absence is uncertain.
@@ -115,10 +219,15 @@ impl ConsumerGroupLiveness {
             return;
         }
         // Validate the whole batch before refreshing anything.
-        let sessions = message
+        let (sessions, remainder) = message
             .body()
-            .as_chunks::<{ ConsumerSession::ENCODED_SIZE }>()
-            .0;
+            .as_chunks::<{ ConsumerSession::ENCODED_SIZE }>();
+        if !remainder.is_empty()
+            || sessions.len() > iggy_binary_protocol::MAX_CONSUMER_SESSIONS_PER_HEARTBEAT
+            || header.incomplete > 1
+        {
+            return;
+        }
         if let Err(error) = sessions
             .iter()
             .try_for_each(|bytes| ConsumerSession::decode(bytes).map(|_| ()))
@@ -128,6 +237,24 @@ impl ConsumerGroupLiveness {
                 replica = header.replica,
                 "invalid consumer session heartbeat body"
             );
+            return;
+        }
+        if header.command == Command::SessionRetirementProgress {
+            if header.incomplete != 0 {
+                return;
+            }
+            if let Some(progress) = &mut self.retirement
+                && header.namespace_revision == progress.revision
+            {
+                for bytes in sessions {
+                    if let Ok((session, _)) = ConsumerSession::decode(bytes)
+                        && session.client_id == progress.identity.client_id
+                        && session.session == progress.identity.session
+                    {
+                        progress.reporters.insert(header.replica);
+                    }
+                }
+            }
             return;
         }
         if header.incomplete != 0 {
@@ -156,5 +283,71 @@ impl ConsumerGroupLiveness {
                 lease.session == session
                     && now.saturating_duration_since(lease.last_seen) >= timeout
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConsumerGroupLiveness, SessionActivity};
+    use iggy_binary_protocol::ConsumerSession;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn retirement_reports_are_paced_and_restart_after_view_or_revision_changes() {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        let identity = iggy_binary_protocol::requests::system::SessionIdentity {
+            client_id: 1,
+            session: 2,
+            metadata_watermark: 3,
+        };
+        let mut tracker = ConsumerGroupLiveness::default();
+        tracker.observe_view(Some(1));
+        tracker.reconcile_retirement(Some(identity), 1);
+        let now = Instant::now();
+        let progress = tracker.retirement.as_mut().unwrap();
+        assert!(progress.report_due(now, INTERVAL));
+        assert!(!progress.report_due(now + Duration::from_millis(100), INTERVAL));
+        assert!(progress.report_due(now + INTERVAL, INTERVAL));
+        tracker.reconcile_retirement(Some(identity), 2);
+        assert!(
+            tracker
+                .retirement
+                .as_mut()
+                .unwrap()
+                .report_due(now + INTERVAL, INTERVAL)
+        );
+        tracker.observe_view(Some(2));
+        tracker.reconcile_retirement(Some(identity), 2);
+        assert!(
+            tracker
+                .retirement
+                .as_mut()
+                .unwrap()
+                .report_due(now + INTERVAL, INTERVAL)
+        );
+    }
+
+    #[test]
+    fn local_sessions_report_recent_activity_and_release_dropped_descriptors() {
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let identity = ConsumerSession {
+            client_id: 1,
+            session: 2,
+        };
+        let activity = Rc::new(SessionActivity::new(identity));
+        let mut tracker = ConsumerGroupLiveness::default();
+        tracker.observe_local_session(&activity);
+        let now = Instant::now();
+        assert_eq!(tracker.local_activity(now, TIMEOUT), vec![identity]);
+        assert!(tracker.local_activity(now + TIMEOUT, TIMEOUT).is_empty());
+        activity.touch();
+        assert_eq!(
+            tracker.local_activity(Instant::now(), TIMEOUT),
+            vec![identity]
+        );
+        drop(activity);
+        assert!(tracker.local_activity(now, TIMEOUT).is_empty());
+        assert!(tracker.local_sessions.is_empty());
     }
 }

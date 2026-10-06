@@ -25,7 +25,7 @@ const (
 	GetSnapshotFileCode       Code = 11
 	GetClusterMetadataCode    Code = 12
 	DescribeOptionsCode       Code = 13
-	AttachConsumerSessionCode Code = 14
+	BindSessionCode           Code = 15
 	GetMeCode                 Code = 20
 	GetClientCode             Code = 21
 	GetClientsCode            Code = 22

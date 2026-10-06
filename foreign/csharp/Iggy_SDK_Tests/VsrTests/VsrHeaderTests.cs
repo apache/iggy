@@ -28,7 +28,7 @@ public sealed class VsrHeaderTests
     {
         var consensusSession = new ConsensusSession(0x0102_0304_0506_0708);
         consensusSession.Resolve(VsrOperation.Register);
-        consensusSession.Bind(session);
+        consensusSession.Bind(session, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         return consensusSession;
     }
@@ -75,7 +75,7 @@ public sealed class VsrHeaderTests
     public void Encode_RegisterUsesZeroRequestAndSession()
     {
         var session = new ConsensusSession(7);
-        var payload = LoginRegister.Serialize("admin", "secret");
+        var payload = LoginRegister.Serialize("admin", "secret", new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         var header = Encode(session, CommandCodes.LOGIN_REGISTER_CODE, payload, out var totalSize);
 
