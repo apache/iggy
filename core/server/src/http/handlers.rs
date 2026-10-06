@@ -1356,15 +1356,10 @@ pub(in crate::http) async fn get_consumer_offset(
     .await?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
-    let (namespace, partition_id, consumer) = resolve_consumer_offset_request(&state.shard, &wire)
+    let (namespace, partition_id, read) = resolve_consumer_offset_request(&state.shard, &wire)
         .map_err(|_| ReadError::NotFound)?
         .ok_or(ReadError::NotFound)?;
-    let reply = SendWrapper::new(
-        state
-            .shard
-            .partition_read(namespace, PartitionRead::ConsumerOffset { consumer }),
-    )
-    .await;
+    let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
     match reply {
         Some(PartitionReadReply::ConsumerOffset {
             stored: Some(stored_offset),

@@ -1365,6 +1365,8 @@ impl Simulator {
                         .retained_consumer_offsets(iggy_common::ConsumerKind::Consumer),
                     consumer_group_offsets: partition
                         .retained_consumer_offsets(iggy_common::ConsumerKind::ConsumerGroup),
+                    external_group_offsets: partition
+                        .retained_consumer_offsets(iggy_common::ConsumerKind::ExternalGroup),
                     log: std::mem::take(&mut partition.log),
                     durable_offset: offsets.commit_offset,
                     write_offset: offsets.write_offset,

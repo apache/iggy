@@ -34,6 +34,7 @@ pub struct DurableOffsetState {
 pub struct DurableConsumerOffsets {
     consumers: RefCell<HashMap<u32, DurableOffsetState>>,
     groups: RefCell<HashMap<u32, DurableOffsetState>>,
+    external_groups: RefCell<HashMap<u32, DurableOffsetState>>,
     membership_epoch: Cell<u64>,
 }
 
@@ -116,6 +117,7 @@ impl DurableConsumerOffsets {
     pub(crate) fn clear(&self) {
         self.consumers.borrow_mut().clear();
         self.groups.borrow_mut().clear();
+        self.external_groups.borrow_mut().clear();
         self.bump_membership_epoch();
     }
 
@@ -140,6 +142,7 @@ impl DurableConsumerOffsets {
         match kind {
             ConsumerKind::Consumer => &self.consumers,
             ConsumerKind::ConsumerGroup => &self.groups,
+            ConsumerKind::ExternalGroup => &self.external_groups,
         }
     }
 

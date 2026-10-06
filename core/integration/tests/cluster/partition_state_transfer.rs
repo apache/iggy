@@ -44,6 +44,10 @@ const PARTITION_ID: u32 = 0;
 /// window a rejoiner could repair from op 1.
 const MESSAGES_COUNT: u32 = 200;
 const STORED_CONSUMER_OFFSET: u64 = 17;
+/// A Kafka-style group name, which the gateway maps onto an Iggy consumer group.
+const EXTERNAL_GROUP: &str = "kafka.cg.transfer";
+/// Past the partition end: an external group offset must cross the transfer unclamped.
+const STORED_EXTERNAL_OFFSET: u64 = 1 << 40;
 
 /// Dead-peer spec sizing: enough 256 KiB payloads (64 MiB total) that the
 /// transfer spans hundreds of 256 KiB chunk round-trips, keeping the pull
@@ -110,6 +114,22 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
         )
         .await
         .expect("store a consumer offset before the wipe");
+    let stream = Identifier::named(STREAM_NAME).expect("stream identifier");
+    let topic = Identifier::named(TOPIC_NAME).expect("topic identifier");
+    client
+        .create_consumer_group(&stream, &topic, EXTERNAL_GROUP)
+        .await
+        .expect("create the consumer group that names the external group");
+    client
+        .store_consumer_offset(
+            &Consumer::external_group(Identifier::named(EXTERNAL_GROUP).expect("group identifier")),
+            &stream,
+            &topic,
+            Some(PARTITION_ID),
+            STORED_EXTERNAL_OFFSET,
+        )
+        .await
+        .expect("store an external group offset before the wipe");
     sleep(Duration::from_secs(1)).await;
     // Deliberately NOT dropped before the wipe: a disconnect commits a
     // Logout, and a fresh (never-checkpointed) metadata rejoin currently
@@ -146,17 +166,22 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
         );
         sleep(MARKER_POLL).await;
     }
-    let offsets_file = find_consumer_offset_file(&data_path)
-        .expect("transferred consumer offset file exists on node 2");
-    let bytes = std::fs::read(&offsets_file).expect("read transferred consumer offset");
-    let offset_bytes = bytes
-        .first_chunk::<8>()
-        .expect("offset file starts with a u64 offset");
-    assert_eq!(
-        u64::from_le_bytes(*offset_bytes),
-        STORED_CONSUMER_OFFSET,
-        "the stored consumer offset must survive the transfer"
-    );
+    for (kind_dir, expected) in [
+        ("consumers", STORED_CONSUMER_OFFSET),
+        ("external_groups", STORED_EXTERNAL_OFFSET),
+    ] {
+        let offsets_file = find_offset_file(&data_path, kind_dir)
+            .unwrap_or_else(|| panic!("transferred {kind_dir} offset file exists on node 2"));
+        let bytes = std::fs::read(&offsets_file).expect("read transferred offset");
+        let offset_bytes = bytes
+            .first_chunk::<8>()
+            .expect("offset file starts with a u64 offset");
+        assert_eq!(
+            u64::from_le_bytes(*offset_bytes),
+            expected,
+            "the stored {kind_dir} offset must survive the transfer"
+        );
+    }
 
     // Functional capstone: with node 1 down, quorum is node 0 + the
     // transferred node 2, so one more produce+poll round-trip cannot commit
@@ -614,11 +639,12 @@ fn is_segment_log(path: &Path) -> bool {
             .is_some_and(|stem| stem.len() == 20 && stem.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-fn find_consumer_offset_file(root: &Path) -> Option<PathBuf> {
+/// The first offset file in a `kind_dir` directory, such as `consumers`.
+fn find_offset_file(root: &Path, kind_dir: &str) -> Option<PathBuf> {
     walk(root, &mut |path| {
         path.parent()
             .and_then(Path::file_name)
-            .is_some_and(|name| name == "consumers")
+            .is_some_and(|name| name == kind_dir)
             && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() >= 8)
     })
 }

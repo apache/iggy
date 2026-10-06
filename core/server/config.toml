@@ -980,8 +980,10 @@ prepare_queue_depth = 32
 dedup_clients_max = 4096
 
 # Distinct durable consumer-offset keys a partition primary admits per kind.
-# Standalone consumers and consumer groups are counted separately. Existing
-# keys remain writable at the limit. A new key is rejected before consensus.
+# Standalone consumers, consumer groups and external groups are counted
+# separately, so one partition can hold up to three times this many keys.
+# Existing keys remain writable at the limit. A new key is rejected before
+# consensus.
 # A non-empty auto_commit poll that needs a new offset key is also rejected
 # with TooManyConsumerOffsets and returns no messages. A poll whose auto_commit
 # cannot be submitted (the owning shard's inbox is full, or the partition

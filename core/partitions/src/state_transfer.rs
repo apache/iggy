@@ -64,7 +64,15 @@ use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 1;
+/// Version 1 has no external group count and section. `server-0.9.0` reads and
+/// writes only this version, so the encoder keeps writing it while the external
+/// group section is empty, and a rolling upgrade can still transfer partitions
+/// in both directions.
+pub(crate) const CONSUMER_OFFSETS_VERSION_1: u8 = 1;
+/// Version 2 adds the external group count and section. It goes out only when
+/// that section holds an entry, and a `server-0.9.0` peer then fails with
+/// `UnsupportedVersion` instead of decoding 4 bytes out of place.
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 2;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -284,8 +292,8 @@ impl StagedSegmentMeta {
     }
 }
 
-/// The consumer-offset artifact: both offset maps plus the applied purge
-/// generation, at the offer's `commit_op`.
+/// The consumer-offset artifact: the offsets of every kind plus the applied
+/// purge generation, at the offer's `commit_op`.
 ///
 /// The purge generation rides here because a receiver that missed a
 /// `PurgeTopic` would otherwise install post-purge data at a stale local
@@ -308,6 +316,8 @@ pub(crate) struct ConsumerOffsetsWire {
     pub consumers: Vec<(u32, u64)>,
     /// `(consumer group id, offset)`, ascending by id.
     pub groups: Vec<(u32, u64)>,
+    /// `(consumer group id, offset)` of external groups, ascending by id.
+    pub external_groups: Vec<(u32, u64)>,
     /// This group's dedup slice, ascending by client. Carried so a replica
     /// rejoining behind the repair floor can absorb a replay of what the group
     /// already committed instead of re-executing it.
@@ -316,20 +326,33 @@ pub(crate) struct ConsumerOffsetsWire {
 
 impl ConsumerOffsetsWire {
     /// Encode: `magic | version u8 | purge_generation u64 | next_offset u64 |
-    /// consumer_count u32 | group_count u32 | dedup_count u32 |
-    /// {id u32, offset u64}xN | {id u32, offset u64}xM |
-    /// {client u128, watermark u64, latest_commit u64, user_id u32,
-    /// committed_window u128}xD | checksum_present u8 | prepare_checksum u128 |
-    /// prepare_length u32 | checkpoint_prepare bytes | XxHash3_64 trailer`. Little-endian throughout.
+    /// consumer_count u32 | group_count u32 | external_group_count u32 |
+    /// dedup_count u32 | {id u32, offset u64}xN | {id u32, offset u64}xM |
+    /// {id u32, offset u64}xE | {client u128, watermark u64, latest_commit u64,
+    /// user_id u32, committed_window u128}xD | checksum_present u8 |
+    /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
+    /// XxHash3_64 trailer`. Little-endian throughout. With no external group
+    /// offset the version is 1, and `external_group_count` and its section are
+    /// left out.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        let all_sections = self.offset_sections();
+        let (version, sections) = if self.external_groups.is_empty() {
+            (
+                CONSUMER_OFFSETS_VERSION_1,
+                &all_sections[..ConsumerKind::ExternalGroup.index()],
+            )
+        } else {
+            (CONSUMER_OFFSETS_VERSION, &all_sections[..])
+        };
         // Size exactly rather than guess; the reservation assert keeps the
         // arithmetic honest as fields are added.
         let reserved = CONSUMER_OFFSETS_MAGIC.len()
             + size_of::<u8>()
             + 2 * size_of::<u64>()
-            + 3 * size_of::<u32>()
-            + (self.consumers.len() + self.groups.len()) * (size_of::<u32>() + size_of::<u64>())
+            + (sections.len() + 1) * size_of::<u32>()
+            + sections.iter().map(|entries| entries.len()).sum::<usize>()
+                * (size_of::<u32>() + size_of::<u64>())
             + self.dedup.len() * DEDUP_ENTRY_LEN
             + size_of::<u8>()
             + size_of::<u128>()
@@ -338,16 +361,16 @@ impl ConsumerOffsetsWire {
             + size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        out.push(CONSUMER_OFFSETS_VERSION);
+        out.push(version);
         out.extend_from_slice(&self.purge_generation.to_le_bytes());
         out.extend_from_slice(&self.next_offset.to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        out.extend_from_slice(&(self.consumers.len() as u32).to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
+        for entries in sections {
+            #[allow(clippy::cast_possible_truncation)]
+            out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        }
         #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(self.dedup.len() as u32).to_le_bytes());
-        for (id, offset) in self.consumers.iter().chain(self.groups.iter()) {
+        for (id, offset) in sections.iter().copied().flatten() {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&offset.to_le_bytes());
         }
@@ -378,7 +401,8 @@ impl ConsumerOffsetsWire {
     /// about the PEER's encoder (duplicate ids, count fields, trailing
     /// bytes), which the transit checksum cannot vouch for. Offset-value
     /// sanity is deliberately NOT here: it needs the installed end offset,
-    /// so the install clamps, mirroring boot recovery.
+    /// so the install clamps, mirroring boot recovery. External group values
+    /// are never clamped.
     ///
     /// # Errors
     /// Any [`ConsumerOffsetsWireError`]; the input is never partially
@@ -396,16 +420,27 @@ impl ConsumerOffsetsWire {
         if magic != CONSUMER_OFFSETS_MAGIC {
             return Err(ConsumerOffsetsWireError::BadMagic);
         }
-        if version != CONSUMER_OFFSETS_VERSION {
+        if !matches!(
+            version,
+            CONSUMER_OFFSETS_VERSION_1 | CONSUMER_OFFSETS_VERSION
+        ) {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
         let purge_generation = cursor.u64()?;
         let next_offset = cursor.u64()?;
         let consumer_count = cursor.u32()?;
         let group_count = cursor.u32()?;
+        // Version 1 has no count to read: its writer holds no external group offset.
+        let external_group_count = if version == CONSUMER_OFFSETS_VERSION_1 {
+            0
+        } else {
+            cursor.u32()?
+        };
         let dedup_count = cursor.u32()?;
         let consumers = Self::decode_section(&mut cursor, "consumers", consumer_count)?;
         let groups = Self::decode_section(&mut cursor, "groups", group_count)?;
+        let external_groups =
+            Self::decode_section(&mut cursor, "external groups", external_group_count)?;
         let dedup = Self::decode_dedup_section(&mut cursor, dedup_count)?;
         let present = cursor.u8()?;
         let checksum = cursor.u128()?;
@@ -434,8 +469,14 @@ impl ConsumerOffsetsWire {
             next_offset,
             consumers,
             groups,
+            external_groups,
             dedup,
         })
+    }
+
+    /// The offset section of each kind, in [`ConsumerKind::ALL`] order.
+    pub(crate) fn offset_sections(&self) -> [&[(u32, u64)]; ConsumerKind::COUNT] {
+        [&self.consumers, &self.groups, &self.external_groups]
     }
 
     /// Same guards as [`Self::decode_section`] at the dedup stride: peer count
@@ -501,12 +542,11 @@ impl ConsumerOffsetsWire {
         // The count is peer input and the reservation is 12 bytes per element
         // after alignment, so it is checked against the bytes actually present
         // before allocating: a ~30 byte artifact could otherwise ask for tens of
-        // megabytes across the two sections. 12 is the wire stride below, and
-        // the guard is a lower bound on purpose: what trails a section varies
-        // (groups trails consumers, the dedup section trails groups and is
-        // absent from a v1 artifact), so only "at least this many bytes
-        // present" holds for both calls. Demanding that `12 * count` be all
-        // that remains would reject valid input.
+        // megabytes across the offset sections. 12 is the wire stride below, and
+        // the guard is a lower bound on purpose: other sections, the dedup
+        // section and the prepare trail each one, so only "at least this many
+        // bytes present" holds for every call. Demanding that `12 * count` be
+        // all that remains would reject valid input.
         if count as usize * (size_of::<u32>() + size_of::<u64>()) > cursor.remaining().len() {
             return Err(ConsumerOffsetsWireError::Truncated);
         }
@@ -585,7 +625,8 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::Truncated => write!(f, "consumer-offsets artifact is truncated"),
             Self::BadMagic => write!(
                 f,
-                "consumer-offsets artifact must use {} version {CONSUMER_OFFSETS_VERSION}",
+                "consumer-offsets artifact must use {} version {CONSUMER_OFFSETS_VERSION_1} \
+                 or {CONSUMER_OFFSETS_VERSION}",
                 String::from_utf8_lossy(&CONSUMER_OFFSETS_MAGIC)
             ),
             Self::TrailingBytes { extra } => write!(
@@ -596,7 +637,8 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::UnsupportedVersion { version } => write!(
                 f,
                 "consumer-offsets artifact version {version} is not understood \
-                 (this build speaks {CONSUMER_OFFSETS_VERSION})"
+                 (this build speaks {CONSUMER_OFFSETS_VERSION_1} and \
+                 {CONSUMER_OFFSETS_VERSION})"
             ),
             Self::ChecksumMismatch { expected, actual } => write!(
                 f,
@@ -720,6 +762,7 @@ mod tests {
             next_offset: 43,
             consumers: vec![(1, 10), (7, 42)],
             groups: vec![(2, 5)],
+            external_groups: Vec::new(),
             dedup: vec![
                 dedup_entry(11, 4, 90),
                 dedup_entry(usize::MAX as u128 + 5, 9, 91),
@@ -775,6 +818,7 @@ mod tests {
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
+            external_groups: Vec::new(),
             dedup: Vec::new(),
         };
         let encoded = empty.encode();
@@ -822,6 +866,104 @@ mod tests {
     }
 
     #[test]
+    fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
+        // Nothing else fails when a layout changes and its version bump is
+        // forgotten, and a peer on another release then reads the artifact out
+        // of place. One entry per section makes each length cover the header,
+        // every count field and every entry stride. Changing a length is the
+        // reminder to change its version.
+        const VERSION_1_LEN: usize = 138;
+        const VERSION_2_LEN: usize = 154;
+
+        let with_external = ConsumerOffsetsWire {
+            prepare_checksum: Some(1),
+            checkpoint_prepare: Vec::new(),
+            purge_generation: 0,
+            next_offset: 0,
+            consumers: vec![(1, 0)],
+            groups: vec![(1, 0)],
+            external_groups: vec![(1, 0)],
+            dedup: vec![dedup_entry(1, 0, 0)],
+        };
+        let without_external = ConsumerOffsetsWire {
+            external_groups: Vec::new(),
+            ..with_external.clone()
+        };
+
+        for (wire, version, len) in [
+            (&without_external, CONSUMER_OFFSETS_VERSION_1, VERSION_1_LEN),
+            (&with_external, CONSUMER_OFFSETS_VERSION, VERSION_2_LEN),
+        ] {
+            let encoded = wire.encode();
+            assert_eq!(
+                (encoded[CONSUMER_OFFSETS_MAGIC.len()], encoded.len()),
+                (version, len),
+                "a consumer-offsets layout changed; bump its version with it"
+            );
+        }
+        assert_eq!(
+            (CONSUMER_OFFSETS_VERSION_1, CONSUMER_OFFSETS_VERSION),
+            (1, 2),
+            "a consumer-offsets version moved; confirm its layout moved with it"
+        );
+    }
+
+    /// `server-0.9.0` writes version 1 with this layout. Decoding it has to give
+    /// the same table, and a table with no external group offset has to encode
+    /// to the same bytes, or every partition transfer between the two releases
+    /// fails during a rolling upgrade.
+    #[test]
+    fn given_server_0_9_0_artifact_when_decoded_and_encoded_again_should_match_it() {
+        let wire = ConsumerOffsetsWire {
+            prepare_checksum: Some(u128::MAX - 7),
+            checkpoint_prepare: vec![1, 2, 3],
+            ..table()
+        };
+        let mut released = Vec::new();
+        released.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        released.push(1);
+        released.extend_from_slice(&wire.purge_generation.to_le_bytes());
+        released.extend_from_slice(&wire.next_offset.to_le_bytes());
+        for count in [wire.consumers.len(), wire.groups.len(), wire.dedup.len()] {
+            released.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        }
+        for (id, offset) in wire.consumers.iter().chain(&wire.groups) {
+            released.extend_from_slice(&id.to_le_bytes());
+            released.extend_from_slice(&offset.to_le_bytes());
+        }
+        for entry in &wire.dedup {
+            released.extend_from_slice(&entry.client.to_le_bytes());
+            released.extend_from_slice(&entry.watermark.to_le_bytes());
+            released.extend_from_slice(&entry.latest_commit.to_le_bytes());
+            released.extend_from_slice(&entry.user_id.to_le_bytes());
+            released.extend_from_slice(&entry.committed_window.to_le_bytes());
+        }
+        released.push(1);
+        released.extend_from_slice(&wire.prepare_checksum.unwrap().to_le_bytes());
+        released.extend_from_slice(
+            &u32::try_from(wire.checkpoint_prepare.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        released.extend_from_slice(&wire.checkpoint_prepare);
+        let trailer = state_artifact_checksum(&released);
+        released.extend_from_slice(&trailer.to_le_bytes());
+
+        assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(wire.clone()));
+        assert_eq!(wire.encode(), released);
+    }
+
+    #[test]
+    fn given_external_groups_when_encoded_should_round_trip() {
+        let wire = ConsumerOffsetsWire {
+            external_groups: vec![(2, 0), (9, 1 << 40)],
+            ..table()
+        };
+
+        assert_eq!(ConsumerOffsetsWire::decode(&wire.encode()), Ok(wire));
+    }
+
+    #[test]
     fn given_foreign_magic_when_decoded_should_reject() {
         let mut wrong = table().encode();
         // Rewrite the magic and re-seal so only the magic check can fire.
@@ -844,6 +986,7 @@ mod tests {
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
+            external_groups: Vec::new(),
             dedup: vec![dedup_entry(9, 1, 1), dedup_entry(4, 2, 2)],
         };
         assert_eq!(
@@ -861,6 +1004,7 @@ mod tests {
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
+            external_groups: Vec::new(),
             dedup: vec![dedup_entry(0, 1, 1), dedup_entry(4, 2, 2)],
         };
         assert_eq!(
@@ -893,6 +1037,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
         let trailer = state_artifact_checksum(&bytes);
         bytes.extend_from_slice(&trailer.to_le_bytes());
@@ -917,6 +1062,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&1_000u32.to_le_bytes());
         let trailer = state_artifact_checksum(&bytes);
         bytes.extend_from_slice(&trailer.to_le_bytes());
@@ -934,6 +1080,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         let trailer = state_artifact_checksum(&bytes);
@@ -957,6 +1104,7 @@ mod tests {
             next_offset: 0,
             consumers: vec![(5, 1), (5, 2)],
             groups: Vec::new(),
+            external_groups: Vec::new(),
             dedup: Vec::new(),
         };
         assert_eq!(
@@ -973,6 +1121,7 @@ mod tests {
             next_offset: 0,
             consumers: Vec::new(),
             groups: vec![(9, 1), (4, 2)],
+            external_groups: Vec::new(),
             dedup: Vec::new(),
         };
         assert_eq!(
@@ -1450,6 +1599,14 @@ pub enum PartitionInstallError {
         offer_next_offset: u64,
         local_next_offset: u64,
     },
+    /// The offer holds no segment, no message offset and no consumer offset,
+    /// while this replica holds committed consumer offsets, so installing it
+    /// would unlink them. Such an offer can come from a primary that lost its
+    /// directory, and a receiver that only holds external group offsets has
+    /// no message offset for [`Self::OfferRewindsDurableData`] to protect.
+    OfferErasesDurableOffsets {
+        local_offsets: usize,
+    },
     /// Consumer-offset staging failed before the segment swap, or finalizing a
     /// staged offset failed during it.
     OffsetPersistence {
@@ -1523,6 +1680,11 @@ impl fmt::Display for PartitionInstallError {
                 f,
                 "offer frontier {offer_next_offset} is below this replica's own next offset \
                  {local_next_offset}; installing it would rewind the offset space"
+            ),
+            Self::OfferErasesDurableOffsets { local_offsets } => write!(
+                f,
+                "offer holds no data while this replica holds {local_offsets} committed \
+                 consumer offsets; installing it would unlink them"
             ),
             Self::OffsetPersistence { path, source } => {
                 write!(f, "consumer offset persistence failed at {path}: {source}")
@@ -1813,13 +1975,6 @@ struct PlannedOffsetWrite {
     value: u64,
 }
 
-pub(crate) const fn consumer_kind_index(kind: ConsumerKind) -> usize {
-    match kind {
-        ConsumerKind::Consumer => 0,
-        ConsumerKind::ConsumerGroup => 1,
-    }
-}
-
 async fn stage_offset_writes(planned: &[PlannedOffsetWrite]) -> Result<(), PartitionInstallError> {
     for batch in planned.chunks(OFFSET_PERSIST_CONCURRENCY) {
         let writes = batch.iter().map(|write| async move {
@@ -1868,32 +2023,24 @@ where
         offsets_wire: &ConsumerOffsetsWire,
         next_offset: u64,
     ) -> Result<Vec<PlannedOffsetWrite>, PartitionInstallError> {
-        let consumer_dir =
-            self.consumer_offsets_path
-                .as_deref()
-                .ok_or(PartitionInstallError::NoOffsetDir {
-                    kind: ConsumerKind::Consumer,
-                })?;
-        let group_dir = self.consumer_group_offsets_path.as_deref().ok_or(
-            PartitionInstallError::NoOffsetDir {
-                kind: ConsumerKind::ConsumerGroup,
-            },
-        )?;
-        let clamp = |offset: u64| next_offset.checked_sub(1).map(|last| offset.min(last));
+        let sections = offsets_wire.offset_sections();
         let mut planned =
-            Vec::with_capacity(offsets_wire.consumers.len() + offsets_wire.groups.len());
-        for (kind, dir, offsets) in [
-            (
-                ConsumerKind::Consumer,
-                consumer_dir,
-                &offsets_wire.consumers,
-            ),
-            (ConsumerKind::ConsumerGroup, group_dir, &offsets_wire.groups),
-        ] {
-            planned.extend(offsets.iter().filter_map(|(id, offset)| {
-                clamp(*offset).map(|value| PlannedOffsetWrite {
+            Vec::with_capacity(sections.iter().map(|entries| entries.len()).sum::<usize>());
+        for (kind, offsets) in ConsumerKind::ALL.into_iter().zip(sections) {
+            let dir = self
+                .consumer_offsets_dir(kind)
+                .ok_or(PartitionInstallError::NoOffsetDir { kind })?;
+            // An external group's value belongs to the external system, so it is never clamped.
+            let clamp = kind != ConsumerKind::ExternalGroup;
+            planned.extend(offsets.iter().filter_map(|&(id, offset)| {
+                let value = if clamp {
+                    offset.min(next_offset.checked_sub(1)?)
+                } else {
+                    offset
+                };
+                Some(PlannedOffsetWrite {
                     kind,
-                    id: *id,
+                    id,
                     path: format!("{dir}/{id}"),
                     value,
                 })
@@ -2094,7 +2241,11 @@ where
 
         // An empty chain at frontier 0 tells the receiver to unlink its own, so
         // serve it only when a recorded purge says the emptiness is the truth.
-        // `install_state_transfer`'s `purge_advances` check re-decides that
+        // Offset-only ops, such as external group commits, move the commit
+        // floor without a message, so a replica holding zero bytes passes the
+        // `NothingCommitted` gate above. Its empty chain would let a receiver at
+        // frontier 0 claim a history that neither replica holds.
+        // `install_state_transfer`'s `purge_advances` check re-decides the purge
         // against the metadata plane and refuses the rest.
         let offsets_wire = self.offsets_wire_snapshot()?;
         if segments.is_empty()
@@ -2253,7 +2404,7 @@ where
     }
 
     fn validate_consumer_offset_transfer_counts(&self) -> Result<(), PartitionTransferUnavailable> {
-        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+        for kind in ConsumerKind::ALL {
             let count = self.durable_consumer_offsets.count(kind);
             if let Err(error) = validate_consumer_offset_transfer_count(
                 kind,
@@ -2288,6 +2439,8 @@ where
         let groups = self.snapshot_offset_kind(ConsumerKind::ConsumerGroup, |id| {
             group_map.contains_key(&ConsumerGroupId(id as usize))
         })?;
+        // Durable state is the only store of external offsets, so no live map can disagree.
+        let external_groups = self.snapshot_offset_kind(ConsumerKind::ExternalGroup, |_| true)?;
         // The append counter, not the segment end: retention can GC every
         // sealed segment while the counter stands at N, and the receiver
         // must resume minting at N either way.
@@ -2330,6 +2483,7 @@ where
             next_offset,
             consumers,
             groups,
+            external_groups,
             dedup,
         })
     }
@@ -2690,6 +2844,23 @@ where
                 offer_next_offset: offsets_wire.next_offset,
                 local_next_offset,
             });
+        }
+        // The durable offset table has no frontier to compare, so the same
+        // rule keys on what each side holds. A replica that only holds external
+        // group offsets reads 0 above, and an offer that holds nothing at all
+        // would unlink every one of them.
+        let offer_holds_nothing = staged.is_empty()
+            && offsets_wire.next_offset == 0
+            && offsets_wire
+                .offset_sections()
+                .iter()
+                .all(|entries| entries.is_empty());
+        let local_offsets: usize = ConsumerKind::ALL
+            .into_iter()
+            .map(|kind| self.durable_consumer_offsets.count(kind))
+            .sum();
+        if !purge_advances && offer_holds_nothing && local_offsets > 0 {
+            return Err(PartitionInstallError::OfferErasesDurableOffsets { local_offsets });
         }
         staged.sort_unstable_by_key(|meta| meta.start_offset);
         for pair in staged.windows(2) {
@@ -3165,83 +3336,45 @@ where
         // appends fold onto a pre-install base until the first real evict.
         self.log.journal_mut().info = crate::log::JournalInfo::default();
 
-        // Consumer offsets: replace both maps through the SAME Arcs (the
+        // Consumer offsets: replace the live maps through the SAME Arcs (the
         // data plane holds clones), unlink the old files, install the
         // transferred entries with locally minted paths, clamped like boot
-        // recovery clamps. The clamp anchors on the GROUP FRONTIER, not the
-        // staged end: an empty staged set (everything GC'd at the origin)
-        // must not rewind every transferred offset to 0 -- a durable,
-        // client-visible rewind the replicas would then disagree on.
+        // recovery clamps, external groups excepted. The clamp anchors on the
+        // GROUP FRONTIER, not the staged end: an empty staged set (everything
+        // GC'd at the origin) must not rewind every transferred offset to 0 --
+        // a durable, client-visible rewind the replicas would then disagree on.
         let installed_end = staged.last().map(|meta| meta.end_offset);
-        // A key that fails the u32 narrowing would strand its old offset
-        // file's delete, which boot can then resurrect: unreachable while
-        // keys are minted from u32 wire ids, so assert it.
-        let old_consumer_paths: Vec<(ConsumerKind, u32, String)> = {
-            let guard = self.consumer_offsets.pin();
-            let mut paths: Vec<(ConsumerKind, u32, String)> = guard
-                .iter()
-                .filter_map(|(key, _)| {
-                    let narrowed = u32::try_from(*key).ok();
-                    debug_assert!(narrowed.is_some(), "consumer offset key {key} exceeds u32");
-                    narrowed.and_then(|id| {
-                        self.persisted_offset_path(ConsumerKind::Consumer, id)
-                            .map(|path| (ConsumerKind::Consumer, id, path))
-                    })
-                })
-                .collect();
-            guard.clear();
-            // The map is not the whole truth about what is on disk: a repaired
-            // pre-purge offset op persists a file this incarnation never held,
-            // and a purged origin offering `next_offset = 0` drops every
-            // incoming entry, so a map-only sweep leaves the old table for boot
-            // to resurrect.
-            paths.extend(
-                strayed_offset_files(self.consumer_offsets_path.as_deref())
+        // The durable table names every file a committed offset op wrote. It is
+        // not the whole truth about what is on disk: a repaired pre-purge offset
+        // op persists a file this incarnation never held, and a purged origin
+        // offering `next_offset = 0` drops every clamped entry, so a table-only
+        // sweep leaves the old table for boot to resurrect.
+        let mut old_paths: Vec<(ConsumerKind, u32, String)> = Vec::new();
+        for kind in ConsumerKind::ALL {
+            self.durable_consumer_offsets.with_entries(kind, |entries| {
+                old_paths.extend(entries.keys().filter_map(|&id| {
+                    self.persisted_offset_path(kind, id)
+                        .map(|path| (kind, id, path))
+                }));
+            });
+            old_paths.extend(
+                strayed_offset_files(self.consumer_offsets_dir(kind))
                     .into_iter()
-                    .filter_map(|path| {
-                        numeric_offset_id(&path).map(|id| (ConsumerKind::Consumer, id, path))
-                    }),
+                    .filter_map(|path| numeric_offset_id(&path).map(|id| (kind, id, path))),
             );
-            paths
-        };
-        let old_group_paths: Vec<(ConsumerKind, u32, String)> = {
-            let guard = self.consumer_group_offsets.pin();
-            let mut paths: Vec<(ConsumerKind, u32, String)> = guard
-                .iter()
-                .filter_map(|(key, _)| {
-                    let narrowed = u32::try_from(key.0).ok();
-                    debug_assert!(
-                        narrowed.is_some(),
-                        "consumer group offset key {} exceeds u32",
-                        key.0
-                    );
-                    narrowed.and_then(|id| {
-                        self.persisted_offset_path(ConsumerKind::ConsumerGroup, id)
-                            .map(|path| (ConsumerKind::ConsumerGroup, id, path))
-                    })
-                })
-                .collect();
-            guard.clear();
-            paths.extend(
-                strayed_offset_files(self.consumer_group_offsets_path.as_deref())
-                    .into_iter()
-                    .filter_map(|path| {
-                        numeric_offset_id(&path).map(|id| (ConsumerKind::ConsumerGroup, id, path))
-                    }),
-            );
-            paths
-        };
-        let mut offset_dirs_changed = [false; 2];
+        }
+        self.consumer_offsets.pin().clear();
+        self.consumer_group_offsets.pin().clear();
+        let mut offset_dirs_changed = [false; ConsumerKind::COUNT];
         let planned_ids: HashSet<_> = planned_offsets
             .iter()
             .map(|write| (write.kind, write.id))
             .collect();
         // Replacements atomically overwrite their old files. Only keys absent
-        // from the clamped plan require unlinking, including every key when
+        // from the plan require unlinking, including every clamped key when
         // the incoming message frontier is empty.
-        let old_paths: HashMap<_, _> = old_consumer_paths
+        let old_paths: HashMap<_, _> = old_paths
             .into_iter()
-            .chain(old_group_paths)
             .filter(|(kind, id, _)| !planned_ids.contains(&(*kind, *id)))
             .map(|(kind, id, path)| ((kind, id), path))
             .collect();
@@ -3251,7 +3384,7 @@ where
             match delete_persisted_offset(&path).await {
                 Ok(removed) => {
                     if removed {
-                        offset_dirs_changed[consumer_kind_index(kind)] = true;
+                        offset_dirs_changed[kind.index()] = true;
                     }
                     self.consumer_offset_capacity_for(kind)
                         .clear_stranded(consumer_id);
@@ -3278,10 +3411,10 @@ where
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
 
-        self.consumer_offset_capacity
-            .rebuild(&self.durable_consumer_offsets, std::iter::empty());
-        self.consumer_group_offset_capacity
-            .rebuild(&self.durable_consumer_offsets, std::iter::empty());
+        for kind in ConsumerKind::ALL {
+            self.consumer_offset_capacity_for(kind)
+                .rebuild(&self.durable_consumer_offsets, std::iter::empty());
+        }
         self.last_polled_offsets.pin().clear();
 
         // The replacement siblings were written and data-synced before any
@@ -3299,17 +3432,22 @@ where
                     path: write.path.clone(),
                     source,
                 })?;
-            offset_dirs_changed[consumer_kind_index(write.kind)] = true;
-            let entry = ConsumerOffset::new(write.kind, write.id, write.value, write.path.clone());
+            offset_dirs_changed[write.kind.index()] = true;
+            let entry =
+                || ConsumerOffset::new(write.kind, write.id, write.value, write.path.clone());
             match write.kind {
                 ConsumerKind::Consumer => {
-                    self.consumer_offsets.pin().insert(write.id as usize, entry);
+                    self.consumer_offsets
+                        .pin()
+                        .insert(write.id as usize, entry());
                 }
                 ConsumerKind::ConsumerGroup => {
                     self.consumer_group_offsets
                         .pin()
-                        .insert(ConsumerGroupId(write.id as usize), entry);
+                        .insert(ConsumerGroupId(write.id as usize), entry());
                 }
+                // Recorded below: the durable table is the only store of an external offset.
+                ConsumerKind::ExternalGroup => {}
             }
             self.durable_consumer_offsets.record_explicit(
                 write.kind,
@@ -3322,19 +3460,36 @@ where
         }
         // One observation per changed directory. Retrying with a newly opened
         // handle can mask the writeback error that the first fsync consumed.
-        for (changed, dir) in offset_dirs_changed.into_iter().zip([
-            self.consumer_offsets_path.as_deref(),
-            self.consumer_group_offsets_path.as_deref(),
-        ]) {
-            if changed {
-                let dir = dir.expect("planned offset directory was validated before mutation");
-                fsync_dir(dir)
-                    .await
-                    .map_err(|source| PartitionInstallError::SwapIo {
-                        path: dir.to_owned(),
-                        source,
-                    })?;
+        // The parent comes last: a kind directory created since its last sync
+        // is not durable until `offsets/` is, and once the WAL restarts at this
+        // install nothing replays the files inside it.
+        let mut parents: Vec<&str> = Vec::with_capacity(1);
+        for kind in ConsumerKind::ALL {
+            if !offset_dirs_changed[kind.index()] {
+                continue;
             }
+            let dir = self
+                .consumer_offsets_dir(kind)
+                .expect("planned offset directory was validated before mutation");
+            fsync_dir(dir)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: dir.to_owned(),
+                    source,
+                })?;
+            if let Some(parent) = Path::new(dir).parent().and_then(Path::to_str)
+                && !parents.contains(&parent)
+            {
+                parents.push(parent);
+            }
+        }
+        for parent in parents {
+            fsync_dir(parent)
+                .await
+                .map_err(|source| PartitionInstallError::SwapIo {
+                    path: parent.to_owned(),
+                    source,
+                })?;
         }
 
         // Counters and stats. The offset counter seeds from the ARTIFACT's
@@ -3423,6 +3578,9 @@ where
         // and this install just re-seeded that counter and recorded it durably
         // before the swap.
         self.purge_deferred = false;
+        // The chain an unrecorded purge reset is gone, so a purge still owed
+        // here has to run whole.
+        self.unrecorded_purge_generation = None;
 
         if let Some(persistence) = &self.persistence {
             let prepare = (!offsets_wire.checkpoint_prepare.is_empty())
@@ -3532,6 +3690,9 @@ where
         self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
         while self.log.retire_front().is_some() {}
+        // Same as a completed install: no chain an unrecorded purge reset
+        // survives this, so a purge still owed here has to run whole.
+        self.unrecorded_purge_generation = None;
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
         self.consumer_offsets.pin().clear();
@@ -3540,18 +3701,14 @@ where
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
 
-        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+        for kind in ConsumerKind::ALL {
             self.consumer_offset_capacity_for(kind)
                 .rebuild(&self.durable_consumer_offsets, std::iter::empty());
         }
-        for (kind, dir) in [
-            (ConsumerKind::Consumer, self.consumer_offsets_path.as_ref()),
-            (
-                ConsumerKind::ConsumerGroup,
-                self.consumer_group_offsets_path.as_ref(),
-            ),
-        ] {
-            let Some(dir) = dir else { continue };
+        for kind in ConsumerKind::ALL {
+            let Some(dir) = self.consumer_offsets_dir(kind) else {
+                continue;
+            };
             for entry in offset_dir_entries(dir) {
                 match entry {
                     OffsetDirEntry::Replacement(path) => {

@@ -1021,9 +1021,10 @@ where
                         Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
                             // NOT fenced: the wipe ran and a fresh chain is
                             // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
+                            // the durable record failed, which leaves
+                            // `applied_purge_generation` unmoved and the
+                            // reconciler re-issuing the purge, which redoes
+                            // only the record.
                             // Same pacing argument as the frontier deferral
                             // above; the caches already describe wiped bytes.
                             self.drop_partition_transfer_state(namespace, partition);
@@ -1035,6 +1036,22 @@ where
                                 "purge-partition deferred: reset applied but the generation \
                                  record failed; the reconciler re-issues it"
                             );
+                        }
+                        Err(error @ partitions::PurgeError::OffsetsNotDurable(_)) => {
+                            // The chain is serviceable, but the unlinks of the
+                            // offset files may not be durable, and no retried
+                            // sync can prove them. Fence it like the arm below,
+                            // so the rebuild replaces those files.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition could not sync an offsets dir; fencing it for rebuild"
+                            );
+                            self.drop_partition_transfer_state(namespace, partition);
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
                         }
                         Err(error @ partitions::PurgeError::Unserviceable(_)) => {
                             // Past the drain, so this group has no serviceable

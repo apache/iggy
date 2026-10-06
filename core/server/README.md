@@ -48,6 +48,12 @@ node also mints. If two HTTP sessions share a client id, the server can
 acknowledge a write of one session from the deduplication record of the other
 and not append it.
 
+Upgrade every server before any client stores an external group offset, for
+example through the Kafka gateway. A `server-0.9.0` replica cannot decode that
+consumer kind. It never acknowledges the prepare, and journal repair fails on it
+in the same way. A partition with a majority of `server-0.9.0` replicas then
+stops committing.
+
 For cluster auto-commit consumers, upgrade all servers and binary SDKs together.
 Pause those consumers, upgrade every server, then update their SDKs and restart
 them to rejoin their groups. Primary polling uses binary commands 14, 103 and

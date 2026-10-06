@@ -18,7 +18,7 @@
 use crate::clients::client::IggyClient;
 use crate::clients::consumer::IggyConsumer;
 use crate::clients::producer::IggyProducer;
-use crate::prelude::{IggyError, SystemClient};
+use crate::prelude::{IggyError, SystemClient, Validatable};
 use crate::stream_builder::{IggyStreamConfig, build};
 use tracing::trace;
 
@@ -41,6 +41,8 @@ impl IggyStream {
         client: &IggyClient,
         config: &IggyStreamConfig,
     ) -> Result<(IggyProducer, IggyConsumer), IggyError> {
+        config.consumer_config().validate()?;
+
         trace!("Check if client is connected");
         if client.ping().await.is_err() {
             return Err(IggyError::NotConnected);
@@ -71,6 +73,8 @@ impl IggyStream {
         connection_string: &str,
         config: &IggyStreamConfig,
     ) -> Result<(IggyClient, IggyProducer, IggyConsumer), IggyError> {
+        config.consumer_config().validate()?;
+
         trace!("Build and connect iggy client");
         let client = build::build_iggy_client(connection_string).await?;
 
@@ -101,5 +105,34 @@ impl IggyStream {
         let client = build::build_iggy_client(connection_string).await?;
 
         Ok(client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
+
+    #[tokio::test]
+    async fn given_external_group_kind_when_building_should_refuse_before_any_server_call() {
+        let config = IggyStreamConfig::new(
+            IggyConsumerConfig::with_external_group_kind(),
+            IggyProducerConfig::default(),
+        );
+
+        // Neither client can reach a server, so any other error proves a call was attempted.
+        let unconnected = IggyClient::default();
+        assert!(matches!(
+            IggyStream::build(&unconnected, &config).await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            IggyStream::with_client_from_connection_string(
+                "iggy://user:secret@127.0.0.1:1",
+                &config
+            )
+            .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
     }
 }

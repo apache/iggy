@@ -117,6 +117,7 @@ pub struct RetainedPartitionState {
     pub offset_space_used: bool,
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
+    pub external_group_offsets: Vec<(u32, u64)>,
 }
 
 /// Partition-level data plane operations.
