@@ -1109,7 +1109,11 @@ where
         }
     }
 
-    pub async fn on_persistence_completed(&mut self, completion: PersistenceCompletion) {
+    pub async fn on_persistence_completed(
+        &mut self,
+        completion: PersistenceCompletion,
+        config: &PartitionsConfig,
+    ) {
         if !self
             .persistence
             .as_ref()
@@ -1128,6 +1132,12 @@ where
             if let Err(error) = self.reclaim_retry_checkpoints(checkpoint_op).await {
                 warn!(%error, namespace_raw = self.namespace().inner(), "cannot reclaim obsolete receipt checkpoints");
             }
+        }
+        if self.consensus.is_normal()
+            && !self.consensus.is_transferring()
+            && self.consensus.commit_min() < self.consensus.commit_max()
+        {
+            self.commit_journal(config).await;
         }
     }
 
@@ -9870,6 +9880,137 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_replicated_singleton_when_a_flush_write_completes_should_reply_without_a_tick()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies) = recording_partition_at(0, 1);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+        partition.open_persistence().await.unwrap();
+        let config = repair_config();
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let completion = Rc::new(Cell::new(None));
+        let captured = Rc::clone(&completion);
+        persistence.set_notifier(Rc::new(move |value| captured.set(Some(value))));
+
+        // Hold the writer until the self-ack has reached the physical-write gate.
+        persistence.sync();
+        assert!(persistence.start());
+        let writer = Rc::clone(&persistence).run();
+        let mut request = checksumless_send_request(partition.namespace(), 2);
+        let body = &mut request.as_mut_slice()[size_of::<RoutedRequestHeader>()..];
+        let mut batch = BatchHeader::decode(body).unwrap();
+        batch.batch_checksum = batch.checksum_for_blob(&body[COMMAND_HEADER_SIZE..]);
+        batch.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+        partition.on_request(request.clone(), None).await;
+        assert_eq!(
+            partition.consensus.pipeline_len(),
+            1,
+            "the send must be admitted: {:?}",
+            replies
+                .borrow()
+                .iter()
+                .map(|(_, reply)| bytemuck::checked::from_bytes::<ReplyHeader>(
+                    &reply.as_slice()[..size_of::<ReplyHeader>()]
+                )
+                .status)
+                .collect::<Vec<_>>()
+        );
+        commit_recorded_loopback(&mut partition).await;
+        let header = partition.consensus.pipeline_head_header().unwrap();
+        assert_eq!(partition.consensus.commit_max(), header.op);
+        assert_eq!(partition.consensus.commit_min(), 0);
+        assert!(!persistence.is_written(&header));
+        assert!(partition.pending_persisted_acks.borrow().is_empty());
+        assert!(replies.borrow().is_empty());
+
+        writer.await;
+        assert!(persistence.failure().is_none());
+        assert!(persistence.is_written(&header));
+        assert_eq!(persistence.durable_op(), 0);
+        assert!(replies.borrow().is_empty());
+        let completed = completion
+            .get()
+            .expect("the buffered write must notify its owner");
+        for stale in [
+            PersistenceCompletion {
+                instance: completed.instance + 1,
+                ..completed
+            },
+            PersistenceCompletion {
+                epoch: completed.epoch + 1,
+                ..completed
+            },
+        ] {
+            partition.on_persistence_completed(stale, &config).await;
+            assert!(replies.borrow().is_empty());
+            assert_eq!(partition.consensus.commit_min(), 0);
+        }
+
+        partition.materialization_missing = true;
+        partition.on_persistence_completed(completed, &config).await;
+        assert!(replies.borrow().is_empty());
+        assert_eq!(partition.consensus.commit_min(), 0);
+        partition.materialization_missing = false;
+
+        partition.consensus().begin_state_transfer_await();
+        partition.on_persistence_completed(completed, &config).await;
+        assert!(replies.borrow().is_empty());
+        assert_eq!(partition.consensus.commit_min(), 0);
+        partition
+            .consensus()
+            .set_state_transfer_stage(consensus::StateTransferStage::Idle);
+
+        partition.consensus().begin_view_probe();
+        partition.on_persistence_completed(completed, &config).await;
+        assert!(replies.borrow().is_empty());
+        assert_eq!(partition.consensus.commit_min(), 0);
+        partition.consensus().init();
+        assert_eq!(partition.consensus.commit_max(), header.op);
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+
+        partition.on_persistence_completed(completed, &config).await;
+
+        assert!(partition.fatal().is_none());
+        assert_eq!(
+            partition.consensus.commit_min(),
+            header.op,
+            "a completed flush must release the self-acked reply without a consensus tick"
+        );
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+        assert_eq!(replies.borrow().len(), 1);
+        assert_eq!(partition.stats.messages_count_inconsistent(), 2);
+        assert_eq!(partition.offset.load(Ordering::Acquire), 1);
+        let consensus::client_table::RequestStatus::Duplicate(cached) = partition
+            .dedup
+            .check_partition_request(1, 0, 1, 1, Operation::SendMessages)
+        else {
+            panic!("the completed send must retain its original receipt");
+        };
+        assert!(
+            replies.borrow()[0]
+                .1
+                .shares_allocation(&cached.into_wire_bytes())
+        );
+
+        partition.on_persistence_completed(completed, &config).await;
+        assert_eq!(replies.borrow().len(), 1);
+        partition.on_request(request, None).await;
+        assert_eq!(replies.borrow().len(), 2);
+        assert!(
+            replies.borrow()[0]
+                .1
+                .shares_allocation(&replies.borrow()[1].1)
+        );
+        assert_eq!(partition.stats.messages_count_inconsistent(), 2);
+        assert_eq!(partition.offset.load(Ordering::Acquire), 1);
+        assert_eq!(persistence.head(), header.op);
+    }
+
+    #[compio::test]
     async fn mixed_durability_replies_before_body_writes_below_the_flush_threshold() {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, replies) = recording_partition_at(0, 3);
@@ -11166,7 +11307,9 @@ mod tests {
             assert!(current.exists());
             let completion = completion.get().unwrap();
             assert!(persistence.accepts_completion(completion));
-            partition.on_persistence_completed(completion).await;
+            partition
+                .on_persistence_completed(completion, &config)
+                .await;
             assert!(!previous.exists());
             assert!(
                 current.exists(),

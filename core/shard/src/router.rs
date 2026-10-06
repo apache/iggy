@@ -874,8 +874,11 @@ where
             }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    partition.on_persistence_completed(completion).await;
+                let partitions = self.plane.partitions();
+                if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                    partition
+                        .on_persistence_completed(completion, partitions.config())
+                        .await;
                 }
             }
             LifecycleFrame::ReconcileApply => {
