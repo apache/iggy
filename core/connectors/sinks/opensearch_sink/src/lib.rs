@@ -127,6 +127,8 @@ pub struct OpenSearchSink {
     // Warns at most once per connector instance instead of once per record,
     // so a persistently misconfigured document_id_field can't flood logs.
     missing_document_id_field_warned: AtomicBool,
+    // A stream with an unsupported schema would otherwise warn at the message rate.
+    invalid_record_warned: AtomicBool,
 }
 
 // `OpenSearch` derives `Debug` down through its `Transport`, and
@@ -146,6 +148,7 @@ impl std::fmt::Debug for OpenSearchSink {
                 "missing_document_id_field_warned",
                 &self.missing_document_id_field_warned,
             )
+            .field("invalid_record_warned", &self.invalid_record_warned)
             .finish()
     }
 }
@@ -247,6 +250,7 @@ impl OpenSearchSink {
             documents_indexed: AtomicU64::new(0),
             errors_count: AtomicU64::new(0),
             missing_document_id_field_warned: AtomicBool::new(false),
+            invalid_record_warned: AtomicBool::new(false),
         }
     }
 
@@ -500,6 +504,20 @@ impl OpenSearchSink {
             id,
             document: Value::Object(document),
         })
+    }
+
+    fn log_invalid_record(&self, reason: &str) {
+        if self.invalid_record_warned.swap(true, Ordering::Relaxed) {
+            debug!(
+                "Dropping invalid OpenSearch sink record for connector ID: {}, reason: {reason}",
+                self.id
+            );
+            return;
+        }
+        warn!(
+            "Dropping invalid OpenSearch sink record for connector ID: {}, reason: {reason}. Further drops are counted and logged at debug level.",
+            self.id
+        );
     }
 
     fn document_id_from_field(
@@ -837,10 +855,7 @@ impl Sink for OpenSearchSink {
                 Ok(document) => documents.push(document),
                 Err(Error::InvalidRecordValue(reason)) => {
                     invalid_records += 1;
-                    warn!(
-                        "Dropping invalid OpenSearch sink record for connector ID: {}, reason: {}",
-                        self.id, reason
-                    );
+                    self.log_invalid_record(&reason);
                 }
                 // A single message's preparation failing must not discard the
                 // documents already built from earlier messages in this batch.
@@ -2074,6 +2089,19 @@ mod tests {
             sink.missing_document_id_field_warned
                 .load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn given_repeated_invalid_records_should_warn_only_once() {
+        let sink = sink_with_config(base_config());
+
+        assert!(!sink.invalid_record_warned.load(Ordering::Relaxed));
+
+        sink.log_invalid_record("unsupported payload");
+        assert!(sink.invalid_record_warned.load(Ordering::Relaxed));
+
+        sink.log_invalid_record("unsupported payload");
+        assert!(sink.invalid_record_warned.load(Ordering::Relaxed));
     }
 
     #[test]
