@@ -815,31 +815,28 @@ impl Sink for OpenSearchSink {
     ) -> Result<(), Error> {
         let invocation = self.invocations_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if self.config.verbose_logging {
-            info!(
-                "OpenSearch sink with ID: {} received: {} messages, schema: {}, stream: {}, topic: {}, partition: {}, offset: {}, invocation: {}",
-                self.id,
-                messages.len(),
-                messages_metadata.schema,
-                topic_metadata.stream,
-                topic_metadata.topic,
-                messages_metadata.partition_id,
-                messages_metadata.current_offset,
-                invocation
-            );
-        } else {
-            debug!(
-                "OpenSearch sink with ID: {} received: {} messages, schema: {}, stream: {}, topic: {}, partition: {}, offset: {}, invocation: {}",
-                self.id,
-                messages.len(),
-                messages_metadata.schema,
-                topic_metadata.stream,
-                topic_metadata.topic,
-                messages_metadata.partition_id,
-                messages_metadata.current_offset,
-                invocation
-            );
+        let verbose = self.config.verbose_logging;
+        macro_rules! log_progress {
+            ($($tt:tt)+) => {
+                if verbose {
+                    info!($($tt)+)
+                } else {
+                    debug!($($tt)+)
+                }
+            };
         }
+
+        log_progress!(
+            "OpenSearch sink with ID: {} received: {} messages, schema: {}, stream: {}, topic: {}, partition: {}, offset: {}, invocation: {}",
+            self.id,
+            messages.len(),
+            messages_metadata.schema,
+            topic_metadata.stream,
+            topic_metadata.topic,
+            messages_metadata.partition_id,
+            messages_metadata.current_offset,
+            invocation
+        );
 
         let client = self
             .client
@@ -883,17 +880,13 @@ impl Sink for OpenSearchSink {
             Ok(indexed) => {
                 self.documents_indexed
                     .fetch_add(indexed as u64, Ordering::Relaxed);
-                if self.config.verbose_logging {
-                    info!(
-                        "OpenSearch sink connector ID: {}: indexed {} of {} messages into index '{}'",
-                        self.id, indexed, messages_count, self.config.index
-                    );
-                } else {
-                    debug!(
-                        "OpenSearch sink connector ID: {}: indexed {} of {} messages into index '{}'",
-                        self.id, indexed, messages_count, self.config.index
-                    );
-                }
+                log_progress!(
+                    "OpenSearch sink connector ID: {}: indexed {} of {} messages into index '{}'",
+                    self.id,
+                    indexed,
+                    messages_count,
+                    self.config.index
+                );
                 Ok(())
             }
             Err(partial) => {
