@@ -52,7 +52,7 @@ async fn given_queued_offset_store_when_purged_should_not_skip_replacement_recor
     for client_id in [42, AUTO_COMMIT_CLIENT_ID] {
         for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
             let (mut partition, config, _directory) =
-                partition_with_old_record(CLUSTER_REPLICAS).await;
+                Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
             let consumer = polling_consumer(kind);
             let (returned, delivered) = poll(
                 partition,
@@ -118,7 +118,8 @@ async fn given_queued_offset_store_when_purged_should_not_skip_replacement_recor
 
 #[compio::test]
 async fn given_queued_automatic_commit_when_purged_should_keep_replacement_records_unread() {
-    let (mut partition, config, _directory) = partition_with_old_record(CLUSTER_REPLICAS).await;
+    let (mut partition, config, _directory) =
+        Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
     partition
         .on_request(append(2, b"old pending prepare"), None)
         .await;
@@ -148,7 +149,8 @@ async fn given_queued_automatic_commit_when_purged_should_keep_replacement_recor
 #[compio::test]
 async fn given_queued_explicit_store_when_history_is_unchanged_should_allow_rewind() {
     for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-        let (mut partition, config, _directory) = partition_with_old_record(CLUSTER_REPLICAS).await;
+        let (mut partition, config, _directory) =
+            Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
         partition
             .on_request(append(2, b"second record"), None)
             .await;
@@ -185,7 +187,7 @@ async fn given_queued_offset_delete_when_history_changes_should_reject_without_r
     for purge in [false, true] {
         for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
             let (mut partition, config, _directory) =
-                partition_with_old_record(CLUSTER_REPLICAS).await;
+                Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
             let (sender, receiver) = oneshot_channel();
             partition
                 .on_request(store(42, 1, kind, 0), Some(sender))
@@ -227,7 +229,8 @@ async fn given_queued_offset_delete_when_history_changes_should_reject_without_r
 #[compio::test]
 async fn given_many_obsolete_offsets_when_purged_should_finish_rejections_and_resume_queued_writes()
 {
-    let (mut partition, config, _directory) = partition_with_old_record(CLUSTER_REPLICAS).await;
+    let (mut partition, config, _directory) =
+        Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
     partition
         .on_request(append(2, b"old pending prepare"), None)
         .await;
@@ -278,7 +281,8 @@ async fn given_many_obsolete_offsets_when_purged_should_finish_rejections_and_re
 #[compio::test]
 async fn given_queued_delete_when_replacement_checkpoint_commits_should_preserve_new_progress() {
     let kind = ConsumerKind::Consumer;
-    let (mut partition, config, _directory) = partition_with_old_record(CLUSTER_REPLICAS).await;
+    let (mut partition, config, _directory) =
+        Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
     let (sender, receiver) = oneshot_channel();
     partition
         .on_request(store(42, 1, kind, 0), Some(sender))
@@ -345,7 +349,7 @@ async fn given_waiting_no_ack_offset_mutation_when_purged_should_reject_without_
     for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
         for delete_offset in [false, true] {
             let (mut partition, config, _directory) =
-                partition_with_old_record(SINGLE_REPLICA).await;
+                Box::pin(partition_with_old_record(SINGLE_REPLICA)).await;
             let (mutation, refusal) = if delete_offset {
                 let (sender, stored) = oneshot_channel();
                 partition
@@ -400,7 +404,8 @@ async fn given_waiting_no_ack_offset_mutation_when_purged_should_reject_without_
 
 #[compio::test]
 async fn given_waiting_no_ack_store_when_dispatched_purge_starts_should_reject_without_replay() {
-    let (mut partition, config, _directory) = partition_with_old_record(SINGLE_REPLICA).await;
+    let (mut partition, config, _directory) =
+        Box::pin(partition_with_old_record(SINGLE_REPLICA)).await;
     partition.set_io_notifier(Rc::new(|_, _| {}), largest_legal_job_charge().unwrap());
     partition
         .on_request(append(2, b"old pending prepare"), None)
@@ -428,7 +433,8 @@ async fn given_waiting_no_ack_store_when_dispatched_purge_starts_should_reject_w
 #[compio::test]
 async fn given_queued_offset_mutations_when_shutdown_follows_purge_should_reject_without_replay() {
     for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-        let (mut partition, config, _directory) = partition_with_old_record(CLUSTER_REPLICAS).await;
+        let (mut partition, config, _directory) =
+            Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
         let (sender, receiver) = oneshot_channel();
         partition
             .on_request(store(42, 1, kind, 0), Some(sender))
