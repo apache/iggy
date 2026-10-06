@@ -58,7 +58,7 @@ verbose_logging = false
   Defaults to `true`.
 - `batch_size`: Maximum documents per OpenSearch `_bulk` request. Defaults
   to `1000`.
-- `timeout`: Per-request timeout as a humantime string, for example `30s`.
+- `timeout`: Per-request timeout as a humantime string, for example `30s`. Values under 1s are raised to 1s.
   Defaults to `30s`. Applies to every request the connector makes, including
   reading the response body.
 - `refresh`: OpenSearch bulk `refresh` parameter: `"false"` (default),

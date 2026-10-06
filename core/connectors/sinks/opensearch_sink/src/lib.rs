@@ -229,7 +229,9 @@ impl ResolvedOpenSearchSinkConfig {
             include_metadata: config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA),
             // Clamped to 1: `[T]::chunks(0)` panics, and `documents.chunks(batch_size)` would hit it on `batch_size = 0`.
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1),
-            timeout: parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT),
+            // Clamped to 1s: a zero timeout expires every request at once, so open() never connects.
+            timeout: parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT)
+                .max(Duration::from_secs(1)),
             refresh: config.refresh.map(Into::into),
             max_retries: config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             retry_delay,
@@ -1593,6 +1595,18 @@ mod tests {
         assert_eq!(sink.config.max_open_retries, DEFAULT_MAX_OPEN_RETRIES);
         assert!(sink.config.refresh.is_none());
         assert!(sink.config.document_id_field.is_none());
+    }
+
+    #[test]
+    fn given_zero_timeout_should_clamp_to_one_second() {
+        for raw in ["0s", "0ms", "500ms"] {
+            let mut config = base_config();
+            config.timeout = Some(raw.to_string());
+
+            let resolved = ResolvedOpenSearchSinkConfig::resolve(1, config);
+
+            assert_eq!(resolved.timeout, Duration::from_secs(1), "timeout {raw}");
+        }
     }
 
     #[test]
