@@ -22,22 +22,29 @@ use crate::prelude::{ConsumerKind, IggyError};
 use crate::stream_builder::IggyConsumerConfig;
 use tracing::{error, trace};
 
-/// Builds an `IggyConsumer` from the given `IggyClient` and `IggyConsumerConfig`.
+/// Builds an [`IggyConsumer`] from `config` and awaits [`IggyConsumer::init()`].
 ///
-/// # Arguments
+/// [`consumer_kind()`] picks between a single consumer and a member of a consumer group. A group
+/// is always created when it is missing, and the consumer always joins it. The consumer reads
+/// [`batch_length()`] messages per request, on the [`polling_strategy()`] and the
+/// [`polling_interval()`] of the configuration.
 ///
-/// * `client` - The `IggyClient` to use.
-/// * `config` - The `IggyConsumerConfig` to use.
+/// An [`encryptor()`] in the configuration replaces the one of the client. When
+/// [`init_retries()`] is set, a failed [`IggyConsumer::init()`] is retried that many times.
 ///
 /// # Errors
 ///
-/// * `IggyError` - If the iggy consumer cannot be build.
+/// - Any error raised while building the consumer, such as an invalid stream or topic name.
+/// - Any error returned by [`IggyConsumer::init()`], after the retries run out.
 ///
-/// # Details
-///
-/// This function will create a new `IggyConsumer` with the given `IggyClient` and `IggyConsumerConfig`.
-/// The `IggyConsumerConfig` fields are used to configure the `IggyConsumer`.
-///
+/// [`IggyConsumer`]: crate::prelude::IggyConsumer
+/// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
+/// [`batch_length()`]: crate::prelude::IggyConsumerConfig::batch_length
+/// [`consumer_kind()`]: crate::prelude::IggyConsumerConfig::consumer_kind
+/// [`encryptor()`]: crate::prelude::IggyConsumerConfig::encryptor
+/// [`init_retries()`]: crate::prelude::IggyConsumerConfig::init_retries
+/// [`polling_interval()`]: crate::prelude::IggyConsumerConfig::polling_interval
+/// [`polling_strategy()`]: crate::prelude::IggyConsumerConfig::polling_strategy
 pub(crate) async fn build_iggy_consumer(
     client: &IggyClient,
     config: &IggyConsumerConfig,
