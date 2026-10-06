@@ -3238,22 +3238,25 @@ mod tests {
             repair.first_batch_offset = Some(20);
         }
 
-        compio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                shard
-                    .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
-                    .await;
-                if shard
-                    .plane
-                    .partitions()
-                    .get_by_ns(&ns)
-                    .is_some_and(|partition| partition.repair.is_none())
-                {
-                    break;
+        Box::pin(compio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    shard
+                        .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+                        .await;
+                    if shard
+                        .plane
+                        .partitions()
+                        .get_by_ns(&ns)
+                        .is_some_and(|partition| partition.repair.is_none())
+                    {
+                        break;
+                    }
+                    compio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
-                compio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        })
+            },
+        ))
         .await
         .expect("repair finishes after its WAL becomes durable");
 

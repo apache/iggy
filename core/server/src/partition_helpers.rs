@@ -1515,7 +1515,7 @@ mod tests {
             }
 
             let recovered = if use_loader {
-                load_partition(
+                Box::pin(load_partition(
                     &config,
                     &partitions_config,
                     namespace,
@@ -1526,7 +1526,7 @@ mod tests {
                     REPLICA,
                     REPLICAS,
                     Rc::new(IggyMessageBus::new(0)),
-                )
+                ))
                 .await
             } else {
                 build_partition_fresh(
@@ -1650,7 +1650,7 @@ mod tests {
             preallocate_segments: Some(false),
             ..Default::default()
         };
-        let result = load_partition(
+        let result = Box::pin(load_partition(
             &config,
             partitions.config(),
             namespace,
@@ -1661,7 +1661,7 @@ mod tests {
             REPLICA,
             REPLICAS,
             Rc::new(IggyMessageBus::new(0)),
-        )
+        ))
         .await;
         assert!(matches!(
             result,
@@ -2015,7 +2015,7 @@ mod tests {
                 };
                 store.write(&state.to_bytes()).await.unwrap();
             }
-            let recovered = load_partition(
+            let recovered = Box::pin(load_partition(
                 &config,
                 &partitions_config,
                 namespace,
@@ -2026,7 +2026,7 @@ mod tests {
                 REPLICA,
                 REPLICAS,
                 Rc::new(IggyMessageBus::new(0)),
-            )
+            ))
             .await
             .unwrap();
             assert_eq!(
@@ -2267,7 +2267,7 @@ mod tests {
         std::fs::remove_file(partitions_config.get_messages_path(1, 1, 0, 0)).unwrap();
         std::fs::remove_file(partitions_config.get_index_path(1, 1, 0, 0)).unwrap();
         let partitions = solo_partitions(&config);
-        let partition = load_partition(
+        let partition = Box::pin(load_partition(
             &config,
             partitions.config(),
             namespace,
@@ -2278,7 +2278,7 @@ mod tests {
             REPLICA,
             REPLICAS,
             Rc::new(IggyMessageBus::new(0)),
-        )
+        ))
         .await
         .unwrap();
         assert_eq!(partition.log.active_segment().start_offset, 1);
