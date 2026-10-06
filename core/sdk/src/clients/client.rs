@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::client_wrapper::{ClientRequestPolicy, ClientWrapper};
 use crate::client_wrappers::connection_info::ConnectionInfo;
 use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
@@ -36,9 +36,11 @@ use iggy_binary_protocol::codes::{
 };
 use iggy_common::Consumer;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+use iggy_common::request_budget::RequestBudget;
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::spawn;
 use tokio::task::JoinHandle;
@@ -227,6 +229,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 #[allow(dead_code)]
 pub struct IggyClient {
     pub(crate) client: IggyRwLock<ClientWrapper>,
+    pub(crate) request_policy: Option<Arc<dyn ClientRequestPolicy>>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
     heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
@@ -447,9 +450,13 @@ impl IggyClient {
     /// [`TcpClient`]: crate::prelude::TcpClient
     /// [`ClientWrapper`]: crate::prelude::ClientWrapper
     pub fn new(client: ClientWrapper) -> Self {
+        // Only TCP currently supplies a request policy. It bounds login, PAT login, and connect
+        // when sign-in credentials are available, including their lock waits.
+        let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
+            request_policy,
             partitioner: None,
             encryptor: None,
             heartbeat_handle: Mutex::new(None),
@@ -559,13 +566,40 @@ impl IggyClient {
             info!("Client-side encryption is enabled.");
         }
 
+        // Only TCP currently supplies a request policy. It bounds login, PAT login, and connect
+        // when sign-in credentials are available, including their lock waits.
+        let request_policy = client.request_policy();
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
+            request_policy,
             partitioner,
             encryptor,
             heartbeat_handle: Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn run_request_with_budget<T>(
+        &self,
+        future: impl Future<Output = Result<T, IggyError>>,
+    ) -> Result<T, IggyError> {
+        let Some(policy) = self
+            .request_policy
+            .as_ref()
+            .filter(|policy| policy.is_active())
+        else {
+            return future.await;
+        };
+        RequestBudget::run(
+            Some(policy.timeout()),
+            || {
+                if let Err(error) = policy.expire() {
+                    error!("Failed to expire the client request: {error}");
+                }
+            },
+            future,
+        )
+        .await
     }
 
     /// Returns a handle to the underlying transport client.
@@ -948,49 +982,61 @@ impl Drop for IggyClient {
 #[async_trait]
 impl Client for IggyClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        let heartbeat_interval;
-        {
-            let client = self.client.read().await;
-            client.connect().await?;
-            heartbeat_interval = client.heartbeat_interval().await;
-        }
-
-        let mut heartbeat_handle = self
-            .heartbeat_handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if heartbeat_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Ok(());
-        }
-
-        drop(heartbeat_handle.take());
-        let client = self.client.clone();
-        *heartbeat_handle = Some(spawn(async move {
-            loop {
-                debug!("Sending the heartbeat...");
-                if let Err(error) = client.read().await.ping().await {
-                    error!("There was an error when sending a heartbeat. {error}");
-                    if error == IggyError::ClientShutdown {
-                        warn!("The client has been shut down - stopping the heartbeat.");
-                        return;
-                    }
-                } else {
-                    debug!("Heartbeat was sent successfully.");
-                    // Picks up a widened assignment (e.g. partition-count
-                    // change) without waiting for an ownership-fence rejection.
-                    client
-                        .read()
-                        .await
-                        .refresh_consumer_group_assignments()
-                        .await;
-                }
-                sleep(heartbeat_interval.get_duration()).await
+        let operation = async {
+            let heartbeat_interval;
+            {
+                let client = self.client.read().await;
+                client.connect().await?;
+                heartbeat_interval = client.heartbeat_interval().await;
             }
-        }));
-        Ok(())
+
+            let mut heartbeat_handle = self
+                .heartbeat_handle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if heartbeat_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+            {
+                return Ok(());
+            }
+
+            drop(heartbeat_handle.take());
+            let client = self.client.clone();
+            *heartbeat_handle = Some(spawn(async move {
+                loop {
+                    debug!("Sending the heartbeat...");
+                    if let Err(error) = client.read().await.ping().await {
+                        error!("There was an error when sending a heartbeat. {error}");
+                        if error == IggyError::ClientShutdown {
+                            warn!("The client has been shut down - stopping the heartbeat.");
+                            return;
+                        }
+                    } else {
+                        debug!("Heartbeat was sent successfully.");
+                        // Picks up a widened assignment (e.g. partition-count
+                        // change) without waiting for an ownership-fence rejection.
+                        client
+                            .read()
+                            .await
+                            .refresh_consumer_group_assignments()
+                            .await;
+                    }
+                    sleep(heartbeat_interval.get_duration()).await
+                }
+            }));
+            Ok(())
+        };
+        if RequestBudget::deadline().is_some()
+            || self
+                .request_policy
+                .as_ref()
+                .is_some_and(|policy| policy.should_budget_connect())
+        {
+            self.run_request_with_budget(operation).await
+        } else {
+            operation.await
+        }
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
@@ -1009,6 +1055,90 @@ impl Client for IggyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_common::{AutoLogin, Credentials, NonZeroIggyDuration, TcpClientConfig, UserClient};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn non_tcp_clients_have_no_request_policy() {
+        for protocol in [
+            TransportProtocol::Http,
+            TransportProtocol::Quic,
+            TransportProtocol::WebSocket,
+        ] {
+            let connection_string = format!("iggy+{protocol}://user:secret@127.0.0.1:1234");
+            let client = IggyClient::from_connection_string(&connection_string).unwrap();
+            assert!(
+                client.request_policy.is_none(),
+                "{protocol} must not have a request policy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_login_deadline_includes_high_level_client_lock() {
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            request_timeout: NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap(),
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let handle = client.client();
+        let lock = handle.write().await;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), client.login_user("iggy", "iggy"))
+                .await
+                .expect("login deadline must cover the high-level client lock");
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn tcp_auto_login_deadline_includes_high_level_client_lock() {
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_owned(),
+                "iggy".into(),
+            )),
+            request_timeout: NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap(),
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let handle = client.client();
+        let lock = handle.write().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("connect deadline must cover the high-level client lock");
+        assert!(matches!(
+            result,
+            Err(IggyError::RequestTimeoutOutcomeUnknown)
+        ));
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_without_credentials_keeps_existing_lock_wait() {
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            request_timeout: NonZeroIggyDuration::new(Duration::from_millis(20)).unwrap(),
+            ..TcpClientConfig::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        let handle = client.client();
+        let lock = handle.write().await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.connect())
+                .await
+                .is_err()
+        );
+        drop(lock);
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
