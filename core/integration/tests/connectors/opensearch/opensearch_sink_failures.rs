@@ -38,23 +38,12 @@
 //!     `Sink::consume()` returns `Err`.
 //!
 //!     That `Err` does not halt the connector. `process_messages` in
-//!     `runtime/src/sink.rs` invokes the FFI `consume` callback and discards
-//!     its return code:
-//!
-//!     ```ignore
-//!     (consume)(plugin_id, ..., messages.as_ptr(), messages.len());
-//!     Ok(SinkBatchTiming { processed_count, decode_elapsed, ffi_elapsed })
-//!     ```
-//!
-//!     `process_messages` always returns `Ok`, so `consume_messages`'s
-//!     `if let Err(error) = result { return Err(error); }` fires only on the
-//!     runtime's own internal failures (serialization, missing message
-//!     fields), never on a plugin-returned `Err`. `ConnectorStatus` never
-//!     leaves `Running`, and `/stats` `errors` (fed only by
-//!     `process_messages`'s own decode/transform/field-validation failures)
-//!     never increments. The malformed document is dropped with no
-//!     API-visible trace; the only record is this connector's own `tracing`
-//!     output. Subscribes to `test_topic_2`, distinct from the healthy
+//!     `runtime/src/sink.rs` counts a non-zero FFI status in the sink's
+//!     error counter and moves on to the next run, so `/stats` `errors`
+//!     rises once per failed run. `ConnectorStatus` never leaves `Running`
+//!     and `last_error` stays empty. The malformed document is dropped; the
+//!     counter and this connector's own `tracing` output are the only trace.
+//!     Subscribes to `test_topic_2`, distinct from the healthy
 //!     sink's `test_topic`, so it never receives the healthy sink's
 //!     messages or vice versa.
 //!
@@ -68,7 +57,9 @@ use crate::connectors::fixtures::{OpenSearchFailureFixture, OpenSearchOps};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::{Identifier, MessageClient};
-use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus, HealthResponse, SinkInfoResponse};
+use iggy_connector_sdk::api::{
+    ConnectorError, ConnectorRuntimeStats, ConnectorStatus, HealthResponse, SinkInfoResponse,
+};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
@@ -100,6 +91,31 @@ async fn fetch_sinks(http_client: &Client, api_address: &str) -> Vec<SinkInfoRes
         .expect("Failed to query /sinks");
     assert_eq!(response.status(), 200);
     response.json().await.expect("Failed to parse sinks")
+}
+
+/// Polls `/stats` until the sink reports at least one error, then returns its count.
+async fn wait_for_sink_errors(http_client: &Client, api_address: &str, key: &str) -> u64 {
+    for _ in 0..100 {
+        let stats: ConnectorRuntimeStats = http_client
+            .get(format!("{api_address}/stats"))
+            .send()
+            .await
+            .expect("Failed to query /stats")
+            .json()
+            .await
+            .expect("Failed to parse stats");
+        let errors = stats
+            .connectors
+            .iter()
+            .find(|connector| connector.key == key)
+            .expect("sink should be reported in stats")
+            .errors;
+        if errors > 0 {
+            return errors;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("sink '{key}' never reported an error in /stats");
 }
 
 /// Returns the matching sink's `last_error`, if any, once it reaches `status`.
@@ -268,8 +284,12 @@ async fn given_missing_index_and_mapping_conflict_should_isolate_failures_from_h
         "the valid document in the mixed batch should still be indexed"
     );
 
-    // The connector itself survives its own consume() failure: no status
-    // change, no last_error, no /stats error count. See the module doc.
+    // The failed run reaches /stats, while the connector itself survives it: no
+    // status change and no last_error. See the module doc.
+    let errors =
+        wait_for_sink_errors(&http_client, &api_address, "opensearch_mapping_conflict").await;
+    assert_eq!(errors, 1, "one failed consume() run should count one error");
+
     let sinks = fetch_sinks(&http_client, &api_address).await;
     let mapping_conflict_sink = sinks
         .iter()
@@ -278,7 +298,7 @@ async fn given_missing_index_and_mapping_conflict_should_isolate_failures_from_h
     assert_eq!(
         mapping_conflict_sink.status,
         ConnectorStatus::Running,
-        "a consume()-level Err does not flip connector status; it is silently absorbed"
+        "a consume()-level Err does not flip connector status"
     );
     assert!(
         mapping_conflict_sink.last_error.is_none(),

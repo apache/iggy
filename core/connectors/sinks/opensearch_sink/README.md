@@ -175,19 +175,18 @@ one from another without converting first is off by a factor of 1000.
 and similar setup failures correctly flip the connector to
 `ConnectorStatus::Error`, reported via the runtime's `/sinks` endpoint.
 
-**A batch that fails at `consume()` time is not currently visible anywhere
-except this connector's own logs.** This is not specific to this connector;
-it is how the shared connectors runtime invokes every sink's `consume()`
-over FFI today: the plugin's returned status is not propagated to
-`ConnectorStatus`, `last_error`, or the `/stats` `errors` counter, and the
-runtime does not hold back or redeliver the failed batch. Verified against a
-live server: a batch containing a real OpenSearch `mapper_parsing_exception`
-was correctly classified and logged by this connector as a
-`PermanentHttpError`, and the connector continued consuming and indexing
-later messages normally, with `ConnectorStatus` staying `Running`
-throughout. **Operators must monitor this connector's own `tracing` output
-(`error!` at target `iggy_connector_opensearch_sink`) to detect indexing
-failures; the runtime's own status and stats APIs will not show them.**
+**A batch that fails at `consume()` time does not change the connector's
+status.** This is how the shared connectors runtime invokes every sink's
+`consume()` over FFI: a non-zero status increments the sink's `errors`
+counter in `/stats`, once per failed run, but `ConnectorStatus` stays
+`Running`, `last_error` stays empty, and the runtime does not hold back or
+redeliver the failed batch. Verified against a live server: a batch containing
+a real OpenSearch `mapper_parsing_exception` was classified and logged by this
+connector as a `PermanentHttpError`, the `/stats` error counter rose, and the
+connector continued consuming and indexing later messages normally.
+**Operators should alert on the `/stats` `errors` counter and read this
+connector's own `tracing` output (`error!` at target
+`iggy_connector_opensearch_sink`) for the cause.**
 
 Within a single `consume()` call, a `_bulk` request can return HTTP 200 while
 individual documents fail. This connector parses the per-item `items[]`
