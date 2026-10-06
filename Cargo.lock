@@ -3258,6 +3258,7 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "bit-set 0.11.1",
+ "blake3",
  "bytemuck",
  "bytes",
  "clock",
@@ -6845,6 +6846,8 @@ dependencies = [
  "iggy_common",
  "mockall",
  "quinn",
+ "rand 0.10.2",
+ "rcgen",
  "reqwest 0.13.5",
  "reqwest-middleware",
  "reqwest-retry",
@@ -12902,6 +12905,7 @@ dependencies = [
  "partitions",
  "prometheus-client",
  "server_common",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]

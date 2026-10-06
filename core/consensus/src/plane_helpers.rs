@@ -404,6 +404,21 @@ pub fn seal_prepare_checksum(mut message: Message<PrepareHeader>) -> Message<Pre
     message
 }
 
+#[must_use]
+/// # Panics
+/// If capacity exceeds `u32`; configuration and recovery validate a tighter bound.
+pub fn seal_prepare_capacity(
+    message: Message<PrepareHeader>,
+    capacity: usize,
+) -> Message<PrepareHeader> {
+    let capacity = u32::try_from(capacity).expect("configured retry capacity fits u32");
+    let message = message.transmute_header(|old, new| {
+        *new = old;
+        new.retry_capacity = capacity;
+    });
+    seal_prepare_checksum(message)
+}
+
 /// Shared preflight checks for `on_ack`.
 ///
 /// # Errors

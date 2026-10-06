@@ -17,9 +17,9 @@
 
 //! Binary protocol versioning.
 //!
-//! The protocol version is this crate's own semver, const-parsed from
-//! `CARGO_PKG_VERSION` into a packed `u32` so it auto-bumps with releases
-//! and stays cheaply comparable. It is exchanged during the login/register
+//! The wire version is an explicit packed semver, maintained manually for
+//! stable Iggy releases and independent of server and SDK package versions.
+//! It is exchanged during the login/register
 //! handshake: clients send [`ClientVersionInfo`] as the body prefix of both
 //! login-register request shapes, the server gates on
 //! [`is_protocol_compatible`] before touching credentials and advertises
@@ -45,10 +45,8 @@
 //! value = major << 20 | minor << 10 | patch
 //! ```
 //!
-//! Integer order equals semver order. The value tracks the
-//! `iggy_binary_protocol` crate release; under 0.x a minor bump may break
-//! the wire, so the gate is minor-scoped. Compatibility across minor versions
-//! after 1.0.0 requires changing the minimum-version calculation below.
+//! Integer order equals semver order. Every component participates in the
+//! compatibility check; a patch increment does not imply wire compatibility.
 //!
 //! ## `ClientVersionInfo` body prefix
 //!
@@ -69,12 +67,15 @@
 //!
 //! ## Login gate
 //!
-//! The server accepts a client when its packed version is
-//! `>= IGGY_PROTOCOL_VERSION_MIN` and its `major.minor` is `<=` the
-//! server's. Patch releases never change the wire, so the upper bound
-//! ignores patch. `IGGY_PROTOCOL_VERSION_MIN` defaults to the current
-//! version with patch zeroed and is widened deliberately when a minor
-//! bump stays wire-compatible.
+//! The server accepts a client when its packed version is in the inclusive
+//! range `IGGY_PROTOCOL_VERSION_MIN..=IGGY_PROTOCOL_VERSION`, including patch.
+//! Set both bounds manually for each stable release. Keep them equal unless
+//! every released protocol in a wider range is deliberately supported.
+//!
+//! Compatibility is defined between stable releases. Intermediate development
+//! and edge builds may share a protocol number while their layouts change;
+//! they require matching client and server builds. Such changes do not require
+//! a protocol bump for each commit.
 //!
 //! ## Rejection frame
 //!
@@ -98,37 +99,30 @@ const COMPONENT_BITS: u32 = 10;
 const COMPONENT_MAX: u32 = (1 << COMPONENT_BITS) - 1;
 const PATCH_MASK: u32 = COMPONENT_MAX;
 
-/// Current binary protocol version: this crate's semver, packed.
-/// Pre-release tags (`-edge.N`) are ignored.
-pub const IGGY_PROTOCOL_VERSION: u32 = parse_packed_semver(env!("CARGO_PKG_VERSION"));
-
-/// Oldest protocol version this build still accepts at login: the current
-/// version with patch zeroed (patch releases never change the wire).
-/// Widen deliberately when a minor bump stays wire-compatible.
+/// Current development protocol version, independent of package versions.
 ///
-/// Under 0.x this makes a server minor bump a client flag-day: every
-/// prior-minor client is rejected at login until MIN is widened. A rolling
-/// upgrade across a minor bump must either widen MIN (when the wire stayed
-/// compatible) or accept that old clients fail re-login -- decide per release.
-// TODO(hubcio): past 1.0.0 follow strict semver: major bump = incompatible,
-// minor/patch = compatible, so MIN derives from the current major instead
-// of the current minor. Under 0.x a minor bump may break the wire, so the
-// minor-scoped window is correct.
-pub const IGGY_PROTOCOL_VERSION_MIN: u32 = IGGY_PROTOCOL_VERSION & !PATCH_MASK;
-// A 0.0.x crate version would pack MIN to 0, which `EvictionHeader::validate`
-// rejects (window requires min >= 1) -- the server would emit eviction frames
-// that fail its own validation.
-const _: () = assert!(IGGY_PROTOCOL_VERSION_MIN > 0);
+/// Version 0.11.1 requires the session-binding secret in login requests.
+/// Finalize this number and the minimum during stable release preparation.
+/// Released servers using protocol 0.11.0 accept every 0.11.x patch, so an
+/// incompatible release needs a new minor version for those servers to reject it.
+pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 11, 1);
+
+/// Oldest protocol version this build accepts at login.
+/// Version 0.11.0 has no session-binding secret and is incompatible.
+///
+/// Keep this equal to the current protocol unless compatibility with older
+/// released protocols has been verified. Decide the range per stable release.
+pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 11, 1);
+const _: () =
+    assert!(IGGY_PROTOCOL_VERSION_MIN > 0 && IGGY_PROTOCOL_VERSION_MIN <= IGGY_PROTOCOL_VERSION);
 
 /// Range check used by the server-side login gate.
 ///
 /// Packed component order preserves semver ordering, so plain integer
-/// comparisons work. The upper bound ignores patch: patch releases never
-/// change the wire, so a newer patch of an accepted minor is compatible.
+/// comparisons enforce both inclusive bounds, including patch versions.
 #[must_use]
 pub const fn is_protocol_compatible(client: u32) -> bool {
-    client >= IGGY_PROTOCOL_VERSION_MIN
-        && (client >> COMPONENT_BITS) <= (IGGY_PROTOCOL_VERSION >> COMPONENT_BITS)
+    client >= IGGY_PROTOCOL_VERSION_MIN && client <= IGGY_PROTOCOL_VERSION
 }
 
 /// Pack semver components: `major << 20 | minor << 10 | patch`.
@@ -160,43 +154,6 @@ impl std::fmt::Display for ProtocolVersion {
     }
 }
 
-/// Const-parse `major.minor.patch[-pre]` into a packed `u32`.
-/// Malformed input is a compile error in const context.
-const fn parse_packed_semver(version: &str) -> u32 {
-    let bytes = version.as_bytes();
-    let (major, i) = parse_component(bytes, 0);
-    assert!(
-        i < bytes.len() && bytes[i] == b'.',
-        "expected '.' after major"
-    );
-    let (minor, j) = parse_component(bytes, i + 1);
-    assert!(
-        j < bytes.len() && bytes[j] == b'.',
-        "expected '.' after minor"
-    );
-    let (patch, k) = parse_component(bytes, j + 1);
-    assert!(
-        k == bytes.len() || bytes[k] == b'-' || bytes[k] == b'+',
-        "unexpected trailing bytes after patch"
-    );
-    pack_protocol_version(major, minor, patch)
-}
-
-/// Parse a decimal run starting at `start`; returns (value, index past digits).
-const fn parse_component(bytes: &[u8], start: usize) -> (u32, usize) {
-    assert!(
-        start < bytes.len() && bytes[start].is_ascii_digit(),
-        "expected digit"
-    );
-    let mut value: u32 = 0;
-    let mut i = start;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value * 10 + (bytes[i] - b'0') as u32;
-        i += 1;
-    }
-    (value, i)
-}
-
 /// Client identity sent as the prefix of every login-register request body.
 ///
 /// Wire format:
@@ -204,8 +161,8 @@ const fn parse_component(bytes: &[u8], start: usize) -> (u32, usize) {
 /// [protocol_version:u32 LE][sdk_name_len:u8][sdk_name:N][sdk_version_len:u8][sdk_version:N]
 /// ```
 ///
-/// `protocol_version` is the packed `iggy_binary_protocol` crate version the
-/// client was built against; `sdk_version` is the client crate's own version
+/// `protocol_version` is the packed wire version the client implements;
+/// `sdk_version` is the client crate's own version
 /// (e.g. the `iggy` crate for the Rust SDK). Encoded first so the server can
 /// parse and gate on it regardless of how the rest of the body evolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,16 +255,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_crate_version_with_prerelease() {
-        assert_eq!(
-            parse_packed_semver("0.10.1-edge.2"),
-            pack_protocol_version(0, 10, 1)
-        );
-        assert_eq!(parse_packed_semver("1.2.3"), pack_protocol_version(1, 2, 3));
-        assert_eq!(
-            parse_packed_semver("10.0.0+build.5"),
-            pack_protocol_version(10, 0, 0)
-        );
+    fn login_without_binding_secret_is_outside_the_compatible_window() {
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 0)));
+        assert!(is_protocol_compatible(pack_protocol_version(0, 11, 1)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 1023)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 0)));
     }
 
     #[test]
@@ -317,27 +269,20 @@ mod tests {
     }
 
     #[test]
-    fn min_is_current_with_patch_zeroed() {
-        assert_eq!(IGGY_PROTOCOL_VERSION_MIN & PATCH_MASK, 0);
-        assert_eq!(
-            IGGY_PROTOCOL_VERSION >> COMPONENT_BITS,
-            IGGY_PROTOCOL_VERSION_MIN >> COMPONENT_BITS
-        );
+    fn min_requires_the_session_binding_wire_layout() {
+        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 11, 1));
     }
 
     #[test]
     fn compatibility_range_boundaries() {
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN));
         assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION));
-        // Patch never changes the wire: any patch of the current minor passes.
-        assert!(is_protocol_compatible(IGGY_PROTOCOL_VERSION | PATCH_MASK));
-        // Next minor is outside the window.
-        assert!(!is_protocol_compatible(
-            ((IGGY_PROTOCOL_VERSION >> COMPONENT_BITS) + 1) << COMPONENT_BITS
-        ));
-        if IGGY_PROTOCOL_VERSION_MIN > 0 {
-            assert!(!is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN - 1));
-        }
+        assert!(
+            !is_protocol_compatible(IGGY_PROTOCOL_VERSION + 1),
+            "a newer patch must not pass the current release's protocol gate"
+        );
+        assert!(!is_protocol_compatible(IGGY_PROTOCOL_VERSION_MIN - 1));
+        assert!(!is_protocol_compatible(u32::MAX));
     }
 
     #[test]
