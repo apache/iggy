@@ -1323,6 +1323,7 @@ mod tests {
     use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
     use iggy_binary_protocol::requests::system::SessionIdentity;
     use iggy_binary_protocol::{Command, Operation, PrepareHeader, WireEncode};
+    use iggy_common::ConsumerKind;
     use journal::DurableAppend;
     use journal::superblock::SuperblockStore;
     use partitions::PartitionPathLayout;
@@ -1338,7 +1339,7 @@ mod tests {
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
     const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
-    const OFFSETS_VERSION: u8 = 3;
+    const OFFSETS_VERSION: u8 = 4;
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
@@ -2246,7 +2247,7 @@ mod tests {
                 .unwrap()
                 .to_le_bytes(),
         );
-        protection.extend_from_slice(&[0; 3 * size_of::<u32>()]);
+        protection.extend_from_slice(&[0; (ConsumerKind::COUNT + 1) * size_of::<u32>()]);
         protection.push(0);
         protection.extend_from_slice(&0_u128.to_le_bytes());
         protection.extend_from_slice(&0_u32.to_le_bytes());
