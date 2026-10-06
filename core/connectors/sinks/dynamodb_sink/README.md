@@ -48,10 +48,12 @@ verbose_logging = false
   which is also the DynamoDB limit, so larger values are clamped. The size
   follows the DynamoDB rules, including the fixed per-item overhead and the
   overhead of nested lists and maps, and rounds every estimate up.
-- `max_retries`: Retries after the first attempt. Defaults to `3`.
-- `retry_delay`: First retry delay as a humantime string. Defaults to `500ms`.
+- `max_retries`: Attempts per request, the first one included. Defaults to
+  `3`, so a failing request is sent three times. `1` disables retries.
+- `retry_delay`: First retry delay as a humantime string. Defaults to
+  `500ms`, and an unparsable value falls back to `1s`.
 - `max_retry_delay`: Upper bound of a single backoff, jitter included.
-  Defaults to `5s`.
+  Defaults to `5s`, and an unparsable value falls back to `1s`.
 - `verbose_logging`: Log per-batch results at info level. Defaults to `false`.
 
 ## Behavior
@@ -60,8 +62,11 @@ JSON objects are written attribute by attribute, so a message field becomes a
 DynamoDB attribute of the matching type. JSON arrays and scalars are nested
 under a `payload` attribute, because a DynamoDB item must be a map. Text
 payloads go into `payload` as a string. Raw payloads are parsed as JSON when
-possible, otherwise they are stored as binary. Protobuf, FlatBuffer, and Avro
-payloads are not supported and are skipped with a warning.
+possible, otherwise they are stored as binary. Avro and FlatBuffer payloads
+carry a framed binary record the connector has no schema for, so they go into
+`payload` as binary. A `Payload::Proto` payload holding a JSON document, which
+is what a descriptor-less `proto_convert` transform hands over, takes the JSON
+path, and any other proto text goes into `payload` as a string.
 
 Metadata attributes are written after the payload, so they overwrite payload
 fields of the same name, including a payload field configured as a key.
@@ -79,9 +84,9 @@ When the payload does not carry the configured `partition_key_field`, the
 connector injects a key built from the stream, topic, partition, and message
 offset, with each name prefixed by its byte length so that a name containing the
 separator cannot build another topic's key. The offset identifies a message
-inside its partition and stays the same on redelivery, unlike the message ID,
-which is `0` for every message sent without an explicit one. When
-`sort_key_field` is configured and missing, the message offset is injected.
+inside its partition and stays the same on redelivery, which is what makes the
+key idempotent. When `sort_key_field` is configured and missing, the message
+offset is injected.
 
 A payload value wins over the injected one, so a message that carries the key
 field with an empty value, or with a value that is neither a string, a number,

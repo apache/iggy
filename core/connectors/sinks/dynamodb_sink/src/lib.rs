@@ -25,8 +25,7 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, PutRequest,
     ScalarAttributeType, WriteRequest,
 };
-use humantime::Duration as HumanDuration;
-use iggy_connector_sdk::retry::retry_backoff;
+use iggy_connector_sdk::retry::{parse_duration, retry_backoff};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -34,7 +33,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use simd_json::{OwnedValue, StaticNode};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -93,7 +91,7 @@ pub struct DynamoDbSink {
 /// Exact key attribute types the table declares. DynamoDB rejects the whole
 /// `BatchWriteItem` request when a key value has another type, so an item that
 /// does not match is dropped before the request is built.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct TableKeyTypes {
     partition: Option<ScalarAttributeType>,
     sort: Option<ScalarAttributeType>,
@@ -183,31 +181,15 @@ impl Sink for DynamoDbSink {
             "Opening DynamoDB sink connector with ID: {}, table: {}",
             self.id, self.config.table
         );
-        let client = self.build_client().await?;
-        let description = client
-            .describe_table()
-            .table_name(&self.config.table)
-            .send()
-            .await
-            .map_err(|error| {
-                Error::InitError(format!(
-                    "DynamoDB table '{}' is not reachable, error: {}",
-                    self.config.table,
-                    describe_sdk_error(&error)
-                ))
-            })?;
-        let (key_schema, attribute_definitions) = description
-            .table
-            .map(|table| {
-                (
-                    table.key_schema.unwrap_or_default(),
-                    table.attribute_definitions.unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
-        self.key_types = self.validate_key_schema(&key_schema, &attribute_definitions)?;
-
-        self.client = Some(client);
+        // The runtime only reports that initialization failed, so the cause is
+        // logged here or it is lost.
+        if let Err(error) = self.connect().await {
+            error!(
+                "Cannot open DynamoDB sink connector with ID: {}, table: {}, error: {error}",
+                self.id, self.config.table
+            );
+            return Err(error);
+        }
         info!(
             "Opened DynamoDB sink connector with ID: {}, table: {}",
             self.id, self.config.table
@@ -241,6 +223,34 @@ impl Sink for DynamoDbSink {
 }
 
 impl DynamoDbSink {
+    async fn connect(&mut self) -> Result<(), Error> {
+        let client = self.build_client().await?;
+        let description = client
+            .describe_table()
+            .table_name(&self.config.table)
+            .send()
+            .await
+            .map_err(|error| {
+                Error::InitError(format!(
+                    "DynamoDB table '{}' is not reachable, error: {}",
+                    self.config.table,
+                    describe_sdk_error(&error)
+                ))
+            })?;
+        let (key_schema, attribute_definitions) = description
+            .table
+            .map(|table| {
+                (
+                    table.key_schema.unwrap_or_default(),
+                    table.attribute_definitions.unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        self.key_types = self.validate_key_schema(&key_schema, &attribute_definitions)?;
+        self.client = Some(client);
+        Ok(())
+    }
+
     async fn build_client(&self) -> Result<Client, Error> {
         if self.config.access_key_id.is_some() != self.config.secret_access_key.is_some() {
             return Err(Error::InvalidConfigValue(
@@ -296,9 +306,10 @@ impl DynamoDbSink {
     }
 
     /// A key field that does not match the table makes DynamoDB reject every
-    /// write, and the runtime stops the connector on the first error, so the
-    /// mismatch is reported while the sink is still opening. The declared key
-    /// types are returned because every item is checked against them.
+    /// write, and a failed write loses its batch instead of stopping the
+    /// connector, so the mismatch is reported while the sink is still opening.
+    /// The declared key types are returned because every item is checked
+    /// against them.
     fn validate_key_schema(
         &self,
         key_schema: &[KeySchemaElement],
@@ -544,7 +555,7 @@ impl DynamoDbSink {
                         )));
                     }
                     attempt += 1;
-                    if attempt > self.max_retries {
+                    if attempt >= self.max_retries {
                         return Err(Error::CannotStoreData(format!(
                             "DynamoDB batch write to table '{}' failed after {attempt} attempts, error: {}",
                             self.config.table,
@@ -552,7 +563,7 @@ impl DynamoDbSink {
                         )));
                     }
                     warn!(
-                        "Transient DynamoDB error on attempt {attempt}/{} for sink ID: {}, error: {}",
+                        "Transient DynamoDB error on attempt {attempt}/{} for sink ID: {}, retrying, error: {}",
                         self.max_retries,
                         self.id,
                         describe_sdk_error(&error)
@@ -567,7 +578,7 @@ impl DynamoDbSink {
             }
 
             attempt += 1;
-            if attempt > self.max_retries {
+            if attempt >= self.max_retries {
                 return Err(Error::CannotStoreData(format!(
                     "DynamoDB left {} of {total} items unprocessed in table '{}' after {attempt} attempts",
                     unprocessed.len(),
@@ -685,47 +696,48 @@ impl DynamoDbSink {
     }
 }
 
-fn parse_duration(raw: Option<&str>, default: &str) -> Duration {
-    let value = raw.unwrap_or(default);
-    HumanDuration::from_str(value)
-        .map(Duration::from)
-        .unwrap_or_else(|_| {
-            warn!("Invalid DynamoDB sink duration '{value}', falling back to '{default}'");
-            HumanDuration::from_str(default)
-                .map(Duration::from)
-                .unwrap_or(Duration::from_millis(500))
-        })
-}
-
 /// DynamoDB items are attribute maps, so anything that is not a JSON object
 /// is nested under a single payload attribute.
 fn payload_into_item(payload: Payload) -> Result<HashMap<String, AttributeValue>, Error> {
     match payload {
-        Payload::Json(value) => Ok(match json_into_attribute_value(value)? {
-            AttributeValue::M(item) => item,
-            other => HashMap::from([(PAYLOAD_FIELD.to_owned(), other)]),
-        }),
-        Payload::Text(text) => Ok(HashMap::from([(
-            PAYLOAD_FIELD.to_owned(),
-            AttributeValue::S(text),
-        )])),
+        Payload::Json(value) => Ok(attribute_into_item(json_into_attribute_value(value)?)),
+        Payload::Text(text) => Ok(single_attribute_item(AttributeValue::S(text))),
         Payload::Raw(bytes) => {
             // simd-json unescapes in place, so a failed parse leaves the
             // buffer rewritten and only the copy can be thrown away.
             let mut buffer = bytes.clone();
-            let attribute = match simd_json::to_owned_value(&mut buffer) {
-                Ok(value) => json_into_attribute_value(value)?,
-                Err(_) => AttributeValue::B(Blob::new(bytes)),
-            };
-            Ok(match attribute {
-                AttributeValue::M(item) => item,
-                other => HashMap::from([(PAYLOAD_FIELD.to_owned(), other)]),
-            })
+            match simd_json::to_owned_value(&mut buffer) {
+                Ok(value) => Ok(attribute_into_item(json_into_attribute_value(value)?)),
+                Err(_) => Ok(single_attribute_item(AttributeValue::B(Blob::new(bytes)))),
+            }
         }
-        Payload::Proto(_) | Payload::FlatBuffer(_) | Payload::Avro(_) => {
-            Err(Error::InvalidPayloadType)
+        // Avro and FlatBuffer carry a framed binary record the connector has no
+        // schema for, so it is stored whole rather than dropped.
+        Payload::Avro(bytes) | Payload::FlatBuffer(bytes) => {
+            Ok(single_attribute_item(AttributeValue::B(Blob::new(bytes))))
+        }
+        // A descriptor-less `proto_convert` transform hands over the JSON it was
+        // given as proto text, so text holding a document takes the JSON path
+        // and anything else is stored like a text payload.
+        Payload::Proto(text) => {
+            let mut buffer = text.as_bytes().to_vec();
+            match simd_json::to_owned_value(&mut buffer) {
+                Ok(value) => Ok(attribute_into_item(json_into_attribute_value(value)?)),
+                Err(_) => Ok(single_attribute_item(AttributeValue::S(text))),
+            }
         }
     }
+}
+
+fn attribute_into_item(attribute: AttributeValue) -> HashMap<String, AttributeValue> {
+    match attribute {
+        AttributeValue::M(item) => item,
+        other => single_attribute_item(other),
+    }
+}
+
+fn single_attribute_item(attribute: AttributeValue) -> HashMap<String, AttributeValue> {
+    HashMap::from([(PAYLOAD_FIELD.to_owned(), attribute)])
 }
 
 fn json_into_attribute_value(value: OwnedValue) -> Result<AttributeValue, Error> {
@@ -1059,11 +1071,18 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_duration_when_created_should_use_default() {
+    fn given_invalid_duration_when_created_should_use_sdk_fallback() {
         let mut config = given_default_config();
         config.retry_delay = Some("not-a-duration".to_owned());
         let sink = DynamoDbSink::new(1, config);
+        assert_eq!(sink.retry_delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn given_no_duration_when_created_should_use_default() {
+        let sink = DynamoDbSink::new(1, given_default_config());
         assert_eq!(sink.retry_delay, Duration::from_millis(500));
+        assert_eq!(sink.max_retry_delay, Duration::from_secs(5));
     }
 
     #[test]
@@ -1245,20 +1264,6 @@ mod tests {
     }
 
     #[test]
-    fn given_unsupported_schema_payload_when_built_should_skip_message() {
-        let sink = DynamoDbSink::new(1, given_default_config());
-        let mut message = given_message(Payload::Avro(vec![1, 2, 3]));
-
-        let result = sink.build_item(
-            &given_topic_metadata(),
-            &given_messages_metadata(),
-            &mut message,
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn given_text_payload_when_built_should_store_payload_attribute() {
         let sink = DynamoDbSink::new(1, given_default_config());
         let mut message = given_message(Payload::Text("hello".to_owned()));
@@ -1306,6 +1311,79 @@ mod tests {
         assert_eq!(
             item[PAYLOAD_FIELD],
             AttributeValue::B(Blob::new(vec![0xff, 0xfe, 0xfd]))
+        );
+    }
+
+    #[test]
+    fn given_avro_payload_when_built_should_store_binary_attribute() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Avro(vec![0x4f, 0x62, 0x6a, 0x01]));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(
+            item[PAYLOAD_FIELD],
+            AttributeValue::B(Blob::new(vec![0x4f, 0x62, 0x6a, 0x01]))
+        );
+    }
+
+    #[test]
+    fn given_flatbuffer_payload_when_built_should_store_binary_attribute() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::FlatBuffer(vec![0x0c, 0x00, 0x00, 0x00]));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(
+            item[PAYLOAD_FIELD],
+            AttributeValue::B(Blob::new(vec![0x0c, 0x00, 0x00, 0x00]))
+        );
+    }
+
+    #[test]
+    fn given_json_proto_payload_when_built_should_map_attributes() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Proto(r#"{"name":"first"}"#.to_owned()));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item["name"], AttributeValue::S("first".to_owned()));
+    }
+
+    #[test]
+    fn given_text_proto_payload_when_built_should_store_string_attribute() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Proto("name: \"first\"".to_owned()));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(
+            item[PAYLOAD_FIELD],
+            AttributeValue::S("name: \"first\"".to_owned())
         );
     }
 
