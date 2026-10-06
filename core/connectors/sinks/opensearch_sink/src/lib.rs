@@ -39,7 +39,7 @@ use opensearch::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -95,8 +95,8 @@ impl From<RefreshPolicy> for Refresh {
     }
 }
 
-// No `Serialize`: nothing serializes this type, and the only in-tree helper for
-// a `SecretString` field writes the credential in plaintext.
+// No `Serialize`: nothing serializes this type, and `serde_secret::serialize_secret`
+// writes a `SecretString` credential in plaintext.
 #[derive(Debug, Default, Deserialize)]
 pub struct OpenSearchSinkConfig {
     pub url: String,
@@ -792,9 +792,7 @@ impl Sink for OpenSearchSink {
         let normalized_url = normalize_url(self.id, &self.config.url)?;
         info!(
             "Opening OpenSearch sink connector with ID: {} for URL: {}, index: {}",
-            self.id,
-            sanitize_url_for_log(&normalized_url),
-            self.config.index
+            self.id, normalized_url, self.config.index
         );
 
         let client = self.create_client(&normalized_url)?;
@@ -1324,13 +1322,13 @@ fn generated_document_id(
     offset: u64,
     message_id: u128,
 ) -> String {
-    let components = json!([
+    let components = (
         topic_metadata.stream.as_str(),
         topic_metadata.topic.as_str(),
         messages_metadata.partition_id,
         offset,
-        message_id.to_string()
-    ]);
+        message_id.to_string(),
+    );
     // Infallible: serde_json only errors on a float used as a map key or a
     // failing custom `Serialize` impl - none of these components are floats.
     let bytes =
@@ -1467,23 +1465,6 @@ fn redact_url_credentials(raw: &str) -> String {
     }
 }
 
-/// The stripping below is unreachable from `open()`'s only call site: `normalize_url`
-/// already rejects embedded credentials before a URL gets here. Kept as defense in
-/// depth for any future caller that doesn't route through `normalize_url` first.
-fn sanitize_url_for_log(normalized: &str) -> String {
-    let Ok(mut url) = Url::parse(normalized) else {
-        return "<invalid-url>".to_string();
-    };
-
-    if !url.username().is_empty() {
-        let _ = url.set_username("");
-    }
-    if url.password().is_some() {
-        let _ = url.set_password(None);
-    }
-    url.to_string().trim_end_matches('/').to_string()
-}
-
 // Case-insensitive for the same reason as `normalize_url`'s scheme check:
 // `HTTP://host` is an explicit scheme, just not a lowercase one.
 fn explicit_http_scheme_hint(raw: &str) -> &'static str {
@@ -1529,6 +1510,7 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
+    use serde_json::json;
     use std::sync::atomic::AtomicU32;
     use wiremock::matchers::{body_bytes, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1579,6 +1561,18 @@ mod tests {
             message.offset,
             message.id,
         )
+    }
+
+    // Pins the hash input encoding: changing it re-keys every previously generated ID,
+    // so a replayed message would index a duplicate instead of upserting.
+    #[test]
+    fn given_fixed_message_should_generate_stable_document_id() {
+        let id = generated_document_id(&topic_metadata(), &messages_metadata(), 11, 42);
+
+        assert_eq!(
+            id,
+            "iggy_51964d3e4cdb12d5e71a33e98892cfc7ac1f08f9c7f8e7d5a0dc95a8fa694542"
+        );
     }
 
     #[test]
@@ -3336,14 +3330,6 @@ mod tests {
         assert!(!is_transient_error(&Error::InitError(
             "missing".to_string()
         )));
-    }
-
-    #[test]
-    fn given_credentials_in_url_should_redact_them_from_logs() {
-        assert_eq!(
-            sanitize_url_for_log("https://admin:hunter2@opensearch.example.com:9200/path"),
-            "https://opensearch.example.com:9200/path"
-        );
     }
 
     #[test]
