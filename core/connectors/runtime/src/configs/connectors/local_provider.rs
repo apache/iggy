@@ -383,14 +383,14 @@ pub enum BaseConnectorConfig {
 }
 
 impl BaseConnectorConfig {
-    fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         match self {
             BaseConnectorConfig::Sink { key, .. } => key,
             BaseConnectorConfig::Source { key, .. } => key,
         }
     }
 
-    fn connector_type(&self) -> &str {
+    pub(crate) fn connector_type(&self) -> &str {
         match self {
             BaseConnectorConfig::Sink { .. } => "sink",
             BaseConnectorConfig::Source { .. } => "source",

@@ -18,6 +18,7 @@
 use crate::configs::connectors::{
     ConnectorKey, ConnectorsConfig, ConnectorsConfigProvider, SinkConfig, SourceConfig,
     create_connectors_config_provider,
+    local_provider::{BaseConnectorConfig, connector_env_prefix},
 };
 use crate::metrics::ConnectorType;
 use ::configs::{
@@ -157,19 +158,31 @@ fn main() -> Result<(), RuntimeError> {
 
 fn print_config_env_vars() -> std::io::Result<()> {
     let sink_source_templates = [
-        ("SINK", SinkConfig::env_templates()),
-        ("SOURCE", SourceConfig::env_templates()),
+        (
+            BaseConnectorConfig::Sink {
+                key: "<KEY>".to_owned(),
+            },
+            SinkConfig::env_templates(),
+        ),
+        (
+            BaseConnectorConfig::Source {
+                key: "<KEY>".to_owned(),
+            },
+            SourceConfig::env_templates(),
+        ),
     ]
     .into_iter()
-    .flat_map(|(kind, templates)| {
+    .flat_map(|(connector, templates)| {
         // "<KEY>" stands in for the real, per-connector key `local_provider`
         // uppercases at runtime - same prefix rule, so the listing can't
         // drift from the names the runtime actually reads.
-        let prefix =
-            crate::configs::connectors::local_provider::connector_env_prefix(kind, "<KEY>");
+        let connector_type = connector.connector_type().to_uppercase();
+        let key = connector.key().to_uppercase();
+        let prefix = connector_env_prefix(&connector_type, &key);
         let plugin_config = format!("{prefix}{PLUGIN_CONFIG_ENV_SEGMENT}<FIELD>");
         templates
             .iter()
+            .filter(|template| !matches!(template.env_name, "KEY" | "VERSION"))
             .map(move |template| format!("{prefix}{}", template.env_name))
             .chain(std::iter::once(plugin_config))
     });
@@ -613,6 +626,7 @@ impl FailedPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::fs;
     use tempfile::TempDir;
 
@@ -666,5 +680,17 @@ mod tests {
         let result = resolve_plugin_path(plugin_path.to_str().unwrap())
             .expect("should resolve existing file");
         assert_eq!(result, plugin_path.to_str().unwrap());
+    }
+
+    #[test]
+    fn list_config_env_help_matches_stream_template_limit() {
+        let template = SinkConfig::env_templates()
+            .iter()
+            .find(|template| template.env_name == "STREAMS_<N>_STREAM")
+            .expect("sink stream template");
+        assert_eq!(template.max_elements, &[256]);
+
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("0-255 for stream fields"));
     }
 }

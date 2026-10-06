@@ -62,9 +62,9 @@ Run `iggy-mcp --list-config-env-vars` to print the supported configuration envir
 
 A non-empty `iggy.token` takes precedence over username and password. It accepts a literal PAT or a `file:` reference such as `file:/run/secrets/iggy_pat`; file contents are trimmed and a leading `~/` expands to the home directory.
 
-Set `command` to the absolute path of the built executable. This Claude Desktop example uses the development broker credentials:
-
 `iggy-mcp` rejects unknown command-line arguments with exit code 2. Keep the client or container `args` list empty unless it contains a supported flag.
+
+Set `command` to the absolute path of the built executable. This Claude Desktop example uses the development broker credentials:
 
 ```json
 {

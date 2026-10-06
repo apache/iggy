@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// Writes each name in `names`, sorted and deduplicated, to the provided writer — one
+/// Writes each name in `names`, sorted and deduplicated, to the provided writer. One
 /// call, one error policy. A closed writer (e.g. `iggy-server --list-config-env-vars | head -1`)
 /// is expected, not a failure: on `BrokenPipe` this stops writing and returns `Ok(())`. Any
 /// other I/O error is real and is propagated so the caller exits non-zero.

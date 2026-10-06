@@ -136,15 +136,6 @@ fn config_env_listing_includes_vector_index_templates() {
     let names = list_config_env_vars("iggy-server");
     let names: HashSet<_> = names.iter().map(String::as_str).collect();
 
-    // Cluster nodes should have indexed templates
-    assert!(
-        names
-            .iter()
-            .any(|name| name.contains("IGGY_CLUSTER_NODES_<N>_")),
-        "server should list cluster node index templates"
-    );
-
-    // Verify nested vector expansion (nested <N> placeholders)
     assert!(
         names
             .iter()
@@ -183,6 +174,14 @@ fn config_env_listing_includes_connector_templates() {
         names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_ENABLED"),
         "connectors should list SOURCE_<KEY>_ENABLED"
     );
+    for excluded in [
+        "IGGY_CONNECTORS_SINK_<KEY>_KEY",
+        "IGGY_CONNECTORS_SINK_<KEY>_VERSION",
+        "IGGY_CONNECTORS_SOURCE_<KEY>_KEY",
+        "IGGY_CONNECTORS_SOURCE_<KEY>_VERSION",
+    ] {
+        assert!(!names.contains(excluded), "connectors listed {excluded}");
+    }
 
     assert_eq!(
         names
@@ -191,6 +190,25 @@ fn config_env_listing_includes_connector_templates() {
             .count(),
         1,
         "enum variants should produce one deduplicated tag name"
+    );
+}
+
+#[test]
+fn mcp_rejects_unknown_arguments() {
+    let mut command = Command::cargo_bin("iggy-mcp").expect("binary should be built");
+    let output = command
+        .arg("--unknown")
+        .timeout(LIST_ENV_VARS_TIMEOUT)
+        .output()
+        .expect("MCP command should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "MCP wrote to stdout");
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("unexpected argument '--unknown'"),
+        "MCP should explain the rejected argument"
     );
 }
 

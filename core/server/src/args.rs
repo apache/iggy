@@ -98,7 +98,7 @@ sorted and deduplicated. Template syntax:
   cluster.nodes[*].advertised_addresses, which caps at 0-15)
 
 Exits immediately before any startup (before dotenv, config loading,
-logging, runtimes, credentials, plugins, filesystem or network activity).
+logging, runtimes, credentials, filesystem or network activity).
 Works even with missing or invalid configuration files.
 
 Example:
@@ -144,4 +144,24 @@ Example:
     /// one `cluster.nodes[*].replica_id` entry in the loaded configuration.
     #[arg(long, verbatim_doc_comment)]
     pub replica_id: Option<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use configs::{ConfigEnvMappings, cluster::ClusterConfig};
+
+    #[test]
+    fn list_config_env_help_matches_cluster_template_limits() {
+        let template = ClusterConfig::env_templates()
+            .iter()
+            .find(|template| template.env_name == "NODES_<N>_ADVERTISED_ADDRESSES_<N>_CLIENT_CIDR")
+            .expect("cluster advertised-address template");
+        assert_eq!(template.max_elements, &[256, 16]);
+
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("0-255 for most fields"));
+        assert!(help.contains("caps at 0-15"));
+    }
 }

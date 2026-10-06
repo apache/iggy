@@ -81,6 +81,16 @@ pub trait ConfigEnvMappings {
 
 impl EnvVarTemplate {
     fn expand(&self) -> Vec<EnvVarMapping> {
+        debug_assert_eq!(
+            self.env_name.matches("<N>").count(),
+            self.max_elements.len(),
+            "env template placeholder count must match max_elements"
+        );
+        debug_assert_eq!(
+            self.config_path.matches("<N>").count(),
+            self.max_elements.len(),
+            "config path placeholder count must match max_elements"
+        );
         let mut results = vec![(self.env_name.to_string(), self.config_path.to_string())];
 
         for &limit in self.max_elements {
@@ -113,6 +123,50 @@ impl EnvVarTemplate {
 /// The returned mappings own leaked names and paths so generated
 /// `ConfigEnvMappings` implementations can cache them in a `OnceLock` and
 /// return `'static` references. Call this once per config type.
+#[doc(hidden)]
 pub fn expand_env_templates(templates: &[EnvVarTemplate]) -> Vec<EnvVarMapping> {
     templates.iter().flat_map(EnvVarTemplate::expand).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_with_matching_placeholders_expands_each_index() {
+        let mappings = expand_env_templates(&[EnvVarTemplate {
+            env_name: "ITEMS_<N>_VALUES_<N>",
+            config_path: "items.<N>.values.<N>",
+            is_secret: false,
+            max_elements: &[2, 2],
+        }]);
+
+        assert_eq!(mappings.len(), 4);
+        assert_eq!(mappings[3].env_name, "ITEMS_1_VALUES_1");
+        assert_eq!(mappings[3].config_path, "items.1.values.1");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "env template placeholder count must match max_elements")]
+    fn template_with_missing_env_placeholder_panics() {
+        expand_env_templates(&[EnvVarTemplate {
+            env_name: "ITEMS",
+            config_path: "items.<N>",
+            is_secret: false,
+            max_elements: &[2],
+        }]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "config path placeholder count must match max_elements")]
+    fn template_with_missing_config_path_placeholder_panics() {
+        expand_env_templates(&[EnvVarTemplate {
+            env_name: "ITEMS_<N>",
+            config_path: "items",
+            is_secret: false,
+            max_elements: &[2],
+        }]);
+    }
 }

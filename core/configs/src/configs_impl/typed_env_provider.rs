@@ -310,8 +310,9 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
 
             let debug_msg = match &context {
                 WarningContext::MainConfig => format!(
-                    "Unknown IGGY_ env var: '{}'.{}. Add to the runtime env-var lists if intentional, \
-                     or add #[derive(ConfigEnv)] to the config struct.",
+                    "Unknown IGGY_ env var: '{}'.{}. Add advertised process variables to \
+                     MCP_RUNTIME_ENV_VARS or CONNECTORS_RUNTIME_ENV_VARS, add a dedicated scan-only \
+                     list for internal variables, or add #[derive(ConfigEnv)] to the config struct.",
                     key, suggestion_hint
                 ),
                 WarningContext::ConnectorConfig(_) => format!(

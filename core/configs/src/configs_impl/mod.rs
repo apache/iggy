@@ -39,6 +39,7 @@ pub use env_listing::{
 };
 pub use env_mapping::{ConfigEnvMappings, EnvVarMapping, EnvVarTemplate, expand_env_templates};
 pub use error::ConfigurationError;
+pub(crate) use file_provider::DISPLAY_CONFIG_ENV;
 pub use file_provider::{FileConfigProvider, RelocatedKey, RelocatedTarget};
 pub use parsing::parse_env_value_to_json;
 pub use traits::{ConfigProvider, ConfigurationType};
