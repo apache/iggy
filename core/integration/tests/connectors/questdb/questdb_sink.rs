@@ -226,9 +226,8 @@ async fn given_invalid_record_in_batch_when_consumed_should_write_the_rest(
     harness: &TestHarness,
     fixture: QuestDbSinkTypedFixture,
 ) {
-    // The middle record fails only after its table, symbol and a column are
-    // already encoded, which is the case the marker/rewind path exists for.
-    // Without it the malformed row would take out the whole batch.
+    // The middle record carries a malformed UUID, which validation refuses
+    // before anything is written, so its siblings are unaffected.
     let fixture = &fixture.0;
     send(
         &harness.root_client().await.unwrap(),
@@ -253,6 +252,48 @@ async fn given_invalid_record_in_batch_when_consumed_should_write_the_rest(
         .collect();
     prices.sort_by(f64::total_cmp);
     assert_eq!(prices, vec![1.0, 3.0]);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_record_whose_column_type_conflicts_when_consumed_should_write_the_rest(
+    harness: &TestHarness,
+    fixture: QuestDbSinkFixture,
+) {
+    // QuestDB pins one type per column for the lifetime of a buffer, so a
+    // record disagreeing with a column an earlier record defined is refused by
+    // the client rather than by validation: nothing about the record alone says
+    // it conflicts. JSON has a single number type, so a producer emitting whole
+    // values as integers and fractional ones as decimals reaches this on
+    // ordinary data. The sink rebuilds the buffered window without the
+    // offending record, which is what keeps the cost to one row.
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            message(1, json!({"sensor_id": 1, "temp": 20.5})),
+            message(2, json!({"sensor_id": 2, "temp": 21})),
+            message(3, json!({"sensor_id": 3, "temp": 22.5})),
+            message(4, json!({"sensor_id": 4, "temp": 23.5})),
+        ],
+    )
+    .await;
+
+    let count = fixture.wait_for_rows(3).await.expect("no rows");
+    assert_eq!(
+        count, 3,
+        "only the conflicting record should be dropped, not the batch"
+    );
+
+    let ids = fixture.column_values("sensor_id").await.expect("no values");
+    let mut ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 3, 4],
+        "the records either side of the conflicting one must survive"
+    );
 }
 
 #[iggy_harness(
@@ -309,7 +350,10 @@ async fn given_bulk_messages_when_consumed_should_write_every_row(
         .wait_for_rows(bulk_count)
         .await
         .expect("Failed to wait for QuestDB rows");
-    assert!(count >= bulk_count, "expected {bulk_count}, got {count}");
+    assert_eq!(
+        count, bulk_count,
+        "expected exactly {bulk_count}, got {count}"
+    );
 }
 
 #[iggy_harness(
@@ -378,24 +422,35 @@ async fn given_questdb_outage_when_consumed_should_buffer_and_replay_on_recovery
     )
     .await;
 
-    // Give the sink time to poll, attempt delivery and park the frames. Without
-    // this the pause could be over before it ever tried, leaving the test
-    // asserting nothing.
-    sleep(Duration::from_secs(3)).await;
-    let segments = QuestDbSinkFixture::sf_segments(&slot);
+    // Wait for the frames to be parked rather than for a fixed duration: the
+    // sink has to poll, attempt delivery and fail before anything reaches disk,
+    // and a loaded machine can take longer than any constant worth hard-coding.
+    let mut parked = Vec::new();
+    for _ in 0..120 {
+        parked = QuestDbSinkFixture::sf_segments(&slot);
+        if !parked.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
     assert!(
-        !segments.is_empty(),
+        !parked.is_empty(),
         "no store-and-forward segments on disk during the outage: {slot:?}"
     );
 
     fixture.resume().await.expect("failed to unpause");
 
     // Everything sent during the outage must arrive once the server is back.
+    // `wait_for_rows` only returns once the count is reached, so the assertion
+    // below is about the exact total rather than the wait succeeding.
     let count = fixture
         .wait_for_rows(15)
         .await
         .expect("rows buffered during the outage were not replayed");
-    assert!(count >= 15, "expected 15 rows after replay, got {count}");
+    assert_eq!(
+        count, 15,
+        "expected exactly 15 rows after replay, got {count}"
+    );
 }
 
 #[iggy_harness(
@@ -579,13 +634,22 @@ async fn given_dedup_table_when_duplicates_delivered_should_collapse_to_one_row(
     // messages, and the table must still hold one row per key.
     let fixture = &fixture.0;
     let client = harness.root_client().await.unwrap();
-    let rows: Vec<serde_json::Value> = (0..10u32)
-        .map(|i| json!({"event_time": 1_788_523_200_000_000i64 + i as i64, "seq": i}))
-        .collect();
+    let rows = |revision: i64| -> Vec<serde_json::Value> {
+        (0..10u32)
+            .map(|i| {
+                json!({
+                    "event_time": 1_788_523_200_000_000i64 + i as i64,
+                    "seq": i,
+                    "revision": revision,
+                })
+            })
+            .collect()
+    };
 
     send(
         &client,
-        rows.iter()
+        rows(1)
+            .iter()
             .enumerate()
             .map(|(i, row)| message((i + 1) as u128, row.clone()))
             .collect(),
@@ -593,19 +657,33 @@ async fn given_dedup_table_when_duplicates_delivered_should_collapse_to_one_row(
     .await;
     fixture.wait_for_rows(10).await.expect("first delivery");
 
-    // Same payloads, fresh message IDs: a replay from the sink's perspective.
+    // Same keys with a higher revision, as fresh Apache Iggy messages: a replay
+    // from the sink's perspective.
     send(
         &client,
-        rows.iter()
+        rows(2)
+            .iter()
             .enumerate()
             .map(|(i, row)| message((i + 100) as u128, row.clone()))
             .collect(),
     )
     .await;
 
-    // Give the second delivery time to land before asserting it did not grow
-    // the table, otherwise the assertion could pass simply by running early.
-    sleep(Duration::from_secs(3)).await;
+    // Wait for the replay to be observable rather than for a fixed duration. A
+    // row count alone cannot tell "the duplicates collapsed" apart from "the
+    // duplicates never arrived", so wait until every row carries the second
+    // revision, which only the replay can produce.
+    let mut upserted = false;
+    for _ in 0..120 {
+        let revisions = fixture.column_values("revision").await.expect("no values");
+        if revisions.len() == 10 && revisions.iter().all(|value| value.as_i64() == Some(2)) {
+            upserted = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(upserted, "the replayed rows never reached the table");
+
     let count = fixture
         .count_rows(&fixture.table())
         .await
