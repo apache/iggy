@@ -18,10 +18,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
 use consensus::PartitionsHandle;
-use crossfire::{RecvError, TryRecvError};
+use futures::future::poll_fn;
 use journal::local_gate::OwnedLocalGateGuard;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -30,13 +30,12 @@ use partitions::{
     PartitionIoResult,
 };
 use server_common::sharding::IggyNamespace;
+pub use server_common::sharding::PARTITION_IO_CAPACITY_MAX;
 use thiserror::Error;
 
-use crate::{IggyShard, Receiver, Sender, channel};
+use crate::IggyShard;
 
 pub const DEFAULT_PARTITION_IO_CAPACITY: usize = 16;
-pub const DEFAULT_PARTITION_IO_BYTES: usize = 256 * 1024 * 1024;
-pub const PARTITION_IO_CAPACITY_MAX: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PartitionIoLimits {
@@ -68,7 +67,7 @@ impl PartitionIoLimits {
         let minimum = partitions::largest_legal_job_charge()
             .filter(|charge| isize::try_from(*charge).is_ok())
             .ok_or(PartitionIoLimitsError::Overflow)?;
-        let bytes_max = bytes_max.unwrap_or_else(|| DEFAULT_PARTITION_IO_BYTES.max(minimum));
+        let bytes_max = bytes_max.unwrap_or(minimum);
         if bytes_max < minimum || bytes_max > isize::MAX as usize {
             return Err(PartitionIoLimitsError::Bytes {
                 value: bytes_max,
@@ -79,11 +78,6 @@ impl PartitionIoLimits {
             capacity,
             bytes_max,
         })
-    }
-
-    #[must_use]
-    pub const fn capacity(self) -> usize {
-        self.capacity
     }
 
     #[must_use]
@@ -122,6 +116,10 @@ struct PartitionIoSlot<SB> {
 #[derive(Default)]
 struct ReadyPartitions {
     queue: RefCell<VecDeque<(IggyNamespace, PartitionIncarnation)>>,
+    waiting: RefCell<VecDeque<(IggyNamespace, PartitionIncarnation)>>,
+    // Only the oldest capacity waiter may also be in the runnable queue.
+    waiting_ready: Cell<bool>,
+    completions: RefCell<VecDeque<PartitionIoToken>>,
     present: RefCell<BTreeSet<(IggyNamespace, PartitionIncarnation)>>,
     waker: RefCell<Option<Waker>>,
 }
@@ -151,13 +149,9 @@ pub struct PartitionIoLane<SB> {
     pub(crate) limits: PartitionIoLimits,
     slots: RefCell<Vec<Option<Rc<PartitionIoSlot<SB>>>>>,
     charged: Cell<usize>,
-    sender: Sender<PartitionIoToken>,
-    receiver: Receiver<PartitionIoToken>,
     ready: Rc<ReadyPartitions>,
     interrupted: Rc<Cell<bool>>,
-    undelivered: Rc<Cell<bool>>,
     closed: Cell<bool>,
-    capacity_blocked: Cell<bool>,
     counters: Rc<IoCounters>,
     #[cfg(test)]
     execution_gate: RefCell<Option<futures::channel::oneshot::Receiver<()>>>,
@@ -165,18 +159,16 @@ pub struct PartitionIoLane<SB> {
 
 impl<SB: SuperblockStore> PartitionIoLane<SB> {
     pub(crate) fn new(limits: PartitionIoLimits) -> Self {
-        let (sender, receiver) = channel(limits.capacity);
         Self {
             limits,
             slots: RefCell::new((0..limits.capacity).map(|_| None).collect()),
             charged: Cell::new(0),
-            sender,
-            receiver,
-            ready: Rc::default(),
+            ready: Rc::new(ReadyPartitions {
+                completions: RefCell::new(VecDeque::with_capacity(limits.capacity)),
+                ..ReadyPartitions::default()
+            }),
             interrupted: Rc::new(Cell::new(false)),
-            undelivered: Rc::new(Cell::new(false)),
             closed: Cell::new(false),
-            capacity_blocked: Cell::new(false),
             counters: Rc::default(),
             #[cfg(test)]
             execution_gate: RefCell::new(None),
@@ -199,30 +191,56 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
     }
 
     pub(crate) fn has_ready(&self) -> bool {
-        self.head().is_some() || self.undelivered.get() || self.interrupted.get()
+        self.head().is_some()
+            || !self.ready.completions.borrow().is_empty()
+            || self.interrupted.get()
     }
 
     pub(crate) fn head(&self) -> Option<(IggyNamespace, PartitionIncarnation)> {
-        if !self.capacity_blocked.get() {
-            return self.ready.queue.borrow().front().copied();
-        }
-        let present = self.ready.present.borrow();
-        self.slots.borrow().iter().flatten().find_map(|slot| {
-            (slot.state.get() == SlotState::Settled
-                && present.contains(&(slot.namespace, slot.incarnation)))
-            .then_some((slot.namespace, slot.incarnation))
-        })
+        self.ready.queue.borrow().front().copied()
     }
 
     pub(crate) fn pop_ready(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
-        self.ready
-            .queue
-            .borrow_mut()
-            .retain(|queued| *queued != (namespace, incarnation));
+        let mut queue = self.ready.queue.borrow_mut();
+        if queue.front() == Some(&(namespace, incarnation)) {
+            queue.pop_front();
+        } else {
+            queue.retain(|queued| *queued != (namespace, incarnation));
+        }
         self.ready
             .present
             .borrow_mut()
             .remove(&(namespace, incarnation));
+        drop(queue);
+        let mut waiting = self.ready.waiting.borrow_mut();
+        if waiting.front() == Some(&(namespace, incarnation)) {
+            waiting.pop_front();
+            self.ready.waiting_ready.set(false);
+            drop(waiting);
+            self.wake_capacity_waiter();
+        }
+    }
+
+    fn wait_for_capacity(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
+        let owner = (namespace, incarnation);
+        debug_assert_eq!(self.ready.queue.borrow().front(), Some(&owner));
+        self.ready.queue.borrow_mut().pop_front();
+        let mut waiting = self.ready.waiting.borrow_mut();
+        if waiting.front() == Some(&owner) {
+            self.ready.waiting_ready.set(false);
+        } else {
+            waiting.push_back(owner);
+        }
+    }
+
+    fn wake_capacity_waiter(&self) {
+        if self.ready.waiting_ready.get() {
+            return;
+        }
+        if let Some(owner) = self.ready.waiting.borrow().front().copied() {
+            self.ready.queue.borrow_mut().push_back(owner);
+            self.ready.waiting_ready.set(true);
+        }
     }
 
     pub(crate) fn reschedule(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
@@ -246,6 +264,15 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
         }) {
             return (existing.state.get() == SlotState::Settled && charge <= existing.charge)
                 .then_some(index);
+        }
+        if self
+            .ready
+            .waiting
+            .borrow()
+            .front()
+            .is_some_and(|owner| *owner != (namespace, incarnation))
+        {
+            return None;
         }
         let charged = self.charged.get().checked_add(charge)?;
         if charged > self.limits.bytes_max {
@@ -298,8 +325,6 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             quiescence,
             counters: Rc::clone(&self.counters),
         };
-        let sender = self.sender.clone();
-        let undelivered = Rc::clone(&self.undelivered);
         let ready = Rc::clone(&self.ready);
         let counters = Rc::clone(&self.counters);
         #[cfg(test)]
@@ -316,48 +341,28 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             slot.state.set(SlotState::Queued);
             counters.active.set(counters.active.get() - 1);
             counters.queued.set(counters.queued.get() + 1);
-            if sender
-                .try_send(PartitionIoToken {
-                    slot: index,
-                    identity,
-                })
-                .is_err()
-            {
-                undelivered.set(true);
-                if let Some(waker) = ready.waker.borrow().as_ref() {
-                    waker.wake_by_ref();
-                }
+            ready.completions.borrow_mut().push_back(PartitionIoToken {
+                slot: index,
+                identity,
+            });
+            if let Some(waker) = ready.waker.borrow().as_ref() {
+                waker.wake_by_ref();
             }
             drop(marker);
         });
     }
 
     #[allow(clippy::future_not_send)]
-    pub(crate) async fn recv(&self) -> Result<PartitionIoToken, RecvError> {
-        self.receiver.recv().await
+    pub(crate) async fn recv(&self) -> PartitionIoToken {
+        poll_fn(|context| {
+            self.register_waker(context.waker());
+            self.try_recv().map_or(Poll::Pending, Poll::Ready)
+        })
+        .await
     }
 
-    pub(crate) fn try_recv(&self) -> Result<PartitionIoToken, TryRecvError> {
-        self.receiver.try_recv().or_else(|error| {
-            if !self.undelivered.get() {
-                return Err(error);
-            }
-            self.slots
-                .borrow()
-                .iter()
-                .enumerate()
-                .find_map(|(index, slot)| {
-                    let slot = slot.as_ref()?;
-                    (slot.state.get() == SlotState::Queued).then(|| PartitionIoToken {
-                        slot: index,
-                        identity: slot.identity.get().expect("queued slot has an identity"),
-                    })
-                })
-                .ok_or_else(|| {
-                    self.undelivered.set(false);
-                    error
-                })
-        })
+    pub(crate) fn try_recv(&self) -> Option<PartitionIoToken> {
+        self.ready.completions.borrow_mut().pop_front()
     }
 
     pub(crate) fn take_result(&self, token: PartitionIoToken) -> Option<PartitionIoResult> {
@@ -398,7 +403,7 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
         }) {
             let slot = slots[index].take().expect("settled slot exists");
             self.charged.set(self.charged.get() - slot.charge);
-            self.capacity_blocked.set(false);
+            self.wake_capacity_waiter();
         }
     }
 
@@ -453,7 +458,7 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
         self.ready.waker.borrow_mut().take();
     }
 
-    fn record_metrics(&self, metrics: &crate::metrics::ShardMetrics) {
+    pub(crate) fn record_metrics(&self, metrics: &crate::metrics::ShardMetrics) {
         metrics.set_partition_io(
             self.counters.active.get(),
             self.counters.queued.get(),
@@ -501,15 +506,11 @@ where
 
     /// Bounded completion and continuation service after each ordinary pump event.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    pub(crate) async fn service_partition_io(&self) -> bool {
-        self.partition_io.record_metrics(&self.metrics);
-        let progressed = if let Ok(token) = self.partition_io.try_recv() {
+    pub(crate) async fn service_partition_io(&self) {
+        if let Some(token) = self.partition_io.try_recv() {
             self.accept_partition_io_completion(token);
             self.cooperate().await;
-            true
-        } else {
-            false
-        };
+        }
         for identity in self.partition_io.interrupted() {
             if let Some(partition) = self.plane.partitions().get_io_owner(&identity.namespace) {
                 partition.interrupt_io(identity);
@@ -517,7 +518,7 @@ where
             self.cooperate().await;
         }
         let Some((namespace, incarnation)) = self.partition_io.head() else {
-            return progressed;
+            return;
         };
         let partitions = self.plane.partitions();
         let Some(partition) = partitions
@@ -528,7 +529,7 @@ where
             if let Some(token) = self.partition_io.retained(namespace, incarnation) {
                 self.partition_io.release(token.slot);
             }
-            return true;
+            return;
         };
         let step = partition.resume_io(partitions.config()).await;
         if let Some(token) = self.partition_io.retained(namespace, incarnation)
@@ -583,12 +584,15 @@ where
                 self.drop_partition_transfer_state(namespace, partition);
                 match outcome {
                     Ok(()) => self.partition_io.reschedule(namespace, incarnation),
-                    Err(partitions::PurgeError::Unserviceable(error)) => {
+                    Err(
+                        partitions::PurgeError::Unserviceable(error)
+                        | partitions::PurgeError::OffsetsNotDurable(error),
+                    ) => {
                         tracing::error!(namespace_raw = namespace.inner(), generation, %error, "partition purge failed after mutation");
                         self.fence_partition_for_rebuild(namespace, partition, Some(0));
                     }
                     Err(error) => {
-                        tracing::warn!(namespace_raw = namespace.inner(), generation, %error, "partition purge remains unapplied; reconciler will retry");
+                        tracing::warn!(namespace_raw = namespace.inner(), generation, %error, "partition purge remains incomplete; reconciler will retry");
                     }
                 }
             }
@@ -617,8 +621,8 @@ where
                     self.partition_io
                         .try_reserve(namespace, incarnation, plan.allocation_charge)
                 else {
-                    self.partition_io.capacity_blocked.set(true);
-                    return progressed;
+                    self.partition_io.wait_for_capacity(namespace, incarnation);
+                    return;
                 };
                 self.partition_io.pop_ready(namespace, incarnation);
                 match partition.capture_io(plan, partitions.config()) {
@@ -646,7 +650,6 @@ where
             }
         }
         self.cooperate().await;
-        true
     }
 }
 
@@ -722,6 +725,236 @@ mod tests {
     const TEST_PARTITIONS: usize = 3;
     const REPLY_DEADLINE: Duration = Duration::from_secs(1);
     const TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    #[compio::test]
+    async fn failed_purge_offset_sync_fences_before_readmission() {
+        const STEPS_MAX: usize = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let partitions = owner.plane.partitions();
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
+        let directories = ["consumers", "groups", "external"]
+            .map(|name| directory.path().join(name).to_str().unwrap().to_owned());
+        for path in &directories {
+            std::fs::create_dir(path).unwrap();
+        }
+        let failed_directory = directories[0].clone();
+        partition.configure_consumer_offset_storage(
+            directories,
+            ConsumerOffsets::with_capacity(1),
+            ConsumerGroupOffsets::with_capacity(1),
+        );
+        assert!(matches!(
+            partition.purge(partitions.config(), 1).await,
+            Err(partitions::PurgeError::Pending)
+        ));
+        let mut failed = false;
+        for _ in 0..STEPS_MAX {
+            if let partitions::PartitionIoStep::Ready(plan) =
+                partition.resume_io(partitions.config()).await
+            {
+                let captured = partition
+                    .capture_io(plan, partitions.config())
+                    .unwrap()
+                    .unwrap();
+                let failure = matches!(&captured.job, partitions::PartitionIoJob::SegmentDirectory(path) if *path == failed_directory);
+                let result = if failure {
+                    partitions::PartitionIoResult::SegmentDirectory(Err(io::Error::other(
+                        "offset directory writeback failed",
+                    )))
+                } else {
+                    captured.job.execute().await
+                };
+                partition.accept_io(captured.identity, result).unwrap();
+                if let Some(gate) = captured.gate {
+                    gate.release();
+                }
+                captured.quiescence.settle(captured.identity);
+                if failure {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "purge reached the offset directory barrier");
+        owner.service_partition_io().await;
+        assert!(
+            partitions.get_by_ns(&namespace).is_none(),
+            "failed purge must stop admission before the next frame"
+        );
+        assert!(owner.shards_table.shard_for(namespace).is_none());
+        assert_eq!(
+            partitions
+                .get_io_owner(&namespace)
+                .unwrap()
+                .applied_purge_generation(),
+            0
+        );
+    }
+
+    #[test]
+    fn idle_partitions_do_not_enter_the_io_ready_queue_on_retry() {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+        while let Some((namespace, incarnation)) = owner.partition_io.head() {
+            owner.partition_io.pop_ready(namespace, incarnation);
+        }
+        for namespace in partitions.namespaces() {
+            partitions.get_io_owner(namespace).unwrap().retry_io();
+        }
+        assert!(!owner.partition_io.has_ready());
+    }
+
+    #[compio::test]
+    async fn completed_commit_publishes_while_one_slot_is_held_and_another_job_waits() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (mut owner, _sender) = test_owner(&bus, Some(&store));
+        owner.partition_io =
+            super::PartitionIoLane::new(super::PartitionIoLimits::new(1, None).unwrap());
+        let lane = &owner.partition_io;
+        let partitions = owner.plane.partitions();
+        partitions.set_io_notifier(lane.notifier(), lane.limits.bytes_max());
+        let completed = IggyNamespace::new(0, 0, 1);
+        let partition = partitions.get_mut_by_ns(&completed).unwrap();
+        let dirs = ["consumers", "groups", "external_groups"]
+            .map(|name| directory.path().join(name).to_str().unwrap().to_owned());
+        for dir in &dirs {
+            std::fs::create_dir(dir).unwrap();
+        }
+        partition.configure_consumer_offset_storage(
+            dirs,
+            ConsumerOffsets::with_capacity(1),
+            ConsumerGroupOffsets::with_capacity(1),
+        );
+        partition.stats.increment_messages_count(1);
+        partition.set_runtime_options(TopicRuntimeOptions {
+            consumer_offset_durability: Durability::Persisted,
+            ..Default::default()
+        });
+        let completed_incarnation = partition.incarnation();
+        let (reply, result) = consensus::oneshot_channel();
+        partitions
+            .on_request_with_reply(store_request(completed, AckLevel::Quorum), Some(reply))
+            .await;
+        let partition = partitions.get_mut_by_ns(&completed).unwrap();
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        for ack in acknowledgments {
+            partition
+                .on_ack(ack.try_into_typed().unwrap(), partitions.config())
+                .await;
+        }
+        let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
+        let mut files_complete = false;
+        for _ in 0..crate::router::COOPERATIVE_EVENT_BUDGET {
+            let partition = partitions.get_mut_by_ns(&completed).unwrap();
+            match partition.resume_io(partitions.config()).await {
+                partitions::PartitionIoStep::Ready(plan) => {
+                    let slot = lane
+                        .try_reserve(completed, completed_incarnation, plan.allocation_charge)
+                        .unwrap();
+                    let captured = partition
+                        .capture_io(plan, partitions.config())
+                        .unwrap()
+                        .unwrap();
+                    let last = matches!(
+                        &captured.job,
+                        partitions::PartitionIoJob::OffsetDirectories(_)
+                    );
+                    lane.dispatch(slot, captured, &captured_bus);
+                    let task = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
+                    task.await;
+                    owner.accept_partition_io_completion(lane.try_recv().unwrap());
+                    if last {
+                        files_complete = true;
+                        break;
+                    }
+                }
+                partitions::PartitionIoStep::Progress => {}
+                _ => panic!("offset commit must reach its directory sync"),
+            }
+        }
+        assert!(files_complete);
+        assert_eq!(
+            partitions
+                .get_by_ns(&completed)
+                .unwrap()
+                .consensus()
+                .commit_min(),
+            0
+        );
+        assert_eq!(lane.charged.get(), 0);
+        let mut result = std::pin::pin!(result);
+        assert!(futures::poll!(&mut result).is_pending());
+
+        let (slot, captured) = capture_first_write(&owner).await;
+        lane.dispatch(slot, captured, &captured_bus);
+        let waiting = IggyNamespace::new(0, 0, 2);
+        let partition = partitions.get_mut_by_ns(&waiting).unwrap();
+        partition.set_superblock(Rc::clone(&store), None);
+        assert!(!partition.reserve_offsets_through(0).await);
+        let waiting_incarnation = partition.incarnation();
+        while let Some((namespace, incarnation)) = lane.head() {
+            lane.pop_ready(namespace, incarnation);
+        }
+        lane.reschedule(waiting, waiting_incarnation);
+        lane.reschedule(completed, completed_incarnation);
+        owner.service_partition_io().await;
+        assert_eq!(
+            lane.ready.waiting.borrow().front(),
+            Some(&(waiting, waiting_incarnation))
+        );
+        for _ in 0..crate::router::COOPERATIVE_EVENT_BUDGET {
+            owner.service_partition_io().await;
+            if let std::task::Poll::Ready(reply) = futures::poll!(&mut result) {
+                assert_eq!(reply.unwrap().header().status, 0);
+                assert_eq!(
+                    partitions
+                        .get_by_ns(&completed)
+                        .unwrap()
+                        .consensus()
+                        .commit_min(),
+                    1
+                );
+                assert_eq!(
+                    lane.counters.active.get(),
+                    1,
+                    "the unrelated file job must still be held"
+                );
+                let task = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
+                task.await;
+                owner.accept_partition_io_completion(lane.try_recv().unwrap());
+                assert!(
+                    lane.ready
+                        .queue
+                        .borrow()
+                        .contains(&(waiting, waiting_incarnation)),
+                    "the freed slot must wake the waiting file job"
+                );
+                return;
+            }
+        }
+        panic!("a completed commit was blocked by unrelated file-job capacity");
+    }
 
     #[compio::test]
     async fn given_held_superblock_when_other_partition_receives_send_should_ack_before_release() {
@@ -859,7 +1092,7 @@ mod tests {
                 ConsumerGroupOffsets::with_capacity(1),
             );
             partition.stats.increment_messages_count(1);
-            store_request(namespace)
+            store_request(namespace, AckLevel::NoAck)
         } else {
             send_request(namespace, 1)
         };
@@ -1610,17 +1843,17 @@ mod tests {
     }
 
     #[compio::test]
-    async fn disconnected_completion_channel_preserves_local_result_for_acceptance() {
+    async fn closing_admission_preserves_local_result_for_acceptance() {
         let store = Rc::new(HeldSuperblock {
             entered: RefCell::new(None),
             held: RefCell::new(None),
         });
         let bus = Rc::new(IggyMessageBus::new(0));
-        let (mut owner, _sender) = test_owner(&bus, Some(&store));
+        let (owner, _sender) = test_owner(&bus, Some(&store));
         let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
         let (slot, captured) = capture_first_write(&owner).await;
-        owner.partition_io.receiver = channel(1).1;
         owner.partition_io.dispatch(slot, captured, &captured_bus);
+        owner.partition_io.close();
         let task = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
         task.await;
         assert!(owner.partition_io.has_ready());
@@ -1655,7 +1888,6 @@ mod tests {
             .set(super::SlotState::Settled);
         lane.reschedule(namespace, old);
         lane.reschedule(namespace, replacement);
-        lane.capacity_blocked.set(true);
         assert_eq!(
             lane.head(),
             Some((namespace, old)),
@@ -1700,13 +1932,25 @@ mod tests {
             lane.try_reserve(identities[1].0, identities[1].1, limits.bytes_max())
                 .is_none()
         );
-        lane.capacity_blocked.set(true);
-        assert!(
-            lane.head().is_none(),
-            "new reservations wait for the oldest eligible job"
+        lane.wait_for_capacity(identities[1].0, identities[1].1);
+        assert_eq!(
+            lane.head(),
+            Some(identities[2]),
+            "CPU continuations remain runnable"
         );
+        assert!(
+            lane.try_reserve(identities[2].0, identities[2].1, half)
+                .is_none()
+        );
+        lane.wait_for_capacity(identities[2].0, identities[2].1);
+        assert!(lane.head().is_none(), "file jobs wait without spinning");
         lane.release(first);
         assert_eq!(lane.head(), Some(identities[1]));
+        assert_eq!(
+            lane.ready.queue.borrow().len(),
+            1,
+            "one capacity release retries only the oldest file job"
+        );
         let large = lane
             .try_reserve(identities[1].0, identities[1].1, limits.bytes_max())
             .unwrap();
@@ -1850,6 +2094,7 @@ mod tests {
             inbox,
             replies,
             2,
+            None,
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
@@ -1901,7 +2146,7 @@ mod tests {
             .unwrap()
     }
 
-    fn store_request(namespace: IggyNamespace) -> Message<RoutedRequestHeader> {
+    fn store_request(namespace: IggyNamespace, ack: AckLevel) -> Message<RoutedRequestHeader> {
         let body = StoreConsumerOffsetRequest {
             consumer: WireConsumer {
                 kind: ConsumerKind::Consumer.as_code(),
@@ -1911,7 +2156,7 @@ mod tests {
             topic_id: WireIdentifier::Numeric(namespace.topic_id().try_into().unwrap()),
             partition_id: Some(namespace.partition_id().try_into().unwrap()),
             offset: 0,
-            ack: AckLevel::NoAck,
+            ack,
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();

@@ -41,6 +41,7 @@ use consensus::state_manifest::artifact_kind;
 use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
+use futures::channel::oneshot;
 use iggy_binary_protocol::responses::messages::send_messages::CONFIRMATION_SIZE;
 use iggy_binary_protocol::{Operation, PrepareHeader, ReplyHeader};
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
@@ -64,6 +65,7 @@ use std::sync::atomic::Ordering;
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
 pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 4;
+pub(crate) const SEGMENT_SWEEP_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const RETRY_CHECKPOINT_MAGIC: [u8; 4] = *b"IRP2";
 const RETRY_CHECKPOINT_PREFIX: &str = "receipts-";
@@ -1880,7 +1882,22 @@ fn segment_dir_entries(partition_dir: &str) -> std::io::Result<impl Iterator<Ite
 /// Remove physical tails outside the logical segment list after draining the WAL.
 /// The owner has settled its writers and published a purge or install backup.
 pub(crate) async fn remove_public_segment_files(partition_dir: &str) -> std::io::Result<()> {
-    let directory = Path::new(partition_dir);
+    let directory = PathBuf::from(partition_dir);
+    let (completed, completion) = oneshot::channel();
+    // Directory iteration and metadata probes must not block the shard. The
+    // admitted job owns this worker, with one directory entry live at a time.
+    std::thread::Builder::new()
+        .name("iggy-segment-sweep".to_owned())
+        .stack_size(SEGMENT_SWEEP_STACK_BYTES)
+        .spawn(move || {
+            let _ = completed.send(remove_public_segment_files_blocking(&directory));
+        })?;
+    completion
+        .await
+        .map_err(|_| std::io::Error::other("segment sweep worker stopped"))?
+}
+
+fn remove_public_segment_files_blocking(directory: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.path();
@@ -1893,7 +1910,7 @@ pub(crate) async fn remove_public_segment_files(partition_dir: &str) -> std::io:
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| stem.parse::<u64>().is_ok())
         {
-            match DiskStorage.remove_file(&name).await {
+            match std::fs::remove_file(&name) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -2136,7 +2153,7 @@ enum InstallPhase {
     RenameLogs(usize),
     OpenSegments(usize),
     EmptyDirectory,
-    OldOffsets(usize),
+    OldOffsets(Option<ConsumerKind>),
     CommitOffsets(usize),
     OffsetDirectories,
     Publish,
@@ -2973,22 +2990,37 @@ where
             InstallPhase::StageOffsets(_) | InstallPhase::DiscardOffsets(_) => {
                 base.checked_mul(OFFSET_PERSIST_CONCURRENCY)
             }
-            InstallPhase::Sweep => pending.staged.iter().try_fold(base, |charge, segment| {
-                charge
-                    .checked_add(segment.log_staging.capacity())?
-                    .checked_add(segment.index_staging.capacity())?
-                    .checked_add(2 * (size_of::<PathBuf>() + 4 * size_of::<&Path>() + 4))
-            }),
-            InstallPhase::OldOffsets(kind) => {
+            InstallPhase::Sweep => pending.staged.iter().try_fold(
+                base.checked_add(SEGMENT_SWEEP_STACK_BYTES)?,
+                |charge, segment| {
+                    charge
+                        .checked_add(segment.log_staging.capacity())?
+                        .checked_add(segment.index_staging.capacity())?
+                        .checked_add(2 * (size_of::<PathBuf>() + 4 * size_of::<&Path>() + 4))
+                },
+            ),
+            InstallPhase::OldOffsets(Some(kind)) => {
                 let retained = pending
                     .offsets_wire
                     .offset_sections()
-                    .get(kind)
+                    .get(kind.index())
                     .map_or(0, |entries| entries.len());
                 base.checked_add(self.offset_cleanup_charge(kind)?)?
                     .checked_add(retained.checked_mul(size_of::<u32>())?)
             }
             InstallPhase::RetryCheckpoint => base.checked_add(pending.retry_checkpoint.capacity()),
+            InstallPhase::Converge => ConsumerKind::ALL.into_iter().try_fold(
+                base.checked_add(size_of::<[HashSet<u32>; ConsumerKind::COUNT]>())?,
+                |charge, kind| {
+                    charge
+                        .checked_add(self.offset_cleanup_charge(kind)?)?
+                        .checked_add(
+                            self.consumer_offset_capacity_for(kind)
+                                .stranded_count()
+                                .checked_mul(size_of::<(ConsumerKind, u32)>())?,
+                        )
+                },
+            ),
             _ => Some(base),
         }
     }
@@ -3044,6 +3076,7 @@ where
                     ),
                     crate::PartitionIoVerdict::Ready => {
                         install.disposition = InstallDisposition::Mutating;
+                        self.cancel_history_maintenance();
                         self.invalidate_poll_history();
                         self.log.invalidate_sealed_read_state();
                         self.segment_checksum_cache.borrow_mut().clear();
@@ -3067,13 +3100,14 @@ where
             }
             InstallPhase::OpenSegments(cursor) if cursor > 0 && cursor >= install.staged.len() => {
                 self.clear_install_offsets();
-                install.phase = InstallPhase::OldOffsets(0);
+                install.phase = InstallPhase::OldOffsets(Some(ConsumerKind::Consumer));
             }
-            InstallPhase::OldOffsets(ConsumerKind::COUNT) => {
+            InstallPhase::OldOffsets(None) => {
                 install.phase = InstallPhase::CommitOffsets(0);
             }
-            InstallPhase::OldOffsets(kind) if self.purge_offset_directory(kind).is_none() => {
-                install.phase = InstallPhase::OldOffsets(kind + 1);
+            InstallPhase::OldOffsets(Some(kind)) if self.consumer_offsets_dir(kind).is_none() => {
+                install.phase =
+                    InstallPhase::OldOffsets(crate::iggy_partition::next_consumer_kind(kind));
             }
             InstallPhase::CommitOffsets(cursor) if cursor == install.planned_offsets.len() => {
                 install.phase = InstallPhase::OffsetDirectories;
@@ -3387,9 +3421,8 @@ where
                 crate::PartitionIoJob::SegmentDirectory(install.partition_dir.clone()),
                 InstallFilePhase::EmptyDirectory,
             ),
-            InstallPhase::OldOffsets(kind) => {
-                let consumer_kind = crate::iggy_partition::purge_offset_kind(*kind)
-                    .ok_or(iggy_common::IggyError::CannotDeleteFile)?;
+            InstallPhase::OldOffsets(Some(kind)) => {
+                let consumer_kind = *kind;
                 // Replacements atomically overwrite their old files, so only keys
                 // absent from the plan are unlinked.
                 let mut retained: Vec<u32> = install
@@ -3471,6 +3504,12 @@ where
                     directory: install.partition_dir.clone(),
                     offset_directories: ConsumerKind::ALL
                         .map(|kind| self.consumer_offsets_dir(kind).map(str::to_owned)),
+                    stranded_offsets: Box::new(ConsumerKind::ALL.map(|kind| {
+                        let capacity = self.consumer_offset_capacity_for(kind);
+                        let mut known = HashSet::with_capacity(capacity.stranded_count());
+                        capacity.extend_stranded_ids(&mut known);
+                        known
+                    })),
                     segment: self.prepare_empty_segment(config, install.offsets_wire.next_offset),
                 }),
                 InstallFilePhase::Converge,
@@ -3579,7 +3618,7 @@ where
             ) => outcome
                 .map(|()| {
                     self.clear_install_offsets();
-                    InstallPhase::OldOffsets(0)
+                    InstallPhase::OldOffsets(Some(ConsumerKind::Consumer))
                 })
                 .map_err(|source| PartitionInstallError::SwapIo {
                     path: install.partition_dir.clone(),
@@ -3614,7 +3653,9 @@ where
                         source: iggy_common::IggyError::CannotDeleteFile,
                     })
                 } else {
-                    Ok(InstallPhase::OldOffsets(kind + 1))
+                    Ok(InstallPhase::OldOffsets(
+                        crate::iggy_partition::next_consumer_kind(consumer_kind),
+                    ))
                 }
             }
             (
@@ -3668,12 +3709,14 @@ where
                 crate::PartitionIoResult::Transfer(crate::io::TransferFileResult::Converged {
                     segment,
                     stranded,
+                    released,
                 }),
             ) => {
                 self.clear_converged_state(&install);
-                if let Some((kind, id)) = stranded
-                    && let Some(kind) = crate::iggy_partition::purge_offset_kind(kind)
-                {
+                for (kind, id) in released {
+                    self.consumer_offset_capacity_for(kind).clear_stranded(id);
+                }
+                if let Some((kind, id)) = stranded {
                     self.consumer_offset_capacity_for(kind).record_stranded(id);
                 }
                 match segment {

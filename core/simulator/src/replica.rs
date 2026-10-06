@@ -436,6 +436,7 @@ pub fn new_shard(
             inbox,
             reply_inbox,
             ServerConfig::default().sharding.poll_completion_capacity,
+            None,
             PapayaShardsTable::new(),
             shard::PartitionConsensusConfig::with_clock(
                 CLUSTER_ID,

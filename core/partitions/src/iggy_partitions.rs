@@ -195,7 +195,8 @@ where
         *self.io_notifier.borrow_mut() = Some((notifier, bytes_max));
     }
 
-    /// Only physical result settlement may look through the tombstone gate.
+    /// Access the physical owner through the tombstone gate for I/O settlement,
+    /// shutdown, fault scans, and ticks. Admission must use the live lookup.
     #[allow(clippy::mut_from_ref)]
     pub fn get_io_owner(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B, SB>> {
         let local = self.namespace_map().get(namespace).copied()?;
@@ -586,9 +587,6 @@ where
     /// `ReconcileOp::ConfirmRemove` after the partition is dropped.
     pub fn untombstone(&self, namespace: &IggyNamespace) {
         self.tombstoned.borrow_mut().remove(namespace);
-        if let Some(partition) = self.get_by_ns(namespace) {
-            self.install_loopback_notifier(*namespace, partition);
-        }
     }
 
     /// Snapshot read resources under a synchronous borrow on the owning pump.
@@ -995,12 +993,8 @@ mod tests {
 
         partitions.tombstone(namespace);
         assert!(!partitions.has_ready_loopbacks());
-        partitions.untombstone(&namespace);
-        assert!(
-            partitions.has_ready_loopbacks(),
-            "unmount cancellation restores queued work"
-        );
         let retired = partitions.remove(&namespace).unwrap();
+        partitions.untombstone(&namespace);
         assert!(!partitions.has_ready_loopbacks());
         let mut messages = Vec::new();
         retired.consensus().drain_loopback_into(&mut messages);

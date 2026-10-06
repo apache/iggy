@@ -222,7 +222,7 @@ where
             None
         };
 
-        let mut shard = IggyShard::new(
+        let shard = IggyShard::new(
             self.identity,
             self.bus,
             self.host,
@@ -232,15 +232,12 @@ where
             self.inbox,
             self.reply_inbox,
             self.poll_completion_capacity,
+            self.partition_io_limits,
             self.shards_table,
             self.partition_consensus,
             coordinator,
             self.metrics,
         )?;
-
-        if let Some(limits) = self.partition_io_limits {
-            shard.partition_io = crate::partition_io::PartitionIoLane::new(limits);
-        }
 
         Ok(BuiltShard { shard })
     }

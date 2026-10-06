@@ -1028,7 +1028,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             && (self.checkpoint_needed.get()
                 || self.retained_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
                     >= self.capacity / 2
-                || self.offset_files.retired_count() >= CHECKPOINT_DIRTY_FILES_MAX
                 || self.dirty_segments.borrow().len() * 2
                     + self
                         .dirty_offsets
@@ -1107,7 +1106,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.queued_bytes.set(0);
     }
 
-    pub fn begin_drain(&self) -> PersistenceDrain {
+    pub(crate) fn begin_drain(&self) -> PersistenceDrain {
         self.enqueue_paused.set(true);
         PersistenceDrain {
             instance: self.instance,
@@ -1122,7 +1121,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     /// # Errors
     /// Preserves storage/interruption failures and the original drain deadline.
-    pub fn observe_drain(&self, drain: &PersistenceDrain) -> io::Result<bool> {
+    pub(crate) fn observe_drain(&self, drain: &PersistenceDrain) -> io::Result<bool> {
         if drain.instance != self.instance || drain.epoch != self.epoch.get() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1146,7 +1145,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         Ok(false)
     }
 
-    pub fn finish_drain(&self, drain: &PersistenceDrain) {
+    pub(crate) fn finish_drain(&self, drain: &PersistenceDrain) {
         if drain.instance == self.instance && drain.epoch == self.epoch.get() {
             self.enqueue_paused.set(false);
         }

@@ -633,11 +633,11 @@ impl LocalPipeline {
     pub fn has_request_before(&self, order: LocalRequestOrder) -> bool {
         self.prepare_queue
             .iter()
-            .any(|entry| entry.local_order.is_none_or(|entry| entry < order))
+            .any(|entry| entry.local_order.is_none_or(|admitted| admitted < order))
             || self
                 .request_queue
                 .iter()
-                .any(|entry| entry.local_order.is_none_or(|entry| entry < order))
+                .any(|entry| entry.local_order.is_none_or(|admitted| admitted < order))
     }
 
     #[must_use]
@@ -5866,7 +5866,6 @@ mod vsr_consensus_tests {
         consensus.pipeline_message(PlaneKind::Metadata, message);
     }
 
-    use crate::drain_committable_prefix;
     use iggy_binary_protocol::Operation;
 
     /// Clock frozen at a fixed instant, so a stamp read off it is assertable.
@@ -5926,8 +5925,7 @@ mod vsr_consensus_tests {
         // Committing the head leaves op 2 in flight, so the timer stays armed --
         // now measuring op 2 rather than carrying op 1's elapsed ticks.
         consensus.advance_commit_max(1);
-        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
-        // As real callers do, per entry: the next drain starts at the op now owed.
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 1);
         consensus.advance_commit_min(1);
         assert!(
             prepare_ticking(&consensus),
@@ -5935,7 +5933,7 @@ mod vsr_consensus_tests {
         );
 
         consensus.advance_commit_max(2);
-        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 2);
         consensus.advance_commit_min(2);
         assert!(
             !prepare_ticking(&consensus),

@@ -309,10 +309,8 @@ impl ConsumerOffsetCapacity {
                 .is_some_and(|token| token.active_count() > 0)
     }
 
-    /// Assigns the pending count outright while [`Self::release_reservation`]
-    /// decrements it. Both take `&self` and neither locks: they are serialized
-    /// by their call sites, which all run under the partition's `&mut self` on
-    /// its own shard thread.
+    /// Assign the pending count under the partition's exclusive shard-local
+    /// ownership. Callers derive it from the remaining admitted operations.
     pub(crate) fn set_pending_count(&self, id: u32, count: usize) {
         if count == 0 {
             if self.pending.borrow_mut().remove(&id).is_some() {
@@ -320,21 +318,6 @@ impl ConsumerOffsetCapacity {
             }
         } else {
             self.pending.borrow_mut().insert(id, count);
-        }
-    }
-
-    /// See [`Self::set_pending_count`] for the serialization contract.
-    #[cfg(test)]
-    pub(crate) fn release_reservation(&self, id: u32) {
-        let mut pending = self.pending.borrow_mut();
-        let Some(count) = pending.get_mut(&id) else {
-            return;
-        };
-        if *count == 1 {
-            pending.remove(&id);
-            self.note_local_key_change();
-        } else {
-            *count -= 1;
         }
     }
 
@@ -616,12 +599,12 @@ mod tests {
         assert_eq!(capacity.try_reserve(7, &durable), Ok(()));
         assert_eq!(capacity.try_reserve(7, &durable), Ok(()));
         assert!(capacity.try_reserve(8, &durable).is_err());
-        capacity.release_reservation(7);
+        capacity.set_pending_count(7, 1);
         assert!(
             capacity.try_reserve(8, &durable).is_err(),
             "one of two reservations still owns the slot"
         );
-        capacity.release_reservation(7);
+        capacity.set_pending_count(7, 0);
         assert!(
             capacity.try_reserve(8, &durable).is_ok(),
             "the slot is released after the last reservation"

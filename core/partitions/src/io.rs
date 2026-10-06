@@ -413,6 +413,8 @@ pub enum TransferFileJob {
     Converge {
         directory: String,
         offset_directories: [Option<String>; ConsumerKind::COUNT],
+        // Keep recovery-only snapshots out of every file job's inline state.
+        stranded_offsets: Box<[HashSet<u32>; ConsumerKind::COUNT]>,
         segment: SegmentIoJob,
     },
 }
@@ -423,7 +425,8 @@ pub enum TransferFileResult {
     Opened(Result<InstalledSegment, crate::state_transfer::PartitionInstallError>),
     Converged {
         segment: Result<InstalledSegment, IggyError>,
-        stranded: Option<(usize, u32)>,
+        stranded: Option<(ConsumerKind, u32)>,
+        released: Vec<(ConsumerKind, u32)>,
     },
 }
 
@@ -997,6 +1000,8 @@ impl TransferFileJob {
                     };
                     let mut storage = match open().await {
                         Ok(storage) => storage,
+                        // A transient open failure need not fence durable history
+                        // or force a complete pull for a partition without a WAL.
                         Err(_) => open().await?,
                     };
                     // Only the tail takes writes, as after a rotation.
@@ -1078,9 +1083,12 @@ impl TransferFileJob {
             Self::Converge {
                 directory,
                 offset_directories,
+                mut stranded_offsets,
                 segment,
             } => {
                 let mut stranded = None;
+                let mut released =
+                    Vec::with_capacity(stranded_offsets.iter().map(HashSet::len).sum());
                 let outcome = async {
                     for (kind, path) in offset_directories.into_iter().enumerate() {
                         let Some(path) = path else {
@@ -1104,13 +1112,16 @@ impl TransferFileJob {
                                     })
                                     .await
                                 {
-                                    stranded = Some((kind, id));
+                                    stranded = Some((ConsumerKind::ALL[kind], id));
                                     return Err(error);
+                                }
+                                if stranded_offsets[kind].remove(&id) {
+                                    released.push((ConsumerKind::ALL[kind], id));
                                 }
                             } else if entry.file_name().to_str().is_some_and(|name| {
                                 crate::offset_storage::offset_replacement_id(name).is_some()
-                            }) {
-                                let _ = compio::fs::remove_file(path).await;
+                            }) && let Err(error) = compio::fs::remove_file(path).await {
+                                warn!(%path, %error, "cannot remove abandoned offset replacement during convergence");
                             }
                         }
                         match crate::state_transfer::fsync_dir(&path).await {
@@ -1150,6 +1161,7 @@ impl TransferFileJob {
                 TransferFileResult::Converged {
                     segment: outcome,
                     stranded,
+                    released,
                 }
             }
         }

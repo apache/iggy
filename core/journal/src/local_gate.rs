@@ -24,15 +24,16 @@
 //!
 //! Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`),
 //! release wakes every waiter and poll order re-races (arrival-order FIFO
-//! under `futures::join!`-style drivers), cancel-safe (dropping the guard
-//! releases; dropping a waiter leaves only a stale waker). Non-reentrant: a
-//! holder that re-acquires deadlocks itself.
+//! under `futures::join!`-style drivers). Dropping a borrowed guard releases;
+//! dropping a waiter leaves only a stale waker. An owned lease requires explicit
+//! release after physical completion: dropping it keeps the resource fenced.
+//! Non-reentrant: a holder that re-acquires deadlocks itself.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// See the module docs. Callers hold the returned guard across the awaited
-/// critical section; dropping it releases the gate and wakes every waiter.
+/// See the module docs. Borrowed guards release on drop; owned leases release
+/// explicitly after physical completion and otherwise keep the gate closed.
 ///
 /// Its exclusion is load-bearing in RELEASE, not only under
 /// `debug_assertions`: this gate is the only enforcement of the superblock

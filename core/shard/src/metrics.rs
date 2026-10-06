@@ -804,27 +804,27 @@ impl ShardMetrics {
         self.register_persistence(registry);
         registry.register(
             "partition_io_active_jobs",
-            "partition I/O active jobs",
+            "partition file jobs whose physical work has not completed",
             self.partition_io_active_jobs.clone(),
         );
         registry.register(
             "partition_io_queued_results",
-            "partition I/O queued results",
+            "completed partition file jobs awaiting acceptance by their owner",
             self.partition_io_queued_results.clone(),
         );
         registry.register(
             "partition_io_charged_bytes",
-            "partition I/O charged bytes",
+            "bytes reserved for partition file jobs and retained continuations",
             self.partition_io_charged_bytes.clone(),
         );
         registry.register(
             "partition_io_wait_depth",
-            "partition I/O wait depth",
+            "partition continuations ready to run or waiting for file-job capacity",
             self.partition_io_wait_depth.clone(),
         );
         registry.register(
             "partition_io_quarantined_jobs",
-            "partition I/O quarantined jobs",
+            "interrupted partition file jobs retaining their reservation and resource fence",
             self.partition_io_quarantined_jobs.clone(),
         );
 

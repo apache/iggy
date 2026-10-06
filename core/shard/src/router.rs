@@ -481,19 +481,14 @@ where
                     }
                 }
                 completion = self.partition_io.recv().fuse() => {
-                    match completion {
-                        Ok(token) => {
-                            self.accept_partition_io_completion(token);
-                            self.cooperate().await;
-                        }
-                        Err(_) => break,
-                    }
+                    self.accept_partition_io_completion(completion);
+                    self.cooperate().await;
                 }
                 completion = self.poll_completions.recv().fuse() => {
                     match completion {
                         Ok(completion) => {
                             self.on_poll_completed(*completion).await;
-                    self.cooperate().await;
+                            self.cooperate().await;
                             self.process_loopback(&mut loopback_buf).await;
                             self.apply_reconcile_ops();
                         }
@@ -586,8 +581,8 @@ where
         let rearm = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut tick = std::pin::pin!(rearm());
         let mut namespace_scratch = Vec::with_capacity(namespaces.len());
-        let mut inbox_closed = false;
-        let mut replies_closed = false;
+        let mut inbox = std::pin::pin!(self.inbox.recv().fuse());
+        let mut replies = std::pin::pin!(self.reply_inbox.recv().fuse());
         loop {
             self.process_one_poll_completion(loopback).await;
             self.service_partition_io().await;
@@ -605,7 +600,7 @@ where
                     for namespace in &namespaces {
                         if let Some(partition) = partitions.get_io_owner(namespace) {
                             partition.drive_persistence().await;
-                            partition.notify_io();
+                            partition.retry_io();
                         }
                     }
                     self.tick_metadata().await;
@@ -613,23 +608,23 @@ where
                     tick.set(rearm());
                 }
                 completion = self.partition_io.recv().fuse() => {
-                    if let Ok(token) = completion {
-                        self.accept_partition_io_completion(token);
-                        self.cooperate().await;
+                    self.accept_partition_io_completion(completion);
+                    self.cooperate().await;
+                }
+                frame = inbox.as_mut() => {
+                    if let Ok(frame) = frame {
+                        if self.accept_frame_for_self(&frame) {
+                            self.process_frame(frame).await;
+                        }
+                        inbox.set(self.inbox.recv().fuse());
                     }
                 }
-                frame = (if inbox_closed { futures::future::Either::Left(futures::future::pending()) } else { futures::future::Either::Right(self.inbox.recv()) }).fuse() => {
-                    match frame {
-                        Ok(frame) if self.accept_frame_for_self(&frame) => self.process_frame(frame).await,
-                        Ok(_) => {},
-                        Err(_) => inbox_closed = true,
-                    }
-                }
-                frame = (if replies_closed { futures::future::Either::Left(futures::future::pending()) } else { futures::future::Either::Right(self.reply_inbox.recv()) }).fuse() => {
-                    match frame {
-                        Ok(frame) if self.accept_frame_for_self(&frame) => self.process_frame(frame).await,
-                        Ok(_) => {},
-                        Err(_) => replies_closed = true,
+                frame = replies.as_mut() => {
+                    if let Ok(frame) = frame {
+                        if self.accept_frame_for_self(&frame) {
+                            self.process_frame(frame).await;
+                        }
+                        replies.set(self.reply_inbox.recv().fuse());
                     }
                 }
                 () = poll_fn(|context| {

@@ -1746,6 +1746,7 @@ where
     ///   pump (client `Reply` forwards only; see [`TaggedSender::reply_sender`]).
     /// * `poll_completion_capacity` - separate limit on running disk polls plus
     ///   results awaiting dequeue by this shard's owner pump. Must be nonzero.
+    /// * `partition_io_limits` - validated file-job limits, or the default limits.
     /// * `shards_table` - namespace -> shard routing table.
     /// * `coordinator` - `Some` on shard 0 (supplied by the builder when
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
@@ -1777,6 +1778,7 @@ where
         inbox: Receiver<ShardFrame>,
         reply_inbox: Receiver<ShardFrame>,
         poll_completion_capacity: usize,
+        partition_io_limits: Option<PartitionIoLimits>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
@@ -1792,10 +1794,10 @@ where
         let ShardIdentity { id, name } = identity;
         let poll_completions =
             poll::completion::PollCompletionLane::new(poll_completion_capacity, &metrics);
-        let partition_io = partition_io::PartitionIoLane::new(PartitionIoLimits::new(
-            partition_io::DEFAULT_PARTITION_IO_CAPACITY,
-            None,
-        )?);
+        let partition_io = partition_io::PartitionIoLane::new(match partition_io_limits {
+            Some(limits) => limits,
+            None => PartitionIoLimits::new(partition_io::DEFAULT_PARTITION_IO_CAPACITY, None)?,
+        });
         Ok(Self {
             id,
             name,
@@ -7705,7 +7707,7 @@ where
                 let _ = partition.persist_superblock_if_needed().await;
             }
             if let Some(partition) = partitions.get_io_owner(namespace) {
-                partition.notify_io();
+                partition.retry_io();
             }
         }
 
@@ -7733,6 +7735,7 @@ where
             }
         }
         self.metrics.record_persistence(&persistence_metrics);
+        self.partition_io.record_metrics(&self.metrics);
         self.metrics
             .record_replica_reads(&self.bus.take_replica_read_stats());
         self.metrics
@@ -8879,7 +8882,6 @@ where
     /// advancing write would stamp that stale counter over the reset the
     /// install just made, then quarantine the segments that would have
     /// contradicted it. `None` where the counter is authoritative.
-    #[allow(clippy::future_not_send)]
     fn fence_partition_for_rebuild(
         &self,
         namespace: IggyNamespace,
@@ -11350,10 +11352,9 @@ fn build_dvc_suffix(
 ///
 /// Worse to skip here than on the metadata plane, which is why this exists.
 /// Partition `append` has no slot-collision check, so a re-prepared op pushes a
-/// duplicate header and rewrites `op_to_storage_offset`, and `committed_prefix` walks
-/// positionally, so the stale entry is what `evict_prefix` flushes to the segment:
+/// duplicate header and rewrites `op_to_storage_offset`. Materialization walks
+/// positionally, so it would flush the stale entry to the segment:
 /// durable divergent bytes, no error anywhere.
-#[allow(clippy::future_not_send)]
 fn partition_view_divergence_from<B, SB>(
     shard: u16,
     partition: &IggyPartition<B, SB>,

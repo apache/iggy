@@ -21,6 +21,7 @@ use server_common::{
     iobuf::{Frozen, Owned},
     send_messages::{self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice_trusted},
 };
+use smallvec::SmallVec;
 use std::io;
 use std::{
     cell::{Cell, UnsafeCell},
@@ -29,7 +30,7 @@ use std::{
 };
 use tracing::warn;
 
-use crate::{Fragment, PollFragments, PollQueryResult};
+use crate::{COMMIT_WALK_OPS_MAX, Fragment, PollFragments, PollQueryResult};
 
 const ZERO_LEN: usize = 0;
 const PREPARE_HEADER_SIZE: usize = std::mem::size_of::<PrepareHeader>();
@@ -544,7 +545,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
     /// Pin the contiguous resident prefix through `commit_max`, stopping at gaps.
     /// Entries remain resident until their physical writes have been accepted.
-    pub fn committed_prefix(&self, commit_max: u64) -> Vec<JournalBuffer> {
+    #[cfg(test)]
+    pub(crate) fn committed_prefix(&self, commit_max: u64) -> Vec<JournalBuffer> {
         let count = self.committed_prefix_len(commit_max);
         let inner = unsafe { &*self.inner.get() };
         let entries = unsafe { &*inner.storage.entries.get() };
@@ -648,7 +650,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     ///
     /// INVARIANT (length-lock): the header is pushed before `storage.write_at`,
     /// so `headers[i]` and the entry at storage index `i` stay positionally
-    /// paired - `committed_prefix`'s zip relies on that. `MemStorage::write_at`
+    /// paired - materialization reads entries by that position. `MemStorage::write_at`
     /// is infallible, so the push never runs ahead of a failed write. A future
     /// fallible `Storage` MUST roll the header push back on a write error (or
     /// write before pushing the header) or the zip desyncs.
@@ -812,6 +814,59 @@ where
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().find(|header| header.op == op).copied()
+    }
+
+    pub(crate) fn headers_for_commit(
+        &self,
+        from_op: u64,
+        count: usize,
+    ) -> Vec<Option<PrepareHeader>> {
+        if count == 1 {
+            return vec![self.header_by_op(from_op)];
+        }
+        let mut selected = vec![None; count];
+        let headers = unsafe { &*self.headers.get() };
+        for header in headers {
+            if let Some(index) = header
+                .op
+                .checked_sub(from_op)
+                .and_then(|index| usize::try_from(index).ok())
+                && let Some(slot) = selected.get_mut(index)
+            {
+                slot.get_or_insert(*header);
+            }
+        }
+        selected
+    }
+
+    pub(crate) fn commit_headers_match(
+        &self,
+        from_op: u64,
+        expected: &[Option<PrepareHeader>],
+    ) -> bool {
+        if let [header] = expected {
+            return self.header_by_op(from_op) == *header;
+        }
+        let mut seen = SmallVec::<[bool; COMMIT_WALK_OPS_MAX]>::new();
+        seen.resize(expected.len(), false);
+        let headers = unsafe { &*self.headers.get() };
+        for header in headers {
+            if let Some(index) = header
+                .op
+                .checked_sub(from_op)
+                .and_then(|index| usize::try_from(index).ok())
+                && let Some(seen) = seen.get_mut(index)
+                && !*seen
+            {
+                if expected[index] != Some(*header) {
+                    return false;
+                }
+                *seen = true;
+            }
+        }
+        seen.iter()
+            .zip(expected)
+            .all(|(seen, header)| *seen == header.is_some())
     }
 
     /// Test residency without scanning the header vector.
@@ -1102,7 +1157,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     /// drain-and-re-append shape as `evict_prefix`, from the other end and retaining
     /// nothing: `append` has no slot-collision check here, so a superseded entry left
     /// in place sits beside the new view's prepare at the same op and
-    /// `committed_prefix`, which walks positionally, flushes the stale one.
+    /// positional materialization flushes the stale one.
     ///
     /// Dropped entries do NOT enter the evicted repair ring: it answers repair for
     /// committed ops, and these are ones the view just decided against.
@@ -1602,6 +1657,54 @@ mod tests {
         assert!(
             !window.contains_key(&1),
             "ops outside the window must not be reported"
+        );
+    }
+
+    #[compio::test]
+    async fn commit_header_snapshot_handles_repair_order_gaps_and_replacements() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [3, 1, 4] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .unwrap();
+        }
+        let selected = journal.headers_for_commit(1, 4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|header| header.map(|header| header.op))
+                .collect::<Vec<_>>(),
+            vec![Some(1), None, Some(3), Some(4)]
+        );
+        assert!(journal.commit_headers_match(1, &selected));
+        journal
+            .append(build_prepare(2, HEADER_SIZE + 16).into_frozen())
+            .await
+            .unwrap();
+        assert!(
+            !journal.commit_headers_match(1, &selected),
+            "repair filled a previously missing header"
+        );
+        let selected = journal.headers_for_commit(1, 4);
+        assert!(journal.commit_headers_match(1, &selected));
+        let duplicate = build_prepare(1, HEADER_SIZE + 16).transmute_header(
+            |mut old, header: &mut PrepareHeader| {
+                old.checksum ^= 1;
+                *header = old;
+            },
+        );
+        journal.append(duplicate.into_frozen()).await.unwrap();
+        assert_eq!(
+            journal.headers_for_commit(1, 4),
+            selected,
+            "the snapshot must agree with header_by_op's first resident match"
+        );
+        assert!(journal.commit_headers_match(1, &selected));
+        journal.truncate_from(3).await.unwrap();
+        assert!(
+            !journal.commit_headers_match(1, &selected),
+            "a truncated selection must not publish"
         );
     }
 

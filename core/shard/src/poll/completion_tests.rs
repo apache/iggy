@@ -1089,6 +1089,7 @@ fn owner_with_metadata_plane(
         inbox,
         replies,
         2,
+        None,
         routes,
         PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
         None,

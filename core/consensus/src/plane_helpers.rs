@@ -501,91 +501,18 @@ where
         || (consensus.view_log_is_pending() && consensus.is_primary_for_view(consensus.view()))
 }
 
-/// Drain and return committable prepares from the pipeline head.
-///
-/// Entries are drained from the head, while covered by the commit frontier, and
-/// only as a contiguous run starting at the next op owed to the state machine.
-///
-/// Callers `advance_commit_min` per entry, so a run starting above
-/// `commit_min + 1` or breaking partway hits that counter's sequential-advance
-/// assert. Pipeline-side twin of `commit_journal`'s gap-stop.
-///
-/// Reported, not asserted: a promoted partition primary reaches it legitimately
-/// while its journal walk clears the apply backlog. Repair arms on the level, and
-/// a hold that never clears fails the simulator's contiguity invariant.
-///
-/// Do NOT read that as "the journal walk always finishes". It can stall on the
-/// partition plane: `committed_headers_from` reads resident headers only, while
-/// `commit_messages` evicts up to `commit_max` (the cluster frontier), so ops past
-/// the per-call cap can be flushed out from under the walk. Pre-existing; see
-/// `IggyPartition::collect_committable_from_journal`.
-///
-/// A head at or below `commit_min` is the other shape: applied already, no repair
-/// owed, only a pop that can no longer happen. The journal walks stop below the
-/// head so they cannot create it, but a `set_commit_floor` jump past a live
-/// pipeline still can, so it is logged apart rather than treated as impossible.
-///
-/// # Panics
-/// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
-pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
-where
-    B: MessageBus,
-    P: Pipeline<Entry = PipelineEntry>,
-{
-    let commit = consensus.commit_max();
-    let commit_min = consensus.commit_min();
-    let mut drained = Vec::new();
-
-    consensus.with_pipeline_mut(|pipeline| {
-        let mut next = commit_min + 1;
-        while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
-            if head_op > commit {
-                break;
-            }
-            if head_op != next {
-                report_uncommittable_head(
-                    consensus.replica(),
-                    head_op,
-                    commit_min,
-                    commit,
-                    drained.len(),
-                );
-                break;
-            }
-
-            let entry = pipeline
-                .pop()
-                .expect("drain_committable_prefix: head exists");
-            drained.push(entry);
-            next += 1;
-        }
-    });
-
-    // Popping through the pipeline directly bypasses
-    // `VsrConsensus::pop_committed_prepare`, so re-establish the prepare
-    // timeout's ticking-iff-non-empty invariant here: an emptied pipeline
-    // disarms it, and a remaining head becomes the entry the timer measures,
-    // timed from now rather than inheriting the drained entry's elapsed ticks.
-    if !drained.is_empty() {
-        consensus.sync_prepare_timeout();
-    }
-
-    drained
-}
-
 /// Header of the pipeline head, iff its op is the next one this replica owes its
 /// state machine and is covered by the commit frontier.
 ///
-/// Peek-only counterpart of [`drain_committable_prefix`] for commit paths that
-/// must survive their driving future being canceled between "committable" and
+/// Commit paths must survive their driving future being canceled between "committable" and
 /// "applied" (see `IggyMetadata::on_ack`): the caller peeks here, performs its
-/// awaits with the entry still in the pipeline, then — in a sync region —
+/// awaits with the entry still in the pipeline, then synchronously
 /// revalidates that the head is still this exact entry before popping and
 /// applying it. A driver dropped at an await strands nothing; a sibling driver
 /// that committed the op first fails the caller's revalidation and re-peeks.
 ///
-/// Bounded below for the reason [`drain_committable_prefix`] is, and reported
-/// rather than asserted for the same one. Holding is safe: a shard pump's panic is
+/// A head that is not `commit_min + 1` is held and reported, because applying it
+/// would violate sequential advancement. Holding is safe: a shard pump's panic is
 /// swallowed by `compio::runtime::spawn`, while `tick_metadata` re-arms repair on
 /// the level.
 pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
@@ -2423,9 +2350,9 @@ mod tests {
     }
 
     /// `advance_commit_min` is strictly sequential, so draining op 7 with 6 never
-    /// applied panics the shard pump. Both gates must hold instead.
+    /// applied panics the shard pump. The commit gate must hold instead.
     #[test]
-    fn given_a_hole_below_the_head_when_committing_should_hold_both_gates() {
+    fn given_a_hole_below_the_head_when_committing_should_hold_the_head() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
         consensus.restore_commit_state(5, 5);
@@ -2439,10 +2366,6 @@ mod tests {
             peek_committable_head(&consensus).is_none(),
             "the head is covered by the frontier but op 6 is not applied"
         );
-        assert!(
-            drain_committable_prefix(&consensus).is_empty(),
-            "the drain must hold on the same hole the peek does"
-        );
         assert_eq!(
             consensus.pipeline_head_header().map(|header| header.op),
             Some(7),
@@ -2450,7 +2373,7 @@ mod tests {
         );
     }
 
-    /// The shape the journal-walk caps prevent. Both gates must still refuse it:
+    /// The shape the journal-walk caps prevent. The gate must still refuse it:
     /// re-applying an applied op panics `advance_commit_min`.
     #[test]
     fn given_an_applied_head_when_committing_should_refuse_it() {
@@ -2468,10 +2391,7 @@ mod tests {
             peek_committable_head(&consensus).is_none(),
             "op 5 is already applied; re-applying it panics advance_commit_min"
         );
-        assert!(
-            drain_committable_prefix(&consensus).is_empty(),
-            "the drain must refuse an applied head too"
-        );
+        assert_eq!(consensus.pipeline_head_header().unwrap().op, 5);
     }
 
     #[test]
@@ -2486,8 +2406,12 @@ mod tests {
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 60, 70));
 
         consensus.advance_commit_max(6);
-        let drained = drain_committable_prefix(&consensus);
-        let drained_ops: Vec<_> = drained.into_iter().map(|entry| entry.header.op).collect();
+        let mut drained_ops = Vec::new();
+        while let Some(header) = peek_committable_head(&consensus) {
+            assert_eq!(consensus.pop_committed_prepare().unwrap().header, header);
+            consensus.advance_commit_min(header.op);
+            drained_ops.push(header.op);
+        }
 
         assert_eq!(drained_ops, vec![5, 6]);
         assert_eq!(

@@ -200,10 +200,6 @@ impl<F> RetainedOffsetFiles<F> {
         self.retired.borrow_mut().clear();
     }
 
-    pub(crate) fn retired_count(&self) -> usize {
-        self.retired.borrow().len()
-    }
-
     pub(crate) fn take_checkpoint(&self) -> (Vec<RetainedOffsetFile<F>>, BTreeSet<PathBuf>) {
         let paths = self
             .files
@@ -825,7 +821,7 @@ mod tests {
         let (_, replacement) = cache.checkout("offset").unwrap();
         cache.put("offset", 9, replacement);
         cache.put("offset", 7, original);
-        assert_eq!(cache.retired_count(), 1);
+        assert_eq!(cache.retired.borrow().len(), 1);
         let replacement = cache.take("offset").unwrap();
         assert_eq!(replacement.file, 9);
         cache.clear();
