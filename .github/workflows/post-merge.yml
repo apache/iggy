@@ -55,32 +55,65 @@ jobs:
           if ! command -v yq >/dev/null 2>&1; then
             YQ_VERSION="v4.47.1"
             YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
             echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
             chmod +x /usr/local/bin/yq
           fi
 
-      # cargo-rail computes the affected crate set for the Docker :edge gate.
-      # Metadata-only `cargo rail plan` (no compile), so it runs on the runner's
-      # preinstalled cargo (version pinned by rust-toolchain.toml) and skips the
-      # heavyweight build-cache restore.
-      # Pinned for the same reason as .github/actions/rust/pre-merge/action.yml:
-      # 0.24 dropped the `-f json` edge-affected-images.sh relies on.
-      - name: Install cargo-rail
-        uses: taiki-e/install-action@v2.87.3
-        with:
-          tool: cargo-rail@0.23.0
+      # Planning is an optimization. A failure falls back to refreshing every
+      # Docker image in the component registry. The Action installs the one
+      # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
+      - name: Plan affected edge images
+        id: rail
+        continue-on-error: true
+        uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
 
       - name: Check all components
         id: check
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+          PLAN_STATUS: ${{ steps.rail.outcome }}
         run: |
-          chmod +x scripts/extract-version.sh
+          set -euo pipefail
 
-          # Refresh :edge only for Docker images whose crate closure or build
-          # context changed in this push (DAG gate). Fail-open to all images.
-          DOCKER_COMPONENTS=$(scripts/ci/edge-affected-images.sh "${{ github.event.before }}" "${{ github.sha }}")
+          COMPONENTS_JSON=$(yq -o=json -I=0 '.components' .github/config/publish.yml)
+          ALL_DOCKER_COMPONENTS=$(jq -r \
+            '[to_entries[] | select(.value.registry == "dockerhub") | .key] | join(",")' \
+            <<< "$COMPONENTS_JSON")
+
+          # The plan can only select images that have a catalog row, so a
+          # catalog that has drifted from publish.yml refreshes every image.
+          if [[ "$PLAN_STATUS" != "success" ]]; then
+            echo "::warning::Cargo-Rail plan unavailable; refreshing all edge images"
+            IMAGE_MATRIX=all
+          elif ! scripts/ci/edge-image-catalog.sh --check; then
+            echo "::warning::Edge image catalog does not match publish.yml; refreshing all edge images"
+            IMAGE_MATRIX=all
+          elif IMAGE_MATRIX=$(cargo-rail-action plan matrix "$PLAN_FILE" edge-images); then
+            echo "::notice::Using validated Cargo-Rail edge image plan: ${IMAGE_MATRIX}"
+          else
+            echo "::warning::Cargo-Rail edge image selector failed; refreshing all edge images"
+            IMAGE_MATRIX=all
+          fi
+
+          if [[ "$IMAGE_MATRIX" == "all" ]]; then
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          elif ! DOCKER_COMPONENTS=$(jq -er --argjson configured "$COMPONENTS_JSON" '
+            [.include[].component] as $selected
+            | [$selected[] | select($configured[.].registry != "dockerhub")] as $unknown
+            | if ($unknown | length) == 0
+              then $selected | join(",")
+              else error("Cargo-Rail selected unknown Docker components \($unknown | join(",")) in matrix \(tojson)")
+              end
+          ' <<< "$IMAGE_MATRIX"); then
+            echo "::warning::Cargo-Rail edge image matrix is invalid; refreshing all edge images"
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          fi
+
           echo "docker_components=$DOCKER_COMPONENTS" >> "$GITHUB_OUTPUT"
           echo "Docker components to refresh: ${DOCKER_COMPONENTS:-<none>}"
+
+          chmod +x scripts/extract-version.sh
 
           # Check Rust crates for pre-release versions without tags
           CRATES_TO_PUBLISH=""

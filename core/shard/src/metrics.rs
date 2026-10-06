@@ -44,6 +44,7 @@ use prometheus_client::registry::Registry;
 use std::sync::{Arc, OnceLock};
 
 use iggy_common::ConsumerKind;
+use message_bus::ReplicaReadMetrics;
 
 /// Label for `frame_drops_total`.
 ///
@@ -195,13 +196,6 @@ fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
 }
 
-const fn consumer_kind_index(kind: ConsumerKind) -> usize {
-    match kind {
-        ConsumerKind::Consumer => 0,
-        ConsumerKind::ConsumerGroup => 1,
-    }
-}
-
 /// Per-shard metric handles.
 ///
 /// Cheap to clone (`Arc` of a `Family` under the hood). Each shard owns
@@ -246,10 +240,12 @@ pub struct ShardMetrics {
     metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
+    replica_socket_reads_total: Counter,
+    replica_inbound_frames_total: Counter,
     partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
-    consumer_offset_denied_counters: [Counter; 2],
+    consumer_offset_denied_counters: [Counter; ConsumerKind::COUNT],
     partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge>,
-    consumer_offset_stranded_gauges: [Gauge; 2],
+    consumer_offset_stranded_gauges: [Gauge; ConsumerKind::COUNT],
 }
 
 impl ShardMetrics {
@@ -264,32 +260,24 @@ impl ShardMetrics {
         }));
         let partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter> =
             Family::default();
-        let consumer_denied = {
-            partition_consumer_offsets_denied_total
-                .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
-                .clone()
-        };
-        let consumer_group_denied = {
-            partition_consumer_offsets_denied_total
-                .get_or_create(&ConsumerOffsetKindLabel {
-                    kind: "consumer_group",
-                })
-                .clone()
-        };
-        let consumer_offset_denied_counters = [consumer_denied, consumer_group_denied];
-        let partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge> =
-            Family::default();
         // End each Family read guard before creating the next series, which
         // needs the same family's write lock on a miss.
-        let consumer_stranded = partition_consumer_offsets_stranded
-            .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
-            .clone();
-        let group_stranded = partition_consumer_offsets_stranded
-            .get_or_create(&ConsumerOffsetKindLabel {
-                kind: "consumer_group",
-            })
-            .clone();
-        let consumer_offset_stranded_gauges = [consumer_stranded, group_stranded];
+        let consumer_offset_denied_counters = ConsumerKind::ALL.map(|kind| {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel {
+                    kind: kind.as_str(),
+                })
+                .clone()
+        });
+        let partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge> =
+            Family::default();
+        let consumer_offset_stranded_gauges = ConsumerKind::ALL.map(|kind| {
+            partition_consumer_offsets_stranded
+                .get_or_create(&ConsumerOffsetKindLabel {
+                    kind: kind.as_str(),
+                })
+                .clone()
+        });
         Self {
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
@@ -320,6 +308,8 @@ impl ShardMetrics {
             metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
+            replica_socket_reads_total: Counter::default(),
+            replica_inbound_frames_total: Counter::default(),
             partition_consumer_offsets_denied_total,
             consumer_offset_denied_counters,
             partition_consumer_offsets_stranded,
@@ -345,6 +335,18 @@ impl ShardMetrics {
         self.partition_wal_checkpoints
             .inc_by(metrics.completed_checkpoints);
         self.partition_wal_errors.inc_by(metrics.failed_writes);
+    }
+
+    /// Fold one sweep's worth of replica socket-read deltas in.
+    ///
+    /// Deltas, never running totals: [`ReplicaReadMetrics`] comes from a
+    /// take that resets the source, so feeding cumulative values here
+    /// would double count every sweep. Both counters stay at zero on a
+    /// shard that owns no plaintext replica link, which is what makes
+    /// them identify the link shard.
+    pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
+        self.replica_socket_reads_total.inc_by(metrics.reads);
+        self.replica_inbound_frames_total.inc_by(metrics.frames);
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -425,7 +427,7 @@ impl ShardMetrics {
     /// Count consumer offset capacity denials from explicit client requests
     /// and automatic commit admission during poll completion.
     pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
-        self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
+        self.consumer_offset_denied_counters[kind.index()].inc();
     }
 
     /// Republished by every partition sweep: the sum over this shard's
@@ -434,14 +436,14 @@ impl ShardMetrics {
     /// store or delete of it succeeds, so a non-zero value that never falls is
     /// an offsets directory an operator has to repair.
     pub fn set_consumer_offsets_stranded(&self, kind: ConsumerKind, count: usize) {
-        self.consumer_offset_stranded_gauges[consumer_kind_index(kind)]
+        self.consumer_offset_stranded_gauges[kind.index()]
             .set(i64::try_from(count).unwrap_or(i64::MAX));
     }
 
     #[cfg(test)]
     #[must_use]
     pub fn consumer_offset_denied_value(&self, kind: ConsumerKind) -> u64 {
-        self.consumer_offset_denied_counters[consumer_kind_index(kind)].get()
+        self.consumer_offset_denied_counters[kind.index()].get()
     }
 
     /// Bumped every time a client request is answered with a retryable denial
@@ -824,6 +826,16 @@ impl ShardMetrics {
             self.partition_prepare_gap_drops_total.clone(),
         );
         registry.register(
+            "replica_socket_reads",
+            "completed socket reads on this shard's plaintext replica links",
+            self.replica_socket_reads_total.clone(),
+        );
+        registry.register(
+            "replica_inbound_frames",
+            "frames decoded off this shard's plaintext replica links",
+            self.replica_inbound_frames_total.clone(),
+        );
+        registry.register(
             "metadata_prepare_gap_drops",
             "replicated metadata prepares dropped out of order by a backup's gap check",
             self.metadata_prepare_gap_drops_total.clone(),
@@ -1011,11 +1023,12 @@ mod tests {
     }
 
     #[test]
-    fn consumer_offset_denials_use_two_cached_kind_series() {
+    fn consumer_offset_denials_use_one_cached_series_per_kind() {
         let metrics = ShardMetrics::for_shard();
         metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
         metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
         metrics.record_consumer_offset_denied(ConsumerKind::ConsumerGroup);
+        metrics.record_consumer_offset_denied(ConsumerKind::ExternalGroup);
 
         assert_eq!(
             metrics.consumer_offset_denied_value(ConsumerKind::Consumer),
@@ -1023,6 +1036,10 @@ mod tests {
         );
         assert_eq!(
             metrics.consumer_offset_denied_value(ConsumerKind::ConsumerGroup),
+            1
+        );
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::ExternalGroup),
             1
         );
         let mut registry = Registry::default();
@@ -1035,7 +1052,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("partition_consumer_offsets_denied_total"))
                 .count(),
-            2
+            3
         );
     }
 

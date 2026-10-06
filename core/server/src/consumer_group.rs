@@ -25,7 +25,10 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
-use crate::responses::{resolve_offset_group_id, resolve_partition_namespace};
+pub mod lease;
+pub mod liveness;
+
+use crate::namespace::{resolve_offset_group_id, resolve_partition_namespace};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::MetadataHandle;
@@ -38,7 +41,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireIdentifier};
+use iggy_binary_protocol::{
+    KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, RoutedRequestHeader, WireIdentifier,
+};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -85,6 +90,7 @@ where
                 group_id: wire.group_id,
                 client_id,
                 in_flight,
+                session: Some(request.header().session),
             }
             .to_bytes()
         }
@@ -200,8 +206,8 @@ where
     Ok(in_flight)
 }
 
-/// Rewrite a group consumer-offset op so its consumer id is the group's
-/// monotonic id rather than the wire name. The partition plane keys group
+/// Rewrite a group or external-group consumer-offset op so its consumer id is
+/// the group's monotonic id rather than the wire name. The partition plane keys group
 /// offsets by that numeric id (decoded from `WireIdentifier::Numeric`), so the
 /// read path -- which resolves the same id from metadata -- and the reconciler
 /// purge agree, and a re-created group (new id) never inherits a stale offset.
@@ -234,7 +240,10 @@ where
     macro_rules! rewrite_group_offset {
         ($ty:ty) => {{
             let mut wire = <$ty>::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            if wire.consumer.kind != KIND_CONSUMER_GROUP {
+            if !matches!(
+                wire.consumer.kind,
+                KIND_CONSUMER_GROUP | KIND_EXTERNAL_GROUP
+            ) {
                 return Ok(request);
             }
             let group_id = resolve_offset_group_id(
@@ -301,8 +310,8 @@ mod tests {
     use shard::metrics::ShardMetrics;
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
-        LifecycleFrame, PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardIdentity,
-        channel, shard_channel,
+        LifecycleFrame, NoopHost, PartitionConsensusConfig, ReplicaTopology, ShardFrame,
+        ShardIdentity, channel, shard_channel,
     };
 
     use super::*;
@@ -690,7 +699,7 @@ mod tests {
     /// Create a group and routes for two partitions, with no members or local
     /// partitions. Tests install partition state and apply joins explicitly.
     fn group_shard() -> Rc<TestShard> {
-        let shard = partition_read_shard();
+        let shard = partition_read_shard(3);
         let mux = &shard.plane.metadata().mux_stm;
         mux.update(prepare_message(
             Operation::CreateStream,
@@ -749,7 +758,7 @@ mod tests {
 
     /// Build a shard with its own inbox so tests can serve group progress reads
     /// and clears through the production message pump.
-    fn partition_read_shard() -> Rc<TestShard> {
+    pub(super) fn partition_read_shard(replica_count: u8) -> Rc<TestShard> {
         // These tests do not dispatch disk polls, so keep that lane minimal.
         const POLL_COMPLETION_CAPACITY: usize = 1;
 
@@ -757,7 +766,7 @@ mod tests {
         let consensus = VsrConsensus::new(
             1,
             0,
-            3,
+            replica_count,
             server_common::sharding::METADATA_GROUP,
             bus.clone(),
             LocalPipeline::new(),
@@ -783,10 +792,7 @@ mod tests {
             TestShard::new(
                 ShardIdentity::new(0, "consumer-group-test".to_string()),
                 bus.clone(),
-                Rc::new(|_, _| {}),
-                Rc::new(|_, _| {}),
-                Rc::new(|_| {}),
-                Rc::new(|_| {}),
+                Rc::new(NoopHost),
                 metadata,
                 partitions,
                 vec![sender],
@@ -794,7 +800,7 @@ mod tests {
                 replies,
                 POLL_COMPLETION_CAPACITY,
                 PapayaShardsTable::new(),
-                PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
+                PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus),
                 None,
                 ShardMetrics::for_shard(),
             )
@@ -827,12 +833,13 @@ mod tests {
         );
         let consumers = directory.join("offsets/consumers");
         let groups = directory.join("offsets/groups");
-        std::fs::create_dir_all(&consumers).unwrap();
-        std::fs::create_dir_all(&groups).unwrap();
+        let external_groups = directory.join("offsets/external_groups");
+        for path in [&consumers, &groups, &external_groups] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         partition.set_partition_dir(directory.to_string_lossy().into_owned());
         partition.configure_consumer_offset_storage(
-            consumers.to_string_lossy().into_owned(),
-            groups.to_string_lossy().into_owned(),
+            [&consumers, &groups, &external_groups].map(|path| path.to_string_lossy().into_owned()),
             ConsumerOffsets::with_capacity(0),
             ConsumerGroupOffsets::with_capacity(1),
         );
@@ -881,6 +888,7 @@ mod tests {
                     group_id: GROUP_ID,
                     client_id: FIRST_CLIENT,
                     in_flight: Vec::new(),
+                    session: None,
                 }
                 .to_bytes(),
             ))
@@ -903,7 +911,7 @@ mod tests {
 
     /// Poll the shard's message pump alongside the operation until it finishes.
     /// This serves progress reads and also executes any requested stale clears.
-    async fn run_with_partition_message_pump<T>(
+    pub(super) async fn run_with_partition_message_pump<T>(
         shard: &Rc<TestShard>,
         operation: impl Future<Output = T>,
     ) -> T {
@@ -1009,8 +1017,8 @@ mod tests {
         let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
             .await
             .unwrap();
-        let messages_size = storage.messages_writer.as_ref().unwrap().size_counter();
-        let index_size = storage.index_writer.as_ref().unwrap().size_counter();
+        let messages_size = storage.messages_size.clone().unwrap();
+        let index_size = storage.index_size.clone().unwrap();
         partition.log.messages_writers_mut()[0] = Some(Rc::new(
             MessagesWriter::new(&messages_path, messages_size, false, false, None)
                 .await

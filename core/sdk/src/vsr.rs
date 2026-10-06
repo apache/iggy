@@ -17,42 +17,65 @@
 
 use crate::session::ConsensusSession;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::codes::{
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
-};
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
-    RequestHeader, read_size_field, result_code, result_section_len,
+    RequestHeader, operation_for_code, read_size_field, result_code, result_section_len,
 };
-use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
+use iggy_common::{IggyError, eviction_reason_to_error};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
+/// A later refusal cannot establish whether an earlier attempt committed.
+#[derive(Default)]
+pub(crate) struct RetryOutcome {
+    uncertain: bool,
+}
 
-// A reconnect creates a fresh VSR client and session. A replicated request
-// retried there gets a new (client_id, request_id) tuple, so server-side
-// deduplication cannot match a mutation that may already have committed before
-// the transport failure. `replay_after_session_reset_is_safe` therefore keeps
-// ambiguous replicated outcomes with the caller instead of replaying them.
-//
-// A future transparent replay path can keep the ConsensusSession's client id
-// and request counter across reconnects and retry under the same identity.
-// Resume would happen through the LOGIN path: the
-// reconnecting client re-authenticates presenting its previous client_id, the
-// server verifies the authenticated user owns that entry, and the rebind commits
-// a Register that adopts the entry with its watermark and reply ring intact. Note
-// the epoch changes because the rebind moves the fence to the new register's op, so
-// the session field must be taken from the new login reply, not carried over.
-//
-// There is deliberately no credential-free rebind: presenting (client, session)
-// on an unauthenticated transport is refused, since that pair is a dedup key and
-// never a bearer token.
+impl RetryOutcome {
+    pub(crate) fn for_reconnect(code: u32, error: &IggyError) -> Self {
+        Self {
+            uncertain: !replay_after_session_reset_is_safe(code, error),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, error: IggyError) -> IggyError {
+        if matches!(error, IggyError::TransientNotCommitted) {
+            self.uncertain = true;
+        }
+        if self.uncertain
+            && matches!(
+                error,
+                IggyError::TransientNotAccepted
+                    | IggyError::Unauthorized
+                    | IggyError::Unauthenticated
+                    | IggyError::StaleClient
+                    | IggyError::NotConnected
+                    | IggyError::CannotEstablishConnection
+            )
+        {
+            IggyError::TransientNotCommitted
+        } else {
+            error
+        }
+    }
+}
+
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,
     payload: &Bytes,
+    retained_header: &mut Option<RequestHeader>,
 ) -> Result<Bytes, IggyError> {
-    let (header, total_size) = encode_request_header(session, code, payload)?;
+    let header = match *retained_header {
+        Some(header) => {
+            validate_retained_header(&header, session)?;
+            header
+        }
+        None => encode_request_header(session, code, payload)?.0,
+    };
+    *retained_header = Some(header);
+    let total_size = header.size as usize;
     let mut request = BytesMut::with_capacity(total_size);
     request.put_slice(bytemuck::bytes_of(&header));
     request.put_slice(payload);
@@ -66,12 +89,7 @@ pub(crate) fn encode_request_header(
 ) -> Result<(RequestHeader, usize), IggyError> {
     let (operation, request_id, session_id) = match code {
         LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE => {
-            // A re-login reuses this `ConsensusSession`; `begin_register`
-            // re-arms it (fresh session) so the Register encodes cleanly instead
-            // of tripping the one-shot register guard. Safe under the transport
-            // stream lock: it is lockstep (one request in flight), so no
-            // in-flight request observes the reset.
-            (Operation::Register, session.begin_register(), 0)
+            (Operation::Register, session.register_request_id(), 0)
         }
         _ => {
             let operation = operation_for_code(code);
@@ -100,59 +118,18 @@ pub(crate) fn encode_request_header(
                 // The metadata watermark tolerates the resulting gaps
                 // (`client_table.rs`: "There is no `RequestGap`").
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
-                (operation, session.next_request_id(), session_id)
+                (operation, session.next_request_id()?, session_id)
             }
         }
     };
-    // Metadata dedup compares this stamp with its cached replies. Partition
-    // dedup tracks request ids without retaining replies or comparing stamps;
-    // send batches carry their own checksum. NonReplicated ops bypass dedup.
-    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
-        0
-    } else {
-        u128::from(calculate_checksum(payload))
-    };
-    let total_size = HEADER_SIZE
-        .checked_add(payload.len())
-        .ok_or(IggyError::InvalidConfiguration)?;
-    let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut reserved = [0; 60];
-    if operation == Operation::NonReplicated {
-        reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
-    }
-    let header = RequestHeader {
-        command: Command::Request,
-        operation,
-        size,
-        client: session.client_id(),
-        request: request_id,
-        session: session_id,
-        // Lets the client table tell a genuine retry from a `request` number reused
-        // for different arguments. Zero means unstamped, which is what an SDK
-        // predating this sends. A server that rewrites the body (PAT, password)
-        // carries it through untouched, so it keeps describing what the client sent.
-        request_checksum,
-        // Replicated prepares get a server timestamp. Direct replies may echo
-        // this field, but no RTT consumer needs a client clock read here.
-        timestamp: 0,
-        reserved,
-        ..Default::default()
-    };
-
-    Ok((header, total_size))
-}
-
-/// `COMMAND_TABLE` is a protocol registry, not a per-server capability list, so
-/// an SDK build cannot know which codes a given server implements. The server is
-/// the authority: an unmapped code is forwarded as non-replicated (the code
-/// rides `RequestHeader.reserved`, which that path already stamps) and the
-/// server answers with a proper error if it does not know it.
-pub(crate) fn operation_for_code(code: u32) -> Operation {
-    if code == LOGOUT_USER_CODE {
-        return Operation::Logout;
-    }
-
-    Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
+    // The header rules (checksum stamp, size, reserved code) live in the
+    // protocol crate so every client and the cross-SDK fixtures share them;
+    // only the session identity is decided here.
+    let header =
+        RequestHeader::for_request(code, session.client_id(), request_id, session_id, payload)
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+    debug_assert_eq!(header.operation, operation);
+    Ok((header, header.size as usize))
 }
 
 /// Whether replaying `code` after reconnecting with a new session cannot
@@ -162,6 +139,7 @@ pub(crate) fn replay_after_session_reset_is_safe(code: u32, error: &IggyError) -
         || matches!(
             error,
             IggyError::NotConnected
+                | IggyError::TransientNotAccepted
                 | IggyError::CannotEstablishConnection
                 | IggyError::Unauthenticated
         )
@@ -169,6 +147,62 @@ pub(crate) fn replay_after_session_reset_is_safe(code: u32, error: &IggyError) -
             operation_for_code(code),
             Operation::NonReplicated | Operation::Logout
         )
+}
+
+/// A transport failure or a lagging replica can be retried on another endpoint.
+pub(crate) fn resume_error_is_retryable(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::Disconnected
+            | IggyError::EmptyResponse
+            | IggyError::NotConnected
+            | IggyError::CannotEstablishConnection
+            | IggyError::TcpError
+            | IggyError::QuicError
+            | IggyError::ConnectionClosed
+            | IggyError::WebSocketSendError
+            | IggyError::WebSocketReceiveError
+            | IggyError::TransientNotAccepted
+    )
+}
+
+/// A resumed session can replay its exact request. A replacement session can
+/// replay only an operation whose outcome proves it was never admitted.
+pub(crate) fn retain_replay_header(
+    header: &mut Option<RequestHeader>,
+    session: &Mutex<ConsensusSession>,
+    code: u32,
+    error: &IggyError,
+) -> Result<(), IggyError> {
+    let session = session
+        .lock()
+        .map_err(|_| IggyError::InvalidConfiguration)?;
+    if header.as_ref().is_some_and(|header| {
+        header.client == session.client_id()
+            && (header.session == session.session().unwrap_or(0)
+                || header.operation == Operation::Register)
+    }) {
+        return Ok(());
+    }
+    if replay_after_session_reset_is_safe(code, error) {
+        *header = None;
+        Ok(())
+    } else {
+        Err(IggyError::TransientNotCommitted)
+    }
+}
+
+pub(crate) fn validate_retained_header(
+    header: &RequestHeader,
+    session: &ConsensusSession,
+) -> Result<(), IggyError> {
+    if header.client != session.client_id()
+        || (header.operation != Operation::Register
+            && header.session != session.session().unwrap_or(0))
+    {
+        return Err(IggyError::TransientNotCommitted);
+    }
+    Ok(())
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
@@ -363,12 +397,14 @@ mod tests {
     use super::*;
     use crate::session::ConsensusSession;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE, SEND_MESSAGES_CODE,
+        CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::consensus::NON_REPLICATED_CODE_RANGE;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
     use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName, WireOptions};
+    use iggy_common::calculate_checksum;
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
@@ -376,8 +412,26 @@ mod tests {
     }
 
     #[test]
-    fn second_register_on_bound_session_re_arms_instead_of_panicking() {
+    fn an_authorization_denial_preserves_an_earlier_uncertain_outcome() {
+        for initial in [IggyError::TransientNotCommitted, IggyError::Disconnected] {
+            let mut outcome = RetryOutcome::for_reconnect(SEND_MESSAGES_CODE, &initial);
+            assert_eq!(
+                outcome.observe(IggyError::Unauthorized),
+                IggyError::TransientNotCommitted
+            );
+        }
+        assert_eq!(
+            RetryOutcome::default().observe(IggyError::Unauthorized),
+            IggyError::Unauthorized
+        );
+    }
+
+    #[test]
+    fn repeated_login_preserves_the_bound_session_and_request_sequence() {
         let request = LoginRegisterRequest {
+            bind_secret: iggy_binary_protocol::requests::users::login_register::BindSecret::new(
+                Box::new([0x5a; 32]),
+            ),
             version_info: ClientVersionInfo {
                 protocol_version: IGGY_PROTOCOL_VERSION,
                 sdk_name: WireName::new("rust-sdk").unwrap(),
@@ -389,19 +443,30 @@ mod tests {
         };
 
         let mut session = ConsensusSession::with_client_id(7);
-        encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes()).unwrap();
-        session.bind(42);
+        encode_contiguous_request(
+            &mut session,
+            LOGIN_REGISTER_CODE,
+            &request.to_bytes(),
+            &mut None,
+        )
+        .unwrap();
+        session.bind(42).unwrap();
 
-        // A second login on the same bound session must encode a fresh Register
-        // (request 0, session 0), not panic in the one-shot register guard.
-        let bytes =
-            encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes())
-                .unwrap();
+        let next_request = session.next_request_id().unwrap();
+        let bytes = encode_contiguous_request(
+            &mut session,
+            LOGIN_REGISTER_CODE,
+            &request.to_bytes(),
+            &mut None,
+        )
+        .unwrap();
         let header = decode_request_header(&bytes);
         assert_eq!(header.operation, Operation::Register);
         assert_eq!(header.request, 0);
         assert_eq!(header.session, 0);
-        assert!(!session.is_bound());
+        assert!(session.is_bound());
+        assert_eq!(session.session(), Some(42));
+        assert_eq!(session.next_request_id().unwrap(), next_request + 1);
     }
 
     #[test]
@@ -454,19 +519,21 @@ mod tests {
 
     #[test]
     fn reply_with_nonzero_status_surfaces_as_typed_error() {
-        // A dispatch-time authorization denial rides `ReplyHeader.status`; the
-        // decode funnel surfaces it as the typed error before any body decode,
-        // even though the deny body is empty.
-        let header = ReplyHeader {
-            command: Command::Reply,
-            size: HEADER_SIZE as u32,
-            status: IggyError::Unauthorized.as_code(),
-            ..Default::default()
-        };
-        let mut buf = [0u8; HEADER_SIZE];
-        buf.copy_from_slice(bytemuck::bytes_of(&header));
-        let result = decode_response_split(&buf, Bytes::new());
-        assert!(matches!(result, Err(IggyError::Unauthorized)));
+        for error in [IggyError::Unauthorized, IggyError::RequestTooOld] {
+            let header = ReplyHeader {
+                command: Command::Reply,
+                operation: Operation::SendMessages,
+                size: HEADER_SIZE as u32,
+                status: error.as_code(),
+                ..Default::default()
+            };
+            let mut buffer = [0u8; HEADER_SIZE];
+            buffer.copy_from_slice(bytemuck::bytes_of(&header));
+            assert!(
+                matches!(decode_response_split(&buffer, Bytes::new()), Err(result) if result == error),
+                "an empty denial body must preserve {error}"
+            );
+        }
     }
 
     #[test]
@@ -488,15 +555,19 @@ mod tests {
     fn replicated_request_increments_request_counter() {
         let mut session = ConsensusSession::with_client_id(42);
         let _ = session.register_request_id();
-        session.bind(99);
+        session.bind(99).unwrap();
         let payload = CreateStreamRequest {
             name: WireName::new("stream").unwrap(),
             options: WireOptions::empty(),
         }
         .to_bytes();
 
-        let first = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
-        let second = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        let first =
+            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload, &mut None)
+                .unwrap();
+        let second =
+            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload, &mut None)
+                .unwrap();
 
         assert_eq!(decode_request_header(&first).request, 1);
         assert_eq!(decode_request_header(&second).request, 2);
@@ -508,11 +579,12 @@ mod tests {
         // Metadata dedup compares the stamp against cached replies. Partition
         // dedup checks request ids without stamps; NonReplicated bypasses dedup.
         let mut session = ConsensusSession::with_client_id(42);
-        session.bind(99);
+        session.bind(99).unwrap();
         let payload = Bytes::from_static(b"payload");
 
         let metadata =
-            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload, &mut None)
+                .unwrap();
         // Hashed against the framed body rather than the `payload` the encoder was
         // handed, so a slice mistake between what is stamped and what is sent fails
         // here instead of reaching the server's `verify_request_checksum`.
@@ -522,10 +594,12 @@ mod tests {
         );
 
         let partition =
-            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
+            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload, &mut None)
+                .unwrap();
         assert_eq!(decode_request_header(&partition).request_checksum, 0);
 
-        let ping = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        let ping =
+            encode_contiguous_request(&mut session, PING_CODE, &Bytes::new(), &mut None).unwrap();
         assert_eq!(decode_request_header(&ping).request_checksum, 0);
     }
 
@@ -535,11 +609,15 @@ mod tests {
         // partition ops advance the counter exactly like metadata ops and
         // the two planes interleave on one sequence.
         let mut session = ConsensusSession::with_client_id(42);
-        session.bind(99);
+        session.bind(99).unwrap();
         let payload = Bytes::from_static(b"batch");
 
-        let first = encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
-        let second = encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
+        let first =
+            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload, &mut None)
+                .unwrap();
+        let second =
+            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload, &mut None)
+                .unwrap();
         assert_eq!(decode_request_header(&first).request, 1);
         assert_eq!(decode_request_header(&second).request, 2);
 
@@ -548,16 +626,22 @@ mod tests {
             options: WireOptions::empty(),
         }
         .to_bytes();
-        let metadata =
-            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &metadata_payload).unwrap();
+        let metadata = encode_contiguous_request(
+            &mut session,
+            CREATE_STREAM_CODE,
+            &metadata_payload,
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(decode_request_header(&metadata).request, 3);
     }
 
     #[test]
     fn ping_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
-        session.bind(99);
-        let bytes = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        session.bind(99).unwrap();
+        let bytes =
+            encode_contiguous_request(&mut session, PING_CODE, &Bytes::new(), &mut None).unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
@@ -575,9 +659,10 @@ mod tests {
     #[test]
     fn logout_uses_replicated_logout_operation() {
         let mut session = ConsensusSession::with_client_id(42);
-        session.bind(99);
+        session.bind(99).unwrap();
         let bytes =
-            encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
+            encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new(), &mut None)
+                .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::Logout);
@@ -588,9 +673,10 @@ mod tests {
     #[test]
     fn read_only_request_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
-        session.bind(99);
+        session.bind(99).unwrap();
         let bytes =
-            encode_contiguous_request(&mut session, GET_STREAM_CODE, &Bytes::new()).unwrap();
+            encode_contiguous_request(&mut session, GET_STREAM_CODE, &Bytes::new(), &mut None)
+                .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
@@ -617,8 +703,9 @@ mod tests {
         );
 
         let mut session = ConsensusSession::with_client_id(42);
-        session.bind(99);
-        let bytes = encode_contiguous_request(&mut session, UNKNOWN_CODE, &Bytes::new()).unwrap();
+        session.bind(99).unwrap();
+        let bytes = encode_contiguous_request(&mut session, UNKNOWN_CODE, &Bytes::new(), &mut None)
+            .unwrap();
         let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);

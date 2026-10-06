@@ -21,9 +21,12 @@ use async_trait::async_trait;
 /// This trait defines the methods to interact with the partition module.
 #[async_trait]
 pub trait SegmentClient {
-    /// Delete last N segments for a partition by unique ID or name.
+    /// Delete the oldest N sealed segments of a partition by unique ID or name.
     ///
-    /// For example, given a partition with 5 segments, if you delete 2 segments, the topic will have 3 segments left (from 1 to 3).
+    /// For example, given a partition with 5 segments, if you delete 2 segments, the partition will
+    /// have 3 segments left (from 3 to 5). The active segment is never deleted, and deletion stops at
+    /// the lowest offset any consumer or consumer group has committed, so fewer than N segments may
+    /// be removed.
     ///
     /// Authentication is required, and the permission to manage the segments.
     async fn delete_segments(

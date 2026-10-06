@@ -29,8 +29,8 @@ use iggy_gateway_kafka::protocol::api::{
 use codec::Encoder;
 use wire::build_api_versions_flexible_request;
 
-#[test]
-fn golden_apiversions_v3_flexible_response_fixture() {
+#[tokio::test]
+async fn golden_apiversions_v3_flexible_response_fixture() {
     // Field-by-field structural tests (`version_firewall_tests.rs`'s `apiversions_advertises_
     // exact_supported_ranges_v3_flexible`) check values against `SCOPED_API_KEYS`, but only this
     // exact-byte pin catches a wrong tagged-fields byte, wrong varint encoding, or misordered
@@ -38,61 +38,62 @@ fn golden_apiversions_v3_flexible_response_fixture() {
     let broker = BrokerAdvertise::default();
     let request = build_api_versions_flexible_request("iggy-test", "0.1.0");
     let actual = handle_request(API_KEY_API_VERSIONS, 3, request, &broker)
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=6 (compact array: N+1=7)
-    // key 0  (Produce)      min=0  max=9  (advertised)
-    // key 1  (Fetch)        min=4  max=12
-    // key 2  (ListOffsets)  min=1  max=6
-    // key 3  (Metadata)     min=0  max=9
-    // key 18 (ApiVersions)  min=0  max=3
-    // key 19 (CreateTopics) min=2  max=5
+    // error_code=0, api_count=12 (compact array: N+1=13)
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 50] = [
+    let expected: [u8; 92] = [
         0x00, 0x00, // error_code
-        0x07, // compact array count (6+1)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce      0-9 (advertised)
-        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch        4-12
-        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets  1-6
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, 0x00, // key 3:  Metadata     0-9
-        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key 18: ApiVersions  0-3
-        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, 0x00, // key 19: CreateTopics 2-5
+        0x0D, // compact array count (12+1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce         0-9 (advertised)
+        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch           4-12
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets     1-6
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, 0x00, // key 3:  Metadata        0-9
+        0x00, 0x0A, 0x00, 0x00, 0x00, 0x04, 0x00, // key 10: FindCoordinator 0-4
+        0x00, 0x0B, 0x00, 0x00, 0x00, 0x09, 0x00, // key 11: JoinGroup       0-9
+        0x00, 0x0C, 0x00, 0x00, 0x00, 0x04, 0x00, // key 12: Heartbeat       0-4
+        0x00, 0x0D, 0x00, 0x00, 0x00, 0x05, 0x00, // key 13: LeaveGroup      0-5
+        0x00, 0x0E, 0x00, 0x00, 0x00, 0x05, 0x00, // key 14: SyncGroup       0-5
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key 18: ApiVersions     0-3
+        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, 0x00, // key 19: CreateTopics    2-5
+        0x00, 0x16, 0x00, 0x00, 0x00, 0x05, 0x00, // key 22: InitProducerId  0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
         0x00, // top-level tagged fields
     ];
     assert_eq!(actual.as_ref(), &expected);
 }
 
-#[test]
-fn golden_apiversions_v1_response_fixture() {
+#[tokio::test]
+async fn golden_apiversions_v1_response_fixture() {
     let broker = BrokerAdvertise::default();
     let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker)
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=6
-    // key 0  (Produce)      min=0  max=9 (KAFKA-18659 advertise min=0)
-    // key 1  (Fetch)        min=4  max=12
-    // key 2  (ListOffsets)  min=1  max=6
-    // key 3  (Metadata)     min=0  max=9
-    // key 18 (ApiVersions)  min=0  max=3
-    // key 19 (CreateTopics) min=2  max=5
-    // throttle_ms=0
-    let expected: [u8; 46] = [
+    // error_code=0, api_count=12; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
+    let expected: [u8; 82] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x06, // api count = 6
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce      0–9 (advertised)
-        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch        4–12
-        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets  1–6
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, // key 3:  Metadata     0–9
-        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, // key 18: ApiVersions  0–3
-        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, // key 19: CreateTopics 2–5
+        0x00, 0x00, 0x00, 0x0C, // api count = 12
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce         0-9 (advertised)
+        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch           4-12
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets     1-6
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, // key 3:  Metadata        0-9
+        0x00, 0x0A, 0x00, 0x00, 0x00, 0x04, // key 10: FindCoordinator 0-4
+        0x00, 0x0B, 0x00, 0x00, 0x00, 0x09, // key 11: JoinGroup       0-9
+        0x00, 0x0C, 0x00, 0x00, 0x00, 0x04, // key 12: Heartbeat       0-4
+        0x00, 0x0D, 0x00, 0x00, 0x00, 0x05, // key 13: LeaveGroup      0-5
+        0x00, 0x0E, 0x00, 0x00, 0x00, 0x05, // key 14: SyncGroup       0-5
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, // key 18: ApiVersions     0-3
+        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, // key 19: CreateTopics    2-5
+        0x00, 0x16, 0x00, 0x00, 0x00, 0x05, // key 22: InitProducerId  0-5
         0x00, 0x00, 0x00, 0x00, // throttle_ms
     ];
     assert_eq!(actual.as_ref(), &expected);
 }
 
-#[test]
-fn golden_metadata_v0_single_topic_response_fixture() {
+#[tokio::test]
+async fn golden_metadata_v0_single_topic_response_fixture() {
     let mut request = Encoder::with_capacity(32);
     request.write_i32(1); // one topic
     request
@@ -101,6 +102,7 @@ fn golden_metadata_v0_single_topic_response_fixture() {
     let req_bytes = request.freeze();
 
     let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default())
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
     // Metadata v0 layout: brokers[], topics[]  (no controller_id - added in v1)

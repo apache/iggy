@@ -85,6 +85,7 @@ export const translateErrorCode = (code: number): string => {
     case '82': return "Invalid number encoding";
     case '83': return "Invalid boolean value";
     case '84': return "Invalid number value";
+    case '85': return "Request is below the deduplication window; outcome unknown, resending may duplicate the write";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
@@ -146,6 +147,7 @@ export const translateErrorCode = (code: number): string => {
     case '2019': return "Invalid partitions count";
     case '2020': return "Topic directory: {0} not found";
     case '2021': return "Too many topics";
+    case '2022': return "Partitions limit reached, raise [metadata] partitions_max";
 
     // TOPIC
     case '3000': return "Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}";
@@ -268,6 +270,8 @@ export const translateErrorCode = (code: number): string => {
     case '14000': return "VSR session already bound; reset before re-binding";
     case '14001': return "VSR session value {0} is invalid (must be non-zero)";
     case '14003': return "Incompatible binary protocol version: client {}, server accepts [{}, {}]";
+    case '14004': return "VSR session mismatch: requested {0}, server bound {1}";
+    case '14005': return "VSR request id exhausted";
 
     default: return 'error';
   }

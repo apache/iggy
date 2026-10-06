@@ -34,8 +34,8 @@ fn default_matches_standard_gateway_port() {
     assert_eq!(b.port, 9093);
 }
 
-#[test]
-fn metadata_reflects_broker_addr() {
+#[tokio::test]
+async fn metadata_reflects_broker_addr() {
     let broker = BrokerAdvertise {
         host: "203.0.113.7".to_string(),
         port: 9093,
@@ -43,6 +43,7 @@ fn metadata_reflects_broker_addr() {
     let mut req = Encoder::with_capacity(4);
     req.write_i32(0);
     let body = handle_request(API_KEY_METADATA, 0, req.freeze(), &broker)
+        .await
         .expect_response("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);

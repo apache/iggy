@@ -174,12 +174,14 @@ impl TransportConn for WssTransportConn {
         // both inner handshake futures are large (rustls + tungstenite
         // state machines) and would otherwise push `run`'s state past
         // the `clippy::large_futures` threshold.
-        let tls_stream = match compio::time::timeout(
-            handshake_grace,
-            Box::pin(tls_handshake(role, self.stream)),
-        )
-        .await
-        {
+        let tls_outcome = futures::select_biased! {
+            () = ctx.shutdown.wait().fuse() => return,
+            outcome = compio::time::timeout(
+                handshake_grace,
+                Box::pin(tls_handshake(role, self.stream)),
+            ).fuse() => outcome,
+        };
+        let tls_stream = match tls_outcome {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 warn!(
@@ -212,12 +214,14 @@ impl TransportConn for WssTransportConn {
             );
             return;
         }
-        let mut ws = match compio::time::timeout(
-            remaining,
-            Box::pin(ws_handshake(tls_stream, is_server, &peer, ws_config)),
-        )
-        .await
-        {
+        let upgrade_outcome = futures::select_biased! {
+            () = ctx.shutdown.wait().fuse() => return,
+            outcome = compio::time::timeout(
+                remaining,
+                Box::pin(ws_handshake(tls_stream, is_server, &peer, ws_config)),
+            ).fuse() => outcome,
+        };
+        let mut ws = match upgrade_outcome {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 warn!(

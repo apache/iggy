@@ -17,6 +17,11 @@
 
 codecov:
   require_ci_to_pass: false
+  notify:
+    # Codecov edits its PR comment after every processed upload, and the
+    # pre-merge coverage legs finish minutes apart. Hold the comment and
+    # statuses until codecov-notify.yml sends one trigger per finished run.
+    manual_trigger: true
 
 coverage:
   precision: 2
@@ -71,6 +76,9 @@ flag_management:
     - name: go
       paths:
         - foreign/go/
+    - name: cpp
+      paths:
+        - foreign/cpp/
 
 component_management:
   individual_components:
@@ -102,6 +110,10 @@ component_management:
       name: "Go SDK"
       paths:
         - foreign/go/
+    - component_id: cpp
+      name: "C++ SDK"
+      paths:
+        - foreign/cpp/
 
 comment:
   layout: "header, diff, components, files"

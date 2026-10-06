@@ -236,7 +236,8 @@ When `include_metadata = true` (default), payloads are wrapped:
 ```
 
 - **`iggy_id`**: Message ID formatted as 32-character lowercase hex string (no dashes)
-- **Non-JSON payload variants** (Raw, FlatBuffer, Proto, Avro): base64-encoded with `"iggy_payload_encoding": "base64"` in payload
+- **Proto**: sent as the JSON document it holds when the text parses as JSON (the descriptor-less `proto_convert` fallback), otherwise as a plain string like Text
+- **Binary payload variants** (Raw, FlatBuffer, Avro): base64-encoded with `"iggy_payload_encoding": "base64"` in payload
 - **JSON/Text payloads**: JSON values are reserialized; text becomes a JSON string.
 - **Timestamps**: `iggy_timestamp` and optional `iggy_origin_timestamp` use Unix epoch microseconds.
 - **Optional metadata**: `include_checksum` and `include_origin_timestamp` default to false. Nonempty message headers are included as `iggy_headers`.

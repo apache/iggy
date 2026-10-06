@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Check uv.lock files are in sync with pyproject.toml
         run: ./scripts/ci/uv-lock-check.sh --check
@@ -74,13 +74,32 @@ jobs:
           if ! command -v yq >/dev/null 2>&1; then
             YQ_VERSION="v4.47.1"
             YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
             echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
             chmod +x /usr/local/bin/yq
           fi
 
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
+
+  edge-image-catalog:
+    name: Check edge image catalog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Check edge image catalog matches publish.yml
+        run: ./scripts/ci/edge-image-catalog.sh --check
 
   license-headers:
     name: Check license headers
@@ -93,7 +112,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.3
+        uses: taiki-e/install-action@v2.87.18
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -114,7 +133,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7
         with:
           node-version: "23"
 
@@ -123,6 +142,9 @@ jobs:
 
       - name: Run markdownlint
         run: ./scripts/ci/markdownlint.sh --check
+
+      - name: Check agent skills
+        run: ./scripts/ci/skills.sh
 
   shellcheck:
     name: Shell scripts lint
@@ -175,7 +197,12 @@ jobs:
 
       - name: Install taplo
         run: |
-          curl -fsSL https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz | gunzip > taplo
+          tarball="$(mktemp)"
+          # Staged to a file because curl --retry cannot rewind a pipe.
+          curl -fsSL --retry 5 --retry-all-errors -o "$tarball" \
+            https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz
+          gunzip -c "$tarball" > taplo
+          rm -f "$tarball"
           chmod +x taplo
           sudo mv taplo /usr/local/bin/
 
@@ -206,7 +233,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.50.1
+        uses: crate-ci/typos@v1.50.2
 
   summary:
     name: Common checks summary
@@ -217,6 +244,7 @@ jobs:
         python-interpreter-versions,
         python-lockfiles,
         version-consistency,
+        edge-image-catalog,
         license-headers,
         third-party-licenses,
         markdown,
@@ -287,6 +315,15 @@ jobs:
             echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          EDGE_IMAGE_CATALOG="${{ needs.edge-image-catalog.result }}"
+          if [ "$EDGE_IMAGE_CATALOG" = "success" ]; then
+            echo "| ✅ Edge Image Catalog | success | Every Docker image has an :edge catalog row |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$EDGE_IMAGE_CATALOG" = "failure" ]; then
+            echo "| ❌ Edge Image Catalog | failure | Catalog drifted from publish.yml (see job log) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ Edge Image Catalog | $EDGE_IMAGE_CATALOG | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           if [ "$LICENSE_HEADERS" = "success" ]; then
             echo "| ✅ License Headers | success | All files have Apache headers |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$LICENSE_HEADERS" = "failure" ]; then
@@ -304,9 +341,9 @@ jobs:
           fi
 
           if [ "$MARKDOWN" = "success" ]; then
-            echo "| ✅ Markdown Lint | success | All markdown files are valid |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ Markdown Lint | success | All markdown files and agent skills are valid |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$MARKDOWN" = "failure" ]; then
-            echo "| ❌ Markdown Lint | failure | Markdown formatting issues found |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ Markdown Lint | failure | Markdown or agent skill issues found |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| ⏭️ Markdown Lint | $MARKDOWN | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi

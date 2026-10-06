@@ -20,33 +20,70 @@ use crate::server::scenarios::{reconnect_after_restart_scenario, restart_offset_
 use crate::server::scenarios::{
     segment_rotation_race_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
+use iggy::prelude::*;
+use integration::harness::TestHarness;
 use integration::iggy_harness;
+use std::collections::HashSet;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+
+const TLS_CLIENTS_PER_SHARD: usize = 2;
+const TLS_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[iggy_harness(
     test_client_transport = TcpTlsGenerated,
-    server(tls = generated)
+    server(tls = generated, logging.level = "info")
 )]
 async fn tcp_tls_scenario_should_be_valid(harness: &TestHarness) {
-    let client = harness.root_client().await.unwrap();
-    tcp_tls_scenario::run(&client).await;
+    let shard_count = tls_test_shard_count(harness).await;
+    let slow_clients = stalled_tls_clients(harness, shard_count).await;
+    let clients = harness
+        .root_clients(shard_count * TLS_CLIENTS_PER_SHARD)
+        .await
+        .unwrap();
+    for client in &clients {
+        tcp_tls_scenario::run(client).await;
+    }
+    drop(slow_clients);
+    assert_tls_client_sharding_and_cleanup(harness, &clients, "TCP-TLS", shard_count).await;
 }
 
 #[iggy_harness(
     test_client_transport = TcpTlsSelfSigned,
-    server(tls = self_signed)
+    server(tls = self_signed, logging.level = "info")
 )]
 async fn tcp_tls_self_signed_scenario_should_be_valid(harness: &TestHarness) {
-    let client = harness.root_client().await.unwrap();
-    tcp_tls_scenario::run(&client).await;
+    let shard_count = tls_test_shard_count(harness).await;
+    let slow_clients = stalled_tls_clients(harness, shard_count).await;
+    let clients = harness
+        .root_clients(shard_count * TLS_CLIENTS_PER_SHARD)
+        .await
+        .unwrap();
+    for client in &clients {
+        tcp_tls_scenario::run(client).await;
+    }
+    drop(slow_clients);
+    assert_tls_client_sharding_and_cleanup(harness, &clients, "TCP-TLS", shard_count).await;
 }
 
 #[iggy_harness(
     test_client_transport = WebSocketTlsGenerated,
-    server(websocket_tls = generated)
+    server(websocket_tls = generated, logging.level = "info")
 )]
 async fn websocket_tls_scenario_should_be_valid(harness: &TestHarness) {
-    let client = harness.root_client().await.unwrap();
-    websocket_tls_scenario::run(&client).await;
+    let shard_count = tls_test_shard_count(harness).await;
+    let slow_clients = stalled_tls_clients(harness, shard_count).await;
+    let clients = harness
+        .root_clients(shard_count * TLS_CLIENTS_PER_SHARD)
+        .await
+        .unwrap();
+    for client in &clients {
+        websocket_tls_scenario::run(client).await;
+    }
+    drop(slow_clients);
+    assert_tls_client_sharding_and_cleanup(harness, &clients, "WSS", shard_count).await;
 }
 
 #[iggy_harness]
@@ -140,4 +177,136 @@ async fn restart_offset_skip(harness: &mut TestHarness) {
 #[iggy_harness]
 async fn segment_rotation_scenario(harness: &TestHarness) {
     segment_rotation_race_scenario::run(harness).await;
+}
+
+async fn tls_test_shard_count(harness: &TestHarness) -> usize {
+    tokio::time::timeout(TLS_TEST_TIMEOUT, async {
+        loop {
+            let logs = harness.server().stdout_plain();
+            if let Some(line) = logs
+                .lines()
+                .find(|line| line.contains("server bootstrap dispatched; awaiting shard runtimes"))
+            {
+                let shard_count = line
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("shards_count="))
+                    .expect("bootstrap log must carry shards_count")
+                    .parse::<usize>()
+                    .expect("bootstrap shards_count must be numeric");
+                assert!(shard_count > 0, "server must start at least one shard");
+                return shard_count;
+            }
+            tokio::time::sleep(TLS_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("server must report its resolved shard count")
+}
+
+async fn assert_tls_client_sharding_and_cleanup(
+    harness: &TestHarness,
+    clients: &[IggyClient],
+    transport: &str,
+    shard_count: usize,
+) {
+    assert_tls_client_sharding(harness, clients, transport, shard_count).await;
+    for client in clients {
+        client.disconnect().await.unwrap();
+    }
+
+    // Each fresh observer has no partition connection and lives on a different
+    // shard. Seeing every observer proves that the gather includes every shard.
+    let observers = harness.root_clients(shard_count).await.unwrap();
+    let observer_ids =
+        assert_tls_client_sharding(harness, &observers, transport, shard_count).await;
+    tokio::time::timeout(TLS_TEST_TIMEOUT, async {
+        loop {
+            let connected = observers[0].get_clients().await.unwrap();
+            let connected_ids: HashSet<_> =
+                connected.iter().map(|client| client.client_id).collect();
+            if connected.len() == observers.len() && connected_ids == observer_ids {
+                break;
+            }
+            tokio::time::sleep(TLS_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("every shard must report only its observer after client disconnect");
+    for observer in observers {
+        observer.disconnect().await.unwrap();
+    }
+}
+
+async fn assert_tls_client_sharding(
+    harness: &TestHarness,
+    clients: &[IggyClient],
+    transport: &str,
+    shard_count: usize,
+) -> HashSet<u32> {
+    let mut client_ids = HashSet::with_capacity(clients.len());
+    for client in clients {
+        client_ids.insert(client.get_me().await.unwrap().client_id);
+    }
+    assert_eq!(client_ids.len(), clients.len(), "client IDs must be unique");
+
+    // The wire exposes only the sequence tail. Match it to the router's
+    // full ID and thread name to prove execution placement after handoff.
+    let install_marker = format!("installing delegated {transport} client fd");
+    tokio::time::timeout(TLS_TEST_TIMEOUT, async {
+        loop {
+            let logs = harness.server().stdout_plain();
+            let mut counts = vec![0; shard_count];
+            let mut installed = HashSet::new();
+            for line in logs.lines().filter(|line| line.contains(&install_marker)) {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let full_id: u128 = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("client_id="))
+                    .expect("install log must carry client_id")
+                    .parse()
+                    .unwrap();
+                let wire_id = u32::try_from(full_id & u128::from(u32::MAX)).unwrap();
+                if !client_ids.contains(&wire_id) {
+                    continue;
+                }
+                let owner = usize::try_from(full_id >> 112).unwrap();
+                assert!(owner < shard_count, "invalid owner: {line}");
+                assert!(
+                    fields.contains(&format!("shard={owner}").as_str()),
+                    "{line}"
+                );
+                assert!(
+                    fields.contains(&format!("shard-{owner}").as_str()),
+                    "{line}"
+                );
+                assert!(installed.insert(wire_id), "client installed twice: {line}");
+                counts[owner] += 1;
+            }
+            if installed == client_ids {
+                assert_eq!(counts, vec![clients.len() / shard_count; shard_count]);
+                break;
+            }
+            tokio::time::sleep(TLS_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("every encrypted client must be installed on its owning shard thread");
+    client_ids
+}
+
+async fn stalled_tls_clients(harness: &TestHarness, shard_count: usize) -> Vec<TcpStream> {
+    let address = match harness.transport().unwrap() {
+        TransportProtocol::Tcp => harness.server().tcp_addr().unwrap(),
+        TransportProtocol::WebSocket => harness.server().websocket_addr().unwrap(),
+        transport => panic!("expected TCP-TLS or WSS, got {transport:?}"),
+    };
+    let mut clients = Vec::with_capacity(shard_count);
+    for _ in 0..shard_count {
+        clients.push(TcpStream::connect(address).await.unwrap());
+    }
+    for _ in 0..shard_count {
+        let mut invalid = TcpStream::connect(address).await.unwrap();
+        invalid.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    }
+    clients
 }

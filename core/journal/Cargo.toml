@@ -35,6 +35,7 @@ futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 server_common = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 twox-hash = { workspace = true }
 

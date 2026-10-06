@@ -19,8 +19,8 @@ use crate::iobuf::{Frozen, Owned};
 use crate::sharding::METADATA_GROUP;
 use aligned_vec::{AVec, ConstAlign};
 use iggy_binary_protocol::{
-    Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSessionHeartbeatHeader,
+    DoViewChangeHeader, ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
     PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
@@ -466,11 +466,11 @@ where
 
 impl Message<RequestHeader> {
     /// Retype the client-wire request into the server-internal
-    /// [`RoutedRequestHeader`] shape in place, with `group` starting unset.
+    /// [`RoutedRequestHeader`] shape in place, with server routing fields unset.
     ///
     /// The two layouts share every field offset (const-asserted where they
-    /// are declared) and `group` claims the client header's reserved tail,
-    /// so the promotion zeroes those eight bytes instead of rebuilding the
+    /// are declared) and routing fields claim the client header's reserved tail,
+    /// so the promotion zeroes those bytes instead of rebuilding the
     /// whole 256-byte header. This is the only sanctioned crossing between
     /// the two layouts: transmute-based reads across them would alias
     /// `group` with reserved bytes a client may have sent nonzero.
@@ -483,8 +483,9 @@ impl Message<RequestHeader> {
     #[must_use]
     pub fn into_routed(self) -> Message<RoutedRequestHeader> {
         let group_offset = offset_of!(RoutedRequestHeader, group);
+        let metadata_offset = offset_of!(RoutedRequestHeader, metadata_watermark);
         let mut owned = self.into_owned();
-        owned.as_mut_slice()[group_offset..group_offset + size_of::<u64>()].fill(0);
+        owned.as_mut_slice()[metadata_offset..group_offset + size_of::<u64>()].fill(0);
         Message::try_from(owned).expect("retyped request message must stay valid")
     }
 }
@@ -644,6 +645,8 @@ pub enum MessageBag {
     ForwardLogout(Message<ForwardLogoutHeader>),
     /// The primary's verdict, routed back to the parked logout by nonce.
     ForwardLogoutResult(Message<ForwardLogoutResultHeader>),
+    /// A backup reports session liveness to the metadata primary without a reply.
+    ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
 }
 
 impl MessageBag {
@@ -725,6 +728,9 @@ impl MessageBag {
             Self::ForwardRegister(message) => (message.header().operation(), METADATA_GROUP),
             Self::ForwardRegisterResult(message) => (message.header().operation(), METADATA_GROUP),
             Self::ForwardLogout(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ConsumerSessionHeartbeat(message) => {
+                (message.header().operation(), METADATA_GROUP)
+            }
             Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
         }
     }
@@ -756,6 +762,7 @@ impl MessageBag {
             Self::ForwardRegister(message) => message.into_generic(),
             Self::ForwardRegisterResult(message) => message.into_generic(),
             Self::ForwardLogout(message) => message.into_generic(),
+            Self::ConsumerSessionHeartbeat(message) => message.into_generic(),
             Self::ForwardLogoutResult(message) => message.into_generic(),
         }
     }
@@ -781,6 +788,7 @@ impl MessageBag {
             Self::ForwardRegister(message) => message.header().command,
             Self::ForwardRegisterResult(message) => message.header().command,
             Self::ForwardLogout(message) => message.header().command,
+            Self::ConsumerSessionHeartbeat(message) => message.header().command,
             Self::ForwardLogoutResult(message) => message.header().command,
         }
     }
@@ -806,6 +814,7 @@ impl MessageBag {
             Self::ForwardRegister(message) => message.header().size(),
             Self::ForwardRegisterResult(message) => message.header().size(),
             Self::ForwardLogout(message) => message.header().size(),
+            Self::ConsumerSessionHeartbeat(message) => message.header().size(),
             Self::ForwardLogoutResult(message) => message.header().size(),
         }
     }
@@ -831,6 +840,7 @@ impl MessageBag {
             Self::ForwardRegister(message) => message.header().operation(),
             Self::ForwardRegisterResult(message) => message.header().operation(),
             Self::ForwardLogout(message) => message.header().operation(),
+            Self::ConsumerSessionHeartbeat(message) => message.header().operation(),
             Self::ForwardLogoutResult(message) => message.header().operation(),
         }
     }
@@ -963,6 +973,11 @@ where
             Command::ForwardLogoutResult => Ok(Self::ForwardLogoutResult(
                 value.try_into_typed::<ForwardLogoutResultHeader>()?,
             )),
+            Command::ConsumerSessionHeartbeat | Command::SessionRetirementProgress => {
+                Ok(Self::ConsumerSessionHeartbeat(
+                    value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
+                ))
+            }
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command::Reply | Command::Eviction => Err(ConsensusError::ClientBoundCommand(command)),
@@ -1592,7 +1607,7 @@ mod tests {
 
     // Promotion must carry the data-bearing reserved prefix verbatim (the
     // non-replicated op code lives in `reserved[0..4]`) and unset only the
-    // `group` tail, whatever junk the client sent in those eight bytes.
+    // routing fields, whatever bytes the client sent in that tail.
     #[test]
     fn into_routed_keeps_reserved_prefix_and_unsets_group() {
         const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
@@ -1611,13 +1626,14 @@ mod tests {
         let header = routed.header();
         assert_eq!(
             header.reserved[..],
-            client_header.reserved[..52],
+            client_header.reserved[..header.reserved.len()],
             "the reserved prefix carries data and must survive promotion"
         );
         assert_eq!(
             header.group, 0,
             "the client-sent reserved tail must not leak into `group`"
         );
+        assert_eq!(header.metadata_watermark, 0);
         assert_eq!(header.client, client_header.client);
         assert_eq!(header.operation, client_header.operation);
         assert_eq!(header.session, client_header.session);

@@ -32,6 +32,124 @@ LoginInfo LoginInfo::FromFfi(ffi::LoginInfo login_info) {
     return LoginInfo(login_info.user_id, std::move(access_token), access_token_expiry);
 }
 
+ffi::GlobalPermissions GlobalPermissions::ToFfi() const {
+    ffi::GlobalPermissions permissions{};
+    permissions.manage_servers = manage_servers_;
+    permissions.read_servers   = read_servers_;
+    permissions.manage_users   = manage_users_;
+    permissions.read_users     = read_users_;
+    permissions.manage_streams = manage_streams_;
+    permissions.read_streams   = read_streams_;
+    permissions.manage_topics  = manage_topics_;
+    permissions.read_topics    = read_topics_;
+    permissions.poll_messages  = poll_messages_;
+    permissions.send_messages  = send_messages_;
+    return permissions;
+}
+
+GlobalPermissions GlobalPermissions::FromFfi(ffi::GlobalPermissions permissions) {
+    GlobalPermissions result;
+    result.manage_servers_ = permissions.manage_servers;
+    result.read_servers_   = permissions.read_servers;
+    result.manage_users_   = permissions.manage_users;
+    result.read_users_     = permissions.read_users;
+    result.manage_streams_ = permissions.manage_streams;
+    result.read_streams_   = permissions.read_streams;
+    result.manage_topics_  = permissions.manage_topics;
+    result.read_topics_    = permissions.read_topics;
+    result.poll_messages_  = permissions.poll_messages;
+    result.send_messages_  = permissions.send_messages;
+    return result;
+}
+
+ffi::TopicPermissions TopicPermissions::ToFfi() const {
+    ffi::TopicPermissions permissions{};
+    permissions.manage_topic  = manage_topic_;
+    permissions.read_topic    = read_topic_;
+    permissions.poll_messages = poll_messages_;
+    permissions.send_messages = send_messages_;
+    return permissions;
+}
+
+TopicPermissions TopicPermissions::FromFfi(ffi::TopicPermissions permissions) {
+    TopicPermissions result;
+    result.manage_topic_  = permissions.manage_topic;
+    result.read_topic_    = permissions.read_topic;
+    result.poll_messages_ = permissions.poll_messages;
+    result.send_messages_ = permissions.send_messages;
+    return result;
+}
+
+ffi::StreamPermissions StreamPermissions::ToFfi() const {
+    ffi::StreamPermissions permissions{};
+    permissions.manage_stream = manage_stream_;
+    permissions.read_stream   = read_stream_;
+    permissions.manage_topics = manage_topics_;
+    permissions.read_topics   = read_topics_;
+    permissions.poll_messages = poll_messages_;
+    permissions.send_messages = send_messages_;
+    permissions.topics.reserve(topics_.size());
+    for (const auto &[topic_id, topic_permissions] : topics_) {
+        ffi::TopicPermissionEntry entry{};
+        entry.topic_id    = topic_id;
+        entry.permissions = topic_permissions.ToFfi();
+        permissions.topics.push_back(entry);
+    }
+    return permissions;
+}
+
+StreamPermissions StreamPermissions::FromFfi(const ffi::StreamPermissions &permissions) {
+    StreamPermissions result;
+    result.manage_stream_ = permissions.manage_stream;
+    result.read_stream_   = permissions.read_stream;
+    result.manage_topics_ = permissions.manage_topics;
+    result.read_topics_   = permissions.read_topics;
+    result.poll_messages_ = permissions.poll_messages;
+    result.send_messages_ = permissions.send_messages;
+    for (const auto &entry : permissions.topics) {
+        result.topics_.insert_or_assign(entry.topic_id, TopicPermissions::FromFfi(entry.permissions));
+    }
+    return result;
+}
+
+ffi::Permissions Permissions::ToFfi() const {
+    ffi::Permissions permissions{};
+    permissions.global = global_.ToFfi();
+    permissions.streams.reserve(streams_.size());
+    for (const auto &[stream_id, stream_permissions] : streams_) {
+        ffi::StreamPermissionEntry entry{};
+        entry.stream_id   = stream_id;
+        entry.permissions = stream_permissions.ToFfi();
+        permissions.streams.push_back(std::move(entry));
+    }
+    return permissions;
+}
+
+Permissions Permissions::FromFfi(const ffi::Permissions &permissions) {
+    Permissions result;
+    result.global_ = GlobalPermissions::FromFfi(permissions.global);
+    for (const auto &entry : permissions.streams) {
+        result.streams_.insert_or_assign(entry.stream_id, StreamPermissions::FromFfi(entry.permissions));
+    }
+    return result;
+}
+
+UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
+    return UserInfo(user.id, user.created_at, static_cast<UserStatus>(user.status),
+                    std::string(user.username.c_str(), user.username.size()),
+                    ResourceOptions::FromFfi(std::move(user.options), rust::Vec<ffi::HeaderEntry>{}));
+}
+
+UserInfoDetails UserInfoDetails::FromFfi(ffi::UserInfoDetails user) {
+    std::optional<::iggy::Permissions> permissions;
+    if (user.has_permissions) {
+        permissions = ::iggy::Permissions::FromFfi(user.permissions);
+    }
+    return UserInfoDetails(user.id, user.created_at, static_cast<UserStatus>(user.status),
+                           std::string(user.username.c_str(), user.username.size()), std::move(permissions),
+                           ResourceOptions::FromFfi(std::move(user.options), rust::Vec<ffi::HeaderEntry>{}));
+}
+
 ffi::Identifier Identifier::ToFfi() const {
     ffi::Identifier identifier{};
     if (kind_ == Kind::Numeric) {
@@ -42,6 +160,10 @@ ffi::Identifier Identifier::ToFfi() const {
     return identifier;
 }
 
+ConsumerOffsetInfo ConsumerOffsetInfo::FromFfi(ffi::ConsumerOffsetInfo offset) {
+    return ConsumerOffsetInfo(offset.partition_id, offset.current_offset, offset.stored_offset);
+}
+
 HeaderField HeaderField::FromFfi(ffi::HeaderField field) {
     return HeaderField(static_cast<HeaderKind>(field.kind),
                        std::vector<std::uint8_t>(field.value.begin(), field.value.end()));
@@ -49,6 +171,47 @@ HeaderField HeaderField::FromFfi(ffi::HeaderField field) {
 
 HeaderEntry HeaderEntry::FromFfi(ffi::HeaderEntry entry) {
     return HeaderEntry(HeaderField::FromFfi(std::move(entry.key)), HeaderField::FromFfi(std::move(entry.value)));
+}
+
+ffi::IggyMessageToSend IggyMessageToSend::ToFfi() const {
+    ffi::IggyMessageToSend ffi_message;
+    ffi_message.id_lo = absl::Uint128Low64(id_);
+    ffi_message.id_hi = absl::Uint128High64(id_);
+    ffi_message.payload.reserve(payload_.size());
+    for (const auto byte : payload_) {
+        ffi_message.payload.push_back(byte);
+    }
+    ffi_message.user_headers.reserve(user_headers_.size());
+    for (const auto &entry : user_headers_) {
+        const auto &key   = entry.Key();
+        const auto &value = entry.Value();
+        ffi::HeaderEntry ffi_entry;
+        ffi_entry.key.kind = static_cast<std::uint8_t>(key.Kind());
+        ffi_entry.key.value.reserve(key.Value().size());
+        for (const auto byte : key.Value()) {
+            ffi_entry.key.value.push_back(byte);
+        }
+        ffi_entry.value.kind = static_cast<std::uint8_t>(value.Kind());
+        ffi_entry.value.value.reserve(value.Value().size());
+        for (const auto byte : value.Value()) {
+            ffi_entry.value.value.push_back(byte);
+        }
+        ffi_message.user_headers.push_back(std::move(ffi_entry));
+    }
+    return ffi_message;
+}
+
+IggyMessagePolled IggyMessagePolled::FromFfi(ffi::IggyMessagePolled message) {
+    std::vector<HeaderEntry> user_headers;
+    user_headers.reserve(message.user_headers.size());
+    for (auto &entry : message.user_headers) {
+        user_headers.push_back(HeaderEntry::FromFfi(std::move(entry)));
+    }
+
+    return IggyMessagePolled(
+        message.checksum, absl::MakeUint128(message.id_hi, message.id_lo), message.offset, message.timestamp,
+        message.origin_timestamp, message.user_headers_length, message.payload_length, message.reserved,
+        std::vector<std::uint8_t>(message.payload.begin(), message.payload.end()), std::move(user_headers));
 }
 
 ResourceOptions ResourceOptions::FromFfi(rust::Vec<ffi::HeaderEntry> explicit_entries,
@@ -87,7 +250,7 @@ TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {
     std::vector<Partition> partitions;
     partitions.reserve(topic.partitions.size());
     for (auto &partition : topic.partitions) {
-        partitions.push_back(Partition::FromFfi(std::move(partition)));
+        partitions.push_back(Partition::FromFfi(partition));
     }
 
     return TopicDetails(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()),
@@ -113,6 +276,83 @@ Stream Stream::FromFfi(ffi::Stream stream) {
     return Stream(stream.id, stream.created_at, std::string(stream.name.c_str(), stream.name.size()), stream.size_bytes,
                   stream.messages_count, stream.topics_count,
                   ResourceOptions::FromFfi(std::move(stream.options), rust::Vec<ffi::HeaderEntry>{}));
+}
+
+ConsumerGroupMember ConsumerGroupMember::FromFfi(ffi::ConsumerGroupMember member) {
+    return ConsumerGroupMember(member.id, member.partitions_count,
+                               std::vector<std::uint32_t>(member.partitions.begin(), member.partitions.end()));
+}
+
+ConsumerGroup ConsumerGroup::FromFfi(ffi::ConsumerGroup group) {
+    return ConsumerGroup(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
+                         group.members_count);
+}
+
+ConsumerGroupDetails ConsumerGroupDetails::FromFfi(ffi::ConsumerGroupDetails group) {
+    std::vector<ConsumerGroupMember> members;
+    members.reserve(group.members.size());
+    for (auto &member : group.members) {
+        members.push_back(ConsumerGroupMember::FromFfi(std::move(member)));
+    }
+
+    return ConsumerGroupDetails(group.id, std::string(group.name.c_str(), group.name.size()), group.partitions_count,
+                                group.members_count, std::move(members));
+}
+
+ConsumerGroupInfo ConsumerGroupInfo::FromFfi(ffi::ConsumerGroupInfo info) {
+    return ConsumerGroupInfo(info.stream_id, info.topic_id, info.group_id);
+}
+
+ClientInfo ClientInfo::FromFfi(ffi::ClientInfo info) {
+    std::optional<std::uint32_t> user_id;
+    if (info.has_user_id) {
+        user_id = info.user_id;
+    }
+    return ClientInfo(info.client_id, user_id, std::string(info.address.c_str(), info.address.size()),
+                      std::string(info.transport.c_str(), info.transport.size()), info.consumer_groups_count);
+}
+
+ClientInfoDetails ClientInfoDetails::FromFfi(ffi::ClientInfoDetails info) {
+    std::optional<std::uint32_t> user_id;
+    if (info.has_user_id) {
+        user_id = info.user_id;
+    }
+    std::vector<ConsumerGroupInfo> consumer_groups;
+    consumer_groups.reserve(info.consumer_groups.size());
+    for (auto &group : info.consumer_groups) {
+        consumer_groups.push_back(ConsumerGroupInfo::FromFfi(group));
+    }
+    return ClientInfoDetails(info.client_id, user_id, std::string(info.address.c_str(), info.address.size()),
+                             std::string(info.transport.c_str(), info.transport.size()), info.consumer_groups_count,
+                             std::move(consumer_groups));
+}
+
+CacheMetricEntry CacheMetricEntry::FromFfi(ffi::CacheMetricEntry entry) {
+    return CacheMetricEntry(entry.stream_id, entry.topic_id, entry.partition_id, entry.hits, entry.misses,
+                            entry.hit_ratio);
+}
+
+Stats Stats::FromFfi(ffi::Stats stats) {
+    std::optional<std::uint32_t> server_semver;
+    if (stats.has_server_semver) {
+        server_semver = stats.iggy_server_semver;
+    }
+    std::vector<CacheMetricEntry> cache_metrics;
+    cache_metrics.reserve(stats.cache_metrics.size());
+    for (auto &entry : stats.cache_metrics) {
+        cache_metrics.push_back(CacheMetricEntry::FromFfi(entry));
+    }
+    return Stats(stats.process_id, stats.cpu_usage, stats.total_cpu_usage, stats.memory_usage, stats.total_memory,
+                 stats.available_memory, stats.run_time_micros, stats.start_time_epoch_micros, stats.read_bytes,
+                 stats.written_bytes, stats.messages_size_bytes, stats.streams_count, stats.topics_count,
+                 stats.partitions_count, stats.segments_count, stats.messages_count, stats.clients_count,
+                 stats.consumer_groups_count, std::string(stats.hostname.c_str(), stats.hostname.size()),
+                 std::string(stats.os_name.c_str(), stats.os_name.size()),
+                 std::string(stats.os_version.c_str(), stats.os_version.size()),
+                 std::string(stats.kernel_version.c_str(), stats.kernel_version.size()),
+                 std::string(stats.iggy_server_version.c_str(), stats.iggy_server_version.size()), server_semver,
+                 std::move(cache_metrics), stats.threads_count, stats.free_disk_space, stats.total_disk_space,
+                 stats.open_files_count, stats.open_files_limit);
 }
 
 }  // namespace iggy

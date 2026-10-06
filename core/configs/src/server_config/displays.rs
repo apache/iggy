@@ -86,8 +86,11 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {} }}",
-            self.prepare_queue_depth, self.journal_slots, self.clients_table_max,
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {}, partitions_max: {} }}",
+            self.prepare_queue_depth,
+            self.journal_slots,
+            self.clients_table_max,
+            self.partitions_max,
         )
     }
 }
@@ -96,16 +99,22 @@ impl Display for MessageBusConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ max_batch: {}, max_message_size: {}, peer_queue_capacity: {}, \
-             reconnect_period: {}, close_peer_timeout: {}, close_grace: {}, \
-             handshake_grace: {} }}",
+            "{{ max_batch: {}, max_message_size: {}, replica_read_buffer_size: {}, \
+             peer_queue_capacity: {}, client_queue_capacity: {}, reconnect_period: {}, \
+             close_peer_timeout: {}, close_grace: {}, handshake_grace: {}, connections_max: {} }}",
             self.max_batch,
             self.max_message_size,
+            self.replica_read_buffer_size,
             self.peer_queue_capacity,
+            self.client_queue_capacity,
             self.reconnect_period,
             self.close_peer_timeout,
             self.close_grace,
             self.handshake_grace,
+            self.connections_max.map_or_else(
+                || "half of RLIMIT_NOFILE".to_owned(),
+                |connections_max| connections_max.to_string()
+            ),
         )
     }
 }

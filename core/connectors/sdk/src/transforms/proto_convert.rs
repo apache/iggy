@@ -862,6 +862,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn given_one_configured_instance_when_objects_and_scalars_are_converted_should_emit_different_payload_variants()
+     {
+        // `encode_json_with_schema` only encodes a top-level object, so the
+        // variant this transform returns turns on the message rather than on
+        // the config. A batch carrying both shapes reaches the runtime as a mix
+        // and has to be split into one FFI call per variant.
+        let descriptor = protox_parse::parse(
+            "record.proto",
+            r#"syntax = "proto3";
+            message StringRecord {
+                string first = 1;
+                string second = 2;
+            }"#,
+        )
+        .expect("test schema must parse");
+        let descriptor_set = prost_types::FileDescriptorSet {
+            file: vec![descriptor],
+        };
+        let converter = ProtoConvert::new(ProtoConvertConfig {
+            source_format: Schema::Json,
+            target_format: Schema::Proto,
+            message_type: Some("StringRecord".to_string()),
+            descriptor_set: Some(descriptor_set.encode_to_vec()),
+            ..ProtoConvertConfig::default()
+        });
+
+        for (payload, expected) in [
+            (
+                simd_json::json!({"first": "encoded", "second": "encoded"}),
+                Schema::Raw,
+            ),
+            (simd_json::json!([1, 2, 3]), Schema::Proto),
+        ] {
+            let converted = converter
+                .transform(
+                    &create_test_metadata(),
+                    create_test_message(Payload::Json(payload)),
+                )
+                .expect("the conversion must not fail")
+                .expect("the message must survive");
+
+            assert_eq!(
+                converted.payload.schema(),
+                expected,
+                "one instance produced {} for a payload expected to be {expected}",
+                converted.payload.schema()
+            );
+        }
+    }
+
     fn create_test_message(payload: Payload) -> DecodedMessage {
         DecodedMessage {
             id: Some(123),
@@ -1093,8 +1144,18 @@ mod tests {
         if let Ok(Some(transformed_message)) = result {
             if let Payload::Json(json_value) = transformed_message.payload {
                 if let simd_json::OwnedValue::Object(map) = json_value {
-                    assert!(map.contains_key("type_url"));
-                    assert!(map.contains_key("value"));
+                    assert_eq!(
+                        map.get("type_url").and_then(|value| value.as_str()),
+                        Some("type.googleapis.com/google.protobuf.StringValue")
+                    );
+                    assert_eq!(
+                        map.get("value").and_then(|value| value.as_str()),
+                        Some(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(b"Hello, World!")
+                                .as_str()
+                        )
+                    );
                 } else {
                     panic!("Expected JSON object");
                 }

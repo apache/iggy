@@ -1,0 +1,104 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: swift-pre-merge
+description: Swift pre-merge testing github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, test, build, build-macos, golden)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # The macOS lane uses the Swift that ships with Xcode on the runner, and
+    # the golden lane only runs the Rust generator.
+    - name: Setup Swift
+      if: inputs.task != 'build-macos' && inputs.task != 'golden'
+      uses: ./.github/actions/utils/setup-swift
+
+    # swift-format ships with the toolchain; the configuration lives in
+    # foreign/swift/.swift-format.
+    - name: Format Check
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/swift
+        swift format lint --strict --recursive Sources Tests Package.swift
+
+    # A warning-free build is the lint gate the Swift compiler provides: the
+    # SDK builds in Swift 6 language mode with strict concurrency checking.
+    - name: Build with warnings as errors
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/swift
+        swift build -Xswiftc -warnings-as-errors
+
+    - name: Test
+      shell: bash
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/swift
+        swift test --parallel
+
+    - name: Build
+      shell: bash
+      if: inputs.task == 'build'
+      run: |
+        cd foreign/swift
+        swift build -c release
+
+    # The manifest declares the Apple platforms, so one lane compiles and tests
+    # on macOS with Xcode's toolchain rather than trusting the Linux build.
+    - name: Build and test on macOS
+      shell: bash
+      if: inputs.task == 'build-macos'
+      run: |
+        cd foreign/swift
+        swift --version
+        swift build -Xswiftc -warnings-as-errors
+        swift test --parallel
+
+    # The generator is a small standalone workspace that needs no system
+    # packages, and the workspace cache never matches its dependency set, so
+    # the lane skips the disk cleanup, the apt install, and the cache restore.
+    - name: Setup Rust for the golden vectors
+      if: inputs.task == 'golden'
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        free-disk-space: "false"
+        read-cache: "false"
+        install-system-dependencies: "false"
+
+    # The generator sits outside the root workspace, so the repo-wide fmt and
+    # clippy runs never see it. The golden fixture is checked in, so this lane
+    # then regenerates it from the Rust crates and fails when the two differ;
+    # otherwise the Swift tests stay green against a stale copy of the protocol.
+    - name: Check the golden vectors match the Rust crates
+      shell: bash
+      if: inputs.task == 'golden'
+      run: |
+        cargo fmt --manifest-path foreign/swift/Tools/golden-vectors/Cargo.toml -- --check
+        cargo clippy --manifest-path foreign/swift/Tools/golden-vectors/Cargo.toml --all-targets -- -D warnings
+        cargo run --manifest-path foreign/swift/Tools/golden-vectors/Cargo.toml -- foreign/swift/Tests/IggyTests/Fixtures/golden.json
+        if ! git diff --exit-code -- foreign/swift/Tests/IggyTests/Fixtures/golden.json; then
+          echo "❌ golden.json is out of date; regenerate it with the command above and commit the result"
+          exit 1
+        fi
+        echo "✅ golden.json matches the Rust crates"

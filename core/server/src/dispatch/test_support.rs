@@ -29,8 +29,9 @@ use message_bus::installer::ConnectionInstaller;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus,
-    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, ConnectionPermit,
+    JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    SharedTlsServerConfig,
 };
 use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::stream::Streams;
@@ -61,6 +62,7 @@ pub type RecordedReplicaSends = Rc<RefCell<Vec<(u8, Vec<u8>)>>>;
 pub struct SpyBus {
     pub client_replies: RecordedReplies,
     pub replica_sends: RecordedReplicaSends,
+    pub replica_send_capacity: Rc<Cell<Option<usize>>>,
     /// Installs of the client connection-lost hook, one per handler built
     /// on this bus.
     pub connection_lost_hooks: Rc<Cell<usize>>,
@@ -103,6 +105,13 @@ impl MessageBus for SpyBus {
         replica: u8,
         data: Frozen<MESSAGE_ALIGN>,
     ) -> Result<(), SendError> {
+        if self
+            .replica_send_capacity
+            .get()
+            .is_some_and(|capacity| self.replica_sends.borrow().len() >= capacity)
+        {
+            return Err(SendError::Backpressure);
+        }
         self.replica_sends
             .borrow_mut()
             .push((replica, data.as_slice().to_vec()));
@@ -136,11 +145,37 @@ impl ConnectionInstaller for SpyBus {
     }
     fn release_replica_handshake_slot(&self, _slot: u64) {}
     fn clear_replica_dial_pending(&self, _replica_id: u8) {}
-    fn install_client_fd(&self, _fd: DupedFd, _meta: ClientConnMeta, _on_request: RequestHandler) {}
+    fn install_client_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _permit: ConnectionPermit,
+        _on_request: RequestHandler,
+    ) {
+    }
     fn install_client_ws_fd(
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
+        _permit: ConnectionPermit,
+        _on_request: RequestHandler,
+    ) {
+    }
+    fn install_client_tcp_tls_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _permit: ConnectionPermit,
+        _on_request: RequestHandler,
+    ) {
+    }
+    fn install_client_wss_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _config: SharedTlsServerConfig,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -183,7 +218,6 @@ pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u12
         PartitionsConfig {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
             validate_checksum: true,
             segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
             preallocate_segments: false,
@@ -276,6 +310,8 @@ pub fn prepare_message(
             client,
             request,
             user_id: 0,
+            session: 1,
+            retry_capacity: u32::try_from(consensus::CLIENTS_TABLE_MAX).unwrap(),
             group: server_common::sharding::METADATA_GROUP,
             ..Default::default()
         };

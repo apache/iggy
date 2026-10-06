@@ -125,7 +125,7 @@ where
     /// build excludes the `simulator` feature and this method.
     #[cfg(any(test, feature = "simulator"))]
     pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
-        (self.on_client_request)(client_id, message);
+        self.host.on_client_request(client_id, message);
     }
 
     /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
@@ -727,7 +727,7 @@ where
                 );
                 self.bus.clear_replica_dial_pending(replica_id);
             }
-            LifecycleFrame::ClientConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -735,9 +735,9 @@ where
                     "installing delegated client fd"
                 );
                 self.bus
-                    .install_client_fd(fd, meta, self.on_client_request.clone());
+                    .install_client_fd(fd, meta, permit, self.on_client_request.clone());
             }
-            LifecycleFrame::ClientWsConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientWsConnectionSetup { fd, meta, permit } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -745,7 +745,47 @@ where
                     "installing delegated WS client fd (pre-upgrade)"
                 );
                 self.bus
-                    .install_client_ws_fd(fd, meta, self.on_client_request.clone());
+                    .install_client_ws_fd(fd, meta, permit, self.on_client_request.clone());
+            }
+            LifecycleFrame::ClientTcpTlsConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated TCP-TLS client fd (pre-handshake)"
+                );
+                self.bus.install_client_tcp_tls_fd(
+                    fd,
+                    meta,
+                    config,
+                    permit,
+                    self.on_client_request.clone(),
+                );
+            }
+            LifecycleFrame::ClientWssConnectionSetup {
+                fd,
+                meta,
+                config,
+                permit,
+            } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated WSS client fd (pre-handshake)"
+                );
+                self.bus.install_client_wss_fd(
+                    fd,
+                    meta,
+                    config,
+                    permit,
+                    self.on_client_request.clone(),
+                );
             }
             LifecycleFrame::ForwardReplicaSend { replica_id, msg } => {
                 if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {
@@ -786,14 +826,14 @@ where
                     self.id, 0,
                     "MetadataSubmit must only be processed on shard 0"
                 );
-                (self.on_metadata_submit)(submit);
+                self.host.on_metadata_submit(submit);
             }
             LifecycleFrame::ListClients { reply } => {
                 // Every shard handles this (not shard-0-only): each replies
                 // with the clients whose connections it homes. The handler
                 // (wired by the server) reads this shard's `SessionManager`
-                // and pushes the list over `reply`.
-                (self.on_list_clients)(reply);
+                // and pushes the answer over `reply`.
+                self.host.on_list_clients(reply);
             }
             LifecycleFrame::PartitionRead {
                 namespace,
@@ -812,17 +852,8 @@ where
                 // `route_typed`). Every refusal answers on `reply`, so the
                 // awaiting shard never waits out its budget on a decision
                 // already made.
-                if let Some(attachment) = attachment
-                    && let Err(error) = self.validate_offset_attachment(&request, &attachment)
-                {
-                    let deny = consensus::build_deny_reply_from_request_header(
-                        request.header(),
-                        error.as_code(),
-                    );
-                    let _ = reply.try_send(Some(deny.into_generic()));
-                } else {
-                    self.on_partition_submit(request, reply).await;
-                }
+                self.dispatch_partition_submit(request, reply, None, attachment)
+                    .await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
@@ -843,8 +874,11 @@ where
             }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    partition.on_persistence_completed(completion).await;
+                let partitions = self.plane.partitions();
+                if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                    partition
+                        .on_persistence_completed(completion, partitions.config())
+                        .await;
                 }
             }
             LifecycleFrame::ReconcileApply => {
@@ -981,9 +1015,10 @@ where
                         Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
                             // NOT fenced: the wipe ran and a fresh chain is
                             // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
+                            // the durable record failed, which leaves
+                            // `applied_purge_generation` unmoved and the
+                            // reconciler re-issuing the purge, which redoes
+                            // only the record.
                             // Same pacing argument as the frontier deferral
                             // above; the caches already describe wiped bytes.
                             self.drop_partition_transfer_state(namespace, partition);
@@ -995,6 +1030,22 @@ where
                                 "purge-partition deferred: reset applied but the generation \
                                  record failed; the reconciler re-issues it"
                             );
+                        }
+                        Err(error @ partitions::PurgeError::OffsetsNotDurable(_)) => {
+                            // The chain is serviceable, but the unlinks of the
+                            // offset files may not be durable, and no retried
+                            // sync can prove them. Fence it like the arm below,
+                            // so the rebuild replaces those files.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition could not sync an offsets dir; fencing it for rebuild"
+                            );
+                            self.drop_partition_transfer_state(namespace, partition);
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
                         }
                         Err(error @ partitions::PurgeError::Unserviceable(_)) => {
                             // Past the drain, so this group has no serviceable

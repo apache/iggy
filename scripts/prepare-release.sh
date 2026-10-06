@@ -56,6 +56,7 @@ RELEASE_PATHS=(
   "about.toml"
   "docker-compose.yml"
   "justfile"
+  "rust-toolchain.toml"
   "bdd"
   "core"
   "examples"

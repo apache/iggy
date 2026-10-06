@@ -120,7 +120,12 @@ Every submitted record contains:
 - `payload_encoding`
 
 `include_metadata` adds `iggy_stream`, `iggy_topic`, `iggy_partition_id`,
-`iggy_offset`, `iggy_timestamp` and `iggy_schema`. The checksum, origin timestamp
+`iggy_offset`, `iggy_timestamp` and `iggy_schema`. `iggy_schema` records the
+payload variant the connector received, not the stream's configured `schema`:
+an `avro` stream writes `json`, because the Avro decoder extracts to JSON by
+default, and `flat_buffer` and `proto` streams do the same. Rows written before
+this change recorded the configured schema, so historical rows on those streams
+disagree with new ones. The checksum, origin timestamp
 and headers have independent inclusion flags. `iggy_headers` is omitted when
 headers are absent or empty. Non-raw headers are strings, including numeric and
 boolean values; raw headers use `{"data":"AQID","iggy_header_encoding":"base64"}`.
@@ -131,7 +136,9 @@ then partition, offset and the 32-digit hexadecimal message ID. Payload and
 transform changes do not alter that identity.
 
 `payload_format = "auto"` stores decoded JSON payloads as queryable SurrealDB
-values, text/Proto variants as strings, and raw/Avro/FlatBuffer bytes as base64
+values, text variants as strings, Proto variants as the JSON document they
+hold when the text parses as JSON or as strings otherwise, and
+raw/Avro/FlatBuffer bytes as base64
 strings, even when raw bytes contain valid JSON. Explicit `json` parses other
 payload variants as JSON, `text` requires UTF-8, and `base64`/`binary` encodes the
 payload bytes. Invalid conversions reject that record. Destination schema,

@@ -22,8 +22,8 @@ install a release compatible with your server:
 go get github.com/apache/iggy/foreign/go
 ```
 
-Unversioned `go get` does not automatically select prereleases. VSR edge
-versions are available, for example `v0.9.0-edge.6`. For unreleased changes,
+Unversioned `go get` selects the latest stable release. VSR support starts
+with `v0.9.0`. For unreleased changes,
 build both SDK and server from the same checkout; `examples/go/go.mod`
 replaces this module with the local SDK source.
 
@@ -50,9 +50,14 @@ Disable the ones you do not need so they cannot race with another process.
 
 `SendMessages` returns any placements the server reports. A send whose reply
 is lost to a dropped connection returns `ErrDisconnected` without a replay.
-A reconnect registers a new client identity, so a caller retry can append
-the batch twice. Consumers must handle duplicates through idempotent
-processing or application-level deduplication.
+A reconnect retains the client identity and authenticates it with `BindSession`.
+Only a terminal bind refusal permits a new registration. An application resend
+still creates a new request and can append the batch twice. Consumers must handle
+duplicates through idempotent processing or application-level deduplication.
+
+An established session has its own lifetime. Password or PAT changes and PAT
+expiry do not end it. Logout, session lease expiry, or user deactivation end the
+session and prevent its bind proof from restoring it.
 
 Crash durability follows the topic's `durability` policy: `replicated`
 confirms replication, while `persisted` also waits for the required replicas
@@ -61,8 +66,8 @@ but does not by itself prove that new messages were appended.
 
 In a cluster, auto-commit polls use persistent connections to partition
 primaries while the coordinator keeps the consumer's group membership.
-Servers must support primary poll routing and consumer-session attachment
-(binary commands 14, 103 and 104). Pause binary auto-commit consumers for the
+Servers must support primary poll routing and shared-session binding
+(binary commands 15 (`BindSession`), 103 and 104). Pause binary auto-commit consumers for the
 whole upgrade: upgrade every server first, then the SDKs, and restart consumers
 so they rejoin their groups. Older SDKs can lose membership when a backup
 refuses an offset commit; the new SDK does not fall back to legacy polling.

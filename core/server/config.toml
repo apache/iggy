@@ -18,10 +18,22 @@
 # Root directory for server data. Environment override: IGGY_PATH.
 path = "local_data"
 
-# Configuration for consumer group cooperative partition rebalancing.
+# Consumer group rebalancing and session liveness.
 [consumer_group]
 # Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
 rebalancing_timeout = "30s"
+# The metadata primary removes members whose hosting server stops reporting their
+# connections for this long, including after a crash. An isolated live consumer
+# loses its session and must log in again. Each new primary grants a fresh timeout.
+# Expiry is always enabled. Incomplete client lists defer expiry across the cluster
+# until a full timeout has passed without an incomplete report.
+# Must exceed cluster.heartbeat_timeout when clustering is enabled, and
+# three heartbeat_interval periods plus two gather (3s) and send (100ms)
+# deadlines, allowing one missed report before expiry.
+session_timeout = "30s"
+# Server-to-server session reports run even when client heartbeat checks are disabled.
+# Must be nonzero. Use the same settings on all nodes.
+heartbeat_interval = "5s"
 
 [data_maintenance.messages]
 # Enables or disables the segment cleaner. It deletes the oldest sealed segments of
@@ -368,6 +380,8 @@ path = "logs"
 # Log filtering directive using the same syntax as the RUST_LOG environment variable.
 # Supports simple levels ("trace", "debug", "info", "warn", "error", "off" or "none")
 # as well as complex directives like "warn,server=debug,iggy=trace".
+# A bare word must be a level: write "target=level" to filter one target.
+# An invalid value fails the boot.
 # Note: RUST_LOG environment variable always takes precedence over this setting.
 level = "info"
 
@@ -385,15 +399,23 @@ max_file_size = "500 MB"
 
 # Maximum total size of all log files.  When this size is reached,
 # the oldest log files will be deleted first. Set it to 0 to allow
-# an unlimited number of archived logs. This does not disable time
-# based log rotation or per-log-file size limits.
+# an unlimited number of archived logs. This does not disable
+# retention or per-log-file size limits.
 max_total_size = "4 GB"
 
-# Time interval for checking log rotation status. Avoid less than 1s.
+# Time interval for checking log rotation status. Must be at least 1 s.
 rotation_check_interval = "1 h"
 
-# Time to retain log files before deletion. Avoid less than 1s, too.
+# Time to keep a rotated log file after its last write. Must be at least
+# 1 s, or 0 to turn off deletion by age (max_total_size still deletes the
+# oldest files). The log file in use is never deleted, so a line can stay
+# on disk for up to the time to fill one file plus the retention.
 retention = "7 days"
+
+# Interval for printing process and host usage (CPU, memory, disk, clients,
+# messages, open file descriptors) to the log from shard 0. "0 s" disables the
+# line. Any other value must be at least 1 s.
+sysinfo_print_interval = "10 s"
 
 # Encryption configuration
 [encryption]
@@ -836,12 +858,23 @@ prepare_queue_depth = 32
 # restore the previous value to recover.
 journal_slots = 1024
 
-# Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
-# virtual clients and HTTP sessions together) hold live session state at once.
-# When full, the client whose last commit is oldest is evicted and its next
-# request re-registers. The HTTP session cap tracks this at half, so raising
-# it lifts both. Must be between 2 and 65536.
+# Initial capacity of the metadata session registry, shared by binary clients
+# and HTTP sessions. Live and unretired sessions occupy slots. A full registry
+# refuses new sessions; it never evicts retry protection. The first committed
+# operation fixes the capacity, so changing this value does not resize an
+# existing registry after restart or transfer. The HTTP cache cap uses half
+# the configured value, but cannot raise the committed registry limit.
+# Must be between 2 and 65536.
 clients_table_max = 8192
+
+# Cap on the partitions of all streams and topics. A request to create a
+# topic or partitions that would exceed it fails with PartitionsLimitReached.
+# The metadata primary checks it with its own value, so give every node the
+# same value. The check counts committed partitions only and does not add up
+# the creates in flight. Up to 3 x prepare_queue_depth creates (96 at the
+# default) can be in flight, with up to 1000 partitions each, so the count
+# can exceed the cap by that much. 0 means no cap.
+partitions_max = 0
 
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
 # plane), a pipeline exists per partition, so raising this multiplies pinned
@@ -860,9 +893,10 @@ clients_table_max = 8192
 # Topic durability and flush scheduling are set at creation and returned by GetTopic.
 # durability controls message completion. consumer_offset_durability controls explicit offset stores and deletes.
 # Both independently default to "replicated". Neither inherits the other.
-# In replicated groups, either persisted policy enables WAL references to segment bodies, retained by hard link until reclamation.
-# This includes replicated messages with persisted offsets. Full message payloads count against wal_bytes_max.
-# Their barriers can also persist co-batched messages. Only replicated/replicated stays off this WAL.
+# Every disk-backed partition uses a WAL for recovery and retries.
+# WAL references retain segment bodies by hard link until reclamation.
+# Full message payloads count against wal_bytes_max under both durability policies.
+# Persistence barriers can also persist co-batched messages.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
 # "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
@@ -895,21 +929,22 @@ clients_table_max = 8192
 # Fenced files remain available for diagnosis. Recovery must not replace an acknowledged durable history with an empty healthy partition.
 # Metadata and partition journals verify their own integrity and recovery frontiers independently of sparse indexes.
 
-# Per-partition active WAL and queued/in-flight prepare budget when either
-# topic policy is persisted. A 4 KiB multiple, from 128 MiB + 8 KiB to 4 GiB.
+# Per-partition active WAL and queued/in-flight prepare budget under both
+# durability policies. A 4 KiB multiple, from 128 MiB + 8 KiB to 4 GiB.
 # The minimum accommodates the retained commit-point prepare and a maximum-size successor.
-# Checkpointing begins at half the byte budget or 1024 dirty files.
+# Checkpointing starts at half the byte budget.
+# Explicit requests or 1024 dirty files can trigger checkpointing sooner.
 # File barriers run with at most 16 concurrent operations. Temporary rewrites need extra disk
 # space. Lowering this budget preserves existing history and blocks new writes
 # until recovery and checkpointing reclaim enough space.
-# Checkpoints synchronize changed files through the partition writer. Other
-# partitions continue while this partition defers materialized commit application.
+# Checkpoints synchronize changed files through the partition writer. Preparing
+# indexes and receipts still awaits I/O in the owning shard pump.
 # The HTTP metrics endpoint exposes per-shard partition_wal_* byte gauges and
 # completed batch, prepare, checkpoint and error counters.
 # partition_wal_retained_bytes plus queued_bytes and in_flight_bytes measures budget usage;
 # partition_wal_disk_bytes measures WAL file length, excluding referenced segment bodies.
-# partition_wal_prepares over partition_wal_batches is the prepares per durable group, and
-# partition_wal_group_commit_waits counts the groups that actually took the optional wait
+# partition_wal_prepares_total over partition_wal_batches_total is the prepares per durable group, and
+# partition_wal_group_commit_waits_total counts the groups that actually took the optional wait
 # below, so a delay that never fires is distinguishable from one that fires and buys nothing.
 wal_bytes_max = "256 MiB"
 
@@ -937,11 +972,12 @@ validate_checksum = true
 # u128 bitset, and this depth bounds that suffix.
 prepare_queue_depth = 32
 
-# Distinct clients each partition group tracks request watermarks for, so a
-# retried produce or consumer-offset write is answered instead of committing a
-# second time. At capacity the client whose newest commit is oldest is evicted;
-# that client's next replay re-executes, exactly as it would have before dedup
-# existed, so under-sizing degrades rather than breaks. Must be > 0 and <= 65536.
+# Initial capacity for session-qualified retry protection in each partition.
+# Live and unretired sessions occupy slots. A full table refuses new writers
+# with TransientNotAccepted; it never evicts existing protection. Ended sessions
+# release slots only after ordered retirement. The first committed operation
+# fixes the capacity, so changing this value does not resize an existing group
+# after restart or transfer. Must be > 0 and <= 65536.
 #
 # Unlike [metadata] clients_table_max, this budget is PER GROUP, so worst-case
 # memory scales with partition count. Size it to the producers one partition
@@ -949,8 +985,10 @@ prepare_queue_depth = 32
 dedup_clients_max = 4096
 
 # Distinct durable consumer-offset keys a partition primary admits per kind.
-# Standalone consumers and consumer groups are counted separately. Existing
-# keys remain writable at the limit. A new key is rejected before consensus.
+# Standalone consumers, consumer groups and external groups are counted
+# separately, so one partition can hold up to three times this many keys.
+# Existing keys remain writable at the limit. A new key is rejected before
+# consensus.
 # A non-empty auto_commit poll that needs a new offset key is also rejected
 # with TooManyConsumerOffsets and returns no messages. A poll whose auto_commit
 # cannot be submitted (the owning shard's inbox is full, or the partition
@@ -1050,12 +1088,32 @@ transfer_artifact_bytes_max = "1088 MiB"
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
 max_batch = 256
 
-# Wire-level cap on a single framed message. Boot refuses a value above the
-# frozen 256 MiB ceiling: segment recovery derives fixed scan and allocation
+# Wire-level cap on a single framed message. Must fit a consumer session report
+# (at least 280 B). Boot refuses a value above the frozen 256 MiB ceiling:
+# segment recovery derives fixed scan and allocation
 # limits from the widest LEGAL record, so batches admitted above the ceiling
 # would be refused as implausible on a later boot. Raising it past 64 MiB
 # also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
+
+# Read-ahead buffer per plaintext replica link. The framing layer decodes every
+# complete frame a fill delivered, and a fill takes what the socket holds rather
+# than waiting for a full buffer. 0 selects the unbuffered path (one read per
+# header, one per body), and so do unlimited and none, which the byte-size parser
+# reads as 0. No-op under cluster.tls.
+#
+# A read at least this size that starts on an empty buffer goes straight to the
+# socket. The bypass needs an empty buffer, so a body between one and two buffers
+# crosses the buffer whole, and a body of two buffers or more crosses it for about
+# one buffer.
+#
+# 32 KiB holds 128 PrepareOks or 8 average Prepares of one burst. It sits below the
+# kernel's default receive buffer (tcp_rmem[1], 128 KiB), which autotuning grows
+# further once the reader falls behind: a backlog then costs several reads rather
+# than one. That is the trade this value sets, fewer bytes copied per Prepare
+# against a lower batching factor under backlog. Boot rejects a nonzero value
+# outside 4 KiB..16 MiB.
+replica_read_buffer_size = "32 KiB"
 
 # Bound on each replica peer's mpsc queue. The writer task drains; the
 # send_to_* path enqueues.
@@ -1066,7 +1124,8 @@ peer_queue_capacity = 4096
 client_queue_capacity = 256
 
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
-reconnect_period = "5 s"
+# Also bounds each dial, so a peer that drops SYNs cannot stall the sweep.
+reconnect_period = "1 s"
 
 # Timeout for per-peer close drain (flush writer, tear down reader)
 # before force-cancellation.
@@ -1082,6 +1141,19 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
+
+# Cap on open client sockets of the node: TCP, TCP-TLS, WebSocket, WSS, HTTP
+# and HTTPS together. Shard 0 closes a connection past the cap at accept, so
+# clients cannot take the file descriptors that storage writes need. QUIC does
+# not count, because its connections share one UDP socket. When unset, the cap
+# is half the soft RLIMIT_NOFILE that the server has after it raises the limit
+# at boot. 0 means no cap.
+#
+# The server always raises the soft RLIMIT_NOFILE to the hard limit at boot
+# (on macOS, to at most 10240), and no setting turns this off. To keep a lower
+# limit, lower the hard limit, for example with LimitNOFILE in a systemd unit
+# or with ulimit -Hn.
+#connections_max = 10000
 
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]

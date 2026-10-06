@@ -1340,6 +1340,36 @@ class IggyClient:
         connection to establish, so only the heartbeat starts and this call
         succeeds even against an unreachable server.
         """
+    def disconnect(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the current connection. Repeated calls are safe. Call `connect`
+        to use the client again. Over TCP and QUIC, that `connect` first waits
+        for the rest of `reestablish_after` (5 s by default). The sign-in made
+        with `login_user` is dropped, so it must be repeated after reconnecting.
+        A client configured with auto-login credentials signs in again on
+        `connect`. Over HTTP there is no connection to close and this call does
+        nothing.
+
+        Known issue: unless reconnection is disabled, the heartbeat of a client
+        with auto-login credentials connects it again and signs in within one
+        heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+
+        Raises:
+            RuntimeError: If the connection cannot be closed.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the connection. Shut down background producers with
+        `IggyProducer.shutdown()` and stop iterating consumers before this call,
+        because they share the connection. Otherwise background producers drop
+        queued messages and consumer iterators hang. Later requests fail with
+        `RuntimeError`. Repeated calls are safe. Over HTTP there is no
+        connection to close, but the heartbeat that `connect` started keeps
+        sending pings until the client is dropped.
+
+        Raises:
+            RuntimeError: If the client cannot be shut down.
+        """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
@@ -1818,6 +1848,7 @@ class IggyClient:
         topic_max_size: MaxTopicSize | None = None,
         send_retries: builtins.int | None = 3,
         send_retry_interval: datetime.timedelta | None = ...,
+        topic_durability: Durability | None = None,
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
         Creates and initializes a high-level producer bound to a stream and topic.
@@ -1826,7 +1857,9 @@ class IggyClient:
         producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
         `None` selects direct mode. `BackgroundProducerConfig` starts background
         workers and makes successful sends mean queue acceptance rather than a
-        server commit. The returned producer is ready to send.
+        server commit. Replicated topics accept producer writes. Set
+        `topic_durability=Durability.PERSISTED` for an automatically created topic
+        when sends require crash-safe retry receipts.
 
         Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
         when stream/topic initialization fails.
@@ -2567,9 +2600,8 @@ class SendMessagesConfirmation:
         r"""
         Gets the offset assigned to the first message of the batch in this partition.
 
-        The offset locates the batch, it does not identify it. Delivery is
-        at-least-once, so an earlier retry may already have committed these
-        messages at a lower offset.
+        The offset locates the batch, it does not identify it. An application
+        resend creates another request and can duplicate the messages.
 
         Confirmation follows VSR quorum commit. A topic with persisted message
         durability also waits for recoverable stable-storage copies on the quorum.
@@ -2588,10 +2620,10 @@ class SendMessagesResponse:
         The list is empty when the server reports no offsets, so check whether
         it is empty before indexing into it.
 
-        A reported `base_offset` never implies uniqueness, because delivery is
-        at-least-once and an earlier retry may already have committed the same
-        messages at a lower offset. Confirmation follows the topic's message
-        durability policy: quorum commit, plus stable storage for persisted topics.
+        A reported `base_offset` never implies uniqueness: an application resend
+        can commit the same messages at another offset. Confirmation follows the
+        topic's policy: quorum commit, plus stable storage and crash-safe retry
+        receipts for persisted topics.
         """
 
 @typing.final
@@ -2767,6 +2799,22 @@ class Stats:
 
         0 when the server does not know its data directory or the disk probe
         fails.
+        """
+    @property
+    def open_files_count(self) -> builtins.int:
+        r"""
+        The number of file descriptors the server process holds open.
+
+        0 when unknown. Where the kernel cannot count them without a scan
+        (Linux before 6.2, macOS), the server scans at least every 10 seconds,
+        so the count can be 10 seconds old.
+        """
+    @property
+    def open_files_limit(self) -> builtins.int:
+        r"""
+        The soft limit on open file descriptors of the server process.
+
+        0 when unknown.
         """
     def __repr__(self) -> builtins.str: ...
 

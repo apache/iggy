@@ -722,6 +722,17 @@ func (e InvalidNumberValue) Is(target error) bool {
 	return ok
 }
 
+type RequestTooOld struct{}
+
+func (e RequestTooOld) Error() string {
+	return "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+}
+func (e RequestTooOld) Code() Code { return 85 }
+func (e RequestTooOld) Is(target error) bool {
+	_, ok := target.(RequestTooOld)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -1355,6 +1366,17 @@ func (e TooManyTopics) Error() string { return "too many topics" }
 func (e TooManyTopics) Code() Code    { return 2021 }
 func (e TooManyTopics) Is(target error) bool {
 	_, ok := target.(TooManyTopics)
+	return ok
+}
+
+type PartitionsLimitReached struct{}
+
+func (e PartitionsLimitReached) Error() string {
+	return "partitions limit reached, raise [metadata] partitions_max"
+}
+func (e PartitionsLimitReached) Code() Code { return 2022 }
+func (e PartitionsLimitReached) Is(target error) bool {
+	_, ok := target.(PartitionsLimitReached)
 	return ok
 }
 
@@ -2654,6 +2676,29 @@ func (e IncompatibleProtocolVersion) Is(target error) bool {
 	return ok
 }
 
+type SessionMismatch struct {
+	Requested uint64
+	Bound     uint64
+}
+
+func (e SessionMismatch) Error() string {
+	return fmt.Sprintf("vsr session mismatch: requested %d, server bound %d", e.Requested, e.Bound)
+}
+func (e SessionMismatch) Code() Code { return 14004 }
+func (e SessionMismatch) Is(target error) bool {
+	_, ok := target.(SessionMismatch)
+	return ok
+}
+
+type RequestIdExhausted struct{}
+
+func (e RequestIdExhausted) Error() string { return "vsr request id exhausted" }
+func (e RequestIdExhausted) Code() Code    { return 14005 }
+func (e RequestIdExhausted) Is(target error) bool {
+	_, ok := target.(RequestIdExhausted)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2723,6 +2768,7 @@ var (
 	ErrInvalidNumberEncoding                      = InvalidNumberEncoding{}
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
+	ErrRequestTooOld                              = RequestTooOld{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2778,6 +2824,7 @@ var (
 	ErrInvalidPartitionsCount                     = InvalidPartitionsCount{}
 	ErrTopicDirectoryNotFound                     = TopicDirectoryNotFound{}
 	ErrTooManyTopics                              = TooManyTopics{}
+	ErrPartitionsLimitReached                     = PartitionsLimitReached{}
 	ErrCannotCreatePartition                      = CannotCreatePartition{}
 	ErrCannotCreatePartitionsDirectory            = CannotCreatePartitionsDirectory{}
 	ErrCannotCreatePartitionDirectory             = CannotCreatePartitionDirectory{}
@@ -2894,6 +2941,8 @@ var (
 	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
+	ErrSessionMismatch                            = SessionMismatch{}
+	ErrRequestIdExhausted                         = RequestIdExhausted{}
 )
 
 type Code uint32
@@ -2967,6 +3016,7 @@ const (
 	InvalidNumberEncodingCode                      Code = 82
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
+	RequestTooOldCode                              Code = 85
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3022,6 +3072,7 @@ const (
 	InvalidPartitionsCountCode                     Code = 2019
 	TopicDirectoryNotFoundCode                     Code = 2020
 	TooManyTopicsCode                              Code = 2021
+	PartitionsLimitReachedCode                     Code = 2022
 	CannotCreatePartitionCode                      Code = 3000
 	CannotCreatePartitionsDirectoryCode            Code = 3001
 	CannotCreatePartitionDirectoryCode             Code = 3002
@@ -3138,6 +3189,8 @@ const (
 	AlreadyAuthenticatedCode                       Code = 14000
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
+	SessionMismatchCode                            Code = 14004
+	RequestIdExhaustedCode                         Code = 14005
 )
 
 func (c Code) String() string {
@@ -3278,6 +3331,8 @@ func (c Code) String() string {
 		return "InvalidBooleanValue"
 	case InvalidNumberValueCode:
 		return "InvalidNumberValue"
+	case RequestTooOldCode:
+		return "RequestTooOld"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3388,6 +3443,8 @@ func (c Code) String() string {
 		return "TopicDirectoryNotFound"
 	case TooManyTopicsCode:
 		return "TooManyTopics"
+	case PartitionsLimitReachedCode:
+		return "PartitionsLimitReached"
 	case CannotCreatePartitionCode:
 		return "CannotCreatePartition"
 	case CannotCreatePartitionsDirectoryCode:
@@ -3620,6 +3677,10 @@ func (c Code) String() string {
 		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
+	case SessionMismatchCode:
+		return "SessionMismatch"
+	case RequestIdExhaustedCode:
+		return "RequestIdExhausted"
 	default:
 		return "Unknown error code"
 	}
@@ -3763,6 +3824,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidBooleanValue
 	case InvalidNumberValueCode:
 		return ErrInvalidNumberValue
+	case RequestTooOldCode:
+		return ErrRequestTooOld
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -3873,6 +3936,8 @@ func FromCode(code Code) IggyError {
 		return ErrTopicDirectoryNotFound
 	case TooManyTopicsCode:
 		return ErrTooManyTopics
+	case PartitionsLimitReachedCode:
+		return ErrPartitionsLimitReached
 	case CannotCreatePartitionCode:
 		return ErrCannotCreatePartition
 	case CannotCreatePartitionsDirectoryCode:
@@ -4105,6 +4170,10 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
+	case SessionMismatchCode:
+		return ErrSessionMismatch
+	case RequestIdExhaustedCode:
+		return ErrRequestIdExhausted
 	default:
 		return ErrError
 	}

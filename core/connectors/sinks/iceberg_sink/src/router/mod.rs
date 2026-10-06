@@ -36,6 +36,7 @@ use iceberg::{
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, warn};
@@ -146,21 +147,24 @@ async fn write_data_files(
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
 
-    let msgs: Vec<&simd_json::OwnedValue> = messages
+    // Proto text holding JSON is the descriptor-less `proto_convert` fallback
+    // and is written as the document it holds. Proto text that is not JSON is
+    // skipped like any other payload without a document.
+    let documents: Vec<Cow<'_, simd_json::OwnedValue>> = messages
         .iter()
-        .filter_map(|payload| match payload {
-            Payload::Json(value) => Some(value),
-            _ => {
+        .filter_map(|payload| {
+            let document = payload.json_document();
+            if document.is_none() {
                 warn!(
                     "Unsupported type of payload, expected JSON, got {}",
                     messages_schema.to_string()
                 );
-                None
             }
+            document
         })
         .collect();
 
-    if msgs.is_empty() {
+    if documents.is_empty() {
         error!(
             "Batch of {} messages has no JSON payloads, the Iceberg sink requires schema = json",
             messages.len()
@@ -168,6 +172,7 @@ async fn write_data_files(
         return Err(Error::InvalidPayloadType);
     }
 
+    let msgs: Vec<&simd_json::OwnedValue> = documents.iter().map(Cow::as_ref).collect();
     let cursor = JsonArrowReader::new(msgs.as_slice());
     let reader = ReaderBuilder::new(Arc::new(
         schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
@@ -437,6 +442,32 @@ mod tests {
             Some(Literal::Primitive(PrimitiveLiteral::String(region))) => region.clone(),
             other => panic!("Expected string partition value, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn given_proto_text_payloads_holding_json_should_write_them_as_rows() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = vec![
+            Payload::Json(simd_json::json!({ "id": 1, "region": "eu" })),
+            Payload::Proto(r#"{"id": 2, "region": "us"}"#.to_owned()),
+        ];
+
+        let data_files = write(&table, &payloads);
+
+        assert_eq!(data_files.len(), 1);
+        assert_eq!(data_files[0].record_count(), 2);
+    }
+
+    #[test]
+    fn given_only_proto_text_that_is_not_json_should_fail_with_invalid_payload_type() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = vec![Payload::Proto("id: 1".to_owned())];
+
+        let error = test_runtime()
+            .block_on(write_data_files(&payloads, &table, Schema::Proto))
+            .expect_err("proto text that is not JSON has no document to write");
+
+        assert_eq!(error, Error::InvalidPayloadType);
     }
 
     #[test]

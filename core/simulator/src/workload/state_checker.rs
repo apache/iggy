@@ -35,7 +35,7 @@ use crate::Simulator;
 use iggy_binary_protocol::PrepareHeader;
 use journal::Journal;
 use server_common::sharding::IggyNamespace;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// One op of the canonical committed chain.
 #[derive(Debug)]
@@ -47,9 +47,16 @@ struct CanonicalCommit {
     /// arriving header's `parent` must equal the canonical previous op's `checksum`,
     /// so keeping each entry's own parent would record a value nothing reads.
     checksum: u128,
-    /// Replicas observed committing this op, so the check can prove it compared
-    /// something rather than passing over an empty chain.
-    replicas: BTreeSet<u8>,
+    /// Replicas observed committing this op, each against the metadata incarnation
+    /// it held at the time, so the check can prove it compared something rather
+    /// than passing over an empty chain.
+    ///
+    /// The incarnation is what separates two failure modes the checksum alone
+    /// reports identically: two replicas holding different history at one op, and
+    /// ONE replica reporting a different header there after a restart. The second
+    /// means it applied one entry and recovered another, which is narrower and
+    /// wants naming as such.
+    witnesses: BTreeMap<u8, u128>,
 }
 
 /// Canonical committed metadata chain, accumulated across ticks.
@@ -154,7 +161,14 @@ impl StateChecker {
             );
             return;
         };
-        self.record(replica_idx, op, &header, seed);
+        self.record(
+            replica_idx,
+            op,
+            &header,
+            replica.metadata_incarnation,
+            committed,
+            seed,
+        );
     }
 
     /// Number of ops in the canonical chain. Tests assert this is non-zero, so a
@@ -170,11 +184,19 @@ impl StateChecker {
     pub fn ops_compared(&self) -> usize {
         self.commits
             .values()
-            .filter(|commit| commit.replicas.len() > 1)
+            .filter(|commit| commit.witnesses.len() > 1)
             .count()
     }
 
-    fn record(&mut self, replica_idx: u8, op: u64, header: &PrepareHeader, seed: u64) {
+    fn record(
+        &mut self,
+        replica_idx: u8,
+        op: u64,
+        header: &PrepareHeader,
+        incarnation: u128,
+        committed: u64,
+        seed: u64,
+    ) {
         // Hash-chain link, checked before the identity comparison so a diverged
         // prefix is reported at the op where the chains part rather than at the
         // first op whose contents happen to differ.
@@ -207,21 +229,35 @@ impl StateChecker {
         }
         match self.commits.get_mut(&op) {
             Some(canonical) => {
-                assert_eq!(
-                    canonical.checksum, header.checksum,
-                    "replicas disagree on committed op {op}: canonical checksum {:#x} \
-                     (committed by {:?}) vs replica {replica_idx}'s {:#x}. Two replicas \
-                     committed different history at the same log position (seed={seed:#x})",
-                    canonical.checksum, canonical.replicas, header.checksum,
+                // Named separately because the fix differs: a replica disagreeing
+                // with its own earlier incarnation applied one entry and recovered
+                // another, and no other replica has to be involved.
+                let restarted_since = canonical
+                    .witnesses
+                    .get(&replica_idx)
+                    .is_some_and(|&recorded| recorded != incarnation);
+                assert!(
+                    canonical.checksum == header.checksum,
+                    "{} on committed op {op}: canonical checksum {:#x} (witnesses \
+                     {:?}) vs replica {replica_idx}'s {:#x} at incarnation \
+                     {incarnation}, commit point {committed} (seed={seed:#x})",
+                    if restarted_since {
+                        "one replica disagrees with its own pre-restart history"
+                    } else {
+                        "replicas committed different history at the same log position"
+                    },
+                    canonical.checksum,
+                    canonical.witnesses,
+                    header.checksum,
                 );
-                canonical.replicas.insert(replica_idx);
+                canonical.witnesses.insert(replica_idx, incarnation);
             }
             None => {
                 self.commits.insert(
                     op,
                     CanonicalCommit {
                         checksum: header.checksum,
-                        replicas: BTreeSet::from([replica_idx]),
+                        witnesses: BTreeMap::from([(replica_idx, incarnation)]),
                     },
                 );
             }

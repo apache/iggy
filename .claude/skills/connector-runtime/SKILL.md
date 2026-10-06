@@ -213,8 +213,9 @@ All families labeled by `connector_key` + `connector_type` (histogram adds `stag
 
 - **Counters**: `iggy_connector_messages_{produced,sent,consumed,processed,filtered}_total` and `iggy_connector_errors_total`. These are the *rendered* names; each is registered without the `_total`, which the OpenMetrics encoder appends.
   - `messages_filtered_total` - intentional drops via transform `Ok(None)`.
-  - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures.
-- **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. Scraped at `/metrics` when `[http.metrics] enabled = true`.
+  - `errors_total` - unexpected drops (decode/encode/build failure, missing field, ...) + batch-level failures, one per failed run.
+  - `sink_runs_total` - FFI `consume()` calls for sink batches, one per contiguous payload-variant run. Divide by `stage_duration_seconds_count{stage="total"}` for runs per batch.
+- **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. One sample per batch for every stage; `ffi` is summed over the batch's runs. Scraped at `/metrics` when `[http.metrics] enabled = true`.
 - **Gauges**: `iggy_connectors_{sources,sinks}_{total,running}`.
 
 `/stats` JSON surface mirrors counters per-connector via `ConnectorStats` (`sdk/api.rs`): `messages_filtered`, `errors`, kind-specific counters.

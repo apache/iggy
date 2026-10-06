@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod client_lifecycle;
 mod consumer_group;
 mod consumer_group_membership;
 mod consumer_offset;

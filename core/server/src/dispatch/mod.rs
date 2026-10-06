@@ -17,8 +17,9 @@
 
 //! Per-shard request dispatch: queue plumbing and the request funnel.
 //!
-//! The tree: [`session_ops`] (login/register/logout and their replica
-//! forwards), [`partition`] (the partition data plane, both mesh ends),
+//! The tree: [`host`] (the shard host: per-client queues, session manager,
+//! connection-lost hook), [`session_ops`] (login/register/logout and their
+//! replica forwards), [`partition`] (the partition data plane, both mesh ends),
 //! [`reads`] (the non-replicated read router), [`submit`] (the shard-0
 //! metadata-submit RPC), `authz` (the wire-path authorization gates),
 //! `failure` (the wire failure channels and the one send exit for
@@ -33,6 +34,7 @@
 
 mod authz;
 mod failure;
+pub mod host;
 pub mod login_error;
 pub mod partition;
 pub mod reads;
@@ -48,36 +50,38 @@ use crate::dispatch::failure::{
 };
 use crate::dispatch::partition::{dispatch_partition_request, handle_delete_segments_request};
 use crate::dispatch::reads::handle_non_replicated_request;
-use crate::dispatch::session_ops::{
-    handle_login_register_request, handle_logout_request, submit_disconnect_logout,
-};
+use crate::dispatch::session_ops::{handle_login_register_request, handle_logout_request};
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
-use crate::responses::build_raw_pat_reply;
+use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, RewriteStage, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::wire::verify_request_checksum;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
+use consensus::MetadataHandle;
+use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
 };
+use iggy_binary_protocol::requests::system::SessionIdentity;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     EvictionReason, GenericHeader, Operation, RequestHeader, RoutedRequestHeader,
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::client_listener::RequestHandler;
-use message_bus::replica::listener::MessageHandler;
+use metadata::impls::metadata::StreamsFrontend;
+use secrecy::ExposeSecret;
 use server_common::Message;
-use shard::{ConnectedClientInfo, ListClientsHandler};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 
@@ -97,149 +101,9 @@ type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHea
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<AHashSet<u128>>>;
 
-/// Build the per-shard [`ListClientsHandler`]: on a `ListClients`
-/// broadcast, serialize this shard's locally-homed connected clients from
-/// its `SessionManager` and push them back over the reply sender. The
-/// aggregation across all shards happens in
-/// [`shard::IggyShard::list_all_clients`].
-pub fn make_list_clients_handler(sessions: &Rc<RefCell<SessionManager>>) -> ListClientsHandler {
-    let sessions = Rc::clone(sessions);
-    Rc::new(move |reply| {
-        let clients: Vec<ConnectedClientInfo> = sessions.borrow().iter_clients().collect();
-        // Best-effort: the gather side bounds itself by count + timeout, so
-        // a dropped reply (receiver gone) just means this shard is omitted.
-        let _ = reply.try_send(clients);
-    })
-}
-
-pub fn make_deferred_replica_message_handler<B, MJ, S, SB>(
-    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-) -> MessageHandler
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let shard_handle = Rc::clone(shard_handle);
-    Rc::new(move |_replica_id, message| {
-        if let Some(shard) = upgrade_shard_handle(&shard_handle) {
-            shard.dispatch(message);
-        }
-    })
-}
-
-/// Build the shard's one client-request handler: per-client FIFO queues
-/// drained one task per client, and the bus connection-lost hook that
-/// logs a dropped connection out. Every transport on the shard must
-/// share the instance (shard 0 hands it to its local QUIC, TCP-TLS and
-/// WSS listeners as well), or a client's ordering guarantee and the
-/// disconnect hook split by transport.
-pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
-    bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    server_config: Arc<ServerConfig>,
-    max_tokens_per_user: u32,
-) -> RequestHandler
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let shard_handle = Rc::clone(shard_handle);
-    let sessions = Rc::clone(sessions);
-    let queues: ClientRequestQueues = Rc::new(RefCell::new(AHashMap::new()));
-    let active: ActiveClientRequests = Rc::new(RefCell::new(AHashSet::new()));
-    let queues_for_disconnect = Rc::clone(&queues);
-    let sessions_for_disconnect = Rc::clone(&sessions);
-    let shard_handle_for_disconnect = Rc::clone(&shard_handle);
-    let bus_for_spawn = (*bus).clone();
-    bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
-        // The socket is gone, so nothing will drain what a live drain task
-        // left queued. The active slot is NOT released here: the transport
-        // task runs this hook while a drain may be suspended at an `.await`,
-        // and clearing the slot would let a frame the dispatch task still has
-        // buffered spawn a second drain over the same queue. The drain task's
-        // own guard covers every exit, the panic compio catches included.
-        queues_for_disconnect.borrow_mut().remove(&client_id);
-        // Upgrade FIRST: `remove_connection` strips the `SessionManager`
-        // entry, so running it ahead of a failed upgrade would drop the
-        // binding without ever submitting the replicated `Logout`, leaking
-        // the `ClientTable` entry and its consumer-group memberships. The
-        // window is pre-build / post-runtime-drop only.
-        let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect) else {
-            // Nothing reaps what stays behind: the heartbeat verifier is
-            // optional and only collects `Bound` / `Authenticated` sessions,
-            // so a `Connected` row survives to process exit.
-            error!(
-                client_id,
-                "client connection lost with no live shard; session and client-table entries \
-                 leak until process exit"
-            );
-            return;
-        };
-        if let Some((vsr_client_id, session)) = sessions_for_disconnect
-            .borrow_mut()
-            .remove_connection(client_id)
-        {
-            submit_disconnect_logout(shard, vsr_client_id, session);
-        }
-    }));
-    Rc::new(move |client_id, message| {
-        enqueue_client_request(
-            &bus_for_spawn,
-            &shard_handle,
-            &sessions,
-            &server_config,
-            max_tokens_per_user,
-            &queues,
-            &active,
-            client_id,
-            message,
-        );
-    })
-}
-
-// Session resume is performed BY THE LOGIN PATH, not by a separate
-// credential-free rebind.
-//
-// A reconnecting client re-authenticates on the new connection and presents
-// its previous `client_id` in the login frame; `submit_register_in_process`
-// finds the existing table entry, verifies the authenticated user owns it,
-// and returns its epoch, so `bind_session` binds the new transport to the
-// old entry with its watermark and reply ring intact. That IS the resume.
-//
-// An earlier revision instead rebound an *unbound* transport straight from
-// the table whenever a replicated frame carried a matching
-// `(client, session)`, treating that pair as a bearer token. That was wrong
-// in four ways, and the combination was a pre-auth session takeover:
-//
-//   - it called `SessionManager::login` itself, so no credential was ever
-//     presented, and the connection was logged in as the entry's cached
-//     `user_id`; authority for replicated ops then resolves from the table
-//     (`resolve_acting_user_id`) and for partition ops from the session
-//     manager, so BOTH planes ran as the original registrant;
-//   - the pair carries far less entropy than "client-generated random
-//     u128" implies: HTTP mints `client_id` from the shard-0 sequential
-//     counter (`mint_shard_zero_client_id`) and the epoch is a metadata commit
-//     position, so neither value is an authentication secret;
-//   - `ClientEntry` carries no transport or plane tag, so a raw TCP peer
-//     could bind an HTTP-originated session;
-//   - `bind_session` demotes the evicted holder to `Connected`, the one
-//     state `login` accepts, so the loser's next replicated frame
-//     re-resumed and stole the session back, unbounded and with no eviction
-//     frame either way.
-//
-// Routing resume through login also restores the checks that path owns:
-// password / PAT verification, `UserStatus::Active`, PAT expiry, the
-// protocol-version gate, and SDK-info recording.
-//
-// An unbound transport sending a replicated frame therefore gets the typed
-// `Eviction(NoSession)` fail-fast below and must log in.
+// BindSession authenticates with the registered secret, never with the
+// public client id and epoch alone. It retains the original retry identity;
+// unbound replicated frames still fail with Eviction(NoSession).
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_client_request<B, MJ, S, SB>(
@@ -485,7 +349,11 @@ pub(in crate::dispatch) fn classify(header: &RoutedRequestHeader, bound: bool) -
         ) {
             return RequestClass::LegacyLogin;
         }
-        if nr_code != PING_CODE && !bound {
+        if !matches!(
+            nr_code,
+            PING_CODE | iggy_binary_protocol::codes::BIND_SESSION_CODE
+        ) && !bound
+        {
             return RequestClass::UnauthenticatedRead;
         }
         return RequestClass::NonReplicatedRead;
@@ -713,10 +581,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `bound` is Some here: `classify` sends unbound transports to
             // `UnboundReplicated`.
             let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
-            let consumer_session = if matches!(
-                request.header().operation,
-                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) {
+            let consumer_session = {
                 let attachment = sessions
                     .borrow()
                     .attached_consumer_session(transport_client_id);
@@ -733,8 +598,6 @@ async fn handle_client_request<B, MJ, S, SB>(
                         return;
                     }
                 }
-            } else {
-                None
             };
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
@@ -747,6 +610,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 transport_client_id,
                 user_id,
                 consumer_session,
+                None,
             )
             .await;
         }
@@ -897,30 +761,357 @@ where
         .and_then(std::rc::Weak::upgrade)
 }
 
+#[allow(clippy::future_not_send)]
+async fn complete_session_binding<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    identity: SessionIdentity,
+    secret: BindSecret,
+) -> Result<(u32, u64), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let watermark = identity.metadata_watermark.max(identity.session);
+    reads::await_metadata_read_frontier(shard, watermark).await?;
+    let (user_id, session, attachment) = if shard.id == 0 {
+        shard
+            .plane
+            .metadata()
+            .client_table
+            .borrow_mut()
+            .bind_session(identity.client_id, identity.session, secret.expose_secret())?
+    } else {
+        let (reply, receiver) = shard::channel(1);
+        shard.forward_metadata_submit(shard::MetadataSubmit::BindSession {
+            vsr_client_id: identity.client_id,
+            session: identity.session,
+            secret,
+            reply,
+        });
+        let outcome = pin!(receiver.recv());
+        let deadline = pin!(
+            shard
+                .bus
+                .sleep(shard.plane.metadata().applied_frontier().read_budget())
+        );
+        match select(outcome, deadline).await {
+            Either::Left((result, _)) => result.map_err(|_| IggyError::TransientNotAccepted)??,
+            Either::Right(_) => return Err(IggyError::TransientNotAccepted),
+        }
+    };
+    let active_user = shard.plane.metadata().mux_stm.users().read(|users| {
+        users
+            .items
+            .get(user_id as usize)
+            .is_some_and(|user| user.status == UserStatus::Active)
+    });
+    if !active_user {
+        return Err(IggyError::Unauthenticated);
+    }
+    sessions.borrow_mut().bind_authenticated_connection(
+        transport_client_id,
+        identity.client_id,
+        session,
+        user_id,
+        attachment,
+        watermark,
+    )?;
+    Ok((user_id, session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cluster_meta::ClusterRoster;
-    use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestMux, TestShard, test_shard};
+    use crate::dispatch::host::ServerHost;
+    use crate::dispatch::test_support::{
+        FIRST_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply, request_message,
+        test_shard,
+    };
+    use consensus::Sequencer;
+    use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::requests::users::{
+        CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
+    };
     use iggy_binary_protocol::{EvictionHeader, ReplyHeader};
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
     use journal::prepare_journal::PrepareJournal;
+    use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::StateMachine;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::ShardId;
     use shard::metrics::ShardMetrics;
     use shard::shards_table::PapayaShardsTable;
     use shard::{
-        LifecycleFrame, PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardIdentity,
+        ConnectedClientInfo, LifecycleFrame, ListClientsReply, MetadataSubmit, NoopHost,
+        PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardHost, ShardIdentity,
         shard_channel,
     };
     use std::mem::size_of;
     use std::sync::atomic::AtomicBool;
+
+    #[compio::test]
+    async fn bind_session_rechecks_the_owner_exists_and_is_active() {
+        const CLIENT: u128 = 1;
+        const TRANSPORT: u128 = 2;
+        const SESSION: u64 = 1;
+        const SECRET: [u8; 32] = [0x5a; 32];
+        for status in [None, Some(UserStatus::Inactive), Some(UserStatus::Active)] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let metadata = shard.plane.metadata();
+            if let Some(status) = status {
+                metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+                metadata
+                    .mux_stm
+                    .update(prepare_message(
+                        Operation::UpdateUser,
+                        CLIENT,
+                        SESSION,
+                        &UpdateUserRequest {
+                            user_id: WireIdentifier::numeric(0),
+                            username: None,
+                            status: Some(status.as_code()),
+                            options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                    ))
+                    .unwrap();
+            }
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(
+                    CLIENT,
+                    0,
+                    bind_verifier(CLIENT, 0, &SECRET),
+                    register_reply(CLIENT, SESSION),
+                )
+                .unwrap();
+            metadata.applied_frontier().advance(SESSION);
+            let sessions = Rc::new(RefCell::new(SessionManager::new()));
+            sessions.borrow_mut().ensure_connection(
+                TRANSPORT,
+                "127.0.0.1:34567".parse().unwrap(),
+                ClientTransportKind::Tcp,
+            );
+            let outcome = complete_session_binding(
+                &shard,
+                &sessions,
+                TRANSPORT,
+                SessionIdentity {
+                    client_id: CLIENT,
+                    session: SESSION,
+                    metadata_watermark: SESSION,
+                },
+                BindSecret::new(Box::new(SECRET)),
+            )
+            .await;
+            if status == Some(UserStatus::Active) {
+                assert_eq!(outcome.unwrap(), (0, SESSION));
+                assert_eq!(
+                    sessions.borrow().get_session(TRANSPORT),
+                    Some((CLIENT, SESSION))
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(IggyError::Unauthenticated)),
+                    "{status:?}: {outcome:?}"
+                );
+                assert!(sessions.borrow().get_session(TRANSPORT).is_none());
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_deleted_user_when_id_reused_should_reject_retained_session() {
+        for primary in [false, true] {
+            assert_revoked_user_cannot_resume(Operation::DeleteUser, primary).await;
+        }
+    }
+
+    #[compio::test]
+    async fn given_deactivated_user_when_reactivated_should_reject_retained_session() {
+        for primary in [false, true] {
+            assert_revoked_user_cannot_resume(Operation::UpdateUser, primary).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_revoked_user_cannot_resume(operation: Operation, primary: bool) {
+        const CLIENT: u128 = 10;
+        const TRANSPORT: u128 = 20;
+        const SESSION: u64 = 2;
+        const USER: u32 = 1;
+        const ROOT_CLIENT: u128 = CLIENT + 1;
+        const SECRET: [u8; 32] = [0x5a; 32];
+        let bus = SpyBus::default();
+        let directory = tempfile::tempdir().unwrap();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        let shard = Rc::new(shard);
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        let create = CreateUserRequest {
+            username: WireName::new("original").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let created = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                0,
+                1,
+                &create.to_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(created.code, 0);
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                USER,
+                bind_verifier(CLIENT, USER, &SECRET),
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        metadata.applied_frontier().advance(SESSION);
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+        let identity = SessionIdentity {
+            client_id: CLIENT,
+            session: SESSION,
+            metadata_watermark: SESSION,
+        };
+        complete_session_binding(
+            &shard,
+            &sessions,
+            TRANSPORT,
+            identity,
+            BindSecret::new(Box::new(SECRET)),
+        )
+        .await
+        .unwrap();
+        let body = if operation == Operation::DeleteUser {
+            DeleteUserRequest {
+                user_id: WireIdentifier::numeric(USER),
+            }
+            .to_bytes()
+        } else {
+            UpdateUserRequest {
+                user_id: WireIdentifier::numeric(USER),
+                username: None,
+                status: Some(UserStatus::Inactive.as_code()),
+                options: WireOptions::empty(),
+            }
+            .to_bytes()
+        };
+        if primary {
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(ROOT_CLIENT, 0, SECRET, register_reply(ROOT_CLIENT, 1))
+                .unwrap();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            consensus.restore_commit_state(SESSION, SESSION);
+            consensus.sequencer().set_sequence(SESSION);
+            let request = request_message(operation, ROOT_CLIENT, 1, 1, &body).transmute_header(
+                |old, header: &mut RoutedRequestHeader| {
+                    *header = old;
+                    header.metadata_watermark = SESSION;
+                },
+            );
+            metadata.submit_request_in_process(request).await.unwrap();
+        } else {
+            let revocation = prepare_message(operation, 0, 3, &body).transmute_header(
+                |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                    *header = old;
+                    header.op = 3;
+                },
+            );
+            metadata::apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                |_| {},
+                consensus::seal_prepare_checksum(revocation),
+            );
+        }
+        let old_binding = sessions.borrow().get_session(TRANSPORT);
+        let restore = if operation == Operation::DeleteUser {
+            prepare_message(
+                Operation::CreateUser,
+                0,
+                4,
+                &CreateUserRequest {
+                    username: WireName::new("replacement").unwrap(),
+                    ..create
+                }
+                .to_bytes(),
+            )
+        } else {
+            prepare_message(
+                Operation::UpdateUser,
+                0,
+                4,
+                &UpdateUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    username: None,
+                    status: Some(UserStatus::Active.as_code()),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            )
+        };
+        assert_eq!(metadata.mux_stm.update(restore).unwrap().code, 0);
+        assert!(metadata.mux_stm.users().read(|users| {
+            users
+                .items
+                .get(USER as usize)
+                .is_some_and(|user| user.status == UserStatus::Active)
+        }));
+        let outcome = complete_session_binding(
+            &shard,
+            &sessions,
+            TRANSPORT,
+            identity,
+            BindSecret::new(Box::new(SECRET)),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(IggyError::Unauthenticated)),
+            "committed {operation:?} must reject the old secret after restoring user id {USER}: {outcome:?}"
+        );
+        assert!(
+            old_binding.is_none(),
+            "committed {operation:?} must invalidate an already authenticated connection"
+        );
+        assert_eq!(metadata.client_table.borrow().ended_sessions().count(), 1);
+    }
 
     /// A test shard wired to its own lanes (the held sender feeds them),
     /// for the reply-lane pump tests below.
@@ -935,7 +1126,6 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
@@ -948,10 +1138,7 @@ mod tests {
         let shard = TestShard::new(
             ShardIdentity::new(0, name.to_string()),
             bus.clone(),
-            Rc::new(|_, _| {}),
-            Rc::new(|_, _| {}),
-            Rc::new(|_| {}),
-            Rc::new(|_| {}),
+            Rc::new(NoopHost),
             metadata,
             partitions,
             vec![sender],
@@ -1052,6 +1239,74 @@ mod tests {
             replies[0].0, TRANSPORT,
             "the forward must reach the client it was addressed to"
         );
+    }
+
+    /// A shard built on [`NoopHost`] routes the host-bound lifecycle frames
+    /// like any other: the host drops the carried reply sender, so the
+    /// waiting side sees a disconnect instead of hanging on the pump, and
+    /// the pump goes on serving frames afterwards.
+    #[compio::test]
+    async fn noop_host_drops_host_bound_replies_and_keeps_the_pump_alive() {
+        const TRANSPORT: u128 = 94;
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let (bus, lane_sender, shard) = reply_lane_test_shard("noop-host-test");
+        let (list_reply, list_rx) = shard::channel::<Vec<ConnectedClientInfo>>(1);
+        let (submit_reply, submit_rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
+        lane_sender
+            .try_send(ShardFrame::lifecycle(LifecycleFrame::ListClients {
+                reply: ListClientsReply::Clients(list_reply),
+            }))
+            .expect("inbox has capacity");
+        lane_sender
+            .try_send(ShardFrame::lifecycle(LifecycleFrame::MetadataSubmit(
+                MetadataSubmit::ClientRequest {
+                    request: Message::<GenericHeader>::new(size_of::<GenericHeader>()),
+                    reply: submit_reply,
+                },
+            )))
+            .expect("inbox has capacity");
+
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        let pump_shard = Rc::clone(&shard);
+        let pump = compio::runtime::spawn(async move {
+            pump_shard
+                .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
+                .await;
+        });
+
+        let list = compio::time::timeout(BUDGET, list_rx.recv())
+            .await
+            .expect("the pump must process the list-clients frame");
+        let submit = compio::time::timeout(BUDGET, submit_rx.recv())
+            .await
+            .expect("the pump must process the metadata-submit frame");
+        assert!(
+            list.is_err(),
+            "a noop host answers list-clients by dropping the reply sender"
+        );
+        assert!(
+            submit.is_err(),
+            "a noop host answers metadata-submit by dropping the reply sender"
+        );
+
+        // Sent only now, so its delivery proves the pump outlived both
+        // host-bound frames rather than being served between them.
+        lane_sender
+            .reply_sender()
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("reply lane has capacity");
+        compio::time::timeout(BUDGET, async {
+            while bus.client_replies.borrow().is_empty() {
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the pump must keep serving after the host-bound frames");
+        stop_tx.try_send(()).expect("stop channel has capacity");
+        let _ = pump.await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies[0].0, TRANSPORT, "forward must reach its client");
     }
 
     /// The `GET_CLUSTER_METADATA` auth gate holds on every roster shape: it
@@ -1535,45 +1790,38 @@ mod tests {
         compio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 
-    /// One handler per shard means one connection-lost hook on its bus: a
+    /// One host per shard means one connection-lost hook on its bus: a
     /// second install would overwrite the first and orphan the sessions
     /// the first one bound.
     #[test]
-    fn deferred_handler_installs_one_connection_lost_hook() {
+    fn server_host_installs_one_connection_lost_hook() {
         let bus = SpyBus::default();
-        let _handler = make_deferred_client_request_handler(
+        let _host = ServerHost::new(
             &bus,
             &unset_shard_handle(),
-            &Rc::new(RefCell::new(SessionManager::new())),
             Arc::new(ServerConfig::default()),
             1,
         );
         assert_eq!(
             bus.connection_lost_hooks.get(),
             1,
-            "one factory call must install exactly one connection-lost hook"
+            "one host must install exactly one connection-lost hook"
         );
     }
 
-    /// The handler is built before the shard it serves. A frame that
+    /// The host is built before the shard it serves. A frame that
     /// arrives while the self-reference is still unset stays queued, and
     /// the enqueue must release the client's active slot: otherwise every
     /// later frame for that client finds the slot taken and nothing is
     /// ever drained, the stranded frame included.
     #[compio::test]
-    async fn deferred_handler_drains_after_the_shard_handle_is_set() {
+    async fn server_host_drains_after_the_shard_handle_is_set() {
         const TRANSPORT: u128 = 98;
         let bus = SpyBus::default();
         let shard_handle = unset_shard_handle();
-        let handler = make_deferred_client_request_handler(
-            &bus,
-            &shard_handle,
-            &Rc::new(RefCell::new(SessionManager::new())),
-            Arc::new(ServerConfig::default()),
-            1,
-        );
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
 
-        handler(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
+        host.on_client_request(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
         run_spawned_tasks().await;
         assert!(
             bus.client_replies.borrow().is_empty(),
@@ -1582,7 +1830,7 @@ mod tests {
 
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-        handler(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
+        host.on_client_request(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
         for _ in 0..500 {
             if bus.client_replies.borrow().len() == 2 {
                 break;

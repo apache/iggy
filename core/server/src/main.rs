@@ -23,11 +23,15 @@ mod banner;
 use args::Args;
 use clap::Parser;
 use configs::server::ServerConfig;
-use server::boot::{apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs};
+use server::boot::{
+    apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
+    raise_open_file_limit,
+};
 use server::server_error::ServerError;
+use server_common::fatal::{FatalReason, descriptors_exhausted, fatal_with_log_flush};
 use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn main() -> Result<(), ServerError> {
     // This prelude must stay ahead of the first thread the process ever
@@ -47,7 +51,7 @@ fn main() -> Result<(), ServerError> {
     #[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
     info!("Using mimalloc allocator");
     #[cfg(not(all(feature = "mimalloc", not(feature = "disable-mimalloc"))))]
-    tracing::warn!("Using the default system allocator");
+    warn!("Using the default system allocator");
     if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
         let _ = dotenvy::from_path(&env_path);
     } else {
@@ -58,6 +62,19 @@ fn main() -> Result<(), ServerError> {
 
     // Before shard threads pin themselves: a pinned capture sees one core.
     capture_allowed_cpus();
+
+    // Before bootstrap: partition persistence sizes its offset-file budget
+    // from the soft limit it reads first, and nothing else raises it except a
+    // side effect of sysinfo's first process refresh on Linux.
+    match raise_open_file_limit() {
+        Ok(limit) => info!(
+            soft_before = limit.soft_before,
+            soft = limit.soft,
+            hard = limit.hard,
+            "open-file limit (RLIMIT_NOFILE) set"
+        ),
+        Err(error) => warn!(error = %error, "open-file limit (RLIMIT_NOFILE) left unchanged"),
+    }
 
     let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
@@ -98,6 +115,18 @@ fn main() -> Result<(), ServerError> {
     #[cfg(feature = "systemd")]
     if let Err(error) = &joined {
         server::boot::systemd::notify_shutdown_failure(error);
+    }
+    if let Err(error) = &joined
+        && descriptors_exhausted()
+    {
+        // `fatal` skips destructors, and the log appenders flush on drop.
+        fatal_with_log_flush(
+            FatalReason::DescriptorsExhausted,
+            &error.to_string(),
+            || {
+                drop(logging);
+            },
+        );
     }
     joined?;
     info!("server shutdown complete");

@@ -302,16 +302,6 @@ public class HttpMessageStream : IIggyClient
                ?? throw new InvalidResponseException("Send messages reply carried no confirmation body.");
     }
 
-    /// <summary>
-    ///     This feature is not supported by the server.
-    /// </summary>
-    /// <exception cref="FeatureUnavailableException"></exception>
-    public Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
-        CancellationToken token = default)
-    {
-        throw new FeatureUnavailableException();
-    }
-
     /// <inheritdoc />
     public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
@@ -1125,7 +1115,14 @@ public class HttpMessageStream : IIggyClient
             // the exception message.
         }
 
-        throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
+        var error = new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
+        if (error.StatusCode == VsrError.REQUEST_TOO_OLD)
+        {
+            // The server no longer knows whether the request committed, so a resend could duplicate it.
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+
+        throw error;
     }
 
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)

@@ -35,6 +35,7 @@ internal enum VsrOperation : byte
     RemoveConsumerGroupMember = 66,
     CompleteConsumerGroupRevocation = 67,
     TruncatePartition = 68,
+    FinalizeSession = 70,
 
     CreateStream = 128,
     UpdateStream = 129,
@@ -61,7 +62,8 @@ internal enum VsrOperation : byte
 
     SendMessages = 160,
     StoreConsumerOffset = 161,
-    DeleteConsumerOffset = 162
+    DeleteConsumerOffset = 162,
+    RetireSession = 166
 }
 
 internal static class VsrOperations
@@ -71,8 +73,7 @@ internal static class VsrOperations
 
     /// <summary>
     ///     Non-replicated codes this build knows to leave no server-side state behind, so re-sending one after a
-    ///     lost connection is indistinguishable from sending it once. Flushing an unsaved buffer is included: it
-    ///     is idempotent by construction, a second flush writes nothing new.
+    ///     lost connection is indistinguishable from sending it once.
     /// </summary>
     private static readonly HashSet<int> NonReplicatedReadCodes =
     [
@@ -86,7 +87,6 @@ internal static class VsrOperations
         CommandCodes.GET_USER_CODE,
         CommandCodes.GET_USERS_CODE,
         CommandCodes.GET_PERSONAL_ACCESS_TOKENS_CODE,
-        CommandCodes.FLUSH_UNSAVED_BUFFER_CODE,
         CommandCodes.GET_CONSUMER_OFFSET_CODE,
         CommandCodes.GET_STREAM_CODE,
         CommandCodes.GET_STREAMS_CODE,
@@ -162,15 +162,6 @@ internal static class VsrOperations
 
         var operation = ForCode(code);
 
-        // A consumer offset write carries an absolute offset and the server applies it as an unconditional
-        // overwrite, on a plane that keeps no client table to dedup against, so a replay lands on the same
-        // value. Denying the retry here reports an unknown outcome for a blip on an offset commit, which
-        // takes down the consume loop over a write that was safe to repeat.
-        if (operation is VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset)
-        {
-            return true;
-        }
-
         if (operation != VsrOperation.NonReplicated)
         {
             return false;
@@ -200,6 +191,7 @@ internal static class VsrOperations
             VsrOperation.Reserved or VsrOperation.Register or VsrOperation.NonReplicated or VsrOperation.Logout =>
                 true,
             >= VsrOperation.CreateTopicWithAssignments and <= VsrOperation.TruncatePartition => true,
+            VsrOperation.FinalizeSession or VsrOperation.RetireSession => true,
             >= VsrOperation.CreateStream and <= VsrOperation.LeaveConsumerGroup => true,
             VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset =>
                 true,
@@ -210,7 +202,8 @@ internal static class VsrOperations
     /// <summary>Replica / journal only; never emitted by a client.</summary>
     internal static bool IsInternal(this VsrOperation operation)
     {
-        return (byte)operation >= InternalStart && (byte)operation < MetadataStart;
+        return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
+            || operation == VsrOperation.RetireSession;
     }
 
     /// <summary>
@@ -222,7 +215,8 @@ internal static class VsrOperations
     /// </summary>
     internal static bool IsMetadata(this VsrOperation operation)
     {
-        return operation.IsInternal() || operation is VsrOperation.CreateStream
+        return (operation.IsInternal() && (byte)operation < (byte)VsrOperation.SendMessages)
+            || operation is VsrOperation.CreateStream
             or VsrOperation.UpdateStream
             or VsrOperation.DeleteStream
             or VsrOperation.PurgeStream

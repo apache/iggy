@@ -100,7 +100,11 @@ impl NumaTopology {
     pub fn detect() -> Result<Self, ShardingError> {
         let topology =
             Topology::new().map_err(|e| ShardingError::TopologyDetection { msg: e.to_string() })?;
+        Self::from_topology(topology)
+    }
 
+    /// Split from [`Self::detect`] so tests can pass a synthetic topology.
+    fn from_topology(topology: Topology) -> Result<Self, ShardingError> {
         let numa_nodes: Vec<_> = topology.objects_with_type(NUMANode).collect();
 
         let node_count = numa_nodes.len();
@@ -481,6 +485,9 @@ impl ShardAllocator {
             numa.cores_per_node
         };
 
+        // Binding to the only node gains nothing, and some VMs reject it.
+        let pin_memory = topology.node_count > 1;
+
         let mut shard_infos = Vec::new();
 
         let node_cpus: Vec<Vec<usize>> = nodes
@@ -511,7 +518,7 @@ impl ShardAllocator {
             for cpu_id in cores_to_use {
                 shard_infos.push(ShardInfo {
                     cpu_set: HashSet::from([cpu_id]),
-                    numa_node: Some(node_id),
+                    numa_node: pin_memory.then_some(node_id),
                 });
             }
         }
@@ -598,6 +605,41 @@ mod tests {
                 ShardingError::InvalidRange { start: 2, end: 1 }
             ));
         }
+    }
+
+    fn synthetic_topology(description: &str) -> NumaTopology {
+        let topology = hwlocality::topology::builder::TopologyBuilder::new()
+            .from_synthetic(description)
+            .expect("valid synthetic description")
+            .build()
+            .expect("synthetic topology builds");
+        NumaTopology::from_topology(topology).expect("synthetic topology has NUMA nodes")
+    }
+
+    #[test]
+    fn a_single_numa_node_is_not_bound() {
+        let topology = synthetic_topology("node:1 core:4 pu:1");
+        let shards =
+            ShardAllocator::compute_numa_assignments(&topology, &NumaConfig::default()).unwrap();
+
+        assert_eq!(shards.len(), 4);
+        assert!(
+            shards.iter().all(|shard| shard.numa_node.is_none()),
+            "a single-node topology must not pin shard memory"
+        );
+    }
+
+    #[test]
+    fn several_numa_nodes_are_still_bound() {
+        let topology = synthetic_topology("node:2 core:2 pu:1");
+        let shards =
+            ShardAllocator::compute_numa_assignments(&topology, &NumaConfig::default()).unwrap();
+
+        assert_eq!(shards.len(), 4);
+        assert!(
+            shards.iter().all(|shard| shard.numa_node.is_some()),
+            "a multi-node topology must keep pinning shard memory"
+        );
     }
 
     #[test]

@@ -38,6 +38,12 @@
 //! operations wait for their forward timeout in a mixed fleet. These commands are
 //! another reason the release cannot be rolled node by node.
 //!
+//! Consumer-session heartbeats (command 30) also require a coordinated upgrade.
+//! Older replicas reject this command and close the replica connection each time
+//! a new backup reports its sessions.
+//! Older replicas cannot report live sessions to a new primary, which would
+//! expire their consumer-group memberships after the configured timeout.
+//!
 //! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
 //! `checksum` as their view-independent identity, and the three client-facing
 //! headers are sealed on neither side, so SDKs are untouched.
@@ -283,28 +289,26 @@ pub struct RequestHeader {
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
-    /// Integrity stamp over the request payload, used by the client table to
-    /// catch a `request` number reused for a different operation: a retry that
-    /// disagrees with the stamp of the cached reply is refused rather than
-    /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison. The Rust SDK stamps metadata/session ops and `DeleteSegments`;
-    /// partition and non-replicated ops leave it zero. The server
-    /// verifies any nonzero stamp before routing.
+    /// Optional XXH3 integrity stamp over the client's request payload. Zero
+    /// means unstamped; the server verifies a nonzero stamp before routing or
+    /// rewriting the body. The Rust SDK stamps metadata/session operations
+    /// and `DeleteSegments`; partition and non-replicated operations leave it
+    /// zero. Retry identity uses the client, session, request, group and
+    /// operation, so matching retries replay the first receipt without
+    /// comparing stamps.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    /// Session fence epoch: the commit op of the latest committed `Register`
-    /// for this `client`. Handed to the client by that register's reply and
-    /// echoed on every subsequent request.
+    /// Session fence epoch: the commit op of the `Register` that created this
+    /// client's logical session, returned by its reply and echoed on subsequent
+    /// requests.
     ///
-    /// Every bind commits a `Register`, so each rebind of the same `client`
-    /// carries a strictly higher value, and a request stamped with an older one
-    /// is a zombie from before that rebind and gets fenced. Being a log
-    /// position rather than a counter is what makes it non-regressing: it
-    /// cannot restart low after the server drops an entry and the client
-    /// registers again.
+    /// `BindSession` and matching registration retries preserve this epoch.
+    /// A new registration after retirement establishes a new epoch, fencing
+    /// requests from the old session. Using the log position keeps the epoch
+    /// monotonic when a registry slot is reused.
     ///
     /// Header validation requires zero on `Register` itself. `NonReplicated`
     /// operations also permit zero before a client has registered.
@@ -337,9 +341,8 @@ const _: () = {
 /// (it is derived: plane from `operation`, partition group from the body),
 /// so this is where the derivation result lives for the internal hop.
 ///
-/// Layout: identical to [`RequestHeader`] with `group` claiming the LAST
-/// eight reserved bytes (the tail, bytes 248..256); the leading 52 reserved
-/// bytes keep their client-wire meaning, so promotion is a same-size copy.
+/// Layout: identical to [`RequestHeader`] with server routing fields claiming
+/// bytes 240..256; the leading 44 reserved bytes keep their client-wire meaning.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RoutedRequestHeader {
@@ -361,10 +364,12 @@ pub struct RoutedRequestHeader {
     pub operation_padding: [u8; 7],
     pub session: u64,
     pub user_id: u32,
-    /// Same offset and meaning as the leading 52 bytes of
+    /// Same offset and meaning as the leading 44 bytes of
     /// `RequestHeader::reserved` -- this region CARRIES DATA (the
     /// non-replicated op code range), so `group` must not displace it.
-    pub reserved: [u8; 52],
+    pub reserved: [u8; 44],
+    /// Server-observed metadata frontier at partition admission.
+    pub metadata_watermark: u64,
     /// The resolved consensus group id (see `binary_protocol::namespace`),
     /// claiming the TAIL of the client header's reserved area.
     pub group: u64,
@@ -401,7 +406,8 @@ impl Default for RoutedRequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 52],
+            reserved: [0; 44],
+            metadata_watermark: 0,
             group: 0,
         }
     }
@@ -576,8 +582,9 @@ pub struct ReplyHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    /// Echoed from the request this reply answers; the client table stores it
-    /// alongside the cached reply. See `RequestHeader::request_checksum`.
+    /// The original request's integrity stamp, preserved with its receipt.
+    /// A replay retains this value even if a retry supplies a different stamp.
+    /// See [`RequestHeader::request_checksum`].
     pub request_checksum: u128,
     pub context: u128,
     pub client: u128,
@@ -632,6 +639,64 @@ impl Default for ReplyHeader {
             operation_padding: [0; 7],
             status: 0,
             reserved: [0; 36],
+        }
+    }
+}
+
+impl ReplyHeader {
+    /// The reply to a committed prepare.
+    ///
+    /// Every field comes from the prepare or is zero, never from the primary's
+    /// live state, so a cached reply replayed by any replica carries the same
+    /// bytes for `(client, request)`: `view` is the commit-time view and
+    /// `replica` the original primary's id. `commit` is the prepare's `op`, not
+    /// `commit_max`, because it drives the `ClientTable` eviction order and
+    /// must be deterministic across replicas.
+    #[must_use]
+    pub fn from_prepare(prepare_header: &PrepareHeader, size: u32) -> Self {
+        Self {
+            cluster: prepare_header.cluster,
+            size,
+            view: prepare_header.view,
+            release: prepare_header.release,
+            command: Command::Reply,
+            replica: prepare_header.replica,
+            request_checksum: prepare_header.request_checksum,
+            client: prepare_header.client,
+            op: prepare_header.op,
+            commit: prepare_header.op,
+            timestamp: prepare_header.timestamp,
+            request: prepare_header.request,
+            operation: prepare_header.operation,
+            ..Self::default()
+        }
+    }
+
+    /// The base of a reply that answers `request_header` without a prepare
+    /// (rejections, denials, non-replicated reads): `cluster`, `view`,
+    /// `release`, `replica`, `request_checksum`, `timestamp`, `request` and
+    /// `operation` echo the request, `command` is `Reply`, `size` is the
+    /// caller's frame length, and every other field is zero.
+    ///
+    /// `client`, `op`, `commit` and `status` stay zero. Callers stamp two
+    /// deliberately different client identities (the transport client id on
+    /// the dispatch paths, the VSR client id elsewhere), so every site names
+    /// `client` itself instead of inheriting one that is right for only half
+    /// of them.
+    #[must_use]
+    pub fn echoing(request_header: &RoutedRequestHeader, size: u32) -> Self {
+        Self {
+            cluster: request_header.cluster,
+            size,
+            view: request_header.view,
+            release: request_header.release,
+            command: Command::Reply,
+            replica: request_header.replica,
+            request_checksum: request_header.request_checksum,
+            timestamp: request_header.timestamp,
+            request: request_header.request,
+            operation: request_header.operation,
+            ..Self::default()
         }
     }
 }
@@ -945,7 +1010,12 @@ pub struct PrepareHeader {
     /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
     /// that field for the stamping contract.
     pub user_id: u32,
-    pub reserved: [u8; 28],
+    /// Immutable capacity nominated by the first committed prepare in this group.
+    pub retry_capacity: u32,
+    pub reserved: [u8; 16],
+    /// Metadata Register commit identifying the authenticated session.
+    /// Zero is reserved for registration and server-originated operations.
+    pub session: u64,
 }
 const _: () = {
     assert!(size_of::<PrepareHeader>() == HEADER_SIZE);
@@ -956,7 +1026,10 @@ const _: () = {
     assert!(
         offset_of!(PrepareHeader, user_id) == offset_of!(PrepareHeader, group) + size_of::<u64>()
     );
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareHeader, retry_capacity) == 228);
+    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 16]>() == 248);
+    assert!(offset_of!(PrepareHeader, session) == 248);
+    assert!(offset_of!(PrepareHeader, session) + size_of::<u64>() == HEADER_SIZE);
 };
 
 impl Default for PrepareHeader {
@@ -982,7 +1055,9 @@ impl Default for PrepareHeader {
             operation_padding: [0; 7],
             group: 0,
             user_id: 0,
-            reserved: [0; 28],
+            retry_capacity: 0,
+            reserved: [0; 16],
+            session: 0,
         }
     }
 }
@@ -1038,8 +1113,8 @@ impl ConsensusHeader for PrepareHeader {
 
 /// `checksum` of a prepare no producer sealed.
 ///
-/// Written by a build predating the identity seal. Verification skips such
-/// entries so an older build's WAL still replays.
+/// Used by in-process producers that do not seal frames. A zero checksum does
+/// not grant storage-format compatibility; boot validates that separately.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
 /// The frame's body, bounded by `size`. What `checksum_body` covers.
@@ -2368,7 +2443,19 @@ impl ConsensusHeader for ForwardRegisterHeader {
                 found: self.command,
             });
         }
-        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)
+        let expected = HEADER_SIZE + crate::requests::users::login_register::BIND_SECRET_BYTES;
+        if self.size as usize != expected {
+            return Err(ConsensusError::InvalidSize {
+                expected: u32::try_from(expected).expect("fixed register frame fits u32"),
+                found: self.size,
+            });
+        }
+        validate_forward_register_frame(
+            u32::try_from(HEADER_SIZE).expect("fixed header fits u32"),
+            self.client,
+            self.nonce,
+            &self.reserved,
+        )
     }
 }
 
@@ -2636,6 +2723,8 @@ pub enum ForwardLogoutOutcome {
     PipelineFull = 2,
     InProgress = 3,
     Canceled = 4,
+    RequestTooOld = 5,
+    OperationMismatch = 6,
 }
 
 impl ConsensusHeader for ForwardLogoutResultHeader {
@@ -3132,6 +3221,104 @@ mod tests {
         assert!(header.validate().is_ok());
     }
 
+    #[test]
+    fn reply_from_prepare_echoes_the_prepare_and_positions_at_its_op() {
+        let prepare = PrepareHeader {
+            checksum: 1,
+            checksum_body: 2,
+            cluster: 3,
+            size: 4,
+            view: 5,
+            release: 6,
+            command: Command::Prepare,
+            replica: 7,
+            reserved_frame: [8; 66],
+            client: 9,
+            parent: 10,
+            request_checksum: 11,
+            op: 12,
+            commit: 13,
+            timestamp: 14,
+            request: 15,
+            operation: Operation::CreateStream,
+            operation_padding: [16; 7],
+            group: 17,
+            user_id: 18,
+            retry_capacity: 31,
+            reserved: [19; 16],
+            session: 37,
+        };
+        let reply = ReplyHeader::from_prepare(&prepare, 20);
+        assert_eq!(reply.cluster, 3);
+        assert_eq!(reply.size, 20);
+        assert_eq!(reply.view, 5);
+        assert_eq!(reply.release, 6);
+        assert_eq!(reply.command, Command::Reply);
+        assert_eq!(reply.replica, 7);
+        assert_eq!(reply.request_checksum, 11);
+        assert_eq!(reply.client, 9);
+        assert_eq!(reply.op, 12);
+        assert_eq!(reply.commit, 12, "the prepare's op, not its commit");
+        assert_eq!(reply.timestamp, 14);
+        assert_eq!(reply.request, 15);
+        assert_eq!(reply.operation, Operation::CreateStream);
+        assert_eq!(reply.checksum, 0);
+        assert_eq!(reply.checksum_body, 0);
+        assert_eq!(reply.reserved_frame, [0; 66]);
+        assert_eq!(reply.context, 0);
+        assert_eq!(reply.operation_padding, [0; 7]);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.reserved, [0; 36]);
+    }
+
+    #[test]
+    fn reply_echoing_copies_the_frame_and_request_identity_only() {
+        let request = RoutedRequestHeader {
+            checksum: 1,
+            checksum_body: 2,
+            cluster: 3,
+            size: 4,
+            view: 5,
+            release: 6,
+            command: Command::Request,
+            replica: 7,
+            reserved_frame: [8; 66],
+            client: 9,
+            request_checksum: 10,
+            timestamp: 11,
+            request: 12,
+            operation: Operation::CreateTopic,
+            operation_padding: [13; 7],
+            session: 14,
+            user_id: 15,
+            reserved: [16; 44],
+            metadata_watermark: 17,
+            group: 17,
+        };
+        let reply = ReplyHeader::echoing(&request, 18);
+        assert_eq!(reply.cluster, 3);
+        assert_eq!(reply.size, 18);
+        assert_eq!(reply.view, 5);
+        assert_eq!(reply.release, 6);
+        assert_eq!(reply.command, Command::Reply);
+        assert_eq!(reply.replica, 7);
+        assert_eq!(reply.request_checksum, 10);
+        assert_eq!(reply.timestamp, 11);
+        assert_eq!(reply.request, 12);
+        assert_eq!(reply.operation, Operation::CreateTopic);
+        // Left to the caller: the client identity and the position fields.
+        assert_eq!(reply.client, 0);
+        assert_eq!(reply.op, 0);
+        assert_eq!(reply.commit, 0);
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.checksum, 0);
+        assert_eq!(reply.checksum_body, 0);
+        assert_eq!(reply.reserved_frame, [0; 66]);
+        assert_eq!(reply.context, 0);
+        assert_eq!(reply.operation_padding, [0; 7]);
+        assert_eq!(reply.reserved, [0; 36]);
+    }
+
     // Wire-discriminant pin: any change breaks SDK decoders.
     #[test]
     fn eviction_reason_discriminants_pinned() {
@@ -3220,7 +3407,7 @@ mod tests {
             checksum: 0,
             checksum_body: 0,
             cluster: 7,
-            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            size: u32::try_from(HEADER_SIZE + 32).expect("HEADER_SIZE fits u32"),
             view: 3,
             release: 0,
             command: Command::ForwardRegister,
@@ -3276,7 +3463,15 @@ mod tests {
             let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf)
                 .expect("a forward-register frame is a valid generic header");
             assert_eq!(generic.command, command);
-            assert_eq!(generic.size as usize, HEADER_SIZE);
+            assert_eq!(
+                generic.size as usize,
+                HEADER_SIZE
+                    + if command == Command::ForwardRegister {
+                        32
+                    } else {
+                        0
+                    }
+            );
         }
 
         let buf = {
@@ -3515,7 +3710,7 @@ mod tests {
         bytes.copy_from_slice(bytemuck::bytes_of(&forward_logout_result(
             ForwardLogoutOutcome::Ok,
         )));
-        bytes[OUTCOME_OFFSET] = 5;
+        bytes[OUTCOME_OFFSET] = u8::MAX;
         assert!(bytemuck::checked::try_from_bytes::<ForwardLogoutResultHeader>(&bytes).is_err());
     }
 
@@ -3526,5 +3721,7 @@ mod tests {
         assert_eq!(ForwardLogoutOutcome::PipelineFull as u8, 2);
         assert_eq!(ForwardLogoutOutcome::InProgress as u8, 3);
         assert_eq!(ForwardLogoutOutcome::Canceled as u8, 4);
+        assert_eq!(ForwardLogoutOutcome::RequestTooOld as u8, 5);
+        assert_eq!(ForwardLogoutOutcome::OperationMismatch as u8, 6);
     }
 }

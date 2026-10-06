@@ -57,10 +57,10 @@
 //!   (their `Frozen<MESSAGE_ALIGN>` fragments flattened, chunked at
 //!   `IOV_MAX`) into `write_vectored_all`. Don't introduce per-message
 //!   syscalls or per-message encryption on the plaintext TCP plane.
-//! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
-//!   connections have no dupable plaintext fd, so shard 0 terminates
-//!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
-//!   inter-shard crossfire channel.
+//! - fd-delegation ([`fd_transfer`]) transfers raw TCP sockets for TCP,
+//!   WS, TCP-TLS and WSS before handshakes. The destination shard owns
+//!   handshake state and I/O. QUIC client callbacks install on shard 0
+//!   through its shared UDP endpoint.
 //! - 0-RTT stays disabled by default on any future QUIC path. Per-
 //!   command opt-in requires a checked-in idempotence audit.
 //!
@@ -75,9 +75,11 @@
 //! transport (TCP, TCP-TLS, WS, WSS, QUIC) plugs in behind the same
 //! registry, fencing, and dispatch logic.
 
+pub mod accept;
 pub mod cache;
 pub mod client_listener;
 pub mod config;
+pub mod connection_cap;
 pub mod connector;
 mod error;
 pub mod fd_transfer;
@@ -89,6 +91,7 @@ pub(crate) mod socket_opts;
 pub mod transports;
 
 pub use config::{IOV_MAX_LIMIT, MessageBusConfig, QuicTuning, WebSocketConfig};
+pub use connection_cap::{ConnectionCap, ConnectionPermit};
 pub use error::SendError;
 pub use installer::ConnectionInstaller;
 pub use installer::conn_info::{
@@ -403,42 +406,26 @@ pub type AcceptedQuicClientFn = std::rc::Rc<dyn Fn(AcceptedQuicConn)>;
 /// requires a dupable plaintext fd) stays well-defined.
 pub type AcceptedWsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
 
+/// Listener TLS configuration shared with the shard owning each connection.
+/// Per-connection TLS state is created only on the destination runtime.
+pub type SharedTlsServerConfig = std::sync::Arc<rustls::ServerConfig>;
+
 /// Callback invoked on every accepted SDK TCP-TLS client connection.
 ///
 /// Fires after shard 0's TCP-TLS listener accepts a raw TCP socket.
-/// Neither the rustls handshake nor any application-layer work has run
-/// yet — the listener stays cheap so a slow handshake on one peer cannot
-/// block subsequent accepts. The callback receives the raw stream plus
-/// a clone of the shared [`std::sync::Arc<rustls::ServerConfig>`] built
-/// at bind time, mints a `client_id`, and calls
-/// [`installer::install_client_tcp_tls`]; the install path drives the
-/// rustls handshake on its own task before forwarding the connection to
-/// [`installer::install_client_conn`].
-///
-/// TCP-TLS stays shard-0 terminal: rustls's connection state machine
-/// is tied to the local task and not serialisable, and the
-/// pre-handshake fd would have to re-handshake on the receiving shard,
-/// losing the point of fd-delegation.
-pub type AcceptedTlsClientFn =
-    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+/// The callback delegates the socket and its listener's configuration
+/// before any TLS bytes are consumed. The destination shard runs
+/// [`installer::install_client_tcp_tls`], owning the handshake and all I/O.
+pub type AcceptedTlsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
 /// Callback invoked on every accepted SDK WSS (WebSocket-over-TLS)
 /// client connection.
 ///
-/// Fires after shard 0's WSS listener accepts a raw TCP socket. Neither
-/// the rustls handshake nor the WebSocket HTTP-Upgrade has run yet — the
-/// listener stays cheap so neither handshake on one peer can block
-/// subsequent accepts. The callback receives the raw stream plus a clone
-/// of the shared [`std::sync::Arc<rustls::ServerConfig>`] built at bind
-/// time, mints a `client_id`, and calls
-/// [`installer::install_client_wss`]; the install path drives
-/// both handshakes on its own task before forwarding the connection to
-/// [`installer::install_client_conn`].
-///
-/// No subprotocol negotiation is performed. WSS stays shard-0 terminal
-/// for the same reasons as the TCP-TLS plane.
-pub type AcceptedWssClientFn =
-    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+/// Fires before either the TLS handshake or WebSocket upgrade. The callback
+/// delegates the raw socket and its listener's configuration to the owning
+/// shard, where [`installer::install_client_wss`] runs both handshakes and
+/// subsequent I/O. No subprotocol negotiation is performed.
+pub type AcceptedWssClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, SharedTlsServerConfig)>;
 
 /// Notifier fired when a delegated replica connection dies.
 ///
@@ -447,6 +434,59 @@ pub type AcceptedWssClientFn =
 /// this closure around a `try_send` into shard 0's inbox so shard 0 can
 /// clear the replica mapping and re-dial.
 pub type ConnectionLostFn = std::rc::Rc<dyn Fn(u8)>;
+
+/// Socket-read accounting for this shard's plaintext replica links.
+///
+/// One instance covers every such link the shard owns, so the ratio of
+/// decoded frames to completed socket reads is their aggregate batching
+/// factor, which is what the read-ahead buffer exists to raise. Only link
+/// shards read replica sockets, so a nonzero value also identifies the
+/// link shard.
+///
+/// `Cell` rather than atomics: the reader task that bumps these and the
+/// shard sweep that drains them run on the same compio thread. Shared
+/// with the reader task through an `Rc`, on the precedent of
+/// `installer::replica`'s `install_aborted`.
+#[derive(Debug, Default)]
+pub struct ReplicaReadStats {
+    reads: Cell<u64>,
+    frames: Cell<u64>,
+}
+
+impl ReplicaReadStats {
+    /// One completed socket read on the replica read half.
+    pub fn record_read(&self) {
+        self.reads.set(self.reads.get() + 1);
+    }
+
+    /// One frame decoded out of the replica read half.
+    pub fn record_frame(&self) {
+        self.frames.set(self.frames.get() + 1);
+    }
+
+    /// Drain both counts, resetting them to zero.
+    ///
+    /// Take semantics because the caller feeds the result to a cumulative
+    /// Prometheus counter's `inc_by`: handing back running totals would
+    /// double count every sweep.
+    pub const fn take(&self) -> ReplicaReadMetrics {
+        ReplicaReadMetrics {
+            reads: self.reads.replace(0),
+            frames: self.frames.replace(0),
+        }
+    }
+}
+
+/// Deltas since the previous [`ReplicaReadStats::take`].
+///
+/// `frames >= reads` is not an invariant: a body that arrives in two
+/// segments, or one that straddles the end of the read-ahead buffer,
+/// costs two reads for one frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaReadMetrics {
+    pub reads: u64,
+    pub frames: u64,
+}
 
 /// Point-to-point message delivery between consensus participants.
 ///
@@ -643,6 +683,16 @@ pub trait MessageBus {
     fn realtime_micros(&self) -> u64 {
         iggy_common::IggyTimestamp::now().as_micros()
     }
+
+    /// Drain this bus's plaintext replica socket-read counters.
+    ///
+    /// The provided default returns zeros so the simulator bus and the
+    /// test buses need no override: they own no replica socket. The
+    /// production bus takes from its own [`ReplicaReadStats`], which the
+    /// reader task of every plaintext replica link shares.
+    fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
+        ReplicaReadMetrics::default()
+    }
 }
 
 /// Production message bus backed by real TCP connections.
@@ -723,6 +773,11 @@ pub struct IggyMessageBus {
     /// pending; entries expire lazily inside [`Self::check_dial_pending`].
     /// Only shard 0's bus ever populates this.
     pending_dials: RefCell<ahash::AHashMap<u8, Instant>>,
+    /// Socket-read counters shared by the reader task of every plaintext
+    /// replica link this shard owns. Drained through
+    /// [`MessageBus::take_replica_read_stats`] by the shard's tick;
+    /// stays at zero on a shard that owns no such link.
+    replica_read_stats: Rc<ReplicaReadStats>,
 }
 
 impl IggyMessageBus {
@@ -835,6 +890,7 @@ impl IggyMessageBus {
             replica_handshake_slots: RefCell::new(ahash::AHashMap::new()),
             replica_slot_seq: Cell::new(0),
             pending_dials: RefCell::new(ahash::AHashMap::new()),
+            replica_read_stats: Rc::new(ReplicaReadStats::default()),
         }
     }
 
@@ -1125,6 +1181,12 @@ impl IggyMessageBus {
         &self.config
     }
 
+    /// Handle every plaintext replica reader task on this shard bumps.
+    #[must_use]
+    pub fn replica_read_stats(&self) -> Rc<ReplicaReadStats> {
+        Rc::clone(&self.replica_read_stats)
+    }
+
     /// Cheap clone of the root shutdown token.
     ///
     /// Handed to accept loops, read tasks, writer tasks, and periodic tasks
@@ -1224,6 +1286,8 @@ impl IggyMessageBus {
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let clients_outcome = self.clients.drain(remaining).await;
+        // Connection tasks skip per-client cleanup during bus shutdown.
+        self.client_meta.borrow_mut().clear();
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let replicas_outcome = self.replicas.drain(remaining).await;
 
@@ -1309,6 +1373,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
 
     fn realtime_micros(&self) -> u64 {
         (**self).realtime_micros()
+    }
+
+    fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
+        (**self).take_replica_read_stats()
     }
 }
 
@@ -1408,11 +1476,15 @@ impl MessageBus for IggyMessageBus {
     fn track_background(&self, handle: JoinHandle<()>) {
         Self::track_background(self, handle);
     }
+
+    fn take_replica_read_stats(&self) -> ReplicaReadMetrics {
+        self.replica_read_stats.take()
+    }
 }
 
 /// Extract the owning shard from a client id.
 ///
-/// Shard 0 mints client ids as `(target_shard_id << 112) | seq`. The top 16
+/// Shard 0 mints client ids with `target_shard_id` in the top 16 bits. Those
 /// bits encode which shard's bus registry holds the connection; any shard
 /// that needs to reply to this client uses this accessor to decide between
 /// the fast path (local) and the slow path (forward via inter-shard).
@@ -1425,8 +1497,8 @@ pub const fn client_id_owning_shard(client_id: u128) -> u16 {
 /// Reserved client id stamped on server-generated auto-commit
 /// `StoreConsumerOffset` ops (a poll's `auto_commit` replicated for failover).
 ///
-/// Never belongs to a live connection: `mint_client_id` produces
-/// `(shard << 112) | seq` and no real shard is `u16::MAX`, so `u128::MAX` is
+/// Never belongs to a live connection: `mint_client_id` puts the shard in the
+/// top 16 bits and no real shard is `u16::MAX`, so `u128::MAX` is
 /// unreachable. The commit path recognises it and skips the (unwaited) reply,
 /// keeping an unrequested frame off a real client's lockstep stream. Nonzero,
 /// so it still satisfies the wire header's `client != 0` validation.

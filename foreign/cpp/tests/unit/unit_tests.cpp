@@ -350,8 +350,10 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     auto moved_to = std::move(client);
     (void)moved_to;
 
-    const auto stream = iggy::Identifier::String("stream");
-    const auto topic  = iggy::Identifier::String("topic");
+    const auto stream   = iggy::Identifier::String("stream");
+    const auto topic    = iggy::Identifier::String("topic");
+    const auto group    = iggy::Identifier::String("group");
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
 
     // Exercising the moved-from guard requires invoking every operation on the valid but empty source object.
     EXPECT_THROW(client.Connect(), iggy::IggyException);
@@ -359,6 +361,12 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.Shutdown(), iggy::IggyException);
     EXPECT_THROW(client.Login("iggy", "iggy"), iggy::IggyException);
     EXPECT_THROW(client.Logout(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetUser(stream), iggy::IggyException);
+    EXPECT_THROW((void)client.GetUsers(), iggy::IggyException);
+    EXPECT_THROW((void)client.CreateUser("user", "secret123", iggy::UserStatus::Active), iggy::IggyException);
+    EXPECT_THROW(client.DeleteUser(stream), iggy::IggyException);
+    EXPECT_THROW(client.UpdateUser(stream, "updated-user", iggy::UserStatus::Active, iggy::UserUpdateOptions{}),
+                 iggy::IggyException);
     EXPECT_THROW(client.CreateStream("stream"), iggy::IggyException);
     EXPECT_THROW(client.UpdateStream(stream, "updated-stream"), iggy::IggyException);
     EXPECT_THROW(client.GetStreams(), iggy::IggyException);
@@ -374,6 +382,40 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.PurgeTopic(stream, topic), iggy::IggyException);
     EXPECT_THROW(client.CreatePartitions(stream, topic, 1), iggy::IggyException);
     EXPECT_THROW(client.DeletePartitions(stream, topic, 1), iggy::IggyException);
+    EXPECT_THROW(client.DeleteSegments(stream, topic, 0, 1), iggy::IggyException);
+    EXPECT_THROW(client.CreateConsumerGroup(stream, topic, "group"), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerGroups(stream, topic), iggy::IggyException);
+    EXPECT_THROW(client.DeleteConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.JoinConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.LeaveConsumerGroup(stream, topic, group), iggy::IggyException);
+    EXPECT_THROW(client.StoreConsumerOffset(consumer, stream, topic, 0, 0), iggy::IggyException);
+    EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
+    EXPECT_THROW((void)client.GetStats(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetMe(), iggy::IggyException);
+    EXPECT_THROW((void)client.GetClient(1), iggy::IggyException);
+    EXPECT_THROW((void)client.GetClients(), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientTest, ConsumerOffsetOperationsRejectMaximumPartitionId) {
+    auto client                  = iggy::IggyBlockingClient::Builder().Build();
+    const auto stream            = iggy::Identifier::String("stream");
+    const auto topic             = iggy::Identifier::String("topic");
+    const auto consumer          = iggy::Consumer::Single(iggy::Identifier::Numeric(1));
+    const auto maximum_partition = std::numeric_limits<std::uint32_t>::max();
+    const auto expect_rejection  = [](auto &&operation) {
+        try {
+            operation();
+            FAIL() << "Expected the maximum std::uint32_t partition_id to be rejected";
+        } catch (const iggy::IggyException &error) {
+            EXPECT_STREQ(error.what(), "partition_id cannot be the maximum std::uint32_t value");
+        }
+    };
+
+    expect_rejection([&] { client.StoreConsumerOffset(consumer, stream, topic, maximum_partition, 0); });
+    expect_rejection([&] { (void)client.GetConsumerOffset(consumer, stream, topic, maximum_partition); });
+    expect_rejection([&] { client.DeleteConsumerOffset(consumer, stream, topic, maximum_partition); });
 }
 
 TEST(AutoLoginKindTest, HasStableDiscriminantsAndZeroInitializedDefault) {

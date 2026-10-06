@@ -104,6 +104,49 @@ void IggyBlockingClient::Logout() {
     RethrowAsIggyException([this] { Handle()->logout_user(); });
 }
 
+UserInfoDetails IggyBlockingClient::GetUser(const Identifier &user) {
+    return RethrowAsIggyException([this, &user] { return UserInfoDetails::FromFfi(Handle()->get_user(user.ToFfi())); });
+}
+
+std::vector<UserInfo> IggyBlockingClient::GetUsers() {
+    return RethrowAsIggyException([this] {
+        std::vector<UserInfo> users;
+        auto ffi_users = Handle()->get_users();
+        users.reserve(ffi_users.size());
+        for (auto &user : ffi_users) {
+            users.push_back(UserInfo::FromFfi(std::move(user)));
+        }
+        return users;
+    });
+}
+
+UserInfoDetails IggyBlockingClient::CreateUser(std::string username,
+                                               std::string password,
+                                               UserStatus status,
+                                               const std::optional<Permissions> &permissions) {
+    return RethrowAsIggyException([this, &username, &password, status, &permissions] {
+        auto ffi_permissions = permissions ? permissions->ToFfi() : ffi::Permissions{};
+        return UserInfoDetails::FromFfi(Handle()->create_user(username, password, static_cast<ffi::UserStatus>(status),
+                                                              permissions.has_value(), std::move(ffi_permissions)));
+    });
+}
+
+void IggyBlockingClient::DeleteUser(const Identifier &user) {
+    RethrowAsIggyException([this, &user] { Handle()->delete_user(user.ToFfi()); });
+}
+
+void IggyBlockingClient::UpdateUser(const Identifier &user,
+                                    std::optional<std::string> username,
+                                    std::optional<UserStatus> status,
+                                    const UserUpdateOptions &options) {
+    RethrowAsIggyException([this, &user, &username, status, &options] {
+        auto ffi_options = ToFfiRawOptions(options.RawEntries());
+        Handle()->update_user(user.ToFfi(), username.has_value(), username.value_or(""), status.has_value(),
+                              static_cast<ffi::UserStatus>(status.value_or(UserStatus::Active)),
+                              std::move(ffi_options));
+    });
+}
+
 StreamDetails IggyBlockingClient::CreateStream(std::string name) {
     return RethrowAsIggyException([this, &name] { return StreamDetails::FromFfi(Handle()->create_stream(name)); });
 }
@@ -250,6 +293,137 @@ void IggyBlockingClient::DeletePartitions(const Identifier &stream,
     RethrowAsIggyException([this, &stream, &topic, partitions_count] {
         Handle()->delete_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
     });
+}
+
+void IggyBlockingClient::DeleteSegments(const Identifier &stream,
+                                        const Identifier &topic,
+                                        const std::uint32_t partition_id,
+                                        const std::uint32_t segments_count) {
+    RethrowAsIggyException([this, &stream, &topic, partition_id, segments_count] {
+        Handle()->delete_segments(stream.ToFfi(), topic.ToFfi(), partition_id, segments_count);
+    });
+}
+
+ConsumerGroupDetails IggyBlockingClient::CreateConsumerGroup(const Identifier &stream,
+                                                             const Identifier &topic,
+                                                             std::string name) {
+    return RethrowAsIggyException([this, &stream, &topic, &name] {
+        return ConsumerGroupDetails::FromFfi(Handle()->create_consumer_group(stream.ToFfi(), topic.ToFfi(), name));
+    });
+}
+
+ConsumerGroupDetails IggyBlockingClient::GetConsumerGroup(const Identifier &stream,
+                                                          const Identifier &topic,
+                                                          const Identifier &group) {
+    return RethrowAsIggyException([this, &stream, &topic, &group] {
+        return ConsumerGroupDetails::FromFfi(
+            Handle()->get_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi()));
+    });
+}
+
+std::vector<ConsumerGroup> IggyBlockingClient::GetConsumerGroups(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException([this, &stream, &topic] {
+        std::vector<ConsumerGroup> groups;
+        auto ffi_groups = Handle()->get_consumer_groups(stream.ToFfi(), topic.ToFfi());
+        groups.reserve(ffi_groups.size());
+        for (auto &group : ffi_groups) {
+            groups.push_back(ConsumerGroup::FromFfi(std::move(group)));
+        }
+        return groups;
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerGroup(const Identifier &stream,
+                                             const Identifier &topic,
+                                             const Identifier &group) {
+    RethrowAsIggyException([this, &stream, &topic, &group] {
+        Handle()->delete_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi());
+    });
+}
+
+void IggyBlockingClient::JoinConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group) {
+    RethrowAsIggyException([this, &stream, &topic, &group] {
+        Handle()->join_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi());
+    });
+}
+
+void IggyBlockingClient::LeaveConsumerGroup(const Identifier &stream,
+                                            const Identifier &topic,
+                                            const Identifier &group) {
+    RethrowAsIggyException([this, &stream, &topic, &group] {
+        Handle()->leave_consumer_group(stream.ToFfi(), topic.ToFfi(), group.ToFfi());
+    });
+}
+
+void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
+                                             const Identifier &stream,
+                                             const Identifier &topic,
+                                             const std::optional<std::uint32_t> partition_id,
+                                             const std::uint64_t offset) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, offset, partition_id] {
+        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == unspecified_partition_id) {
+            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+        }
+        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
+                                        std::string(consumer.KindName()), consumer.Id().ToFfi(), offset);
+    });
+}
+
+ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consumer,
+                                                         const Identifier &stream,
+                                                         const Identifier &topic,
+                                                         const std::optional<std::uint32_t> partition_id) {
+    return RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
+        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == unspecified_partition_id) {
+            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+        }
+        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        return ConsumerOffsetInfo::FromFfi(Handle()->get_consumer_offset(
+            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi()));
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerOffset(const Consumer &consumer,
+                                              const Identifier &stream,
+                                              const Identifier &topic,
+                                              const std::optional<std::uint32_t> partition_id) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id] {
+        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+        if (partition_id == unspecified_partition_id) {
+            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+        }
+        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
+                                         std::string(consumer.KindName()), consumer.Id().ToFfi());
+    });
+}
+
+ClientInfoDetails IggyBlockingClient::GetMe() {
+    return RethrowAsIggyException([this] { return ClientInfoDetails::FromFfi(Handle()->get_me()); });
+}
+
+ClientInfoDetails IggyBlockingClient::GetClient(std::uint32_t client_id) {
+    return RethrowAsIggyException(
+        [this, client_id] { return ClientInfoDetails::FromFfi(Handle()->get_client(client_id)); });
+}
+
+std::vector<ClientInfo> IggyBlockingClient::GetClients() {
+    return RethrowAsIggyException([this] {
+        std::vector<ClientInfo> clients;
+        auto ffi_clients = Handle()->get_clients();
+        clients.reserve(ffi_clients.size());
+        for (auto &client : ffi_clients) {
+            clients.push_back(ClientInfo::FromFfi(std::move(client)));
+        }
+        return clients;
+    });
+}
+
+Stats IggyBlockingClient::GetStats() {
+    return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {

@@ -17,11 +17,17 @@
 
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library", "cc_test")
 
+config_setting(
+    name = "coverage_enabled",
+    values = {"define": "iggy_cpp_coverage=1"},
+)
+
 genrule(
     name = "cargo_build",
     srcs = glob(["src/**/*.rs"]) + [
         "Cargo.toml",
         "build.rs",
+        "@iggy_source//:cpp_rust_dependencies",
     ],
     outs = [
         "libiggy_cpp.a",
@@ -55,7 +61,7 @@ genrule(
         env -u PWD \
             CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" \
             RUSTC="$$RUSTC" \
-            "$$CARGO" build $$FLAGS
+            "$$CARGO" build --quiet $$FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 
@@ -88,9 +94,46 @@ genrule(
     ],
 )
 
+genrule(
+    name = "extract_profiler_runtime",
+    outs = ["libprofiler_builtins.a"],
+    cmd = """
+        set -euo pipefail
+
+        EXECROOT="$$(pwd)"
+        RUSTC="$$EXECROOT/$(execpath @rs_host_tools//:rustc)"
+        PROFILER_RT_OUT="$$EXECROOT/$(location libprofiler_builtins.a)"
+
+        RT_SYSROOT="$$("$$RUSTC" --print sysroot)"
+        RT_HOST="$$("$$RUSTC" -vV | sed -n 's/^host: //p')"
+        RT_RLIB="$$(find "$$RT_SYSROOT/lib/rustlib/$$RT_HOST/lib" -maxdepth 1 -name 'libprofiler_builtins-*.rlib' -print -quit)"
+        if [ -z "$$RT_RLIB" ]; then
+            echo "ERROR: Failed to locate libprofiler_builtins rlib under $$RT_SYSROOT" >&2
+            exit 1
+        fi
+        cp "$$RT_RLIB" "$$PROFILER_RT_OUT"
+        for member in $$(ar t "$$PROFILER_RT_OUT"); do
+            case "$$member" in
+                *.o) ;;
+                *) ar d "$$PROFILER_RT_OUT" "$$member" ;;
+            esac
+        done
+    """,
+    tools = [
+        "@rs_host_tools//:rust_toolchain",
+        "@rs_host_tools//:rustc",
+    ],
+)
+
 cc_import(
     name = "iggy_cpp_static",
     static_library = ":libiggy_cpp.a",
+)
+
+cc_import(
+    name = "profiler_rt",
+    static_library = ":libprofiler_builtins.a",
+    alwayslink = True,
 )
 
 cc_library(
@@ -139,7 +182,11 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":iggy_cpp_static",
-    ],
+        "@abseil-cpp//absl/numeric:int128",
+    ] + select({
+        ":coverage_enabled": [":profiler_rt"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_binary(

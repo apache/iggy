@@ -162,9 +162,7 @@
 //! discriminator, like `checkpoint_id` on every prepare
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
-use crate::partition_helpers::{
-    build_partition_fresh, delete_partitions_from_disk, load_partition_or_fence,
-};
+use crate::partition_helpers::{build_partition_fresh, load_partition_or_fence};
 use crate::shell::ServerShard;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -175,11 +173,12 @@ use iggy_binary_protocol::{
     AckLevel, Command, Operation, ReplyHeader, RoutedRequestHeader, WireConsumer, WireEncode,
     WireIdentifier,
 };
-use iggy_common::{ConsumerGroupId, IggyTimestamp};
+use iggy_common::{ConsumerGroupId, ConsumerKind, IggyTimestamp};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Partition, StatsRegistry};
+use partitions::{delete_partitions_from_disk, read_created_revision};
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -660,11 +659,15 @@ async fn reconcile_additions(
             // delete that failed leaves the tombstone standing with no
             // `ConfirmRemove` behind it -- the same permanent fence the in-map
             // branch above escapes, told apart by the same signal.
-            if ctx.has_pending_delete_failure(ns) {
+            if ctx.has_pending_delete_failure(ns)
+                || partitions
+                    .failed_revision(&ns)
+                    .is_some_and(|failed| failed < epoch)
+            {
                 trace!(
                     shard = shard_id,
                     ns_raw = ns.inner(),
-                    "additions: ns tombstoned before materialisation with a failed disk delete; re-driving teardown"
+                    "additions: removing fenced files of a superseded or incompletely deleted incarnation"
                 );
                 tear_down_owned_partition(ctx, ns, counters).await;
                 continue;
@@ -753,12 +756,16 @@ async fn reconcile_additions(
                 "additions: recreate committed mid-pass; deferring the build to the next pass"
             );
             counters.deferred += 1;
-            // Skipping alone only settles it when nothing is on disk. With a
-            // directory there, the next pass takes the loader arm below and
-            // hydrates the NEW incarnation out of the OLD segments, so the
-            // prior life has to go first. Teardown tombstones until its
-            // `ConfirmRemove` lands, which is what holds that pass off.
-            if prior_life_on_disk {
+            // Skipping alone settles it unless the directory is unmarked. The
+            // loader deletes a directory marked by an older incarnation and
+            // keeps one marked by the committed or a newer one, which can hold
+            // data this replica served. An unmarked directory, from an older
+            // server, it would adopt as the NEW incarnation, so that prior life
+            // has to go first. Teardown tombstones until its `ConfirmRemove`
+            // lands, which is what holds the next pass off. A marker that
+            // cannot be read is left to that pass's loader.
+            if prior_life_on_disk && matches!(read_created_revision(&partition_dir).await, Ok(None))
+            {
                 tear_down_owned_partition(ctx, ns, counters).await;
             }
             continue;
@@ -781,6 +788,7 @@ async fn reconcile_additions(
         } else {
             build_partition_fresh(
                 ctx.config.as_ref(),
+                partitions.config(),
                 ns,
                 partition_stats,
                 created_revision,
@@ -805,7 +813,10 @@ async fn reconcile_additions(
                 counters.materialised += 1;
             }
             // Tombstoned by the loader over damaged files; the gate above keeps
-            // every later pass from rebuilding over them.
+            // every later pass from rebuilding over them. Or deferred, because
+            // the directory belongs to a newer incarnation than local metadata
+            // knows: nothing is counted, so the pass may fast-skip, and the
+            // commit that moves metadata on bumps the revision and retries it.
             Ok(None) => {}
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
@@ -1019,7 +1030,7 @@ async fn tear_down_owned_partition(
         ns.stream_id(),
         ns.topic_id(),
         ns.partition_id(),
-        ctx.config.as_ref(),
+        partitions.config(),
     )
     .await
     {
@@ -1074,9 +1085,9 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
         };
         let dead = partitions
             .with_partition(&namespace, |partition| {
-                partition.dead_consumer_group_offset_ids(|group_id| {
-                    // A lagging metadata replica cannot prove a group deleted
-                    // until it has applied the allocation of that group's id.
+                // A lagging metadata replica cannot prove a group deleted
+                // until it has applied the allocation of that group's id.
+                partition.dead_group_offset_keys(|group_id| {
                     group_id >= *next_group_id || live.contains(&group_id)
                 })
             })
@@ -1084,8 +1095,8 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
         // Bound work per pass so a historical directory cannot monopolize the
         // reconciler. Unprocessed keys keep the partition's dirty flag armed.
         let mut tickets = Vec::with_capacity(dead.len().min(GROUP_OFFSET_DELETES_PER_PASS));
-        for consumer_id in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
-            let request = group_offset_delete_request(namespace, consumer_id);
+        for (kind, consumer_id) in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
+            let request = group_offset_delete_request(namespace, kind, consumer_id);
             if let Ok(ticket) = ctx.shard.partition_submit(namespace, request) {
                 counters.cg_offsets_submitted += 1;
                 tickets.push(ticket);
@@ -1134,10 +1145,14 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
 
 fn group_offset_delete_request(
     namespace: IggyNamespace,
+    kind: ConsumerKind,
     consumer_id: u32,
 ) -> Message<RoutedRequestHeader> {
     let body = DeleteConsumerOffsetRequest {
-        consumer: WireConsumer::consumer_group(WireIdentifier::Numeric(consumer_id)),
+        consumer: WireConsumer {
+            kind: kind.as_code(),
+            id: WireIdentifier::Numeric(consumer_id),
+        },
         stream_id: WireIdentifier::Numeric(
             u32::try_from(namespace.stream_id()).expect("stream id fits u32"),
         ),
@@ -1467,9 +1482,10 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, PassCounters, ReconcilerCtx, build_partition_fresh,
-        current_revision, delete_partitions_from_disk, fetch_partition_build_inputs,
-        reconcile_consumer_group_offsets, reconcile_once,
+        FailureCause, FailureRecord, PassCounters, ReconcilerCtx, TargetPartition,
+        build_partition_fresh, current_revision, delete_partitions_from_disk,
+        fetch_partition_build_inputs, reconcile_additions, reconcile_consumer_group_offsets,
+        reconcile_once,
     };
     use configs::server::ServerConfig;
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -1485,8 +1501,8 @@ mod tests {
         PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
-        RequestPreparesHeader, RoutedRequestHeader, WireIdentifier, WireOptions,
+        AckLevel, Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestPreparesHeader, RoutedRequestHeader, WireConsumer, WireIdentifier, WireOptions,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1557,6 +1573,7 @@ mod tests {
         header.size = u32::try_from(total_size).expect("prepare size fits u32");
         header.op = op;
         header.operation = operation;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
         msg
     }
 
@@ -1780,6 +1797,7 @@ mod tests {
             group_id: WireIdentifier::numeric(group_id),
             client_id,
             in_flight: Vec::new(),
+            session: None,
         };
         mux.update(build_prepare(op, Operation::JoinConsumerGroup, &req))
             .expect("JoinConsumerGroup apply succeeds");
@@ -1808,12 +1826,15 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
                 encryptor: None,
-                path_layout: PartitionPathLayout::default(),
+                // The reconciler reads segment and offset paths off this layout,
+                // so it must root where `test_config` rooted the server's own.
+                path_layout: PartitionPathLayout {
+                    streams_root: config.get_streams_path(),
+                },
             },
         );
         let shards_table = PapayaShardsTable::new();
@@ -2003,6 +2024,60 @@ mod tests {
             3,
             "second pass over an unchanged target must be a no-op"
         );
+    }
+
+    /// A delete and a recreate of the same ids can commit while a pass runs,
+    /// so the pass holds an older epoch than the committed partition. The
+    /// directory of the committed incarnation must survive that deferral,
+    /// while an unmarked one, which the next pass would adopt, must go.
+    #[compio::test]
+    async fn mid_pass_recreate_tears_down_only_an_unmarked_directory() {
+        for marked in [true, false] {
+            let tmp = TempDir::new().expect("tempdir for system path");
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "stream-a");
+            seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+            let shard = build_test_shard(0, &config, mux);
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ns = IggyNamespace::new(0, 0, 0);
+            let (_, _, partition) =
+                fetch_partition_build_inputs(&ctx, ns).expect("committed namespace resolves");
+            let snapshot_epoch = partition
+                .created_revision
+                .checked_sub(1)
+                .expect("the topic create follows the stream create");
+            let directory =
+                ctx.config
+                    .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
+            std::fs::create_dir_all(&directory).unwrap();
+            if marked {
+                partitions::write_created_revision(&directory, partition.created_revision)
+                    .await
+                    .unwrap();
+            }
+
+            reconcile_additions(
+                &ctx,
+                vec![TargetPartition {
+                    ns,
+                    epoch: snapshot_epoch,
+                }],
+                &mut PassCounters::default(),
+            )
+            .await;
+
+            assert_eq!(
+                std::path::Path::new(&directory).exists(),
+                marked,
+                "marked: {marked}"
+            );
+            assert_eq!(
+                shard.plane.partitions().is_tombstoned(&ns),
+                !marked,
+                "marked: {marked}"
+            );
+        }
     }
 
     /// A pass captures its targets once and then awaits disk work per
@@ -2235,6 +2310,7 @@ mod tests {
             fetch_partition_build_inputs(&ctx, ns).expect("committed namespace has stats");
         let live = build_partition_fresh(
             &config,
+            ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
@@ -2265,6 +2341,7 @@ mod tests {
 
         let redundant = build_partition_fresh(
             &config,
+            ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
@@ -2275,14 +2352,11 @@ mod tests {
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
-        .await
-        .expect("redundant build succeeds over the live incarnation's path");
-        ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
-            namespace: ns,
-            partition: Box::new(redundant),
-            epoch: LIVE_EPOCH + 1,
-        });
-        ctx.shard.apply_reconcile_ops();
+        .await;
+        assert!(
+            redundant.is_err(),
+            "the live WAL must retain its exclusive writer"
+        );
 
         assert_eq!(
             shard.plane.partitions().len(),
@@ -3084,6 +3158,106 @@ mod tests {
         );
     }
 
+    /// Receive half of the inverted-range fix: a `RepairDone` landing on a
+    /// session whose floor the commit walk already passed must close the
+    /// session. Verifying the moot floor kept it armed while the walk ran to
+    /// the fetch ceiling, and the next chunk request was `9..=8`.
+    #[compio::test]
+    async fn repair_done_over_a_passed_floor_closes_the_session() {
+        const NONCE: u128 = 13;
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-repair-ceiling");
+        seed_topic(&mux, 2, 0, "topic-repair-ceiling", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        let served = iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::NoAck,
+        };
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_mut_by_ns(&ns)
+                .expect("partition is materialised");
+            partition.repair = Some(RepairSession {
+                nonce: NONCE,
+                view: 0,
+                commit_to_op: 8,
+                fetch_to_op: 8,
+                floor: None,
+                peer: 1,
+                first_batch_offset: None,
+                idle_ticks: 0,
+            });
+            for op in 1..=8 {
+                let parent = partition.consensus().last_prepare_checksum();
+                let group = partition.consensus().group();
+                let cluster = partition.consensus().cluster();
+                let prepare = build_prepare(op, Operation::StoreConsumerOffset, &served)
+                    .transmute_header(|old, header| {
+                        *header = old;
+                        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                        header.session = 1;
+                        header.request = op;
+                        header.parent = parent;
+                        header.group = group;
+                        header.cluster = cluster;
+                        header.checksum = header.identity_checksum();
+                    });
+                partition.apply_repaired_prepare(prepare).await;
+                if op < 8 {
+                    partition.consensus().advance_commit_max(op);
+                    partition.commit_journal(partitions.config()).await;
+                }
+            }
+            assert_eq!(partition.consensus().commit_min(), 7);
+            partition.consensus().advance_commit_max(8);
+            partition.recovered_durable_offset = Some(10);
+            let repair = partition.repair.as_mut().expect("repair remains armed");
+            repair.floor = Some(5);
+            repair.first_batch_offset = Some(20);
+        }
+
+        compio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                shard
+                    .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+                    .await;
+                if shard
+                    .plane
+                    .partitions()
+                    .get_by_ns(&ns)
+                    .is_some_and(|partition| partition.repair.is_none())
+                {
+                    break;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("repair finishes after its WAL becomes durable");
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&ns)
+            .expect("partition survives the reply");
+        assert_eq!(partition.consensus().commit_min(), 8);
+        assert!(
+            partition.repair.is_none(),
+            "a walk that reached the fetch ceiling leaves nothing to request"
+        );
+    }
+
     /// Serve half of the purge gate in `on_request_prepares`: while a
     /// committed purge has not applied locally, the journal still holds
     /// pre-purge entries with no floor to fence them, so serving a rejoiner
@@ -3175,6 +3349,15 @@ mod tests {
         assert!(partitions.contains(&ns));
         let partition_root = ctx.config.get_partition_path(0, 0, 0);
         assert!(std::path::Path::new(&partition_root).exists());
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-wedge",
+            vec![assignment(0, 1)],
+        );
 
         // Reconstruct the post-failed-teardown state: tombstone set +
         // shards_table row gone + a `FailureCause::Delete` record, but the
@@ -3382,6 +3565,47 @@ mod tests {
         assert!(!partitions.is_tombstoned(&ns));
     }
 
+    #[compio::test]
+    async fn given_retirement_fence_when_topic_recreated_between_passes_should_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "old", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let old_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| inner.revision);
+        shard.plane.partitions().fence(namespace, old_revision);
+        crate::partition_helpers::record_partition_retirement_fence(
+            &ctx.config.get_system_path(),
+            namespace,
+            old_revision,
+        )
+        .await
+        .unwrap();
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "new",
+            vec![assignment(0, 1)],
+        );
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(!shard.plane.partitions().is_tombstoned(&namespace));
+        assert!(
+            shard.plane.partitions().contains(&namespace),
+            "a fence for the deleted incarnation must not strand its replacement"
+        );
+    }
+
     /// The sibling guard: while the namespace is STILL in the committed
     /// target, the fenced-ghost sweep must not touch it -- only an operator
     /// delete authorises destroying the bytes the fence guards. (The
@@ -3489,6 +3713,15 @@ mod tests {
         let partitions = shard.plane.partitions();
         assert!(partitions.contains(&ns));
 
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-defer-skip",
+            vec![assignment(0, 1)],
+        );
+
         // Post-successful-teardown, pre-drain state: fenced, unlinked, and a
         // `ConfirmRemove` queued but not yet applied. `ns` is still in the
         // committed target, so the additions pass can only defer the rebuild.
@@ -3498,7 +3731,7 @@ mod tests {
             ns.stream_id(),
             ns.topic_id(),
             ns.partition_id(),
-            ctx.config.as_ref(),
+            partitions.config(),
         )
         .await
         .expect("teardown disk delete succeeds");
@@ -3728,8 +3961,8 @@ mod tests {
             "failed submission must not unlink or remove either offset"
         );
         assert_eq!(
-            partition.dead_consumer_group_offset_ids(|id| id == u64::from(live_key)),
-            vec![dead_key]
+            partition.dead_group_offset_keys(|id| id == u64::from(live_key)),
+            vec![(ConsumerKind::ConsumerGroup, dead_key)]
         );
         assert!(!ctx.last_pass_noop.get(), "failed cleanup must be retried");
     }

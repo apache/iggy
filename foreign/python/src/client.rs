@@ -517,6 +517,48 @@ impl IggyClient {
         })
     }
 
+    /// Closes the current connection. Repeated calls are safe. Call `connect`
+    /// to use the client again. Over TCP and QUIC, that `connect` first waits
+    /// for the rest of `reestablish_after` (5 s by default). The sign-in made
+    /// with `login_user` is dropped, so it must be repeated after reconnecting.
+    /// A client configured with auto-login credentials signs in again on
+    /// `connect`. Over HTTP there is no connection to close and this call does
+    /// nothing.
+    ///
+    /// Known issue: unless reconnection is disabled, the heartbeat of a client
+    /// with auto-login credentials connects it again and signs in within one
+    /// heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the connection cannot be closed.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn disconnect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.disconnect().await.map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
+    /// Closes the connection. Shut down background producers with
+    /// `IggyProducer.shutdown()` and stop iterating consumers before this call,
+    /// because they share the connection. Otherwise background producers drop
+    /// queued messages and consumer iterators hang. Later requests fail with
+    /// `RuntimeError`. Repeated calls are safe. Over HTTP there is no
+    /// connection to close, but the heartbeat that `connect` started keeps
+    /// sending pings until the client is dropped.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client cannot be shut down.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn shutdown<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner.shutdown().await.map_err(to_runtime_error)?;
+            Ok(())
+        })
+    }
+
     /// Creates a new stream with the provided ID and name.
     /// Raises `RuntimeError` if the stream cannot be created.
     #[pyo3(signature = (name))]
@@ -1334,7 +1376,9 @@ impl IggyClient {
     /// producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
     /// `None` selects direct mode. `BackgroundProducerConfig` starts background
     /// workers and makes successful sends mean queue acceptance rather than a
-    /// server commit. The returned producer is ready to send.
+    /// server commit. Replicated topics accept producer writes. Set
+    /// `topic_durability=Durability.PERSISTED` for an automatically created topic
+    /// when sends require crash-safe retry receipts.
     ///
     /// Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
     /// when stream/topic initialization fails.
@@ -1351,6 +1395,7 @@ impl IggyClient {
         topic_max_size=None,
         send_retries=Some(3),
         send_retry_interval=RetryInterval::default(),
+        topic_durability=None,
     ))]
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[IggyProducer]", imports=("collections.abc")))]
     fn producer<'a>(
@@ -1376,6 +1421,9 @@ impl IggyClient {
         >,
         send_retries: Option<i64>,
         send_retry_interval: RetryInterval,
+        #[gen_stub(override_type(type_repr = "Durability | None"))] topic_durability: Option<
+            &Bound<'_, PyAny>,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mode = mode.unwrap_or_default();
 
@@ -1399,7 +1447,8 @@ impl IggyClient {
             .inner
             .producer(stream, topic)
             .map_err(to_value_error)?
-            .send_retries(send_retries, send_retry_interval);
+            .send_retries(send_retries, send_retry_interval)
+            .topic_durability(crate::durability::Durability::try_from(topic_durability)?.0);
 
         builder = match mode {
             ProducerMode::Direct(config) => builder.direct((&config).into()),

@@ -277,7 +277,10 @@ impl DurableStorage for SimStorage {
     }
 
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<SimFile> {
-        let creates = matches!(mode, OpenMode::Create | OpenMode::CreateOrOpen);
+        let creates = matches!(
+            mode,
+            OpenMode::Create | OpenMode::CreateWriteOnly | OpenMode::CreateOrOpen
+        );
         let operation = if creates {
             StorageOperation::Create
         } else {
@@ -290,7 +293,7 @@ impl DurableStorage for SimStorage {
                 if let Some(&inode) = state.directory(parent)?.get(&name) {
                     match &mut state.inodes[inode] {
                         Inode::File { buffered, .. } => {
-                            if mode == OpenMode::Create {
+                            if matches!(mode, OpenMode::Create | OpenMode::CreateWriteOnly) {
                                 buffered.clear();
                             }
                         }
@@ -669,3 +672,6 @@ fn missing() -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod purge;

@@ -39,9 +39,7 @@ use std::rc::Rc;
 use crate::http::error::{Consistency, ReadError};
 use crate::http::extractor::Identity;
 use crate::http::state::HttpInner;
-use crate::responses::{
-    NonReplicatedResponse, build_non_replicated_response, resolve_stream_id, resolve_topic_id,
-};
+use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 
 /// The per-op RBAC + consistency check itself, without the waits: run the
 /// route's `rule` against the caller's committed permissions via the live
@@ -98,8 +96,7 @@ pub(in crate::http) async fn read_local(
 ) -> Result<Bytes, ReadError> {
     gate_local_read(state, identity, consistency, code, rule).await?;
     let clients_count = if code == GET_STATS_CODE {
-        u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
-            .unwrap_or(u32::MAX)
+        u32::try_from(SendWrapper::new(state.shard.count_all_clients()).await).unwrap_or(u32::MAX)
     } else {
         0
     };
@@ -311,7 +308,7 @@ pub(in crate::http) async fn await_recovery_barrier(
 
 /// Resolve a wire stream identifier to its committed slab id for a read/write
 /// gate, or `None` on a miss (the gate is then a pass-through, so the existing
-/// not-found path renders the 404). Mirrors the TCP dispatch resolvers.
+/// not-found path renders the 404).
 pub(in crate::http) fn resolve_gate_stream(
     state: &HttpInner,
     stream_id: &WireIdentifier,
@@ -322,7 +319,7 @@ pub(in crate::http) fn resolve_gate_stream(
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| resolve_stream_id(inner, stream_id))
+        .resolve_stream_id(stream_id)
 }
 
 /// Resolve a wire user identifier to its committed slab id, or `None` on a
@@ -353,11 +350,7 @@ pub(in crate::http) fn resolve_gate_topic(
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| {
-            let stream_id = resolve_stream_id(inner, stream_id)?;
-            let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
-            Some((stream_id, topic_id))
-        })
+        .resolve_topic_ids(stream_id, topic_id)
 }
 
 /// Resolve an (`Identifier`, `Identifier`) pair to committed (stream, topic)
@@ -467,8 +460,8 @@ pub(in crate::http) fn topic_durability(
         .mux_stm
         .streams()
         .read(|inner| {
-            let stream_id = resolve_stream_id(inner, &stream)?;
-            let topic_id = resolve_topic_id(inner, stream_id, &topic)?;
+            let stream_id = inner.resolve_stream_id(&stream)?;
+            let topic_id = inner.resolve_topic_id(stream_id, &topic)?;
             let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
             let created_revision = topic.partitions.first()?.created_revision;
             Some(TopicDurability {
@@ -493,41 +486,38 @@ mod tests {
     };
     use crate::http::state::MetadataWatermarks;
     use crate::http::wire::encode_send_messages;
-    use crate::responses::{resolve_stream_id, resolve_topic_id};
     use iggy_binary_protocol::codes::{
         DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
         GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
         GET_USER_CODE, GET_USERS_CODE,
     };
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
-    use iggy_binary_protocol::{WireDecode, WireIdentifier};
+    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
+    };
+    use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
+    use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
+    use iggy_binary_protocol::{WireDecode, WireIdentifier, WireName, WireOptions};
+    use iggy_common::IggyTimestamp;
     use metadata::AppliedFrontier;
+    use metadata::stm::StateHandler;
+    use metadata::stm::stream::StreamsInner;
     use std::future::pending;
     use std::sync::Arc;
 
     #[test]
     fn produce_routing_keeps_the_attested_topic_when_names_are_reused() {
         for rename_stream in [false, true] {
-            let mut inner = metadata::stm::stream::StreamsInner::default();
-            let mut stream = metadata::stm::stream::Stream::default();
-            let topic_id = stream.topics.insert(metadata::stm::stream::Topic {
-                name: "orders".into(),
-                partitions: vec![metadata::stm::stream::Partition::new(
-                    0,
-                    1,
-                    iggy_common::IggyTimestamp::default(),
-                    3,
-                    0,
-                )],
-                ..Default::default()
-            });
-            stream.topic_index.insert("orders".into(), topic_id);
-            let stream_id = inner.items.insert(stream);
-            inner.index.insert("events".into(), stream_id);
+            let mut inner = StreamsInner::default();
+            let stream_id = create_stream(&mut inner, "events");
+            let topic_id = create_topic(&mut inner, "events", "orders", 1);
             let original = super::TopicDurability {
                 stream_id,
                 topic_id,
-                created_revision: 3,
+                created_revision: inner.items[stream_id].topics[topic_id].partitions[0]
+                    .created_revision,
                 durability: iggy_common::Durability::Persisted,
             };
             let (stream, topic) = original.identifiers().unwrap();
@@ -543,37 +533,39 @@ mod tests {
             let metadata_length = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
             let (request, _) = SendMessagesHeader::decode(&body[4..4 + metadata_length]).unwrap();
 
-            let stream = inner.items.get_mut(stream_id).unwrap();
-            stream.topics.get_mut(topic_id).unwrap().name = "renamed".into();
-            stream.topic_index.insert("renamed".into(), topic_id);
-            let replacement_topic = stream
-                .topics
-                .insert(metadata::stm::stream::Topic::default());
-            stream
-                .topic_index
-                .insert("orders".into(), replacement_topic);
+            commit(
+                &mut inner,
+                &UpdateTopicRequest {
+                    stream_id: WireIdentifier::named("events").unwrap(),
+                    topic_id: WireIdentifier::named("orders").unwrap(),
+                    name: WireName::new("renamed").unwrap(),
+                    options: WireOptions::empty(),
+                },
+            );
+            let replacement_topic = create_topic(&mut inner, "events", "orders", 2);
             assert_eq!(
-                resolve_topic_id(&inner, stream_id, &WireIdentifier::named("orders").unwrap()),
+                inner.resolve_topic_id(stream_id, &WireIdentifier::named("orders").unwrap()),
                 Some(replacement_topic)
             );
             if rename_stream {
-                inner.items.get_mut(stream_id).unwrap().name = "renamed-stream".into();
-                inner.index.insert("renamed-stream".into(), stream_id);
-                let replacement_stream =
-                    inner.items.insert(metadata::stm::stream::Stream::default());
-                inner.index.insert("events".into(), replacement_stream);
+                commit(
+                    &mut inner,
+                    &UpdateStreamRequest {
+                        stream_id: WireIdentifier::named("events").unwrap(),
+                        name: WireName::new("renamed-stream").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                );
+                let replacement_stream = create_stream(&mut inner, "events");
                 assert_eq!(
-                    resolve_stream_id(&inner, &WireIdentifier::named("events").unwrap()),
+                    inner.resolve_stream_id(&WireIdentifier::named("events").unwrap()),
                     Some(replacement_stream)
                 );
             }
 
+            assert_eq!(inner.resolve_stream_id(&request.stream_id), Some(stream_id));
             assert_eq!(
-                resolve_stream_id(&inner, &request.stream_id),
-                Some(stream_id)
-            );
-            assert_eq!(
-                resolve_topic_id(&inner, stream_id, &request.topic_id),
+                inner.resolve_topic_id(stream_id, &request.topic_id),
                 Some(topic_id)
             );
             assert_eq!(
@@ -581,6 +573,54 @@ mod tests {
                 iggy_common::Durability::Persisted
             );
         }
+    }
+
+    /// Applies `request` through its `StateHandler`, as a committed prepare
+    /// would, and returns the reply body.
+    fn commit(
+        inner: &mut StreamsInner,
+        request: &(impl StateHandler<State = StreamsInner> + std::fmt::Debug),
+    ) -> bytes::Bytes {
+        let reply = request.apply(inner, IggyTimestamp::default());
+        assert_eq!(reply.code, 0, "{request:?} must commit");
+        reply.body
+    }
+
+    fn create_stream(inner: &mut StreamsInner, name: &str) -> usize {
+        let reply = commit(
+            inner,
+            &CreateStreamRequest {
+                name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
+            },
+        );
+        GetStreamResponse::decode_from(&reply).unwrap().stream.id as usize
+    }
+
+    fn create_topic(
+        inner: &mut StreamsInner,
+        stream: &str,
+        name: &str,
+        consensus_group_id: u64,
+    ) -> usize {
+        let reply = commit(
+            inner,
+            &CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::named(stream).unwrap(),
+                    partitions_count: 1,
+                    name: WireName::new(name).unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id,
+                }],
+                created_view: 0,
+            },
+        );
+        GetTopicResponse::decode_from(&reply).unwrap().topic.id as usize
     }
 
     #[test]

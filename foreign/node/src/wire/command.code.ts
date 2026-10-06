@@ -23,7 +23,7 @@ export const COMMAND_CODE = {
   GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
   GetClusterMetadata: 12,
   DescribeOptions: 13,
-  AttachConsumerSession: 14,
+  BindSession: 15,
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
@@ -44,7 +44,6 @@ export const COMMAND_CODE = {
   LoginRegisterWithAccessToken: 45,
   PollMessages: 100,
   SendMessages: 101,
-  FlushUnsavedBuffers: 102,
   GetPollRouting: 103,
   PollMessagesOnPrimary: 104,
   GetOffset: 120,

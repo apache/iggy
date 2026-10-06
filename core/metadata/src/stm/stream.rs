@@ -18,7 +18,8 @@
 use crate::stm::StateHandler;
 use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupSnapshot,
-    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RemoveConsumerGroupMemberRequest,
+    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RefreshConsumerGroupSessionRequest,
+    RemoveConsumerGroupMemberRequest,
 };
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
@@ -317,7 +318,7 @@ pub struct Stream {
 
     pub stats: Arc<StreamStats>,
     pub topics: IdSlab<Topic>,
-    pub topic_index: AHashMap<Arc<str>, usize>,
+    pub(crate) topic_index: AHashMap<Arc<str>, usize>,
 }
 
 impl Default for Stream {
@@ -844,24 +845,30 @@ impl StatsRegistry {
 
 define_state! {
     Streams {
-        index: AHashMap<Arc<str>, usize>,
-        items: IdSlab<Stream>,
+        pub(crate) index: AHashMap<Arc<str>, usize>,
+        pub items: IdSlab<Stream>,
         // Monotonic counter bumped on every partition-shaping commit
         // (create/delete topic, create/delete partitions, delete stream).
         // Reconciler uses it for a fast-skip when nothing changed and stamps
         // it onto each new Partition::created_revision. Deterministic across
         // replicas: same ops, same order.
-        revision: u64,
+        pub revision: u64,
+        // Retirement proofs survive truncation and purge, but not a changed
+        // set of partition incarnations.
+        pub namespace_revision: u64,
         // Total pending cooperative revocations across all groups, recomputed
         // once per commit by `post_apply`. The consensus tick reads it O(1)
         // every 10ms instead of walking every stream/topic/group/member to
         // decide whether to wake the reconciler. Deterministic (same ops, same
         // recompute on every replica).
-        pending_revocations_count: u64,
+        pub(crate) pending_revocations_count: u64,
+        // Derived with the revocation count after membership changes and restore.
+        // Locations are (stream, topic, group, member); never persisted.
+        pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
         // Shared aggregate stats, one `Arc` per stream/topic across both
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
-        stats_registry: Arc<StatsRegistry>,
+        pub stats_registry: Arc<StatsRegistry>,
     }
 }
 
@@ -994,30 +1001,39 @@ collect_handlers! {
         CompleteConsumerGroupRevocation,
         TruncatePartition,
     }
+    internal { RefreshConsumerGroupSession }
 }
 
 impl StreamsInner {
-    /// Recompute `pending_revocations_count` so the consensus tick's
-    /// `has_pending_revocations` read (and the reconciler's fast-skip) is O(1)
-    /// instead of walking every group each 10ms. Called only by the apply
-    /// handlers that can change pending revocations (join, leave, remove,
-    /// complete, and group-dropping deletes), so non-consumer-group commits pay
-    /// nothing. Recompute (not a delta) keeps the count drift-proof.
-    pub(crate) fn recompute_pending_revocations_count(&mut self) {
+    /// Rebuild derived group metadata after membership/revocation changes or restore.
+    /// Session refreshes use the membership index without rescanning unrelated clients.
+    pub(crate) fn recompute_consumer_group_metadata(&mut self) {
         let mut count: u64 = 0;
-        for (_, stream) in &self.items {
-            for (_, topic) in &stream.topics {
+        for memberships in self.consumer_group_members.values_mut() {
+            memberships.clear();
+        }
+        for (stream_id, stream) in &self.items {
+            for (topic_id, topic) in &stream.topics {
                 for group in topic.consumer_groups.values() {
-                    for (_, member) in &group.members {
+                    for (member_id, member) in &group.members {
                         count += member.pending_revocations.len() as u64;
+                        self.consumer_group_members
+                            .entry(member.client_id)
+                            .or_default()
+                            .push((stream_id, topic_id, group.id, member_id));
                     }
                 }
             }
         }
         self.pending_revocations_count = count;
+        self.consumer_group_members
+            .retain(|_, memberships| !memberships.is_empty());
     }
 
-    pub(crate) fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    /// Resolve a wire stream identifier to its committed slab id, `None` when
+    /// the stream does not exist.
+    #[must_use]
+    pub fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -1031,11 +1047,11 @@ impl StreamsInner {
         }
     }
 
-    pub(crate) fn resolve_topic_id(
-        &self,
-        stream_id: usize,
-        identifier: &WireIdentifier,
-    ) -> Option<usize> {
+    /// Resolve a wire topic identifier within the stream already resolved to
+    /// slab id `stream_id` to its committed slab id, `None` when the stream or
+    /// topic does not exist.
+    #[must_use]
+    pub fn resolve_topic_id(&self, stream_id: usize, identifier: &WireIdentifier) -> Option<usize> {
         let stream = self.items.get(stream_id)?;
         match identifier {
             WireIdentifier::Numeric(id) => {
@@ -1163,6 +1179,29 @@ impl Streams {
         F: FnOnce(&StreamsInner) -> R,
     {
         self.inner.read(f)
+    }
+
+    /// Resolve a wire stream identifier to its committed slab id, `None` when
+    /// the stream does not exist.
+    #[must_use]
+    pub fn resolve_stream_id(&self, stream_id: &WireIdentifier) -> Option<usize> {
+        self.read(|inner| inner.resolve_stream_id(stream_id))
+    }
+
+    /// Resolve a wire (stream, topic) pair to committed slab ids, `None` when
+    /// the stream or topic does not exist. Both lookups run under one read
+    /// guard, so the pair comes from one committed state.
+    #[must_use]
+    pub fn resolve_topic_ids(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<(usize, usize)> {
+        self.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            Some((stream_id, topic_id))
+        })
     }
 
     /// Committed delete watermark for a partition (the offset below which
@@ -1550,6 +1589,48 @@ impl Streams {
         })
     }
 
+    /// The persisted session fence survives client-table eviction and replica restart.
+    #[must_use]
+    pub fn consumer_group_session(&self, client_id: u128) -> Option<u64> {
+        self.inner.read(|inner| {
+            inner
+                .consumer_group_members
+                .get(&client_id)?
+                .iter()
+                .filter_map(|&(stream_id, topic_id, group_id, member_id)| {
+                    inner
+                        .items
+                        .get(stream_id)?
+                        .topics
+                        .get(topic_id)?
+                        .consumer_groups
+                        .get(&group_id)?
+                        .members
+                        .get(member_id)?
+                        .session
+                })
+                .max()
+        })
+    }
+
+    /// Apply the session fence from a committed Register, including on replay.
+    pub fn refresh_consumer_group_session(&self, client_id: u128, session: u64) {
+        if session == 0
+            || !self
+                .inner
+                .read(|inner| inner.consumer_group_members.contains_key(&client_id))
+        {
+            return;
+        }
+        let cmd = StreamsCommand::RefreshConsumerGroupSession(
+            RefreshConsumerGroupSessionRequest { client_id, session },
+            IggyTimestamp::from(0),
+        );
+        if let Err(error) = self.inner.try_apply(cmd) {
+            tracing::error!(client_id, %error, "consumer session refresh dispatched to reader-only Streams STM");
+        }
+    }
+
     /// Drop a disconnected client from every consumer group it joined and
     /// rebalance. Applied through the left-right writer as a deterministic
     /// side-effect of the `Logout` commit on each replica (not a separate
@@ -1578,6 +1659,20 @@ impl Streams {
                 .iter()
                 .flat_map(|(_, stream)| stream.topics.iter())
                 .map(|(_, topic)| topic.consumer_groups.len())
+                .sum()
+        })
+    }
+
+    /// Total committed partition count across all topics (for the node-wide
+    /// `[metadata] partitions_max` admission check).
+    #[must_use]
+    pub fn partition_count(&self) -> usize {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .map(|(_, topic)| topic.partitions.len())
                 .sum()
         })
     }
@@ -1781,7 +1876,13 @@ impl Streams {
                                 .expect("sim partition count fits u32"),
                             name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
                                 .expect("sim topic name is valid"),
-                            options: WireOptions::empty(),
+                            options: iggy_common::TopicCreateOptions {
+                                durability: iggy_common::Durability::Persisted,
+                                consumer_offset_durability: iggy_common::Durability::Persisted,
+                                ..Default::default()
+                            }
+                            .to_wire()
+                            .expect("valid simulator durability options"),
                         },
                         derived_options: WireOptions::empty(),
                         partitions,
@@ -2065,8 +2166,9 @@ impl StateHandler for DeleteStreamRequest {
         state.items.remove(stream_id);
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
+        state.namespace_revision = state.revision;
         // The dropped stream may have held groups with pending revocations.
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -2176,6 +2278,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         // monotonic revision and stamp every new partition with it.
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
+        state.namespace_revision = state.revision;
 
         // Share one `Arc<TopicStats>` across both left-right buffers via the
         // registry, parented to the stream's shared `Arc<StreamStats>`. The id
@@ -2395,8 +2498,9 @@ impl StateHandler for DeleteTopicRequest {
             .stats_registry
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
+        state.namespace_revision = state.revision;
         // The dropped topic may have held groups with pending revocations.
-        state.recompute_pending_revocations_count();
+        state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -2514,6 +2618,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
 
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
+        state.namespace_revision = state.revision;
 
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
@@ -2583,6 +2688,7 @@ impl StateHandler for DeletePartitionsRequest {
                 .stats_registry
                 .remove_partitions(stream_id, topic_id, &removed_ids);
             state.revision = state.revision.wrapping_add(1);
+            state.namespace_revision = state.revision;
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -2601,6 +2707,7 @@ pub struct StreamsSnapshot {
     /// `#[serde(default)]` so older snapshots restore at revision 0.
     #[serde(default)]
     pub revision: u64,
+    pub namespace_revision: u64,
 }
 
 impl Snapshotable for Streams {
@@ -2679,6 +2786,7 @@ impl Snapshotable for Streams {
             StreamsSnapshot {
                 items,
                 revision: inner.revision,
+                namespace_revision: inner.namespace_revision,
             }
         })
     }
@@ -2823,12 +2931,14 @@ impl StreamsInner {
             index,
             items,
             revision: snapshot.revision,
+            namespace_revision: snapshot.namespace_revision,
             // Recomputed from the restored groups just below.
             pending_revocations_count: 0,
+            consumer_group_members: AHashMap::new(),
             last_result: None,
             stats_registry,
         };
-        inner.recompute_pending_revocations_count();
+        inner.recompute_consumer_group_metadata();
         inner
     }
 }

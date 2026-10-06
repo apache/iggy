@@ -381,7 +381,7 @@ benchmark = true
 
 Emitted fields:
 
-- **sink**: `connector_key`, `stream`, `topic`, `partition_id`, `current_offset`, `batch_size`, `processed_count`, `decode_us`, `prepare_us`, `ffi_us`, `total_us`
+- **sink**: `connector_key`, `stream`, `topic`, `partition_id`, `current_offset`, `batch_size`, `processed_count`, `runs`, `decode_us`, `prepare_us`, `ffi_us`, `total_us`. `runs` is the number of `consume()` calls the batch was split into, one per contiguous payload variant, and `ffi_us` is summed over all of them.
 - **source**: `connector_key`, `stream`, `topic`, `batch_size`, `sent_count`, `decode_us`, `prepare_us`, `iggy_send_us`, `state_saved`, `state_save_us`, `total_us` (`state_save_us` is 0 when `state_saved` is false)
 
 Filter the stream via `RUST_LOG=iggy_connectors::benchmark=info`. The corresponding stage durations are also recorded in the `iggy_connector_stage_duration_seconds` histogram regardless of this flag, so Prometheus dashboards remain available without enabling text events.
@@ -405,12 +405,15 @@ The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint wh
 - `iggy_connector_messages_processed_total`: Messages processed and sent to sink plugin
 - `iggy_connector_messages_filtered_total`: Messages intentionally dropped by transforms returning `Ok(None)`
 - `iggy_connector_errors_total`: Errors encountered
+- `iggy_connector_sink_runs_total`: FFI `consume()` calls made for sink batches. A batch is split into one call per contiguous payload variant, so this counter over `iggy_connector_stage_duration_seconds_count{stage="total"}` is the average number of runs per batch, and it equals that count when no batch splits
 
 ### Stage Duration Histograms (labeled with `connector_key`, `connector_type`, `stage`)
 
 - `iggy_connector_stage_duration_seconds`: Per-batch processing stage duration
 
 Stage label values (snake_case): `decode`, `prepare`, `total` on both sides; `ffi` on sinks; `iggy_send`, `state_save` on sources. The `connector_type` label is also snake_case (`source` / `sink`). Histograms are always exposed (independent of `benchmark`); buckets cover 50us to 5s.
+
+Every stage records one sample per batch. The `ffi` sample is the summed duration of every `consume()` call the batch was split into, so a batch that split into several runs still counts once; `iggy_connector_sink_runs_total` shows how often that happens.
 
 **Cardinality:** each `(connector_key, stage)` pair yields ~16 series (13 explicit buckets + `+Inf` + `_sum` + `_count`), times 3 stages per sink or 5 per source, times the number of distinct `connector_key` values. `connector_key` comes from operator config, so keep it bounded. Do not template per-user or per-request keys into it or the time-series database will blow up.
 
