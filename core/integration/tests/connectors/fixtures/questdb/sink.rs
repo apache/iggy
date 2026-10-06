@@ -119,9 +119,15 @@ impl QuestDbSinkFixture {
 
     /// Column name to type, as QuestDB actually created them.
     pub async fn column_types(&self) -> Result<HashMap<String, String>, TestBinaryError> {
-        let value = self
-            .exec(&format!("show columns from '{}'", self.table()))
-            .await?;
+        let query = format!("show columns from '{}'", self.table());
+        let value = self.exec(&query).await?;
+        // Surface a query error rather than returning an empty map, which a
+        // test asserting a column is absent would read as success.
+        if let Some(error) = value.get("error") {
+            return Err(TestBinaryError::InvalidState {
+                message: format!("QuestDB rejected `{query}`: {error}"),
+            });
+        }
         let mut columns = HashMap::new();
         if let Some(rows) = value.get("dataset").and_then(serde_json::Value::as_array) {
             for row in rows {
@@ -511,7 +517,10 @@ impl TestFixture for QuestDbSinkDedupFixture {
             include_stream_column: Some(false),
             include_topic_column: Some(false),
             pre_create_ddl: Some(format!(
-                "create table {SINK_TABLE} (seq LONG, timestamp TIMESTAMP_NS) \
+                // `revision` is deliberately outside the dedup keys: a second
+                // delivery carrying a higher revision proves it reached the
+                // table, which a row count alone cannot show.
+                "create table {SINK_TABLE} (seq LONG, revision LONG, timestamp TIMESTAMP_NS) \
                  timestamp(timestamp) partition by DAY WAL \
                  DEDUP UPSERT KEYS(timestamp, seq)"
             )),

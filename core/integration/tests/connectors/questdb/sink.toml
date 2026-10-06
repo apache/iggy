@@ -18,9 +18,3 @@
 [connectors]
 config_type = "local"
 config_dir = "../connectors/sinks/questdb_sink"
-[plugin_config]
-# `connection_string` and `table` come from the fixture, which knows the
-# container's mapped port.
-ack_level = "ok"
-flush_timeout = "15s"
-batch_size = 500
