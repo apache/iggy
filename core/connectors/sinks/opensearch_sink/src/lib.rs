@@ -458,12 +458,13 @@ impl OpenSearchSink {
         messages_metadata: &MessagesMetadata,
         mut message: ConsumedMessage,
     ) -> Result<PreparedDocument, Error> {
-        let payload = std::mem::replace(&mut message.payload, Payload::Raw(Vec::new()));
+        let payload =
+            std::mem::replace(&mut message.payload, Payload::Raw(Vec::new())).into_json_document();
 
         let mut document = match payload {
             Payload::Json(value) => document_from_json(owned_value_to_serde_json(&value)),
             Payload::Raw(bytes) => document_from_raw(bytes),
-            Payload::Text(text) => Map::from_iter([
+            Payload::Text(text) | Payload::Proto(text) => Map::from_iter([
                 ("text".to_string(), Value::String(text)),
                 ("data_type".to_string(), Value::String("text".to_string())),
             ]),
@@ -1917,6 +1918,41 @@ mod tests {
             .expect("prepare document");
 
         assert_eq!(prepared.document["text"], "hello");
+        assert_eq!(prepared.document["data_type"], "text");
+    }
+
+    #[test]
+    fn given_proto_payload_with_json_text_should_index_as_json_document() {
+        let sink = sink_with_config(base_config());
+
+        let prepared = sink
+            .prepare_document(
+                &topic_metadata(),
+                &messages_metadata(),
+                message(Payload::Proto(
+                    r#"{"name":"user_1","amount":2.5}"#.to_string(),
+                )),
+            )
+            .expect("prepare document");
+
+        assert_eq!(prepared.document["name"], "user_1");
+        assert_eq!(prepared.document["amount"], 2.5);
+        assert!(prepared.document.get("data_type").is_none());
+    }
+
+    #[test]
+    fn given_proto_payload_with_non_json_text_should_index_text_field() {
+        let sink = sink_with_config(base_config());
+
+        let prepared = sink
+            .prepare_document(
+                &topic_metadata(),
+                &messages_metadata(),
+                message(Payload::Proto("name: \"user_1\"".to_string())),
+            )
+            .expect("prepare document");
+
+        assert_eq!(prepared.document["text"], "name: \"user_1\"");
         assert_eq!(prepared.document["data_type"], "text");
     }
 

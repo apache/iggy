@@ -17,3 +17,4 @@
 
 mod opensearch_sink;
 mod opensearch_sink_failures;
+mod proto_text;
