@@ -45,6 +45,15 @@ a model, rather than a change the author understands and takes responsibility fo
 a judgment about the submission, not about you, and it does not bar you from contributing
 again if you come back with a change you can take responsibility for.
 
+### Bugs Found by an Agent
+
+Prove the bug first. The fix comes after it's agreed on the issue.
+
+1. Search open issues. If it's already there, comment on it
+2. Otherwise open an issue and a PR with a failing test marked `#[ignore]`
+3. Put any suggested fix in a TODO in the test
+4. Link the issue with "Relates to #123", not "Closes #123"
+
 ### Green CI
 
 Maintainers will not start reviewing a PR while its CI is failing. Get the
@@ -166,9 +175,10 @@ line in a regular PR comment (not an inline review reply):
 | `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
 | `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
-Some labels move on their own: opening or marking a non-draft PR ready sets
-`S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
-closing or converting to draft clears both.
+Some labels move on their own. Opening a non-draft PR, or marking a draft
+ready, sets `S-waiting-on-review`. A "Request changes" review sets
+`S-waiting-on-author`, and so does a `/skill` bot review with findings for the
+author. Closing a PR, or converting it to a draft, clears both.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the

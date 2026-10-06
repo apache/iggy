@@ -25,6 +25,8 @@ pub trait ConsumerOffsetClient {
     ///
     /// Authentication is required, and the permission to poll the messages.
     /// A new key at the per-partition limit returns [`IggyError::TooManyConsumerOffsets`] (3024).
+    /// A queued store that outlives a partition history reset, such as purge, returns [`IggyError::InvalidOffset`] (4100), even if its numeric offset fits the replacement history.
+    /// This refusal is terminal. Re-evaluate the intended checkpoint against the current data before issuing a new store, rather than replaying the old request.
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -52,6 +54,8 @@ pub trait ConsumerOffsetClient {
     /// Missing numeric and named groups return codes 5000 and 5003 respectively.
     /// A replica unable to admit the request returns [`IggyError::TransientNotAccepted`].
     /// Deletion does not allocate a new key and is allowed at the offset limit.
+    /// A queued delete that outlives a partition history reset, such as purge, returns [`IggyError::ConsumerOffsetNotFound`] (3021), even if a replacement checkpoint exists.
+    /// This refusal is terminal and preserves replacement progress. Re-evaluate which checkpoint to delete before issuing a new request.
     async fn delete_consumer_offset(
         &self,
         consumer: &Consumer,

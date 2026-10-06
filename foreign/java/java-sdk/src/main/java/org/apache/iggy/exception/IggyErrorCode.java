@@ -67,6 +67,12 @@ public enum IggyErrorCode {
     INVALID_BOOLEAN_VALUE(83),
     INVALID_NUMBER_VALUE(84),
 
+    /**
+     * The request is below the server's deduplication window. Its outcome is unknown;
+     * resending can duplicate the write.
+     */
+    REQUEST_TOO_OLD(85),
+
     // Client errors
     CLIENT_NOT_FOUND(100),
 
@@ -89,6 +95,7 @@ public enum IggyErrorCode {
     INVALID_TOPIC_ID(2016),
     INVALID_REPLICATION_FACTOR(2018),
     TOO_MANY_TOPICS(2021),
+    PARTITIONS_LIMIT_REACHED(2022),
 
     // Partition errors
     PARTITION_NOT_FOUND(3007),

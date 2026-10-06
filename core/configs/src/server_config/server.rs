@@ -27,9 +27,7 @@ use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
-use crate::common::system::{
-    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig,
-};
+use crate::common::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
 use configs::{
     ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
     RelocatedTarget, TypedEnvProvider,
@@ -366,78 +364,6 @@ impl ServerConfig {
             partition_id
         )
     }
-
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_segment_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        format!(
-            "{}/{:0>20}",
-            self.get_partition_path(stream_id, topic_id, partition_id),
-            start_offset
-        )
-    }
-
-    pub fn get_messages_file_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{LOG_EXTENSION}")
-    }
-
-    pub fn get_index_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{INDEX_EXTENSION}")
-    }
 }
 
 impl SystemPaths for ServerConfig {
@@ -483,6 +409,27 @@ mod tests {
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
         assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
+        assert_eq!(cfg.message_bus.connections_max, None);
+        assert_eq!(ServerConfig::default().message_bus.connections_max, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_zero_connections_max_env_var_when_loading_should_disable_the_cap() {
+        const NAME: &str = "IGGY_MESSAGE_BUS_CONNECTIONS_MAX";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "0") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.message_bus.connections_max, Some(0));
     }
 
     #[test]

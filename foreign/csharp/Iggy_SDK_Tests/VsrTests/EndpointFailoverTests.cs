@@ -25,6 +25,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
@@ -290,6 +291,50 @@ public sealed class EndpointFailoverTests
         await client.PingAsync(TestContext.Current.CancellationToken);
         Assert.True(node.Registrations > registrationsBeforeEviction,
             "the reconnect signed in again with the remembered credentials");
+    }
+
+    /// <summary>
+    ///     REQUEST_TOO_OLD refuses a write whose request id fell below the server's deduplication window. The
+    ///     server no longer knows whether it committed, so the caller gets the outcome-unknown type that the
+    ///     publisher refuses to resend, the same stop the Rust producer makes on this code.
+    /// </summary>
+    [Fact]
+    public async Task AgedOutRefusalOfAWriteIsReportedAsOutcomeUnknown()
+    {
+        using var node = new MockNode();
+        var sends = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.SendMessages)
+            {
+                Interlocked.Increment(ref sends);
+
+                return Reply(request.Operation, [], VsrError.REQUEST_TOO_OLD);
+            }
+
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+
+        var unknown = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.SendMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(1),
+                Kinds.Partitioning.PartitionId(1), new Message(Guid.NewGuid(), new byte[] { 1 }),
+                TestContext.Current.CancellationToken));
+
+        var refusal = Assert.IsType<IggyInvalidStatusCodeException>(unknown.InnerException);
+        Assert.Equal(VsrError.REQUEST_TOO_OLD, refusal.StatusCode);
+        Assert.Equal(1, Volatile.Read(ref sends));
     }
 
     /// <summary>

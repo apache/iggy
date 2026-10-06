@@ -658,7 +658,7 @@ pub(in crate::http) async fn get_metrics(
         .mux_stm
         .users()
         .read(|users| users.items.len() as u64);
-    let clients_count = SendWrapper::new(state.shard.list_all_clients()).await.len() as u64;
+    let clients_count = SendWrapper::new(state.shard.count_all_clients()).await as u64;
 
     let metrics = &state.metrics;
     metrics.streams.set(gauge_value(streams_count));

@@ -30,14 +30,12 @@
 use crate::coordinator::{ShardZeroCoordinator, classify_try_send_err};
 use crate::metrics::{ShardMetrics, frame_drop_variant};
 use crate::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
-    PartitionConsensusConfig, Receiver, ShardCtorError, ShardFrame, ShardIdentity, TaggedSender,
+    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig, Receiver,
+    ShardCtorError, ShardFrame, ShardHost, ShardIdentity, TaggedSender,
 };
 use consensus::VsrConsensus;
 use journal::JournalHandle;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
-use message_bus::client_listener::RequestHandler;
-use message_bus::replica::listener::MessageHandler;
 use message_bus::{MessageBus, SendError};
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
@@ -63,10 +61,7 @@ where
 {
     identity: ShardIdentity,
     bus: B,
-    on_replica_message: MessageHandler,
-    on_client_request: RequestHandler,
-    on_metadata_submit: MetadataSubmitHandler,
-    on_list_clients: ListClientsHandler,
+    host: Rc<dyn ShardHost>,
     metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
     partitions: IggyPartitions<B, SB>,
     senders: Vec<TaggedSender>,
@@ -94,10 +89,7 @@ where
     pub fn new(
         identity: ShardIdentity,
         bus: B,
-        on_replica_message: MessageHandler,
-        on_client_request: RequestHandler,
-        on_metadata_submit: MetadataSubmitHandler,
-        on_list_clients: ListClientsHandler,
+        host: Rc<dyn ShardHost>,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
@@ -112,10 +104,7 @@ where
         Self {
             identity,
             bus,
-            on_replica_message,
-            on_client_request,
-            on_metadata_submit,
-            on_list_clients,
+            host,
             metadata,
             partitions,
             senders,
@@ -219,6 +208,7 @@ where
                 total_shards,
                 self.coord_config.clone(),
                 self.metrics.clone(),
+                crate::boot_nonce(self.metadata.consensus.as_ref()),
             )?))
         } else {
             None
@@ -227,10 +217,7 @@ where
         let shard = IggyShard::new(
             self.identity,
             self.bus,
-            self.on_replica_message,
-            self.on_client_request,
-            self.on_metadata_submit,
-            self.on_list_clients,
+            self.host,
             self.metadata,
             self.partitions,
             self.senders,

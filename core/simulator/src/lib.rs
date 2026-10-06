@@ -1682,16 +1682,296 @@ fn materialise_partition(
 }
 
 #[cfg(test)]
+mod consumer_offset_history_tests;
+
+#[cfg(test)]
 mod tests {
+    use super::partition_repair_driver_tests::cluster;
     use super::*;
     use crate::client::SimClient;
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
-    use consensus::Status;
+    use consensus::{Status, client_table::COMMITTED_WINDOW_BITS};
     use futures::FutureExt;
-    use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
-    use iggy_common::ConsumerKind;
-    use server_common::sharding::IggyNamespace;
+    use iggy_binary_protocol::{AckLevel, RoutedRequestHeader, WireIdentifier};
+    use iggy_common::{ConsumerKind, IggyError};
+    use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT};
+
+    const DISCONNECT_STREAM: &str = "sim-stream-0";
+    const DISCONNECT_TOPIC: &str = "sim-topic-0-0";
+    const DISCONNECT_GROUP: &str = "disconnect-recovery";
+    const DISCONNECT_PROGRESS_STEPS: usize = 200;
+
+    #[test]
+    fn given_pending_metadata_when_disconnected_session_expires_should_reassign_partition() {
+        let (mut sim, original, replacement) = consumer_group_disconnect_fixture(3, 2);
+        let pending = original.create_stream("disconnect-in-flight");
+        sim.submit_request(original.client_id(), 0, pending.into_generic());
+        assert!(
+            (0..DISCONNECT_PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.metadata_consensus(0)
+                    .unwrap()
+                    .pipeline_has_message_from_client(original.client_id())
+            }),
+            "disconnect must happen while the original client's metadata request is pending"
+        );
+        sim.outboxes[0].notify_client_connection_lost(original.client_id());
+        sim.run_pumps();
+        assert!(
+            (0..DISCONNECT_PROGRESS_STEPS).any(|_| {
+                sim.step();
+                !sim.metadata_consensus(0)
+                    .unwrap()
+                    .pipeline_has_message_from_client(original.client_id())
+            }),
+            "the pending request must finish after the disconnect"
+        );
+        sim.shell_login(&replacement);
+        let joined = submit_and_wait_for_reply(
+            &mut sim,
+            replacement.client_id(),
+            0,
+            replacement.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        );
+        assert_eq!(joined.header().status, 0);
+        for _ in 0..DISCONNECT_PROGRESS_STEPS {
+            sim.step();
+        }
+        recover_disconnected_group(&mut sim, &original, &replacement);
+    }
+
+    #[test]
+    fn given_evicted_client_table_entry_when_disconnected_session_expires_should_reassign_partition()
+     {
+        let (mut sim, original, replacement) = consumer_group_disconnect_fixture(1, 1);
+        sim.shell_login(&replacement);
+        assert_eq!(
+            sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .client_table
+                .borrow()
+                .get_epoch(original.client_id()),
+            None,
+            "the new registration must evict the original client-table entry"
+        );
+        sim.outboxes[0].notify_client_connection_lost(original.client_id());
+        sim.run_pumps();
+        let joined = submit_and_wait_for_reply(
+            &mut sim,
+            replacement.client_id(),
+            0,
+            replacement.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        );
+        assert_eq!(joined.header().status, 0);
+        for _ in 0..DISCONNECT_PROGRESS_STEPS {
+            sim.step();
+        }
+        recover_disconnected_group(&mut sim, &original, &replacement);
+    }
+
+    fn consumer_group_disconnect_fixture(
+        replica_count: u8,
+        client_capacity: usize,
+    ) -> (Simulator, SimClient, SimClient) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let original = SimClient::new(1);
+        let replacement = SimClient::new(2);
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            [original.client_id(), replacement.client_id()].into_iter(),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 2,
+                seed: 0x4273,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        for replica in &sim.replicas {
+            replica.shards[0]
+                .plane
+                .metadata()
+                .client_table
+                .borrow_mut()
+                .set_capacity(client_capacity);
+        }
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.init_partition(namespace);
+        sim.seed_stream_topic_partition(namespace);
+        sim.shell_login(&original);
+        for request in [
+            original.create_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+            original.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        ] {
+            let reply = submit_and_wait_for_reply(&mut sim, original.client_id(), 0, request);
+            assert_eq!(reply.header().status, 0);
+        }
+        assert_eq!(
+            disconnect_group_assignment(&sim, original.client_id()),
+            Some(vec![0]),
+            "original consumer must own the only partition before disconnecting"
+        );
+        (sim, original, replacement)
+    }
+
+    fn disconnect_group_assignment(sim: &Simulator, client_id: u128) -> Option<Vec<u32>> {
+        sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_member_assignment(
+                &WireIdentifier::numeric(0),
+                &WireIdentifier::numeric(0),
+                &WireIdentifier::named(DISCONNECT_GROUP).unwrap(),
+                client_id,
+            )
+            .map(|(_, partitions)| partitions)
+    }
+
+    fn recover_disconnected_group(
+        sim: &mut Simulator,
+        original: &SimClient,
+        replacement: &SimClient,
+    ) {
+        assert_eq!(
+            disconnect_group_assignment(sim, original.client_id()),
+            Some(vec![0]),
+            "failed disconnect cleanup must leave the original owning the only partition"
+        );
+        assert_eq!(
+            disconnect_group_assignment(sim, replacement.client_id()),
+            Some(vec![]),
+            "the replacement joins successfully but cannot poll any partition"
+        );
+        let owner = Rc::clone(&sim.replicas[0].shards[0]);
+        let session = owner
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_session(original.client_id())
+            .expect("the orphan retains its session even after client-table eviction");
+        let original_id = original.client_id();
+        let replacement_id = replacement.client_id();
+        let (complete, completed) = shard::channel(1);
+        // The simulator does not run the wall-clock liveness task. Exercise its
+        // committed cleanup separately from timeout selection and reporting.
+        sim.executor.spawn(async move {
+            let live = owner.gather_consumer_sessions().await;
+            assert!(live.complete);
+            assert!(
+                live.clients
+                    .iter()
+                    .all(|client| client.client_id != original_id),
+                "the real disconnect callback must remove the original connection"
+            );
+            assert!(
+                live.clients
+                    .iter()
+                    .any(|client| client.client_id == replacement_id)
+            );
+            let cleanup = owner
+                .plane
+                .metadata()
+                .submit_expired_logout_in_process(original_id, Some(session))
+                .await;
+            complete.try_send(cleanup).unwrap();
+        });
+        let cleanup = (0..DISCONNECT_PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                completed.recv().now_or_never()
+            })
+            .expect("session expiry cleanup must complete")
+            .expect("cleanup result channel stays open")
+            .expect("the primary must accept expiry cleanup");
+        assert!(cleanup.is_some(), "expiry must commit a Logout");
+        assert_eq!(disconnect_group_assignment(sim, original_id), None);
+        assert_eq!(
+            disconnect_group_assignment(sim, replacement_id),
+            Some(vec![0]),
+            "expiry must give the existing replacement the orphan's partition"
+        );
+    }
+
+    #[test]
+    fn given_a_shard_that_stops_answering_when_gathering_clients_should_report_incomplete() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let network_options = packet::PacketSimulatorOptions {
+            node_count: 1,
+            client_count: 1,
+            seed: 0x4273,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(1, 2, std::iter::once(1), network_options);
+        sim.shell_login(&SimClient::new(1));
+        for missing_shard in [false, true] {
+            if missing_shard {
+                sim.executor.abort(sim.replicas[0].pump_tasks[1]);
+            }
+            let shard = Rc::clone(&sim.replicas[0].shards[0]);
+            let result = Rc::new(RefCell::new(None));
+            let gathered = Rc::clone(&result);
+            sim.executor.spawn(async move {
+                *gathered.borrow_mut() = Some(futures::join!(
+                    shard.gather_clients(),
+                    shard.gather_consumer_sessions(),
+                    shard.count_all_clients()
+                ));
+            });
+            assert!(matches!(
+                sim.executor.run_until_stalled(POLL_BUDGET),
+                RunOutcome::Quiescent { .. }
+            ));
+            if missing_shard {
+                assert!(
+                    result.borrow().is_none(),
+                    "gather must wait for the missing shard until its deadline"
+                );
+                sim.executor.advance_time(LIST_CLIENTS_GATHER_TIMEOUT);
+                assert!(matches!(
+                    sim.executor.run_until_stalled(POLL_BUDGET),
+                    RunOutcome::Quiescent { .. }
+                ));
+            }
+            let (gathered, sessions, count) = result
+                .borrow_mut()
+                .take()
+                .expect("gather must complete within its deadline");
+            assert_eq!(gathered.complete, !missing_shard);
+            assert_eq!(sessions.complete, !missing_shard);
+            assert_eq!(
+                count,
+                gathered.clients.len(),
+                "the count must cover the same shards as the client list"
+            );
+            if !missing_shard {
+                assert!(
+                    gathered
+                        .clients
+                        .iter()
+                        .any(|client| client.vsr_client_id == Some(1))
+                );
+                assert!(
+                    sessions
+                        .clients
+                        .iter()
+                        .any(|session| session.client_id == 1)
+                );
+            }
+        }
+    }
 
     pub fn submit_and_wait_for_reply(
         sim: &mut Simulator,
@@ -2955,6 +3235,174 @@ mod tests {
             schedule_a, schedule_b,
             "shell schedule diverged at same seed"
         );
+    }
+
+    #[test]
+    fn given_aged_out_request_when_replayed_should_report_unknown_outcome() {
+        for initially_committed in [false, true] {
+            let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.init_partition(namespace);
+            sim.register_client_with_primary(&client);
+
+            let delayed = client.send_messages(namespace, &[Bytes::from_static(b"aged-out")]);
+            let destination = u8::from(!initially_committed);
+            let first = submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                destination,
+                delayed.deep_copy(),
+            );
+            assert_eq!(
+                first.header().status,
+                if initially_committed {
+                    0
+                } else {
+                    IggyError::TransientNotAccepted.as_code()
+                },
+                "the original attempt must establish the intended admission outcome",
+            );
+            for _ in 0..COMMITTED_WINDOW_BITS {
+                let later =
+                    client.send_messages(namespace, &[Bytes::from_static(b"committed-later")]);
+                let committed = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, later);
+                assert_eq!(committed.header().status, 0);
+            }
+
+            let expected = sim
+                .offsets(0, namespace)
+                .expect("committed partition offsets");
+            let replay = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delayed);
+            assert_eq!(
+                replay.header().status,
+                IggyError::RequestTooOld.as_code(),
+                "aging out cannot prove whether request 1 committed",
+            );
+            assert_eq!(
+                sim.offsets(0, namespace),
+                Some(expected),
+                "rejecting an aged-out request must not append another payload",
+            );
+        }
+    }
+
+    #[test]
+    fn given_reordered_requests_within_dedup_window_when_retried_should_commit_once() {
+        let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let delayed = client.send_messages(namespace, &[Bytes::from_static(b"delayed")]);
+        let later = client.send_messages(namespace, &[Bytes::from_static(b"later")]);
+        let committed =
+            submit_and_wait_for_reply(&mut sim, client.client_id(), 0, later.deep_copy());
+        assert_eq!(committed.header().status, 0);
+        let committed =
+            submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delayed.deep_copy());
+        assert_eq!(committed.header().status, 0);
+        let expected = sim.offsets(0, namespace).unwrap();
+        assert_eq!(
+            expected.commit_offset, 1,
+            "both reordered requests must append"
+        );
+        for replay in [delayed, later] {
+            let duplicate = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, replay);
+            assert_eq!(duplicate.header().status, 0);
+            assert_eq!(
+                sim.offsets(0, namespace),
+                Some(expected),
+                "a retained duplicate must not append again"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_unpersisted_creation_view_when_replicas_restart_should_preserve_acknowledged_writes() {
+        const PROGRESS_STEPS: usize = 2_000;
+        const PAYLOAD: &[u8] = b"acknowledged-before-late-materialization";
+        for created_view in [1, 2] {
+            let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+            sim.register_client_with_primary(&client);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.partition_created_views.insert(namespace, created_view);
+            sim.seed_stream_topic_partition(namespace);
+            for replica in &sim.replicas[..2] {
+                materialise_partition(
+                    replica,
+                    namespace,
+                    false,
+                    created_view,
+                    sim.consumer_offsets_max,
+                );
+                assert!(
+                    replica.partition_superblocks.borrow()[&namespace]
+                        .read_latest_sync()
+                        .is_none(),
+                    "the crash must precede the first durable view write"
+                );
+            }
+            for replica in 0..2 {
+                sim.replica_crash(replica);
+            }
+            for replica in 0..2 {
+                sim.replica_restart(replica);
+            }
+            let primary = (0..PROGRESS_STEPS)
+                .find_map(|_| {
+                    sim.step();
+                    (0..2).find(|replica| {
+                        sim.partition_consensus_state(usize::from(*replica), namespace)
+                            .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                    })
+                })
+                .expect("the restarted quorum must elect a primary");
+            let request = client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]);
+            let committed =
+                submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+            assert_eq!(committed.header().status, 0);
+            let committed_op = committed.header().commit;
+            let expected = sim
+                .offsets(usize::from(primary), namespace)
+                .expect("acknowledged partition offsets");
+
+            materialise_partition(
+                &sim.replicas[2],
+                namespace,
+                false,
+                created_view,
+                sim.consumer_offsets_max,
+            );
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    (0..3).all(|replica| {
+                        sim.partition_consensus_state(replica, namespace)
+                            .is_some_and(|state| {
+                                state.status == Status::Normal && state.commit_min >= committed_op
+                            })
+                            && sim.offsets(replica, namespace) == Some(expected)
+                    })
+                }),
+                "late materialization must preserve the acknowledged prefix: states={:?}, offsets={:?}",
+                (0..3)
+                    .map(|replica| sim.partition_consensus_state(replica, namespace))
+                    .collect::<Vec<_>>(),
+                (0..3)
+                    .map(|replica| sim.offsets(replica, namespace))
+                    .collect::<Vec<_>>()
+            );
+            for replica in 0..3 {
+                let prepare = retained_prepare(&sim, replica, namespace, committed_op);
+                assert!(
+                    prepare
+                        .body()
+                        .windows(PAYLOAD.len())
+                        .any(|bytes| bytes == PAYLOAD),
+                    "replica {replica} lost the acknowledged payload at op {committed_op}"
+                );
+            }
+        }
     }
 
     fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {
@@ -5576,6 +6024,149 @@ mod view_change_data_loss_tests {
             metadata_holds(&sim, primary, committed),
             "op {committed} must be repaired back into the new primary's journal"
         );
+    }
+
+    thread_local! {
+        /// The primary's first `StartView` to the prober. A link hook is a bare `fn`
+        /// and cannot capture.
+        static PROBE_ANSWER: RefCell<Option<Message<GenericHeader>>> = const { RefCell::new(None) };
+    }
+
+    /// Keep a copy of the probe answer and let the original through. No partition
+    /// group exists in the test that installs it, so every `StartView` is metadata.
+    fn copy_probe_answer(packet: &packet::Packet) -> bool {
+        if packet.message.header().command == Command::StartView {
+            PROBE_ANSWER.with_borrow_mut(|answer| {
+                answer.get_or_insert_with(|| packet.message.deep_copy());
+            });
+        }
+        false
+    }
+
+    /// A probe answer delivered twice must not take back what the prober acked in
+    /// between: re-adopting the copy drops its head, and the plane truncates above
+    /// it. With the other backup down, the prober holds the only copy of the op
+    /// besides the primary, so the next view would lose an op the client saw commit.
+    #[test]
+    fn given_a_prober_that_acked_past_its_probe_answer_when_a_copy_arrives_late_should_keep_the_op()
+    {
+        const PRIMARY: u8 = 0;
+        const OTHER_BACKUP: u8 = 1;
+        const PROBER: u8 = 2;
+        const STEPS_MAX: usize = 5_000;
+        const LATE_DELIVERY_STEPS: usize = 50;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        // The prober restarts and probes, and a copy of the primary's answer is kept
+        // for a second, late delivery.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(PRIMARY), ProcessId::Replica(PROBER)) =
+            Some(copy_probe_answer);
+        sim.replica_crash(PROBER);
+        sim.replica_restart(PROBER);
+        for _ in 0..STEPS_MAX {
+            sim.step();
+            if metadata_status(&sim, PROBER) == Status::Normal {
+                break;
+            }
+        }
+        assert_eq!(
+            metadata_status(&sim, PROBER),
+            Status::Normal,
+            "the prober must adopt the primary's answer"
+        );
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(PRIMARY), ProcessId::Replica(PROBER)) = None;
+        let answer = PROBE_ANSWER
+            .take()
+            .expect("the primary must have answered the probe");
+        let (answered_head, answered_commit) = metadata_progress(&sim, PROBER);
+        assert_eq!(
+            answered_head, answered_commit,
+            "the answer must find the cluster idle, so its head is the prober's commit point"
+        );
+
+        // The next op commits on the prober's ack alone, and with commit heartbeats
+        // withheld the prober still takes the answer's head as the commit point.
+        sim.replica_crash(OTHER_BACKUP);
+        sim.network
+            .link_filter_mut(ProcessId::Replica(PRIMARY), ProcessId::Replica(PROBER))
+            .remove(Command::Commit);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            PRIMARY,
+            client.create_stream("acked-by-the-prober"),
+        );
+        assert_eq!(reply.header().status, 0);
+        let acked_op = answered_head + 1;
+        assert_eq!(metadata_progress(&sim, PRIMARY).1, acked_op);
+        assert_eq!(metadata_progress(&sim, PROBER), (acked_op, answered_head));
+
+        // The kept copy, delayed in the network until now.
+        sim.network.submit(
+            ProcessId::Replica(PRIMARY),
+            ProcessId::Replica(PROBER),
+            answer,
+        );
+        for _ in 0..LATE_DELIVERY_STEPS {
+            sim.step();
+        }
+        assert_eq!(
+            metadata_progress(&sim, PROBER).0,
+            acked_op,
+            "the late answer moved the prober's head back below an op it acked"
+        );
+        assert!(
+            metadata_holds(&sim, PROBER, acked_op),
+            "the late answer truncated op {acked_op} from the prober's journal"
+        );
+
+        // The primary dies before the other backup ever saw the op.
+        sim.replica_crash(PRIMARY);
+        sim.replica_restart(OTHER_BACKUP);
+        let mut primary = None;
+        for _ in 0..STEPS_MAX {
+            sim.step();
+            primary = (1..replica_count).find(|&replica| is_new_metadata_primary(&sim, replica));
+            if primary.is_some_and(|primary| metadata_progress(&sim, primary).1 >= acked_op) {
+                break;
+            }
+        }
+        let primary =
+            primary.expect("a metadata primary must be elected after the old one crashes");
+        assert!(
+            metadata_progress(&sim, primary).1 >= acked_op,
+            "the next view lost op {acked_op}, which the client saw commit"
+        );
+    }
+
+    fn metadata_status(sim: &Simulator, replica: u8) -> Status {
+        sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus")
+            .status()
     }
 }
 

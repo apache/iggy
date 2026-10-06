@@ -1340,6 +1340,36 @@ class IggyClient:
         connection to establish, so only the heartbeat starts and this call
         succeeds even against an unreachable server.
         """
+    def disconnect(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the current connection. Repeated calls are safe. Call `connect`
+        to use the client again. Over TCP and QUIC, that `connect` first waits
+        for the rest of `reestablish_after` (5 s by default). The sign-in made
+        with `login_user` is dropped, so it must be repeated after reconnecting.
+        A client configured with auto-login credentials signs in again on
+        `connect`. Over HTTP there is no connection to close and this call does
+        nothing.
+
+        Known issue: unless reconnection is disabled, the heartbeat of a client
+        with auto-login credentials connects it again and signs in within one
+        heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+
+        Raises:
+            RuntimeError: If the connection cannot be closed.
+        """
+    def shutdown(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Closes the connection. Shut down background producers with
+        `IggyProducer.shutdown()` and stop iterating consumers before this call,
+        because they share the connection. Otherwise background producers drop
+        queued messages and consumer iterators hang. Later requests fail with
+        `RuntimeError`. Repeated calls are safe. Over HTTP there is no
+        connection to close, but the heartbeat that `connect` started keeps
+        sending pings until the client is dropped.
+
+        Raises:
+            RuntimeError: If the client cannot be shut down.
+        """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
@@ -2767,6 +2797,22 @@ class Stats:
 
         0 when the server does not know its data directory or the disk probe
         fails.
+        """
+    @property
+    def open_files_count(self) -> builtins.int:
+        r"""
+        The number of file descriptors the server process holds open.
+
+        0 when unknown. Where the kernel cannot count them without a scan
+        (Linux before 6.2, macOS), the server scans at least every 10 seconds,
+        so the count can be 10 seconds old.
+        """
+    @property
+    def open_files_limit(self) -> builtins.int:
+        r"""
+        The soft limit on open file descriptors of the server process.
+
+        0 when unknown.
         """
     def __repr__(self) -> builtins.str: ...
 

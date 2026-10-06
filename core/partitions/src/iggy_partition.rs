@@ -46,7 +46,7 @@ use consensus::Pipeline;
 use consensus::{
     AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus,
     PartitionDiagEvent, PipelineEntry, PlaneKind, Project, ReplicaLogContext, RequestLogEvent,
-    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    Sequencer, SimEventKind, SliceRequestStatus, VsrConsensus, ack_preflight, ack_quorum_reached,
     build_deny_reply_from_request, build_reply_from_request, build_reply_message,
     drain_committable_prefix, emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
     fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
@@ -940,9 +940,11 @@ where
         &mut self,
         persistence: &Rc<PartitionPersistence>,
     ) -> Result<(), IggyError> {
+        // New empty WALs carry view zero; positive certificates belong to recovered history.
         if !self.materialization_missing
             && self.recovered_log_view.is_none()
             && persistence.head() == 0
+            && matches!(persistence.certified_log_view(), None | Some(0))
         {
             persistence.certify_log_view(self.consensus.log_view(), 0, 0);
             if persistence.start() {
@@ -1646,7 +1648,7 @@ where
         if !committed_restored && !append_restored {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             namespace_raw = self.consensus().group(),
             offset_frontier = frontier,
             offset_reserved = reserved,
@@ -4143,7 +4145,7 @@ where
         }
         let file_backed =
             self.log.storages().iter().any(|storage| {
-                storage.messages_reader.is_some() || storage.messages_writer.is_some()
+                storage.messages_reader.is_some() || storage.messages_size.is_some()
             });
         if file_backed {
             PartitionDirResolution::Unresolvable
@@ -4409,24 +4411,48 @@ where
                 // carried: the offset confirmations are not retained (no reply
                 // ring in this mode), so a retried produce learns it committed
                 // but not where.
-                if self
+                match self
                     .dedup
-                    .is_duplicate(client_id, message.header().user_id, request)
+                    .check_slice_request(client_id, message.header().user_id, request)
                 {
-                    let committed = build_reply_from_request(
-                        &self.consensus,
-                        message.header(),
-                        committed_reply_body(message.header().operation),
-                    );
-                    Self::deliver_reply_or_log(
-                        &self.consensus,
-                        message.header(),
-                        committed,
-                        reply.take(),
-                        "duplicate reply send failed",
-                    )
-                    .await;
-                    return;
+                    SliceRequestStatus::New => {}
+                    SliceRequestStatus::Committed => {
+                        let committed = build_reply_from_request(
+                            &self.consensus,
+                            message.header(),
+                            committed_reply_body(message.header().operation),
+                        );
+                        Self::deliver_reply_or_log(
+                            &self.consensus,
+                            message.header(),
+                            committed,
+                            reply.take(),
+                            "duplicate reply send failed",
+                        )
+                        .await;
+                        return;
+                    }
+                    SliceRequestStatus::AgedOut => {
+                        emit_partition_diag(
+                            tracing::Level::DEBUG,
+                            &PartitionDiagEvent::new(
+                                ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                                "rejecting client request aged out of the dedup window",
+                            )
+                            .with_operation(message.header().operation)
+                            .with_client(client_id)
+                            .with_request(request),
+                        );
+                        Self::send_partition_deny_or_log(
+                            consensus,
+                            message.header(),
+                            IggyError::RequestTooOld.as_code(),
+                            "aged-out request rejection failed",
+                            reply.take(),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
 
@@ -4548,9 +4574,11 @@ where
                 // request room -> buffer; both full -> drop+warn (client retries
                 // via read-timeout).
                 if consensus.pipeline_is_full() {
-                    let push_result = consensus.push_queued_request(
-                        consensus::RequestEntry::with_sender(message, reply.take()),
-                    );
+                    let entry = consensus::RequestEntry::with_sender(message, reply.take())
+                        .with_consumer_offset_history(
+                            consumer_offset.is_some().then_some(self.poll_history),
+                        );
+                    let push_result = consensus.push_queued_request(entry);
                     if let Err(mut refused) = push_result {
                         emit_partition_diag(
                             tracing::Level::WARN,
@@ -4655,13 +4683,6 @@ where
         while promoted < slots_freed {
             let req = self.consensus().pop_queued_request();
             let Some(mut req) = req else { break };
-            let parsed_store = (req.message.header().operation == Operation::StoreConsumerOffset)
-                .then(|| {
-                    Self::parse_consumer_offset_request(
-                        Operation::StoreConsumerOffset,
-                        &req.message,
-                    )
-                });
             let context = req.take_auto_commit();
             // History and capacity ownership can change while the request
             // waits for a prepare slot, so admission alone is not sufficient.
@@ -4671,8 +4692,7 @@ where
                         .consumer_offset_capacity_for(context.reservation.kind())
                         .owns(&context.reservation)
             }) {
-                consecutive_denials += 1;
-                if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                if Self::record_promotion_denial(&mut consecutive_denials) {
                     break;
                 }
                 continue;
@@ -4681,6 +4701,40 @@ where
             // Taken before the preflight so a refusal answers the parked waiter
             // instead of waking it with `Canceled`.
             let mut reply_sender = req.take_reply_sender();
+            if req
+                .consumer_offset_history()
+                .is_some_and(|history| history != self.poll_history)
+            {
+                // An old offset can fit the replacement history, and an old
+                // delete can erase a replacement checkpoint. Refuse before
+                // projection with a terminal error so clients do not replay it.
+                let error = Self::parse_consumer_offset_request(
+                    req.message.header().operation,
+                    &req.message,
+                )
+                .map_or(
+                    IggyError::InvalidCommand,
+                    |(_, consumer_id, offset, _)| {
+                        offset.map_or_else(
+                            || IggyError::ConsumerOffsetNotFound(consumer_id as usize),
+                            IggyError::InvalidOffset,
+                        )
+                    },
+                );
+                if self
+                    .deny_queued_request(
+                        req.message.header(),
+                        error.as_code(),
+                        "queued offset history deny reply send failed",
+                        reply_sender.take(),
+                        &mut consecutive_denials,
+                    )
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
             if !self
                 .admit_reserved_send(&req.message, &mut reply_sender)
                 .await
@@ -4688,33 +4742,40 @@ where
                 break;
             }
 
+            let parsed_store = (req.message.header().operation == Operation::StoreConsumerOffset)
+                .then(|| {
+                    Self::parse_consumer_offset_request(
+                        Operation::StoreConsumerOffset,
+                        &req.message,
+                    )
+                });
             if let Some(parsed) = parsed_store {
                 let Ok((kind, consumer_id, Some(offset), _)) = parsed else {
-                    Self::send_partition_deny_or_log(
-                        self.consensus(),
-                        req.message.header(),
-                        IggyError::InvalidCommand.as_code(),
-                        "queued consumer offset parse deny reply send failed",
-                        reply_sender.take(),
-                    )
-                    .await;
-                    consecutive_denials += 1;
-                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    if self
+                        .deny_queued_request(
+                            req.message.header(),
+                            IggyError::InvalidCommand.as_code(),
+                            "queued consumer offset parse deny reply send failed",
+                            reply_sender.take(),
+                            &mut consecutive_denials,
+                        )
+                        .await
+                    {
                         break;
                     }
                     continue;
                 };
                 if let Some(error) = self.store_offset_range_error(offset) {
-                    Self::send_partition_deny_or_log(
-                        self.consensus(),
-                        req.message.header(),
-                        error.as_code(),
-                        "queued offset range deny reply send failed",
-                        reply_sender.take(),
-                    )
-                    .await;
-                    consecutive_denials += 1;
-                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    if self
+                        .deny_queued_request(
+                            req.message.header(),
+                            error.as_code(),
+                            "queued offset range deny reply send failed",
+                            reply_sender.take(),
+                            &mut consecutive_denials,
+                        )
+                        .await
+                    {
                         break;
                     }
                     continue;
@@ -4728,8 +4789,7 @@ where
                     )
                     .await
                 {
-                    consecutive_denials += 1;
-                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                    if Self::record_promotion_denial(&mut consecutive_denials) {
                         break;
                     }
                     continue;
@@ -4786,6 +4846,24 @@ where
         if self.queued_requests_ready() {
             self.drain_request_queue_into_prepares(1).await;
         }
+    }
+
+    async fn deny_queued_request(
+        &self,
+        header: &RoutedRequestHeader,
+        status: u32,
+        send_fail_label: &'static str,
+        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
+        consecutive_denials: &mut usize,
+    ) -> bool {
+        Self::send_partition_deny_or_log(self.consensus(), header, status, send_fail_label, waiter)
+            .await;
+        Self::record_promotion_denial(consecutive_denials)
+    }
+
+    const fn record_promotion_denial(consecutive_denials: &mut usize) -> bool {
+        *consecutive_denials += 1;
+        *consecutive_denials >= PROMOTION_DENIALS_MAX
     }
 
     /// # Panics
@@ -7110,8 +7188,7 @@ where
         self.install_empty_segment(config, start_offset).await?;
         self.stats.increment_segments_count(1);
 
-        let sealed_storage = &mut self.log.storages_mut()[sealed_index];
-        let _ = sealed_storage.shutdown();
+        self.log.storages_mut()[sealed_index].seal();
         self.log.messages_writers_mut()[sealed_index] = None;
         self.log.index_writers_mut()[sealed_index] = None;
         // Drop the sealed segment's in-memory index cache: only the ACTIVE
@@ -7258,13 +7335,11 @@ where
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
             // victim is the front once the previous one is gone.
-            let Some((segment, mut storage)) = self.log.retire_front() else {
+            let Some((segment, storage)) = self.log.retire_front() else {
                 break;
             };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
 
             for path in messages_path
                 .into_iter()
@@ -7379,10 +7454,9 @@ where
             None
         } else {
             let messages_size_bytes = storage
-                .messages_writer
-                .as_ref()
-                .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
-                .size_counter();
+                .messages_size
+                .clone()
+                .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
             Some(Rc::new(
                 MessagesWriter::new(
                     &messages_path,
@@ -7396,10 +7470,9 @@ where
             ))
         };
         let index_size_bytes = storage
-            .index_writer
-            .as_ref()
-            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
-            .size_counter();
+            .index_size
+            .clone()
+            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?;
         let index_writer = Rc::new(
             IggyIndexWriter::new(&index_path, index_size_bytes, persisted, false)
                 .await
@@ -7450,12 +7523,10 @@ where
             if segment.size.as_bytes_u64() > 0 || segment.start_offset >= frontier {
                 break;
             }
-            let Some((segment, mut storage)) = self.log.retire_back() else {
+            let Some((segment, storage)) = self.log.retire_back() else {
                 break;
             };
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
             for path in messages_path
                 .into_iter()
                 .chain(index_path)
@@ -7723,13 +7794,11 @@ where
         // Drain every segment (including the active one) and unlink its files.
         let segment_count = self.log.segments().len();
         for _ in 0..segment_count {
-            let Some((segment, mut storage)) = self.log.retire_front() else {
+            let Some((segment, storage)) = self.log.retire_front() else {
                 break;
             };
 
             let (messages_path, index_path) = storage.segment_and_index_paths();
-            let _ = storage.shutdown();
-            drop(storage);
 
             for path in messages_path
                 .into_iter()
@@ -9132,13 +9201,82 @@ mod tests {
                         .log
                         .storages()
                         .iter()
-                        .all(|storage| storage.messages_writer.is_none())
+                        .all(|storage| storage.messages_size.is_none())
                 );
                 assert!(partition.log.messages_writers().iter().all(Option::is_none));
                 assert!(partition.log.index_writers().last().unwrap().is_some());
                 assert_eq!(partition.consensus().commit_min(), 1);
             }
         }
+    }
+
+    #[compio::test]
+    async fn given_multi_segment_transfer_when_installing_should_keep_writers_on_the_tail_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        partition.set_partition_dir(partition_dir.clone());
+        for kind in ["consumers", "groups"] {
+            std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
+        }
+        partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
+        partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
+        let mut prepares = Vec::new();
+        let mut parent = 0;
+        for offset in 0..3u64 {
+            let prepare = checksummed_segment_prepare(offset + 1, parent, offset, b"transferred");
+            parent = prepare.header().checksum;
+            prepares.push(prepare);
+        }
+        let mut staged = Vec::new();
+        for (offset, prepare) in (0u64..).zip(&prepares) {
+            let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+            let artifact = consensus::StateArtifact::for_bytes(
+                consensus::state_manifest::artifact_kind::SEGMENT_LOG,
+                offset,
+                &body,
+            );
+            staged.push(
+                partition
+                    .spill_transfer_segment(&artifact, body)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let last = prepares.last().unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            prepare_checksum: Some(last.header().checksum),
+            checkpoint_prepare: last.as_slice().to_vec(),
+            purge_generation: 0,
+            next_offset: 3,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            dedup: Vec::new(),
+        };
+        partition
+            .install_state_transfer(&repair_config(), 3, staged, &offsets.encode(), 0)
+            .await
+            .unwrap();
+
+        let tail = partition.log.segments().len() - 1;
+        assert_eq!(
+            tail, 2,
+            "each staged segment must install as its own segment"
+        );
+        for index in 0..tail {
+            let storage = &partition.log.storages()[index];
+            assert!(
+                storage.messages_size.is_none() && storage.index_size.is_none(),
+                "sealed segment {index} must not keep write cursors"
+            );
+            assert!(
+                partition.log.messages_writers()[index].is_none()
+                    && partition.log.index_writers()[index].is_none(),
+                "sealed segment {index} must not keep a writer open"
+            );
+        }
+        assert!(partition.log.storages()[tail].index_size.is_some());
+        assert!(partition.log.index_writers()[tail].is_some());
     }
 
     #[compio::test]
@@ -9646,6 +9784,35 @@ mod tests {
         partition.on_replicate(prepare).await;
         assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
         assert_eq!(partition.consensus().last_prepare_checksum(), checksum);
+    }
+
+    #[compio::test]
+    async fn certified_empty_wal_without_superblock_preserves_its_log_view() {
+        const CREATED_VIEW: u32 = 2;
+        const LOG_VIEW: u32 = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(CREATED_VIEW, 0);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        let wal = directory.path().join("prepares-0");
+        let mut journal =
+            journal::PartitionPrepareJournal::open(&wal, partition.consensus().group(), 0)
+                .await
+                .unwrap();
+        journal.certify_log_view(LOG_VIEW, 0, 0).await.unwrap();
+        drop(journal);
+
+        partition.open_persistence().await.unwrap();
+
+        assert_eq!(partition.consensus().view(), LOG_VIEW);
+        assert_eq!(partition.consensus().log_view(), LOG_VIEW);
+        assert!(!partition.requires_state_transfer());
+        drop(partition);
+        let journal =
+            journal::PartitionPrepareJournal::open(&wal, IggyNamespace::new(1, 1, 0).inner(), 0)
+                .await
+                .unwrap();
+        assert_eq!(journal.certified_log_view(), Some(LOG_VIEW));
     }
 
     #[compio::test]
@@ -10187,30 +10354,42 @@ mod tests {
 
     #[compio::test]
     async fn given_advanced_view_when_persist_gate_runs_should_write_vsr_state_once() {
-        let mut partition = partition_at_view(3, 2);
-        let store = Rc::new(RecordingSuperblock::default());
-        partition.set_superblock(store.clone(), None);
+        for (view, log_view) in [(3, 2), (2, 0)] {
+            let case = format!("view {view}, log_view {log_view}");
+            let mut partition = partition_at_view(view, log_view);
+            let store = Rc::new(RecordingSuperblock::default());
+            partition.set_superblock(store.clone(), None);
 
-        assert!(partition.persist_superblock_if_needed().await);
+            assert!(
+                partition.persist_superblock_if_needed().await,
+                "{case}: the first gate run must persist the view"
+            );
 
-        let state = consensus::VsrState::try_from(store.writes.borrow()[0].as_slice())
-            .expect("recorded payload decodes as a VsrState");
-        assert_eq!(state.cluster, TEST_CLUSTER);
-        assert_eq!(state.view, 3);
-        assert_eq!(state.log_view, 2);
-        assert_eq!(
-            (state.checkpoint_op, state.checkpoint_checksum),
-            (0, 0),
-            "no partition checkpoint exists yet, so the pairing fields stay zero"
-        );
-        assert!(!partition.consensus().needs_superblock_persist());
+            let state = consensus::VsrState::try_from(store.writes.borrow()[0].as_slice())
+                .expect("recorded payload decodes as a VsrState");
+            assert_eq!(state.cluster, TEST_CLUSTER, "{case}");
+            assert_eq!(state.view, view, "{case}");
+            assert_eq!(state.log_view, log_view, "{case}");
+            assert_eq!(
+                (state.checkpoint_op, state.checkpoint_checksum),
+                (0, 0),
+                "{case}"
+            );
+            assert!(
+                !partition.consensus().needs_superblock_persist(),
+                "{case}: a landed write must make the view durable"
+            );
 
-        assert!(partition.persist_superblock_if_needed().await);
-        assert_eq!(
-            store.attempts.get(),
-            1,
-            "an unchanged view must take the lock-free fast path, not rewrite"
-        );
+            assert!(
+                partition.persist_superblock_if_needed().await,
+                "{case}: a durable view must pass the gate"
+            );
+            assert_eq!(
+                store.attempts.get(),
+                1,
+                "{case}: an unchanged view must not rewrite"
+            );
+        }
     }
 
     /// The `offset_frontier` of the most recent recorded write.
@@ -11166,30 +11345,28 @@ mod tests {
 
     #[compio::test]
     async fn given_failing_superblock_when_persist_gate_runs_should_withhold_and_back_off() {
-        let mut partition = partition_at_view(1, 1);
-        let store = Rc::new(RecordingSuperblock::default());
-        store.fail_writes.set(true);
-        partition.set_superblock(store.clone(), None);
+        for (view, log_view) in [(1, 1), (2, 0)] {
+            let case = format!("view {view}, log_view {log_view}");
+            let mut partition = partition_at_view(view, log_view);
+            let store = Rc::new(RecordingSuperblock::default());
+            store.fail_writes.set(true);
+            partition.set_superblock(store.clone(), None);
 
-        assert!(
-            !partition.persist_superblock_if_needed().await,
-            "a failed write must withhold the send"
-        );
-        assert_eq!(store.attempts.get(), 1);
-
-        assert!(
-            !partition.persist_superblock_if_needed().await,
-            "the backoff window must withhold without retrying the write"
-        );
-        assert_eq!(
-            store.attempts.get(),
-            1,
-            "a call inside the backoff window must not touch the store"
-        );
-        assert!(
-            partition.consensus().needs_superblock_persist(),
-            "the view stays undurable until a write lands"
-        );
+            assert!(
+                !partition.persist_superblock_if_needed().await,
+                "{case}: a failed write must withhold the send"
+            );
+            assert_eq!(store.attempts.get(), 1, "{case}");
+            assert!(
+                !partition.persist_superblock_if_needed().await,
+                "{case}: the backoff window must withhold without retrying the write"
+            );
+            assert_eq!(store.attempts.get(), 1, "{case}");
+            assert!(
+                partition.consensus().needs_superblock_persist(),
+                "{case}: the view stays undurable until a write lands"
+            );
+        }
     }
 
     /// Client-facing bus that records every `send_to_client` frame so tests
@@ -15112,7 +15289,6 @@ mod tests {
         PartitionsConfig {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
-
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,

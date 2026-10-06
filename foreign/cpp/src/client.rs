@@ -359,31 +359,6 @@ impl Client {
         })
     }
 
-    pub fn flush_unsaved_buffer(
-        &self,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-        partition_id: u32,
-        fsync: bool,
-    ) -> Result<(), String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not flush unsaved buffer: {error}"))?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not flush unsaved buffer: {error}"))?;
-
-        RUNTIME.block_on(async {
-            self.inner
-                .flush_unsaved_buffer(&rust_stream_id, &rust_topic_id, partition_id, fsync)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Could not flush unsaved buffer for stream '{rust_stream_id}', topic '{rust_topic_id}', partition '{partition_id}': {error}"
-                    )
-                })?;
-            Ok(())
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn poll_messages(
         &self,
@@ -1164,6 +1139,7 @@ impl Client {
         username: String,
         has_status: bool,
         status: ffi::UserStatus,
+        options: Vec<ffi::HeaderEntry>,
     ) -> Result<(), String> {
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
@@ -1171,6 +1147,9 @@ impl Client {
             .then(|| RustUserStatus::try_from(status))
             .transpose()
             .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
+        let raw = ffi_options_to_raw(options)
+            .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
+        let rust_options = UserUpdateOptions { raw };
 
         RUNTIME.block_on(async {
             self.inner
@@ -1178,7 +1157,7 @@ impl Client {
                     &rust_user_id,
                     has_username.then_some(username.as_str()),
                     rust_status,
-                    &UserUpdateOptions::default(),
+                    &rust_options,
                 )
                 .await
                 .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;

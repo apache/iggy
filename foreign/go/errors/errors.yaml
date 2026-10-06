@@ -335,6 +335,10 @@
   code: 84
   format: "invalid number value"
   fields: []
+- name: RequestTooOld
+  code: 85
+  format: "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -650,6 +654,10 @@
 - name: TooManyTopics
   code: 2021
   format: "too many topics"
+  fields: []
+- name: PartitionsLimitReached
+  code: 2022
+  format: "partitions limit reached, raise [metadata] partitions_max"
   fields: []
 - name: CannotCreatePartition
   code: 3000

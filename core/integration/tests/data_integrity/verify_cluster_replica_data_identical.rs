@@ -67,7 +67,7 @@ const BURST_BATCH_MESSAGES: u32 = 2;
 
 // `messages_required_to_save = 1` forces every committed batch to persist to its
 // segment immediately on every node, so each replica materialises the segment
-// files while running (the VSR server serves no flush_unsaved_buffer, and
+// files while running (the server has no on-demand flush, and
 // shutdown-flush would couple the test to drain behaviour). It is a topic
 // creation option, so it travels with the topic to every replica.
 #[iggy_harness(cluster_nodes = 3)]

@@ -18,12 +18,14 @@
 pub mod builder;
 pub mod config;
 pub mod coordinator;
+pub mod host;
 pub mod metrics;
 mod poll;
 mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
+pub use host::{NoopHost, ShardHost};
 pub use poll::{ConsumerAttachment, PollCompleted};
 pub use router::CONSENSUS_TICK_INTERVAL;
 
@@ -41,12 +43,13 @@ use consensus::{
 use crossfire::AsyncRxTrait;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader,
-    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
-    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, ConsumerSession,
+    ConsumerSessionHeartbeatHeader, DoViewChangeHeader, ForwardLogoutHeader,
+    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader,
 };
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
@@ -58,7 +61,7 @@ use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
-use message_bus::{BusMessage, MessageBus, SharedTlsServerConfig};
+use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfig};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
@@ -67,7 +70,9 @@ use partitions::state_transfer::TransferArtifact;
 use partitions::{
     FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
 };
-use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+use server_common::sharding::{
+    IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, PartitionLocation, ShardId,
+};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
@@ -211,6 +216,8 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    /// Replica-link liveness report routed to shard 0; no proposal or reply.
+    ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     AttachConsumerSession {
         vsr_client_id: u128,
         session: u64,
@@ -283,14 +290,6 @@ pub enum MetadataSubmit {
     },
 }
 
-/// Handler shard 0 runs for an inbound [`MetadataSubmit`].
-///
-/// The server wires it to `submit_register_in_process` /
-/// `submit_logout_in_process` / `submit_request_in_process` and sends the
-/// result back over the frame's `reply` sender. A peer shard (no consensus)
-/// must never receive this frame.
-pub type MetadataSubmitHandler = Rc<dyn Fn(MetadataSubmit)>;
-
 /// One connected client's identity, as seen by the shard that homes it.
 ///
 /// Gathered from every shard for `get_clients` (shared-nothing: each shard
@@ -317,15 +316,21 @@ pub struct ConnectedClientInfo {
     pub protocol_version: Option<u32>,
 }
 
-/// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
-/// The server wires it to read the shard's `SessionManager` and push its
-/// connected clients back over the carried reply sender.
-pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
+#[derive(Debug)]
+pub enum ListClientsReply {
+    Clients(Sender<Vec<ConnectedClientInfo>>),
+    Sessions(Sender<Vec<ConsumerSession>>),
+    /// The number of connected clients only, for the readers that need no
+    /// client details.
+    Count(Sender<usize>),
+}
 
-/// Per-shard reply budget for the `list_all_clients` gather. A shard that
-/// doesn't answer within this window is skipped (partial result) so one
-/// wedged shard can't hang the read.
-const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Best-effort client list plus whether every shard answered.
+pub struct GatheredClients<T = ConnectedClientInfo> {
+    pub clients: Vec<T>,
+    /// False if any shard rejected the request or failed to reply before the deadline.
+    pub complete: bool,
+}
 
 /// A read executed on the shard that owns a partition: a message poll or a
 /// consumer-offset lookup. Carried by [`LifecycleFrame::PartitionRead`];
@@ -633,8 +638,9 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
     Ok(())
 }
 
-/// Starting point for [`IggyShard::next_forward_nonce`]: the low half
-/// of this boot's consensus incarnation.
+/// The low half of this boot's consensus incarnation: the starting point for
+/// [`IggyShard::next_forward_nonce`] and the boot field of every client id
+/// shard 0 mints ([`coordinator::ShardZeroCoordinator`]).
 ///
 /// Forward nonces are node-local and never persisted, so a counter that starts
 /// at zero every boot re-mints the exact sequence the previous boot used. A
@@ -643,10 +649,12 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
 /// incarnation is fresh per boot, which moves the whole sequence.
 ///
 /// Zero on shards owning no metadata consensus (they never forward) and
-/// wherever nothing set an incarnation, which degenerates to the unseeded
-/// sequence: no worse than before, and the shards that take it are test ones.
+/// wherever nothing set an incarnation. Production shard 0 always gets a
+/// nonzero nonce, since boot draws the incarnation at random with the low bit
+/// set. It must: the client ids shard 0 mints stay unique across boots only
+/// through this nonce.
 #[allow(clippy::cast_possible_truncation)]
-fn forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
+fn boot_nonce<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64 {
     consensus.map_or(0, VsrConsensus::incarnation) as u64
 }
 
@@ -707,10 +715,13 @@ pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
-    /// 16 bits of `meta.client_id`.
+    /// 16 bits of `meta.client_id`. `permit` is the socket's slot in the
+    /// node's connection cap. It travels with the fd, so a frame dropped
+    /// unprocessed frees the slot with the socket.
     ClientConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+        permit: ConnectionPermit,
     },
     /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
     /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
@@ -733,6 +744,7 @@ pub enum LifecycleFrame {
     ClientWsConnectionSetup {
         fd: DupedFd,
         meta: ClientConnMeta,
+        permit: ConnectionPermit,
     },
     /// Delegate TCP-TLS before reading TLS bytes. The destination wraps the
     /// fd on its runtime and owns the handshake and connection tasks.
@@ -740,6 +752,7 @@ pub enum LifecycleFrame {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     },
     /// Delegate WSS before either handshake. The listener's configuration
     /// travels with the socket; all TLS and WebSocket state stays local to
@@ -748,6 +761,7 @@ pub enum LifecycleFrame {
         fd: DupedFd,
         meta: ClientConnMeta,
         config: SharedTlsServerConfig,
+        permit: ConnectionPermit,
     },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
@@ -767,12 +781,13 @@ pub enum LifecycleFrame {
     /// shard 0; processing it on a peer is a routing bug.
     MetadataSubmit(MetadataSubmit),
     /// Broadcast query for `get_clients`: every shard replies with the
-    /// clients whose connections it homes, over `reply`. Unlike
+    /// clients whose connections it homes, or only their number, over
+    /// `reply`. Unlike
     /// [`MetadataSubmit`] this is sent to ALL shards (shared-nothing: each
     /// shard knows only its own connections). See
     /// [`IggyShard::list_all_clients`].
     ListClients {
-        reply: Sender<Vec<ConnectedClientInfo>>,
+        reply: ListClientsReply,
     },
     /// Execute a partition read (message poll / consumer-offset lookup) on
     /// the shard that owns `namespace` and push the result back over
@@ -1376,13 +1391,17 @@ where
     /// surface without going through consensus.
     pub bus: B,
 
-    /// Callback attached to every delegated replica connection installed
-    /// on this shard. The bus' reader task invokes this for each inbound
-    /// consensus message; the callback is typically `|_, msg| shard.dispatch(msg)`.
+    /// The process embedding this shard: serves client requests, runs
+    /// metadata submits, answers the list-clients query. See [`ShardHost`].
+    host: Rc<dyn ShardHost>,
+
+    /// [`ShardHost::on_replica_message`] as the bus installs it on every
+    /// delegated replica connection; built once so an install clones one `Rc`.
     on_replica_message: MessageHandler,
 
-    /// Callback attached to every delegated client connection installed on
-    /// this shard. Invoked for each inbound `Request` frame.
+    /// [`ShardHost::on_client_request`] as the bus installs it on every
+    /// delegated client connection, and as shard 0 hands it to the transports
+    /// it terminates locally (see [`Self::client_request_handler`]).
     on_client_request: RequestHandler,
 
     /// In-flight metadata journal repair: set when the recovery
@@ -1446,20 +1465,8 @@ where
     /// Monotonic source of forwarding nonces. Node-local: the
     /// nonce only has to distinguish this node's own in-flight forwards, across
     /// its restarts as well as within one boot. Seeded by
-    /// [`forward_nonce_seed`].
+    /// [`boot_nonce`].
     forward_nonce: Cell<u64>,
-
-    /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
-    /// these (it owns the metadata consensus group); peers send them here
-    /// via [`Self::forward_metadata_submit`]. Defaults to a no-op for the
-    /// simulator stub ctor.
-    on_metadata_submit: MetadataSubmitHandler,
-
-    /// Handler for inbound [`LifecycleFrame::ListClients`] broadcast
-    /// queries. Every shard receives these (not just shard 0); the server
-    /// wires it to its per-shard `SessionManager`. Defaults to a no-op for
-    /// the simulator stub ctor.
-    on_list_clients: ListClientsHandler,
 
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
@@ -1720,6 +1727,9 @@ where
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
     ///   by the consensus planes so the router can reach the
     ///   `ConnectionInstaller` surface directly).
+    /// * `host` - the embedding process' handlers, see [`ShardHost`].
+    ///   Wrapped once here into the `Rc<dyn Fn>` adapters the bus installs
+    ///   per delegated connection.
     /// * `senders` - one [`TaggedSender`] per shard. The ctor asserts
     ///   `senders[i].shard_id() == i`; use [`shard_channel`] at
     ///   construction time so every sender carries the id of the shard
@@ -1753,10 +1763,7 @@ where
     pub fn new(
         identity: ShardIdentity,
         bus: B,
-        on_replica_message: MessageHandler,
-        on_client_request: RequestHandler,
-        on_metadata_submit: MetadataSubmitHandler,
-        on_list_clients: ListClientsHandler,
+        host: Rc<dyn ShardHost>,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
@@ -1773,7 +1780,7 @@ where
             u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
-        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
+        let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let poll_completions =
@@ -1783,10 +1790,9 @@ where
             name,
             plane,
             bus,
-            on_replica_message,
-            on_client_request,
-            on_metadata_submit,
-            on_list_clients,
+            on_replica_message: host::replica_message_handler(&host),
+            on_client_request: host::client_request_handler(&host),
+            host,
             senders,
             shard_count,
             inbox,
@@ -1969,12 +1975,58 @@ where
     /// treat the result as best-effort-complete.
     #[allow(clippy::future_not_send)]
     pub async fn list_all_clients(&self) -> Vec<ConnectedClientInfo> {
+        self.gather_clients().await.clients
+    }
+
+    /// Count every shard's connected clients, bounded like
+    /// [`Self::list_all_clients`]. Each shard replies with one number, so the
+    /// periodic readers build no client records.
+    #[allow(clippy::future_not_send)]
+    pub async fn count_all_clients(&self) -> usize {
+        let (count, _complete) = self
+            .gather_replies(ListClientsReply::Count, 0usize, |count, shard_clients| {
+                *count = count.saturating_add(shard_clients);
+            })
+            .await;
+        count
+    }
+
+    /// Gather administrative client details with completeness information.
+    #[allow(clippy::future_not_send)]
+    pub async fn gather_clients(&self) -> GatheredClients {
+        self.gather_client_info(ListClientsReply::Clients).await
+    }
+
+    /// Gather bound session identities with completeness information for expiry decisions.
+    #[allow(clippy::future_not_send)]
+    pub async fn gather_consumer_sessions(&self) -> GatheredClients<ConsumerSession> {
+        self.gather_client_info(ListClientsReply::Sessions).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn gather_client_info<ClientInfo: Send + 'static>(
+        &self,
+        reply: fn(Sender<Vec<ClientInfo>>) -> ListClientsReply,
+    ) -> GatheredClients<ClientInfo> {
+        let (clients, complete) = self.gather_replies(reply, Vec::new(), Extend::extend).await;
+        GatheredClients { clients, complete }
+    }
+
+    /// Broadcast one [`LifecycleFrame::ListClients`] and fold each shard's
+    /// reply into `gathered`. The flag is false if a shard did not answer.
+    #[allow(clippy::future_not_send)]
+    async fn gather_replies<Reply: Send + 'static, Gathered>(
+        &self,
+        reply: fn(Sender<Reply>) -> ListClientsReply,
+        mut gathered: Gathered,
+        mut fold: impl FnMut(&mut Gathered, Reply),
+    ) -> (Gathered, bool) {
         let shard_count = self.shard_count as usize;
-        let (reply_tx, reply_rx) = channel::<Vec<ConnectedClientInfo>>(shard_count.max(1));
+        let (reply_tx, reply_rx) = channel::<Reply>(shard_count.max(1));
         let mut expected = 0usize;
         for sender in &self.senders {
             let frame = ShardFrame::lifecycle(LifecycleFrame::ListClients {
-                reply: reply_tx.clone(),
+                reply: reply(reply_tx.clone()),
             });
             if let Err(error) = sender.try_send(frame) {
                 tracing::warn!(
@@ -1990,7 +2042,6 @@ where
         // reply sender is dropped (defensive; we also bound by count).
         drop(reply_tx);
 
-        let mut clients = Vec::new();
         let mut received = 0usize;
         // One deadline across the whole gather, timed on the injected clock
         // (virtual under the simulator, wall-clock in production) via a single
@@ -2003,8 +2054,8 @@ where
         let gather = async {
             while received < expected {
                 match reply_rx.recv().await {
-                    Ok(batch) => {
-                        clients.extend(batch);
+                    Ok(shard_reply) => {
+                        fold(&mut gathered, shard_reply);
                         received += 1;
                     }
                     Err(_) => break, // all reply senders dropped
@@ -2022,7 +2073,7 @@ where
                 "list_all_clients: gather timed out; returning partial result"
             );
         }
-        clients
+        (gathered, received == shard_count)
     }
 
     /// Run a partition read on the shard owning `namespace` and await the reply.
@@ -2237,12 +2288,22 @@ where
         self.coordinator.clone()
     }
 
+    /// The adapter this shard installs on its delegated client connections,
+    /// for the transports shard 0 terminates locally. What every transport
+    /// on a shard must share is the host behind it (the per-client queues
+    /// and the disconnect hook live there); a second adapter over the same
+    /// host would be harmless, this one just saves building it.
+    #[must_use]
+    pub fn client_request_handler(&self) -> RequestHandler {
+        Rc::clone(&self.on_client_request)
+    }
+
     /// Create a shard without inter-shard channels or delegated connections.
     ///
     /// Useful for the simulator where inbound messages are delivered
     /// directly via [`on_message`](Self::on_message) instead of the TCP /
-    /// fd-transfer path. Installs no-op connection handlers because the
-    /// simulator never receives a replica connection-setup frame.
+    /// fd-transfer path. Hosted by [`NoopHost`] because the simulator never
+    /// receives a connection-setup or host-bound frame.
     #[must_use]
     pub fn without_inbox(
         identity: ShardIdentity,
@@ -2265,17 +2326,17 @@ where
         let (_tx, inbox) = channel(1);
         let (_reply_tx, reply_inbox) = channel(1);
         let metrics = crate::metrics::ShardMetrics::for_shard();
-        let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
+        let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
+        let host: Rc<dyn ShardHost> = Rc::new(NoopHost);
         Self {
             id,
             name,
             bus,
-            on_replica_message: std::rc::Rc::new(|_, _| {}),
-            on_client_request: std::rc::Rc::new(|_, _| {}),
-            on_metadata_submit: std::rc::Rc::new(|_| {}),
-            on_list_clients: std::rc::Rc::new(|_| {}),
+            on_replica_message: host::replica_message_handler(&host),
+            on_client_request: host::client_request_handler(&host),
+            host,
             plane,
             coordinator: None,
             senders: Vec::new(),
@@ -3238,6 +3299,14 @@ where
             MessageBag::ForwardRegisterResult(ref msg) => {
                 self.on_forward_register_result(*msg.header());
             }
+            MessageBag::ConsumerSessionHeartbeat(msg) => {
+                if self.peer_is_known(msg.header().replica, "ConsumerSessionHeartbeat")
+                    && control_suffix_body_verified(&msg, msg.header().checksum_body).is_some()
+                {
+                    self.host
+                        .on_metadata_submit(MetadataSubmit::ConsumerSessionHeartbeat(msg));
+                }
+            }
             MessageBag::ForwardLogout(ref msg) => self.on_forward_logout(*msg.header()),
             MessageBag::ForwardLogoutResult(ref msg) => {
                 self.on_forward_logout_result(*msg.header());
@@ -3253,12 +3322,13 @@ where
             self.id, 0,
             "ForwardRegister routes to the metadata consensus owner"
         );
-        (self.on_metadata_submit)(MetadataSubmit::ForwardedRegister {
-            vsr_client_id: header.client,
-            user_id: header.user_id,
-            nonce: header.nonce,
-            origin_replica: header.replica,
-        });
+        self.host
+            .on_metadata_submit(MetadataSubmit::ForwardedRegister {
+                vsr_client_id: header.client,
+                user_id: header.user_id,
+                nonce: header.nonce,
+                origin_replica: header.replica,
+            });
     }
 
     fn on_forward_register_result(&self, header: ForwardRegisterResultHeader) {
@@ -3286,13 +3356,14 @@ where
             self.id, 0,
             "ForwardLogout routes to the metadata consensus owner"
         );
-        (self.on_metadata_submit)(MetadataSubmit::ForwardedLogout {
-            vsr_client_id: header.client,
-            session: header.session,
-            request: header.request,
-            nonce: header.nonce,
-            origin_replica: header.replica,
-        });
+        self.host
+            .on_metadata_submit(MetadataSubmit::ForwardedLogout {
+                vsr_client_id: header.client,
+                session: header.session,
+                request: header.request,
+                nonce: header.nonce,
+                origin_replica: header.replica,
+            });
     }
 
     fn on_forward_logout_result(&self, header: ForwardLogoutResultHeader) {
@@ -4291,19 +4362,19 @@ where
             .as_ref()
             .map(|state| (state.view, state.log_view));
         let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
-        let consensus::FreshGroupStart { join, seed_view } =
-            consensus::fresh_group_start(restarted, durable_view, created_view);
+        let consensus::FreshGroupStart {
+            join,
+            view_fallback,
+            seed_view,
+        } = consensus::fresh_group_start(restarted, durable_view, created_view);
 
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
-        if let Some((view, log_view)) = durable_view {
-            consensus.set_view(view);
-            consensus.set_log_view(log_view);
-            consensus.mark_superblock_durable(view, log_view);
-        } else if let Some(view) = seed_view {
-            consensus.set_view(view);
-            consensus.set_log_view(view);
-        }
+        consensus.restore_view(consensus::ViewRestore {
+            durable_view,
+            view_fallback,
+            seed_view,
+        });
         // A rebuilt replica cannot know the group's `(op, commit)`: the
         // partition journal is in-memory and segments carry no op numbers. So
         // in a cluster it joins quorum-invisible and asks the view's primary
@@ -4311,13 +4382,7 @@ where
         // `init` would set `Status::Normal` and arm the commit broadcast on
         // whichever replica is primary-by-index, the split-brain
         // `init_as_backup` exists to prevent.
-        match join {
-            consensus::JoinMode::ProbeAsBackup { .. } => {
-                consensus.init_as_backup();
-                consensus.begin_view_probe();
-            }
-            consensus::JoinMode::Init => consensus.init(),
-        }
+        consensus.join(join);
 
         let stats = Arc::new(PartitionStats::default());
         let mut partition = IggyPartition::with_in_memory_storage(
@@ -4592,8 +4657,9 @@ where
             };
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, suffix_body);
             // Every rejection path (wrong primary, old view, stale incarnation,
-            // below the commit floor, self-sent) returns no actions, and an
-            // adopted StartView always emits at least `CommitJournal`. That
+            // nothing above a Normal replica's head in its own view, below the
+            // commit point (commit_max), self-sent) returns no actions,
+            // and an adopted StartView always emits at least `CommitJournal`. That
             // makes emptiness the adoption signal -- and the arms below must
             // not fire on a StartView this replica did not adopt.
             let adopted = !actions.is_empty();
@@ -13515,11 +13581,14 @@ mod partition_ack_durability_tests {
         }
         sent.borrow_mut().clear();
         headers.reverse();
+        // A merge concludes a view change, so its StartView opens a newer view. View 3
+        // is led by replica 0 again; another view-0 StartView at the backup's head is
+        // a duplicate the backup ignores.
         dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(
             consensus,
             &partition,
             vec![VsrAction::SendStartView {
-                view: 0,
+                view: 3,
                 op: 2,
                 commit: 1,
                 incarnation: 0,

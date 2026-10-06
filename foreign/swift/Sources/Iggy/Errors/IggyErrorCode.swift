@@ -16,8 +16,8 @@
 // under the License.
 
 // Every discriminant the server can answer with, transcribed from
-// `core/common/src/error/iggy_error.rs`. The golden-vector generator that
-// follows in a later change dumps the same table and the tests compare.
+// `core/common/src/error/iggy_error.rs`. `Tools/golden-vectors` dumps the
+// same table from the crate and `ErrorCodeTests` compares the two.
 
 /// Numeric error code shared with every other Apache Iggy SDK and the server.
 ///
@@ -92,6 +92,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidNumberEncoding = 82
     case invalidBooleanValue = 83
     case invalidNumberValue = 84
+    case requestTooOld = 85
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -147,6 +148,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidPartitionsCount = 2019
     case topicDirectoryNotFound = 2020
     case tooManyTopics = 2021
+    case partitionsLimitReached = 2022
     case cannotCreatePartition = 3000
     case cannotCreatePartitionsDirectory = 3001
     case cannotCreatePartitionDirectory = 3002
@@ -338,6 +340,7 @@ extension IggyErrorCode {
         case .invalidNumberEncoding: "invalid_number_encoding"
         case .invalidBooleanValue: "invalid_boolean_value"
         case .invalidNumberValue: "invalid_number_value"
+        case .requestTooOld: "request_too_old"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -393,6 +396,7 @@ extension IggyErrorCode {
         case .invalidPartitionsCount: "invalid_partitions_count"
         case .topicDirectoryNotFound: "topic_directory_not_found"
         case .tooManyTopics: "too_many_topics"
+        case .partitionsLimitReached: "partitions_limit_reached"
         case .cannotCreatePartition: "cannot_create_partition"
         case .cannotCreatePartitionsDirectory: "cannot_create_partitions_directory"
         case .cannotCreatePartitionDirectory: "cannot_create_partition_directory"

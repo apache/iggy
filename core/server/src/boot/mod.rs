@@ -24,6 +24,7 @@
 //! the leaves hold the support it calls into.
 
 mod credentials;
+mod fd_limit;
 mod handoff;
 mod listeners;
 mod recovery;
@@ -32,13 +33,16 @@ pub mod systemd;
 mod threads;
 mod topology;
 
+pub use crate::dispatch::host::ServerHost;
 pub use credentials::apply_default_root_credentials;
+pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
 use crate::boot::credentials::{
     ensure_default_root_user, load_replica_auth, load_replica_tls_ctx,
     validate_root_credentials_env,
 };
+use crate::boot::fd_limit::client_connection_cap;
 use crate::boot::handoff::{
     BootstrapBarrier, MetadataHandoff, await_bootstrap_complete, await_metadata_bundle,
     broadcast_metadata_bundle, signal_bootstrap_complete,
@@ -57,29 +61,17 @@ use crate::boot::threads::{
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
-use crate::dispatch::submit::make_metadata_submit_handler;
-use crate::dispatch::{
-    make_deferred_client_request_handler, make_deferred_replica_message_handler,
-    make_list_clients_handler,
-};
 use crate::server_error::ServerError;
-use crate::session_manager::SessionManager;
-use crate::shell::{
-    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellBus, ShellHandlers,
-    ShellShardHandle,
-};
+use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::{Operation, PrepareHeader};
-use journal::superblock::SuperblockStore;
-use journal::{Journal, JournalHandle};
+use iggy_binary_protocol::Operation;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
-use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
@@ -88,47 +80,12 @@ use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{error, info, warn};
-
-/// Build the deferred dispatch handlers for `shard_handle` against `bus`.
-///
-/// They share one fresh [`SessionManager`]. The caller must set the weak
-/// self-reference in `shard_handle` once the shard is built, so the
-/// handlers can upgrade it per frame.
-pub fn wire_shell_handlers<B, MJ, S, SB>(
-    bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-    server_config: Arc<ServerConfig>,
-    max_tokens_per_user: u32,
-) -> ShellHandlers
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
-    ShellHandlers {
-        on_replica_message: make_deferred_replica_message_handler(shard_handle),
-        on_client_request: make_deferred_client_request_handler(
-            bus,
-            shard_handle,
-            &sessions,
-            server_config,
-            max_tokens_per_user,
-        ),
-        on_metadata_submit: make_metadata_submit_handler(shard_handle),
-        on_list_clients: make_list_clients_handler(&sessions),
-        sessions,
-    }
-}
 
 /// Load the server configuration from the active config provider.
 ///
@@ -257,6 +214,11 @@ pub fn bootstrap(
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
+    // Before the shards, so the first count is there when a client connects.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
+    if let Err(error) = crate::sysinfo_probe::start_open_files_scan(sysinfo_print_interval) {
+        warn!(error = %error, "cannot start the open-files scan thread, so open_files_count stays 0");
+    }
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 
@@ -529,10 +491,17 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
-                |mux_stm, client, stamp| {
-                    mux_stm
-                        .streams()
-                        .remove_consumer_group_member(client, stamp);
+                |mux_stm, header| {
+                    if header.operation == iggy_binary_protocol::Operation::Register {
+                        mux_stm
+                            .streams()
+                            .refresh_consumer_group_session(header.client, header.op);
+                    } else {
+                        mux_stm.streams().remove_consumer_group_member(
+                            header.client,
+                            iggy_common::IggyTimestamp::from(header.timestamp),
+                        );
+                    }
                 },
             )
             .await
@@ -639,6 +608,7 @@ async fn shard_main(
     // table from scratch, so running it afterwards would drop every resumed
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
+    metadata.set_partitions_max(config.metadata.partitions_max);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
     // clients that kept their identity across the restart (IGGY-137). Recovery
@@ -668,7 +638,7 @@ async fn shard_main(
     let ShardBuild {
         shard,
         sessions,
-        on_client_request,
+        consumer_group_liveness,
         shard_handle,
     } = Box::pin(build_shard_for_thread(
         shard_id,
@@ -862,12 +832,14 @@ async fn shard_main(
     } else {
         None
     };
-    let stop_signals = StopSignals {
+    let mut stop_signals = StopSignals {
         pump: stop_tx,
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
         segment_cleaner: segment_cleaner_stop,
+        sysinfo_printer: None,
+        consumer_group_liveness: None,
     };
 
     // One keep-alive per process, so shard 0 owns it. Started before the
@@ -917,21 +889,6 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        // Reseed the client-id minter above every recovered entry before any
-        // listener accepts. The counter is per process; the table it must not
-        // collide with was rebuilt from the previous boot's WAL. Keyed by view
-        // so a later promotion refolds the table (the minting path calls the
-        // same method, see `HttpInner::register_session_once`).
-        let boot_view = shard
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()
-            .map_or(0, consensus::VsrConsensus::view);
-        coord.seed_client_sequence(
-            boot_view,
-            shard.plane.metadata().client_table.borrow().client_ids(),
-        );
         // The request handler strands every frame until the weak
         // self-reference is backfilled, so the build must have done that
         // before the first listener binds.
@@ -944,7 +901,13 @@ async fn shard_main(
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
-        let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
+        let connections = Rc::new(client_connection_cap(config.message_bus.connections_max));
+        let accepted_client = make_shard_zero_client_accept_fns(
+            coord,
+            &bus,
+            shard.client_request_handler(),
+            &connections,
+        );
         let roster = sessions.borrow().cluster_roster();
 
         if let Err(error) = start_tcp_runtime(
@@ -955,6 +918,7 @@ async fn shard_main(
             accepted_replica,
             dialed_replica,
             accepted_client,
+            &connections,
             &shard_metrics_all,
         )
         .await
@@ -976,6 +940,41 @@ async fn shard_main(
         // this is the first point at which a unit ordered after us may dial.
         #[cfg(feature = "systemd")]
         systemd::notify_ready();
+    }
+
+    if shard_id == 0 {
+        let (stop_tx, stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.consumer_group.heartbeat_interval.get_duration();
+        let timeout = config.consumer_group.session_timeout.get_duration();
+        let handle = compio::runtime::spawn(async move {
+            crate::consumer_group::liveness::run(
+                cleaner_shard,
+                consumer_group_liveness,
+                stop_rx,
+                interval,
+                timeout,
+            )
+            .await;
+        });
+        bus.track_background(handle);
+        stop_signals.consumer_group_liveness = Some(stop_tx);
+    }
+
+    // Shard 0 only, since the line describes the whole process. After the
+    // bootstrap barrier: before it, a peer that still recovers times out the
+    // client gather, and each tick would warn and print zero clients. A zero
+    // interval disables it.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval;
+    if shard_id == 0 && !sysinfo_print_interval.is_zero() {
+        let (stop_tx, stop_rx) = channel(1);
+        let printer_shard = Rc::clone(&shard);
+        let interval = sysinfo_print_interval.get_duration();
+        let handle = compio::runtime::spawn(async move {
+            crate::sysinfo_printer::run_sysinfo_printer(printer_shard, stop_rx, interval).await;
+        });
+        bus.track_background(handle);
+        stop_signals.sysinfo_printer = Some(stop_tx);
     }
 
     bus.token().wait().await;

@@ -27,7 +27,9 @@ pub mod install_backup;
 mod journal;
 mod log;
 mod messages_writer;
+mod offset_recovery;
 pub mod offset_storage;
+mod partition_storage;
 mod persistence;
 mod poll_plan;
 #[cfg(feature = "simulator")]
@@ -37,6 +39,7 @@ pub use persistence::{
 };
 mod segment;
 pub mod segment_anchor;
+mod segment_recovery;
 pub mod state_transfer;
 mod types;
 
@@ -69,8 +72,17 @@ pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
 pub use iggy_partition::{PollCompletion, PollReplication};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
+pub use partition_storage::{
+    CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
+    create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
+    hydrate_partition_log, read_created_revision, write_created_revision,
+};
 pub use poll_plan::{PollPlan, PollReadResult};
 pub use segment::Segment;
+pub use segment_recovery::{
+    PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,
+    load_persisted_segments_with_checkpoint,
+};
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;

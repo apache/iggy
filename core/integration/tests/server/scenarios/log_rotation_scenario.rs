@@ -21,6 +21,7 @@ use iggy_common::{Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSi
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -28,12 +29,15 @@ use test_case::test_matrix;
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
+use zip::ZipArchive;
 
 const RETENTION_SECS: u64 = 30;
 const OPERATION_TIMEOUT_SECS: u64 = 10;
 const OPERATION_LOOP_COUNT: usize = 300;
 const FROM_BYTES_TO_KB: u64 = 1000;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
+const LOGGING_INITIALIZED_LINE: &str = "Logging initialized";
+const DECOY_LOG_DIR: &str = "decoy_logs";
 
 static PRINT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -124,6 +128,92 @@ async fn log_rotation_should_be_valid(present_log_config: LogRotationTestConfig)
     let log_dir = format!("{}/logs", harness.server().data_path().display());
 
     run(&harness, &log_dir, present_log_config).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn given_log_path_existing_in_working_directory_when_server_starts_should_log_under_data_path()
+ {
+    // The server runs in this directory, so the decoy has the same relative
+    // path as the configured log directory.
+    let working_dir = tempfile::tempdir().expect("create server working directory");
+    let decoy = working_dir.path().join(DECOY_LOG_DIR);
+    std::fs::create_dir(&decoy).expect("create decoy directory in the working directory");
+    let extra_envs = HashMap::from([("IGGY_LOGGING_PATH".to_string(), DECOY_LOG_DIR.to_string())]);
+    let mut harness = TestHarness::builder()
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(extra_envs)
+                .current_dir(working_dir.path())
+                .build(),
+        )
+        .build()
+        .unwrap();
+
+    harness.start().await.unwrap();
+
+    let log_file = harness
+        .server()
+        .data_path()
+        .join(DECOY_LOG_DIR)
+        .join(IGGY_LOG_BASE_NAME);
+    assert!(log_file.is_file(), "no log file at {}", log_file.display());
+    let leaked = std::fs::read_dir(&decoy)
+        .expect("read decoy directory")
+        .count();
+    assert_eq!(
+        leaked,
+        0,
+        "the server wrote logs into the working directory {}",
+        decoy.display()
+    );
+
+    let snapshot = harness
+        .root_client()
+        .await
+        .unwrap()
+        .snapshot(
+            SnapshotCompression::Stored,
+            vec![SystemSnapshotType::ServerLogs],
+        )
+        .await
+        .unwrap();
+    let mut server_logs = String::new();
+    ZipArchive::new(Cursor::new(snapshot.0))
+        .unwrap()
+        .by_name(&format!("{}.txt", SystemSnapshotType::ServerLogs))
+        .unwrap()
+        .read_to_string(&mut server_logs)
+        .unwrap();
+    assert!(
+        server_logs.contains(LOGGING_INITIALIZED_LINE),
+        "the snapshot read the empty working directory copy, not the logs under the data path"
+    );
+}
+
+#[tokio::test]
+#[parallel]
+async fn given_rust_log_and_config_level_when_server_starts_should_apply_rust_log() {
+    // Only the startup line from `server_common` tells the two filters apart;
+    // the harness needs the other info lines to see the cluster form.
+    let extra_envs = HashMap::from([
+        (
+            "IGGY_LOGGING_LEVEL".to_string(),
+            "info,server_common=warn".to_string(),
+        ),
+        ("RUST_LOG".to_string(), "info".to_string()),
+    ]);
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::builder().extra_envs(extra_envs).build())
+        .build()
+        .unwrap();
+
+    harness.start().await.unwrap();
+
+    assert!(
+        harness.server().stdout_contains("Log filter: info"),
+        "the server_common startup line is missing, so logging.level overrode RUST_LOG"
+    );
 }
 
 async fn run(harness: &TestHarness, log_dir: &str, present_log_config: LogRotationTestConfig) {
