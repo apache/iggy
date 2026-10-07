@@ -55,10 +55,10 @@ pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
-    CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PartitionIncarnation,
-    PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob, PartitionIoNotifier,
-    PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources, PartitionIoResult,
-    PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+    CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
+    PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
+    PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
 };
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 

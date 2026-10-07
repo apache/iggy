@@ -430,6 +430,8 @@ pub enum PartitionReadReply {
     SegmentDeleteOffset {
         up_to_offset: Option<u64>,
         lagging: bool,
+        created_revision: u64,
+        purge_generation: u64,
     },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
@@ -5029,7 +5031,12 @@ where
         else {
             return;
         };
-        if partition.history_is_busy() {
+        let consensus = partition.consensus();
+        let serving_primary = consensus.is_primary()
+            && consensus.is_normal()
+            && consensus.log_view() == consensus.view()
+            && !partition.read_history_is_changing();
+        if partition.history_is_busy() && !serving_primary {
             partition.defer_view_transition(MessageBag::RequestStartView(msg.clone()));
             return;
         }
@@ -7686,6 +7693,12 @@ where
         );
         let partitions = self.plane.partitions();
         let repair_retry_ticks = self.repair_retry_ticks.get();
+        self.partition_io.tick();
+        for identity in self.partition_io.interrupted() {
+            if let Some(partition) = partitions.get_io_owner(&identity.namespace) {
+                partition.interrupt_io(identity);
+            }
+        }
         let gap_debounce_ticks = self.repair_gap_debounce_ticks.get();
         // Fan out over every group (each partition's heartbeat/retransmit timer
         // must advance), so the keyed single-namespace lookup the control-frame
@@ -7704,8 +7717,10 @@ where
                 }
                 let _ = partition.persist_superblock_if_needed().await;
             }
-            if let Some(partition) = partitions.get_io_owner(namespace) {
-                partition.retry_io();
+            if let Some(partition) = partitions.get_io_owner(namespace)
+                && partition.needs_io_retry()
+            {
+                self.partition_io.retry(*namespace, partition.incarnation());
             }
         }
 
@@ -8530,6 +8545,8 @@ where
     where
         B: MessageBus,
     {
+        // TODO: Move partition offer hashing, segment loads and receiver spills
+        // into bounded file-lane jobs so they cannot stall consensus ticks.
         // Pass 1 inside the borrow decides; a segment artifact that is not
         // resident exits with its path and is loaded OUTSIDE the borrow (a
         // RefCell borrow must not be held across an await), then pass 2

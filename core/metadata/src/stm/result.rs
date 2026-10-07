@@ -210,6 +210,7 @@ result_enum!(TruncatePartitionResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     PartitionNotFound = 3007,
+    HistoryChanged = 3014,
 });
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`

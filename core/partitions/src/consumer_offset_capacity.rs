@@ -321,6 +321,10 @@ impl ConsumerOffsetCapacity {
         }
     }
 
+    pub(crate) fn has_pending(&self, id: u32) -> bool {
+        self.pending.borrow().contains_key(&id)
+    }
+
     pub(crate) const fn is_uncertain(&self) -> bool {
         self.uncertain.get()
     }

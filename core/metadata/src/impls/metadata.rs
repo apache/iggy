@@ -156,7 +156,9 @@ impl IggySnapshot {
         compio::runtime::spawn(async move {
             let _permit = permit;
             let result = Self::write_durably_inner(&path, encoded, SnapshotIo::Compio).await;
-            let _ = sender.send(result);
+            if let Err(Err(error)) = sender.send(result) {
+                warn!(path = %path.display(), %error, "snapshot write failed after its caller stopped");
+            }
         })
         .detach();
         receiver
@@ -1827,6 +1829,8 @@ pub enum StateTransferUnavailable {
     /// No snapshot has ever been persisted. The WAL still holds the full
     /// history, so the requester's journal repair covers its whole gap.
     NoSnapshot,
+    /// A checkpoint or detached snapshot writer still owns the snapshot.
+    CheckpointInProgress,
     /// `snapshot.bin` exists but could not be read, or failed its integrity
     /// trailer. Refusing is strictly better than shipping it: the receiver
     /// would re-seal the corruption under a fresh valid trailer.
@@ -1839,6 +1843,7 @@ impl std::fmt::Display for StateTransferUnavailable {
             Self::NotCaughtUpPrimary => write!(f, "not a caught-up primary"),
             Self::NoCoordinator => write!(f, "no snapshot coordinator on this shard"),
             Self::NoSnapshot => write!(f, "no snapshot has been persisted yet"),
+            Self::CheckpointInProgress => write!(f, "snapshot checkpoint is in progress"),
             Self::SnapshotUnreadable(source) => {
                 write!(f, "persisted snapshot is unreadable: {source}")
             }
@@ -1925,13 +1930,20 @@ where
     pub async fn state_transfer_offer(
         &self,
     ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
-        let _checkpoint = self.checkpoint_lock.acquire().await;
+        let _checkpoint = self
+            .checkpoint_lock
+            .try_acquire()
+            .ok_or(StateTransferUnavailable::CheckpointInProgress)?;
         let _snapshot_io = if self
             .coordinator
             .as_ref()
             .is_none_or(|coordinator| matches!(coordinator.io, SnapshotIo::Compio))
         {
-            Some(SNAPSHOT_IO.lock().await)
+            Some(
+                SNAPSHOT_IO
+                    .try_lock()
+                    .ok_or(StateTransferUnavailable::CheckpointInProgress)?,
+            )
         } else {
             None
         };
@@ -2205,7 +2217,9 @@ where
                 );
                 let checksum = checkpoint_checksum(snapshot_bytes);
                 self.clear_state_transfer_offer_cache();
-                coordinator.write_snapshot(snapshot_bytes.to_vec()).await?;
+                let mut encoded = Vec::with_capacity(snapshot_bytes.len() + SNAPSHOT_TRAILER_LEN);
+                encoded.extend_from_slice(snapshot_bytes);
+                coordinator.write_snapshot(encoded).await?;
                 coordinator.seed_last_checkpoint(snapshot_seq, checksum);
                 tracing::info!(
                     checkpoint_op = snapshot_seq,
@@ -4345,69 +4359,19 @@ where
     msg
 }
 
-/// Build a `TruncatePartition` request attributed to the originating client.
-///
-/// Replicated through the standard client-request path so the commit records
-/// `(client, session, request)` in the `ClientTable` and advances that
-/// session's watermark. Attributing the truncate to an internal id (or
-/// skipping the commit) would leave this request id unrecorded, so the
-/// client's own retry of it would re-execute instead of deduping.
-///
-/// `template` is the client's own `DeleteSegments` header: it supplies the wire
-/// `cluster` / `view` / `release` and the client's `request` number.
-/// `client_id` / `session` are the bound VSR identity.
+/// Build a truncate attributed to the client's original request and session.
+/// Committed rejections also advance the client table, so retries deduplicate.
 ///
 /// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few fixed-width fields, so this cannot happen in practice.
+/// If the request size exceeds `u32::MAX`; this fixed-size command cannot.
 #[must_use]
 pub fn build_truncate_partition_client_message(
     template: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
-    stream_id: u32,
-    topic_id: u32,
-    partition_id: u32,
-    up_to_offset: u64,
+    request: &TruncatePartitionRequest,
 ) -> Message<RoutedRequestHeader> {
-    build_truncate_partition_client_message_with_identifiers(
-        template,
-        client_id,
-        session,
-        WireIdentifier::numeric(stream_id),
-        WireIdentifier::numeric(topic_id),
-        partition_id,
-        up_to_offset,
-    )
-}
-
-/// [`build_truncate_partition_client_message`] with the client's raw wire
-/// identifiers (name or id) instead of resolved numeric ids.
-///
-/// Used when the target does not resolve on the handling node: the truncate
-/// still commits, and the apply rejects it as a committed result, keeping the
-/// client's request sequence contiguous while surfacing the typed error.
-///
-/// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few small fields, so this cannot happen in practice.
-#[must_use]
-pub fn build_truncate_partition_client_message_with_identifiers(
-    template: &RoutedRequestHeader,
-    client_id: u128,
-    session: u64,
-    stream_id: WireIdentifier,
-    topic_id: WireIdentifier,
-    partition_id: u32,
-    up_to_offset: u64,
-) -> Message<RoutedRequestHeader> {
-    let body = TruncatePartitionRequest {
-        stream_id,
-        topic_id,
-        partition_id,
-        up_to_offset,
-    }
-    .to_bytes();
+    let body = request.to_bytes();
     let header_size = size_of::<RoutedRequestHeader>();
     let total = header_size + body.len();
     let mut msg = Message::<RoutedRequestHeader>::new(total);
@@ -4432,6 +4396,35 @@ pub fn build_truncate_partition_client_message_with_identifiers(
         };
     }
     msg
+}
+
+/// Build a committed rejection for a target that did not resolve locally.
+/// Keeping the raw identifiers lets metadata report the missing resource.
+///
+/// # Panics
+/// If the request size exceeds `u32::MAX`; this fixed-size command cannot.
+#[must_use]
+pub fn build_truncate_partition_client_message_with_identifiers(
+    template: &RoutedRequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RoutedRequestHeader> {
+    build_truncate_partition_client_message(
+        template,
+        client_id,
+        session,
+        &TruncatePartitionRequest {
+            stream_id,
+            topic_id,
+            partition_id,
+            up_to_offset,
+            expected_history: None,
+        },
+    )
 }
 
 fn build_prepare_message<B, P>(
@@ -4700,9 +4693,18 @@ mod tests {
             .persist(&path)
             .await
             .unwrap();
-        let first = metadata.state_transfer_offer().await.unwrap();
+        let checkpoint = metadata.checkpoint_lock.acquire().await;
+        {
+            let mut blocked_offer = std::pin::pin!(metadata.state_transfer_offer());
+            assert!(matches!(
+                futures::poll!(&mut blocked_offer),
+                std::task::Poll::Ready(Err(StateTransferUnavailable::CheckpointInProgress))
+            ));
+        }
+        drop(checkpoint);
+        let first = settled_transfer_offer(&metadata).await.unwrap();
         std::fs::remove_file(&path).unwrap();
-        let cached = metadata.state_transfer_offer().await.unwrap();
+        let cached = settled_transfer_offer(&metadata).await.unwrap();
         assert!(
             Rc::ptr_eq(&first, &cached),
             "a cache hit must need no disk read"
@@ -4715,7 +4717,7 @@ mod tests {
             .install_state_transfer(&incoming, ClientTable::new(CLIENTS_TABLE_MAX), 1, 1)
             .await
             .unwrap();
-        let replaced = metadata.state_transfer_offer().await.unwrap();
+        let replaced = settled_transfer_offer(&metadata).await.unwrap();
         assert_eq!(replaced.snapshot_seq, 1);
         assert!(!Rc::ptr_eq(&first, &replaced));
 
@@ -4724,9 +4726,28 @@ mod tests {
         damaged[0] ^= 1;
         std::fs::write(&path, damaged).unwrap();
         assert!(matches!(
-            metadata.state_transfer_offer().await,
+            settled_transfer_offer(&metadata).await,
             Err(StateTransferUnavailable::SnapshotUnreadable(_))
         ));
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn settled_transfer_offer(
+        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+    ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        compio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                match metadata.state_transfer_offer().await {
+                    Err(StateTransferUnavailable::CheckpointInProgress) => {
+                        compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .expect("concurrent snapshot writers settle")
     }
 
     #[compio::test]

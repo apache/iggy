@@ -332,6 +332,8 @@ pub enum IggyError {
     /// range frees again.
     #[error("Partition id space exhausted for this topic")]
     PartitionIdSpaceExhausted = 3013,
+    #[error("Partition history changed after the request was resolved")]
+    PartitionHistoryChanged = 3014,
     #[error("Failed to read consumers offsets from path: {0}")]
     CannotReadConsumerOffsets(String) = 3020,
     #[error("Consumer offset for consumer with ID: {0} was not found.")]

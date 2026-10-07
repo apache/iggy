@@ -106,7 +106,7 @@ pub trait DurableStorage {
     fn entries(&self, path: &Path) -> impl Future<Output = io::Result<Vec<StorageEntry>>>;
     /// Enumerate regular files without including directories.
     ///
-    /// Disk scans skip unreadable entries and unsupported file types, and bound
+    /// Disk scans report unreadable entries, skip unsupported file types, and bound
     /// both worker concurrency and buffered paths. Other backends may use their
     /// existing directory enumeration through the default implementation.
     ///
@@ -321,13 +321,13 @@ impl DurableStorage for DiskStorage {
             .spawn(move || {
                 let _permit = permit;
                 let result = (|| {
-                    // An unreadable entry must not hide the remaining files.
-                    // Only opening the directory fails the scan.
+                    let mut scan_error = None;
                     for entry in std::fs::read_dir(&directory)? {
                         let entry = match entry {
                             Ok(entry) => entry,
                             Err(error) => {
                                 warn!(path = %directory.display(), %error, "failed to read directory entry");
+                                scan_error.get_or_insert(error);
                                 continue;
                             }
                         };
@@ -335,6 +335,7 @@ impl DurableStorage for DiskStorage {
                             Ok(file_type) => file_type.is_file(),
                             Err(error) => {
                                 warn!(path = %directory.display(), %error, "failed to read entry type");
+                                scan_error.get_or_insert(error);
                                 continue;
                             }
                         };
@@ -342,7 +343,7 @@ impl DurableStorage for DiskStorage {
                             return Ok(());
                         }
                     }
-                    Ok(())
+                    scan_error.map_or(Ok(()), Err)
                 })();
                 // Explicit completion distinguishes an empty directory from an
                 // interrupted worker. Closed receivers abandon enumeration.
@@ -577,6 +578,11 @@ mod tests {
         let mut successor = Box::pin(run_blocking("iggy-test-successor", || Ok(())));
         assert!(futures::poll!(&mut successor).is_pending());
         compio::time::sleep(Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut successor).is_pending());
+        let independent = std::thread::spawn(|| {
+            futures::executor::block_on(run_blocking("iggy-test-independent", || Ok(())))
+        });
+        independent.join().unwrap().unwrap();
         assert!(futures::poll!(&mut successor).is_pending());
         release.send(()).unwrap();
         successor.await.unwrap();

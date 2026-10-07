@@ -414,7 +414,8 @@ retention = "7 days"
 
 # Interval for printing process and host usage (CPU, memory, disk, clients,
 # messages, open file descriptors) to the log from shard 0. "0 s" disables the
-# line. Any other value must be at least 1 s.
+# line. Any other value must be at least 1 s. CPU usage covers the latest
+# sampler interval (1 s), independently of this print interval.
 sysinfo_print_interval = "10 s"
 
 # Encryption configuration

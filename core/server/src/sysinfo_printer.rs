@@ -20,6 +20,7 @@
 //! Spawned on shard 0 only: the numbers describe the whole process, so one
 //! line per node is enough, and the client count is already a cross-shard
 //! gather.
+//! CPU usage is the latest sampler delta (1 s), not the interval between logs.
 
 use crate::shell::ServerShard;
 use crate::sysinfo_probe::{SystemStats, probe_system_stats};

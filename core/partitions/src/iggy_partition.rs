@@ -236,8 +236,7 @@ where
     io_sequence: Cell<u64>,
     io_active: Rc<crate::io::PartitionIoQuiescence>,
     pub(crate) transition: Option<PendingPartitionTransition>,
-    io_replies: VecDeque<(PipelineEntry, Option<CachedReply>)>,
-    io_promotions: usize,
+    deferred_views: Vec<server_common::MessageBag>,
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Identity shared with pending polls and replaced when their history retires.
     poll_history: PollHistoryId,
@@ -608,7 +607,6 @@ enum NoAckStep {
 
 pub enum PendingPartitionTransition {
     View {
-        message: server_common::MessageBag,
         drain: Option<crate::PersistenceDrain>,
     },
     Truncate {
@@ -690,12 +688,14 @@ struct PendingCommit {
     batch_stats: Vec<Option<CommittedBatchStats>>,
     retirements: Vec<(u64, RetireSessionsRequest)>,
     offset_effects: Vec<ConsumerOffsetEffect>,
+    offset_batch: Vec<(usize, ConsumerOffsetPlan)>,
     incarnation: crate::PartitionIncarnation,
     poll_history: PollHistoryId,
     applied_floor: u64,
     from_pipeline: bool,
     send_client_replies: bool,
     materialize: bool,
+    index_span_limit: u64,
     phase: CommitPhase,
     next_entry: usize,
     evictable: usize,
@@ -731,6 +731,7 @@ enum CommitStep {
 }
 
 struct PendingMaterialization {
+    index_span_limit: u64,
     incarnation: crate::PartitionIncarnation,
     poll_history: PollHistoryId,
     through_op: u64,
@@ -793,10 +794,15 @@ enum PartitionShutdownPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SuperblockIntent {
+    /// Preserve an incoming frontier before a destructive swap; never rewind.
     Advance { frontier: u64, reserved: u64 },
+    /// A purge legitimately replaces both the frontier and its reservation.
     Reset(u64),
+    /// Drop a local reservation to the installed group's committed frontier.
     Install(u64),
+    /// Bypass retry backoff before moving the frontier's corroborating files.
     Quarantine(Option<u64>),
+    /// After a successful shutdown flush, retain only the consumed reservation.
     Collapse { frontier: u64, reserved: u64 },
 }
 
@@ -964,8 +970,7 @@ where
             io_sequence: Cell::new(0),
             io_active: Rc::default(),
             transition: None,
-            io_replies: VecDeque::new(),
-            io_promotions: 0,
+            deferred_views: Vec::new(),
             poll_history: PollHistoryId::default(),
             incarnation: crate::PartitionIncarnation::default(),
             workerless_offset_files: Rc::default(),
@@ -1211,10 +1216,6 @@ where
             persistence: self.persistence.clone(),
             offset_files: Rc::clone(&self.workerless_offset_files),
         }
-    }
-
-    pub fn stop_io_admission(&self) {
-        self.io_active.retire();
     }
 
     pub fn begin_quarantine(&mut self, frontier: Option<u64>) {
@@ -1579,10 +1580,12 @@ where
     }
 
     pub fn needs_persistence_checkpoint(&self) -> bool {
-        self.persistence.as_ref().is_some_and(|persistence| {
-            persistence.needs_checkpoint()
-                && self.consensus.commit_min().min(persistence.head()) > persistence.checkpoint_op()
-        })
+        self.maintenance.checkpoint.is_none()
+            && self.persistence.as_ref().is_some_and(|persistence| {
+                persistence.needs_checkpoint()
+                    && self.consensus.commit_min().min(persistence.head())
+                        > persistence.checkpoint_op()
+            })
     }
 
     pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
@@ -1749,7 +1752,10 @@ where
             | PendingCheckpoint::Syncing(_)
             | PendingCheckpoint::Reclaiming => Ok(Some(crate::PartitionIoStep::Pending)),
             PendingCheckpoint::Flush(through) => {
-                if !self.begin_materialization(through)? {
+                if !self.begin_materialization(
+                    through,
+                    self.effective_size_of_messages_required_to_save(config),
+                )? {
                     return Ok(Some(crate::PartitionIoStep::Pending));
                 }
                 if self.materialization.is_none() {
@@ -1924,12 +1930,10 @@ where
         self.durability().is_persisted() && self.persistence_checkpoint_pending()
     }
 
-    /// The checkpoint worker syncs the retained offset handles and opens the
-    /// dirty offset paths. A write in its window reopens a file with a
-    /// truncation and a delete removes a listed path, so the checkpoint could
-    /// sync an empty file or fail.
-    fn offset_writes_wait_for_checkpoint(&self) -> bool {
-        self.persistence_checkpoint_pending()
+    /// A checkpoint may still need to open the deleted path. In-place writes
+    /// preserve that path and remain covered by the uncheckpointed WAL tail.
+    fn offset_effect_waits_for_checkpoint(&self, plan: &ConsumerOffsetPlan) -> bool {
+        matches!(plan.action, ConsumerOffsetAction::Delete) && self.persistence_checkpoint_pending()
     }
 
     pub async fn drive_persistence(&mut self) {
@@ -1966,6 +1970,9 @@ where
             let Some(header) = pending else {
                 break;
             };
+            if header.op > persistence.head() {
+                break;
+            }
             if persistence.checksum(header.op) == Some(header.checksum)
                 && !self.send_prepare_ok(&header).await
             {
@@ -2257,27 +2264,6 @@ where
         claim
             .max(self.held_offset_frontier())
             .max(self.durable_offset_frontier.get())
-    }
-
-    /// Record an incoming state-transfer frontier, advancing the frontier and
-    /// SETTING the reservation to the frontier this write records.
-    ///
-    /// Not to the offer: `write_superblock_inner` clamps the reservation up to
-    /// the frontier it writes, which is `advanced_frontier(frontier)` and sits
-    /// above the offer whenever an earlier over-claiming write left the durable
-    /// frontier higher.
-    ///
-    /// The one place the otherwise-monotone reservation may come down, and the
-    /// one place it must: the offer describes the group's committed log, so a
-    /// local reservation above it covers offsets this replica never confirmed.
-    /// Carried forward, it re-seeds the counter a lease block above the group
-    /// after the next restart, where every replicated prepare fails the
-    /// `base_offset == dirty_offset + 1` check.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
-    pub async fn install_offset_frontier_at(&self, frontier: u64) -> bool {
-        self.complete_superblock_intent(SuperblockIntent::Install(frontier))
-            .await
     }
 
     const fn offset_range_is_reserved(&self, end_offset: u64) -> bool {
@@ -2870,87 +2856,6 @@ where
         on_disk.max(self.offset_frontier())
     }
 
-    /// Force the durable record to catch up with the current offset frontier,
-    /// outside the view-change gate.
-    ///
-    /// [`Self::persist_superblock_if_needed`] fires on `(view, log_view)`
-    /// changes only, which is the right trigger for the split-brain fence and
-    /// the wrong one for the frontier: an install can move the counter by
-    /// millions without touching the view.
-    ///
-    /// One production caller, at the END of a state-transfer install, which is
-    /// also the converge path that follows a failed one. It pairs with the
-    /// [`Self::persist_offset_frontier_at`] the install writes BEFORE its
-    /// destructive swap: that one is a lower bound across the swap window, this
-    /// one records what the installed chain actually holds. Returns whether the
-    /// record now holds it; a failure is logged there and left to the ordinary
-    /// retry, since the install itself already succeeded.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
-    pub async fn persist_offset_frontier(&self) -> bool {
-        self.persist_offset_frontier_at(self.offset_frontier())
-            .await
-    }
-
-    /// Record a frontier that may be LOWER than the one already on disk.
-    ///
-    /// The frontier is conditionally monotone: it advances everywhere except a
-    /// purge, which legitimately resets the offset space to 0. The advancing
-    /// form cannot express that -- it maxes against the live counter -- and the
-    /// distinction has to be explicit: a purge that leaves the old frontier
-    /// recorded makes the next boot re-seed the counter to the state the purge
-    /// just erased, and the following append stamps `base_offset` N where every
-    /// peer stamps 0.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
-    pub async fn reset_offset_frontier(&self) -> bool {
-        self.reset_offset_frontier_at(self.offset_frontier()).await
-    }
-
-    /// [`Self::reset_offset_frontier`] for a frontier the live counter does not
-    /// hold yet.
-    ///
-    /// Two callers need the value spelled out rather than read off the counter.
-    /// A purge records its reset BEFORE it unlinks anything, while the counter
-    /// still names the pre-purge space, so a crash mid-unlink cannot boot into
-    /// a re-seed of the space the purge was erasing. An install under an
-    /// advancing purge generation records the offer's frontier, which is
-    /// legitimately below the local counter: the advancing form would max it
-    /// straight back up and leave the pre-purge value on disk across the swap
-    /// window.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
-    pub async fn reset_offset_frontier_at(&self, frontier: u64) -> bool {
-        self.complete_superblock_intent(SuperblockIntent::Reset(frontier))
-            .await
-    }
-
-    /// Record the frontier immediately ahead of an irreversible quarantine,
-    /// BYPASSING the retry backoff.
-    ///
-    /// The gate exists because the other writers' callers became retry loops,
-    /// and skipping a doomed write costs them nothing. This caller is the
-    /// opposite: it writes once and then moves the segments that are the
-    /// record's only corroborating witness into `.fenced.N`, so a skip here is
-    /// not deferred work, it is the last chance gone. A disk that recovered
-    /// inside the backoff window would otherwise leave the rebuild re-seeding
-    /// from a stale record with nothing left to take the max against.
-    ///
-    /// `intended` is the frontier the caller knows the group is at, written
-    /// verbatim; `None` means the live counter is authoritative and the
-    /// advancing form applies.
-    ///
-    /// The reservation keeps its max either way: `vsr_state` calls it a monotone
-    /// ceiling, and only a purge or an install may bring it down. Inert while
-    /// the one `Some` caller is the replicated `ConvergeFailed` arm, where the
-    /// fence never ran and it already equals the frontier.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
-    pub async fn record_frontier_before_quarantine(&self, intended: Option<u64>) -> bool {
-        self.complete_superblock_intent(SuperblockIntent::Quarantine(intended))
-            .await
-    }
-
     /// Whether a recent write failure's backoff window is still open.
     ///
     /// The same gate [`Self::persist_superblock_if_needed`] applies before its
@@ -2962,64 +2867,16 @@ where
         self.consensus.clock_realtime_micros() < self.superblock_retry_after_micros.get()
     }
 
-    /// Drop the reservation back onto the frontier, once a graceful flush has
-    /// made the segments account for every offset this replica confirmed.
-    ///
-    /// The reservation is there for the crash case, where they do not. Left
-    /// standing it would make every ordinary restart resume a lease block
-    /// higher and hole the offset space for nothing.
-    ///
-    /// Collapses onto [`Self::mint_frontier`], not [`Self::offset_frontier`]: the
-    /// append point is what the next boot has to resume at, and on a boot that
-    /// consumed a reservation without appending it is the reservation itself, so
-    /// reading the committed frontier here would write a record BELOW what an
-    /// earlier life already confirmed to a client. A clean stop is the runbook
-    /// answer to an incident, which would make it the one action that undoes the
-    /// protection.
-    ///
-    /// The frontier field still records only what is held: a graceful stop
-    /// flushes the committed prefix, but the journal can hold an uncommitted tail
-    /// that the next view legitimately truncates.
-    ///
-    /// Callers must have flushed FIRST, and must not call this when the flush
-    /// failed: the claim it makes is precisely that the flush succeeded.
-    ///
-    /// BYPASSES the retry backoff, like `record_frontier_before_quarantine`: the
-    /// stop is the last chance, not deferred work. Skipped, the reservation
-    /// stands and the next boot seeds the append counter a lease block above the
-    /// data, holing the offset space for nothing.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; a failed collapse leaves a gap"]
-    pub async fn collapse_offset_reservation(&self) -> bool {
+    /// Collapse only after a successful flush. A reservation consumed on boot
+    /// remains the mint frontier even when no new messages have been appended.
+    fn collapse_superblock_intent(&self) -> Option<SuperblockIntent> {
         let reserved = self.mint_frontier();
-        if self.durable_offset_reserved.get() <= reserved {
-            return true;
-        }
-        self.complete_superblock_intent(SuperblockIntent::Collapse {
-            frontier: self.advanced_frontier(0),
-            reserved,
+        (self.superblock.is_some() && self.durable_offset_reserved.get() > reserved).then(|| {
+            SuperblockIntent::Collapse {
+                frontier: self.advanced_frontier(0),
+                reserved,
+            }
         })
-        .await
-    }
-
-    /// [`Self::persist_offset_frontier`] for a frontier this replica has not
-    /// reached yet.
-    ///
-    /// Used to record an INCOMING frontier before a destructive swap: the
-    /// install unlinks the old chain and fsyncs that before the first staged
-    /// rename lands, and boot sweeps `.log.staging` unconditionally, so a crash
-    /// in that window otherwise leaves no copy of the frontier anywhere. Writing
-    /// the claim first makes it a durable lower bound the whole way through, and
-    /// over-claiming is harmless: the convergence that follows a failed install
-    /// seeds the counter from the same artifact frontier.
-    #[allow(clippy::future_not_send)]
-    #[must_use = "the bool is the durability verdict; dropping it silently ignores a failed write"]
-    pub async fn persist_offset_frontier_at(&self, frontier: u64) -> bool {
-        self.complete_superblock_intent(SuperblockIntent::Advance {
-            frontier,
-            reserved: 0,
-        })
-        .await
     }
 
     /// Whether the offset reservation is close enough to being consumed that it
@@ -3973,7 +3830,7 @@ where
         // the group agreed. Safe wherever the read was served, and checked
         // before the role so a caught-up backup is not refused for a
         // commit nobody needs.
-        if !self.has_unsettled_local_requests()
+        if !self.consumer_offset_is_blocked(kind, consumer_id, None, true)
             && self
                 .durable_consumer_offsets
                 .covers(kind, consumer_id, offset)
@@ -4010,7 +3867,13 @@ where
             return Err(IggyError::TransientNotAccepted);
         }
         let order = self.next_local_request_order()?;
-        if self.consensus.pipeline_is_full() || self.has_unsettled_local_requests() {
+        if self.consensus.pipeline_is_full()
+            || self
+                .consensus
+                .with_pipeline(|pipeline| !pipeline.request_queue_is_empty())
+            || !self.no_ack.is_empty()
+            || self.consumer_offset_is_blocked(kind, consumer_id, Some(offset), true)
+        {
             let context = AutoCommitRequestContext {
                 history: self.poll_history,
                 reservation,
@@ -4041,12 +3904,61 @@ where
             .ok_or(IggyError::TransientNotAccepted)
     }
 
-    fn has_unsettled_local_requests(&self) -> bool {
-        !self.no_ack.is_empty()
-            || self.pending_commit.is_some()
+    fn consumer_offset_is_blocked(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: Option<u64>,
+        include_queued: bool,
+    ) -> bool {
+        // Admission reserves a store's key before its prepare is journaled.
+        // This also covers a poll completion awaiting on_replicate.
+        if self
+            .consumer_offset_capacity_for(kind)
+            .has_pending(consumer_id)
             || self
-                .consensus
-                .with_pipeline(|pipeline| !pipeline.is_empty())
+                .pending_consumer_offset_commits
+                .values()
+                .any(|pending| pending.kind == kind && pending.consumer_id == consumer_id)
+            || (include_queued
+                && self.no_ack.iter().any(|pending| {
+                    pending.pending.kind == kind && pending.pending.consumer_id == consumer_id
+                }))
+        {
+            return true;
+        }
+        let needs_messages =
+            offset.is_some_and(|offset| self.store_offset_range_error(kind, offset).is_some());
+        if needs_messages
+            && self
+                .pending_commit
+                .as_ref()
+                .is_some_and(PendingCommit::has_sends)
+        {
+            return true;
+        }
+        self.consensus.with_pipeline(|pipeline| {
+            (include_queued
+                && pipeline.pending_requests().any(|entry| {
+                    (needs_messages && entry.message.header().operation == Operation::SendMessages)
+                        || Self::parse_consumer_offset_request(
+                            entry.message.header().operation,
+                            &entry.message,
+                        )
+                        .is_ok_and(|(pending_kind, pending_id, _, _)| {
+                            pending_kind == kind && pending_id == consumer_id
+                        })
+                }))
+                || (needs_messages
+                    && pipeline.prepare_head().is_some_and(|head| {
+                        let tail = pipeline.prepare_tail().expect("pipeline head implies tail");
+                        (head.header.op..=tail.header.op).any(|op| {
+                            pipeline.message_by_op(op).is_some_and(|entry| {
+                                entry.header.operation == Operation::SendMessages
+                            })
+                        })
+                    }))
+        })
     }
 
     /// `on_replicate` journals nothing during a transition, retirement or
@@ -4500,7 +4412,7 @@ where
                 }
                 NoAckStep::Progress
             }
-            NoAckPhase::OffsetReady(_) if self.offset_writes_wait_for_checkpoint() => {
+            NoAckPhase::OffsetReady(plan) if self.offset_effect_waits_for_checkpoint(plan) => {
                 NoAckStep::Pending
             }
             NoAckPhase::OffsetReady(_) => NoAckStep::Ready,
@@ -5223,16 +5135,17 @@ where
         }
     }
 
-    pub fn retry_io(&self) {
-        if self.io_active.get().is_none()
+    #[must_use]
+    pub fn needs_io_retry(&self) -> bool {
+        self.io_active.get().is_none()
             && (self.pending_commit.is_some()
                 || self.materialization.is_some()
                 || self.transition.is_some()
+                || !self.deferred_views.is_empty()
                 || self.superblock_intent.get().is_some()
                 || self.pending_wire_actions.borrow().is_some()
                 || !self.pending_persisted_acks.borrow().is_empty()
                 || !self.no_ack.is_empty()
-                || !self.io_replies.is_empty()
                 || self.maintenance.flush_through.is_some()
                 || self.maintenance.checkpoint.is_some()
                 || self.maintenance.retention.is_some()
@@ -5240,16 +5153,7 @@ where
                     .maintenance
                     .shutdown
                     .is_some_and(|phase| phase != PartitionShutdownPhase::Complete)
-                || self.io_promotions > 0
                 || self.queued_requests_ready())
-        {
-            self.notify_io();
-        }
-    }
-
-    #[must_use]
-    pub fn io_active(&self) -> Option<crate::PartitionIoIdentity> {
-        self.io_active.get()
     }
 
     #[must_use]
@@ -5280,7 +5184,6 @@ where
             || self.pending_commit.is_some()
             || self.materialization.is_some()
             || self.maintenance.flush_through.is_some()
-            || !self.io_replies.is_empty()
             || self.no_ack.front().is_some_and(|head| {
                 !matches!(
                     head.phase,
@@ -5291,23 +5194,26 @@ where
     }
 
     pub fn defer_view_transition(&mut self, message: server_common::MessageBag) {
-        match &mut self.transition {
-            Some(PendingPartitionTransition::View {
-                message: pending, ..
-            }) => {
-                if deferred_view_order(&message).is_some_and(|incoming| {
-                    deferred_view_order(pending).is_some_and(|current| incoming > current)
-                }) {
-                    *pending = message;
-                }
+        let Some((view, phase, sender)) = deferred_view_order(&message) else {
+            return;
+        };
+        if sender >= self.consensus.replica_count() {
+            return;
+        }
+        if let Some(pending) = self.deferred_views.iter_mut().find(|pending| {
+            deferred_view_order(pending).is_some_and(|(_, pending_phase, pending_sender)| {
+                pending_phase == phase && pending_sender == sender
+            })
+        }) {
+            if deferred_view_order(pending).is_some_and(|(pending_view, _, _)| view >= pending_view)
+            {
+                *pending = message;
             }
-            None => {
-                self.transition = Some(PendingPartitionTransition::View {
-                    message,
-                    drain: None,
-                });
-            }
-            Some(_) => {}
+        } else {
+            self.deferred_views.push(message);
+        }
+        if self.transition.is_none() {
+            self.transition = Some(PendingPartitionTransition::View { drain: None });
         }
         self.notify_io();
     }
@@ -5361,6 +5267,9 @@ where
         &mut self,
         config: &PartitionsConfig,
     ) -> Result<crate::PartitionIoStep, IggyError> {
+        if self.transition.is_none() && !self.deferred_views.is_empty() {
+            self.transition = Some(PendingPartitionTransition::View { drain: None });
+        }
         if self.io_active.get().is_some() {
             if self.io_active.is_interrupted() && self.maintenance.shutdown.is_some() {
                 self.maintenance.shutdown = Some(PartitionShutdownPhase::Complete);
@@ -5380,11 +5289,6 @@ where
                 return Ok(self.drive_quarantine_io().await);
             }
             return Ok(crate::PartitionIoStep::Pending);
-        }
-        if !self.io_replies.is_empty() {
-            let replies = std::mem::take(&mut self.io_replies);
-            self.deliver_commit_replies(replies).await;
-            return Ok(crate::PartitionIoStep::Progress);
         }
         if let Some(transition) = &self.transition
             && let Some(head) = self.no_ack.front()
@@ -5473,7 +5377,7 @@ where
                 CommitStep::Pending => Ok(crate::PartitionIoStep::Pending),
                 CommitStep::Ready => self.io_plan(crate::PartitionIoContinuation::Commit),
                 CommitStep::Publish => {
-                    self.queue_committed_replies();
+                    self.finish_pending_commit().await;
                     Ok(crate::PartitionIoStep::Progress)
                 }
             };
@@ -5499,7 +5403,16 @@ where
                 return Ok(crate::PartitionIoStep::Pending);
             }
             let ready_through = self.flushable_through(through);
-            if self.begin_materialization(ready_through)?
+            let journal = &self.log.journal().inner;
+            let prefix = journal.committed_prefix_len(ready_through);
+            let retained = journal.with_entries(|entries| entries.len().saturating_sub(prefix));
+            // Eviction rebuilds the retained tail. Amortize partial flushes so
+            // a slow writer cannot make us rebuild a large tail after each write.
+            if (ready_through == through || prefix >= retained)
+                && self.begin_materialization(
+                    ready_through,
+                    self.effective_size_of_messages_required_to_save(config),
+                )?
                 && (self.materialization.is_some() || ready_through == through)
             {
                 if self.materialization.is_none() {
@@ -5519,10 +5432,15 @@ where
                 }
                 persistence.finish_drain(drain);
             }
-            let Some(PendingPartitionTransition::View { message, .. }) = self.transition.take()
-            else {
-                unreachable!("ready view transition exists");
-            };
+            self.transition = None;
+            let next = self
+                .deferred_views
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, message)| deferred_view_order(message))
+                .map(|(index, _)| index)
+                .expect("a view transition owns a deferred message");
+            let message = self.deferred_views.swap_remove(next);
             return Ok(crate::PartitionIoStep::Transition(message));
         }
         if let Some(PendingPartitionTransition::Truncate { from_op, drain, .. }) =
@@ -5599,13 +5517,6 @@ where
             }
         }
         if let Some(through) = self.maintenance.retention {
-            if self
-                .persistence
-                .as_ref()
-                .is_some_and(|persistence| !persistence.is_quiescent())
-            {
-                return Ok(crate::PartitionIoStep::Pending);
-            }
             if self.retention_is_ready(through) {
                 return self.io_plan(crate::PartitionIoContinuation::Retention);
             }
@@ -5615,10 +5526,10 @@ where
             self.deny_queued_requests_at_shutdown().await;
             return Ok(crate::PartitionIoStep::Progress);
         }
-        if self.io_promotions > 0 || self.queued_requests_ready() {
-            self.io_promotions = self.io_promotions.saturating_sub(1);
+        if self.queued_requests_ready() {
             let queued = self.consensus.request_queue_len();
-            self.drain_request_queue_into_prepares(1).await;
+            self.drain_request_queue_into_prepares(consensus::PIPELINE_PREPARE_QUEUE_MAX)
+                .await;
             if self.consensus.request_queue_len() < queued {
                 return Ok(crate::PartitionIoStep::Progress);
             }
@@ -5670,6 +5581,14 @@ where
             )
             .ok_or(IggyError::CannotWriteToFile)?
         };
+        if continuation == crate::PartitionIoContinuation::Commit
+            && let Some(pending) = &self.pending_commit
+            && matches!(pending.phase, CommitPhase::OffsetReady(_))
+        {
+            allocation_charge = allocation_charge
+                .checked_mul(pending.offset_batch.len() + 1)
+                .ok_or(IggyError::CannotWriteToFile)?;
+        }
         if continuation == crate::PartitionIoContinuation::Checkpoint
             && let Some(PendingCheckpoint::Receipts(_, receipts)) = &self.maintenance.checkpoint
         {
@@ -5819,6 +5738,7 @@ where
             )
         {
             drop(result);
+            self.notify_io();
             return Ok(());
         }
         if identity.history != self.poll_history {
@@ -6081,7 +6001,8 @@ where
         let commit_min = self.consensus.commit_min();
         if self.log.journal().inner.committed_prefix_len(commit_min) > 0 {
             self.maintenance.transfer_flush = true;
-            self.request_flush(commit_min);
+            self.defer_flush(commit_min);
+            self.notify_io();
             return true;
         }
         // A flush through a committed op the walk has not applied yet leaves
@@ -6154,17 +6075,11 @@ where
                 crate::PartitionIoStep::Progress
             }
             Some(PartitionShutdownPhase::Collapse) => {
-                let reserved = self.mint_frontier();
-                let verdict = if self.superblock.is_none()
-                    || self.durable_offset_reserved.get() <= reserved
-                {
-                    crate::PartitionIoVerdict::Ready
-                } else {
-                    self.request_superblock_intent(SuperblockIntent::Collapse {
-                        frontier: self.advanced_frontier(0),
-                        reserved,
-                    })
-                };
+                let verdict = self
+                    .collapse_superblock_intent()
+                    .map_or(crate::PartitionIoVerdict::Ready, |intent| {
+                        self.request_superblock_intent(intent)
+                    });
                 if verdict == crate::PartitionIoVerdict::Pending {
                     return crate::PartitionIoStep::Pending;
                 }
@@ -6242,11 +6157,13 @@ where
         true
     }
 
-    fn queue_committed_replies(&mut self) {
+    async fn finish_pending_commit(&mut self) {
         if let Some(committed) = self.publish_pending_commit() {
-            debug_assert!(self.io_replies.is_empty());
-            self.io_promotions += committed.len();
-            self.io_replies = committed.into();
+            let committed_count = committed.len();
+            self.deliver_commit_replies(committed).await;
+            self.drain_no_ack().await;
+            self.drain_request_queue_into_prepares(committed_count)
+                .await;
         }
     }
 
@@ -6739,8 +6656,11 @@ where
                 return;
             }
 
+            let offset_blocked = consumer_offset.is_some_and(|(kind, id, offset, _)| {
+                self.consumer_offset_is_blocked(kind, id, offset, true)
+            });
             if matches!(message.header().operation, Operation::DeleteConsumerOffset)
-                && !self.has_unsettled_local_requests()
+                && !offset_blocked
                 && let Some((kind, consumer_id, _, _)) = consumer_offset
                 && let Err(error) = self.ensure_consumer_offset_exists(kind, consumer_id)
             {
@@ -6779,7 +6699,7 @@ where
             // status-only `classify_partition_reply` would misread a result-body
             // code on this committed-shaped frame (op=commit_max) as success.
             if matches!(message.header().operation, Operation::StoreConsumerOffset)
-                && !self.has_unsettled_local_requests()
+                && !offset_blocked
                 && let Some((kind, _, Some(requested_offset), _)) = consumer_offset
                 && let Some(error) = self.store_offset_range_error(kind, requested_offset)
             {
@@ -6840,7 +6760,7 @@ where
                 let queued = consensus.pipeline_is_full()
                     || consensus.with_pipeline(|pipeline| !pipeline.request_queue_is_empty())
                     || !self.no_ack.is_empty()
-                    || (consumer_offset.is_some() && self.has_unsettled_local_requests());
+                    || offset_blocked;
                 let reservation = if queued {
                     crate::PartitionIoVerdict::Pending
                 } else {
@@ -6940,13 +6860,14 @@ where
                         *request.message.header(),
                         request.local_order,
                         self.request_mint_ceiling(&request.message),
+                        self.queued_request_is_blocked(&request.message, request.local_order),
                     )
                 })
             });
-            let Some((header, order, ceiling)) = head else {
+            let Some((header, order, ceiling, blocked)) = head else {
                 break;
             };
-            if self.queued_request_is_blocked(&header, order) {
+            if blocked {
                 break;
             }
             let reservation_ready = if let Some(ceiling) = ceiling {
@@ -7115,26 +7036,26 @@ where
                 && !self.consensus.pipeline_is_full()
                 && self.consensus.with_pipeline(|pipeline| {
                     pipeline.request_head().is_some_and(|request| {
-                        !self.queued_request_is_blocked(
-                            request.message.header(),
-                            request.local_order,
-                        )
+                        !self.queued_request_is_blocked(&request.message, request.local_order)
                     })
                 }))
     }
 
     fn queued_request_is_blocked(
         &self,
-        header: &RoutedRequestHeader,
+        message: &Message<RoutedRequestHeader>,
         order: Option<LocalRequestOrder>,
     ) -> bool {
         self.no_ack
             .front()
             .is_some_and(|head| order.is_some_and(|order| order > head.local_order))
             || (matches!(
-                header.operation,
+                message.header().operation,
                 Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) && (self.consensus.pipeline_len() > 0 || self.pending_commit.is_some()))
+            ) && Self::parse_consumer_offset_request(message.header().operation, message)
+                .is_ok_and(|(kind, id, offset, _)| {
+                    self.consumer_offset_is_blocked(kind, id, offset, false)
+                }))
     }
 
     fn no_ack_ready(&self) -> bool {
@@ -8301,7 +8222,10 @@ where
             {
                 return Ok(true);
             }
-            if !self.begin_materialization(through_op)? {
+            if !self.begin_materialization(
+                through_op,
+                self.effective_size_of_messages_required_to_save(config),
+            )? {
                 return Ok(false);
             }
             if self.materialization.is_none() {
@@ -8327,7 +8251,11 @@ where
         }
     }
 
-    fn begin_materialization(&mut self, through_op: u64) -> Result<bool, IggyError> {
+    fn begin_materialization(
+        &mut self,
+        through_op: u64,
+        index_span_limit: u64,
+    ) -> Result<bool, IggyError> {
         if self.materialization.is_some() {
             return Ok(true);
         }
@@ -8340,6 +8268,7 @@ where
             return Ok(false);
         }
         self.materialization = Some(PendingMaterialization {
+            index_span_limit,
             incarnation: self.incarnation,
             poll_history: self.poll_history,
             through_op,
@@ -8522,7 +8451,11 @@ where
             .persistence
             .as_ref()
             .filter(|persistence| persistence.segment_checkpoint().is_some())
-            .map(|_| iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE);
+            .and_then(|_| {
+                self.materialization
+                    .as_ref()
+                    .map(|pending| pending.index_span_limit)
+            });
         self.log.journal().inner.with_entries(|entries| {
             let entries = entries
                 .get(first_entry..prefix_len)
@@ -8824,17 +8757,17 @@ where
         config: &PartitionsConfig,
         send_client_replies: bool,
     ) {
-        if !self.io_replies.is_empty() {
-            self.notify_io();
-            return;
-        }
-        if self.pending_commit.is_none()
-            && !self.select_commit(headers, config, send_client_replies)
-        {
+        let mut just_selected = self.pending_commit.is_none();
+        if just_selected && !self.select_commit(headers, config, send_client_replies) {
             return;
         }
         loop {
-            let step = match self.drive_commit() {
+            let step = if std::mem::take(&mut just_selected) {
+                self.drive_validated_commit()
+            } else {
+                self.drive_commit()
+            };
+            let step = match step {
                 Ok(step) => step,
                 Err(error) => {
                     self.fail_pending_commit(&error);
@@ -8864,14 +8797,7 @@ where
                     }
                 }
                 CommitStep::Publish => {
-                    let Some(committed) = self.publish_pending_commit() else {
-                        return;
-                    };
-                    let committed_count = committed.len();
-                    self.deliver_commit_replies(committed).await;
-                    self.drain_no_ack().await;
-                    self.drain_request_queue_into_prepares(committed_count)
-                        .await;
+                    self.finish_pending_commit().await;
                     return;
                 }
             }
@@ -8882,6 +8808,10 @@ where
         if !self.pending_commit_is_current() {
             return Err(IggyError::CannotWriteToFile);
         }
+        self.drive_validated_commit()
+    }
+
+    fn drive_validated_commit(&mut self) -> Result<CommitStep, IggyError> {
         // Selection bounds the commit run. Revalidate after yielding or I/O,
         // while CPU-only phases can share this validation in the same turn.
         loop {
@@ -8906,7 +8836,9 @@ where
                     }
                 },
                 CommitPhase::Offsets => self.drive_committed_offsets(),
-                CommitPhase::OffsetReady(_) if self.offset_writes_wait_for_checkpoint() => {
+                CommitPhase::OffsetReady(plan)
+                    if self.offset_effect_waits_for_checkpoint(&plan) =>
+                {
                     Ok(CommitStep::Pending)
                 }
                 CommitPhase::OffsetReady(_) => Ok(CommitStep::Ready),
@@ -8970,7 +8902,7 @@ where
                 .last()
                 .ok_or(IggyError::CannotWriteToFile)?
                 .op;
-            if !self.begin_materialization(through_op)? {
+            if !self.begin_materialization(through_op, pending.index_span_limit)? {
                 if has_sends {
                     return Ok(CommitStep::Pending);
                 }
@@ -8998,7 +8930,6 @@ where
             .pending_commit
             .as_ref()
             .ok_or(IggyError::CannotWriteToFile)?;
-
         let Some(header) = pending.headers.get(pending.next_entry).copied() else {
             self.pending_commit
                 .as_mut()
@@ -9018,11 +8949,63 @@ where
                 .next_entry += 1;
             return Ok(CommitStep::Progress);
         }
+        let plan = self.plan_committed_offset(header.op, pending)?;
+        if let ConsumerOffsetAction::Ready(effect) = plan.action {
+            self.accept_committed_offset_effect(effect)?;
+        } else {
+            let mut batch = Vec::new();
+            if matches!(plan.action, ConsumerOffsetAction::Write { .. }) {
+                for (entry, header) in pending
+                    .headers
+                    .iter()
+                    .enumerate()
+                    .skip(pending.next_entry + 1)
+                {
+                    if batch.len() + 1 >= crate::state_transfer::OFFSET_PERSIST_CONCURRENCY {
+                        break;
+                    }
+                    if header.op <= self.purge_floor_op {
+                        continue;
+                    }
+                    match header.operation {
+                        Operation::StoreConsumerOffset => {}
+                        Operation::DeleteConsumerOffset => break,
+                        _ => continue,
+                    }
+                    let next = self.plan_committed_offset(header.op, pending)?;
+                    if !matches!(next.action, ConsumerOffsetAction::Write { .. })
+                        || std::iter::once(&plan)
+                            .chain(batch.iter().map(|(_, plan)| plan))
+                            .any(|earlier| {
+                                earlier.pending.kind == next.pending.kind
+                                    && earlier.pending.consumer_id == next.pending.consumer_id
+                            })
+                    {
+                        break;
+                    }
+                    batch.push((entry, next));
+                }
+            }
+            let pending = self
+                .pending_commit
+                .as_mut()
+                .expect("selected commit exists");
+            pending.offset_batch = batch;
+            pending.phase = CommitPhase::OffsetReady(plan);
+        }
+        Ok(CommitStep::Progress)
+    }
+
+    fn plan_committed_offset(
+        &self,
+        op: u64,
+        pending: &PendingCommit,
+    ) -> Result<ConsumerOffsetPlan, IggyError> {
         let offset = self
             .pending_consumer_offset_commits
-            .get(&header.op)
+            .get(&op)
             .copied()
-            .map_or_else(|| self.restage_consumer_offset_from_journal(header.op), Ok)?;
+            .map_or_else(|| self.restage_consumer_offset_from_journal(op), Ok)?;
         let tracked = pending
             .offset_effects
             .iter()
@@ -9038,16 +9021,7 @@ where
                 },
                 |effect| effect.state,
             );
-        let plan = self.plan_consumer_offset_effect(offset, tracked);
-        if let ConsumerOffsetAction::Ready(effect) = plan.action {
-            self.accept_committed_offset_effect(effect)?;
-        } else {
-            self.pending_commit
-                .as_mut()
-                .expect("selected commit exists")
-                .phase = CommitPhase::OffsetReady(plan);
-        }
-        Ok(CommitStep::Progress)
+        Ok(self.plan_consumer_offset_effect(offset, tracked))
     }
 
     fn capture_commit_phase(
@@ -9061,10 +9035,33 @@ where
             .phase;
         let (job, submitted) = match phase {
             CommitPhase::Materialize => return self.capture_materialization(config),
-            CommitPhase::OffsetReady(plan) => (
-                self.capture_consumer_offset_effect(&plan)?,
-                CommitPhase::OffsetSubmitted(plan),
-            ),
+            CommitPhase::OffsetReady(plan) => {
+                let first = self.capture_consumer_offset_effect(&plan)?;
+                let batch = &self
+                    .pending_commit
+                    .as_ref()
+                    .expect("selected commit exists")
+                    .offset_batch;
+                let job = if batch.is_empty() {
+                    first
+                } else {
+                    let crate::io::PartitionIoJob::OffsetWrite(first) = first else {
+                        return Err(IggyError::CannotWriteToFile);
+                    };
+                    let mut jobs = Vec::with_capacity(batch.len() + 1);
+                    jobs.push(first);
+                    for (_, plan) in batch {
+                        let crate::io::PartitionIoJob::OffsetWrite(job) =
+                            self.capture_consumer_offset_effect(plan)?
+                        else {
+                            return Err(IggyError::CannotWriteToFile);
+                        };
+                        jobs.push(job);
+                    }
+                    crate::io::PartitionIoJob::OffsetBatch(jobs)
+                };
+                (job, CommitPhase::OffsetSubmitted(plan))
+            }
             CommitPhase::SegmentDirectory => (
                 crate::io::PartitionIoJob::SegmentDirectory(
                     self.partition_dir
@@ -9108,8 +9105,41 @@ where
                     .as_mut()
                     .expect("selected commit exists")
                     .phase = CommitPhase::OffsetReady(plan);
-                let effect = self.accept_consumer_offset_effect(plan, result)?;
-                self.accept_committed_offset_effect(effect)
+                if let crate::io::PartitionIoResult::OffsetBatch(results) = result {
+                    let batch = std::mem::take(
+                        &mut self
+                            .pending_commit
+                            .as_mut()
+                            .expect("selected commit exists")
+                            .offset_batch,
+                    );
+                    if results.len() != batch.len() + 1 {
+                        return Err(IggyError::CannotWriteToFile);
+                    }
+                    let first_entry = self
+                        .pending_commit
+                        .as_ref()
+                        .expect("selected commit exists")
+                        .next_entry;
+                    for ((entry, plan), result) in std::iter::once((first_entry, plan))
+                        .chain(batch)
+                        .zip(results)
+                    {
+                        self.pending_commit
+                            .as_mut()
+                            .expect("selected commit exists")
+                            .next_entry = entry;
+                        let effect = self.accept_consumer_offset_effect(
+                            plan,
+                            crate::io::PartitionIoResult::OffsetWrite(result),
+                        )?;
+                        self.accept_committed_offset_effect(effect)?;
+                    }
+                    Ok(())
+                } else {
+                    let effect = self.accept_consumer_offset_effect(plan, result)?;
+                    self.accept_committed_offset_effect(effect)
+                }
             }
             (
                 CommitPhase::SegmentDirectorySubmitted,
@@ -9211,7 +9241,6 @@ where
             || matches!(*self.transfer_plan.borrow(), Some(TransferPlanSlot::Wanted))
             || self.consensus.is_transferring()
             || self.io_active.is_retiring()
-            || !self.io_replies.is_empty()
             || headers
                 .first()
                 .is_none_or(|first| Some(first.op) != applied_floor.checked_add(1))
@@ -9258,12 +9287,14 @@ where
             batch_stats,
             retirements,
             offset_effects: Vec::new(),
+            offset_batch: Vec::new(),
             incarnation: self.incarnation,
             poll_history: self.poll_history,
             applied_floor,
             from_pipeline,
             send_client_replies,
             materialize,
+            index_span_limit: self.effective_size_of_messages_required_to_save(config),
             phase: CommitPhase::Start,
             next_entry: 0,
             evictable: 0,
@@ -9347,6 +9378,7 @@ where
         }
         let mut retirements = pending.retirements.into_iter().peekable();
         let mut committed = Vec::with_capacity(entries.len());
+        let mut offset_keys = HashSet::new();
         for ((entry, header), batch_stats) in entries
             .into_iter()
             .zip(&pending.headers)
@@ -9356,7 +9388,7 @@ where
                 self.publish_committed_batch_stats(batch_stats);
             }
             if let Some(offset) = self.pending_consumer_offset_commits.remove(&header.op) {
-                self.refresh_consumer_offset_reservation(offset.kind, offset.consumer_id);
+                offset_keys.insert((offset.kind, offset.consumer_id));
             }
             if let Some((_, retirement)) = retirements.next_if(|(op, _)| *op == header.op) {
                 for identity in retirement.identities {
@@ -9403,11 +9435,8 @@ where
             );
             committed.push((entry, reply));
         }
-        for effect in &pending.offset_effects {
-            self.refresh_consumer_offset_reservation(
-                effect.pending.kind,
-                effect.pending.consumer_id,
-            );
+        for (kind, consumer_id) in offset_keys {
+            self.refresh_consumer_offset_reservation(kind, consumer_id);
         }
         self.consensus.sync_prepare_timeout();
         self.evict_committed_prefix(pending.evictable);
@@ -9953,6 +9982,11 @@ where
             messages_writer,
             index_position: index_writer.position(),
             index_writer,
+        };
+        let frozen_batches = if bodies_written.is_some() {
+            Vec::new()
+        } else {
+            frozen_batches
         };
         let job = crate::MaterializationIoJob {
             allocation_charge: crate::io::materialization_allocation_charge(
@@ -10687,6 +10721,8 @@ where
     /// [`PurgeError::GenerationNotRecorded`] when the completion marker cannot
     /// be persisted: cleanup is not rolled back, the applied generation stays,
     /// and `PrepareOk` stays deferred until a retried purge records it.
+    /// [`PurgeError::Unserviceable`] when phase planning, capture, directory
+    /// enumeration, or a mismatched completion prevents reliable cleanup.
     pub async fn complete_purge_with_storage<S: DurableStorage>(
         &mut self,
         config: &PartitionsConfig,
@@ -11094,6 +11130,7 @@ where
     }
 
     fn publish_purged_state(&mut self) {
+        self.maintenance.retention = None;
         self.recovered_durable_offset = None;
         self.installed_frontier = None;
         self.segment_checksum_cache.borrow_mut().clear();
@@ -11589,8 +11626,6 @@ where
         // consumer-offset ops (via `apply_replicated_operation`) append
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
-        // (`header_by_op` is a linear scan, so re-proving that here would
-        // put O(journal) on every ack; the call-order invariant stands in.)
         send_prepare_ok_common(self.consensus(), header, true).await
     }
 }
@@ -11600,19 +11635,39 @@ enum DeferredViewPhase {
     StartViewChange,
     DoViewChange,
     StartView,
+    RequestStartView,
+    StateTransferTarget,
 }
 
-fn deferred_view_order(message: &server_common::MessageBag) -> Option<(u32, DeferredViewPhase)> {
+fn deferred_view_order(
+    message: &server_common::MessageBag,
+) -> Option<(u32, DeferredViewPhase, u8)> {
     match message {
-        server_common::MessageBag::StartViewChange(message) => {
-            Some((message.header().view, DeferredViewPhase::StartViewChange))
-        }
-        server_common::MessageBag::DoViewChange(message) => {
-            Some((message.header().view, DeferredViewPhase::DoViewChange))
-        }
-        server_common::MessageBag::StartView(message) => {
-            Some((message.header().view, DeferredViewPhase::StartView))
-        }
+        server_common::MessageBag::StartViewChange(message) => Some((
+            message.header().view,
+            DeferredViewPhase::StartViewChange,
+            message.header().replica,
+        )),
+        server_common::MessageBag::DoViewChange(message) => Some((
+            message.header().view,
+            DeferredViewPhase::DoViewChange,
+            message.header().replica,
+        )),
+        server_common::MessageBag::StartView(message) => Some((
+            message.header().view,
+            DeferredViewPhase::StartView,
+            message.header().replica,
+        )),
+        server_common::MessageBag::RequestStartView(message) => Some((
+            message.header().view,
+            DeferredViewPhase::RequestStartView,
+            message.header().replica,
+        )),
+        server_common::MessageBag::StateTransferTarget(message) => Some((
+            message.header().view,
+            DeferredViewPhase::StateTransferTarget,
+            message.header().replica,
+        )),
         _ => None,
     }
 }
@@ -12058,7 +12113,7 @@ mod tests {
     use consensus::LocalPipeline;
     use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
     use iggy_binary_protocol::{
-        Command, ReplyHeader, StartViewHeader, WireConsumer, WireEncode, WireName,
+        Command, CommitHeader, ReplyHeader, StartViewHeader, WireConsumer, WireEncode, WireName,
     };
     use journal::DurableAppend;
     use message_bus::{BusMessage, SendError};
@@ -12319,6 +12374,76 @@ mod tests {
             "commits resume once the plan is pinned"
         );
         assert!(!partition.maintenance.transfer_flush);
+    }
+
+    #[compio::test]
+    async fn given_wal_lane_published_persisted_runs_when_idle_should_leave_the_tick_retry_set() {
+        const RUNS: u64 = 4;
+        const IDLE_TURNS_MAX: usize = 64;
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, config, mut parent) =
+            partition_with_committed_send(root.path(), iggy_common::Durability::Persisted, 1).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let notified = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = Rc::clone(&notified);
+        partition.set_io_notifier(
+            Rc::new(move |_, _| counter.set(counter.get() + 1)),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        for run in 0..RUNS {
+            let first = 2 * run + 2;
+            let mut prepares = Vec::new();
+            for op in [first, first + 1] {
+                let prepare = checksummed_segment_prepare(op, parent, op - 1, b"run");
+                parent = prepare.header().checksum;
+                persistence
+                    .append(prepare.clone().into_frozen(), true)
+                    .unwrap();
+                prepares.push(prepare);
+            }
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            for prepare in prepares {
+                let header = *prepare.header();
+                partition.consensus.with_pipeline_mut(|pipeline| {
+                    pipeline.push(PipelineEntry::new(header));
+                });
+                partition
+                    .append_repaired_send_messages(prepare)
+                    .await
+                    .unwrap();
+            }
+            partition.consensus().advance_commit_max(first + 1);
+            let headers = partition.select_persistable_commits(&config);
+            assert_eq!(headers.len(), 2);
+            // Select inline, as `on_ack` does, so the lane only publishes the run.
+            partition
+                .handle_committed_entries(headers, &config, true)
+                .await;
+            assert!(
+                partition.pending_commit.is_some(),
+                "a Persisted run under a dispatcher must wait for a lane job"
+            );
+            settle_partition_io(&mut partition, &config).await;
+            assert_eq!(partition.consensus().commit_min(), first + 1);
+        }
+        let mut idle_turns = 0;
+        while idle_turns < IDLE_TURNS_MAX {
+            notified.set(0);
+            if !partition.needs_io_retry() {
+                break;
+            }
+            idle_turns += 1;
+            assert!(matches!(
+                partition.resume_io(&config).await,
+                crate::PartitionIoStep::Pending
+            ));
+        }
+        assert!(partition.fatal().is_none());
+        assert_eq!(
+            idle_turns, 0,
+            "an idle partition must not stay in the tick retry set"
+        );
     }
 
     /// Installing wipes the journal, so an offer below a committed op this
@@ -13290,76 +13415,389 @@ mod tests {
         assert_eq!(persistence.checkpoint_op(), header.op);
     }
 
+    /// A one-message send prepare as the primary stamps it at `timestamp`.
+    fn stamped_send_prepare(
+        op: u64,
+        parent: u128,
+        offset: u64,
+        timestamp: u64,
+    ) -> Message<PrepareHeader> {
+        let mut prepare = checksummed_segment_prepare(op, parent, offset, b"payload");
+        let body = &mut prepare.as_mut_slice()[size_of::<PrepareHeader>()..];
+        let mut batch = BatchHeader::decode(body).unwrap();
+        batch.base_timestamp = timestamp;
+        batch.batch_checksum = batch.checksum_for_blob(&body[COMMAND_HEADER_SIZE..]);
+        batch.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+        prepare.transmute_header(|original, header: &mut PrepareHeader| {
+            *header = original;
+            header.timestamp = timestamp;
+            header.checksum = header.identity_checksum();
+        })
+    }
+
+    /// Start the WAL writer without polling it. Until the returned future
+    /// runs, every lane turn sees the busy writer of a spawned writer task
+    /// that is still writing.
+    fn hold_wal_writer(
+        persistence: &Rc<PartitionPersistence>,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        persistence.sync();
+        assert!(persistence.start());
+        Rc::clone(persistence).run()
+    }
+
+    /// The primary's Commit heartbeat, handled as the shard's `on_commit` does.
+    async fn commit_on_heartbeat(
+        partition: &mut IggyPartition<RecordingBus>,
+        config: &PartitionsConfig,
+        commit: u64,
+    ) {
+        let group = partition.namespace().inner();
+        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = TEST_CLUSTER;
+                header.group = group;
+                header.commit = commit;
+                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
+            },
+        );
+        assert!(matches!(
+            partition.consensus().handle_commit(heartbeat.header()),
+            consensus::CommitOutcome::Advanced
+        ));
+        partition.commit_journal(config).await;
+    }
+
+    /// A cleaner frame between the purge's segment jobs stores a retention
+    /// offset from the old history. The purge restarts offsets at 0, so the
+    /// offset must not reach the new history, even though lane turns keep it
+    /// while the WAL writer is busy.
     #[compio::test]
-    async fn committed_offset_writes_wait_out_a_pending_checkpoint() {
-        const CLIENT: u128 = 42;
-        const CONSUMER: u32 = 7;
-        let kind = ConsumerKind::Consumer;
+    async fn given_cleaner_frame_inside_dispatched_purge_when_new_segment_seals_should_keep_it() {
+        const RECORDS_PER_SEGMENT: u64 = 2;
+        const OLD_RECORDS: u64 = 3 * RECORDS_PER_SEGMENT;
+        const PURGE_GENERATION: u64 = 1;
+        let hour = std::time::Duration::from_hours(1);
+        let expiry = IggyExpiry::ExpireDuration(iggy_common::IggyDuration::from(hour));
+        let now = IggyTimestamp::now();
+        let old_timestamp = now.as_micros() - 2 * u64::try_from(hour.as_micros()).unwrap();
+
         let root = tempfile::tempdir().unwrap();
-        let (mut partition, replies, config, parent) =
+        let mut config = repair_config();
+        config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+        let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (mut partition, _) = recording_partition_at(1, 3);
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+        let record_len =
+            stamped_send_prepare(1, 0, 0, 1).as_slice().len() - size_of::<PrepareHeader>();
+        let segment_size = IggyByteSize::from(RECORDS_PER_SEGMENT * record_len as u64);
+        partition.runtime_options.segment_size = Some(segment_size);
+        partition.log.active_segment_mut().max_size = segment_size;
+        partition.open_persistence().await.unwrap();
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let layout = |partition: &IggyPartition<RecordingBus>| {
+            partition
+                .log
+                .segments()
+                .iter()
+                .map(|segment| (segment.start_offset, segment.end_offset, segment.sealed))
+                .collect::<Vec<_>>()
+        };
+
+        let mut parent = 0;
+        let writer = hold_wal_writer(&persistence);
+        for op in 1..=OLD_RECORDS {
+            let prepare = stamped_send_prepare(op, parent, op - 1, old_timestamp + op);
+            parent = prepare.header().checksum;
+            partition.on_replicate(prepare).await;
+        }
+        writer.await;
+        commit_on_heartbeat(&mut partition, &config, OLD_RECORDS).await;
+        settle_partition_io(&mut partition, &config).await;
+        assert_eq!(
+            layout(&partition),
+            vec![(0, 1, true), (2, 3, true), (4, 5, true), (6, 6, false)]
+        );
+
+        let writer = hold_wal_writer(&persistence);
+        assert!(matches!(
+            partition.purge(&config, PURGE_GENERATION).await,
+            Err(PurgeError::Pending)
+        ));
+        assert!(matches!(
+            partition.resume_io(&config).await,
+            crate::PartitionIoStep::Pending
+        ));
+        writer.await;
+        let old_segments = partition.log.segments().len();
+        while partition.log.segments().len() == old_segments {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::Progress => {}
+                _ => panic!("unexpected purge step before the first segment job"),
+            }
+        }
+        assert_eq!(
+            layout(&partition),
+            vec![(2, 3, true), (4, 5, true), (6, 6, false)]
+        );
+        assert_eq!(
+            partition.clean_expired_segments(now, expiry, None).await,
+            SegmentRemoval::default()
+        );
+        loop {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::PurgeFinished { outcome, .. } => {
+                    outcome.unwrap();
+                    break;
+                }
+                _ => panic!("unexpected purge step"),
+            }
+        }
+        assert_eq!(layout(&partition), vec![(0, 0, false)]);
+
+        // Sustained produce load: a new append restarts the writer before
+        // each lane turn, so no turn sees an idle writer.
+        let fresh_timestamp = IggyTimestamp::now().as_micros();
+        let mut writer = hold_wal_writer(&persistence);
+        for offset in 0..=RECORDS_PER_SEGMENT {
+            let op = OLD_RECORDS + 1 + offset;
+            let prepare = stamped_send_prepare(op, parent, offset, fresh_timestamp + offset);
+            parent = prepare.header().checksum;
+            partition.on_replicate(prepare).await;
+            writer.await;
+            writer = hold_wal_writer(&persistence);
+            commit_on_heartbeat(&mut partition, &config, op).await;
+            settle_partition_io(&mut partition, &config).await;
+        }
+        assert_eq!(layout(&partition), vec![(0, 1, true), (2, 2, false)]);
+        assert_eq!(
+            leading_expired_end(partition.log.segments(), IggyTimestamp::now(), expiry),
+            None,
+            "no post-purge message has expired"
+        );
+
+        // A due checkpoint, as the shard tick starts it. The byte trigger needs
+        // half of a WAL budget of at least 128 MiB, so the test requests it.
+        persistence.request_checkpoint();
+        assert!(partition.needs_persistence_checkpoint());
+        partition.checkpoint_persistence(&config).await;
+        settle_partition_io(&mut partition, &config).await;
+
+        // The load stops: the writer completes the checkpoint and goes idle.
+        writer.await;
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none());
+        assert!(
+            persistence
+                .segment_checkpoint()
+                .is_some_and(|checkpoint| checkpoint.next_offset > RECORDS_PER_SEGMENT - 1),
+            "the checkpoint covers the sealed post-purge segment"
+        );
+        assert_eq!(
+            layout(&partition),
+            vec![(0, 1, true), (2, 2, false)],
+            "a retention offset from the purged history removed unexpired messages"
+        );
+        assert!(directory.join("00000000000000000000.log").is_file());
+        assert_eq!(
+            partition.stats.messages_count_inconsistent(),
+            RECORDS_PER_SEGMENT + 1
+        );
+        let writer = hold_wal_writer(&persistence);
+        assert!(!persistence.is_quiescent());
+        partition
+            .remove_sealed_segments_up_to(RECORDS_PER_SEGMENT - 1)
+            .await;
+        let crate::PartitionIoStep::Ready(plan) = partition.resume_io(&config).await else {
+            panic!("a busy writer must not block retention of a checkpointed sealed segment");
+        };
+        assert_eq!(plan.continuation, crate::PartitionIoContinuation::Retention);
+        execute_partition_io_plan(&mut partition, &config, plan).await;
+        assert_eq!(layout(&partition), vec![(2, 2, false)]);
+        writer.await;
+    }
+
+    #[compio::test]
+    async fn given_transfer_flush_when_tick_promotes_a_queued_send_should_ack_it_on_the_primary() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, mut config, parent) =
             partition_with_committed_send(root.path(), iggy_common::Durability::Replicated, 3)
                 .await;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
         let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
-        let request = store_offset_request(CLIENT, 1, kind, CONSUMER, 0, AckLevel::Quorum);
-        let store = request.transmute_header(|request, header: &mut PrepareHeader| {
-            *header = PrepareHeader {
-                command: Command::Prepare,
-                operation: request.operation,
-                cluster: TEST_CLUSTER,
-                group: request.group,
-                size: request.size,
-                client: CLIENT,
-                user_id: request.user_id,
-                session: request.session,
-                request: request.request,
-                retry_capacity: u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap(),
-                op: 2,
-                parent,
-                ..PrepareHeader::default()
-            };
-            header.checksum = header.identity_checksum();
-        });
-        let header = *store.header();
+        config.messages_required_to_save = 8;
+        let prepare = checksummed_segment_prepare(2, parent, 1, b"resident");
+        let header = *prepare.header();
         persistence
-            .append(store.clone().into_frozen(), false)
+            .append(prepare.clone().into_frozen(), false)
             .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
         partition.consensus.with_pipeline_mut(|pipeline| {
             pipeline.push(PipelineEntry::new(header));
         });
         partition
-            .log
-            .journal()
-            .inner
-            .append(store.into_frozen())
+            .append_repaired_send_messages(prepare)
             .await
             .unwrap();
-        partition.stage_consumer_offset_upsert(header.op, kind, CONSUMER, 0, false);
-        persistence.checkpoint(1);
-        partition.consensus.advance_commit_max(header.op);
-        let path = partition.persisted_offset_path(kind, CONSUMER).unwrap();
-
+        partition.consensus.advance_commit_max(2);
         partition.commit_journal(&config).await;
-        assert!(partition.fatal().is_none());
-        assert_eq!(
-            partition.consensus.commit_min(),
-            1,
-            "the store must wait for the checkpoint"
+        assert_eq!(partition.consensus.commit_min(), 2);
+        assert_eq!(partition.log.journal().inner.resident_count(), 1);
+        partition.consensus.sequencer().set_sequence(2);
+        partition
+            .consensus
+            .set_last_prepare_checksum(header.checksum);
+        for _ in 0..2 {
+            let order = partition.next_local_request_order().unwrap();
+            let request = consensus::RequestEntry::with_sender(
+                checksumless_send_request(partition.namespace(), 1),
+                None,
+            );
+            assert!(partition.queue_local_request(request, order).is_ok());
+        }
+
+        assert!(matches!(
+            partition.state_transfer_offer(&config).await,
+            Err(PartitionTransferUnavailable::FlushPending)
+        ));
+        assert!(partition.drive_transfer_plan());
+        assert!(partition.maintenance.transfer_flush);
+
+        partition.resume_queued_requests().await;
+        settle_partition_io(&mut partition, &config).await;
+        partition.resume_queued_requests().await;
+
+        assert!(
+            partition
+                .consensus
+                .with_pipeline(|pipeline| pipeline.entry_by_op(3).is_some()
+                    && pipeline.entry_by_op(4).is_some()),
+            "both queued sends must be promoted"
         );
-        assert!(!std::path::Path::new(&path).exists());
-        assert_eq!(replies.borrow().len(), 1);
-
-        partition.start_persistence();
-        persistence.drain().await.unwrap();
-        assert!(!partition.persistence_checkpoint_pending());
-        partition.commit_journal(&config).await;
-        assert!(partition.fatal().is_none());
-        assert_eq!(partition.consensus.commit_min(), header.op);
-        assert!(std::path::Path::new(&path).is_file());
-        assert_eq!(replies.borrow().len(), 2);
+        let mut loopback = Vec::new();
+        partition.consensus().drain_loopback_into(&mut loopback);
+        let acked: Vec<u64> = loopback
+            .into_iter()
+            .map(|ack| ack.try_into_typed::<PrepareOkHeader>().unwrap().header().op)
+            .collect();
+        assert!(
+            acked.contains(&4),
+            "control: the primary acks a send promoted after the flush: {acked:?}"
+        );
+        assert!(
+            acked.contains(&3),
+            "a send promoted during the transfer flush must retain its self-ack: {acked:?}"
+        );
+        assert!(persistence.head() >= 4);
     }
 
     #[compio::test]
-    async fn no_ack_offset_writes_wait_out_a_pending_checkpoint() {
+    async fn committed_offset_mutations_obey_checkpoint_dependencies() {
+        const CLIENT: u128 = 42;
+        const CONSUMER: u32 = 7;
+        let kind = ConsumerKind::Consumer;
+        for delete in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut partition, replies, config, parent) =
+                partition_with_committed_send(root.path(), iggy_common::Durability::Replicated, 3)
+                    .await;
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            let request = if delete {
+                let initial = PendingConsumerOffsetCommit::upsert(kind, CONSUMER, 0);
+                partition
+                    .persist_consumer_offset_commit(initial)
+                    .await
+                    .unwrap();
+                partition.apply_consumer_offset_commit(initial);
+                delete_offset_request(CLIENT, 1, CONSUMER)
+            } else {
+                store_offset_request(CLIENT, 1, kind, CONSUMER, 0, AckLevel::Quorum)
+            };
+            let store = request.transmute_header(|request, header: &mut PrepareHeader| {
+                *header = PrepareHeader {
+                    command: Command::Prepare,
+                    operation: request.operation,
+                    cluster: TEST_CLUSTER,
+                    group: request.group,
+                    size: request.size,
+                    client: CLIENT,
+                    user_id: request.user_id,
+                    session: request.session,
+                    request: request.request,
+                    retry_capacity: u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap(),
+                    op: 2,
+                    parent,
+                    ..PrepareHeader::default()
+                };
+                header.checksum = header.identity_checksum();
+            });
+            let header = *store.header();
+            persistence
+                .append(store.clone().into_frozen(), false)
+                .unwrap();
+            partition.consensus.with_pipeline_mut(|pipeline| {
+                pipeline.push(PipelineEntry::new(header));
+            });
+            partition
+                .log
+                .journal()
+                .inner
+                .append(store.into_frozen())
+                .await
+                .unwrap();
+            if delete {
+                partition.stage_consumer_offset_delete(header.op, kind, CONSUMER);
+            } else {
+                partition.stage_consumer_offset_upsert(header.op, kind, CONSUMER, 0, false);
+            }
+            persistence.checkpoint(1);
+            partition.consensus.advance_commit_max(header.op);
+            let path = partition.persisted_offset_path(kind, CONSUMER).unwrap();
+
+            partition.commit_journal(&config).await;
+            assert!(partition.fatal().is_none());
+            assert_eq!(
+                partition.consensus.commit_min(),
+                if delete { 1 } else { header.op },
+                "only a delete must wait for the checkpoint"
+            );
+            assert!(std::path::Path::new(&path).exists());
+            assert_eq!(replies.borrow().len(), if delete { 1 } else { 2 });
+
+            partition.start_persistence();
+            persistence.drain().await.unwrap();
+            assert!(!partition.persistence_checkpoint_pending());
+            partition.commit_journal(&config).await;
+            assert!(partition.fatal().is_none());
+            assert_eq!(partition.consensus.commit_min(), header.op);
+            assert_eq!(std::path::Path::new(&path).is_file(), !delete);
+            assert_eq!(replies.borrow().len(), 2);
+        }
+    }
+
+    #[compio::test]
+    async fn no_ack_offset_writes_continue_during_a_pending_checkpoint() {
         const CONSUMER: u32 = 7;
         let kind = ConsumerKind::Consumer;
         let root = tempfile::tempdir().unwrap();
@@ -13379,15 +13817,65 @@ mod tests {
             )
             .await;
         assert!(partition.fatal().is_none());
-        assert!(!std::path::Path::new(&path).exists());
-        assert!(futures::poll!(receiver.as_mut()).is_pending());
+        assert!(std::path::Path::new(&path).exists());
+        let reply = receiver.as_mut().await.unwrap();
+        assert_eq!(reply.header().status, 0);
 
         partition.start_persistence();
         persistence.drain().await.unwrap();
         partition.resume_queued_requests().await;
         assert!(std::path::Path::new(&path).is_file());
-        let reply = receiver.await.unwrap();
-        assert_eq!(reply.header().status, 0);
+    }
+
+    #[compio::test]
+    async fn given_small_written_prefix_when_flush_is_due_should_wait_without_rebuilding_the_tail()
+    {
+        const THROUGH: u64 = 9;
+        const WRITTEN: u64 = 3;
+        let root = tempfile::tempdir().unwrap();
+        let (mut partition, _, config, mut parent) =
+            partition_with_committed_send(root.path(), iggy_common::Durability::Replicated, 3)
+                .await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        for op in 2..=THROUGH {
+            let prepare = checksummed_segment_prepare(op, parent, op - 1, b"queued");
+            parent = prepare.header().checksum;
+            persistence
+                .append(prepare.clone().into_frozen(), false)
+                .unwrap();
+            partition
+                .append_repaired_send_messages(prepare)
+                .await
+                .unwrap();
+            if op == WRITTEN {
+                assert!(persistence.start());
+                Rc::clone(&persistence).run().await;
+            }
+        }
+        let writer = hold_wal_writer(&persistence);
+        partition.consensus.advance_commit_max(THROUGH);
+        for op in 2..=THROUGH {
+            partition.consensus.advance_commit_min(op);
+        }
+        partition.consensus.sequencer().set_sequence(THROUGH);
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        partition.defer_flush(THROUGH);
+        partition.resume_io(&config).await;
+        assert!(
+            partition.materialization.is_none(),
+            "two written entries must not rebuild six retained entries"
+        );
+        assert_eq!(
+            partition.log.journal().inner.resident_count(),
+            usize::try_from(THROUGH - 1).unwrap()
+        );
+        writer.await;
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none());
+        assert_eq!(partition.log.journal().inner.resident_count(), 0);
     }
 
     #[compio::test]
@@ -14155,6 +14643,104 @@ mod tests {
         partition.commit_journal(&repair_config()).await;
         assert_eq!(partition.dedup.count(), 1);
         assert!(!partition.dedup.contains(identity.client_id));
+    }
+
+    fn send_request_for_client(
+        namespace: IggyNamespace,
+        client_id: u128,
+    ) -> Message<RoutedRequestHeader> {
+        let mut send = checksumless_send_request(namespace, 1).transmute_header(
+            |header, next: &mut RoutedRequestHeader| {
+                *next = header;
+                next.client = client_id;
+            },
+        );
+        send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(namespace, 0));
+        send
+    }
+
+    #[compio::test]
+    async fn given_in_flight_send_when_storing_committed_offset_should_admit_independent_requests()
+    {
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.stats.increment_messages_count(1);
+        let namespace = partition.namespace();
+        partition
+            .on_request(send_request_for_client(namespace, 1), None)
+            .await;
+        partition
+            .on_request(
+                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum),
+                None,
+            )
+            .await;
+        partition
+            .on_request(send_request_for_client(namespace, 2), None)
+            .await;
+        assert_eq!(partition.consensus.pipeline_len(), 3);
+        assert_eq!(partition.consensus.request_queue_len(), 0);
+    }
+
+    #[compio::test]
+    async fn given_in_flight_send_when_storing_its_offset_should_preserve_the_dependency() {
+        let (mut partition, replies) = recording_partition_at(0, 3);
+        let namespace = partition.namespace();
+        partition
+            .on_request(send_request_for_client(namespace, 1), None)
+            .await;
+        partition
+            .on_request(
+                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum),
+                None,
+            )
+            .await;
+        assert_eq!(partition.consensus.pipeline_len(), 1);
+        assert_eq!(partition.consensus.request_queue_len(), 1);
+        assert!(
+            replies.borrow().is_empty(),
+            "the store must await its earlier send, not be rejected"
+        );
+    }
+
+    #[compio::test]
+    async fn given_unstaged_auto_commit_when_another_key_completes_should_admit_only_independent_keys()
+     {
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.stats.increment_messages_count(1);
+        let namespace = partition.namespace();
+        partition
+            .on_request(send_request_for_client(namespace, 1), None)
+            .await;
+        let first = partition
+            .complete_poll(poll_read_result(
+                &partition,
+                PollingConsumer::ConsumerGroup(7, 1),
+                true,
+                Some(0),
+            ))
+            .unwrap();
+        assert!(first.replication.is_some());
+        let independent = partition
+            .complete_poll(poll_read_result(
+                &partition,
+                PollingConsumer::ConsumerGroup(8, 1),
+                true,
+                Some(0),
+            ))
+            .unwrap();
+        assert!(independent.replication.is_some());
+        let dependent = partition
+            .complete_poll(poll_read_result(
+                &partition,
+                PollingConsumer::ConsumerGroup(7, 1),
+                true,
+                Some(0),
+            ))
+            .unwrap();
+        assert!(dependent.replication.is_none());
+        assert_eq!(partition.consensus.pipeline_len(), 3);
+        assert_eq!(partition.consensus.request_queue_len(), 1);
     }
 
     #[compio::test]
@@ -16140,7 +16726,11 @@ mod tests {
         partition.offset.store(24, Ordering::Release);
         partition.dirty_offset.store(24, Ordering::Relaxed);
 
-        assert!(partition.collapse_offset_reservation().await);
+        assert!(
+            partition
+                .complete_superblock_intent(partition.collapse_superblock_intent().unwrap())
+                .await
+        );
         assert_eq!(last_recorded_frontier(&store), 25);
         assert_eq!(
             last_recorded_reservation(&store),
@@ -16213,7 +16803,7 @@ mod tests {
         partition.set_superblock(store.clone(), Some(&recovered));
         partition.restore_offset_frontier(Some(&recovered));
 
-        assert!(partition.collapse_offset_reservation().await);
+        assert!(partition.collapse_superblock_intent().is_none());
         assert_eq!(
             store.attempts.get(),
             0,
@@ -16238,7 +16828,11 @@ mod tests {
         let mut partition = partition_at_view(1, 1);
         partition.set_superblock(store.clone(), Some(&recorded_state(0, 70_000)));
 
-        assert!(partition.install_offset_frontier_at(1_030).await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Install(1_030))
+                .await
+        );
         assert_eq!(
             last_recorded_reservation(&store),
             1_030,
@@ -16255,7 +16849,11 @@ mod tests {
         let mut partition = partition_at_view(1, 1);
         partition.set_superblock(store.clone(), Some(&recorded_state(500, 70_000)));
 
-        assert!(partition.reset_offset_frontier_at(0).await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Reset(0))
+                .await
+        );
         assert_eq!(last_recorded_frontier(&store), 0);
         assert_eq!(
             last_recorded_reservation(&store),
@@ -16274,7 +16872,14 @@ mod tests {
         partition.set_offset_space_used(true);
         partition.offset.store(99, Ordering::Release);
 
-        assert!(partition.persist_offset_frontier_at(100).await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Advance {
+                    frontier: 100,
+                    reserved: 0
+                })
+                .await
+        );
         assert_eq!(last_recorded_frontier(&store), 100);
         assert_eq!(
             last_recorded_reservation(&store),
@@ -16293,7 +16898,14 @@ mod tests {
         let store = Rc::new(RecordingSuperblock::default());
         partition.set_superblock(store.clone(), None);
 
-        assert!(partition.persist_offset_frontier_at(9_000).await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Advance {
+                    frontier: 9_000,
+                    reserved: 0
+                })
+                .await
+        );
         assert_eq!(last_recorded_frontier(&store), 9_000);
         assert_eq!(
             partition.offset_frontier(),
@@ -16302,7 +16914,14 @@ mod tests {
              value the fence would otherwise persist"
         );
 
-        assert!(partition.persist_offset_frontier().await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Advance {
+                    frontier: partition.offset_frontier(),
+                    reserved: 0
+                })
+                .await
+        );
 
         assert_eq!(
             last_recorded_frontier(&store),
@@ -16334,7 +16953,14 @@ mod tests {
         partition.set_superblock(store.clone(), Some(&recovered));
         assert_eq!(partition.offset_frontier(), 0, "nothing minted locally");
 
-        assert!(partition.persist_offset_frontier().await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Advance {
+                    frontier: partition.offset_frontier(),
+                    reserved: 0
+                })
+                .await
+        );
 
         assert_eq!(
             last_recorded_frontier(&store),
@@ -16354,10 +16980,21 @@ mod tests {
         partition.offset.store(9_000, Ordering::Release);
         partition.set_offset_space_used(true);
 
-        assert!(partition.persist_offset_frontier().await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Advance {
+                    frontier: partition.offset_frontier(),
+                    reserved: 0
+                })
+                .await
+        );
         assert_eq!(last_recorded_frontier(&store), 9_001);
 
-        assert!(partition.reset_offset_frontier_at(12).await);
+        assert!(
+            partition
+                .complete_superblock_intent(SuperblockIntent::Reset(12))
+                .await
+        );
 
         assert_eq!(
             last_recorded_frontier(&store),
@@ -17216,6 +17853,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .exhaust_capacity_for_test();
+        let stalled_header = *message.header();
         backup.on_replicate(message).await;
         {
             let sent = backup.consensus().message_bus().sent_to_replicas.borrow();
@@ -17232,6 +17870,13 @@ mod tests {
             assert!(!sent.iter().any(|(target, _)| *target == 0));
         }
 
+        assert!(!backup.register_rebuilt_ack(&stalled_header));
+        assert!(backup.pending_persisted_acks.borrow().contains_key(&1));
+        backup.drive_persistence().await;
+        assert!(
+            backup.pending_persisted_acks.borrow().contains_key(&1),
+            "the WAL has not accepted the parked ack's prepare yet"
+        );
         backup
             .persistence
             .as_ref()
@@ -17262,6 +17907,22 @@ mod tests {
         assert!(persistence.failure().is_none());
         persistence.drain_with_timeout().await.unwrap();
         assert!(persistence.is_durable_through(2));
+        backup.drive_persistence().await;
+        assert!(
+            backup
+                .consensus()
+                .message_bus()
+                .sent_to_replicas
+                .borrow()
+                .iter()
+                .any(|(target, message)| {
+                    *target == 0
+                        && message.len() == size_of::<PrepareOkHeader>()
+                        && bytemuck::checked::from_bytes::<PrepareOkHeader>(message.as_slice()).op
+                            == 1
+                }),
+            "the parked ack must be delivered without a prepare retransmit"
+        );
     }
 
     #[compio::test]
@@ -17370,8 +18031,8 @@ mod tests {
 
     #[compio::test]
     async fn deferred_views_keep_newer_progress_without_replacing_history_transitions() {
-        let (mut partition, _) = recording_partition();
-        let start_change = |view| {
+        let (mut partition, _) = recording_partition_at(0, 5);
+        let start_change = |view, replica| {
             server_common::MessageBag::StartViewChange(
                 Message::<iggy_binary_protocol::StartViewChangeHeader>::new(size_of::<
                     iggy_binary_protocol::StartViewChangeHeader,
@@ -17383,6 +18044,7 @@ mod tests {
                             u32::try_from(size_of::<iggy_binary_protocol::StartViewChangeHeader>())
                                 .unwrap();
                         header.view = view;
+                        header.replica = replica;
                     },
                 ),
             )
@@ -17403,16 +18065,29 @@ mod tests {
                 ),
             )
         };
-        partition.defer_view_transition(start_change(1));
+        partition.defer_view_transition(start_change(1, 2));
         partition.defer_view_transition(start_view(1));
-        partition.defer_view_transition(start_change(1));
+        partition.defer_view_transition(start_change(1, 1));
+        partition.defer_view_transition(start_change(1, 2));
+        partition.defer_view_transition(start_change(1, 5));
         partition.defer_view_transition(start_view(0));
+        for replica in [1, 2] {
+            assert!(matches!(partition.resume_io(&repair_config()).await,
+                crate::PartitionIoStep::Transition(server_common::MessageBag::StartViewChange(message))
+                if message.header().view == 1 && message.header().replica == replica));
+        }
         assert!(matches!(partition.resume_io(&repair_config()).await,
-            crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message)) if message.header().view == 1));
+            crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message))
+            if message.header().view == 1));
+        assert!(partition.deferred_views.is_empty());
         partition.defer_view_transition(start_view(1));
-        partition.defer_view_transition(start_change(2));
+        partition.defer_view_transition(start_change(2, 1));
         assert!(matches!(partition.resume_io(&repair_config()).await,
-            crate::PartitionIoStep::Transition(server_common::MessageBag::StartViewChange(message)) if message.header().view == 2));
+            crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message))
+            if message.header().view == 1));
+        assert!(matches!(partition.resume_io(&repair_config()).await,
+            crate::PartitionIoStep::Transition(server_common::MessageBag::StartViewChange(message))
+            if message.header().view == 2));
         partition.transition = Some(PendingPartitionTransition::Truncate {
             from_op: 3,
             actions: Vec::new(),
@@ -17435,6 +18110,11 @@ mod tests {
             partition.transition,
             Some(PendingPartitionTransition::Purge(_))
         ));
+        partition.transition = None;
+        assert!(matches!(partition.resume_io(&repair_config()).await,
+            crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message))
+            if message.header().view == 4));
+        assert!(partition.deferred_views.is_empty());
     }
 
     #[compio::test]
@@ -17698,6 +18378,120 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_old_offsets_when_install_replaces_them_should_keep_cleanup_keys_and_batch_renames()
+     {
+        const OLD_CONSUMER: u32 = 99;
+        const INCOMING_OFFSETS: u32 = 33;
+        const STEPS_MAX: usize = 128;
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(1, 1);
+        partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
+        partition.open_persistence().await.unwrap();
+        let dirs = ["consumers", "groups", "external_groups"]
+            .map(|name| directory.path().join(name).to_str().unwrap().to_owned());
+        for dir in &dirs {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let consumers = dirs[0].clone();
+        partition.configure_consumer_offset_storage(
+            dirs,
+            ConsumerOffsets::with_capacity(1),
+            ConsumerGroupOffsets::with_capacity(1),
+        );
+        let old = PendingConsumerOffsetCommit::upsert(ConsumerKind::Consumer, OLD_CONSUMER, 4);
+        partition.persist_consumer_offset_commit(old).await.unwrap();
+        partition.apply_consumer_offset_commit(old);
+        let prepare = checksummed_segment_prepare(1, 0, 8, b"installed");
+        let wire = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::PARTITION_DEDUP_CLIENTS_MAX,
+            prepare_checksum: Some(prepare.header().checksum),
+            checkpoint_prepare: prepare.as_slice().to_vec(),
+            next_offset: 9,
+            consumers: (0..INCOMING_OFFSETS).map(|id| (id, 4)).collect(),
+            ..Default::default()
+        };
+        partition.materialization_missing = true;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        partition
+            .queue_state_transfer_install(1, Vec::new(), &wire.encode(), 0, 1)
+            .unwrap();
+        let config = repair_config();
+        let mut cleaned = false;
+        let mut batches = Vec::new();
+        let mut installed = false;
+        for _ in 0..STEPS_MAX {
+            let _ = partition.persist_superblock_if_needed().await;
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    let captured = partition.capture_io(plan, &config).unwrap().unwrap();
+                    if let crate::PartitionIoJob::PurgeOffsets {
+                        directory, known, ..
+                    } = &captured.job
+                        && *directory == consumers
+                    {
+                        assert!(
+                            known.contains(&OLD_CONSUMER),
+                            "a directory scan failure must still leave a known cleanup path"
+                        );
+                        cleaned = true;
+                    }
+                    if let crate::PartitionIoJob::Transfer(
+                        crate::io::TransferFileJob::CommitOffsets(paths),
+                    ) = &captured.job
+                    {
+                        batches.push(paths.len());
+                    }
+                    let result = captured.job.execute().await;
+                    partition.accept_io(captured.identity, result).unwrap();
+                    if let Some(gate) = captured.gate {
+                        gate.release();
+                    }
+                    captured.quiescence.settle(captured.identity);
+                }
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Pending => {
+                    partition
+                        .persistence
+                        .as_ref()
+                        .unwrap()
+                        .drain_with_timeout()
+                        .await
+                        .unwrap();
+                }
+                crate::PartitionIoStep::InstallFinished { outcome, .. } => {
+                    outcome.unwrap();
+                    installed = true;
+                    break;
+                }
+                _ => panic!("unexpected install continuation"),
+            }
+        }
+        assert!(installed && cleaned);
+        assert_eq!(batches, [16, 16, 1]);
+        assert!(
+            !std::path::Path::new(&consumers)
+                .join(OLD_CONSUMER.to_string())
+                .exists()
+        );
+        assert_eq!(
+            partition.durable_consumer_offset_count(ConsumerKind::Consumer),
+            INCOMING_OFFSETS as usize
+        );
+        for id in 0..INCOMING_OFFSETS {
+            assert_eq!(
+                crate::offset_storage::read_offset_max(&format!("{consumers}/{id}"), 0)
+                    .await
+                    .unwrap()
+                    .offset,
+                4
+            );
+        }
+    }
+
+    #[compio::test]
     #[allow(clippy::too_many_lines)]
     async fn queued_delete_observes_held_no_ack_store_success_and_failures() {
         const CLIENT: u128 = 42;
@@ -17877,6 +18671,8 @@ mod tests {
             partition.apply_consumer_offset_commit(initial);
             let mutations = [
                 PendingConsumerOffsetCommit::upsert(kind, CONSUMER, 3),
+                PendingConsumerOffsetCommit::upsert(kind, CONSUMER + 1, 4),
+                PendingConsumerOffsetCommit::upsert_auto_commit(kind, CONSUMER + 2, 5),
                 PendingConsumerOffsetCommit::upsert_auto_commit(kind, CONSUMER, 2),
                 PendingConsumerOffsetCommit::delete(kind, CONSUMER),
                 PendingConsumerOffsetCommit::upsert_auto_commit(kind, CONSUMER, 1),
@@ -17891,9 +18687,14 @@ mod tests {
                     CLIENT
                 };
                 let request = match pending.mutation {
-                    PendingConsumerOffsetMutation::Upsert(offset) => {
-                        store_offset_request(client, op, kind, CONSUMER, offset, AckLevel::Quorum)
-                    }
+                    PendingConsumerOffsetMutation::Upsert(offset) => store_offset_request(
+                        client,
+                        op,
+                        kind,
+                        pending.consumer_id,
+                        offset,
+                        AckLevel::Quorum,
+                    ),
                     PendingConsumerOffsetMutation::Delete => {
                         delete_offset_request(client, op, CONSUMER)
                     }
@@ -17935,7 +18736,7 @@ mod tests {
                         partition.stage_consumer_offset_upsert(
                             op,
                             kind,
-                            CONSUMER,
+                            pending.consumer_id,
                             offset,
                             pending.auto_commit,
                         );
@@ -17959,6 +18760,7 @@ mod tests {
             let mut written_offsets = Vec::new();
             let mut deletes = 0;
             let mut barriers = 0;
+            let mut batches = 0;
             loop {
                 match partition.drive_commit().unwrap() {
                     CommitStep::Progress => {}
@@ -17971,8 +18773,15 @@ mod tests {
                                 .all(|op| pipeline.entry_by_op(op).unwrap().has_reply_sender())
                         }));
                         let job = partition.capture_commit_phase(&config).unwrap().unwrap();
-                        let writes_offset =
-                            matches!(&job, crate::io::PartitionIoJob::OffsetWrite(_));
+                        let writes_offset = matches!(
+                            &job,
+                            crate::io::PartitionIoJob::OffsetWrite(_)
+                                | crate::io::PartitionIoJob::OffsetBatch(_)
+                        );
+                        if let crate::io::PartitionIoJob::OffsetBatch(writes) = &job {
+                            assert_eq!(writes.len(), 3);
+                            batches += 1;
+                        }
                         let deletes_offset =
                             matches!(&job, crate::io::PartitionIoJob::OffsetDelete(_));
                         let syncs_directory =
@@ -18020,6 +18829,7 @@ mod tests {
                 vec![3, 1],
                 "coverage must follow the reset and deletion"
             );
+            assert_eq!(batches, 1, "independent keys must share one file job");
             assert_eq!(deletes, 1);
             assert_eq!(barriers, 1);
             assert!(bus_replies.borrow().is_empty());
@@ -18043,7 +18853,10 @@ mod tests {
                     assert!(futures::poll!(&mut *receiver).is_pending());
                 }
             } else {
-                partition.queue_committed_replies();
+                assert!(matches!(
+                    partition.resume_io(&config).await,
+                    crate::PartitionIoStep::Progress
+                ));
                 assert_eq!(partition.consensus.commit_min(), through_op);
                 assert_eq!(partition.consensus.pipeline_len(), 0);
                 assert!(partition.pending_consumer_offset_commits.is_empty());
@@ -18055,16 +18868,6 @@ mod tests {
                         .committed_offset,
                     1
                 );
-                for receiver in &mut receivers {
-                    assert!(
-                        futures::poll!(&mut *receiver).is_pending(),
-                        "publication does not deliver replies"
-                    );
-                }
-                assert!(matches!(
-                    partition.resume_io(&config).await,
-                    crate::PartitionIoStep::Progress
-                ));
                 for mut receiver in receivers {
                     let std::task::Poll::Ready(Ok(reply)) = futures::poll!(&mut receiver) else {
                         panic!("one continuation must deliver the whole committed reply batch");
@@ -19306,7 +20109,7 @@ mod tests {
      {
         let refusals: [fn(&mut IggyPartition<RecordingBus>); 3] = [
             IggyPartition::begin_shutdown_io,
-            |partition| partition.stop_io_admission(),
+            |partition| partition.io_active.retire(),
             |partition| {
                 let message =
                     Message::<iggy_binary_protocol::RequestStartViewHeader>::new(size_of::<
@@ -23444,106 +24247,124 @@ mod tests {
             iggy_common::Durability::Replicated,
             iggy_common::Durability::Persisted,
         ] {
-            let directory = tempfile::tempdir().unwrap();
-            let namespace = IggyNamespace::new(1, 1, 0);
-            let mut config = repair_config();
-            config.path_layout.streams_root = directory
-                .path()
-                .join("streams")
-                .to_string_lossy()
-                .into_owned();
-            let partition_path = config.get_partition_path(1, 1, 0);
-            std::fs::create_dir_all(&partition_path).unwrap();
-            let (mut partition, _) = recording_partition_at(0, 1);
-            set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_path));
-            partition.set_partition_dir(partition_path);
-            partition.runtime_options.durability = durability;
-            partition.runtime_options.segment_size = Some(IggyByteSize::from(SEGMENT_BYTES));
-            partition.log.active_segment_mut().max_size = IggyByteSize::from(SEGMENT_BYTES);
-            partition.open_persistence().await.unwrap();
-            partition.log.retire_front().unwrap();
-            partition.install_empty_segment(&config, 0).await.unwrap();
-            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
-            assert!(persistence.segment_checkpoint().is_some());
-            let mut parent = 0;
-            let mut expected = Vec::new();
-            let mut last_position = 0;
-            for ordinal in 0..RECORDS {
-                let payload = vec![u8::try_from(ordinal).unwrap(); PAYLOAD_BYTES];
-                let prepare = checksummed_segment_prepare(ordinal + 1, parent, ordinal, &payload);
-                parent = prepare.header().checksum;
-                last_position = expected.len() as u64;
-                expected.extend_from_slice(&prepare.as_slice()[size_of::<PrepareHeader>()..]);
-                persistence
-                    .append(prepare.clone().into_frozen(), durability.is_persisted())
-                    .unwrap();
-                partition
-                    .append_repaired_send_messages(prepare)
-                    .await
-                    .unwrap();
+            for (span, expected_indexes) in [
+                (iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, 4),
+                (
+                    3 * iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+                    2,
+                ),
+                (
+                    iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE / 4,
+                    8,
+                ),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let namespace = IggyNamespace::new(1, 1, 0);
+                let mut config = repair_config();
+                config.size_of_messages_required_to_save = IggyByteSize::from(span);
+                config.path_layout.streams_root = directory
+                    .path()
+                    .join("streams")
+                    .to_string_lossy()
+                    .into_owned();
+                let partition_path = config.get_partition_path(1, 1, 0);
+                std::fs::create_dir_all(&partition_path).unwrap();
+                let (mut partition, _) = recording_partition_at(0, 1);
+                set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_path));
+                partition.set_partition_dir(partition_path);
+                partition.runtime_options.durability = durability;
+                partition.runtime_options.segment_size = Some(IggyByteSize::from(SEGMENT_BYTES));
+                partition.log.active_segment_mut().max_size = IggyByteSize::from(SEGMENT_BYTES);
+                partition.open_persistence().await.unwrap();
+                partition.log.retire_front().unwrap();
+                partition.install_empty_segment(&config, 0).await.unwrap();
+                let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+                assert!(persistence.segment_checkpoint().is_some());
+                let mut parent = 0;
+                let mut expected = Vec::new();
+                let mut last_position = 0;
+                for ordinal in 0..RECORDS {
+                    let payload = vec![u8::try_from(ordinal).unwrap(); PAYLOAD_BYTES];
+                    let prepare =
+                        checksummed_segment_prepare(ordinal + 1, parent, ordinal, &payload);
+                    parent = prepare.header().checksum;
+                    last_position = expected.len() as u64;
+                    expected.extend_from_slice(&prepare.as_slice()[size_of::<PrepareHeader>()..]);
+                    persistence
+                        .append(prepare.clone().into_frozen(), durability.is_persisted())
+                        .unwrap();
+                    partition
+                        .append_repaired_send_messages(prepare)
+                        .await
+                        .unwrap();
+                }
+                assert!(persistence.start());
+                Rc::clone(&persistence).run().await;
+                partition.consensus.restore_commit_state(RECORDS, RECORDS);
+                partition.consensus.sequencer().set_sequence(RECORDS);
+                assert!(
+                    partition
+                        .commit_messages_inner(&config, true, RECORDS)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    std::fs::read(config.get_messages_path(1, 1, 0, 0)).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    file_len(std::path::Path::new(&config.get_index_path(1, 1, 0, 0)))
+                        / crate::iggy_index::IGGY_INDEX_SIZE as u64,
+                    expected_indexes
+                );
+                let args =
+                    PollingArgs::new(iggy_common::PollingStrategy::offset(RECORDS - 1), 1, false);
+                let plan = partition.build_poll_plan(PollingConsumer::Consumer(1, 0), &args, true);
+                let PollTier::Disk { disk, .. } = &plan.tier else {
+                    panic!("the flushed backlog must be polled from disk");
+                };
+                assert!(
+                    last_position.saturating_sub(disk.start_position) <= span,
+                    "the last poll must not rescan the whole coalesced WAL backlog: {} bytes skipped",
+                    last_position.saturating_sub(disk.start_position)
+                );
+                let result = plan.execute().await;
+                assert_eq!(result.last_matching_offset, Some(RECORDS - 1));
+                let completion = partition.complete_poll(result).unwrap();
+                let polled: Vec<_> = completion
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.as_slice().iter().copied())
+                    .collect();
+                assert_eq!(polled, expected[usize::try_from(last_position).unwrap()..]);
+                persistence.request_checkpoint();
+                partition.checkpoint_persistence(&config).await;
+                persistence.drain().await.unwrap();
+                assert_eq!(persistence.checkpoint_op(), RECORDS);
+                let checkpoint = persistence.segment_checkpoint();
+                drop(partition);
+                drop(persistence);
+                let recovered = crate::segment_recovery::load_persisted_segments_with_checkpoint(
+                    &config,
+                    namespace,
+                    IggyByteSize::from(SEGMENT_BYTES),
+                    durability.is_persisted(),
+                    &PartitionStats::default(),
+                    checkpoint,
+                )
+                .await
+                .unwrap();
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].segment.end_offset, RECORDS - 1);
+                assert_eq!(
+                    recovered[0].segment.size.as_bytes_u64(),
+                    expected.len() as u64
+                );
+                assert_eq!(
+                    std::fs::read(config.get_messages_path(1, 1, 0, 0)).unwrap(),
+                    expected
+                );
             }
-            assert!(persistence.start());
-            Rc::clone(&persistence).run().await;
-            partition.consensus.restore_commit_state(RECORDS, RECORDS);
-            partition.consensus.sequencer().set_sequence(RECORDS);
-            assert!(
-                partition
-                    .commit_messages_inner(&config, true, RECORDS)
-                    .await
-                    .unwrap()
-            );
-            assert_eq!(
-                std::fs::read(config.get_messages_path(1, 1, 0, 0)).unwrap(),
-                expected
-            );
-            let args =
-                PollingArgs::new(iggy_common::PollingStrategy::offset(RECORDS - 1), 1, false);
-            let plan = partition.build_poll_plan(PollingConsumer::Consumer(1, 0), &args, true);
-            let PollTier::Disk { disk, .. } = &plan.tier else {
-                panic!("the flushed backlog must be polled from disk");
-            };
-            assert!(
-                last_position.saturating_sub(disk.start_position)
-                    <= iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-                "the last poll must not rescan the whole coalesced WAL backlog: {} bytes skipped",
-                last_position.saturating_sub(disk.start_position)
-            );
-            let result = plan.execute().await;
-            assert_eq!(result.last_matching_offset, Some(RECORDS - 1));
-            let completion = partition.complete_poll(result).unwrap();
-            let polled: Vec<_> = completion
-                .fragments
-                .iter()
-                .flat_map(|fragment| fragment.as_slice().iter().copied())
-                .collect();
-            assert_eq!(polled, expected[usize::try_from(last_position).unwrap()..]);
-            persistence.request_checkpoint();
-            partition.checkpoint_persistence(&config).await;
-            persistence.drain().await.unwrap();
-            assert_eq!(persistence.checkpoint_op(), RECORDS);
-            let checkpoint = persistence.segment_checkpoint();
-            drop(partition);
-            drop(persistence);
-            let recovered = crate::segment_recovery::load_persisted_segments_with_checkpoint(
-                &config,
-                namespace,
-                IggyByteSize::from(SEGMENT_BYTES),
-                durability.is_persisted(),
-                &PartitionStats::default(),
-                checkpoint,
-            )
-            .await
-            .unwrap();
-            assert_eq!(recovered.len(), 1);
-            assert_eq!(recovered[0].segment.end_offset, RECORDS - 1);
-            assert_eq!(
-                recovered[0].segment.size.as_bytes_u64(),
-                expected.len() as u64
-            );
-            assert_eq!(
-                std::fs::read(config.get_messages_path(1, 1, 0, 0)).unwrap(),
-                expected
-            );
         }
     }
 
@@ -23588,7 +24409,15 @@ mod tests {
             };
             fixture.partition.io_bytes_max.set(bytes_max);
             fixture.partition.consensus.advance_commit_max(RECORDS);
-            assert!(fixture.partition.begin_materialization(RECORDS).unwrap());
+            assert!(
+                fixture
+                    .partition
+                    .begin_materialization(
+                        RECORDS,
+                        iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
+                    )
+                    .unwrap()
+            );
             let mut jobs = 0;
             loop {
                 match fixture.partition.drive_materialization().unwrap() {

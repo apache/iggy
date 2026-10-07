@@ -430,13 +430,15 @@ pub(crate) async fn sweep_tmp_files(bases: &[PathBuf]) {
             .filter(|entry| {
                 let name = entry.file_name();
                 prefixes.iter().any(|prefix| {
-                    name.as_encoded_bytes()
-                        .strip_prefix(prefix.as_slice())
-                        .and_then(|suffix| std::str::from_utf8(suffix).ok())
-                        .and_then(|suffix| suffix.split_once('-'))
-                        .is_some_and(|(process, sequence)| {
-                            process.parse::<u32>().is_ok() && sequence.parse::<u64>().is_ok()
-                        })
+                    name.as_encoded_bytes() == &prefix[..prefix.len() - 1]
+                        || name
+                            .as_encoded_bytes()
+                            .strip_prefix(prefix.as_slice())
+                            .and_then(|suffix| std::str::from_utf8(suffix).ok())
+                            .and_then(|suffix| suffix.split_once('-'))
+                            .is_some_and(|(process, sequence)| {
+                                process.parse::<u32>().is_ok() && sequence.parse::<u64>().is_ok()
+                            })
                 })
             })
             .map(|entry| entry.path())
@@ -1381,12 +1383,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("journal.wal");
         let orphan = directory.path().join("journal.wal.tmp.7-11");
+        let legacy = directory.path().join("journal.wal.tmp");
         let unrelated = directory.path().join("journal.wal.tmp.backup");
         std::fs::write(&orphan, b"incomplete").unwrap();
+        std::fs::write(&legacy, b"legacy incomplete").unwrap();
         std::fs::write(&unrelated, b"keep").unwrap();
         let journal = PrepareJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), None);
         assert!(!orphan.exists());
+        assert!(!legacy.exists());
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
     }
 

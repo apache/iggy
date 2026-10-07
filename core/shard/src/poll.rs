@@ -294,12 +294,17 @@ where
                 .map_or(PartitionReadReply::NotFound, |()| PartitionReadReply::Ack),
             PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
                 .segment_delete_resolution(&namespace, count)
-                .map_or(PartitionReadReply::NotFound, |(up_to_offset, lagging)| {
-                    PartitionReadReply::SegmentDeleteOffset {
-                        up_to_offset,
-                        lagging,
-                    }
-                }),
+                .map_or(
+                    PartitionReadReply::NotFound,
+                    |(up_to_offset, lagging, created_revision, purge_generation)| {
+                        PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
+                            created_revision,
+                            purge_generation,
+                        }
+                    },
+                ),
         };
         let _ = reply.try_send(result);
     }

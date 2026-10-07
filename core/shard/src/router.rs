@@ -587,11 +587,12 @@ where
             self.process_one_poll_completion(loopback).await;
             self.service_partition_io().await;
             self.process_loopback(loopback).await;
-            let finished = namespaces.iter().all(|namespace| {
-                partitions
-                    .get_io_owner(namespace)
-                    .is_none_or(|partition| partition.shutdown_io_complete())
-            });
+            let finished = !self.partition_io.has_ready()
+                && namespaces.iter().all(|namespace| {
+                    partitions
+                        .get_io_owner(namespace)
+                        .is_none_or(|partition| partition.shutdown_io_complete())
+                });
             if finished && self.partition_io.outstanding() == 0 {
                 break;
             }
@@ -600,7 +601,9 @@ where
                     for namespace in &namespaces {
                         if let Some(partition) = partitions.get_io_owner(namespace) {
                             partition.drive_persistence().await;
-                            partition.retry_io();
+                            if partition.needs_io_retry() {
+                                self.partition_io.retry(*namespace, partition.incarnation());
+                            }
                         }
                     }
                     self.tick_metadata().await;

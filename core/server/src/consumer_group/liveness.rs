@@ -1784,6 +1784,7 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partition_id: 0,
             up_to_offset: 0,
+            expected_history: None,
         };
         for _ in 0..3 {
             assert_eq!(

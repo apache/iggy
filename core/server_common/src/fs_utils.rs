@@ -20,6 +20,7 @@ use futures::channel::oneshot;
 use futures::lock::Mutex;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::fatal::NoteDescriptorExhaustion;
@@ -180,7 +181,7 @@ pub async fn truncate_file(file: &fs::File, length: u64) -> io::Result<()> {
     .await
 }
 
-/// Run filesystem work unsupported by io_uring on a process-wide bounded worker.
+/// Run filesystem work unsupported by io_uring on one worker per calling shard.
 /// The operation owns its state and continues to completion if the caller is dropped.
 ///
 /// # Errors
@@ -190,8 +191,10 @@ pub async fn run_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     // Cancellation must not admit another operation while this one owns filesystem state.
-    static WORKER: Mutex<()> = Mutex::new(());
-    let permit = WORKER.lock().await;
+    thread_local! {
+        static WORKER: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    }
+    let permit = WORKER.with(Arc::clone).lock_owned().await;
     let (sender, receiver) = oneshot::channel();
     std::thread::Builder::new()
         .name(name.to_owned())

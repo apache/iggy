@@ -745,14 +745,19 @@ where
         &self,
         namespace: &IggyNamespace,
         count: u32,
-    ) -> Option<(Option<u64>, bool)> {
+    ) -> Option<(Option<u64>, bool, u64, u64)> {
         self.with_partition(namespace, |partition| {
             let consensus = partition.consensus();
             let lagging = consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
                 || consensus.commit_min() < consensus.commit_max();
-            (partition.nth_oldest_sealed_end_offset(count), lagging)
+            (
+                partition.nth_oldest_sealed_end_offset(count),
+                lagging,
+                partition.created_revision(),
+                partition.applied_purge_generation(),
+            )
         })
     }
 }
@@ -901,7 +906,6 @@ where
             );
             return;
         }
-        let config = self.config.clone();
         let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
@@ -912,7 +916,7 @@ where
             );
             return;
         };
-        partition.on_ack(message, &config).await;
+        partition.on_ack(message, &self.config).await;
     }
 }
 

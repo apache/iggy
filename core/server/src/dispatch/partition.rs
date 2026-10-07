@@ -47,7 +47,7 @@ use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{
     KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, RoutedRequestHeader,
-    WireDecode,
+    WireDecode, WireIdentifier,
 };
 use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use journal::superblock::SuperblockStore;
@@ -57,6 +57,7 @@ use metadata::impls::metadata::{
     StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
 };
+use metadata::stm::stream::TruncatePartitionRequest;
 use partitions::{PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -1060,10 +1061,13 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
                 &header,
                 vsr_client_id,
                 session,
-                0,
-                0,
-                0,
-                0,
+                &TruncatePartitionRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: 0,
+                    up_to_offset: 0,
+                    expected_history: None,
+                },
             );
             send_result_rejection(
                 shard,
@@ -1171,7 +1175,7 @@ where
         }
     };
     let namespace = IggyNamespace::from_raw(namespace_raw);
-    let up_to_offset = match shard
+    let (up_to_offset, expected_history) = match shard
         .partition_read(
             namespace,
             PartitionRead::ResolveSegmentDeleteOffset {
@@ -1182,8 +1186,10 @@ where
     {
         Some(PartitionReadReply::SegmentDeleteOffset {
             up_to_offset: Some(offset),
+            created_revision,
+            purge_generation,
             ..
-        }) => offset,
+        }) => (offset, Some((created_revision, purge_generation))),
         // Nothing sealed to delete on a replica that has not converged on the
         // replicated log (a backup behind the commit frontier may be missing
         // whole sealed segments). Answering now would commit a no-op truncate
@@ -1193,6 +1199,7 @@ where
         Some(PartitionReadReply::SegmentDeleteOffset {
             up_to_offset: None,
             lagging: true,
+            ..
         }) => {
             debug!(
                 client_id,
@@ -1201,6 +1208,12 @@ where
             return Err(IggyError::TransientNotAccepted);
         }
         Some(PartitionReadReply::Rejected(error)) => return Err(error),
+        Some(PartitionReadReply::SegmentDeleteOffset {
+            up_to_offset: None,
+            created_revision,
+            purge_generation,
+            ..
+        }) => (0, Some((created_revision, purge_generation))),
         other => {
             debug!(
                 client_id,
@@ -1208,17 +1221,20 @@ where
                 reply = ?other,
                 "delete_segments: nothing to delete; committing no-op truncate"
             );
-            0
+            (0, None)
         }
     };
     Ok(build_truncate_partition_client_message(
         template,
         client_id,
         session,
-        namespace.stream_id() as u32,
-        namespace.topic_id() as u32,
-        namespace.partition_id() as u32,
-        up_to_offset,
+        &TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(namespace.stream_id() as u32),
+            topic_id: WireIdentifier::numeric(namespace.topic_id() as u32),
+            partition_id: namespace.partition_id() as u32,
+            up_to_offset,
+            expected_history,
+        },
     ))
 }
 

@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use consensus::PartitionsHandle;
 use futures::future::poll_fn;
@@ -36,6 +37,7 @@ use thiserror::Error;
 use crate::IggyShard;
 
 pub const DEFAULT_PARTITION_IO_CAPACITY: usize = 16;
+const CONTINUATIONS_PER_RETRY: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PartitionIoLimits {
@@ -106,6 +108,7 @@ struct PartitionIoSlot<SB> {
     incarnation: PartitionIncarnation,
     identity: Cell<Option<PartitionIoIdentity>>,
     state: Cell<SlotState>,
+    elapsed: Cell<Duration>,
     charge: usize,
     result: RefCell<Option<PartitionIoResult>>,
     resources: RefCell<Option<PartitionIoResources<SB>>>,
@@ -116,6 +119,9 @@ struct PartitionIoSlot<SB> {
 #[derive(Default)]
 struct ReadyPartitions {
     queue: RefCell<VecDeque<(IggyNamespace, PartitionIncarnation)>>,
+    retries: RefCell<VecDeque<(IggyNamespace, PartitionIncarnation)>>,
+    retry_present: RefCell<BTreeSet<(IggyNamespace, PartitionIncarnation)>>,
+    continuations: Cell<usize>,
     waiting: RefCell<VecDeque<(IggyNamespace, PartitionIncarnation)>>,
     // Only the oldest capacity waiter may also be in the runnable queue.
     waiting_ready: Cell<bool>,
@@ -131,9 +137,29 @@ struct IoCounters {
     quarantined: Cell<usize>,
 }
 
+impl<SB> PartitionIoSlot<SB> {
+    fn interrupt(&self, interrupted: &Cell<bool>, counters: &IoCounters) {
+        if self.state.get() != SlotState::Running {
+            return;
+        }
+        self.state.set(SlotState::Interrupted);
+        interrupted.set(true);
+        if let Some(quiescence) = self.quiescence.borrow().as_ref() {
+            quiescence.interrupt();
+        }
+        counters.active.set(counters.active.get() - 1);
+        counters.quarantined.set(counters.quarantined.get() + 1);
+    }
+}
+
 impl ReadyPartitions {
     fn notify(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
-        if !self.present.borrow_mut().insert((namespace, incarnation)) {
+        if !self.present.borrow_mut().insert((namespace, incarnation))
+            && !self
+                .retry_present
+                .borrow_mut()
+                .remove(&(namespace, incarnation))
+        {
             return;
         }
         self.queue.borrow_mut().push_back((namespace, incarnation));
@@ -191,13 +217,33 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
     }
 
     pub(crate) fn has_ready(&self) -> bool {
-        self.head().is_some()
+        !self.ready.queue.borrow().is_empty()
+            || !self.ready.retry_present.borrow().is_empty()
             || !self.ready.completions.borrow().is_empty()
             || self.interrupted.get()
     }
 
     pub(crate) fn head(&self) -> Option<(IggyNamespace, PartitionIncarnation)> {
+        if self.ready.queue.borrow().is_empty()
+            || self.ready.continuations.get() >= CONTINUATIONS_PER_RETRY
+        {
+            while let Some(owner) = self.ready.retries.borrow_mut().pop_front() {
+                if self.ready.retry_present.borrow_mut().remove(&owner) {
+                    self.ready.queue.borrow_mut().push_front(owner);
+                    self.ready.continuations.set(0);
+                    break;
+                }
+            }
+        }
         self.ready.queue.borrow().front().copied()
+    }
+
+    pub(crate) fn retry(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
+        let owner = (namespace, incarnation);
+        if self.ready.present.borrow_mut().insert(owner) {
+            self.ready.retry_present.borrow_mut().insert(owner);
+            self.ready.retries.borrow_mut().push_back(owner);
+        }
     }
 
     pub(crate) fn pop_ready(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
@@ -211,6 +257,13 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             .present
             .borrow_mut()
             .remove(&(namespace, incarnation));
+        self.ready
+            .retry_present
+            .borrow_mut()
+            .remove(&(namespace, incarnation));
+        self.ready
+            .continuations
+            .set(self.ready.continuations.get().saturating_add(1));
         drop(queue);
         let mut waiting = self.ready.waiting.borrow_mut();
         if waiting.front() == Some(&(namespace, incarnation)) {
@@ -225,6 +278,9 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
         let owner = (namespace, incarnation);
         debug_assert_eq!(self.ready.queue.borrow().front(), Some(&owner));
         self.ready.queue.borrow_mut().pop_front();
+        self.ready
+            .continuations
+            .set(self.ready.continuations.get().saturating_add(1));
         let mut waiting = self.ready.waiting.borrow_mut();
         if waiting.front() == Some(&owner) {
             self.ready.waiting_ready.set(false);
@@ -248,6 +304,22 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
 
     pub(crate) fn reschedule(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
         self.ready.notify(namespace, incarnation);
+    }
+
+    fn continue_ready(&self, namespace: IggyNamespace, incarnation: PartitionIncarnation) {
+        let owner = (namespace, incarnation);
+        if self.ready.waiting_ready.get() && self.ready.waiting.borrow().front() == Some(&owner) {
+            let mut queue = self.ready.queue.borrow_mut();
+            let previous = queue.pop_front();
+            debug_assert_eq!(previous, Some(owner));
+            queue.push_back(owner);
+            self.ready
+                .continuations
+                .set(self.ready.continuations.get().saturating_add(1));
+        } else {
+            self.pop_ready(namespace, incarnation);
+            self.reschedule(namespace, incarnation);
+        }
     }
 
     pub(crate) fn try_reserve(
@@ -287,6 +359,7 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             incarnation,
             identity: Cell::new(None),
             state: Cell::new(SlotState::Reserved),
+            elapsed: Cell::new(Duration::ZERO),
             charge,
             result: RefCell::new(None),
             resources: RefCell::new(None),
@@ -321,11 +394,11 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
         *slot.gate.borrow_mut() = gate;
         *slot.quiescence.borrow_mut() = Some(Rc::clone(&quiescence));
         slot.state.set(SlotState::Running);
+        slot.elapsed.set(Duration::ZERO);
         self.counters.active.set(self.counters.active.get() + 1);
         let marker = InterruptionMarker {
             slot: Rc::clone(&slot),
             interrupted: Rc::clone(&self.interrupted),
-            quiescence,
             counters: Rc::clone(&self.counters),
         };
         let ready = Rc::clone(&self.ready);
@@ -340,6 +413,9 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
                     .expect("test releases captured file job");
             }
             let result = job.execute().await;
+            if slot.state.get() == SlotState::Interrupted {
+                return;
+            }
             *slot.result.borrow_mut() = Some(result);
             slot.state.set(SlotState::Queued);
             counters.active.set(counters.active.get() - 1);
@@ -432,6 +508,25 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
                     })
                     .flatten()
             })
+    }
+
+    pub(crate) fn tick(&self) {
+        // Count the injected pump ticks so the simulator uses the same deadline.
+        // A timed-out writer keeps its lease and allocation charge until shutdown.
+        for slot in self.slots.borrow().iter().flatten() {
+            if slot.state.get() != SlotState::Running {
+                continue;
+            }
+            let elapsed = slot.elapsed.get() + crate::CONSENSUS_TICK_INTERVAL;
+            slot.elapsed.set(elapsed);
+            if elapsed >= partitions::PARTITION_IO_DRAIN_TIMEOUT {
+                tracing::error!(
+                    namespace_raw = slot.namespace.inner(),
+                    "partition file job timed out; fencing its owner"
+                );
+                slot.interrupt(&self.interrupted, &self.counters);
+            }
+        }
     }
 
     pub(crate) fn interrupted(&self) -> Vec<PartitionIoIdentity> {
@@ -542,14 +637,13 @@ where
         }
         match step {
             partitions::PartitionIoStep::WireActions(actions) => {
-                self.partition_io.pop_ready(namespace, incarnation);
                 crate::dispatch_partition_wire_actions::<B, _, MJ, _>(
                     partition.consensus(),
                     partition,
                     actions,
                 )
                 .await;
-                self.partition_io.reschedule(namespace, incarnation);
+                self.partition_io.continue_ready(namespace, incarnation);
             }
             partitions::PartitionIoStep::TransferReady => {
                 self.partition_io.pop_ready(namespace, incarnation);
@@ -600,21 +694,20 @@ where
                 }
             }
             partitions::PartitionIoStep::ViewApplied { actions, peer } => {
-                self.partition_io.pop_ready(namespace, incarnation);
                 if let Some(peer) = peer {
                     self.finish_partition_view_adoption(namespace, peer, actions)
                         .await;
                 } else {
                     self.advance_pending_partition_view(namespace).await;
                 }
+                self.partition_io.continue_ready(namespace, incarnation);
             }
             partitions::PartitionIoStep::Transition(message) => {
-                self.partition_io.pop_ready(namespace, incarnation);
                 self.on_message(message).await;
+                self.partition_io.continue_ready(namespace, incarnation);
             }
             partitions::PartitionIoStep::Progress => {
-                self.partition_io.pop_ready(namespace, incarnation);
-                self.partition_io.reschedule(namespace, incarnation);
+                self.partition_io.continue_ready(namespace, incarnation);
             }
             partitions::PartitionIoStep::Pending => {
                 self.partition_io.pop_ready(namespace, incarnation);
@@ -659,21 +752,12 @@ where
 struct InterruptionMarker<SB> {
     slot: Rc<PartitionIoSlot<SB>>,
     interrupted: Rc<Cell<bool>>,
-    quiescence: Rc<partitions::PartitionIoQuiescence>,
     counters: Rc<IoCounters>,
 }
 
 impl<SB> Drop for InterruptionMarker<SB> {
     fn drop(&mut self) {
-        if self.slot.state.get() == SlotState::Running {
-            self.slot.state.set(SlotState::Interrupted);
-            self.interrupted.set(true);
-            self.quiescence.interrupt();
-            self.counters.active.set(self.counters.active.get() - 1);
-            self.counters
-                .quarantined
-                .set(self.counters.quarantined.get() + 1);
-        }
+        self.slot.interrupt(&self.interrupted, &self.counters);
     }
 }
 
@@ -697,7 +781,7 @@ mod tests {
         StartViewChangeHeader, WireEncode, WireIdentifier,
     };
     use iggy_common::{
-        ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
+        ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize, IggyError,
         IggyTimestamp, PartitionStats, TopicRuntimeOptions, variadic,
     };
     use journal::prepare_journal::PrepareJournal;
@@ -731,76 +815,115 @@ mod tests {
     const TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     #[compio::test]
-    async fn failed_purge_offset_sync_fences_before_readmission() {
+    async fn failed_purge_file_phases_fence_before_readmission() {
         const STEPS_MAX: usize = 64;
-        let directory = tempfile::tempdir().unwrap();
-        let bus = Rc::new(IggyMessageBus::new(0));
-        let (owner, _sender) = test_owner(&bus, None);
-        let namespace = IggyNamespace::new(0, 0, 0);
-        let partitions = owner.plane.partitions();
-        partitions.set_io_notifier(
-            owner.partition_io.notifier(),
-            owner.partition_io.limits.bytes_max(),
-        );
-        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-        partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
-        let directories = ["consumers", "groups", "external"]
-            .map(|name| directory.path().join(name).to_str().unwrap().to_owned());
-        for path in &directories {
-            std::fs::create_dir(path).unwrap();
+        #[derive(Clone, Copy, Debug)]
+        enum Failure {
+            Segments,
+            Cleanup,
+            Plant,
+            OffsetDirectory,
         }
-        let failed_directory = directories[0].clone();
-        partition.configure_consumer_offset_storage(
-            directories,
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
-        );
-        assert!(matches!(
-            partition.purge(partitions.config(), 1).await,
-            Err(partitions::PurgeError::Pending)
-        ));
-        let mut failed = false;
-        for _ in 0..STEPS_MAX {
-            if let partitions::PartitionIoStep::Ready(plan) =
-                partition.resume_io(partitions.config()).await
-            {
-                let captured = partition
-                    .capture_io(plan, partitions.config())
-                    .unwrap()
-                    .unwrap();
-                let failure = matches!(&captured.job, partitions::PartitionIoJob::SegmentDirectory(path) if *path == failed_directory);
-                let result = if failure {
-                    partitions::PartitionIoResult::SegmentDirectory(Err(io::Error::other(
-                        "offset directory writeback failed",
-                    )))
-                } else {
-                    captured.job.execute().await
-                };
-                partition.accept_io(captured.identity, result).unwrap();
-                if let Some(gate) = captured.gate {
-                    gate.release();
-                }
-                captured.quiescence.settle(captured.identity);
-                if failure {
-                    failed = true;
-                    break;
+        for failure_phase in [
+            Failure::Segments,
+            Failure::Cleanup,
+            Failure::Plant,
+            Failure::OffsetDirectory,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let (owner, _sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let partitions = owner.plane.partitions();
+            partitions.set_io_notifier(
+                owner.partition_io.notifier(),
+                owner.partition_io.limits.bytes_max(),
+            );
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
+            partition.open_persistence().await.unwrap();
+            let directories = ["consumers", "groups", "external"]
+                .map(|name| directory.path().join(name).to_str().unwrap().to_owned());
+            for path in &directories {
+                std::fs::create_dir(path).unwrap();
+            }
+            let failed_directory = directories[0].clone();
+            partition.configure_consumer_offset_storage(
+                directories,
+                ConsumerOffsets::with_capacity(1),
+                ConsumerGroupOffsets::with_capacity(1),
+            );
+            assert!(matches!(
+                partition.purge(partitions.config(), 1).await,
+                Err(partitions::PurgeError::Pending)
+            ));
+            let mut failed = false;
+            for _ in 0..STEPS_MAX {
+                let step = partition.resume_io(partitions.config()).await;
+                if let partitions::PartitionIoStep::Ready(plan) = step {
+                    let captured = partition
+                        .capture_io(plan, partitions.config())
+                        .unwrap()
+                        .unwrap();
+                    let injected = match (&captured.job, failure_phase) {
+                        (partitions::PartitionIoJob::RemoveSegment { .. }, Failure::Segments) => {
+                            Some(partitions::PartitionIoResult::SegmentRemoved(Err(
+                                IggyError::CannotDeleteFile,
+                            )))
+                        }
+                        (partitions::PartitionIoJob::PurgeCleanup { .. }, Failure::Cleanup) => {
+                            Some(partitions::PartitionIoResult::PurgeCleanup(Err(
+                                io::Error::other("cleanup failed"),
+                            )))
+                        }
+                        (partitions::PartitionIoJob::EmptySegment(_), Failure::Plant) => {
+                            Some(partitions::PartitionIoResult::EmptySegment(Err(
+                                IggyError::CannotWriteToFile,
+                            )))
+                        }
+                        (
+                            partitions::PartitionIoJob::SegmentDirectory(path),
+                            Failure::OffsetDirectory,
+                        ) if *path == failed_directory => {
+                            Some(partitions::PartitionIoResult::SegmentDirectory(Err(
+                                io::Error::other("offset directory writeback failed"),
+                            )))
+                        }
+                        _ => None,
+                    };
+                    let failure = injected.is_some();
+                    let result = match injected {
+                        Some(result) => result,
+                        None => captured.job.execute().await,
+                    };
+                    partition.accept_io(captured.identity, result).unwrap();
+                    if let Some(gate) = captured.gate {
+                        gate.release();
+                    }
+                    captured.quiescence.settle(captured.identity);
+                    if failure {
+                        failed = true;
+                        break;
+                    }
+                } else if matches!(step, partitions::PartitionIoStep::Pending) {
+                    compio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
+            assert!(failed, "purge reached {failure_phase:?}");
+            owner.service_partition_io().await;
+            assert!(
+                partitions.get_by_ns(&namespace).is_none(),
+                "failed purge must stop admission before the next frame"
+            );
+            assert!(owner.shards_table.shard_for(namespace).is_none());
+            assert_eq!(
+                partitions
+                    .get_io_owner(&namespace)
+                    .unwrap()
+                    .applied_purge_generation(),
+                0
+            );
         }
-        assert!(failed, "purge reached the offset directory barrier");
-        owner.service_partition_io().await;
-        assert!(
-            partitions.get_by_ns(&namespace).is_none(),
-            "failed purge must stop admission before the next frame"
-        );
-        assert!(owner.shards_table.shard_for(namespace).is_none());
-        assert_eq!(
-            partitions
-                .get_io_owner(&namespace)
-                .unwrap()
-                .applied_purge_generation(),
-            0
-        );
     }
 
     #[test]
@@ -816,7 +939,7 @@ mod tests {
             owner.partition_io.pop_ready(namespace, incarnation);
         }
         for namespace in partitions.namespaces() {
-            partitions.get_io_owner(namespace).unwrap().retry_io();
+            assert!(!partitions.get_io_owner(namespace).unwrap().needs_io_retry());
         }
         assert!(!owner.partition_io.has_ready());
     }
@@ -1978,6 +2101,54 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_stuck_file_job_when_timeout_expires_should_fence_and_ignore_late_completion() {
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, Some(&store));
+        let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
+        let (slot, captured) = capture_first_write(&owner).await;
+        let identity = captured.identity;
+        let charge = owner.partition_io.charged.get();
+        owner.partition_io.dispatch(slot, captured, &captured_bus);
+        let mut elapsed = Duration::ZERO;
+        while elapsed + crate::CONSENSUS_TICK_INTERVAL < partitions::PARTITION_IO_DRAIN_TIMEOUT {
+            owner.partition_io.tick();
+            elapsed += crate::CONSENSUS_TICK_INTERVAL;
+        }
+        assert_eq!(owner.partition_io.counters.active.get(), 1);
+        assert_eq!(
+            owner.partition_io.interrupted(),
+            [] as [partitions::PartitionIoIdentity; 0]
+        );
+        let mut scratch = Vec::new();
+        assert!(owner.tick_partitions(&mut scratch).await.is_some());
+        let partition = owner
+            .plane
+            .partitions()
+            .get_io_owner(&identity.namespace)
+            .unwrap();
+        assert!(partition.fatal().is_some());
+        assert_eq!(owner.partition_io.counters.quarantined.get(), 1);
+        let completion = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
+        completion.await;
+        assert!(owner.partition_io.try_recv().is_none());
+        assert!(partition.capture_teardown().drain().await.is_err());
+        owner.partition_io.release(slot);
+        assert_eq!(owner.partition_io.charged.get(), charge);
+        assert_eq!(owner.partition_io.counters.active.get(), 0);
+        assert_eq!(owner.partition_io.counters.quarantined.get(), 1);
+        assert!(
+            owner
+                .partition_io
+                .try_reserve(identity.namespace, identity.incarnation, charge)
+                .is_none()
+        );
+    }
+
+    #[compio::test]
     async fn closing_admission_preserves_local_result_for_acceptance() {
         let store = Rc::new(HeldSuperblock {
             entered: RefCell::new(None),
@@ -2031,6 +2202,58 @@ mod tests {
         lane.pop_ready(namespace, old);
         lane.release(slot);
         assert_eq!(lane.head(), Some((namespace, replacement)));
+    }
+
+    #[test]
+    fn given_many_retries_when_completion_arrives_should_prioritize_it_without_starving_retries() {
+        const RETRY_OWNERS: usize = 1000;
+        let lane = super::PartitionIoLane::<HeldSuperblock>::new(
+            super::PartitionIoLimits::new(2, None).unwrap(),
+        );
+        let incarnation = partitions::PartitionIncarnation::default();
+        for index in 0..RETRY_OWNERS {
+            lane.retry(IggyNamespace::new(0, 0, index), incarnation);
+        }
+        let completed = IggyNamespace::new(0, 0, RETRY_OWNERS - 1);
+        lane.reschedule(completed, incarnation);
+        for _ in 0..super::CONTINUATIONS_PER_RETRY {
+            assert_eq!(lane.head(), Some((completed, incarnation)));
+            lane.continue_ready(completed, incarnation);
+        }
+        assert_eq!(
+            lane.head(),
+            Some((IggyNamespace::new(0, 0, 0), incarnation))
+        );
+        lane.pop_ready(IggyNamespace::new(0, 0, 0), incarnation);
+        lane.pop_ready(completed, incarnation);
+        for index in 1..RETRY_OWNERS - 1 {
+            let namespace = IggyNamespace::new(0, 0, index);
+            assert_eq!(lane.head(), Some((namespace, incarnation)));
+            lane.pop_ready(namespace, incarnation);
+        }
+        assert!(!lane.has_ready());
+        assert!(lane.head().is_none(), "a promoted retry must not run twice");
+    }
+
+    #[test]
+    fn given_woken_capacity_waiter_when_cpu_work_progresses_should_keep_its_fifo_place() {
+        let limits = super::PartitionIoLimits::new(1, None).unwrap();
+        let lane = super::PartitionIoLane::<HeldSuperblock>::new(limits);
+        let incarnation = partitions::PartitionIncarnation::default();
+        let owners: [_; 3] = std::array::from_fn(|index| IggyNamespace::new(0, 0, index));
+        let occupied = lane.try_reserve(owners[0], incarnation, 1).unwrap();
+        for owner in &owners[1..] {
+            lane.reschedule(*owner, incarnation);
+            lane.wait_for_capacity(*owner, incarnation);
+        }
+        lane.release(occupied);
+        assert_eq!(lane.head(), Some((owners[1], incarnation)));
+        lane.continue_ready(owners[1], incarnation);
+        assert!(lane.try_reserve(owners[2], incarnation, 1).is_none());
+        assert_eq!(lane.head(), Some((owners[1], incarnation)));
+        assert!(lane.try_reserve(owners[1], incarnation, 1).is_some());
+        lane.pop_ready(owners[1], incarnation);
+        assert_eq!(lane.head(), Some((owners[2], incarnation)));
     }
 
     #[test]

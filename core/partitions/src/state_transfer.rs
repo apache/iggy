@@ -41,7 +41,6 @@ use consensus::state_manifest::artifact_kind;
 use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
-use futures::channel::oneshot;
 use iggy_binary_protocol::responses::messages::send_messages::CONFIRMATION_SIZE;
 use iggy_binary_protocol::{Operation, PrepareHeader, ReplyHeader};
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
@@ -50,6 +49,7 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::fs_utils::run_blocking;
 use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::sharding::IggyNamespace;
@@ -1882,18 +1882,10 @@ pub(crate) async fn segment_dir_entries(partition_dir: &str) -> std::io::Result<
 /// The owner has settled its writers and published a purge or install backup.
 pub(crate) async fn remove_public_segment_files(partition_dir: &str) -> std::io::Result<()> {
     let directory = PathBuf::from(partition_dir);
-    let (completed, completion) = oneshot::channel();
-    // Directory iteration and metadata probes must not block the shard. The
-    // admitted job owns this worker, with one directory entry live at a time.
-    std::thread::Builder::new()
-        .name("iggy-segment-sweep".to_owned())
-        .stack_size(SEGMENT_SWEEP_STACK_BYTES)
-        .spawn(move || {
-            let _ = completed.send(remove_public_segment_files_blocking(&directory));
-        })?;
-    completion
-        .await
-        .map_err(|_| std::io::Error::other("segment sweep worker stopped"))?
+    run_blocking("iggy-segment-sweep", move || {
+        remove_public_segment_files_blocking(&directory)
+    })
+    .await
 }
 
 fn remove_public_segment_files_blocking(directory: &Path) -> std::io::Result<()> {
@@ -1994,20 +1986,22 @@ pub async fn quarantine_partition_files(
             "a thousand fenced copies of this partition already exist",
         ));
     };
-    for path in segment_dir_entries(partition_dir).await? {
-        let quarantined = path.to_str().is_some_and(|path| {
-            [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
-                .iter()
-                .any(|suffix| path.ends_with(suffix))
-        });
-        if !quarantined {
-            continue;
+    let source = partition_dir.to_owned();
+    let target = run_blocking("iggy-segment-quarantine", move || {
+        for entry in std::fs::read_dir(source)? {
+            let path = entry?.path();
+            let quarantined = path.to_str().is_some_and(|path| {
+                [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
+                    .iter()
+                    .any(|suffix| path.ends_with(suffix))
+            });
+            if quarantined && let Some(name) = path.file_name() {
+                std::fs::rename(&path, Path::new(&target).join(name))?;
+            }
         }
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        compio::fs::rename(&path, &PathBuf::from(&target).join(name)).await?;
-    }
+        Ok(target)
+    })
+    .await?;
     if let Some(revision) = wal_revision {
         let name = format!("prepares-{revision}");
         match compio::fs::rename(
@@ -2046,18 +2040,21 @@ pub async fn quarantine_partition_files(
 /// passes none), so a wider filter would unlink every live `.log` and `.index`
 /// on the partition -- worst at the reuse scan, which runs at descriptor-accept
 /// on a serving partition.
-pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: &HashSet<&Path>) {
-    let Ok(entries) = segment_dir_entries(partition_dir).await else {
-        return;
-    };
-    for path in entries {
-        let is_staging = path
-            .to_str()
-            .is_some_and(|path| path.ends_with(STAGING_SUFFIX));
-        if is_staging && !keep.contains(path.as_path()) {
-            let _ = compio::fs::remove_file(&path).await;
+pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: HashSet<PathBuf>) {
+    let partition_dir = partition_dir.to_owned();
+    let _ = run_blocking("iggy-staging-sweep", move || {
+        for entry in std::fs::read_dir(partition_dir)? {
+            let path = entry?.path();
+            let is_staging = path
+                .to_str()
+                .is_some_and(|path| path.ends_with(STAGING_SUFFIX));
+            if is_staging && !keep.contains(&path) {
+                let _ = std::fs::remove_file(path);
+            }
         }
-    }
+        Ok(())
+    })
+    .await;
 }
 
 fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
@@ -2183,7 +2180,7 @@ enum InstallFilePhase {
     OpenSegment(usize),
     EmptyDirectory,
     OldOffsets(ConsumerKind),
-    CommitOffset(usize),
+    CommitOffsets { start: usize, end: usize },
     OffsetDirectories,
     PurgeGeneration,
     RetryCheckpoint,
@@ -2929,8 +2926,7 @@ where
             matched_paths.clear();
         }
         // Sweep strays: anything staged that no adopted meta claims.
-        let keep: HashSet<&Path> = matched_paths.iter().map(PathBuf::as_path).collect();
-        sweep_staging_except(&partition_dir, &keep).await;
+        sweep_staging_except(&partition_dir, matched_paths.into_iter().collect()).await;
         *self.reuse_scan_memo.borrow_mut() = Some(ReuseScanMemo {
             digest,
             adopted: adopted.clone(),
@@ -2986,9 +2982,9 @@ where
                 .flatten(),
         )?;
         match pending.phase {
-            InstallPhase::StageOffsets(_) | InstallPhase::DiscardOffsets(_) => {
-                base.checked_mul(OFFSET_PERSIST_CONCURRENCY)
-            }
+            InstallPhase::StageOffsets(_)
+            | InstallPhase::DiscardOffsets(_)
+            | InstallPhase::CommitOffsets(_) => base.checked_mul(OFFSET_PERSIST_CONCURRENCY),
             InstallPhase::Sweep => pending.staged.iter().try_fold(
                 base.checked_add(SEGMENT_SWEEP_STACK_BYTES)?,
                 |charge, segment| {
@@ -3098,10 +3094,11 @@ where
                 install.phase = InstallPhase::OpenSegments(0);
             }
             InstallPhase::OpenSegments(cursor) if cursor > 0 && cursor >= install.staged.len() => {
-                self.clear_install_offsets();
+                self.clear_install_journal();
                 install.phase = InstallPhase::OldOffsets(Some(ConsumerKind::Consumer));
             }
             InstallPhase::OldOffsets(None) => {
+                self.clear_install_offsets();
                 install.phase = InstallPhase::CommitOffsets(0);
             }
             InstallPhase::OldOffsets(Some(kind)) if self.consumer_offsets_dir(kind).is_none() => {
@@ -3436,12 +3433,21 @@ where
                     InstallFilePhase::OldOffsets(consumer_kind),
                 )
             }
-            InstallPhase::CommitOffsets(cursor) => (
-                file_job(crate::io::TransferFileJob::CommitOffset(
-                    install.planned_offsets[*cursor].path.clone(),
-                )),
-                InstallFilePhase::CommitOffset(*cursor),
-            ),
+            InstallPhase::CommitOffsets(cursor) => {
+                let end = (*cursor + OFFSET_PERSIST_CONCURRENCY).min(install.planned_offsets.len());
+                (
+                    file_job(crate::io::TransferFileJob::CommitOffsets(
+                        install.planned_offsets[*cursor..end]
+                            .iter()
+                            .map(|write| write.path.clone())
+                            .collect(),
+                    )),
+                    InstallFilePhase::CommitOffsets {
+                        start: *cursor,
+                        end,
+                    },
+                )
+            }
             // The parent syncs after every kind: a kind directory created since
             // its last sync is not durable until `offsets/` is, and once the WAL
             // restarts at this install nothing replays the files inside it.
@@ -3556,11 +3562,12 @@ where
                 InstallFilePhase::Sweep => InstallPhase::RenameIndexes(0),
                 InstallFilePhase::RenameIndex(cursor) => InstallPhase::RenameIndexes(cursor + 1),
                 InstallFilePhase::RenameLog(cursor) => InstallPhase::RenameLogs(cursor + 1),
-                InstallFilePhase::CommitOffset(cursor) => {
-                    let write = &install.planned_offsets[cursor];
-                    self.publish_transferred_offset(write);
-                    install.offset_dirs_changed[write.kind.index()] = true;
-                    InstallPhase::CommitOffsets(cursor + 1)
+                InstallFilePhase::CommitOffsets { start, end } => {
+                    for write in &install.planned_offsets[start..end] {
+                        self.publish_transferred_offset(write);
+                        install.offset_dirs_changed[write.kind.index()] = true;
+                    }
+                    InstallPhase::CommitOffsets(end)
                 }
                 InstallFilePhase::FinishBackup => InstallPhase::ClearMissing,
                 InstallFilePhase::ClearMissing => {
@@ -3616,7 +3623,7 @@ where
                 crate::PartitionIoResult::SegmentDirectory(outcome),
             ) => outcome
                 .map(|()| {
-                    self.clear_install_offsets();
+                    self.clear_install_journal();
                     InstallPhase::OldOffsets(Some(ConsumerKind::Consumer))
                 })
                 .map_err(|source| PartitionInstallError::SwapIo {
@@ -3748,9 +3755,12 @@ where
         ));
     }
 
-    fn clear_install_offsets(&mut self) {
+    fn clear_install_journal(&mut self) {
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
+    }
+
+    fn clear_install_offsets(&mut self) {
         self.consumer_offsets.pin().clear();
         self.consumer_group_offsets.pin().clear();
         self.last_polled_offsets.pin().clear();

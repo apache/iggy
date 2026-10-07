@@ -62,6 +62,15 @@ impl LocalGate {
         LocalGateAcquire { gate: self }
     }
 
+    #[must_use]
+    pub const fn try_acquire(&self) -> Option<LocalGateGuard<'_>> {
+        if self.busy.replace(true) {
+            None
+        } else {
+            Some(LocalGateGuard { gate: self })
+        }
+    }
+
     /// A dropped owned lease leaves the resource fenced. Only an owner that
     /// observed physical completion may release it.
     #[must_use]

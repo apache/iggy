@@ -55,7 +55,7 @@ const FILE_PATH_COPIES_MAX: usize = 8;
 // glibc __alloc_dir bounds its filesystem-sized readdir buffer at 1 MiB.
 // The control reserve separately covers DIR metadata and Rust iterator ownership.
 const DIRECTORY_ITERATION_SCRATCH_MAX: usize = 1024 * 1024;
-const PARTITION_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PARTITION_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-unique identity of one partition owner, preserved across its views.
 /// A replacement in the same namespace always has a different identity.
@@ -82,6 +82,7 @@ pub struct MaterializationIoResult {
 pub enum PartitionIoJob<SB = PingPongSuperblock> {
     Materialize(MaterializationIoJob),
     OffsetWrite(OffsetIoJob),
+    OffsetBatch(Vec<OffsetIoJob>),
     OffsetDelete(OffsetDeleteIoJob),
     OffsetDirectories(OffsetDirectoriesIoJob),
     SegmentDirectory(String),
@@ -131,6 +132,7 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
 pub enum PartitionIoResult {
     Materialize(MaterializationIoResult),
     OffsetWrite(OffsetIoResult),
+    OffsetBatch(Vec<OffsetIoResult>),
     OffsetDelete(Result<bool, IggyError>),
     OffsetDirectories(OffsetDirectoriesIoResult),
     SegmentDirectory(std::io::Result<()>),
@@ -348,6 +350,7 @@ pub struct PartitionIoResources<SB> {
     indexes: Option<Rc<IggyIndexWriter>>,
     file: Option<File>,
     permit: Option<Rc<OffsetFilePermit>>,
+    offset_files: Vec<(Option<File>, Option<Rc<OffsetFilePermit>>)>,
     buffers: Vec<Frozen<4096>>,
 }
 
@@ -420,7 +423,7 @@ pub enum TransferFileJob {
         bodies: bool,
         active: bool,
     },
-    CommitOffset(String),
+    CommitOffsets(Vec<String>),
     ClearMissing(String),
     Converge {
         directory: String,
@@ -584,6 +587,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             indexes: None,
             file: None,
             permit: None,
+            offset_files: Vec::new(),
             buffers: Vec::new(),
         };
         match self {
@@ -596,6 +600,12 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             Self::OffsetWrite(job) => {
                 retained.file.clone_from(&job.file);
                 retained.permit.clone_from(&job.permit);
+            }
+            Self::OffsetBatch(jobs) => {
+                retained.offset_files = jobs
+                    .iter()
+                    .map(|job| (job.file.clone(), job.permit.clone()))
+                    .collect();
             }
             Self::Rotate { job, .. } => retained.indexes.clone_from(&job.old_index),
             Self::IndexSync(writer) => retained.indexes = Some(Rc::clone(writer)),
@@ -633,6 +643,9 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
         match self {
             Self::Materialize(job) => PartitionIoResult::Materialize(job.execute().await),
             Self::OffsetWrite(job) => PartitionIoResult::OffsetWrite(job.execute().await),
+            Self::OffsetBatch(jobs) => PartitionIoResult::OffsetBatch(
+                futures::future::join_all(jobs.into_iter().map(OffsetIoJob::execute)).await,
+            ),
             Self::OffsetDelete(job) => PartitionIoResult::OffsetDelete(job.execute().await),
             Self::OffsetDirectories(job) => {
                 PartitionIoResult::OffsetDirectories(job.execute().await)
@@ -674,7 +687,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                 if outcome.is_ok() {
                     crate::state_transfer::sweep_staging_except(
                         &directory,
-                        &std::collections::HashSet::new(),
+                        std::collections::HashSet::new(),
                     )
                     .await;
                 }
@@ -933,8 +946,8 @@ impl TransferFileJob {
                 keep,
                 bodies,
             } => {
-                let keep = keep.iter().map(std::path::PathBuf::as_path).collect();
-                crate::state_transfer::sweep_staging_except(&directory, &keep).await;
+                crate::state_transfer::sweep_staging_except(&directory, keep.into_iter().collect())
+                    .await;
                 let outcome = async {
                     if bodies {
                         crate::state_transfer::remove_public_segment_files(&directory).await?;
@@ -1072,16 +1085,22 @@ impl TransferFileJob {
                     }
                 }))
             }
-            Self::CommitOffset(path) => TransferFileResult::Finished(
-                crate::offset_storage::commit_offset_replacement(&path)
-                    .await
-                    .map_err(|source| {
-                        crate::state_transfer::PartitionInstallError::OffsetPersistence {
-                            path,
-                            source,
-                        }
-                    }),
-            ),
+            Self::CommitOffsets(paths) => {
+                let results = futures::future::join_all(paths.into_iter().map(|path| async move {
+                    crate::offset_storage::commit_offset_replacement(&path)
+                        .await
+                        .map_err(|source| {
+                            crate::state_transfer::PartitionInstallError::OffsetPersistence {
+                                path,
+                                source,
+                            }
+                        })
+                }))
+                .await;
+                TransferFileResult::Finished(
+                    results.into_iter().try_for_each(std::convert::identity),
+                )
+            }
             Self::ClearMissing(path) => TransferFileResult::Finished(
                 crate::state_transfer::clear_materialization_missing(&path)
                     .await
@@ -1384,7 +1403,80 @@ impl OffsetDirectoriesIoJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use journal::durable_storage::{OpenMode, RegularFiles, StorageEntry};
     use server_common::iobuf::Owned;
+
+    struct FailedOffsetScan;
+
+    impl DurableStorage for FailedOffsetScan {
+        type File = <DiskStorage as DurableStorage>::File;
+
+        async fn open(&self, path: &Path, mode: OpenMode) -> std::io::Result<Self::File> {
+            DiskStorage.open(path, mode).await
+        }
+
+        async fn create_directories(&self, path: &Path) -> std::io::Result<()> {
+            DiskStorage.create_directories(path).await
+        }
+
+        async fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+            DiskStorage.sync_directory(path).await
+        }
+
+        async fn rename(&self, source: &Path, target: &Path) -> std::io::Result<()> {
+            DiskStorage.rename(source, target).await
+        }
+
+        async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            DiskStorage.remove_file(path).await
+        }
+
+        async fn hard_link(&self, source: &Path, target: &Path) -> std::io::Result<()> {
+            DiskStorage.hard_link(source, target).await
+        }
+
+        async fn exists(&self, path: &Path) -> std::io::Result<bool> {
+            DiskStorage.exists(path).await
+        }
+
+        async fn entries(&self, path: &Path) -> std::io::Result<Vec<StorageEntry>> {
+            DiskStorage.entries(path).await
+        }
+
+        fn regular_files(
+            &self,
+            path: &Path,
+        ) -> impl Future<Output = std::io::Result<RegularFiles>> {
+            std::future::ready(Ok(Box::pin(futures::stream::iter([
+                Ok(path.join("1")),
+                Err(std::io::Error::other("directory scan interrupted")),
+            ])) as RegularFiles))
+        }
+
+        async fn remove_tree(&self, path: &Path) -> std::io::Result<()> {
+            DiskStorage.remove_tree(path).await
+        }
+    }
+
+    #[compio::test]
+    async fn given_failed_offset_scan_when_replacing_history_should_remove_known_stale_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for id in [1, 99] {
+            std::fs::write(directory.path().join(id.to_string()), [0; 16]).unwrap();
+        }
+        let result = purge_offset_files(
+            &FailedOffsetScan,
+            directory.path().to_str().unwrap(),
+            HashSet::from([1, 99]),
+            &[1],
+        )
+        .await;
+        assert!(result.scan_error.is_some());
+        assert_eq!(result.failed, [] as [u32; 0]);
+        assert_eq!(result.released, [99]);
+        assert!(directory.path().join("1").is_file());
+        assert!(!directory.path().join("99").exists());
+    }
 
     #[test]
     fn materialization_charges_pinned_allocations_and_vector_capacity() {

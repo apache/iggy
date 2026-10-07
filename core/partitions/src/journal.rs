@@ -15,22 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use ahash::AHashMap;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
     send_messages::{self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice_trusted},
 };
-use smallvec::SmallVec;
 use std::io;
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     collections::{BTreeMap, HashMap},
     ops::RangeInclusive,
 };
 use tracing::warn;
 
-use crate::{COMMIT_WALK_OPS_MAX, Fragment, PollFragments, PollQueryResult};
+use crate::{Fragment, PollFragments, PollQueryResult};
 
 const ZERO_LEN: usize = 0;
 const PREPARE_HEADER_SIZE: usize = std::mem::size_of::<PrepareHeader>();
@@ -170,6 +170,8 @@ where
     /// letting us seek to the closest batch for timestamp-based polling.
     timestamp_to_op: UnsafeCell<BTreeMap<(u64, u64), u64>>,
     headers: UnsafeCell<Vec<PrepareHeader>>,
+    /// Commit validation uses the first resident occurrence, including duplicates.
+    first_header_by_op: RefCell<AHashMap<u64, usize>>,
     inner: UnsafeCell<JournalInner<S>>,
     /// Ring of recently evicted committed entries, keyed by op, retained so
     /// this replica can serve journal repair for rejoin windows after the
@@ -226,6 +228,7 @@ where
             offset_to_op: UnsafeCell::new(BTreeMap::new()),
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
             headers: UnsafeCell::new(Vec::new()),
+            first_header_by_op: RefCell::new(AHashMap::new()),
             inner: UnsafeCell::new(JournalInner {
                 storage: S::default(),
             }),
@@ -330,6 +333,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         unsafe { &mut *self.offset_to_op.get() }.clear();
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         unsafe { &mut *self.headers.get() }.clear();
+        self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.evicted_ring.get() }.clear();
         self.evicted_ring_bytes.set(0);
         self.resident_control_ops.set(0);
@@ -532,6 +536,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
         let headers = unsafe { &mut *self.headers.get() };
         headers.clear();
+        self.first_header_by_op.borrow_mut().clear();
         let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
         op_to_storage_offset.clear();
         let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
@@ -594,6 +599,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         {
             let headers = unsafe { &mut *self.headers.get() };
             headers.clear();
+            self.first_header_by_op.borrow_mut().clear();
             let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
             op_to_storage_offset.clear();
             let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
@@ -691,6 +697,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
         {
             let headers = unsafe { &mut *self.headers.get() };
+            if !headers.is_empty() {
+                self.first_header_by_op
+                    .borrow_mut()
+                    .entry(op)
+                    .or_insert(headers.len());
+            }
             headers.push(header);
         };
 
@@ -794,13 +806,14 @@ where
     S: Storage<Buffer = JournalBuffer>,
 {
     #[must_use]
-    pub const fn with_storage(storage: S) -> Self {
+    pub fn with_storage(storage: S) -> Self {
         Self {
             op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
             offset_to_op: UnsafeCell::new(BTreeMap::new()),
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner { storage }),
+            first_header_by_op: RefCell::new(AHashMap::new()),
             evicted_ring: UnsafeCell::new(BTreeMap::new()),
             evicted_ring_bytes: Cell::new(0),
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
@@ -813,7 +826,11 @@ where
 
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
-        headers.iter().find(|header| header.op == op).copied()
+        if headers.first().is_some_and(|header| header.op == op) {
+            return headers.first().copied();
+        }
+        let index = *self.first_header_by_op.borrow().get(&op)?;
+        headers.get(index).copied()
     }
 
     pub(crate) fn headers_for_commit(
@@ -821,22 +838,14 @@ where
         from_op: u64,
         count: usize,
     ) -> Vec<Option<PrepareHeader>> {
-        if count == 1 {
-            return vec![self.header_by_op(from_op)];
-        }
-        let mut selected = vec![None; count];
-        let headers = unsafe { &*self.headers.get() };
-        for header in headers {
-            if let Some(index) = header
-                .op
-                .checked_sub(from_op)
-                .and_then(|index| usize::try_from(index).ok())
-                && let Some(slot) = selected.get_mut(index)
-            {
-                slot.get_or_insert(*header);
-            }
-        }
-        selected
+        (0..count)
+            .map(|index| {
+                u64::try_from(index)
+                    .ok()
+                    .and_then(|index| from_op.checked_add(index))
+                    .and_then(|op| self.header_by_op(op))
+            })
+            .collect()
     }
 
     pub(crate) fn commit_headers_match(
@@ -844,29 +853,13 @@ where
         from_op: u64,
         expected: &[Option<PrepareHeader>],
     ) -> bool {
-        if let [header] = expected {
-            return self.header_by_op(from_op) == *header;
-        }
-        let mut seen = SmallVec::<[bool; COMMIT_WALK_OPS_MAX]>::new();
-        seen.resize(expected.len(), false);
-        let headers = unsafe { &*self.headers.get() };
-        for header in headers {
-            if let Some(index) = header
-                .op
-                .checked_sub(from_op)
-                .and_then(|index| usize::try_from(index).ok())
-                && let Some(seen) = seen.get_mut(index)
-                && !*seen
-            {
-                if expected[index] != Some(*header) {
-                    return false;
-                }
-                *seen = true;
-            }
-        }
-        seen.iter()
-            .zip(expected)
-            .all(|(seen, header)| *seen == header.is_some())
+        expected.iter().enumerate().all(|(index, expected)| {
+            u64::try_from(index)
+                .ok()
+                .and_then(|index| from_op.checked_add(index))
+                .and_then(|op| self.header_by_op(op))
+                == *expected
+        })
     }
 
     /// Test residency without scanning the header vector.

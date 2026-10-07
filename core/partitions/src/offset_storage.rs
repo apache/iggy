@@ -373,7 +373,7 @@ pub async fn persist_offset_retained(
         OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(path)
             .await
             .note_descriptor_exhaustion(|| format!("opening {path}"))
@@ -751,16 +751,9 @@ mod tests {
     use super::*;
 
     fn unique_temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "iggy-offset-storage-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        tempfile::tempdir()
+            .expect("create offset storage test directory")
+            .keep()
     }
 
     #[test]

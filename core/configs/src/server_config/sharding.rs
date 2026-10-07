@@ -107,6 +107,8 @@ pub struct ShardingConfig {
     /// Retained job allocations, resolved at boot against the largest legal record.
     /// Omission selects the single-job minimum, slightly above 4 GiB per shard.
     /// This is an admission ceiling; memory is allocated only for admitted jobs.
+    /// Config validation checks representability; boot checks the minimum against
+    /// the compiled file-job layout.
     #[config_env(leaf)]
     pub partition_io_bytes_max: Option<IggyByteSize>,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
