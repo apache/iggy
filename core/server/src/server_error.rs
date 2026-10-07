@@ -61,6 +61,11 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to spawn the system stats sampler: {source}")]
+    SystemStatsSamplerSpawnFailed {
+        #[source]
+        source: std::io::Error,
+    },
     // `{source}` is deliberately part of the Display text: the shard-join
     // failure report and `%error` log fields print Display only, and the
     // source carries the io_uring remediation folded in by
