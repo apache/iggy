@@ -27,9 +27,9 @@ use tokio::time::sleep;
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
     QuestDbOps, QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
-    QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
-    QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
-    QuestDbSinkTypedFixture,
+    QuestDbSinkNumbersAsDoubleFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture,
+    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
+    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -283,19 +283,51 @@ async fn given_invalid_record_in_batch_when_consumed_should_write_the_rest(
     server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_more_conflicts_than_the_recovery_cap_when_consumed_should_still_write_the_rest(
+async fn given_numbers_as_double_when_consumed_should_write_both_mixed_records(
+    harness: &TestHarness,
+    fixture: QuestDbSinkNumbersAsDoubleFixture,
+) {
+    // The README offers this switch as the cure for the type conflict, so the
+    // cure is driven against a real server here rather than only in a unit test.
+    // Both records must land, and the column must be a DOUBLE.
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            message(1, json!({"sensor_id": 1, "temp": 20})),
+            message(2, json!({"sensor_id": 2, "temp": 20.5})),
+        ],
+    )
+    .await;
+
+    let count = fixture.wait_for_rows(2).await.expect("no rows");
+    assert_eq!(count, 2, "both records must survive the mixed number types");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(
+        columns.get("temp").map(String::as_str),
+        Some("DOUBLE"),
+        "the whole-number record must not pin the column to LONG: {columns:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_many_conflicting_records_when_consumed_should_write_every_other_one(
     harness: &TestHarness,
     fixture: QuestDbSinkFixture,
 ) {
-    // Each conflict costs one recovery, and past the cap the sink stops
-    // recovering and fails the batch. The runtime records that failure and keeps
-    // polling, so the records after the failed batch must still arrive. This
-    // pins that a producer alternating integer and decimal values cannot stop
-    // ingestion.
+    // JSON has one number type, so a producer alternating whole and fractional
+    // values for one field makes every second record disagree with the column
+    // type the first one pinned. The client refuses those records and rolls each
+    // one back, so the sink keeps the buffer and loses only them. An earlier
+    // version counted recoveries and failed the whole batch past a cap, which
+    // dropped the rows already buffered and every later chunk.
+    let total = 24u32;
     let mut messages = Vec::new();
-    for i in 0..24u32 {
-        // Alternating shapes for one field, which is what pins and then
-        // contradicts the column type.
+    for i in 0..total {
         let temp = if i % 2 == 0 { json!(20) } else { json!(20.5) };
         messages.push(message(
             (i + 1) as u128,
@@ -304,13 +336,23 @@ async fn given_more_conflicts_than_the_recovery_cap_when_consumed_should_still_w
     }
     send(&harness.root_client().await.unwrap(), messages).await;
 
-    // Half the records share the type that each window pins first, so at least
-    // those arrive. The exact count depends on how the runtime batches, so the
-    // assertion is a floor rather than an equality.
-    let count = fixture.wait_for_rows(1).await.expect("no rows at all");
-    assert!(
-        count >= 1,
-        "the connector wrote nothing, so a run of conflicts stopped it: {count}"
+    // The records sharing the pinned type are exactly the even ones, so the
+    // count is an equality rather than a floor, and every one of the twelve has
+    // to arrive. A cap that failed the batch would leave far fewer.
+    let expected = (total / 2) as usize;
+    let count = fixture.wait_for_rows(expected).await.expect("no rows");
+    assert_eq!(
+        count, expected,
+        "every record matching the pinned column type must survive"
+    );
+
+    let ids = fixture.column_values("sensor_id").await.expect("no values");
+    let mut ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (0..total as i64).filter(|i| i % 2 == 0).collect::<Vec<_>>(),
+        "the surviving records must be exactly the ones that agree on the type"
     );
 }
 
@@ -322,10 +364,10 @@ async fn given_rejected_record_before_a_conflicting_one_when_consumed_should_wri
     harness: &TestHarness,
     fixture: QuestDbSinkFixture,
 ) {
-    // The rejected record sits inside the window that the conflicting record
-    // forces the sink to rebuild. A rebuild that replayed it would be refused
-    // again and would take the rest of the chunk with it, so this pins that the
-    // rebuild only replays records the buffer accepted.
+    // Two records in one batch are refused for different reasons: one by this
+    // mapping before anything is written, one by the client after it rolled the
+    // row back. Both must cost one record, and the records around them must
+    // still be written, which is what this pins.
     send(
         &harness.root_client().await.unwrap(),
         vec![
@@ -367,8 +409,8 @@ async fn given_record_whose_column_type_conflicts_when_consumed_should_write_the
     // the client rather than by validation: nothing about the record alone says
     // it conflicts. JSON has a single number type, so a producer emitting whole
     // values as integers and fractional ones as decimals reaches this on
-    // ordinary data. The sink rebuilds the buffered window without the
-    // offending record, which is what keeps the cost to one row.
+    // ordinary data. The client rolls the half-written row back itself, so the
+    // buffer stays usable and only the offending record is lost.
     send(
         &harness.root_client().await.unwrap(),
         vec![

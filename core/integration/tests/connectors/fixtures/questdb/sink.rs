@@ -28,12 +28,12 @@ use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BATCH_SIZE, ENV_SINK_CONNECTION_STRING,
     ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS, ENV_SINK_INCLUDE_OFFSET_COLUMN,
     ENV_SINK_INCLUDE_PARTITION_COLUMN, ENV_SINK_INCLUDE_STREAM_COLUMN,
-    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_LOG_REJECTED_PAYLOAD, ENV_SINK_PATH,
-    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
-    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD,
-    ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS,
-    HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps,
-    SINK_PLUGIN_PATH, create_http_client, ensure_plugin_built,
+    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_LOG_REJECTED_PAYLOAD, ENV_SINK_NUMBERS_AS_DOUBLE,
+    ENV_SINK_PATH, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
+    ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE,
+    ENV_SINK_TIMESTAMP_FIELD, ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT,
+    ENV_SINK_UUID_COLUMNS, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer,
+    QuestDbOps, SINK_PLUGIN_PATH, create_http_client, ensure_plugin_built,
 };
 
 const POLL_ATTEMPTS: usize = 120;
@@ -56,6 +56,7 @@ pub struct QuestDbSinkOptions {
     pub include_partition_column: Option<bool>,
     pub include_offset_column: Option<bool>,
     pub include_headers: Option<bool>,
+    pub numbers_as_double: Option<bool>,
     pub log_rejected_payload: Option<bool>,
     pub batch_size: Option<u32>,
     pub flush_timeout: Option<String>,
@@ -359,6 +360,9 @@ impl TestFixture for QuestDbSinkFixture {
                 value.to_string(),
             );
         }
+        if let Some(value) = self.options.numbers_as_double {
+            envs.insert(ENV_SINK_NUMBERS_AS_DOUBLE.to_string(), value.to_string());
+        }
         if let Some(value) = self.options.include_headers {
             envs.insert(ENV_SINK_INCLUDE_HEADERS.to_string(), value.to_string());
         }
@@ -405,6 +409,16 @@ macro_rules! delegate_fixture {
         }
     };
 }
+
+delegate_fixture!(
+    /// Every JSON number written as a DOUBLE, so a column's type follows its
+    /// name rather than whichever record defined it first.
+    QuestDbSinkNumbersAsDoubleFixture,
+    QuestDbSinkOptions {
+        numbers_as_double: Some(true),
+        ..Default::default()
+    }
+);
 
 delegate_fixture!(
     QuestDbSinkTypedFixture,
