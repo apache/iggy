@@ -77,12 +77,13 @@ const MAX_BATCH_RECOVERIES: usize = 8;
 /// an error, taking down any `wss://` connection attempt. Installing one up
 /// front makes the choice explicit.
 ///
-/// The slot is process-wide and shared. The Apache Iggy client installs
-/// `aws-lc-rs` into it from `core/sdk/src/tcp/tcp_client.rs` and
-/// `core/sdk/src/websocket_client.rs`, so whichever runs first decides for the
-/// whole process. Both providers are correct, and this is called only for a
-/// connect string that needs TLS, which keeps a plain `ws://` sink from
-/// deciding TLS for components that do use it.
+/// The slot is process-wide and shared. The Apache Iggy client installs into it
+/// too, `aws-lc-rs` from `core/sdk/src/tcp/tcp_client.rs` and `ring` from
+/// `core/sdk/src/quic/quic_client.rs`, so whichever runs first decides for the
+/// whole process. Every one of those providers is correct, and the first install
+/// wins rather than failing. This runs only for a connect string that needs TLS,
+/// which keeps a plain `ws://` sink from deciding TLS for a component that does
+/// use it.
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
 fn ensure_crypto_provider() {
