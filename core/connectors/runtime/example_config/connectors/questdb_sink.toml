@@ -70,6 +70,12 @@ batch_size = 1000
 # from being rejected whole.
 max_flush_bytes = 1000000
 
+# JSON has one number type, so the same field can arrive as 2 and as 2.5 and
+# claim two different QuestDB column types. Set this to write every number as a
+# DOUBLE, which makes the type follow the column name. Integers then lose
+# exactness above 2^53.
+numbers_as_double = false
+
 # A rejected record cannot be replayed or dead-lettered, so its log line is the
 # only trace. Enable this to include a truncated payload in that line, at the
 # cost of writing user data to the log.

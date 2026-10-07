@@ -61,6 +61,11 @@ include_headers = false
 # ok | durable. `durable` needs QuestDB Enterprise with replication configured;
 # without it every flush waits for a durable ack that never arrives.
 ack_level = "ok"
+
+# How long one flush waits without progress, not a budget for the whole batch,
+# so a batch that flushes several times can wait this long more than once. At
+# ack_level = "ok" a value of "0s" means fire and forget. It is refused at
+# ack_level = "durable", because a zero timeout never expires.
 flush_timeout = "30s"
 batch_size = 1000
 

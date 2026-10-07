@@ -58,13 +58,13 @@ verbose_logging = false
 | `timestamp_unit` | `auto` | `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers from magnitude. |
 | `symbol_columns` | `[]` | Payload fields stored as `SYMBOL` instead of `VARCHAR`. A listed field must hold a scalar, and a record carrying an object or an array there is rejected rather than losing the value. Matched without regard to case. |
 | `uuid_columns` | `[]` | Payload fields holding canonical RFC-4122 strings, stored as `UUID`. A listed field must hold a string, and a record carrying another type there is rejected. Matched without regard to case, as QuestDB resolves column names. |
-| `include_stream_column` | `true` | Write the Iggy stream name as a `SYMBOL`. |
-| `include_topic_column` | `true` | Write the Iggy topic name as a `SYMBOL`. |
+| `include_stream_column` | `true` | Write the Iggy stream name as a `SYMBOL` named `stream`. |
+| `include_topic_column` | `true` | Write the Iggy topic name as a `SYMBOL` named `topic`. |
 | `include_partition_column` | `false` | Write `partition_id` as a `LONG`. |
 | `include_offset_column` | `false` | Write `offset` as a `LONG`. |
 | `include_headers` | `false` | Write each message header as a `header_<key>` `VARCHAR`. |
 | `ack_level` | `ok` | `ok` waits for server acceptance; `durable` waits for the Enterprise durable-ACK barrier. |
-| `flush_timeout` | `30s` | How long to wait for the configured ack level, for the whole batch. `0s` at `ack_level = "ok"` means fire and forget: the sink publishes and does not wait. `0s` is refused at `ack_level = "durable"`, because a zero timeout never expires. |
+| `flush_timeout` | `30s` | How long one flush waits for the configured ack level, measured as time without progress rather than as a total budget. `0s` at `ack_level = "ok"` means fire and forget: the sink publishes and does not wait. `0s` is refused at `ack_level = "durable"`, because a zero timeout never expires. A batch that flushes several times can therefore wait this long more than once. |
 | `batch_size` | `1000` | Maximum rows per flush. |
 | `max_flush_bytes` | `1000000` | Flush once the encoded buffer reaches this many bytes, regardless of `batch_size`. See below. |
 | `numbers_as_double` | `false` | Write every JSON number as a `DOUBLE`. See the note below. |
@@ -113,6 +113,10 @@ the rows independently of the consumer offset.
 
 The parent of `sf_dir` must already exist. The connector does not create paths
 recursively and does not expand `~`.
+
+Give each connector instance its own `sender_id`, or its own `sf_dir`. Two pools
+that share a directory under one `sender_id` adopt each other's slots, so one
+instance can replay frames the other queued.
 
 **A terminal rejection persists in the store-and-forward log.** If QuestDB
 rejects a frame with a terminal error such as a schema mismatch, restarting the
@@ -184,8 +188,7 @@ Every QuestDB table has a designated timestamp and the client cannot name it, so
 an auto-created table calls it `timestamp`. A payload field named `timestamp` is
 therefore written as an ordinary column beside it, which the server can refuse.
 Rename that field with a transform, or pre-create the table with an explicit
-`timestamp(<name>)` clause. For a different name, pre-create the
-table with an explicit `timestamp(<name>)` clause. The field named by
+`timestamp(<name>)` clause. The field named by
 `timestamp_field` is written only as the designated timestamp, never also as a
 data column.
 
@@ -256,6 +259,25 @@ Until then, **alert on the connector's logs rather than on
 `iggy_connector_errors_total`**. Every rejection is logged at `error` with the
 stream, topic, partition, offset and message ID.
 
+### Reserved column names
+
+The connector writes these columns itself, and a payload field of the same name
+is rejected rather than silently overwritten. Names match without regard to
+case, as QuestDB resolves them.
+
+| Column | Written when |
+| ------ | ------------ |
+| `stream` | `include_stream_column = true`, the default |
+| `topic` | `include_topic_column = true`, the default |
+| `partition_id` | `include_partition_column = true` |
+| `offset` | `include_offset_column = true` |
+| `payload` | the record carries no field structure |
+| `header_<key>` | `include_headers = true` |
+
+A producer whose records carry their own `stream` or `topic` field therefore
+loses every record under the defaults. Turn the matching flag off, or rename the
+field with a transform.
+
 Rejections come in three kinds, and only the first two name a record:
 
 - **Validated before the wire.** A payload that is not a JSON object, a
@@ -271,11 +293,10 @@ Rejections come in three kinds, and only the first two name a record:
   buffer. The important one is column type: QuestDB pins a column's type to
   whatever the first row defined it as, so a later record disagreeing cannot be
   judged from that record alone. JSON has one number type, so a producer writing
-  `2` and `2.5` for the same field reaches this on ordinary data. The connector
-  rebuilds the rows buffered since the last flush without the offending record
-  and flushes them, which keeps the cost to that one record. Past a few
-  recoveries in one batch it stops and fails the batch instead, on the grounds
-  that the records are fighting each other rather than one being bad.
+  `2` and `2.5` for the same field reaches this on ordinary data. The client
+  rolls the half-written row back before reporting the error, so the cost stays
+  at that one record and the rest of the batch is written. Set
+  `numbers_as_double = true` to stop it happening at all.
 - **Rejected by the server, at flush.** QuestDB acknowledges and rejects whole
   frames, not rows: a rejection carries frame sequence numbers
   (`from_fsn` / `to_fsn`), not a row index. The connector reports the failure for
