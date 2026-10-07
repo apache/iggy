@@ -26,9 +26,8 @@ use kafka_protocol::messages::offset_commit_response::{
     OffsetCommitResponsePartition, OffsetCommitResponseTopic,
 };
 use kafka_protocol::messages::{OffsetCommitRequest, OffsetCommitResponse};
-use tokio::time::Instant;
 
-use crate::bridge::IggyBridge;
+use crate::bridge::{IggyBridge, OffsetCalls};
 use crate::error::Result;
 use crate::group::CommitRequest;
 use crate::protocol::api::{
@@ -78,8 +77,8 @@ pub async fn handle(
         .await;
     let topics = match (&state.bridge, error) {
         (Some(bridge), ERROR_NONE) => {
-            let deadline = offset_deadline(state, connection).await;
-            commit_all(bridge, &request, deadline).await
+            let calls = OffsetCalls::new(offset_deadline(state, connection).await);
+            commit_all(bridge, &request, &calls).await
         }
         (None, ERROR_NONE) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
         (_, error) => same_code(&request, error),
@@ -87,12 +86,12 @@ pub async fn handle(
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }
 
-/// Stores every requested offset. The partitions run at once across the offset slots, and a
+/// Stores every requested offset. The slots run at once, each one partition at a time, and a
 /// partition that the deadline leaves out answers 14 and makes no call.
 async fn commit_all(
     bridge: &IggyBridge,
     request: &OffsetCommitRequest,
-    deadline: Instant,
+    calls: &OffsetCalls,
 ) -> Vec<OffsetCommitResponseTopic> {
     let group = request.group_id.0.as_str();
     let targets: Vec<_> = request
@@ -119,7 +118,7 @@ async fn commit_all(
         }
     }
 
-    let results = bridge.commit_group_offsets(group, &commits, deadline).await;
+    let results = bridge.commit_group_offsets(group, &commits, calls).await;
     let mut refused = 0_usize;
     let mut first_refusal = None;
     for ((topic_at, partition_at), result) in positions.into_iter().zip(results) {

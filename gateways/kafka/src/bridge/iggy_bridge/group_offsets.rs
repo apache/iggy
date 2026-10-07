@@ -25,23 +25,61 @@ use futures::future::join_all;
 use iggy::prelude::{
     Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient, IggyError,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::info;
 
-use super::{IggyBridge, KafkaTopicMetadata, LazyClient, SLOT_LIMIT, TopicTarget};
+use super::{
+    IggyBridge, KafkaTopicMetadata, LazyClient, SLOT_LIMIT, TopicTarget, in_slot, permit_by,
+};
 use crate::bridge::error::BridgeError;
 
 /// Prefix of the Iggy consumer group that holds a Kafka group's offsets. It keeps a Kafka group
 /// apart from a native Iggy group of the same name.
 pub const OFFSET_GROUP_PREFIX: &str = "kafka.cg.";
 
-/// Offset calls that run at once, each slot on a client of its own, so offset calls never wait
+/// Offset calls that run at once, each slot on clients of its own, so offset calls never wait
 /// behind a Produce send.
 const OFFSET_SLOTS: usize = 4;
 
 /// The slot of a call that belongs to no partition. Any slot will do.
 const LISTING_SLOT: usize = 0;
+
+/// The offset calls of one Kafka request. A request queues at most one call per slot, so a
+/// request with many partitions cannot hold up the others.
+pub struct OffsetCalls {
+    deadline: Instant,
+    /// The request's place in the queue of each slot.
+    queued: [Arc<Semaphore>; OFFSET_SLOTS],
+}
+
+impl OffsetCalls {
+    /// Calls that give up at `deadline`. A call that has not started by then never starts.
+    #[must_use]
+    pub fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            queued: std::array::from_fn(|_| Arc::new(Semaphore::new(1))),
+        }
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// The turn of `lane`, a lane of `slot`, once no other call of this request waits there.
+    /// Keep both permits until the call ends. `None` if a turn does not come by the deadline.
+    async fn take(
+        &self,
+        slot: usize,
+        lane: &Lane,
+    ) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let queued = permit_by(&self.queued[slot], self.deadline).await?;
+        let turn = permit_by(&lane.turn, self.deadline).await?;
+        Some((queued, turn))
+    }
+}
 
 impl IggyBridge {
     /// Stores each `(topic, partition, offset)` of `commits` as a committed offset of Kafka group
@@ -52,18 +90,18 @@ impl IggyBridge {
     /// store that finds no Iggy group for the offsets creates it. A replay that Iggy already
     /// applied counts as done.
     ///
-    /// Each commit starts once its slot is free. Commits on one slot start in the order given.
+    /// Commits on one slot start one at a time, in the order given.
     ///
     /// # Errors
     ///
     /// Per commit: [`BridgeError::Iggy`] if Iggy refuses it or `group` names no valid Iggy group,
-    /// and [`BridgeError::Timeout`] if it does not end by `deadline`. A commit that has not
-    /// started by then never starts.
+    /// and [`BridgeError::Timeout`] if it does not end by the deadline of `calls`. A commit that
+    /// has not started by then never starts.
     pub async fn commit_group_offsets(
         &self,
         group: &str,
         commits: &[(&TopicTarget, u32, i64)],
-        deadline: Instant,
+        calls: &OffsetCalls,
     ) -> Vec<Result<(), BridgeError>> {
         let names = match OffsetNames::new(group) {
             Ok(names) => Arc::new(names),
@@ -80,13 +118,13 @@ impl IggyBridge {
             let commit = move |client: Arc<IggyClient>| async move {
                 commit_on(&client, &names, &stream_id, &topic_id, partition, offset).await
             };
-            self.commit_in_slot(slot_of(topic, partition), deadline, commit)
+            self.commit_in_slot(slot_of(topic, partition), calls, commit)
         }))
         .await
     }
 
     /// The committed offset of Kafka group `group` for each `(topic, partition)` of `reads`, in
-    /// order. `None` when there is no key or no group. The reads run at once.
+    /// order. `None` when there is no key or no group. Reads on different slots run at once.
     ///
     /// # Errors
     ///
@@ -95,7 +133,7 @@ impl IggyBridge {
         &self,
         group: &str,
         reads: &[(&TopicTarget, u32)],
-        deadline: Instant,
+        calls: &OffsetCalls,
     ) -> Vec<Result<Option<u64>, BridgeError>> {
         let names = match OffsetNames::new(group) {
             Ok(names) => names,
@@ -115,7 +153,7 @@ impl IggyBridge {
                     .map_err(BridgeError::Iggy)?;
                 Ok(info.map(|info| info.stored_offset))
             };
-            self.read_in_slot(slot_of(topic, partition), deadline, read)
+            self.read_in_slot(slot_of(topic, partition), calls, read)
         }))
         .await
     }
@@ -125,12 +163,12 @@ impl IggyBridge {
     /// # Errors
     ///
     /// [`BridgeError::Iggy`] if Iggy refuses the call, for example for a missing topic, or `group`
-    /// names no valid Iggy group. [`BridgeError::Timeout`] past `deadline`.
+    /// names no valid Iggy group. [`BridgeError::Timeout`] past the deadline of `calls`.
     pub async fn holds_offset_group(
         &self,
         group: &str,
         topic: &TopicTarget,
-        deadline: Instant,
+        calls: &OffsetCalls,
     ) -> Result<bool, BridgeError> {
         let group_id = OffsetNames::new(group)
             .map_err(BridgeError::Iggy)?
@@ -144,79 +182,90 @@ impl IggyBridge {
                 .map_err(BridgeError::Iggy)
         };
         // Any slot will do. Partition 0's keeps the choice fixed.
-        self.read_in_slot(slot_of(topic, 0), deadline, lookup).await
+        self.read_in_slot(slot_of(topic, 0), calls, lookup).await
     }
 
-    /// [`Self::list_kafka_topics`] on an offset slot's client, so it never waits behind Produce.
+    /// [`Self::list_kafka_topics`] on an offset slot's read client, so it never waits behind
+    /// Produce.
     ///
     /// # Errors
     ///
-    /// As [`Self::list_kafka_topics`]. [`BridgeError::Timeout`] past `deadline`.
-    pub async fn list_kafka_topics_until(
+    /// As [`Self::list_kafka_topics`]. [`BridgeError::Timeout`] past the deadline of `calls`.
+    pub async fn list_kafka_topics_in_slot(
         &self,
-        deadline: Instant,
+        calls: &OffsetCalls,
     ) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
         let listing =
             |client: Arc<IggyClient>| async move { self.list_kafka_topics_on(&client).await };
-        self.read_in_slot(LISTING_SLOT, deadline, listing).await
+        self.read_in_slot(LISTING_SLOT, calls, listing).await
     }
 
-    /// Runs `call` with the client of `slot`, and waits for it until `deadline`. The call keeps
-    /// the slot until it ends, even after its caller stops waiting, so the next call on the slot
-    /// cannot overtake it. A call that has not started by `deadline` never starts.
+    /// Runs `call` with the commit client of `slot`, and waits for it until the deadline of
+    /// `calls`. The call keeps the slot until it ends, or for at most `SLOT_LIMIT`, even after its
+    /// caller stops waiting. A call that has not started by the deadline never starts.
     async fn commit_in_slot<F>(
         &self,
         slot: usize,
-        deadline: Instant,
+        calls: &OffsetCalls,
         call: impl FnOnce(Arc<IggyClient>) -> F,
     ) -> Result<(), BridgeError>
     where
         F: Future<Output = Result<(), BridgeError>> + Send + 'static,
     {
-        let Some((turn, client)) = self.offset_pool.take(slot, deadline).await else {
+        let lane = &self.offset_pool.slots[slot].commits;
+        let Some((_queued, turn)) = calls.take(slot, lane).await else {
             return Err(BridgeError::Timeout);
         };
-        let client = match timeout_at(deadline, client.connected(&self.config)).await {
+        let client = match timeout_at(calls.deadline, lane.client.connected(&self.config)).await {
             Ok(connected) => connected?,
             Err(_elapsed) => return Err(BridgeError::Timeout),
         };
-        match timeout_at(deadline, spawn_holding(turn, call(client))).await {
-            Ok(Ok(ended)) => ended,
-            // A task that ends with no answer leaves the outcome unknown too.
-            Ok(Err(_)) | Err(_) => Err(BridgeError::Timeout),
+        // The turn comes back only to be dropped. A commit that outlives its caller frees it in
+        // its task.
+        match in_slot(turn, calls.deadline, timeout(SLOT_LIMIT, call(client))).await {
+            Some((Ok(ended), _)) => ended,
+            // Still running at the deadline, or cut off at `SLOT_LIMIT`: it may still land.
+            Some((Err(_), _)) | None => Err(BridgeError::Timeout),
         }
     }
 
-    /// Runs `call` with the client of `slot`, and frees the slot when it ends or at `deadline`.
-    /// A read that `deadline` cuts off leaves its client behind, so the next call on the slot
-    /// does not wait behind it in the SDK. A call that has not started by `deadline` never starts.
+    /// Runs `call` with the read client of `slot`, and frees the slot when it ends or at the
+    /// deadline of `calls`. A read that the deadline cuts off leaves its client behind, so the
+    /// next read on the slot does not wait behind it in the SDK. A read that has not started by
+    /// the deadline never starts.
     async fn read_in_slot<T, F>(
         &self,
         slot: usize,
-        deadline: Instant,
+        calls: &OffsetCalls,
         call: impl FnOnce(Arc<IggyClient>) -> F,
     ) -> Result<T, BridgeError>
     where
         F: Future<Output = Result<T, BridgeError>>,
     {
-        let Some((_turn, client)) = self.offset_pool.take(slot, deadline).await else {
+        let lane = &self.offset_pool.slots[slot].reads;
+        let Some((_queued, _turn)) = calls.take(slot, lane).await else {
             return Err(BridgeError::Timeout);
         };
-        let read = async { call(client.connected(&self.config).await?).await };
-        client.until(deadline, read).await
+        let read = async { call(lane.client.connected(&self.config).await?).await };
+        lane.client.until(calls.deadline, read).await
     }
 }
 
-/// The offset slots. A partition always takes the same slot. A commit keeps its slot until the
-/// SDK lets go of it, so the commits of one partition reach Iggy in the order they started, and a
-/// read that comes after them waits for them. A read frees its slot by its deadline.
+/// The offset slots. A partition always takes the same slot. A slot has a lane for commits and
+/// one for reads, each with its own client, so only commits wait on commits. The commits of a
+/// partition share one client, which sends one call at a time, so they reach Iggy in order.
 pub(super) struct OffsetPool {
     slots: Vec<OffsetSlot>,
 }
 
 struct OffsetSlot {
+    commits: Lane,
+    reads: Lane,
+}
+
+/// A client, and one call on it at a time.
+struct Lane {
     client: LazyClient,
-    /// One call at a time.
     turn: Arc<Semaphore>,
 }
 
@@ -225,61 +274,40 @@ impl OffsetPool {
         Self {
             slots: (0..OFFSET_SLOTS)
                 .map(|_| OffsetSlot {
-                    client: LazyClient::default(),
-                    turn: Arc::new(Semaphore::new(1)),
+                    commits: Lane::new(LazyClient::default()),
+                    reads: Lane::new(LazyClient::default()),
                 })
                 .collect(),
         }
     }
 
-    /// Slot `slot`, with its client. `None` if it is not free by `deadline`.
-    async fn take(
-        &self,
-        slot: usize,
-        deadline: Instant,
-    ) -> Option<(OwnedSemaphorePermit, &LazyClient)> {
-        let slot = &self.slots[slot];
-        match timeout_at(deadline, Arc::clone(&slot.turn).acquire_owned()).await {
-            Ok(Ok(turn)) if Instant::now() < deadline => Some((turn, &slot.client)),
-            _ => None,
-        }
-    }
-
-    /// Shuts down each client that connected, and returns the first error. A client that fails to
-    /// shut down stops none of the others.
+    /// Shuts down each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
-        let mut closed = Ok(());
-        for slot in &self.slots {
-            let shutdown = slot.client.close().await;
-            closed = closed.and(shutdown);
-        }
-        closed
+        let clients = self
+            .slots
+            .iter()
+            .flat_map(|slot| [&slot.commits.client, &slot.reads.client]);
+        LazyClient::close_all(clients).await
     }
 }
 
-/// The slot of `partition` of `topic`, the same at every call.
+impl Lane {
+    fn new(client: LazyClient) -> Self {
+        Self {
+            client,
+            turn: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+/// The slot of `partition` of `topic`, the same at every call. The partitions of a topic take the
+/// slots in turn, so a topic with one partition per slot uses every slot.
 fn slot_of(topic: &TopicTarget, partition: u32) -> usize {
     let mut hasher = DefaultHasher::new();
-    (&topic.stream_id, &topic.topic_id, partition).hash(&mut hasher);
-    usize::from(hasher.finish().to_le_bytes()[0]) % OFFSET_SLOTS
-}
-
-/// Runs `call` in a task that keeps `turn` until `call` ends, even after its caller stops
-/// waiting, so the next call on the slot cannot overtake it.
-fn spawn_holding<T: Send + 'static>(
-    turn: OwnedSemaphorePermit,
-    call: impl Future<Output = Result<T, BridgeError>> + Send + 'static,
-) -> oneshot::Receiver<Result<T, BridgeError>> {
-    let (sender, receiver) = oneshot::channel();
-    tokio::spawn(async move {
-        let ended = timeout(SLOT_LIMIT, call)
-            .await
-            .unwrap_or(Err(BridgeError::Timeout));
-        // The caller may have stopped waiting.
-        let _ = sender.send(ended);
-        drop(turn);
-    });
-    receiver
+    (&topic.stream_id, &topic.topic_id).hash(&mut hasher);
+    let first = usize::from(hasher.finish().to_le_bytes()[0]);
+    let step = usize::try_from(partition).map_or(0, |partition| partition % OFFSET_SLOTS);
+    (first + step) % OFFSET_SLOTS
 }
 
 /// One refusal per call, for a group id that names no valid Iggy group.
@@ -375,10 +403,13 @@ async fn create_offset_group(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use iggy::prelude::{ConsumerKind, IggyClientBuilder};
     use secrecy::SecretString;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::bridge::iggy_bridge::FetchPool;
@@ -395,6 +426,10 @@ mod tests {
         Instant::now() + Duration::from_millis(20)
     }
 
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
     /// A client that never dialed and holds no credentials, so each call fails at once.
     fn offline_client() -> Arc<IggyClient> {
         let client = IggyClientBuilder::new()
@@ -405,8 +440,15 @@ mod tests {
         Arc::new(client)
     }
 
-    /// A bridge that never dials. Each offset slot holds the client at its index.
-    fn offline_bridge(slot_clients: [Arc<IggyClient>; OFFSET_SLOTS]) -> IggyBridge {
+    fn offline_clients() -> [Arc<IggyClient>; OFFSET_SLOTS] {
+        std::array::from_fn(|_| offline_client())
+    }
+
+    /// A bridge that never dials. Each offset slot holds the clients at its index.
+    fn offline_bridge(
+        commit_clients: [Arc<IggyClient>; OFFSET_SLOTS],
+        read_clients: [Arc<IggyClient>; OFFSET_SLOTS],
+    ) -> IggyBridge {
         IggyBridge {
             client: offline_client(),
             config: IggyBridgeConfig {
@@ -420,11 +462,12 @@ mod tests {
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             offset_pool: OffsetPool {
-                slots: slot_clients
+                slots: commit_clients
                     .into_iter()
-                    .map(|client| OffsetSlot {
-                        client: LazyClient::holding(client),
-                        turn: Arc::new(Semaphore::new(1)),
+                    .zip(read_clients)
+                    .map(|(commits, reads)| OffsetSlot {
+                        commits: Lane::new(LazyClient::holding(commits)),
+                        reads: Lane::new(LazyClient::holding(reads)),
                     })
                     .collect(),
             },
@@ -436,6 +479,20 @@ mod tests {
         (0..64)
             .find(|&partition| slot_of(topic, partition) != slot)
             .expect("the partitions of one topic spread over the slots")
+    }
+
+    /// A commit on `slot` that holds its commit lane until `released` fires or drops.
+    async fn stuck_commit(bridge: &IggyBridge, slot: usize, released: oneshot::Receiver<()>) {
+        let commit = bridge
+            .commit_in_slot(slot, &OffsetCalls::new(soon()), |_client| async move {
+                let _ = released.await;
+                Ok(())
+            })
+            .await;
+        assert!(
+            matches!(commit, Err(BridgeError::Timeout)),
+            "the caller gives up"
+        );
     }
 
     #[test]
@@ -459,74 +516,82 @@ mod tests {
         assert!(OffsetNames::new(&format!("{longest}g")).is_err());
     }
 
+    /// Hashing the partition index too would put two partitions of most such topics on one slot.
     #[test]
-    fn given_the_partitions_of_a_topic_should_pin_each_to_one_slot_and_use_several() {
-        let orders = target("orders");
-        let slots: Vec<usize> = (0..64)
-            .map(|partition| slot_of(&orders, partition))
-            .collect();
+    fn given_a_topic_with_one_partition_per_slot_should_give_each_partition_its_own_slot() {
+        let partitions = u32::try_from(OFFSET_SLOTS).unwrap();
+        for name in ["orders", "payments", "audit", "clicks"] {
+            let topic = target(name);
+            let mut slots: Vec<usize> = (0..partitions)
+                .map(|partition| slot_of(&topic, partition))
+                .collect();
+            slots.sort_unstable();
 
-        for (partition, &slot) in (0..64).zip(&slots) {
-            assert_eq!(slot_of(&target("orders"), partition), slot);
+            assert_eq!(slots, (0..OFFSET_SLOTS).collect::<Vec<_>>(), "{name}");
+            assert_eq!(slot_of(&topic, partitions), slot_of(&topic, 0), "{name}");
         }
-        assert!(
-            slots.iter().any(|&slot| slot != slots[0]),
-            "the partitions of one topic must spread over the slots"
-        );
     }
 
-    #[tokio::test]
-    async fn given_a_taken_slot_when_the_deadline_passes_should_not_start_the_call() {
-        let pool = OffsetPool::new();
-        let held = pool.take(0, soon()).await.expect("a free slot");
-
-        assert!(pool.take(0, soon()).await.is_none());
-        drop(held);
-        assert!(pool.take(0, soon()).await.is_some());
-    }
-
-    /// A commit given up on can still land, so the next call on its slot must wait for it, or a
+    /// A commit given up on can still land, so the next commit on its slot must wait for it, or a
     /// newer offset could land first and lose to the older one.
     #[tokio::test]
-    async fn given_a_commit_given_up_on_when_the_next_call_comes_should_wait_for_it_to_end() {
-        let pool = OffsetPool::new();
+    async fn given_a_commit_given_up_on_when_the_next_commit_comes_should_wait_for_it_to_end() {
+        let bridge = offline_bridge(offline_clients(), offline_clients());
         let (release, released) = oneshot::channel::<()>();
-        let (turn, _) = pool.take(0, soon()).await.expect("a free slot");
-        let stuck = spawn_holding(turn, async move {
-            let _ = released.await;
-            Ok(1)
-        });
+        stuck_commit(&bridge, 0, released).await;
 
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        let next = bridge
+            .commit_in_slot(0, &OffsetCalls::new(soon()), |_client| async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert!(matches!(next, Err(BridgeError::Timeout)));
         assert!(
-            timeout_at(soon(), stuck).await.is_err(),
-            "the caller gives up"
-        );
-        assert!(
-            pool.take(0, soon()).await.is_none(),
-            "the call still holds its slot"
+            !started.load(Ordering::SeqCst),
+            "the stuck commit still holds the slot"
         );
 
-        release.send(()).expect("the call waits for its release");
-        let later = Instant::now() + Duration::from_secs(5);
-        assert!(pool.take(0, later).await.is_some());
+        release
+            .send(())
+            .expect("the stuck commit waits for its release");
+        let after = bridge
+            .commit_in_slot(0, &OffsetCalls::new(later()), |_client| async { Ok(()) })
+            .await;
+        assert!(after.is_ok(), "the slot frees when the stuck commit ends");
+    }
+
+    /// Only commits wait on commits. A read on the slot of a stuck commit goes ahead.
+    #[tokio::test]
+    async fn given_a_stuck_commit_when_reading_on_its_slot_should_not_wait_for_it() {
+        let bridge = offline_bridge(offline_clients(), offline_clients());
+        let (_release, released) = oneshot::channel::<()>();
+        stuck_commit(&bridge, 0, released).await;
+
+        let read = bridge
+            .read_in_slot(0, &OffsetCalls::new(soon()), |_client| async { Ok(7) })
+            .await;
+
+        assert_eq!(read.unwrap(), 7);
     }
 
     /// A busy slot must cost only its own partitions, wherever they sit in the request.
     #[tokio::test]
     async fn given_a_busy_slot_when_committing_should_still_commit_on_the_free_slots() {
-        let bridge = offline_bridge(std::array::from_fn(|_| offline_client()));
+        let bridge = offline_bridge(offline_clients(), offline_clients());
         let orders = target("orders");
         let busy = slot_of(&orders, 0);
         let free = partition_off_slot(&orders, busy);
-        let _held = bridge
-            .offset_pool
-            .take(busy, soon())
+        let _held = OffsetCalls::new(soon())
+            .take(busy, &bridge.offset_pool.slots[busy].commits)
             .await
             .expect("a free slot");
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let calls = OffsetCalls::new(Instant::now() + Duration::from_millis(200));
 
         let results = bridge
-            .commit_group_offsets("g", &[(&orders, 0, 5), (&orders, free, 7)], deadline)
+            .commit_group_offsets("g", &[(&orders, 0, 5), (&orders, free, 7)], &calls)
             .await;
 
         assert!(matches!(results[0], Err(BridgeError::Timeout)));
@@ -537,28 +602,75 @@ mod tests {
         );
     }
 
-    /// A Java consumer retries a timed out `OffsetFetch`. A read that kept its slot, or its client,
-    /// would make the retry wait behind it.
+    /// A request queues one call per slot, so another request waits behind one of its calls, not
+    /// behind all of them.
     #[tokio::test]
-    async fn given_a_read_cut_off_by_its_deadline_should_free_its_slot_and_drop_its_client() {
-        let clients: [Arc<IggyClient>; OFFSET_SLOTS] = std::array::from_fn(|_| offline_client());
-        let bridge = offline_bridge(clients.clone());
+    async fn given_a_request_with_many_reads_on_a_slot_should_let_another_request_in_after_one() {
+        let bridge = offline_bridge(offline_clients(), offline_clients());
+        let busy = OffsetCalls::new(later())
+            .take(0, &bridge.offset_pool.slots[0].reads)
+            .await
+            .expect("a free slot");
+        let (large, small) = (OffsetCalls::new(later()), OffsetCalls::new(later()));
+        let order = Mutex::new(Vec::new());
+        let read = async |calls: &OffsetCalls, name: &'static str| {
+            let order = &order;
+            bridge
+                .read_in_slot(0, calls, move |_client| async move {
+                    order.lock().unwrap().push(name);
+                    Ok(())
+                })
+                .await
+        };
+
+        let (first, second, third, other, ()) = tokio::join!(
+            read(&large, "large 1"),
+            read(&large, "large 2"),
+            read(&large, "large 3"),
+            read(&small, "small"),
+            async {
+                tokio::task::yield_now().await;
+                drop(busy);
+            },
+        );
+
+        assert!(first.is_ok() && second.is_ok() && third.is_ok() && other.is_ok());
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["large 1", "small", "large 2", "large 3"]
+        );
+    }
+
+    /// A Java consumer retries a timed out `OffsetFetch`. A read that kept its slot, or its client,
+    /// would make the retry wait behind it. The commit client stays, so commits keep their order.
+    #[tokio::test]
+    async fn given_a_read_cut_off_by_its_deadline_should_free_its_slot_and_drop_only_its_client() {
+        let (commit_clients, read_clients) = (offline_clients(), offline_clients());
+        let bridge = offline_bridge(commit_clients.clone(), read_clients.clone());
 
         let read = bridge
-            .read_in_slot(1, soon(), |_client| {
+            .read_in_slot(1, &OffsetCalls::new(soon()), |_client| {
                 std::future::pending::<Result<(), BridgeError>>()
             })
             .await;
 
         assert!(matches!(read, Err(BridgeError::Timeout)));
         assert!(
-            bridge.offset_pool.take(1, soon()).await.is_some(),
+            OffsetCalls::new(soon())
+                .take(1, &bridge.offset_pool.slots[1].reads)
+                .await
+                .is_some(),
             "the slot is free"
         );
         assert_eq!(
-            Arc::strong_count(&clients[1]),
+            Arc::strong_count(&read_clients[1]),
             1,
-            "the slot let go of its client, so the next call connects a new one"
+            "the read client is gone, so the next read connects a new one"
+        );
+        assert_eq!(
+            Arc::strong_count(&commit_clients[1]),
+            2,
+            "the commit client stays"
         );
     }
 

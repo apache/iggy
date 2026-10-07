@@ -22,7 +22,7 @@ use std::time::Duration;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
 };
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 use tracing::info;
 
@@ -38,8 +38,8 @@ mod topics;
 
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
-pub use group_offsets::OFFSET_GROUP_PREFIX;
 use group_offsets::OffsetPool;
+pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
@@ -88,7 +88,8 @@ const SLOT_LIMIT: Duration = Duration::from_secs(45);
 ///
 /// A call given up on keeps its slot until it ends, so the next call waits for the slot, not in
 /// the SDK queue. A `call` that stops itself sooner frees the slot while the SDK can still hold
-/// its connection, so it must leave that connection behind. See `LazyClient::until`.
+/// its connection. A Fetch poll then drops that connection (`LazyClient::until`). An offset
+/// commit keeps it, so the next commit waits behind it in the SDK and commits stay in order.
 async fn in_slot<S: Send + 'static, T: Send + 'static>(
     slot: S,
     deadline: Instant,
@@ -103,11 +104,19 @@ async fn in_slot<S: Send + 'static, T: Send + 'static>(
     timeout_at(deadline, receiver).await.ok()?.ok()
 }
 
+/// A permit of `turn`. `None` if it is not free before `deadline`, so a call never starts late.
+async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSemaphorePermit> {
+    match timeout_at(deadline, Arc::clone(turn).acquire_owned()).await {
+        Ok(Ok(permit)) if Instant::now() < deadline => Some(permit),
+        _ => None,
+    }
+}
+
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
 /// One lockstep client serves Produce, Metadata and `CreateTopics` for every Kafka connection, so
 /// those Iggy calls run one at a time. Topic probes use a client of their own, Fetch polls one per
-/// read slot, and offset calls one per offset slot. A Produce pool is a TODO in `docs/SCOPE.md`.
+/// read slot, and offset calls two per offset slot. A Produce pool is a TODO in `docs/SCOPE.md`.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -120,7 +129,7 @@ pub struct IggyBridge {
     fetch_pool: Arc<FetchPool>,
     /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
     probe_client: LazyClient,
-    /// Group offset slots, each with its own client. See `commit_group_offsets`.
+    /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
 }
 

@@ -504,9 +504,9 @@ impl GroupCoordinator {
     /// of the session of `member`, the member that heartbeats on that connection. Never parks.
     pub async fn offset_hold(&self, member: Option<&GroupMember>) -> Duration {
         let hold = self.config.min_session_timeout / 2;
-        if member.is_none() {
+        let Some(member) = member else {
             return hold;
-        }
+        };
         let groups = self.groups.lock().await;
         state::offset_hold(&groups, member, hold, Instant::now())
     }

@@ -40,7 +40,8 @@ leaves it behind.
   and stores again. A group that already exists counts as created. An operator can delete the group,
   and the next commit creates it again.
 - The prefix keeps a Kafka group apart from a native Iggy group with the same name.
-- Group id: 1 to 246 bytes, else `INVALID_GROUP_ID` (24). Iggy names stop at 255.
+- Group id: 1 to 246 bytes, else `INVALID_GROUP_ID` (24). Iggy names stop at 255. Unlike Kafka,
+  an empty id is refused in OffsetCommit and OffsetFetch too.
 - Negative offset: delete the key. A missing key or group counts as success. Kafka consumers read any
   negative offset as none.
 - Metadata string and leader epoch: dropped. OffsetFetch returns `""` and -1.
@@ -61,13 +62,18 @@ leaves it behind.
 
 ## Calls
 
-- Offset calls run on 4 offset slots, each with its own Iggy client. They never wait behind
-  Produce. The topic listing for a null topic list runs on a slot too.
-- The partitions of a request, the groups of a v8 OffsetFetch and the topics of a null topic list
-  all run at once.
-- A partition always takes the same slot. A commit keeps its slot until the SDK lets go of it, so
-  the commits of one partition reach Iggy in order, even after a caller gives up. A read waits for
-  them, and frees its slot at the deadline.
+- Offset calls run on 4 offset slots. Each slot has an Iggy client for commits and one for reads,
+  so a read never waits behind a commit, and no offset call waits behind Produce. The topic listing
+  for a null topic list runs on a slot too.
+- A request queues at most one call per slot, so a large request cannot hold up the others. Within
+  that, its partitions, the groups of a v8 OffsetFetch and the topics of a null topic list run at
+  once.
+- A partition always takes the same slot. The partitions of a topic take the slots in turn.
+- A commit keeps its slot until it ends, or for at most 45 s. The commits of a slot share one
+  client, which sends one call at a time, so the commits of a partition reach Iggy in order, even
+  after a caller gives up.
+- A read frees its slot at the deadline. A read cut off there drops its client, so the next read
+  does not wait behind it.
 - A request gives up at half of the minimum session timeout: 3 s at the default 6 s. A heartbeat
   on the same connection waits behind it, so a request also gives up at half of what is left of
   the session of the member that heartbeats there. A partition that the deadline leaves out

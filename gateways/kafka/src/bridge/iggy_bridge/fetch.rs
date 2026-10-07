@@ -77,15 +77,9 @@ impl FetchPool {
         })
     }
 
-    /// Shuts down each client that connected, and returns the first error. A client that fails to
-    /// shut down stops none of the others.
+    /// Shuts down each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
-        let mut closed = Ok(());
-        for client in &self.all {
-            let shutdown = client.close().await;
-            closed = closed.and(shutdown);
-        }
-        closed
+        LazyClient::close_all(&self.all).await
     }
 }
 
@@ -141,6 +135,19 @@ impl LazyClient {
             return Ok(());
         };
         with_request_timeout(client.shutdown()).await
+    }
+
+    /// Shuts down each client that connected, and returns the first error. A client that fails to
+    /// shut down stops none of the others.
+    pub(super) async fn close_all(
+        clients: impl IntoIterator<Item = &Self>,
+    ) -> Result<(), BridgeError> {
+        let mut closed = Ok(());
+        for client in clients {
+            let shutdown = client.close().await;
+            closed = closed.and(shutdown);
+        }
+        closed
     }
 }
 

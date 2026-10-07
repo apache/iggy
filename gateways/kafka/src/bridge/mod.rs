@@ -30,6 +30,7 @@ pub mod topic_map;
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig};
 pub use error::BridgeError;
 pub use iggy_bridge::{
-    IggyBridge, KafkaTopicMetadata, OFFSET_GROUP_PREFIX, TopicCreationOutcome, TopicTarget,
+    IggyBridge, KafkaTopicMetadata, OFFSET_GROUP_PREFIX, OffsetCalls, TopicCreationOutcome,
+    TopicTarget,
 };
 pub use topic_map::{TopicMapping, TopicOverride};

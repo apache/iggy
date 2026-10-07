@@ -49,8 +49,11 @@ use crate::protocol::api::{
 /// group id this gateway admits must leave room for that prefix (`docs/OFFSET_STORAGE.md`).
 pub const MAX_GROUP_ID_BYTES: usize = 246;
 
-/// Whether every group API admits `group_id`. Kafka refuses an empty one, and a longer one than
-/// [`MAX_GROUP_ID_BYTES`] cannot name its offsets in Iggy.
+/// Whether every group API admits `group_id`.
+///
+/// A longer one than [`MAX_GROUP_ID_BYTES`] cannot name its offsets in Iggy. Kafka refuses an
+/// empty one only in the membership APIs, and accepts it in `OffsetCommit` and `OffsetFetch` for
+/// old clients. This gateway refuses it in every API.
 #[must_use]
 pub const fn is_valid_group_id(group_id: &str) -> bool {
     !group_id.is_empty() && group_id.len() <= MAX_GROUP_ID_BYTES
@@ -1179,20 +1182,15 @@ pub fn commit_step(groups: &mut Groups, request: &CommitRequest, now: Instant) -
 /// still lands in time. A member that is not there, or whose session has ended, leaves `hold`.
 pub fn offset_hold(
     groups: &Groups,
-    member: Option<&GroupMember>,
+    member: &GroupMember,
     hold: Duration,
     now: Instant,
 ) -> Duration {
-    let left = member.and_then(|member| {
-        let found = groups
-            .get(&member.group_id)?
-            .members
-            .get(&member.member_id)?;
-        found
-            .session_deadline
-            .checked_duration_since(now)
-            .filter(|left| !left.is_zero())
-    });
+    let left = groups
+        .get(&member.group_id)
+        .and_then(|group| group.members.get(&member.member_id))
+        .and_then(|found| found.session_deadline.checked_duration_since(now))
+        .filter(|left| !left.is_zero());
     left.map_or(hold, |left| hold.min(left / 2))
 }
 
@@ -3214,22 +3212,21 @@ mod tests {
         let hold = Duration::from_secs(3);
         let late = now + session - Duration::from_secs(2);
 
-        assert_eq!(offset_hold(&groups, Some(&member), hold, now), hold);
+        assert_eq!(offset_hold(&groups, &member, hold, now), hold);
         assert_eq!(
-            offset_hold(&groups, Some(&member), hold, late),
+            offset_hold(&groups, &member, hold, late),
             Duration::from_secs(1)
         );
         assert_eq!(
-            offset_hold(&groups, Some(&member), hold, now + session),
+            offset_hold(&groups, &member, hold, now + session),
             hold,
             "a session that has ended cannot be saved"
         );
-        assert_eq!(offset_hold(&groups, None, hold, late), hold);
         let gone = GroupMember {
             member_id: StrBytes::from_static_str("gone"),
             ..member
         };
-        assert_eq!(offset_hold(&groups, Some(&gone), hold, late), hold);
+        assert_eq!(offset_hold(&groups, &gone, hold, late), hold);
     }
 
     #[test]

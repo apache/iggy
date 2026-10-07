@@ -735,14 +735,23 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                 // No reply, or an owner that does not hold the partition yet,
                 // says nothing about the offset, so it must not read as "no
                 // stored offset". A read moves no progress, so the client may
-                // retry it.
+                // retry it. The SDK retries every 50 ms, so the not-yet-held
+                // case logs at debug.
                 reply => {
-                    warn!(
-                        transport_client_id,
-                        namespace = namespace.inner(),
-                        ?reply,
-                        "consumer offset read unanswered; replying not accepted"
-                    );
+                    if matches!(reply, Some(PartitionReadReply::NotFound)) {
+                        debug!(
+                            transport_client_id,
+                            namespace = namespace.inner(),
+                            "consumer offset partition not held by owner; replying not accepted"
+                        );
+                    } else {
+                        warn!(
+                            transport_client_id,
+                            namespace = namespace.inner(),
+                            ?reply,
+                            "consumer offset read unanswered; replying not accepted"
+                        );
+                    }
                     send_non_replicated_deny(
                         shard,
                         request,

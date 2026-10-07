@@ -30,7 +30,7 @@ use kafka_protocol::messages::{GroupId, OffsetFetchRequest, OffsetFetchResponse,
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
-use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, TopicTarget};
+use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
@@ -96,7 +96,7 @@ impl GroupQuery {
 }
 
 /// The answer for one group. A group error carries no topics.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct GroupAnswer {
     error: i16,
     topics: Vec<TopicAnswer>,
@@ -111,7 +111,7 @@ impl GroupAnswer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TopicAnswer {
     name: TopicName,
     partitions: Vec<PartitionAnswer>,
@@ -148,23 +148,27 @@ pub async fn handle(
     };
 
     let queries = GroupQuery::all(api_version, &request);
-    let deadline = offset_deadline(state, connection).await;
+    let calls = OffsetCalls::new(offset_deadline(state, connection).await);
     // The groups read at once, so a slow group cannot spend the time of the others.
     let answers = join_all(
         queries
             .iter()
-            .map(|query| answer(state.bridge.as_deref(), query, deadline)),
+            .map(|query| answer(state.bridge.as_deref(), query, &calls)),
     )
     .await;
     respond_or_close(
-        encode_response(api_version, &queries, &answers),
+        encode_response(api_version, &queries, answers),
         "OffsetFetch",
     )
 }
 
 /// One failed read fails the whole group, so a client never reads a lost answer as "nothing
 /// committed" and resets its position.
-async fn answer(bridge: Option<&IggyBridge>, query: &GroupQuery, deadline: Instant) -> GroupAnswer {
+async fn answer(
+    bridge: Option<&IggyBridge>,
+    query: &GroupQuery,
+    calls: &OffsetCalls,
+) -> GroupAnswer {
     if !is_valid_group_id(&query.group_id) {
         return GroupAnswer::error(ERROR_INVALID_GROUP_ID);
     }
@@ -172,13 +176,13 @@ async fn answer(bridge: Option<&IggyBridge>, query: &GroupQuery, deadline: Insta
         return GroupAnswer::error(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     };
     // A group the deadline leaves out costs no Iggy call.
-    if Instant::now() >= deadline {
+    if Instant::now() >= calls.deadline() {
         return GroupAnswer::error(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
     }
-    // Each Iggy call stops at `deadline` on its own, so none is cut off holding its slot.
+    // Each Iggy call stops at the deadline on its own, so none is cut off holding its slot.
     let read = match &query.topics {
-        Some(topics) => read_topics(bridge, &query.group_id, topics, deadline).await,
-        None => read_every_topic(bridge, &query.group_id, deadline).await,
+        Some(topics) => read_topics(bridge, &query.group_id, topics, calls).await,
+        None => read_every_topic(bridge, &query.group_id, calls).await,
     };
     match read {
         Ok(topics) => GroupAnswer {
@@ -205,13 +209,13 @@ fn refusal(group: &str, error: &BridgeError) -> i16 {
     code
 }
 
-/// Every requested partition, in request order. A partition with no offset answers -1. The reads
-/// run at once across the offset slots.
+/// Every requested partition, in request order. A partition with no offset answers -1. Reads on
+/// different offset slots run at once.
 async fn read_topics(
     bridge: &IggyBridge,
     group: &str,
     topics: &[(TopicName, Vec<i32>)],
-    deadline: Instant,
+    calls: &OffsetCalls,
 ) -> core::result::Result<Vec<TopicAnswer>, BridgeError> {
     // A name that cannot map to Iggy names no topic, so nothing is committed under it.
     let targets: Vec<Option<TopicTarget>> = topics
@@ -246,7 +250,7 @@ async fn read_topics(
             }
         }
     }
-    let offsets = bridge.fetch_group_offsets(group, &reads, deadline).await;
+    let offsets = bridge.fetch_group_offsets(group, &reads, calls).await;
     for ((topic_at, partition_at), read) in positions.into_iter().zip(offsets) {
         answers[topic_at].partitions[partition_at].offset = committed(read)?;
     }
@@ -254,17 +258,18 @@ async fn read_topics(
 }
 
 /// A null topic list, as the Java `Admin.listConsumerGroupOffsets` sends for a whole group: only
-/// the partitions with an offset, on every topic that holds the group. The topics read at once.
+/// the partitions with an offset, on every topic that holds the group. The topics read at once,
+/// and `calls` keeps the request to one queued call per slot.
 async fn read_every_topic(
     bridge: &IggyBridge,
     group: &str,
-    deadline: Instant,
+    calls: &OffsetCalls,
 ) -> core::result::Result<Vec<TopicAnswer>, BridgeError> {
-    let topics = bridge.list_kafka_topics_until(deadline).await?;
+    let topics = bridge.list_kafka_topics_in_slot(calls).await?;
     let answers = join_all(
         topics
             .into_iter()
-            .map(|topic| read_listed_topic(bridge, group, topic, deadline)),
+            .map(|topic| read_listed_topic(bridge, group, topic, calls)),
     )
     .await;
     answers
@@ -278,10 +283,10 @@ async fn read_listed_topic(
     bridge: &IggyBridge,
     group: &str,
     topic: KafkaTopicMetadata,
-    deadline: Instant,
+    calls: &OffsetCalls,
 ) -> core::result::Result<Option<TopicAnswer>, BridgeError> {
     let target = bridge.topic_target(&topic.kafka_topic)?;
-    match bridge.holds_offset_group(group, &target, deadline).await {
+    match bridge.holds_offset_group(group, &target, calls).await {
         Ok(true) => {}
         Ok(false) => return Ok(None),
         // A topic deleted since the listing holds no offsets.
@@ -293,7 +298,7 @@ async fn read_listed_topic(
     let reads: Vec<_> = (0..topic.partitions_count)
         .map(|partition| (&target, partition))
         .collect();
-    let offsets = bridge.fetch_group_offsets(group, &reads, deadline).await;
+    let offsets = bridge.fetch_group_offsets(group, &reads, calls).await;
     let mut partitions = Vec::new();
     for (partition, read) in (0..topic.partitions_count).zip(offsets) {
         let offset = committed(read)?;
@@ -330,7 +335,11 @@ fn committed(
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
-fn encode_response(version: i16, queries: &[GroupQuery], answers: &[GroupAnswer]) -> Result<Bytes> {
+fn encode_response(
+    version: i16,
+    queries: &[GroupQuery],
+    answers: Vec<GroupAnswer>,
+) -> Result<Bytes> {
     let partitions: usize = answers
         .iter()
         .flat_map(|answer| &answer.topics)
@@ -350,10 +359,10 @@ fn encode_response(version: i16, queries: &[GroupQuery], answers: &[GroupAnswer]
                     .with_topics(
                         answer
                             .topics
-                            .iter()
+                            .into_iter()
                             .map(|topic| {
                                 OffsetFetchResponseTopics::default()
-                                    .with_name(topic.name.clone())
+                                    .with_name(topic.name)
                                     .with_partitions(
                                         topic
                                             .partitions
@@ -378,10 +387,12 @@ fn encode_response(version: i16, queries: &[GroupQuery], answers: &[GroupAnswer]
         );
     }
 
-    let (Some(query), Some(answer)) = (queries.first(), answers.first()) else {
+    let (Some(query), Some(GroupAnswer { error, topics })) =
+        (queries.first(), answers.into_iter().next())
+    else {
         return encode_message(&OffsetFetchResponse::default(), version, capacity);
     };
-    let topics = if version < FIRST_GROUP_ERROR_VERSION && answer.error != ERROR_NONE {
+    let topics = if version < FIRST_GROUP_ERROR_VERSION && error != ERROR_NONE {
         // No group error field yet: the error goes on every partition asked for.
         query
             .topics
@@ -394,13 +405,13 @@ fn encode_response(version: i16, queries: &[GroupQuery], answers: &[GroupAnswer]
                     .map(|&index| PartitionAnswer {
                         index,
                         offset: UNKNOWN_OFFSET,
-                        error: answer.error,
+                        error,
                     })
                     .collect(),
             })
             .collect()
     } else {
-        answer.topics.clone()
+        topics
     };
     let topics = topics
         .into_iter()
@@ -423,7 +434,7 @@ fn encode_response(version: i16, queries: &[GroupQuery], answers: &[GroupAnswer]
         .collect();
     let mut response = OffsetFetchResponse::default().with_topics(topics);
     if version >= FIRST_GROUP_ERROR_VERSION {
-        response = response.with_error_code(answer.error);
+        response = response.with_error_code(error);
     }
     encode_message(&response, version, capacity)
 }

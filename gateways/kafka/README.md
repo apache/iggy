@@ -9,8 +9,10 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `COORDINATOR_LOAD_IN_PROGRESS` (14), and Metadata reports every requested topic unknown.
 > **CreateTopics runs as the bridge's own
 > Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that
-> can reach this port can create topics (up to 1000 partitions each). Every client reads and writes
-> as the bridge's Iggy user. See [docs/SCOPE.md](docs/SCOPE.md).
+> can reach this port can create topics (up to 1000 partitions each). OffsetCommit creates Iggy
+> resources too: a consumer group `kafka.cg.<group>` per group id and topic, which nothing deletes
+> ([cleanup](docs/OFFSET_STORAGE.md#limits)). Every client reads and writes as the bridge's Iggy
+> user. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >

@@ -166,7 +166,7 @@ A JoinGroup may list at most `MAX_PROTOCOLS_PER_MEMBER` (16) protocols; more is 
 (42). The byte cap above does not bound the count, protocol selection runs under the coordinator
 lock, and stock clients list one or two assignors.
 
-## What a real consumer still cannot do
+## What a real consumer can and cannot do
 
 Without a bridge, a consumer completes JoinGroup and SyncGroup and then holds no partitions.
 Metadata is a stub that answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's
