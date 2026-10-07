@@ -734,13 +734,13 @@ where
         })
     }
 
-    /// [`Self::nth_oldest_sealed_end_offset`] plus whether this replica is
-    /// still behind the replicated log, read in one partition access so the
-    /// pair is consistent. "Nothing sealed to delete" is settled on a
-    /// converged replica (a committed-but-unflushed resident tail is normal
-    /// under a large `messages_required_to_save` and must ack as a no-op),
-    /// but transient on a lagging one (a backup that has not learned the
-    /// commit frontier may be missing whole sealed segments).
+    /// Read `(end_offset, lagging, created_revision, applied_purge_generation)`
+    /// in one partition access. The caller compares this local history with
+    /// committed metadata before submitting the resolved watermark.
+    /// No sealed segment permits a no-op on a converged history; a lagging
+    /// replica must retry because it may be missing whole sealed segments.
+    /// `None` means no local partition. The caller can record that no-op with
+    /// a zero watermark and no history guard.
     pub fn segment_delete_resolution(
         &self,
         namespace: &IggyNamespace,

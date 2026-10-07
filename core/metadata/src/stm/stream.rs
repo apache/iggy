@@ -884,7 +884,9 @@ pub struct TruncatePartitionRequest {
     pub partition_id: u32,
     pub up_to_offset: u64,
     /// `(created_revision, purge_generation)` captured with the offset on its owner.
-    /// Absent only in legacy journal records or unresolved-target rejections.
+    /// Absent in legacy records, unresolved-target rejections, and owner-missing no-ops.
+    /// Older decoders ignore this trailing guard; mixed-release replication
+    /// cannot enforce it.
     pub expected_history: Option<(u64, u64)>,
 }
 
