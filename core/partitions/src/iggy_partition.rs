@@ -8501,6 +8501,13 @@ where
             index: None,
             info: JournalInfo::default(),
         };
+        // Reference-WAL bodies can run ahead while an index job waits. Bound
+        // each index's span without writing those bodies a second time.
+        let index_span_limit = self
+            .persistence
+            .as_ref()
+            .filter(|persistence| persistence.segment_checkpoint().is_some())
+            .map(|_| iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE);
         self.log.journal().inner.with_entries(|entries| {
             let entries = entries
                 .get(first_entry..prefix_len)
@@ -8552,7 +8559,10 @@ where
                     meta.total_size,
                     meta.message_count,
                 );
-                if file_position >= segment.max_size.as_bytes_u64() {
+                if file_position >= segment.max_size.as_bytes_u64()
+                    || index_span_limit
+                        .is_some_and(|maximum| chunk.info.size.as_bytes_u64() >= maximum)
+                {
                     break;
                 }
             }
@@ -23239,6 +23249,118 @@ mod tests {
 
     fn file_len(path: &std::path::Path) -> u64 {
         std::fs::metadata(path).expect("stat file").len()
+    }
+
+    #[compio::test]
+    async fn reference_wal_backlog_keeps_disk_poll_seek_bounded() {
+        const RECORDS: u64 = 8;
+        const PAYLOAD_BYTES: usize = 512 * 1024;
+        const SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let namespace = IggyNamespace::new(1, 1, 0);
+            let mut config = repair_config();
+            config.path_layout.streams_root = directory
+                .path()
+                .join("streams")
+                .to_string_lossy()
+                .into_owned();
+            let partition_path = config.get_partition_path(1, 1, 0);
+            std::fs::create_dir_all(&partition_path).unwrap();
+            let (mut partition, _) = recording_partition_at(0, 1);
+            set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_path));
+            partition.set_partition_dir(partition_path);
+            partition.runtime_options.durability = durability;
+            partition.runtime_options.segment_size = Some(IggyByteSize::from(SEGMENT_BYTES));
+            partition.log.active_segment_mut().max_size = IggyByteSize::from(SEGMENT_BYTES);
+            partition.open_persistence().await.unwrap();
+            partition.log.retire_front().unwrap();
+            partition.install_empty_segment(&config, 0).await.unwrap();
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            assert!(persistence.segment_checkpoint().is_some());
+            let mut parent = 0;
+            let mut expected = Vec::new();
+            let mut last_position = 0;
+            for ordinal in 0..RECORDS {
+                let payload = vec![u8::try_from(ordinal).unwrap(); PAYLOAD_BYTES];
+                let prepare = checksummed_segment_prepare(ordinal + 1, parent, ordinal, &payload);
+                parent = prepare.header().checksum;
+                last_position = expected.len() as u64;
+                expected.extend_from_slice(&prepare.as_slice()[size_of::<PrepareHeader>()..]);
+                persistence
+                    .append(prepare.clone().into_frozen(), durability.is_persisted())
+                    .unwrap();
+                partition
+                    .append_repaired_send_messages(prepare)
+                    .await
+                    .unwrap();
+            }
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+            partition.consensus.restore_commit_state(RECORDS, RECORDS);
+            partition.consensus.sequencer().set_sequence(RECORDS);
+            assert!(
+                partition
+                    .commit_messages_inner(&config, true, RECORDS)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                std::fs::read(config.get_messages_path(1, 1, 0, 0)).unwrap(),
+                expected
+            );
+            let args =
+                PollingArgs::new(iggy_common::PollingStrategy::offset(RECORDS - 1), 1, false);
+            let plan = partition.build_poll_plan(PollingConsumer::Consumer(1, 0), &args, true);
+            let PollTier::Disk { disk, .. } = &plan.tier else {
+                panic!("the flushed backlog must be polled from disk");
+            };
+            assert!(
+                last_position.saturating_sub(disk.start_position)
+                    <= iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+                "the last poll must not rescan the whole coalesced WAL backlog: {} bytes skipped",
+                last_position.saturating_sub(disk.start_position)
+            );
+            let result = plan.execute().await;
+            assert_eq!(result.last_matching_offset, Some(RECORDS - 1));
+            let completion = partition.complete_poll(result).unwrap();
+            let polled: Vec<_> = completion
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.as_slice().iter().copied())
+                .collect();
+            assert_eq!(polled, expected[usize::try_from(last_position).unwrap()..]);
+            persistence.request_checkpoint();
+            partition.checkpoint_persistence(&config).await;
+            persistence.drain().await.unwrap();
+            assert_eq!(persistence.checkpoint_op(), RECORDS);
+            let checkpoint = persistence.segment_checkpoint();
+            drop(partition);
+            drop(persistence);
+            let recovered = crate::segment_recovery::load_persisted_segments_with_checkpoint(
+                &config,
+                namespace,
+                IggyByteSize::from(SEGMENT_BYTES),
+                durability.is_persisted(),
+                &PartitionStats::default(),
+                checkpoint,
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].segment.end_offset, RECORDS - 1);
+            assert_eq!(
+                recovered[0].segment.size.as_bytes_u64(),
+                expected.len() as u64
+            );
+            assert_eq!(
+                std::fs::read(config.get_messages_path(1, 1, 0, 0)).unwrap(),
+                expected
+            );
+        }
     }
 
     #[compio::test]
