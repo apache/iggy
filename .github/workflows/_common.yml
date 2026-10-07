@@ -18,6 +18,11 @@
 name: _common
 on:
   workflow_call:
+    inputs:
+      validate-third-party-licenses:
+        description: "Whether to validate bundled third-party licenses"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -121,6 +126,7 @@ jobs:
 
   third-party-licenses:
     name: Validate third-party licenses
+    if: inputs.validate-third-party-licenses
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
