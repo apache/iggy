@@ -1864,19 +1864,18 @@ fn staging_paths(partition_dir: &str, start_offset: u64) -> (PathBuf, PathBuf) {
 
 /// Every entry of one partition directory, as paths.
 ///
-/// BLOCKING `read_dir` on the pump: compio-fs 0.12 exposes no async directory
-/// walk, and `spawn_blocking` is not an escape either -- the shard executors run
-/// `thread_pool_limit(0)`. Bounded by the entry count of ONE partition directory,
-/// but it is a real stall (and under the write lock at the converge site), so it
-/// stays recorded rather than hidden.
-///
 /// Enumeration only: callers keep their own predicates and their own
 /// error policies (propagate / silent skip / log-and-fail), which is what
 /// `sweep_staging_except`'s do-not-widen warning depends on.
-fn segment_dir_entries(partition_dir: &str) -> std::io::Result<impl Iterator<Item = PathBuf>> {
-    Ok(std::fs::read_dir(partition_dir)?
-        .flatten()
-        .map(|entry| entry.path()))
+pub(crate) async fn segment_dir_entries(partition_dir: &str) -> std::io::Result<Vec<PathBuf>> {
+    let partition_dir = partition_dir.to_owned();
+    server_common::fs_utils::run_blocking("iggy-segment-scan", move || {
+        Ok(std::fs::read_dir(partition_dir)?
+            .flatten()
+            .map(|entry| entry.path())
+            .collect())
+    })
+    .await
 }
 
 /// Remove physical tails outside the logical segment list after draining the WAL.
@@ -1995,7 +1994,7 @@ pub async fn quarantine_partition_files(
             "a thousand fenced copies of this partition already exist",
         ));
     };
-    for path in segment_dir_entries(partition_dir)? {
+    for path in segment_dir_entries(partition_dir).await? {
         let quarantined = path.to_str().is_some_and(|path| {
             [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
                 .iter()
@@ -2048,7 +2047,7 @@ pub async fn quarantine_partition_files(
 /// on the partition -- worst at the reuse scan, which runs at descriptor-accept
 /// on a serving partition.
 pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: &HashSet<&Path>) {
-    let Ok(entries) = segment_dir_entries(partition_dir) else {
+    let Ok(entries) = segment_dir_entries(partition_dir).await else {
         return;
     };
     for path in entries {

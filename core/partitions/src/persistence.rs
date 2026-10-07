@@ -147,6 +147,7 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     checkpoint_needed: Cell<bool>,
     dirty_segments: RefCell<BTreeSet<u64>>,
     dirty_offsets: [RefCell<BTreeSet<u32>>; ConsumerKind::COUNT],
+    dirty_offset_directories: [Cell<bool>; ConsumerKind::COUNT],
     purge_generation: Cell<u64>,
     purge_floor: Cell<u64>,
     capacity: u64,
@@ -570,6 +571,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             checkpoint_needed: Cell::new(false),
             dirty_segments: RefCell::new(BTreeSet::new()),
             dirty_offsets: std::array::from_fn(|_| RefCell::new(BTreeSet::new())),
+            // Recovery may have completed a rename or unlink without its final barrier.
+            dirty_offset_directories: std::array::from_fn(|_| Cell::new(true)),
             purge_generation: Cell::new(journal.purge_marker().0),
             purge_floor: Cell::new(journal.purge_marker().1),
             capacity,
@@ -857,6 +860,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn mark_offset_dirty(&self, kind_index: usize, consumer_id: u32, exists: bool) {
+        self.dirty_offset_directories[kind_index].set(true);
         let mut offsets = self.dirty_offsets[kind_index].borrow_mut();
         if exists {
             offsets.insert(consumer_id);
@@ -869,12 +873,19 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.offset_files.retire_all();
     }
 
-    pub fn take_dirty_files(&self) -> (BTreeSet<u64>, [BTreeSet<u32>; ConsumerKind::COUNT]) {
+    pub fn take_dirty_files(
+        &self,
+    ) -> (
+        BTreeSet<u64>,
+        [BTreeSet<u32>; ConsumerKind::COUNT],
+        [bool; ConsumerKind::COUNT],
+    ) {
         (
             std::mem::take(&mut *self.dirty_segments.borrow_mut()),
             std::array::from_fn(|index| {
                 std::mem::take(&mut *self.dirty_offsets[index].borrow_mut())
             }),
+            std::array::from_fn(|index| self.dirty_offset_directories[index].replace(false)),
         )
     }
 
@@ -919,6 +930,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             return;
         }
         self.checkpoint_requested.set(self.checkpoint.get());
+        for dirty in &self.dirty_offset_directories {
+            dirty.set(true);
+        }
         self.certified_log_view.set(None);
         self.requested_log_view.set(None);
         let epoch = self.epoch.get().wrapping_add(1);
@@ -990,6 +1004,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.certified_log_view.set(None);
         self.requested_log_view.set(None);
         self.checkpoint_requested.set(op);
+        for dirty in &self.dirty_offset_directories {
+            dirty.set(true);
+        }
         let epoch = self.epoch.get().wrapping_add(1);
         self.epoch.set(epoch);
         self.queue.borrow_mut().clear();
@@ -1691,13 +1708,15 @@ mod tests {
         persistence.mark_offset_dirty(0, 7, true);
         persistence.mark_offset_dirty(0, 7, false);
         persistence.mark_offset_dirty(1, 9, true);
-        let (segments, offsets) = persistence.take_dirty_files();
+        let (segments, offsets, directories) = persistence.take_dirty_files();
         assert_eq!(segments.into_iter().collect::<Vec<_>>(), vec![0]);
         assert!(offsets[0].is_empty());
         assert!(offsets[1].contains(&9));
-        let (segments, offsets) = persistence.take_dirty_files();
+        assert_eq!(directories, [true; ConsumerKind::COUNT]);
+        let (segments, offsets, directories) = persistence.take_dirty_files();
         assert!(segments.is_empty());
         assert!(offsets.iter().all(BTreeSet::is_empty));
+        assert_eq!(directories, [false; ConsumerKind::COUNT]);
         let first = prepare(1, 0);
         let checkpoint_header = *first.header();
         let second = prepare(2, first.header().checksum);

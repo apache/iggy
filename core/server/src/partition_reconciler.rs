@@ -738,7 +738,7 @@ async fn reconcile_additions(
         let partition_dir =
             ctx.config
                 .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
-        let prior_life_on_disk = std::fs::metadata(&partition_dir).is_ok();
+        let prior_life_on_disk = compio::fs::metadata(&partition_dir).await.is_ok();
 
         // The target was snapshotted before this read, so a delete plus a
         // recreate of the same slab keys can commit in between. Everything

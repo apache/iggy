@@ -6828,7 +6828,7 @@ where
             return;
         }
 
-        match planes.0.state_transfer_offer() {
+        match planes.0.state_transfer_offer().await {
             Ok(offer) => {
                 tracing::info!(
                     shard = self.id,

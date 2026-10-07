@@ -16,9 +16,13 @@
 // under the License.
 
 use compio::fs;
+use futures::channel::oneshot;
+use futures::lock::Mutex;
 use std::io;
 use std::path::{Path, PathBuf};
 use tracing::warn;
+
+use crate::fatal::NoteDescriptorExhaustion;
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
@@ -54,7 +58,7 @@ impl DirEntry {
 /// Reserve segment space without changing its contents or logical length.
 /// Unsupported or failed reservations fall back to buffered allocation.
 #[cfg(target_os = "linux")]
-pub fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
+pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
     let Ok(len) = i64::try_from(len) else {
         warn!(
             target: "iggy.partitions.storage",
@@ -65,9 +69,19 @@ pub fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
         return;
     };
 
-    // Shard runtimes disable the worker pool, so this opt-in reservation runs
-    // inline. Slow filesystem allocation stalls the shard until it returns.
-    if let Err(error) = fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len) {
+    let reservation = async {
+        let descriptor = std::os::fd::AsFd::as_fd(file)
+            .try_clone_to_owned()
+            .note_descriptor_exhaustion(|| {
+                "duplicating a file descriptor to preallocate".to_owned()
+            })?;
+        run_blocking("iggy-file-preallocate", move || {
+            fallocate(descriptor, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len)
+                .map_err(io::Error::from)
+        })
+        .await
+    };
+    if let Err(error) = reservation.await {
         warn!(
             target: "iggy.partitions.storage",
             file = %file_path.display(),
@@ -80,7 +94,7 @@ pub fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
 
 /// Reserve segment space when supported, without changing its logical length.
 #[cfg(not(target_os = "linux"))]
-pub fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
+pub async fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
     PREALLOCATION_UNAVAILABLE.call_once(|| {
         warn!(
             target: "iggy.partitions.storage",
@@ -95,9 +109,12 @@ pub fn preallocate_file(_file: &fs::File, file_path: &Path, _len: u64) {
 /// safe deletion (contents before containers).
 /// Symlinks are treated as files and not followed.
 pub async fn walk_dir(root: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
-    let root = root.as_ref();
+    let root = root.as_ref().to_path_buf();
+    run_blocking("iggy-directory-walk", move || walk_dir_blocking(&root)).await
+}
 
-    let metadata = fs::metadata(root).await?;
+fn walk_dir_blocking(root: &Path) -> io::Result<Vec<DirEntry>> {
+    let metadata = std::fs::metadata(root)?;
     if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -118,7 +135,7 @@ pub async fn walk_dir(root: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
         for entry in std::fs::read_dir(&current_dir)? {
             let entry = entry?;
             let entry_path = entry.path();
-            let metadata = fs::symlink_metadata(&entry_path).await?;
+            let metadata = entry.file_type()?;
 
             if metadata.is_dir() {
                 stack.push(entry_path);
@@ -147,4 +164,92 @@ pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Truncate the open inode without requiring IORING_OP_FTRUNCATE support.
+///
+/// # Errors
+/// Returns descriptor duplication or filesystem errors.
+pub async fn truncate_file(file: &fs::File, length: u64) -> io::Result<()> {
+    let descriptor = std::os::fd::AsFd::as_fd(file)
+        .try_clone_to_owned()
+        .note_descriptor_exhaustion(|| "duplicating a file descriptor to truncate".to_owned())?;
+    run_blocking("iggy-file-truncate", move || {
+        std::fs::File::from(descriptor).set_len(length)
+    })
+    .await
+}
+
+/// Run filesystem work unsupported by io_uring on a process-wide bounded worker.
+/// The operation owns its state and continues to completion if the caller is dropped.
+///
+/// # Errors
+/// Returns thread creation, operation, or interrupted-worker errors.
+pub async fn run_blocking<T: Send + 'static>(
+    name: &'static str,
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    // Cancellation must not admit another operation while this one owns filesystem state.
+    static WORKER: Mutex<()> = Mutex::new(());
+    let permit = WORKER.lock().await;
+    let (sender, receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = sender.send(operation());
+        })?;
+    receiver
+        .await
+        .map_err(|_| io::Error::other(format!("{name} stopped")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::create_shard_executor;
+
+    #[test]
+    fn given_nested_directory_with_symlink_when_removing_should_preserve_external_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("partition");
+        let child = root.join("nested");
+        let target = directory.path().join("external");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("segment.log"), b"messages").unwrap();
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        let runtime = create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let entries = walk_dir(&root).await.unwrap();
+            assert_eq!(entries.last().unwrap().path, root);
+            remove_dir_all(&root).await.unwrap();
+        });
+        assert!(!root.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_segment_contents_when_preallocating_without_pool_should_preserve_bytes_and_length() {
+        const RESERVATION_BYTES: u64 = 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("segment.log");
+        std::fs::write(&path, b"messages").unwrap();
+        let runtime = create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .await
+                .unwrap();
+            preallocate_file(&file, &path, RESERVATION_BYTES).await;
+            assert_eq!(
+                file.metadata().await.unwrap().len(),
+                b"messages".len() as u64
+            );
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"messages");
+    }
 }

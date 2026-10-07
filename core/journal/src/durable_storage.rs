@@ -20,10 +20,9 @@
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
-use futures::channel::oneshot;
-use futures::lock::Mutex;
 use futures::{Stream, stream};
 use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::fs_utils::{run_blocking, truncate_file};
 use server_common::iobuf::{Frozen, Owned};
 use std::ffi::OsString;
 use std::io;
@@ -134,7 +133,9 @@ pub trait DurableStorage {
 pub trait DurableFile {
     /// Best-effort reservation that must not change bytes or logical length.
     /// Backends without physical allocation may ignore this hint.
-    fn preallocate(&self, _path: &Path, _length: u64) {}
+    fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = ()> {
+        async {}
+    }
 
     /// # Errors
     /// Returns an error if the complete range cannot be read.
@@ -394,8 +395,8 @@ impl DurableStorage for DiskStorage {
 }
 
 impl DurableFile for File {
-    fn preallocate(&self, path: &Path, length: u64) {
-        server_common::fs_utils::preallocate_file(self, path, length);
+    async fn preallocate(&self, path: &Path, length: u64) {
+        server_common::fs_utils::preallocate_file(self, path, length).await;
     }
 
     async fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
@@ -452,42 +453,12 @@ impl DurableFile for File {
     }
 
     async fn truncate(&self, length: u64) -> io::Result<()> {
-        // Older kernels lack IORING_OP_FTRUNCATE and shard fallback pools are
-        // disabled. Own the inode until the worker completes, even on cancellation.
-        let descriptor = std::os::fd::AsFd::as_fd(self)
-            .try_clone_to_owned()
-            .note_descriptor_exhaustion(|| {
-                "duplicating a file descriptor to truncate".to_owned()
-            })?;
-        run_blocking("iggy-file-truncate", move || {
-            std::fs::File::from(descriptor).set_len(length)
-        })
-        .await
+        truncate_file(self, length).await
     }
 
     async fn sync(&self) -> io::Result<()> {
         self.sync_data().await
     }
-}
-
-async fn run_blocking<T: Send + 'static>(
-    name: &'static str,
-    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    // Keep the permit on the worker: cancelling its caller must not admit
-    // another blocking operation while this one still owns filesystem state.
-    static WORKER: Mutex<()> = Mutex::new(());
-    let permit = WORKER.lock().await;
-    let (sender, receiver) = oneshot::channel();
-    std::thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = sender.send(operation());
-        })?;
-    receiver
-        .await
-        .map_err(|_| io::Error::other(format!("{name} stopped")))?
 }
 
 fn directory_entries(path: &Path) -> io::Result<Vec<StorageEntry>> {

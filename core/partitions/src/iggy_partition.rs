@@ -1667,7 +1667,7 @@ where
         let Some(persistence) = &self.persistence else {
             return (Vec::new(), Vec::new());
         };
-        let (segments, offsets) = persistence.take_dirty_files();
+        let (segments, offsets, dirty_directories) = persistence.take_dirty_files();
         let mut paths = Vec::with_capacity(
             segments.len() * 2
                 + offsets
@@ -1708,7 +1708,10 @@ where
             }
         }
         let mut directories = Vec::with_capacity(ConsumerKind::COUNT + 2);
-        for directory in self.consumer_offset_dirs.iter().flatten() {
+        for (directory, dirty) in self.consumer_offset_dirs.iter().zip(dirty_directories) {
+            let Some(directory) = directory.as_ref().filter(|_| dirty) else {
+                continue;
+            };
             let path = std::path::PathBuf::from(directory);
             directories.push(path.clone());
             if let Some(parent) = path.parent()
@@ -14950,6 +14953,31 @@ mod tests {
         assert!(directories.contains(&directory.path().join("offsets/consumers")));
         assert!(directories.contains(&directory.path().join("offsets/groups")));
         assert!(directories.contains(&directory.path().to_path_buf()));
+
+        let (_, clean) = partition.persistence_checkpoint_files(&repair_config());
+        assert_eq!(clean, [directory.path().to_path_buf()]);
+
+        let kind = ConsumerKind::ExternalGroup;
+        let external = directory.path().join("offsets/external_groups");
+        partition.consumer_offset_dirs[kind.index()] =
+            Some(external.to_string_lossy().into_owned());
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence.mark_offset_dirty(kind.index(), 7, true);
+        persistence.mark_offset_dirty(kind.index(), 7, false);
+        let (files, deleted) = partition.persistence_checkpoint_files(&repair_config());
+        assert!(files.is_empty(), "the last key was deleted");
+        assert_eq!(
+            deleted,
+            [
+                external,
+                directory.path().join("offsets"),
+                directory.path().to_path_buf()
+            ]
+        );
+
+        persistence.reset(0, None);
+        let (_, reset) = partition.persistence_checkpoint_files(&repair_config());
+        assert_eq!(reset.len(), ConsumerKind::COUNT + 2);
     }
 
     async fn publish_empty_retry_checkpoint(

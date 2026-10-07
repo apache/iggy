@@ -64,7 +64,7 @@ impl MessagesWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if let Some(preallocate_size) = preallocate_size {
-            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64());
+            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64()).await;
         }
 
         if file_exists {
