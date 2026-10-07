@@ -405,12 +405,12 @@ mod tests {
         assert!(dir.path().join("notes.tmp").exists());
         assert_eq!(consumers.entries.len(), 1);
         assert_eq!(consumers.entries[0].consumer_id, 9);
-        assert!(consumers.stranded_ids.is_empty());
+        assert_eq!(consumers.stranded_ids, [] as [u32; 0]);
         assert!(!dir.path().join("8").exists());
         assert!(!dir.path().join("10").exists());
         let groups = load_consumer_group_offsets(path).await.unwrap();
         assert_eq!(groups.entries.len(), 1);
         assert_eq!(groups.entries[0].0, ConsumerGroupId(9));
-        assert!(groups.stranded_ids.is_empty());
+        assert_eq!(groups.stranded_ids, [] as [u32; 0]);
     }
 }

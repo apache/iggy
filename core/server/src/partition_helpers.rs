@@ -649,7 +649,7 @@ async fn load_partition(
             && !first_initialization
             && !journal::PartitionPrepareJournal::has_published_frontier(&directory)
                 .await
-                .map_err(&wal_error)?
+                .map_err(wal_error)?
         {
             return Err(wal_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -662,7 +662,7 @@ async fn load_partition(
                 partition_metadata.created_revision,
             )
             .await
-            .map_err(&wal_error)?;
+            .map_err(wal_error)?;
         }
         let (persistence, prepares) = PartitionPersistence::open_with_capacity(
             &directory,
@@ -675,7 +675,7 @@ async fn load_partition(
                 .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
         )
         .await
-        .map_err(&wal_error)?;
+        .map_err(wal_error)?;
         if let Some(log_view) = persistence.certified_log_view()
             && log_view != 0
             && log_view < partition_metadata.created_view

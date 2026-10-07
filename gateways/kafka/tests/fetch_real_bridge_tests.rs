@@ -296,7 +296,7 @@ fn values(partition: &PartitionData) -> Vec<Option<Bytes>> {
 fn assert_refused(partition: &PartitionData, code: i16) {
     assert_eq!(partition.error_code, code);
     assert_eq!(partition.high_watermark, UNKNOWN_OFFSET);
-    assert!(records(partition).is_empty());
+    assert_eq!(records(partition), []);
 }
 
 #[tokio::test]
@@ -484,7 +484,7 @@ async fn given_offset_at_high_watermark_when_fetching_should_wait_and_return_emp
     let partition = only(&response);
     assert_eq!(partition.error_code, ERROR_NONE);
     assert_eq!(partition.high_watermark, 2);
-    assert!(records(partition).is_empty());
+    assert_eq!(records(partition), []);
 }
 
 #[tokio::test]
@@ -587,7 +587,7 @@ async fn given_zero_max_wait_when_fetching_should_answer_at_once() {
         let partition = only(&response);
         assert_eq!(partition.error_code, ERROR_NONE);
         assert_eq!(partition.high_watermark, 0);
-        assert!(records(partition).is_empty());
+        assert_eq!(records(partition), []);
     }
 }
 
@@ -631,7 +631,7 @@ async fn given_an_empty_partition_when_fetching_past_it_should_answer_6_after_th
     let response = fetch(&state, &at_start).await;
     let partition = only(&response);
     assert_eq!(partition.error_code, ERROR_NONE, "caught up, not refused");
-    assert!(records(partition).is_empty());
+    assert_eq!(records(partition), []);
 }
 
 #[tokio::test]

@@ -89,7 +89,7 @@ struct OffsetFilePermit;
 impl OffsetFilePermit {
     fn acquire() -> Option<Self> {
         RETAINED_OFFSET_FILES
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < *OFFSET_FILE_LIMIT).then_some(count + 1)
             })
             .ok()

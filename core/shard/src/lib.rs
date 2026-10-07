@@ -12703,7 +12703,7 @@ mod control_frame_tests {
         let msg = frame(0, 0);
         let body = control_suffix_body_verified(&msg, msg.header().checksum_body)
             .expect("a header-only frame has nothing to verify");
-        assert!(body.is_empty());
+        assert_eq!(body, b"");
     }
 }
 
