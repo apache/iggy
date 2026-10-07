@@ -5705,10 +5705,8 @@ where
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
-        if partition.history_is_busy() {
-            partition.defer_view_transition(MessageBag::RepairRangeReply(msg.clone()));
-            return;
-        }
+        // Repair replies do not replace history. complete_repair waits for
+        // file results; fencing live prepares here would create another gap.
         let Some(session) = partition.repair else {
             return;
         };

@@ -683,14 +683,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
 
-    use consensus::{LocalPipeline, PartitionsHandle, Pipeline, VsrConsensus};
+    use consensus::{LocalPipeline, PartitionsHandle, Pipeline, Sequencer, VsrConsensus};
     use futures::FutureExt;
     use futures::channel::oneshot;
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::{
-        AckLevel, Command, ConsensusHeader, GenericHeader, Operation, PrepareOkHeader, ReplyHeader,
-        RoutedRequestHeader, StartViewChangeHeader, WireEncode, WireIdentifier,
+        AckLevel, Command, ConsensusHeader, GenericHeader, Operation, PrepareHeader,
+        PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader, RoutedRequestHeader,
+        StartViewChangeHeader, WireEncode, WireIdentifier,
     };
     use iggy_common::{
         ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
@@ -1625,6 +1626,137 @@ mod tests {
             old_view + 1
         );
         assert_eq!(owner.partition_io.charged.get(), 0);
+    }
+
+    #[compio::test]
+    async fn repair_replies_during_held_io_do_not_discard_live_prepares() {
+        for command in [Command::RangeEvicted, Command::RepairDone] {
+            for nonce in [1, 2] {
+                let store = Rc::new(HeldSuperblock {
+                    entered: RefCell::new(None),
+                    held: RefCell::new(None),
+                });
+                let bus = Rc::new(IggyMessageBus::new(0));
+                let (owner, _sender) = test_owner(&bus, None);
+                let partitions = owner.plane.partitions();
+                let namespace = IggyNamespace::new(0, 0, 0);
+                let mut primary = VsrConsensus::new(
+                    1,
+                    1,
+                    3,
+                    namespace.inner(),
+                    bus.clone(),
+                    LocalPipeline::new(),
+                );
+                primary.set_view(1);
+                primary.set_log_view(1);
+                primary.init();
+                let mut origin: IggyPartition<_, HeldSuperblock> =
+                    IggyPartition::with_in_memory_storage(
+                        Arc::new(PartitionStats::default()),
+                        primary,
+                        IggyByteSize::from(SEGMENT_BYTES),
+                    );
+                origin.on_request(send_request(namespace, 1), None).await;
+                let frozen = origin.log.journal().inner.repair_entry(1).unwrap();
+                let mut prepare = Message::<PrepareHeader>::new(frozen.len());
+                prepare.as_mut_slice().copy_from_slice(frozen.as_slice());
+
+                let mut backup = VsrConsensus::new(
+                    1,
+                    2,
+                    3,
+                    namespace.inner(),
+                    bus.clone(),
+                    LocalPipeline::new(),
+                );
+                backup.set_view(1);
+                backup.set_log_view(1);
+                backup.init();
+                let mut partition = IggyPartition::with_in_memory_storage(
+                    Arc::new(PartitionStats::default()),
+                    backup,
+                    IggyByteSize::from(SEGMENT_BYTES),
+                );
+                partition.set_superblock(Rc::clone(&store), None);
+                partitions.insert(namespace, partition);
+                partitions.set_io_notifier(
+                    owner.partition_io.notifier(),
+                    owner.partition_io.limits.bytes_max(),
+                );
+                let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+                assert!(!partition.persist_superblock_if_needed().await);
+                let partitions::PartitionIoStep::Ready(plan) =
+                    partition.resume_io(partitions.config()).await
+                else {
+                    panic!("the backup must persist its view");
+                };
+                let slot = owner
+                    .partition_io
+                    .try_reserve(namespace, partition.incarnation(), plan.allocation_charge)
+                    .unwrap();
+                let captured = partition
+                    .capture_io(plan, partitions.config())
+                    .unwrap()
+                    .unwrap();
+                let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
+                owner.partition_io.dispatch(slot, captured, &captured_bus);
+                partition.repair = Some(RepairSession {
+                    nonce: 1,
+                    view: 1,
+                    commit_to_op: 0,
+                    fetch_to_op: 0,
+                    floor: None,
+                    peer: 1,
+                    first_batch_offset: None,
+                    idle_ticks: 0,
+                });
+                let reply =
+                    Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
+                        .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
+                            header.command = command;
+                            header.size =
+                                u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
+                            header.group = namespace.inner();
+                            header.cluster = 1;
+                            header.replica = 1;
+                            header.nonce = nonce;
+                            header.op = 1;
+                            header.seal();
+                        });
+                owner.on_repair_range_reply(&reply).await;
+                let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+                partition.on_replicate(prepare).await;
+                assert_eq!(
+                    partition.consensus().sequencer().current_sequence(),
+                    1,
+                    "{command:?} with nonce {nonce} must not fence a live prepare"
+                );
+                assert!(partition.log.journal().inner.holds_op(1));
+                assert_eq!(partition.take_prepare_gap_drops(), 0);
+                assert_eq!(
+                    partition.complete_repair(partitions.config()).await,
+                    RepairConclusion::InProgress
+                );
+                let task = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
+                task.await;
+                assert_eq!(
+                    partition.complete_repair(partitions.config()).await,
+                    RepairConclusion::InProgress,
+                    "completed file results still require acceptance"
+                );
+                owner.accept_partition_io_completion(owner.partition_io.try_recv().unwrap());
+                for _ in 0..TEST_PARTITIONS {
+                    owner.service_partition_io().await;
+                }
+                let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+                assert_eq!(
+                    partition.complete_repair(partitions.config()).await,
+                    RepairConclusion::Done
+                );
+                assert_eq!(partition.consensus().commit_min(), 0);
+            }
+        }
     }
 
     #[compio::test]
