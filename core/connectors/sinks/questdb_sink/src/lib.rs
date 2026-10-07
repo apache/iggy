@@ -17,20 +17,22 @@
 
 mod mapping;
 
-use std::collections::HashSet;
+use std::borrow::Cow;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
 use questdb::ConnectHandlers;
 use questdb::ErrorCode;
 use questdb::QuestDb;
 use questdb::ingress::AckLevel;
+use questdb::ingress::TableName;
 use questdb::ingress::{QwpWsErrorHandler, QwpWsErrorPolicy, QwpWsSenderError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -44,6 +46,8 @@ sink_connector!(QuestDbSink);
 const CONNECTOR_NAME: &str = "QuestDB sink";
 const DEFAULT_BATCH_SIZE: u32 = 1000;
 const DEFAULT_FLUSH_TIMEOUT: &str = "30s";
+/// `DEFAULT_FLUSH_TIMEOUT` parsed, so the text and the fallback cannot drift.
+const DEFAULT_FLUSH_TIMEOUT_DURATION: Duration = Duration::from_secs(30);
 
 /// Rejections are logged one line per record so a bad message can be traced
 /// back to its offset. A batch where every record is malformed would otherwise
@@ -71,8 +75,14 @@ const MAX_BATCH_RECOVERIES: usize = 8;
 /// `ring` and `aws-lc-rs` is linked. The connectors runtime links both, so
 /// `ClientConfig::builder()` cannot choose and **panics** instead of returning
 /// an error, taking down any `wss://` connection attempt. Installing one up
-/// front makes the choice explicit. A competing install by another plugin is
-/// not an error: the first one wins and either provider is correct here.
+/// front makes the choice explicit.
+///
+/// The slot is process-wide and shared. The Apache Iggy client installs
+/// `aws-lc-rs` into it from `core/sdk/src/tcp/tcp_client.rs` and
+/// `core/sdk/src/websocket_client.rs`, so whichever runs first decides for the
+/// whole process. Both providers are correct, and this is called only for a
+/// connect string that needs TLS, which keeps a plain `ws://` sink from
+/// deciding TLS for components that do use it.
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
 fn ensure_crypto_provider() {
@@ -127,6 +137,10 @@ pub struct QuestDbSinkConfig {
     /// Off by default: a rejected payload is still user data and may carry
     /// personal or otherwise sensitive fields.
     pub log_rejected_payload: Option<bool>,
+    /// Write every JSON number as a `DOUBLE`, so a column's type follows its
+    /// name rather than whichever record defined it first. Off by default,
+    /// because it stores integers as doubles.
+    pub numbers_as_double: Option<bool>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -144,6 +158,10 @@ pub struct QuestDbSink {
     /// The `sink_connector!` macro requires `new` to be infallible, so a bad
     /// config is recorded here and surfaced from `open` instead.
     init_error: Option<Error>,
+    /// Set by the rejection handler when QuestDB refuses a frame terminally.
+    /// The handler is the only report of a rejection the sink never asks `wait`
+    /// about, so the batch reads this to avoid reporting a success.
+    server_rejected: Arc<AtomicBool>,
     db: Option<Arc<QuestDb>>,
     state: Mutex<State>,
 }
@@ -196,8 +214,26 @@ impl QuestDbSink {
                 warn!(
                     "Invalid flush_timeout for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_FLUSH_TIMEOUT}"
                 );
-                Duration::from_secs(30)
+                DEFAULT_FLUSH_TIMEOUT_DURATION
             });
+        // The client reads a zero timeout as "no deadline". At the default ack
+        // level the sink treats it as fire and forget and never calls `wait`,
+        // but a durable ack level has to wait, so the pair would block the FFI
+        // call for good with no way to stop the connector.
+        if ack_level == AckLevel::Durable && flush_timeout.is_zero() {
+            reject(Error::InvalidConfigValue(
+                "flush_timeout must be greater than zero when ack_level is \"durable\", because a zero timeout never expires".to_owned(),
+            ));
+        }
+
+        // A bad table name fails on every row, and each failure burns one batch
+        // recovery, so catch it once at construction instead.
+        if let Err(error) = TableName::new(config.table.as_str()) {
+            reject(Error::InvalidConfigValue(format!(
+                "table {} is not a valid QuestDB table name: {error}",
+                config.table
+            )));
+        }
 
         let mapping = Mapping {
             table: config.table,
@@ -219,6 +255,7 @@ impl QuestDbSink {
             include_partition_column: config.include_partition_column.unwrap_or(false),
             include_offset_column: config.include_offset_column.unwrap_or(false),
             include_headers: config.include_headers.unwrap_or(false),
+            numbers_as_double: config.numbers_as_double.unwrap_or(false),
         };
         if let Err(error) = validate_column_overlap(&mapping) {
             reject(error);
@@ -243,6 +280,7 @@ impl QuestDbSink {
             verbose: config.verbose_logging.unwrap_or(false),
             log_rejected_payload: config.log_rejected_payload.unwrap_or(false),
             init_error,
+            server_rejected: Arc::new(AtomicBool::new(false)),
             db: None,
             state: Mutex::new(State {
                 messages_processed: 0,
@@ -254,12 +292,16 @@ impl QuestDbSink {
         }
     }
 
+    /// `already_logged` is the number of rejections logged individually by
+    /// earlier chunks of the same runtime batch, so the per-batch log cap spans
+    /// the batch rather than restarting for each chunk.
     async fn write_batch(
         &self,
         db: Arc<QuestDb>,
         messages: Vec<ConsumedMessage>,
         topic_metadata: &TopicMetadata,
         partition_id: u32,
+        already_logged: usize,
     ) -> Result<BatchOutcome, Error> {
         let mapping = Arc::clone(&self.mapping);
         let stream = topic_metadata.stream.clone();
@@ -283,91 +325,98 @@ impl QuestDbSink {
             };
 
             let mut outcome = BatchOutcome::default();
-            // Rows pending in the buffer, reset on every flush. Tracked
-            // separately from `rows_written`, which spans the whole batch.
-            let mut pending = 0usize;
-            // Index of the first message appended into the current buffer since
-            // the last flush. A client-side rejection rebuilds exactly this
-            // window, so the cost of recovering stays proportional to it.
-            let mut window_start = 0usize;
+            // Indices of the messages sitting in the current buffer, in the
+            // order they were appended. A client rejection rebuilds exactly
+            // these, so a rejected record is never replayed and the cost of
+            // recovering stays proportional to what the buffer holds.
+            let mut buffered: Vec<usize> = Vec::new();
             let mut recoveries = 0usize;
-            let mut index = 0usize;
-            while index < messages.len() {
+            // One deadline for the whole batch, so a shutdown waits for this
+            // batch rather than for one `flush_timeout` per window.
+            let deadline = Instant::now() + flush_timeout;
+            let flush_context = FlushContext {
+                id,
+                stream: &stream,
+                topic: &topic,
+                partition_id,
+            };
+            for index in 0..messages.len() {
                 let message = &messages[index];
                 // Flush before the buffer can outgrow the QWP per-frame cap.
                 // `batch_size` bounds rows, not bytes, so a batch of wide rows
                 // would otherwise be rejected whole and lose every row in it.
-                if pending > 0 && buffer.len() >= max_flush_bytes {
+                if !buffered.is_empty() && buffer.len() >= max_flush_bytes {
                     flush_window(
                         &mut sender,
                         &mut buffer,
                         ack_level,
-                        flush_timeout,
+                        remaining(deadline),
                         &mut outcome,
-                        &FlushContext {
-                            id,
-                            stream: &stream,
-                            topic: &topic,
-                            partition_id,
-                        },
+                        &flush_context,
                     )?;
-                    pending = 0;
-                    window_start = index;
+                    buffered.clear();
                 }
 
                 let reason = match mapping.append_row(&mut buffer, message, context) {
                     Ok(()) => {
                         outcome.rows_written += 1;
-                        pending += 1;
-                        index += 1;
+                        buffered.push(index);
                         continue;
                     }
                     Err(RowError::Invalid(reason)) => reason,
-                    // The client refused the row. Validation covers everything
-                    // it can, but some rules are only knowable to the buffer:
-                    // a column's type is pinned by whichever row defined it
-                    // first, so a later row disagreeing with it cannot be
-                    // predicted from that row alone. The buffer may now hold a
-                    // partial row and cannot be flushed, so rebuild the window
-                    // without the offending message and flush it, which bounds
-                    // the loss to one record instead of the whole batch.
-                    Err(RowError::Client(error)) => {
+                    // The record reached the buffer and was refused there. Some
+                    // rules are only knowable to the buffer: a column's type is
+                    // pinned by whichever row defined it first, so a later row
+                    // disagreeing with it cannot be judged from that row alone.
+                    // The buffer can now hold a partial row and cannot be
+                    // flushed, so rebuild it from the records it already
+                    // accepted and flush that, which keeps the loss to this one
+                    // record instead of the whole batch. `Drift` lands here too:
+                    // it means the two mapping passes disagree, which is equally
+                    // unsafe to continue on and equally recoverable.
+                    Err(error @ (RowError::Client(_) | RowError::Drift(_))) => {
+                        let reason = match &error {
+                            RowError::Client(error) => error.to_string(),
+                            RowError::Drift(reason) => rebuild_failed(reason).to_string(),
+                            RowError::Invalid(_) => unreachable!("matched above"),
+                        };
                         if recoveries >= MAX_BATCH_RECOVERIES {
                             warn!(
-                                "{CONNECTOR_NAME} ID: {id} giving up after {recoveries} row recoveries in one batch, discarding {pending} buffered rows, stream: {stream}, topic: {topic}, partition_id: {partition_id}"
+                                "{CONNECTOR_NAME} ID: {id} giving up after {recoveries} row recoveries in one batch, discarding {} buffered rows, stream: {stream}, topic: {topic}, partition_id: {partition_id}",
+                                buffered.len()
                             );
-                            return Err(FlushError::publishing(error));
+                            outcome.rows_written -= buffered.len();
+                            return Err(FlushError::publishing(match error {
+                                RowError::Client(error) => error,
+                                RowError::Drift(reason) => rebuild_failed(&reason),
+                                RowError::Invalid(_) => unreachable!("matched above"),
+                            }));
                         }
                         recoveries += 1;
-                        let reason = error.to_string();
                         buffer = sender.new_buffer();
-                        for prior in &messages[window_start..index] {
+                        for prior in &buffered {
                             mapping
-                                .append_row(&mut buffer, prior, context)
-                                .map_err(|error| match error {
-                                    RowError::Client(error) => FlushError::publishing(error),
-                                    RowError::Invalid(reason) => {
-                                        FlushError::publishing(rebuild_failed(&reason))
-                                    }
+                                .append_row(&mut buffer, &messages[*prior], context)
+                                .map_err(|error| {
+                                    FlushError::publishing(match error {
+                                        RowError::Client(error) => error,
+                                        RowError::Invalid(reason) | RowError::Drift(reason) => {
+                                            rebuild_failed(&reason)
+                                        }
+                                    })
                                 })?;
                         }
-                        if index > window_start {
+                        if !buffered.is_empty() {
                             flush_window(
                                 &mut sender,
                                 &mut buffer,
                                 ack_level,
-                                flush_timeout,
+                                remaining(deadline),
                                 &mut outcome,
-                                &FlushContext {
-                                    id,
-                                    stream: &stream,
-                                    topic: &topic,
-                                    partition_id,
-                                },
+                                &flush_context,
                             )?;
                         }
-                        pending = 0;
-                        window_start = index + 1;
+                        buffered.clear();
                         reason
                     }
                 };
@@ -378,7 +427,7 @@ impl QuestDbSink {
                 // survives. Log the identity needed to find the message,
                 // one line per record rather than a batch summary.
                 outcome.rejected_rows += 1;
-                if outcome.rejected_rows <= MAX_LOGGED_REJECTIONS_PER_BATCH {
+                if already_logged + outcome.rejected_rows <= MAX_LOGGED_REJECTIONS_PER_BATCH {
                     let payload = if log_payload {
                         format!(", payload: {}", payload_preview(&message.payload))
                     } else {
@@ -390,30 +439,16 @@ impl QuestDbSink {
                     );
                 }
                 outcome.last_rejection = Some(reason);
-                index += 1;
             }
 
-            if outcome.rejected_rows > MAX_LOGGED_REJECTIONS_PER_BATCH {
-                error!(
-                    "{CONNECTOR_NAME} ID: {id} rejected {} messages in this batch, stream: {stream}, topic: {topic}, partition_id: {partition_id}; {} further rejections were not logged individually",
-                    outcome.rejected_rows,
-                    outcome.rejected_rows - MAX_LOGGED_REJECTIONS_PER_BATCH
-                );
-            }
-
-            if pending > 0 {
+            if !buffered.is_empty() {
                 flush_window(
                     &mut sender,
                     &mut buffer,
                     ack_level,
-                    flush_timeout,
+                    remaining(deadline),
                     &mut outcome,
-                    &FlushContext {
-                        id,
-                        stream: &stream,
-                        topic: &topic,
-                        partition_id,
-                    },
+                    &flush_context,
                 )?;
             }
             Ok(outcome)
@@ -429,16 +464,14 @@ impl QuestDbSink {
 
     fn map_client_error(&self, failure: FlushError) -> Error {
         let FlushError { phase, error } = failure;
-        let code = error.code();
         let message = format!("{CONNECTOR_NAME} ID: {}: {error}", self.id);
         if phase == FlushPhase::Publishing && is_transient(&error) {
             return Error::CannotStoreData(message);
         }
         // `ServerSchemaMismatch` is a query-path code and never reaches a
         // sender, so a schema rejection arrives as `ServerRejection` carrying a
-        // schema category the sink cannot read. Both are reported the same way
-        // and the dedicated variant would be dead, so it is not special-cased.
-        let _ = code;
+        // schema category the sink cannot read. Both are reported the same way,
+        // so the code is not read at all.
         Error::PermanentHttpError(message)
     }
 }
@@ -453,8 +486,26 @@ impl Sink for QuestDbSink {
             );
             return Err(error);
         }
-        ensure_crypto_provider();
         let connection_string = self.connection_string.expose_secret().to_owned();
+        let uses_tls = connection_string
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("wss:");
+        if uses_tls {
+            ensure_crypto_provider();
+        }
+        // A connect string that disables verification is a test convenience, so
+        // say so once rather than letting a production deployment carry it
+        // silently.
+        if connection_string
+            .to_ascii_lowercase()
+            .contains("tls_verify=unsafe_off")
+        {
+            warn!(
+                "{CONNECTOR_NAME} ID: {} has TLS certificate verification disabled through tls_verify=unsafe_off; use this only against a test server",
+                self.id
+            );
+        }
         // Durable acks are refused outright unless the connect string asks the
         // server for them, so a config that sets one without the other fails
         // every batch while the rows themselves land. Catch it here rather than
@@ -478,8 +529,9 @@ impl Sink for QuestDbSink {
         // detail would be discarded. This is the only place that detail exists:
         // the `questdb::Error` the sink sees carries none of it.
         let mut handlers = ConnectHandlers::default();
+        let rejected = Arc::clone(&self.server_rejected);
         handlers.error_handler = Some(QwpWsErrorHandler::new(move |error| {
-            report_server_rejection(id, error)
+            report_server_rejection(id, &rejected, error)
         }));
 
         // `QuestDb::connect_with_handlers` dials the server, so this doubles as
@@ -550,6 +602,7 @@ impl Sink for QuestDbSink {
                     batch,
                     topic_metadata,
                     messages_metadata.partition_id,
+                    total.rejected_rows,
                 )
                 .await?;
             total.merge(outcome);
@@ -561,6 +614,13 @@ impl Sink for QuestDbSink {
                 self.id,
                 total.rejected_rows,
                 total.last_rejection.as_deref().unwrap_or("unknown")
+            );
+        }
+        if total.rejected_rows > MAX_LOGGED_REJECTIONS_PER_BATCH {
+            error!(
+                "{CONNECTOR_NAME} ID: {} did not log {} of those rejections individually",
+                self.id,
+                total.rejected_rows - MAX_LOGGED_REJECTIONS_PER_BATCH
             );
         }
 
@@ -583,7 +643,15 @@ impl Sink for QuestDbSink {
         // healthy connector while nothing is being committed. Escalate so the
         // error counter moves; the rows stay queued either way, and the runtime
         // does not replay a failed batch, so nothing is lost by saying so.
-        if stalled >= PENDING_ACK_BATCHES_BEFORE_ESCALATION {
+        // A terminal rejection reported through the handler has to fail the
+        // batch. Taking the flag clears it, so one rejection fails one batch.
+        if self.server_rejected.swap(false, Ordering::Relaxed) {
+            return Err(Error::CannotStoreData(format!(
+                "{CONNECTOR_NAME} ID: {}: QuestDB terminally rejected a frame from this connector; the preceding log line carries the category and the frame range",
+                self.id
+            )));
+        }
+        if should_escalate_stall(stalled) {
             return Err(Error::CannotStoreData(format!(
                 "{CONNECTOR_NAME} ID: {}: the last {stalled} batches were flushed without QuestDB acknowledging them at ack_level {:?}; the frames are queued but nothing is being committed",
                 self.id, self.ack_level
@@ -594,9 +662,33 @@ impl Sink for QuestDbSink {
 
     async fn close(&mut self) -> Result<(), Error> {
         if let Some(db) = self.db.take() {
-            // Dropping the pool drains buffered frames, which blocks for up to
-            // the client's `close_flush_timeout_millis`.
-            if let Err(error) = tokio::task::spawn_blocking(move || drop(db)).await {
+            let id = self.id;
+            let ack_level = self.ack_level;
+            let flush_timeout = self.flush_timeout;
+            // Dropping the pool drains what it holds only on a best-effort
+            // basis, bounded by the client's `close_flush_timeout`, and then
+            // discards the rest. Earlier batches already reported success, so
+            // wait for the queue to drain first and say so plainly when it does
+            // not, rather than losing those rows without a word.
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                match db.borrow_sender() {
+                    Ok(mut sender) => {
+                        if let Err(error) = sender.wait(ack_level, flush_timeout) {
+                            warn!(
+                                "{CONNECTOR_NAME} ID: {id} is closing with frames QuestDB has not acknowledged, so rows already reported as written can be lost: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            "{CONNECTOR_NAME} ID: {id} could not borrow a sender to drain before close, so queued frames can be lost: {error}"
+                        );
+                    }
+                }
+                drop(db);
+            })
+            .await
+            {
                 warn!(
                     "{CONNECTOR_NAME} ID: {} close task failed: {error}",
                     self.id
@@ -642,20 +734,20 @@ impl BatchOutcome {
 
 /// Renders a rejected payload for the log, truncated on a char boundary so a
 /// large or binary message cannot blow up the log line.
-fn payload_preview(payload: &iggy_connector_sdk::Payload) -> String {
-    use iggy_connector_sdk::Payload;
-
-    let rendered = match payload {
+fn payload_preview(payload: &Payload) -> String {
+    // A text payload is borrowed rather than copied, because the common case is
+    // a payload short enough to need no truncation at all.
+    let rendered: Cow<'_, str> = match payload {
         Payload::Json(value) => {
-            simd_json::to_string(value).unwrap_or_else(|_| "<unrenderable>".to_owned())
+            Cow::Owned(simd_json::to_string(value).unwrap_or_else(|_| "<unrenderable>".to_owned()))
         }
-        Payload::Text(text) | Payload::Proto(text) => text.clone(),
+        Payload::Text(text) | Payload::Proto(text) => Cow::Borrowed(text.as_str()),
         Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
-            format!("<{} bytes>", bytes.len())
+            Cow::Owned(format!("<{} bytes>", bytes.len()))
         }
     };
     if rendered.len() <= REJECTED_PAYLOAD_PREVIEW_BYTES {
-        return rendered;
+        return rendered.into_owned();
     }
     let mut end = REJECTED_PAYLOAD_PREVIEW_BYTES;
     while end > 0 && !rendered.is_char_boundary(end) {
@@ -675,11 +767,11 @@ fn parse_ack_level(raw: Option<&str>) -> Option<AckLevel> {
 /// A column cannot be both a `SYMBOL` and a `UUID`, and neither can double as
 /// the designated timestamp. Catching it here beats a per-row failure later.
 fn validate_column_overlap(mapping: &Mapping) -> Result<(), Error> {
-    let overlap: HashSet<_> = mapping
+    if let Some(column) = mapping
         .symbol_columns
-        .intersection(&mapping.uuid_columns)
-        .collect();
-    if let Some(column) = overlap.into_iter().next() {
+        .iter()
+        .find(|column| mapping.uuid_columns.contains(column))
+    {
         return Err(Error::InvalidConfigValue(format!(
             "column {column} is listed in both symbol_columns and uuid_columns"
         )));
@@ -728,6 +820,26 @@ impl FlushError {
             error,
         }
     }
+}
+
+/// Whether a run of unacknowledged batches has gone on long enough to report.
+///
+/// One unacknowledged flush is delivery lag. A run of them means the server has
+/// stopped acknowledging, and reporting every one of those batches as a success
+/// would leave the runtime's metrics showing a healthy connector while nothing
+/// is committed.
+fn should_escalate_stall(consecutive_batches: u64) -> bool {
+    consecutive_batches >= PENDING_ACK_BATCHES_BEFORE_ESCALATION
+}
+
+/// Time left before `deadline`, floored just above zero.
+///
+/// The floor matters: the client reads `Duration::ZERO` as "no deadline" and
+/// waits forever, so an exhausted budget must still pass a positive value.
+fn remaining(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1))
 }
 
 /// Identity of the batch being flushed, for the log lines only.
@@ -791,7 +903,7 @@ fn flush_window(
 /// rejection reaches the sink as an error code with none of this detail
 /// attached, and a retriable one is never surfaced at all even though it tells
 /// an operator the server is pushing back.
-fn report_server_rejection(id: u32, error: &QwpWsSenderError) {
+fn report_server_rejection(id: u32, rejected: &Arc<AtomicBool>, error: &QwpWsSenderError) {
     let status = error
         .status
         .map_or_else(|| "none".to_owned(), |status| format!("0x{status:02x}"));
@@ -801,6 +913,11 @@ fn report_server_rejection(id: u32, error: &QwpWsSenderError) {
     let message = error.message.as_deref().unwrap_or("");
     let terminal = error.applied_policy == QwpWsErrorPolicy::Terminal;
     if terminal {
+        // The handler runs on the client's own thread and is the only report of
+        // a rejection the sink never asks `wait` about, which happens whenever
+        // the ack level and the timeout make the sink skip the wait. Record it
+        // so the batch can fail rather than reporting success.
+        rejected.store(true, Ordering::Relaxed);
         error!(
             "{CONNECTOR_NAME} ID: {id} QuestDB rejected a batch terminally, category: {:?}, status: {status}, frames: [{}, {}], sequence: {sequence}, message: {message}",
             error.category, error.from_fsn, error.to_fsn
@@ -896,6 +1013,7 @@ mod tests {
             batch_size: None,
             max_flush_bytes: None,
             log_rejected_payload: None,
+            numbers_as_double: None,
             verbose_logging: None,
         }
     }
@@ -911,6 +1029,86 @@ mod tests {
         assert!(sink.mapping.include_stream_column);
         assert!(sink.mapping.include_topic_column);
         assert!(!sink.mapping.include_partition_column);
+    }
+
+    #[test]
+    fn given_durable_acks_with_a_zero_flush_timeout_when_constructed_should_record_init_error() {
+        // The client reads a zero timeout as "no deadline", so a durable ack
+        // level would wait for good inside the FFI call and the connector could
+        // not be stopped.
+        let mut config = config();
+        config.ack_level = Some("durable".to_owned());
+        config.flush_timeout = Some("0s".to_owned());
+        let sink = QuestDbSink::new(1, config);
+        assert!(matches!(
+            sink.init_error,
+            Some(Error::InvalidConfigValue(_))
+        ));
+    }
+
+    #[test]
+    fn given_zero_flush_timeout_at_the_default_ack_level_when_constructed_should_be_accepted() {
+        // At the default ack level a zero timeout is fire and forget, which is a
+        // legitimate choice, so the guard above must not reject it.
+        let mut config = config();
+        config.flush_timeout = Some("0s".to_owned());
+        let sink = QuestDbSink::new(1, config);
+        assert!(sink.init_error.is_none());
+        assert_eq!(sink.flush_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn given_a_run_of_unacknowledged_batches_when_deciding_should_escalate_at_the_threshold() {
+        assert!(!should_escalate_stall(0));
+        assert!(!should_escalate_stall(
+            PENDING_ACK_BATCHES_BEFORE_ESCALATION - 1
+        ));
+        assert!(should_escalate_stall(PENDING_ACK_BATCHES_BEFORE_ESCALATION));
+        assert!(should_escalate_stall(
+            PENDING_ACK_BATCHES_BEFORE_ESCALATION + 1
+        ));
+    }
+
+    #[test]
+    fn given_a_short_payload_when_previewing_should_return_it_whole() {
+        let preview = payload_preview(&Payload::Text("hello".to_owned()));
+        assert_eq!(preview, "hello");
+    }
+
+    #[test]
+    fn given_a_long_payload_when_previewing_should_truncate_and_report_the_size() {
+        let text = "a".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES * 2);
+        let preview = payload_preview(&Payload::Text(text.clone()));
+        assert!(preview.len() < text.len(), "{preview}");
+        assert!(
+            preview.ends_with(&format!("({} bytes total)", text.len())),
+            "{preview}"
+        );
+    }
+
+    #[test]
+    fn given_a_multibyte_boundary_when_previewing_should_not_split_a_character() {
+        // The cut lands inside a multi-byte character, so the walk has to step
+        // back to a boundary rather than slicing a char in half.
+        let text = "é".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES);
+        let preview = payload_preview(&Payload::Text(text));
+        assert!(preview.contains('é'));
+    }
+
+    #[test]
+    fn given_a_binary_payload_when_previewing_should_report_the_byte_count_only() {
+        let preview = payload_preview(&Payload::Raw(vec![0xff, 0xfe, 0xfd]));
+        assert_eq!(preview, "<3 bytes>");
+    }
+
+    #[test]
+    fn given_an_exhausted_deadline_when_computing_the_remaining_time_should_stay_above_zero() {
+        // A zero duration means "wait forever" to the client, so the floor must
+        // never reach zero however long the batch already took.
+        let past = Instant::now() - Duration::from_secs(60);
+        assert!(remaining(past) > Duration::ZERO);
+        let future = Instant::now() + Duration::from_secs(10);
+        assert!(remaining(future) > Duration::from_secs(5));
     }
 
     #[tokio::test]
