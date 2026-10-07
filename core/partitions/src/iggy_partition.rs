@@ -3093,7 +3093,6 @@ where
                 if keyed_by_group(pending.kind) && tracked.is_none() {
                     self.mark_consumer_group_offsets_need_reconcile();
                 }
-                Ok(())
             }
             PendingConsumerOffsetMutation::Upsert(offset) => {
                 if let Some(path) = path.as_deref() {
@@ -3112,7 +3111,6 @@ where
                 if keyed_by_group(pending.kind) && created {
                     self.mark_consumer_group_offsets_need_reconcile();
                 }
-                Ok(())
             }
             PendingConsumerOffsetMutation::Delete => {
                 if let Some(path) = path.as_deref() {
@@ -3150,9 +3148,9 @@ where
                     .remove(pending.kind, pending.consumer_id);
                 capacity.forget_inactive_provisional(pending.consumer_id);
                 capacity.rearm_if_below_limit(&self.durable_consumer_offsets);
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Accept a read only while its message history still belongs to this owner.
@@ -11898,7 +11896,7 @@ mod tests {
         assert_eq!(cursor.u64().unwrap(), CHECKPOINT_OP);
         let wire = crate::state_transfer::ConsumerOffsetsWire::decode(cursor.remaining()).unwrap();
         assert!(wire.consumers.is_empty() && wire.groups.is_empty());
-        assert!(wire.checkpoint_prepare.is_empty());
+        assert_eq!(wire.checkpoint_prepare, b"");
         assert_eq!(wire.required_metadata_frontier, METADATA_FRONTIER);
         let mut recovered = test_partition();
         recovered.set_partition_dir(directory.path().to_string_lossy().into_owned());
@@ -14224,7 +14222,7 @@ mod tests {
                 (ConsumerKind::ConsumerGroup, 9)
             ]
         );
-        assert!(partition.dead_group_offset_keys(|_| true).is_empty());
+        assert_eq!(partition.dead_group_offset_keys(|_| true), []);
     }
 
     /// The reconciler deletes a bounded number of dead keys per pass. Ordered
@@ -14905,7 +14903,7 @@ mod tests {
             .unwrap();
         assert!(epoch.get() > initial);
         let after_create = epoch.get();
-        assert!(partition.dead_group_offset_keys(|_| true).is_empty());
+        assert_eq!(partition.dead_group_offset_keys(|_| true), []);
         assert_eq!(epoch.get(), after_create);
         partition.stage_consumer_offset_upsert(2, ConsumerKind::ConsumerGroup, 7, 2, true);
         partition
@@ -16484,7 +16482,7 @@ mod tests {
             partition.occupied_consumer_offset_count(ConsumerKind::ConsumerGroup),
             0
         );
-        assert!(partition.consumer_group_offset_ids().is_empty());
+        assert_eq!(partition.consumer_group_offset_ids(), [] as [u64; 0]);
     }
 
     #[compio::test]
@@ -16526,12 +16524,7 @@ mod tests {
             vec![(ConsumerKind::ConsumerGroup, 7)],
             "the same dead key is reclaimed once it is no longer stranded"
         );
-        assert!(
-            partition
-                .offsets_wire_snapshot_for_test()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(partition.offsets_wire_snapshot_for_test().unwrap(), []);
     }
 
     #[test]
@@ -16825,7 +16818,7 @@ mod tests {
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
         );
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 7, 11, 11);
-        assert!(partition.dead_group_offset_keys(|_| false).is_empty());
+        assert_eq!(partition.dead_group_offset_keys(|_| false), []);
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::ConsumerGroup),
             1
@@ -19089,7 +19082,7 @@ mod tests {
 
         assert_eq!(&body[..], &[0, 0, 0, 0]);
         let (response, _) = SendMessagesResponse::decode(&body).unwrap();
-        assert!(response.confirmations.is_empty());
+        assert_eq!(response.confirmations, []);
     }
 
     #[test]

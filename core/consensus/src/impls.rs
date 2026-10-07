@@ -5570,7 +5570,7 @@ mod vsr_consensus_tests {
             panic!("the settled primary must answer the backup's probe: {replies:?}");
         };
         assert_eq!(*target, Some(REJOINING_REPLICA));
-        assert!(suffix.is_empty());
+        assert_eq!(suffix.as_slice(), []);
         let response = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
             .transmute_header(|_, header: &mut StartViewHeader| {
                 header.command = Command::StartView;

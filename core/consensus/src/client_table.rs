@@ -2748,7 +2748,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(clients_of(&table).is_empty());
+        assert_eq!(clients_of(&table), [] as [u128; 0]);
     }
 
     #[cfg(debug_assertions)]

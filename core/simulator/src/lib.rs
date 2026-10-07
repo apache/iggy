@@ -6666,7 +6666,7 @@ mod partition_repair_driver_tests {
                 .is_none(),
             "resident operations must not consume a repair session while waiting for the next walk"
         );
-        assert!(repair_requests(&sim).is_empty());
+        assert_eq!(repair_requests(&sim), []);
 
         let mut namespace_scratch = Vec::new();
         assert!(
@@ -6677,7 +6677,7 @@ mod partition_repair_driver_tests {
             (Status::Normal, 0, OPS as u64, OPS as u64),
             "the existing tick must finish the resident backlog without peer repair"
         );
-        assert!(repair_requests(&sim).is_empty());
+        assert_eq!(repair_requests(&sim), []);
     }
 
     #[test]

@@ -249,7 +249,7 @@ async fn a_null_topics_array_against_an_empty_bridge_lists_nothing() {
     let (state, _seed) = connected_state(&server).await;
 
     let topics = send(&state, None).await;
-    assert!(topics.is_empty());
+    assert_eq!(topics, []);
 }
 
 #[tokio::test]

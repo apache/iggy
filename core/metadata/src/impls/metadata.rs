@@ -6486,12 +6486,12 @@ mod tests {
                 .unwrap(),
             Some(session + 1)
         );
-        assert!(
+        assert_eq!(
             metadata
                 .mux_stm
                 .streams()
-                .consumer_group_memberships(CLIENT)
-                .is_empty()
+                .consumer_group_memberships(CLIENT),
+            []
         );
         assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
         assert_eq!(metadata.mux_stm.streams().consumer_group_count(), 1);
@@ -6517,12 +6517,12 @@ mod tests {
             None
         );
 
-        assert!(
+        assert_eq!(
             metadata
                 .mux_stm
                 .streams()
-                .consumer_group_memberships(CLIENT)
-                .is_empty()
+                .consumer_group_memberships(CLIENT),
+            []
         );
         assert_eq!(metadata.mux_stm.streams().consumer_group_count(), 1);
         assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), 2);
@@ -6681,12 +6681,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(
+        assert_eq!(
             metadata
                 .mux_stm
                 .streams()
-                .consumer_group_memberships(CLIENT)
-                .is_empty()
+                .consumer_group_memberships(CLIENT),
+            []
         );
         assert_eq!(metadata.client_table.borrow().count(), capacity);
     }
