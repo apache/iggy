@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
+
 use iggy_connector_sdk::{ConsumedMessage, Payload};
 use questdb::ingress::{Buffer, ColumnName, TimestampMicros, TimestampNanos};
 use simd_json::OwnedValue;
@@ -146,10 +148,6 @@ impl ColumnNames {
             .any(|configured| configured.eq_ignore_ascii_case(name))
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     pub fn insert(&mut self, name: String) {
         if !self.contains(&name) {
             self.0.push(name);
@@ -205,11 +203,17 @@ pub struct RowContext<'a> {
 impl Mapping {
     /// Appends one row.
     ///
-    /// The message is validated in full before the first write, so a rejected
-    /// message is skipped without ever having touched the buffer. Rolling a
-    /// half-written row back instead would mean a marker per row, and on the
-    /// QWP/WebSocket path setting a marker clones every table buffered so far,
-    /// which makes building a batch quadratic in its length.
+    /// The message is validated in full before the first write, so a message
+    /// this mapping rejects never touches the buffer.
+    ///
+    /// That ordering is what the caller relies on, and the reason is narrower
+    /// than it looks. The client rolls back a row it refuses itself, on every
+    /// column and symbol setter, so a rejection from the client costs one record
+    /// and leaves the buffer usable. It cannot roll back a rejection of this
+    /// mapping's own: once an earlier column of the row is written, nothing
+    /// removes it. The public `set_marker` API would, but on this transport it
+    /// snapshots every buffered table, which makes building a batch quadratic in
+    /// its length. Validating first is the cheap way to get the same guarantee.
     pub fn append_row(
         &self,
         buffer: &mut Buffer,
@@ -322,7 +326,7 @@ impl Mapping {
             ));
         }
 
-        self.validate_timestamp(fields)
+        self.validate_timestamp(message, fields)
     }
 
     /// Column names this connector emits itself for every row.
@@ -361,11 +365,20 @@ impl Mapping {
 
     /// The caller skips nulls and has already validated the name, so neither is
     /// rechecked here.
+    /// Rejects a value the write pass would refuse, before anything is written.
+    ///
+    /// This repeats work the write pass does again, and that is deliberate. The
+    /// client rolls back a row it refuses itself, but it cannot roll back a
+    /// refusal of ours: by the time this mapping decides an array is ragged or a
+    /// UUID is malformed, the row's earlier columns are already in the buffer,
+    /// and nothing would remove them. Checking first is what keeps a bad value
+    /// to one rejected record instead of a partial row. The cost is one extra
+    /// build per array, per nested object and per UUID column, and only for
+    /// records that carry them.
     fn validate_column(&self, name: &str, value: &OwnedValue) -> Result<(), RowError> {
-        // A column declared as a UUID has to hold one. Writing a number or a
-        // boolean there instead creates a column of the wrong type, which the
-        // server then refuses for every later row, or silently stores the wrong
-        // shape when it creates the column itself.
+        // A column declared as a UUID has to hold one. A number or a boolean
+        // there creates a column of the wrong type, which the client accepts and
+        // the server then refuses for every later row.
         if self.uuid_columns.contains(name) {
             let OwnedValue::String(text) = value else {
                 return Err(RowError::Invalid(format!(
@@ -387,10 +400,23 @@ impl Mapping {
 
     fn validate_timestamp(
         &self,
+        message: &ConsumedMessage,
         fields: Option<&simd_json::owned::Object>,
     ) -> Result<(), RowError> {
-        if self.timestamp_source != TimestampSource::Payload {
-            return Ok(());
+        // `Buffer::at` is the one call that refuses a value without rolling the
+        // row back, so a timestamp it would refuse is the only input that can
+        // leave a partial row. Every source has to be checked, not just the
+        // payload one: `origin_timestamp` comes from the producer, and a value
+        // above `i64::MAX` wraps negative in the cast that follows.
+        match self.timestamp_source {
+            TimestampSource::Server => return Ok(()),
+            TimestampSource::Message => {
+                return validate_micros("message timestamp", message.timestamp);
+            }
+            TimestampSource::Origin => {
+                return validate_micros("origin timestamp", message.origin_timestamp);
+            }
+            TimestampSource::Payload => {}
         }
         let field = self
             .timestamp_field
@@ -438,7 +464,7 @@ impl Mapping {
                     continue;
                 }
                 if let Some(text) = scalar_to_symbol(value) {
-                    buffer.symbol(name.as_str(), text.as_str())?;
+                    buffer.symbol(name.as_str(), text.as_ref())?;
                 }
             }
         }
@@ -620,6 +646,21 @@ impl Mapping {
 
 /// `timestamp == 0` means unset in Apache Iggy, so the row falls back to the
 /// server clock rather than landing at the Unix epoch.
+/// Rejects a microsecond timestamp the buffer would refuse.
+///
+/// Apache Iggy carries these as `u64` and the client takes an `i64`, so a value
+/// above `i64::MAX` wraps negative. `Buffer::at` refuses a negative value
+/// without rolling the row back, which is the one input that leaves a partial
+/// row, so it is caught before anything is written.
+fn validate_micros(label: &str, micros: u64) -> Result<(), RowError> {
+    if micros > i64::MAX as u64 {
+        return Err(RowError::Invalid(format!(
+            "{label} {micros} is too large for a QuestDB timestamp"
+        )));
+    }
+    Ok(())
+}
+
 fn micros_or_now(micros: u64) -> TimestampMicros {
     if micros == 0 {
         TimestampMicros::now()
@@ -669,14 +710,16 @@ fn is_symbol_scalar(value: &OwnedValue) -> bool {
     )
 }
 
-fn scalar_to_symbol(value: &OwnedValue) -> Option<String> {
+/// Borrows a string value and renders the rest, so the common case of a string
+/// symbol copies nothing on a path that runs for every symbol of every row.
+fn scalar_to_symbol(value: &OwnedValue) -> Option<Cow<'_, str>> {
     match value {
         OwnedValue::Static(StaticNode::Null) => None,
-        OwnedValue::Static(StaticNode::Bool(flag)) => Some(flag.to_string()),
-        OwnedValue::Static(StaticNode::I64(number)) => Some(number.to_string()),
-        OwnedValue::Static(StaticNode::U64(number)) => Some(number.to_string()),
-        OwnedValue::Static(StaticNode::F64(number)) => Some(number.to_string()),
-        OwnedValue::String(text) => Some(text.clone()),
+        OwnedValue::Static(StaticNode::Bool(flag)) => Some(Cow::Owned(flag.to_string())),
+        OwnedValue::Static(StaticNode::I64(number)) => Some(Cow::Owned(number.to_string())),
+        OwnedValue::Static(StaticNode::U64(number)) => Some(Cow::Owned(number.to_string())),
+        OwnedValue::Static(StaticNode::F64(number)) => Some(Cow::Owned(number.to_string())),
+        OwnedValue::String(text) => Some(Cow::Borrowed(text.as_str())),
         _ => None,
     }
 }
@@ -1473,6 +1516,37 @@ mod tests {
         let line = rendered(&buffer);
         assert!(line.contains("flag=true"), "{line}");
         assert!(line.contains("count=7"), "{line}");
+    }
+
+    #[test]
+    fn given_a_client_rejection_when_appending_should_leave_the_buffer_usable() {
+        // The caller keeps the same buffer after a client rejection, which only
+        // holds because the client rolls the half-written row back itself before
+        // returning the error. Pin that: the rejected row leaves no trace and the
+        // next record still writes.
+        let mapping = mapping();
+        let mut buffer = qwp_buffer();
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"temp":21.5}"#), context())
+            .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+
+        // Conflicts with the type the first row pinned.
+        let error = mapping
+            .append_row(&mut buffer, &json_message(r#"{"temp":21}"#), context())
+            .unwrap_err();
+        assert!(matches!(error, RowError::Client(_)), "got {error:?}");
+        assert_eq!(
+            buffer.row_count(),
+            1,
+            "the refused row must not be left half written"
+        );
+
+        // The same buffer still takes a well-formed record.
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"temp":22.5}"#), context())
+            .unwrap();
+        assert_eq!(buffer.row_count(), 2, "the buffer must still be usable");
     }
 
     #[test]
