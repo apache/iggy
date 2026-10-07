@@ -1998,7 +1998,6 @@ dependencies = [
  "charming",
  "colored",
  "comfy-table",
- "derive-new",
  "derive_more",
  "human-repr",
  "rand 0.10.2",

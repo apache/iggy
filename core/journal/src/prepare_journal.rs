@@ -1981,7 +1981,7 @@ mod tests {
         assert_eq!(from_4[0].op, 5);
 
         let from_10 = journal.iter_headers_from(10);
-        assert!(from_10.is_empty());
+        assert_eq!(from_10, []);
     }
 
     #[compio::test]

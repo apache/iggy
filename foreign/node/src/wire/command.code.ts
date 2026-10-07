@@ -20,7 +20,7 @@ import { reverseRecord } from '../type.utils.js';
 export const COMMAND_CODE = {
   Ping: 1,
   GetStats: 10,
-  GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
+  GetSnapshot: 11,
   GetClusterMetadata: 12,
   DescribeOptions: 13,
   BindSession: 15,
