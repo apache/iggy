@@ -168,17 +168,15 @@ lock, and stock clients list one or two assignors.
 
 ## What a real consumer still cannot do
 
-A consumer completes JoinGroup and SyncGroup and then holds no partitions. Metadata is a stub that
-answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's assignor sees no
-partitions and hands every member an empty assignment. The consumer stays a member and keeps
-heartbeating, but has nothing to fetch.
+Without a bridge, a consumer completes JoinGroup and SyncGroup and then holds no partitions.
+Metadata is a stub that answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's
+assignor sees no partitions and hands every member an empty assignment. The consumer stays a
+member and keeps heartbeating, but has nothing to fetch.
 
-Once Metadata reports partitions, the next wall is `OffsetFetch` (9), which a consumer sends after
-`SyncGroup` for a non-empty assignment and which is not in scope
-([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so
-that consumer would loop: coordinator connection closes, client marks the coordinator unknown,
-re-runs FindCoordinator, retries OffsetFetch, closes again. Fetch reads records with a bridge, so a
-consumer that uses `assign()` outside a group can consume. A group member cannot until #3542 lands.
+With a bridge, Metadata reports the partitions and a group member consumes. After `SyncGroup`, it
+reads its start position with `OffsetFetch` (9) and later commits with `OffsetCommit` (8). Both
+keep the offsets in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without a bridge, both answer
+`COORDINATOR_LOAD_IN_PROGRESS` (14), and the client retries them.
 
 A dynamic consumer releases its partitions on close through `LeaveGroup`. A static one does not
 send it (see [Static membership](#static-membership-is-accepted-not-honoured)), so a static

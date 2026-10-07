@@ -31,12 +31,15 @@ use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 
 mod fetch;
+mod group_offsets;
 mod offsets;
 mod produce;
 mod topics;
 
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+pub use group_offsets::OFFSET_GROUP_PREFIX;
+use group_offsets::OffsetPool;
 pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
@@ -103,8 +106,8 @@ async fn in_slot<S: Send + 'static, T: Send + 'static>(
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
 /// One lockstep client serves Produce, Metadata and `CreateTopics` for every Kafka connection, so
-/// those Iggy calls run one at a time. Topic probes use a client of their own, and Fetch polls one
-/// per read slot. A Produce pool is a TODO in `docs/SCOPE.md`.
+/// those Iggy calls run one at a time. Topic probes use a client of their own, Fetch polls one per
+/// read slot, and offset calls one per offset slot. A Produce pool is a TODO in `docs/SCOPE.md`.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -117,6 +120,8 @@ pub struct IggyBridge {
     fetch_pool: Arc<FetchPool>,
     /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
     probe_client: LazyClient,
+    /// Group offset slots, each with its own client. See `commit_group_offsets`.
+    offset_pool: OffsetPool,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -154,6 +159,7 @@ impl IggyBridge {
             send_slot: Arc::new(Semaphore::new(1)),
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            offset_pool: OffsetPool::new(),
         })
     }
 
@@ -199,8 +205,12 @@ impl IggyBridge {
     pub async fn close(self) -> Result<(), BridgeError> {
         let fetch_clients = self.fetch_pool.close().await;
         let probe_client = self.probe_client.close().await;
+        let offset_clients = self.offset_pool.close().await;
         let shared_client = with_request_timeout(self.client.shutdown()).await;
-        fetch_clients.and(probe_client).and(shared_client)
+        fetch_clients
+            .and(probe_client)
+            .and(offset_clients)
+            .and(shared_client)
     }
 }
 

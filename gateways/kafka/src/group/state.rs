@@ -35,8 +35,8 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::group::{
-    GroupCoordinatorConfig, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult,
-    LeavingMember, LeftMember, SyncRequest, SyncResult, owned_str,
+    CommitRequest, GroupCoordinatorConfig, GroupMember, JoinRequest, JoinResult, JoinedMember,
+    LeaveRequest, LeaveResult, LeavingMember, LeftMember, SyncRequest, SyncResult, owned_str,
 };
 use crate::protocol::api::{
     ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID, ERROR_GROUP_MAX_SIZE_REACHED,
@@ -48,6 +48,13 @@ use crate::protocol::api::{
 /// An Iggy name caps at 255 bytes and a Kafka group's offset key is `kafka.cg.<group>`, so a
 /// group id this gateway admits must leave room for that prefix (`docs/OFFSET_STORAGE.md`).
 pub const MAX_GROUP_ID_BYTES: usize = 246;
+
+/// Whether every group API admits `group_id`. Kafka refuses an empty one, and a longer one than
+/// [`MAX_GROUP_ID_BYTES`] cannot name its offsets in Iggy.
+#[must_use]
+pub const fn is_valid_group_id(group_id: &str) -> bool {
+    !group_id.is_empty() && group_id.len() <= MAX_GROUP_ID_BYTES
+}
 
 /// Protocol selection is polynomial in this count under the coordinator lock. Stock clients list
 /// one or two assignors.
@@ -677,7 +684,7 @@ fn roster_entry_bytes(
 
 /// Everything a `JoinGroup` can be rejected for before any group is touched.
 fn join_request_error(config: &GroupCoordinatorConfig, request: &JoinRequest) -> Option<i16> {
-    if request.group_id.is_empty() || request.group_id.len() > MAX_GROUP_ID_BYTES {
+    if !is_valid_group_id(&request.group_id) {
         return Some(ERROR_INVALID_GROUP_ID);
     }
     if request.session_timeout < config.min_session_timeout
@@ -1110,6 +1117,83 @@ pub fn leave_step(groups: &mut Groups, request: &LeaveRequest, now: Instant) -> 
         error: ERROR_NONE,
         members,
     }
+}
+
+/// Kafka's `ClassicGroup.validateOffsetCommit`. Never creates a group.
+///
+/// A group with no members is Kafka's `Empty`: a negative generation commits without a member. A
+/// gateway restart empties every group, so a member's next commit gets `UNKNOWN_MEMBER_ID` and it
+/// rejoins. Kafka's v9 answer, `GROUP_ID_NOT_FOUND`, is fatal in the Java consumer.
+pub fn commit_step(groups: &mut Groups, request: &CommitRequest, now: Instant) -> i16 {
+    if !is_valid_group_id(&request.group_id) {
+        return ERROR_INVALID_GROUP_ID;
+    }
+    let empty = || {
+        if request.generation_id < 0 {
+            ERROR_NONE
+        } else {
+            ERROR_UNKNOWN_MEMBER_ID
+        }
+    };
+    if !tick_group(groups, &request.group_id, now) {
+        return empty();
+    }
+    let Some(group) = groups.get_mut(&request.group_id) else {
+        return empty();
+    };
+    if group.members.is_empty() {
+        return empty();
+    }
+    if request.generation_id < 0
+        && request.member_id.is_empty()
+        && request.group_instance_id.is_none()
+    {
+        return ERROR_UNKNOWN_MEMBER_ID;
+    }
+    if let Some(instance_id) = &request.group_instance_id {
+        let holds = |member: &Member| member.group_instance_id.as_ref() == Some(instance_id);
+        if !group.members.values().any(holds) {
+            return ERROR_UNKNOWN_MEMBER_ID;
+        }
+        if !group.members.get(&request.member_id).is_some_and(holds) {
+            return ERROR_FENCED_INSTANCE_ID;
+        }
+    }
+    let (generation_id, phase) = (group.generation_id, group.phase);
+    let Some(member) = group.members.get_mut(&request.member_id) else {
+        return ERROR_UNKNOWN_MEMBER_ID;
+    };
+    if request.generation_id != generation_id {
+        return ERROR_ILLEGAL_GENERATION;
+    }
+    // A member commits right before it rejoins, so `PreparingRebalance` accepts.
+    if phase == Phase::CompletingRebalance {
+        return ERROR_REBALANCE_IN_PROGRESS;
+    }
+    member.session_deadline = now + member.session_timeout;
+    ERROR_NONE
+}
+
+/// How long an offset call may hold the connection that `member` heartbeats on: `hold`, and at
+/// most half of what is left of that member's session, so a heartbeat that waits behind the call
+/// still lands in time. A member that is not there, or whose session has ended, leaves `hold`.
+pub fn offset_hold(
+    groups: &Groups,
+    member: Option<&GroupMember>,
+    hold: Duration,
+    now: Instant,
+) -> Duration {
+    let left = member.and_then(|member| {
+        let found = groups
+            .get(&member.group_id)?
+            .members
+            .get(&member.member_id)?;
+        found
+            .session_deadline
+            .checked_duration_since(now)
+            .filter(|left| !left.is_zero())
+    });
+    left.map_or(hold, |left| hold.min(left / 2))
 }
 
 fn admit(
@@ -2952,5 +3036,216 @@ mod tests {
 
         assert_eq!(result.error, ERROR_INVALID_GROUP_ID);
         assert!(result.members.is_empty());
+    }
+
+    fn commit(member_id: &str, generation_id: i32) -> CommitRequest {
+        CommitRequest {
+            group_id: group_id(),
+            generation_id,
+            member_id: StrBytes::from_string(member_id.to_owned()),
+            group_instance_id: None,
+        }
+    }
+
+    /// Admin tools and `assign()` consumers commit this way.
+    #[test]
+    fn given_no_group_when_committing_without_a_generation_should_accept_and_not_create_it() {
+        let mut groups = Groups::new();
+
+        let error = commit_step(&mut groups, &commit("", -1), Instant::now());
+
+        assert_eq!(error, ERROR_NONE);
+        assert!(groups.is_empty());
+    }
+
+    /// What every member meets after a gateway restart. `UNKNOWN_MEMBER_ID` makes it rejoin.
+    #[test]
+    fn given_no_group_when_committing_with_a_generation_should_answer_unknown_member_id() {
+        let mut groups = Groups::new();
+
+        let error = commit_step(&mut groups, &commit("m-1", 3), Instant::now());
+
+        assert_eq!(error, ERROR_UNKNOWN_MEMBER_ID);
+    }
+
+    #[test]
+    fn given_only_pending_ids_when_committing_without_a_generation_should_accept() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let _ = join_step(&mut groups, &config, &pending_request(), now);
+
+        assert_eq!(commit_step(&mut groups, &commit("", -1), now), ERROR_NONE);
+    }
+
+    /// Without the refresh a member that only commits, and so heartbeats less, is evicted.
+    #[test]
+    fn given_a_stable_member_when_committing_should_refresh_its_session() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_leader, follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+
+        let error = commit_step(
+            &mut groups,
+            &commit(follower.as_str(), generation),
+            now + Duration::from_secs(9),
+        );
+        let heartbeat = heartbeat_step(
+            &mut groups,
+            &group_id(),
+            generation,
+            &follower,
+            now + Duration::from_secs(15),
+        );
+
+        assert_eq!(error, ERROR_NONE);
+        assert_ne!(heartbeat, ERROR_UNKNOWN_MEMBER_ID);
+        assert!(groups[&group_id()].members.contains_key(&follower));
+    }
+
+    /// The consumer commits before it rejoins, while the old generation is still current.
+    #[test]
+    fn given_a_preparing_rebalance_when_a_member_commits_its_generation_should_accept() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+        let _ = leave(&mut groups, &[(follower.as_str(), None)], now);
+        assert_eq!(groups[&group_id()].phase, Phase::PreparingRebalance);
+
+        let error = commit_step(&mut groups, &commit(leader.as_str(), generation), now);
+
+        assert_eq!(error, ERROR_NONE);
+    }
+
+    #[test]
+    fn given_a_completing_rebalance_when_a_member_commits_should_answer_rebalance_in_progress() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (_leader, follower) = two_members(&mut groups, &config, &["x"], &["x"], now);
+        let group = &groups[&group_id()];
+        assert_eq!(group.phase, Phase::CompletingRebalance);
+        let generation = group.generation_id;
+
+        let error = commit_step(&mut groups, &commit(follower.as_str(), generation), now);
+
+        assert_eq!(error, ERROR_REBALANCE_IN_PROGRESS);
+    }
+
+    #[test]
+    fn given_a_group_with_members_when_committing_should_check_member_and_generation() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, _follower) = stable_two_members(&mut groups, &config, now);
+        let generation = groups[&group_id()].generation_id;
+        let mut check = |request: &CommitRequest| commit_step(&mut groups, request, now);
+
+        assert_eq!(check(&commit("", -1)), ERROR_UNKNOWN_MEMBER_ID);
+        assert_eq!(
+            check(&commit("stranger", generation)),
+            ERROR_UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(
+            check(&commit(leader.as_str(), generation - 1)),
+            ERROR_ILLEGAL_GENERATION
+        );
+        assert_eq!(
+            check(&commit(leader.as_str(), -1)),
+            ERROR_ILLEGAL_GENERATION
+        );
+        assert_eq!(check(&commit(leader.as_str(), generation)), ERROR_NONE);
+    }
+
+    #[test]
+    fn given_a_static_member_when_committing_should_check_its_instance_id() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let member = member_id_of(&join_step(
+            &mut groups,
+            &config,
+            &static_request("i-1"),
+            now,
+        ));
+        let generation = groups[&group_id()].generation_id;
+        let _ = sync_step(
+            &mut groups,
+            &config,
+            &sync_request(&member, generation),
+            now,
+        );
+        let with_instance = |member_id: &str, instance_id: &str| CommitRequest {
+            group_instance_id: Some(StrBytes::from_string(instance_id.to_owned())),
+            ..commit(member_id, generation)
+        };
+
+        assert_eq!(
+            commit_step(&mut groups, &with_instance("other", "i-1"), now),
+            ERROR_FENCED_INSTANCE_ID
+        );
+        assert_eq!(
+            commit_step(&mut groups, &with_instance(member.as_str(), "i-2"), now),
+            ERROR_UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(
+            commit_step(&mut groups, &with_instance(member.as_str(), "i-1"), now),
+            ERROR_NONE
+        );
+    }
+
+    /// Each offset call takes at most half of what is left, so calls queued back to back still
+    /// leave the heartbeat behind them room to land.
+    #[test]
+    fn given_a_member_near_its_session_end_the_offset_hold_should_take_half_of_what_is_left() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        let (leader, _follower) = stable_two_members(&mut groups, &config, now);
+        let session = groups[&group_id()].members[&leader].session_timeout;
+        let member = GroupMember {
+            group_id: group_id(),
+            member_id: leader,
+        };
+        let hold = Duration::from_secs(3);
+        let late = now + session - Duration::from_secs(2);
+
+        assert_eq!(offset_hold(&groups, Some(&member), hold, now), hold);
+        assert_eq!(
+            offset_hold(&groups, Some(&member), hold, late),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            offset_hold(&groups, Some(&member), hold, now + session),
+            hold,
+            "a session that has ended cannot be saved"
+        );
+        assert_eq!(offset_hold(&groups, None, hold, late), hold);
+        let gone = GroupMember {
+            member_id: StrBytes::from_static_str("gone"),
+            ..member
+        };
+        assert_eq!(offset_hold(&groups, Some(&gone), hold, late), hold);
+    }
+
+    #[test]
+    fn given_an_invalid_group_id_when_committing_should_answer_invalid_group_id() {
+        let mut groups = Groups::new();
+        let mut request = commit("", -1);
+        request.group_id = StrBytes::new();
+        assert_eq!(
+            commit_step(&mut groups, &request, Instant::now()),
+            ERROR_INVALID_GROUP_ID
+        );
+
+        request.group_id = StrBytes::from_string("g".repeat(MAX_GROUP_ID_BYTES + 1));
+        assert_eq!(
+            commit_step(&mut groups, &request, Instant::now()),
+            ERROR_INVALID_GROUP_ID
+        );
     }
 }

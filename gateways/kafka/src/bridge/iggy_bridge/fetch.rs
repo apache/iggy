@@ -99,6 +99,12 @@ impl FetchPool {
 pub(super) struct LazyClient(Arc<AsyncMutex<Option<Arc<IggyClient>>>>);
 
 impl LazyClient {
+    /// A client already in hand, so a test needs no server.
+    #[cfg(test)]
+    pub(super) fn holding(client: Arc<IggyClient>) -> Self {
+        Self(Arc::new(AsyncMutex::new(Some(client))))
+    }
+
     /// The client, connected at the first call. Callers that come during a connect wait for it.
     pub(super) async fn connected(
         &self,
@@ -283,8 +289,8 @@ impl IggyBridge {
     /// Reads up to `count` messages of `partition`, from `offset` on, with the client of `slot`.
     /// Hands the slot back with the result. `None` if no result comes by `deadline`.
     ///
-    /// A plain consumer without auto commit, so Iggy stores no offset. Always an explicit
-    /// offset, never `Next` (see `docs/OFFSET_STORAGE.md`).
+    /// A plain consumer without auto commit, so Iggy stores no offset. Always the request's
+    /// offset, never `Next`.
     ///
     /// The errors are those of [`Self::probe`]. A partition the topic lacks is
     /// [`BridgeError::Iggy`] here. The poll stops at `deadline` too, so a result that comes then

@@ -25,7 +25,7 @@
 //!
 //! The stack is real on all three sides: a spawned `iggy-server` process, the gateway in-process
 //! with a real `IggyAuthenticator`, and a client from a container. They automate categories S and T
-//! of `docs/MANUAL_TESTING.md`.
+//! of `docs/MANUAL_TESTING.md`, and test G9.
 //!
 //! The Fetch tests swap the authenticator for a bridge: kcat writes records through Produce, and
 //! kcat and the Java consumer read them back through Fetch.
@@ -512,14 +512,15 @@ fn ready_server() -> Option<TestServer> {
     }
 }
 
-/// Writes `RECORDS` to partition 0 of `TOPIC` through the gateway, with kcat's producer and one
+/// Writes `records` to partition 0 of `TOPIC` through the gateway, with kcat's producer and one
 /// header on each record.
-fn produce_with_kcat(gateway: SocketAddr) {
+fn produce_with_kcat(gateway: SocketAddr, records: &[(&str, &str)]) {
     let dir = tempfile::tempdir().expect("create records dir");
     let path = dir.path().join("records.txt");
-    let lines = RECORDS
-        .map(|(key, value)| format!("{key}:{value}\n"))
-        .join("");
+    let lines: String = records
+        .iter()
+        .flat_map(|&(key, value)| [key, ":", value, "\n"])
+        .collect();
     std::fs::write(&path, lines).expect("write records");
     run_client(
         KCAT_IMAGE,
@@ -824,7 +825,7 @@ async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back
     let Some((_server, gateway)) = bridged_stack().await else {
         return;
     };
-    produce_with_kcat(gateway);
+    produce_with_kcat(gateway, &RECORDS);
     // `-e` stops at the end of the partition, which kcat takes from the high watermark that Fetch
     // sends. A wrong watermark stops it early or holds it until the container timeout.
     let output = run_client(
@@ -868,6 +869,73 @@ async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back
     );
 }
 
+/// G9 of `docs/MANUAL_TESTING.md`, with a real client on both offset APIs. The first run reads
+/// every record and commits as it closes. `--from-beginning` applies only to a group with no
+/// committed offset, so the second run must print only the record written in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_group_that_committed_when_the_java_consumer_runs_again_should_resume_after_it() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let expected: Vec<String> = RECORDS
+        .iter()
+        .enumerate()
+        .map(|(offset, (key, value))| format!("Offset:{offset}\t{key}\t{value}"))
+        .collect();
+    let first = consume_as_group(gateway, RECORDS.len());
+    assert_eq!(
+        records_read(&first),
+        expected,
+        "a group with no offset must start from the beginning, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_group(gateway, 1);
+    assert_eq!(
+        records_read(&second),
+        vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
+        "the group must resume after its commit, got: {second}"
+    );
+}
+
+/// Reads `count` records of `TOPIC` with the Java console consumer in group `e2e-resume`, from
+/// the group's committed offset, or from the beginning when it has none. It commits as it closes.
+fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
+    let count = count.to_string();
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-resume",
+            "--from-beginning",
+            "--max-messages",
+            &count,
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer in a group")
+}
+
+/// The records a console consumer printed, as `Offset:<offset>\t<key>\t<value>`.
+fn records_read(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("Offset:"))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_records_when_the_java_consumer_reads_the_partition_should_get_them_in_order() {
     // A second Fetch client with its own code: the Java consumer resolves `earliest` through
@@ -876,7 +944,7 @@ async fn given_records_when_the_java_consumer_reads_the_partition_should_get_the
     let Some((_server, gateway)) = bridged_stack().await else {
         return;
     };
-    produce_with_kcat(gateway);
+    produce_with_kcat(gateway, &RECORDS);
     let count = RECORDS.len().to_string();
     let output = run_client(
         KAFKA_IMAGE,
