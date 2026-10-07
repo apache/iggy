@@ -17,6 +17,7 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le};
+use crate::requests::users::login_register::{BIND_SECRET_BYTES, BindSecret};
 use crate::version::ClientVersionInfo;
 use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretString};
@@ -33,12 +34,14 @@ use secrecy::{ExposeSecret, SecretString};
 /// Wire format:
 /// ```text
 /// [ClientVersionInfo]
+/// [bind_secret:32]
 /// [token_len:u8][token:N]
 /// [context_len:u32_le][context:N?]
 /// ```
 #[derive(Debug, Clone)]
 pub struct LoginRegisterWithPatRequest {
     pub version_info: ClientVersionInfo,
+    pub bind_secret: BindSecret,
     pub token: SecretString,
     pub client_context: Option<String>,
 }
@@ -46,6 +49,7 @@ pub struct LoginRegisterWithPatRequest {
 impl WireEncode for LoginRegisterWithPatRequest {
     fn encoded_size(&self) -> usize {
         self.version_info.encoded_size()
+            + BIND_SECRET_BYTES
             + 1
             + self.token.expose_secret().len()
             + 4
@@ -54,6 +58,7 @@ impl WireEncode for LoginRegisterWithPatRequest {
 
     fn encode(&self, buf: &mut BytesMut) {
         self.version_info.encode(buf);
+        buf.put_slice(self.bind_secret.expose_secret());
         let token = self.token.expose_secret();
         debug_assert!(
             u8::try_from(token.len()).is_ok(),
@@ -85,8 +90,9 @@ impl LoginRegisterWithPatRequest {
         version_info: ClientVersionInfo,
         tail: &[u8],
     ) -> Result<(Self, usize), WireError> {
-        let token_len = read_u8(tail, 0)? as usize;
-        let mut pos = 1;
+        let (bind_secret, _) = BindSecret::decode(tail)?;
+        let token_len = read_u8(tail, BIND_SECRET_BYTES)? as usize;
+        let mut pos = BIND_SECRET_BYTES + 1;
         let token = SecretString::from(read_str(tail, pos, token_len)?);
         pos += token_len;
 
@@ -103,6 +109,7 @@ impl LoginRegisterWithPatRequest {
         Ok((
             Self {
                 version_info,
+                bind_secret,
                 token,
                 client_context,
             },
@@ -134,6 +141,7 @@ mod tests {
 
     fn assert_req_eq(a: &LoginRegisterWithPatRequest, b: &LoginRegisterWithPatRequest) {
         assert_eq!(a.version_info, b.version_info);
+        assert_eq!(a.bind_secret.expose_secret(), b.bind_secret.expose_secret());
         assert_eq!(a.token.expose_secret(), b.token.expose_secret());
         assert_eq!(a.client_context, b.client_context);
     }
@@ -142,6 +150,7 @@ mod tests {
     fn roundtrip_full() {
         let req = LoginRegisterWithPatRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             token: SecretString::from("pat-abc123def456"),
             client_context: Some("rust-sdk".to_string()),
         };
@@ -155,6 +164,7 @@ mod tests {
     fn roundtrip_no_context() {
         let req = LoginRegisterWithPatRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             token: SecretString::from("tok"),
             client_context: None,
         };
@@ -168,6 +178,7 @@ mod tests {
     fn encoded_size_matches_output() {
         let req = LoginRegisterWithPatRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             token: SecretString::from("t"),
             client_context: Some("ctx".to_string()),
         };
@@ -178,6 +189,7 @@ mod tests {
     fn truncated_returns_error() {
         let req = LoginRegisterWithPatRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             token: SecretString::from("t"),
             client_context: Some("c".to_string()),
         };
@@ -194,6 +206,7 @@ mod tests {
     fn wire_layout_version_info_first() {
         let req = LoginRegisterWithPatRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             token: SecretString::from("t"),
             client_context: None,
         };

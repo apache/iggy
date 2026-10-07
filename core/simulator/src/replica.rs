@@ -315,8 +315,7 @@ pub fn new_shard(
     if let Some((snapshot, checksum)) = local_checkpoint.as_ref() {
         metadata.seed_checkpoint_ref(snapshot.snapshot().sequence_number, *checksum);
         if let Some(table) = snapshot.snapshot().client_table.clone() {
-            let capacity = metadata.client_table_capacity();
-            let restored = ClientTable::from_snapshot(table, capacity)
+            let restored = ClientTable::from_snapshot(table)
                 .expect("the local checkpoint's client table decodes");
             assert!(
                 metadata.install_client_table(restored),

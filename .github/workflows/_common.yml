@@ -18,6 +18,11 @@
 name: _common
 on:
   workflow_call:
+    inputs:
+      validate-third-party-licenses:
+        description: "Whether to validate bundled third-party licenses"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -112,7 +117,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.18
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -121,6 +126,7 @@ jobs:
 
   third-party-licenses:
     name: Validate third-party licenses
+    if: inputs.validate-third-party-licenses
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -233,7 +239,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.50.2
+        uses: crate-ci/typos@v1.50.3
 
   summary:
     name: Common checks summary

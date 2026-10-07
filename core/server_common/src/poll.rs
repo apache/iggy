@@ -44,7 +44,7 @@ impl PollHistoryId {
     fn allocate(counter: &AtomicU64) -> Self {
         // The counter provides uniqueness, not publication of partition state.
         let id = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("poll history ID counter exhausted");

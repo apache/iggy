@@ -50,6 +50,7 @@ pub fn consumer_offset_file_ids(
     let kind_dir = match kind {
         ConsumerKind::Consumer => "consumers",
         ConsumerKind::ConsumerGroup => "groups",
+        ConsumerKind::ExternalGroup => "external_groups",
     };
     let dir = data_path.join(format!(
         "streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/offsets/{kind_dir}"

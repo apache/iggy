@@ -75,7 +75,8 @@ pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
     CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
     create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
-    hydrate_partition_log, read_created_revision, write_created_revision,
+    hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
+    write_revision_record,
 };
 pub use poll_plan::{PollPlan, PollReadResult};
 pub use segment::Segment;
@@ -108,6 +109,12 @@ pub type RetainedPartitionLog =
 #[cfg(any(test, feature = "simulator"))]
 pub struct RetainedPartitionState {
     pub log: RetainedPartitionLog,
+    pub head_op: u64,
+    pub applied_op: u64,
+    pub prepare_checksum: u128,
+    pub retry_capacity: Option<usize>,
+    pub retry_protection: Vec<consensus::DedupWatermark>,
+    pub required_metadata_frontier: u64,
     /// Offset counter the previous incarnation had proved durable.
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.
@@ -117,6 +124,7 @@ pub struct RetainedPartitionState {
     pub offset_space_used: bool,
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
+    pub external_group_offsets: Vec<(u32, u64)>,
 }
 
 /// Partition-level data plane operations.

@@ -20,11 +20,16 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use consensus::{Consensus, MetadataHandle};
+use futures::future::{Either, select};
+use iggy_binary_protocol::requests::system::{
+    MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest, SessionIdentity,
+};
 use iggy_binary_protocol::{
     Command, ConsensusHeader, ConsumerSession, ConsumerSessionHeartbeatHeader, HEADER_SIZE,
     MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, PrepareHeader, WireEncode,
@@ -43,7 +48,9 @@ use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 
 const MAX_LOGOUTS_PER_PASS: usize = 256;
+const MAX_RETIREMENTS_PER_PASS: usize = 128;
 const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const RETIREMENT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Pass {
@@ -58,15 +65,49 @@ pub async fn run(
     stop: Receiver<()>,
     interval: Duration,
     timeout: Duration,
+    system_path: String,
 ) {
     let shutdown = shard.bus.token();
-    'running: while compio::time::timeout(interval, stop.recv()).await.is_err() {
-        loop {
-            match report_and_expire(&shard, &liveness, &stop, &shutdown, timeout).await {
-                Pass::Stopped => break 'running,
-                Pass::HitCap => {}
-                Pass::Drained => break,
+    let mut next_report = Instant::now() + interval;
+    'running: loop {
+        let pending_retirement = shard
+            .plane
+            .metadata()
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .is_some();
+        let report_wait = next_report.saturating_duration_since(Instant::now());
+        let wait = if pending_retirement {
+            report_wait.min(RETIREMENT_SWEEP_INTERVAL)
+        } else {
+            report_wait
+        };
+        if compio::time::timeout(wait, stop.recv()).await.is_ok() || shutdown.is_triggered() {
+            break;
+        }
+        if Instant::now() >= next_report {
+            loop {
+                match report_and_expire(
+                    &shard,
+                    &liveness,
+                    &stop,
+                    &shutdown,
+                    interval,
+                    timeout,
+                    &system_path,
+                )
+                .await
+                {
+                    Pass::Stopped => break 'running,
+                    Pass::HitCap => {}
+                    Pass::Drained => break,
+                }
             }
+            next_report = Instant::now() + interval;
+        } else {
+            retire_sessions(&shard, &liveness, &stop, &shutdown, interval, &system_path).await;
         }
     }
 }
@@ -76,7 +117,9 @@ async fn report_and_expire<B, MJ, S, SB>(
     liveness: &RefCell<ConsumerGroupLiveness>,
     stop: &Receiver<()>,
     shutdown: &ShutdownToken,
+    report_interval: Duration,
     timeout: Duration,
+    system_path: &str,
 ) -> Pass
 where
     B: ShellBus,
@@ -94,43 +137,25 @@ where
     let view = consensus.view();
     let serving = consensus.is_normal() && !consensus.is_transferring();
     let primary_view = (consensus.is_primary() && serving).then_some(view);
-    liveness.borrow_mut().observe_view(primary_view);
+    liveness.borrow_mut().observe_view(serving.then_some(view));
     if !consensus.is_normal() || (consensus.is_primary() && !serving) {
         return Pass::Drained;
     }
 
     let incomplete = !clients.complete;
-    let sessions = clients.clients;
+    let mut sessions = clients.clients;
+    sessions.extend(liveness.borrow_mut().local_activity(now, timeout));
 
     if primary_view.is_some() {
         let table = metadata.client_table.borrow();
-        let members = metadata.mux_stm.streams().read(|inner| {
-            inner
-                .items
-                .iter()
-                .flat_map(|(_, stream)| {
-                    stream.topics.iter().flat_map(|(_, topic)| {
-                        topic.consumer_groups.values().flat_map(|group| {
-                            group.members.iter().map(|(_, member)| {
-                                (
-                                    member.client_id,
-                                    table.get_epoch(member.client_id).or(member.session),
-                                )
-                            })
-                        })
-                    })
-                })
-                .fold(
-                    BTreeMap::<u128, Option<u64>>::new(),
-                    |mut members, (client_id, session)| {
-                        members
-                            .entry(client_id)
-                            .and_modify(|current| *current = (*current).max(session))
-                            .or_insert(session);
-                        members
-                    },
-                )
-        });
+        let members: BTreeMap<u128, Option<u64>> = table
+            .client_ids()
+            .filter_map(|client_id| {
+                table
+                    .get_epoch(client_id)
+                    .map(|session| (client_id, Some(session)))
+            })
+            .collect();
         drop(table);
         let mut tracker = liveness.borrow_mut();
         tracker.reconcile(view, &members, now);
@@ -144,9 +169,30 @@ where
         // A backup can lag a freshly joined group. Report all bound sessions;
         // filtering through its replicated memberships would drop valid renewals.
         // Even an empty gather must report incompleteness to the primary.
-        return report_sessions(shard, liveness, &sessions, incomplete, stop, shutdown).await;
+        let pass = report_sessions(shard, liveness, &sessions, incomplete, stop, shutdown).await;
+        if pass != Pass::Stopped {
+            retire_sessions(
+                shard,
+                liveness,
+                stop,
+                shutdown,
+                report_interval,
+                system_path,
+            )
+            .await;
+        }
+        return pass;
     }
 
+    retire_sessions(
+        shard,
+        liveness,
+        stop,
+        shutdown,
+        report_interval,
+        system_path,
+    )
+    .await;
     expire_sessions(shard, liveness, stop, shutdown, timeout, now).await
 }
 
@@ -231,6 +277,349 @@ where
     shard::bus_timeout(&shard.bus, CONSUMER_SESSION_REPORT_TIMEOUT, send)
         .await
         .unwrap_or(Pass::Drained)
+}
+
+async fn retire_sessions<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    stop: &Receiver<()>,
+    shutdown: &ShutdownToken,
+    report_interval: Duration,
+    system_path: &str,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let mut deadline = pin!(shard.bus.sleep(CONSUMER_SESSION_REPORT_TIMEOUT));
+    for _ in 0..MAX_LOGOUTS_PER_PASS {
+        let before = shard.plane.metadata().client_table.borrow().count();
+        let retirement = pin!(retire_session(
+            shard,
+            liveness,
+            stop,
+            shutdown,
+            report_interval,
+            system_path,
+        ));
+        match select(retirement, deadline.as_mut()).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), retirement)) => {
+                // Finalization can own an admitted WAL append. Canceling it
+                // strands that op and blocks subsequent metadata requests.
+                retirement.await;
+                break;
+            }
+        }
+        if shard.plane.metadata().client_table.borrow().count() >= before {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn retire_session<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    liveness: &RefCell<ConsumerGroupLiveness>,
+    stop: &Receiver<()>,
+    shutdown: &ShutdownToken,
+    report_interval: Duration,
+    system_path: &str,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let Some(consensus) = metadata.consensus.as_ref() else {
+        return;
+    };
+    if !consensus.is_normal()
+        || consensus.is_transferring()
+        || consensus.commit_min() != consensus.commit_max()
+    {
+        return;
+    }
+    let view = consensus.view();
+    liveness.borrow_mut().observe_view(Some(view));
+    let identity = metadata
+        .client_table
+        .borrow()
+        .ended_sessions()
+        .min_by_key(|identity| (identity.metadata_watermark, identity.client_id));
+    let Some(identity) = identity else {
+        liveness.borrow_mut().reconcile_retirement(None, 0);
+        return;
+    };
+    let revision = metadata
+        .mux_stm
+        .streams()
+        .read(|inner| inner.namespace_revision);
+    liveness
+        .borrow_mut()
+        .reconcile_retirement(Some(identity), revision);
+    let remote_quorum = consensus.is_primary()
+        && liveness
+            .borrow()
+            .retirement
+            .as_ref()
+            .is_some_and(|progress| progress.reporters.len() >= consensus.quorum_replication());
+    if remote_quorum {
+        // The metadata primary need not belong to the common reporting quorum.
+        // Every reporter already proved retirement in every allocated group.
+        if let Err(error) = metadata.submit_session_finalization(identity).await {
+            trace!(
+                ?error,
+                client_id = identity.client_id,
+                "session finalization deferred"
+            );
+        }
+        return;
+    }
+    let (cursor, reported) = {
+        let tracker = liveness.borrow();
+        let Some(progress) = &tracker.retirement else {
+            return;
+        };
+        (progress.cursor, progress.reported)
+    };
+    if !reported {
+        let mut identities: Vec<_> = metadata.client_table.borrow().ended_sessions().collect();
+        identities
+            .sort_unstable_by_key(|identity| (identity.metadata_watermark, identity.client_id));
+        let batch_limit = MAX_SESSIONS_PER_RETIREMENT.min(
+            shard.bus_max_message_size().saturating_sub(HEADER_SIZE)
+                / SessionIdentity::ENCODED_SIZE,
+        );
+        if batch_limit == 0 {
+            return;
+        }
+        identities.truncate(batch_limit);
+        let body = RetireSessionsRequest { identities }.to_bytes();
+        let namespaces = {
+            let mut tracker = liveness.borrow_mut();
+            if tracker
+                .retirement_namespaces
+                .as_ref()
+                .is_none_or(|(cached_revision, _)| *cached_revision != revision)
+            {
+                tracker.retirement_fences.clear();
+                tracker.retirement_namespaces = Some((
+                    revision,
+                    metadata.mux_stm.streams().read(|inner| {
+                        let mut namespaces = Vec::new();
+                        for (_, stream) in &inner.items {
+                            for (topic_id, topic) in &stream.topics {
+                                for partition in &topic.partitions {
+                                    namespaces.push((
+                                        server_common::sharding::IggyNamespace::new(
+                                            stream.id,
+                                            topic_id,
+                                            partition.id,
+                                        ),
+                                        partition.created_revision,
+                                    ));
+                                }
+                            }
+                        }
+                        Rc::from(namespaces)
+                    }),
+                ));
+            }
+            let Some((_, namespaces)) = &tracker.retirement_namespaces else {
+                return;
+            };
+            Rc::clone(namespaces)
+        };
+        // Repeated barriers are idempotent, so an unfinished sweep can resume
+        // without delaying activity reports past their existing budget.
+        let completed = shard::bus_timeout(&shard.bus, CONSUMER_SESSION_REPORT_TIMEOUT, async {
+            for (namespace, created_revision) in namespaces
+                .iter()
+                .skip(cursor)
+                .take(MAX_RETIREMENTS_PER_PASS)
+            {
+                if stop.try_recv().is_ok() || shutdown.is_triggered() {
+                    return false;
+                }
+                if consensus.view() != view || !consensus.is_normal() {
+                    return false;
+                }
+                let status = shard
+                    .partition_read(
+                        *namespace,
+                        shard::PartitionRead::SessionRetired { identity },
+                    )
+                    .await;
+                let retired = match status {
+                    Some(shard::PartitionReadReply::SessionRetired(true)) => true,
+                    Some(shard::PartitionReadReply::SessionRetirementFailed {
+                        created_revision: failed_revision,
+                    }) if failed_revision == *created_revision => {
+                        if liveness.borrow().retirement_fences.get(namespace)
+                            == Some(created_revision)
+                        {
+                            true
+                        } else {
+                            match crate::partition_helpers::record_partition_retirement_fence(
+                                system_path,
+                                *namespace,
+                                *created_revision,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    liveness
+                                        .borrow_mut()
+                                        .retirement_fences
+                                        .insert(*namespace, *created_revision);
+                                    true
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, namespace_raw = namespace.inner(),
+                                    "retirement waits for durable partition fence");
+                                    false
+                                }
+                            }
+                        }
+                    }
+                    _ => false,
+                };
+                if !retired {
+                    let size = HEADER_SIZE + body.len();
+                    let mut request =
+                        Message::<iggy_binary_protocol::RoutedRequestHeader>::new(size)
+                            .transmute_header(
+                                |_, header: &mut iggy_binary_protocol::RoutedRequestHeader| {
+                                    header.command = Command::Request;
+                                    header.operation =
+                                        iggy_binary_protocol::Operation::RetireSession;
+                                    header.cluster = consensus.cluster();
+                                    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                                    header.session = 1;
+                                    header.request = identity.metadata_watermark;
+                                    header.metadata_watermark = consensus.commit_min();
+                                    header.group = namespace.inner();
+                                    header.size =
+                                        u32::try_from(size).expect("retirement frame fits u32");
+                                },
+                            );
+                    request.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                    if let Ok(ticket) = shard.partition_submit(*namespace, request) {
+                        let _ = shard.await_partition_submit(ticket).await;
+                    }
+                }
+                let retired = retired
+                    || matches!(
+                        shard
+                            .partition_read(
+                                *namespace,
+                                shard::PartitionRead::SessionRetired { identity }
+                            )
+                            .await,
+                        Some(shard::PartitionReadReply::SessionRetired(true))
+                    );
+                let mut tracker = liveness.borrow_mut();
+                let Some(progress) = &mut tracker.retirement else {
+                    return false;
+                };
+                if progress.identity != identity || progress.revision != revision {
+                    return false;
+                }
+                progress.complete &= retired;
+                progress.cursor += 1;
+            }
+            let mut tracker = liveness.borrow_mut();
+            let Some(progress) = &mut tracker.retirement else {
+                return false;
+            };
+            if progress.cursor < namespaces.len() {
+                return false;
+            }
+            if !progress.complete {
+                progress.cursor = 0;
+                progress.complete = true;
+                return false;
+            }
+            progress.reported = true;
+            true
+        })
+        .await
+        .unwrap_or(false);
+        if !completed {
+            return;
+        }
+    }
+    if consensus.view() != view
+        || !consensus.is_normal()
+        || consensus.is_transferring()
+        || metadata
+            .mux_stm
+            .streams()
+            .read(|inner| inner.namespace_revision)
+            != revision
+    {
+        return;
+    }
+    if consensus.is_primary() {
+        let ready = {
+            let mut tracker = liveness.borrow_mut();
+            let Some(progress) = &mut tracker.retirement else {
+                return;
+            };
+            progress.reporters.insert(consensus.replica());
+            progress.reporters.len() >= consensus.quorum_replication()
+        };
+        if ready && let Err(error) = metadata.submit_session_finalization(identity).await {
+            trace!(
+                ?error,
+                client_id = identity.client_id,
+                "session finalization deferred"
+            );
+        }
+    } else {
+        if !liveness
+            .borrow_mut()
+            .retirement
+            .as_mut()
+            .is_some_and(|progress| {
+                // The primary can receive this report before it starts the sweep.
+                progress.report_due(
+                    Instant::now(),
+                    report_interval.min(RETIREMENT_SWEEP_INTERVAL),
+                )
+            })
+        {
+            return;
+        }
+        let message = heartbeat_message(
+            consensus.cluster(),
+            view,
+            consensus.replica(),
+            &[ConsumerSession {
+                client_id: identity.client_id,
+                session: identity.session,
+            }],
+            false,
+        )
+        .transmute_header(|old, header| {
+            *header = old;
+            header.command = Command::SessionRetirementProgress;
+            header.namespace_revision = revision;
+            header.seal();
+        });
+        if let Err(error) = shard
+            .bus
+            .send_to_replica(consensus.primary_index(view), message.into_frozen())
+            .await
+        {
+            trace!(?error, "session retirement report deferred");
+        }
+    }
 }
 
 async fn expire_sessions<B, MJ, S, SB>(
@@ -343,8 +732,11 @@ fn heartbeat_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::test_support::{SpyBus, TestShard, prepare_message, test_shard};
+    use crate::dispatch::test_support::{
+        SpyBus, TestShard, prepare_message, register_reply, test_shard,
+    };
     use consensus::client_table::ClientTable;
+    use consensus::{LocalPipeline, PartitionsHandle, Sequencer, ViewRestore, VsrConsensus};
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -356,6 +748,7 @@ mod tests {
     use message_bus::lifecycle::Shutdown;
     use metadata::stm::StateMachine;
     use metadata::stm::consumer_group::JoinConsumerGroupRequest;
+    use metadata::stm::stream::TruncatePartitionRequest;
     use server_common::MessageBag;
     use server_common::sharding::METADATA_GROUP;
 
@@ -501,7 +894,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn mixed_legacy_membership_epochs_do_not_block_automatic_expiry() {
+    async fn membership_epochs_do_not_replace_the_durable_session_registry() {
         let (_dir, shard) = shard_with_members(1).await;
         let metadata = shard.plane.metadata();
         let topic = CreateTopicWithAssignmentsRequest {
@@ -545,23 +938,26 @@ mod tests {
                 0
             );
         }
-        assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+        assert_eq!(
+            metadata.client_table.borrow().get_epoch(CLIENT),
+            Some(SESSION)
+        );
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
         let (_stop, receiver) = shard::channel(1);
         let (_signal, shutdown) = Shutdown::new();
-        report_and_expire(&shard, &tracker, &receiver, &shutdown, TIMEOUT).await;
+        report_and_expire(&shard, &tracker, &receiver, &shutdown, TIMEOUT, TIMEOUT, "").await;
         assert_eq!(tracker.borrow().leases[&CLIENT].session, Some(SESSION));
         let expired_at = Instant::now() + TIMEOUT * 2;
         assert_eq!(
             expire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, expired_at).await,
             Pass::Drained
         );
-        assert!(
+        assert_eq!(
             metadata
                 .mux_stm
                 .streams()
-                .consumer_group_memberships(CLIENT)
-                .is_empty()
+                .consumer_group_memberships(CLIENT),
+            []
         );
     }
 
@@ -578,7 +974,8 @@ mod tests {
             let (_signal, shutdown) = Shutdown::new();
             let tracker = RefCell::new(ConsumerGroupLiveness::default());
             assert_eq!(
-                report_and_expire(&shard, &tracker, &receiver, &shutdown, TIMEOUT).await,
+                report_and_expire(&shard, &tracker, &receiver, &shutdown, TIMEOUT, TIMEOUT, "")
+                    .await,
                 Pass::Drained
             );
             if replica == 0 {
@@ -652,6 +1049,19 @@ mod tests {
             .mux_stm
             .streams()
             .refresh_consumer_group_session(CLIENT, SESSION + 1);
+        let mut table = ClientTable::new(MAX_LOGOUTS_PER_PASS + 1);
+        for index in 0..=MAX_LOGOUTS_PER_PASS {
+            let client_id = CLIENT + index as u128;
+            let epoch = if index == 0 { SESSION + 1 } else { SESSION };
+            table
+                .commit_register(client_id, 0, [0x5a; 32], register_reply(client_id, epoch))
+                .unwrap();
+        }
+        *metadata.client_table.borrow_mut() = table;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.advance_commit_max(SESSION + 1);
+        consensus.advance_commit_min(SESSION + 1);
+        consensus.sequencer().set_sequence(SESSION + 1);
         let (_stop, receiver) = shard::channel(1);
         let (_signal, shutdown) = Shutdown::new();
 
@@ -668,7 +1078,10 @@ mod tests {
             .await,
             Pass::Drained
         );
-        assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), 0);
+        assert_eq!(
+            metadata.consensus.as_ref().unwrap().commit_min(),
+            SESSION + 1
+        );
 
         assert_eq!(
             expire_sessions(
@@ -684,7 +1097,7 @@ mod tests {
         );
         assert_eq!(
             metadata.consensus.as_ref().unwrap().commit_min(),
-            (MAX_LOGOUTS_PER_PASS - 1) as u64
+            SESSION + 1 + (MAX_LOGOUTS_PER_PASS - 1) as u64
         );
         assert_eq!(
             metadata.mux_stm.streams().consumer_group_session(CLIENT),
@@ -732,14 +1145,19 @@ mod tests {
 
     async fn shard_with_members(count: usize) -> (tempfile::TempDir, Rc<TestShard>) {
         let dir = tempfile::tempdir().unwrap();
-        let mut shard = test_shard(&SpyBus::default(), 0, 1, 1);
+        let mut shard = Rc::try_unwrap(super::super::tests::partition_read_shard(1))
+            .ok()
+            .unwrap();
         let metadata = shard.plane.metadata_mut();
         metadata.journal = Some(
             PrepareJournal::open(&dir.path().join("journal.wal"), 0)
                 .await
                 .unwrap(),
         );
-        metadata.client_table = RefCell::new(ClientTable::new(1));
+        metadata.client_table = RefCell::new(ClientTable::new(count));
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.restore_commit_state(SESSION, SESSION);
+        consensus.sequencer().set_sequence(SESSION);
         let create_stream = CreateStreamRequest {
             name: WireName::new("stream").unwrap(),
             options: WireOptions::empty(),
@@ -782,6 +1200,11 @@ mod tests {
         }
         for index in 0..count {
             let client_id = CLIENT + index as u128;
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(client_id, 0, [0x5a; 32], register_reply(client_id, SESSION))
+                .unwrap();
             let join = JoinConsumerGroupRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -999,6 +1422,399 @@ mod tests {
         assert!(tracker.expired(VIEW, CLIENT, Some(SESSION), now + TIMEOUT, TIMEOUT));
     }
 
+    #[compio::test]
+    async fn retirement_sweep_discards_quorum_from_the_previous_view() {
+        const END_OP: u64 = SESSION + 1;
+        let (_directory, mut shard) = shard_with_members(1).await;
+        let mut consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.restore_view(ViewRestore {
+            durable_view: Some((VIEW, VIEW)),
+            view_fallback: None,
+            seed_view: None,
+        });
+        consensus.init();
+        consensus.restore_commit_state(END_OP, END_OP);
+        consensus.sequencer().set_sequence(END_OP);
+        Rc::get_mut(&mut shard)
+            .unwrap()
+            .plane
+            .metadata_mut()
+            .consensus = Some(consensus);
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, END_OP)
+        );
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        let revision = metadata
+            .mux_stm
+            .streams()
+            .read(|inner| inner.namespace_revision);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(VIEW - 1));
+            tracker.reconcile_retirement(Some(identity), revision);
+            let progress = tracker.retirement.as_mut().unwrap();
+            progress.reported = true;
+            progress.reporters.extend([0, 1]);
+        }
+        let (stop, receiver) = shard::channel(1);
+        stop.try_send(()).unwrap();
+        let (_signal, shutdown) = Shutdown::new();
+        let sweep = Box::pin(retire_sessions(
+            &shard, &tracker, &receiver, &shutdown, TIMEOUT, "",
+        ));
+        assert!(
+            futures::poll!(sweep).is_ready(),
+            "old-view quorum must not start a session finalization"
+        );
+        let tracker = tracker.borrow();
+        let progress = tracker.retirement.as_ref().unwrap();
+        assert!(!progress.reported);
+        assert!(progress.reporters.is_empty());
+        assert_eq!(progress.cursor, 0);
+        assert_eq!(
+            metadata
+                .consensus
+                .as_ref()
+                .unwrap()
+                .sequencer()
+                .current_sequence(),
+            END_OP
+        );
+        assert_eq!(
+            metadata.client_table.borrow().ended_sessions().next(),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn retirement_quorum_discards_reports_from_an_older_namespace_revision() {
+        let identity = iggy_binary_protocol::requests::system::SessionIdentity {
+            client_id: CLIENT,
+            session: SESSION,
+            metadata_watermark: 3,
+        };
+        let report = |revision| {
+            heartbeat_message(
+                CLUSTER,
+                VIEW,
+                1,
+                &[ConsumerSession {
+                    client_id: CLIENT,
+                    session: SESSION,
+                }],
+                false,
+            )
+            .transmute_header(|old, header| {
+                *header = old;
+                header.command = Command::SessionRetirementProgress;
+                header.namespace_revision = revision;
+                header.seal();
+            })
+        };
+        let mut tracker = ConsumerGroupLiveness::default();
+        tracker.observe_view(Some(VIEW));
+        tracker.reconcile_retirement(Some(identity), 1);
+        tracker.receive(CLUSTER, Some(VIEW), &report(1), Instant::now(), TIMEOUT);
+        assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
+
+        tracker.reconcile_retirement(Some(identity), 2);
+        assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
+        tracker.receive(CLUSTER, Some(VIEW), &report(1), Instant::now(), TIMEOUT);
+        assert!(tracker.retirement.as_ref().unwrap().reporters.is_empty());
+        tracker.receive(CLUSTER, Some(VIEW), &report(2), Instant::now(), TIMEOUT);
+        assert_eq!(tracker.retirement.as_ref().unwrap().reporters.len(), 1);
+    }
+
+    #[compio::test]
+    async fn given_retirement_budget_expires_during_finalization_when_logging_in_should_make_progress()
+     {
+        const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
+        let (_directory, shard) = shard_with_members(2).await;
+        let metadata = shard.plane.metadata();
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_capacity(3)
+            .unwrap();
+        for client_id in [CLIENT, CLIENT + 1] {
+            assert!(
+                metadata
+                    .client_table
+                    .borrow_mut()
+                    .end_session(client_id, 0, SESSION, SESSION)
+            );
+        }
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .find(|identity| identity.client_id == CLIENT)
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let revision = metadata
+            .mux_stm
+            .streams()
+            .read(|inner| inner.namespace_revision);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        {
+            let mut tracker = tracker.borrow_mut();
+            tracker.observe_view(Some(consensus.view()));
+            tracker.reconcile_retirement(Some(identity), revision);
+            let progress = tracker.retirement.as_mut().unwrap();
+            progress.reported = true;
+            progress.reporters.insert(consensus.replica());
+        }
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        // Expire at the finalization's first I/O yield, after it claims an op.
+        shard.bus.instant_timers.set(true);
+        retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, "").await;
+        shard.bus.instant_timers.set(false);
+
+        metadata.resume_stranded_commits().await;
+        let login = compio::time::timeout(
+            LOGIN_TIMEOUT,
+            metadata.submit_register_in_process(CLIENT + 2, 0, [0x6b; 32]),
+        )
+        .await
+        .expect("a retirement deadline must not strand a prepare ahead of the next login")
+        .expect("finalization must release capacity for the new login");
+        assert_eq!(login.epoch, SESSION + 2);
+        assert_eq!(metadata.client_table.borrow().count(), 2);
+        assert!(metadata.client_table.borrow().get_epoch(CLIENT).is_none());
+        assert_eq!(
+            metadata
+                .client_table
+                .borrow()
+                .ended_sessions()
+                .next()
+                .map(|identity| identity.client_id),
+            Some(CLIENT + 1),
+            "the expired sweep must defer the next session's finalization"
+        );
+        assert_eq!(
+            consensus.commit_min(),
+            consensus.sequencer().current_sequence()
+        );
+    }
+
+    #[compio::test]
+    async fn given_failed_partition_when_retiring_should_allow_new_sessions() {
+        let (directory, shard) = shard_with_members(1).await;
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        shard
+            .plane
+            .partitions()
+            .fence(server_common::sharding::IggyNamespace::new(0, 0, 0), 1);
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        super::super::tests::run_with_partition_message_pump(
+            &shard,
+            retire_sessions(
+                &shard,
+                &tracker,
+                &receiver,
+                &shutdown,
+                TIMEOUT,
+                directory.path().to_str().unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            metadata.client_table.borrow().count(),
+            0,
+            "one failed partition must not fill the session registry permanently"
+        );
+        assert_eq!(
+            crate::partition_helpers::partition_retirement_fence(
+                directory.path().to_str().unwrap(),
+                server_common::sharding::IggyNamespace::new(0, 0, 0),
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT + 1,
+                0,
+                [0x6b; 32],
+                register_reply(CLIENT + 1, SESSION + 2),
+            )
+            .expect("retirement must release capacity for a new login");
+    }
+
+    #[compio::test]
+    async fn given_failed_fence_write_when_retiring_should_retain_session_until_retry() {
+        let (directory, shard) = shard_with_members(1).await;
+        let system_path = directory.path().to_str().unwrap();
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        let namespace = server_common::sharding::IggyNamespace::new(0, 0, 0);
+        shard.plane.partitions().fence(namespace, 1);
+        let obstruction = directory.path().join("partition-initialization");
+        std::fs::write(&obstruction, b"not a directory").unwrap();
+        let tracker = RefCell::new(ConsumerGroupLiveness::default());
+        let (_stop, receiver) = shard::channel(1);
+        let (_signal, shutdown) = Shutdown::new();
+        super::super::tests::run_with_partition_message_pump(
+            &shard,
+            retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+        )
+        .await;
+        assert_eq!(
+            metadata.client_table.borrow().count(),
+            1,
+            "an unpersisted fence is not a retirement proof"
+        );
+        std::fs::remove_file(obstruction).unwrap();
+        super::super::tests::run_with_partition_message_pump(
+            &shard,
+            retire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, system_path),
+        )
+        .await;
+        assert_eq!(metadata.client_table.borrow().count(), 0);
+    }
+
+    #[compio::test]
+    async fn given_teardown_or_stale_failure_when_retiring_should_not_fence_current_incarnation() {
+        for failed_revision in [None, Some(0)] {
+            let (directory, shard) = shard_with_members(1).await;
+            let metadata = shard.plane.metadata();
+            assert!(
+                metadata
+                    .client_table
+                    .borrow_mut()
+                    .end_session(CLIENT, 0, SESSION, SESSION)
+            );
+            let namespace = server_common::sharding::IggyNamespace::new(0, 0, 0);
+            if let Some(revision) = failed_revision {
+                shard.plane.partitions().fence(namespace, revision);
+            } else {
+                shard.plane.partitions().tombstone(namespace);
+            }
+            let tracker = RefCell::new(ConsumerGroupLiveness::default());
+            let (_stop, receiver) = shard::channel(1);
+            let (_signal, shutdown) = Shutdown::new();
+            super::super::tests::run_with_partition_message_pump(
+                &shard,
+                retire_sessions(
+                    &shard,
+                    &tracker,
+                    &receiver,
+                    &shutdown,
+                    TIMEOUT,
+                    directory.path().to_str().unwrap(),
+                ),
+            )
+            .await;
+            assert_eq!(metadata.client_table.borrow().count(), 1);
+            assert_eq!(
+                crate::partition_helpers::partition_retirement_fence(
+                    directory.path().to_str().unwrap(),
+                    namespace,
+                )
+                .await
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_segment_deletion_when_retiring_should_keep_sweep_progress() {
+        let (_directory, shard) = shard_with_members(1).await;
+        let metadata = shard.plane.metadata();
+        assert!(
+            metadata
+                .client_table
+                .borrow_mut()
+                .end_session(CLIENT, 0, SESSION, SESSION)
+        );
+        let identity = metadata
+            .client_table
+            .borrow()
+            .ended_sessions()
+            .next()
+            .unwrap();
+        let mut tracker = ConsumerGroupLiveness::default();
+        tracker.reconcile_retirement(
+            Some(identity),
+            metadata
+                .mux_stm
+                .streams()
+                .read(|inner| inner.namespace_revision),
+        );
+        let progress = tracker.retirement.as_mut().unwrap();
+        progress.cursor = 1;
+        progress.reporters.insert(1);
+        let truncate = TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 0,
+            up_to_offset: 0,
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                metadata
+                    .mux_stm
+                    .update(prepare_message(
+                        Operation::TruncatePartition,
+                        CLIENT,
+                        1,
+                        &truncate.to_bytes()
+                    ))
+                    .unwrap()
+                    .code,
+                0
+            );
+            tracker.reconcile_retirement(
+                Some(identity),
+                metadata
+                    .mux_stm
+                    .streams()
+                    .read(|inner| inner.namespace_revision),
+            );
+            let progress = tracker.retirement.as_ref().unwrap();
+            assert_eq!(
+                progress.cursor, 1,
+                "segment deletion must not restart session retirement"
+            );
+            assert!(progress.reporters.contains(&1));
+        }
+    }
+
     #[test]
     fn bounded_heartbeat_round_trips_through_replica_routing() {
         let sessions = vec![
@@ -1008,27 +1824,39 @@ mod tests {
             };
             MAX_CONSUMER_SESSIONS_PER_HEARTBEAT
         ];
-        let message = heartbeat_message(CLUSTER, VIEW, 2, &sessions, false);
-        assert_eq!(
-            u128::from(iggy_common::calculate_checksum(message.body())),
-            message.header().checksum_body
-        );
-        let bag = MessageBag::try_from(message.into_generic()).unwrap();
-        assert_eq!(bag.command(), Command::ConsumerSessionHeartbeat);
-        assert_eq!(
-            bag.routing(),
-            (iggy_binary_protocol::Operation::Reserved, METADATA_GROUP)
-        );
-        let typed = bag
-            .into_generic()
-            .try_into_typed::<ConsumerSessionHeartbeatHeader>()
-            .unwrap();
-        assert_eq!(
-            typed.body().len(),
-            sessions.len() * ConsumerSession::ENCODED_SIZE
-        );
-        let mut corrupted = typed.into_generic();
-        corrupted.as_mut_slice()[std::mem::offset_of!(ConsumerSessionHeartbeatHeader, view)] ^= 1;
-        assert!(MessageBag::try_from(corrupted).is_err());
+        for command in [
+            Command::ConsumerSessionHeartbeat,
+            Command::SessionRetirementProgress,
+        ] {
+            let message = heartbeat_message(CLUSTER, VIEW, 2, &sessions, false).transmute_header(
+                |old, header| {
+                    *header = old;
+                    header.command = command;
+                    header.seal();
+                },
+            );
+            assert_eq!(
+                u128::from(iggy_common::calculate_checksum(message.body())),
+                message.header().checksum_body
+            );
+            let bag = MessageBag::try_from(message.into_generic()).unwrap();
+            assert_eq!(bag.command(), command);
+            assert_eq!(
+                bag.routing(),
+                (iggy_binary_protocol::Operation::Reserved, METADATA_GROUP)
+            );
+            let typed = bag
+                .into_generic()
+                .try_into_typed::<ConsumerSessionHeartbeatHeader>()
+                .unwrap();
+            assert_eq!(
+                typed.body().len(),
+                sessions.len() * ConsumerSession::ENCODED_SIZE
+            );
+            let mut corrupted = typed.into_generic();
+            corrupted.as_mut_slice()[std::mem::offset_of!(ConsumerSessionHeartbeatHeader, view)] ^=
+                1;
+            assert!(MessageBag::try_from(corrupted).is_err());
+        }
     }
 }

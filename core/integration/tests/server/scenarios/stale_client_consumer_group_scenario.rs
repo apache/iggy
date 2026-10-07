@@ -379,7 +379,7 @@ async fn should_handle_stale_client_with_manual_reconnection(
     let server_addr = harness.server().raw_tcp_addr().unwrap();
 
     let setup_client = create_client(&server_addr, "500ms").await;
-    setup_resources(&setup_client, Durability::default()).await;
+    setup_resources(&setup_client, Durability::Persisted).await;
 
     // Client with 1h heartbeat will become stale
     let stale_client = create_client(&server_addr, "1h").await;
@@ -524,7 +524,7 @@ async fn should_handle_stale_client_with_auto_reconnection(
     let server_addr = harness.server().raw_tcp_addr().unwrap();
 
     let setup_client = create_client(&server_addr, "500ms").await;
-    setup_resources(&setup_client, Durability::default()).await;
+    setup_resources(&setup_client, Durability::Persisted).await;
 
     let consumer_client = create_reconnecting_client(&server_addr).await;
     // Note: auto_login is enabled in create_reconnecting_client, so no manual login needed

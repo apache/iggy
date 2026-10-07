@@ -16,11 +16,44 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le};
+use crate::codec::{WireDecode, WireEncode, read_bytes, read_str, read_u8, read_u32_le};
 use crate::primitives::identifier::WireName;
 use crate::version::ClientVersionInfo;
 use bytes::{BufMut, BytesMut};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
+
+pub const BIND_SECRET_BYTES: usize = 32;
+
+/// A connection-binding credential retained for one logical session.
+#[derive(Debug)]
+pub struct BindSecret(SecretBox<[u8; BIND_SECRET_BYTES]>);
+
+impl BindSecret {
+    #[must_use]
+    pub fn new(secret: Box<[u8; BIND_SECRET_BYTES]>) -> Self {
+        Self(SecretBox::new(secret))
+    }
+}
+
+impl WireDecode for BindSecret {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let mut secret = Box::new([0; BIND_SECRET_BYTES]);
+        secret.copy_from_slice(read_bytes(buf, 0, BIND_SECRET_BYTES)?);
+        Ok((Self::new(secret), BIND_SECRET_BYTES))
+    }
+}
+
+impl Clone for BindSecret {
+    fn clone(&self) -> Self {
+        Self::new(Box::new(*self.expose_secret()))
+    }
+}
+
+impl ExposeSecret<[u8; BIND_SECRET_BYTES]> for BindSecret {
+    fn expose_secret(&self) -> &[u8; BIND_SECRET_BYTES] {
+        self.0.expose_secret()
+    }
+}
 
 /// Combined login + register request for the server.
 ///
@@ -35,6 +68,7 @@ use secrecy::{ExposeSecret, SecretString};
 /// Wire format:
 /// ```text
 /// [ClientVersionInfo]
+/// [bind_secret:32]
 /// [username_len:u8][username:N][password_len:u8][password:N]
 /// [context_len:u32_le][context:N?]
 /// ```
@@ -51,12 +85,14 @@ use secrecy::{ExposeSecret, SecretString};
 /// by non-`vsr` builds against the legacy `iggy-server`) is untouched.
 /// The server speaks VSR framing only; a non-`vsr` SDK cannot log in to
 /// the server. Foreign-language SDKs (C++, C#, Python, Go, Java) adopt this
-/// shape, with their own `sdk_name`, when they wire VSR framing. Bump
-/// [`crate::version::IGGY_PROTOCOL_VERSION`] on any wire-incompatible
-/// change.
+/// shape, with their own `sdk_name`, when they wire VSR framing. Maintain
+/// [`crate::version::IGGY_PROTOCOL_VERSION`] and its minimum for stable
+/// releases according to [`crate::version`]. Intermediate edge builds may
+/// share a protocol number without compatible layouts.
 #[derive(Debug, Clone)]
 pub struct LoginRegisterRequest {
     pub version_info: ClientVersionInfo,
+    pub bind_secret: BindSecret,
     pub username: WireName,
     pub password: SecretString,
     pub client_context: Option<String>,
@@ -65,6 +101,7 @@ pub struct LoginRegisterRequest {
 impl WireEncode for LoginRegisterRequest {
     fn encoded_size(&self) -> usize {
         self.version_info.encoded_size()
+            + BIND_SECRET_BYTES
             + self.username.encoded_size()
             + 1
             + self.password.expose_secret().len()
@@ -74,6 +111,7 @@ impl WireEncode for LoginRegisterRequest {
 
     fn encode(&self, buf: &mut BytesMut) {
         self.version_info.encode(buf);
+        buf.put_slice(self.bind_secret.expose_secret());
         self.username.encode(buf);
         let password = self.password.expose_secret();
         debug_assert!(
@@ -106,8 +144,9 @@ impl LoginRegisterRequest {
         version_info: ClientVersionInfo,
         tail: &[u8],
     ) -> Result<(Self, usize), WireError> {
-        let (username, name_len) = WireName::decode(tail)?;
-        let mut pos = name_len;
+        let (bind_secret, _) = BindSecret::decode(tail)?;
+        let (username, name_len) = WireName::decode(&tail[BIND_SECRET_BYTES..])?;
+        let mut pos = BIND_SECRET_BYTES + name_len;
 
         let password_len = read_u8(tail, pos)? as usize;
         pos += 1;
@@ -127,6 +166,7 @@ impl LoginRegisterRequest {
         Ok((
             Self {
                 version_info,
+                bind_secret,
                 username,
                 password,
                 client_context,
@@ -158,6 +198,7 @@ mod tests {
 
     fn assert_req_eq(a: &LoginRegisterRequest, b: &LoginRegisterRequest) {
         assert_eq!(a.version_info, b.version_info);
+        assert_eq!(a.bind_secret.expose_secret(), b.bind_secret.expose_secret());
         assert_eq!(a.username, b.username);
         assert_eq!(a.password.expose_secret(), b.password.expose_secret());
         assert_eq!(a.client_context, b.client_context);
@@ -167,6 +208,7 @@ mod tests {
     fn roundtrip_full() {
         let req = LoginRegisterRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             username: WireName::new("admin").unwrap(),
             password: SecretString::from("secret"),
             client_context: Some("rust-sdk".to_string()),
@@ -181,6 +223,7 @@ mod tests {
     fn roundtrip_no_context() {
         let req = LoginRegisterRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             username: WireName::new("user").unwrap(),
             password: SecretString::from("pass"),
             client_context: None,
@@ -195,6 +238,7 @@ mod tests {
     fn encoded_size_matches_output() {
         let req = LoginRegisterRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             username: WireName::new("admin").unwrap(),
             password: SecretString::from("p"),
             client_context: Some("ctx".to_string()),
@@ -206,6 +250,7 @@ mod tests {
     fn truncated_returns_error() {
         let req = LoginRegisterRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             username: WireName::new("u").unwrap(),
             password: SecretString::from("p"),
             client_context: Some("c".to_string()),
@@ -223,6 +268,7 @@ mod tests {
     fn wire_layout_version_info_first() {
         let req = LoginRegisterRequest {
             version_info: version_info(),
+            bind_secret: BindSecret::new(Box::new([0x5a; BIND_SECRET_BYTES])),
             username: WireName::new("u").unwrap(),
             password: SecretString::from("p"),
             client_context: None,

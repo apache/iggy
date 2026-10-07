@@ -214,7 +214,7 @@ mod tests {
         // here means the probe wired nothing (the pre-fix stubbed literal).
         assert_eq!(stats.process_id, std::process::id());
         assert!(stats.total_memory > 0);
-        assert!(!stats.hostname.is_empty());
+        assert_ne!(stats.hostname, "");
     }
 
     #[test]

@@ -68,6 +68,7 @@ import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { describeOptions } from './system/describe-options.command.js';
 import { getStats } from './system/get-stats.command.js';
+import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
 
 import { getClusterMetadata } from './cluster/get-cluster-metadata.command.js';
@@ -189,6 +190,7 @@ type MessageAPI = ReturnType<typeof messageAPI>;
 const systemAPI = (c: ClientProvider) => ({
   ping: ping(c),
   getStats: getStats(c),
+  snapshot: snapshot(c),
   describeOptions: describeOptions(c)
 });
 

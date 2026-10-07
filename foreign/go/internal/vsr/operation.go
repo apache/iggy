@@ -36,6 +36,7 @@ const (
 	OperationRemoveConsumerGroupMember       Operation = 66
 	OperationCompleteConsumerGroupRevocation Operation = 67
 	OperationTruncatePartition               Operation = 68
+	OperationFinalizeSession                 Operation = 70
 
 	OperationCreateStream              Operation = 128
 	OperationUpdateStream              Operation = 129
@@ -63,6 +64,7 @@ const (
 	OperationSendMessages         Operation = 160
 	OperationStoreConsumerOffset  Operation = 161
 	OperationDeleteConsumerOffset Operation = 162
+	OperationRetireSession        Operation = 166
 )
 
 // Band boundaries. The internal band is never client-sent.
@@ -83,6 +85,7 @@ var allOperations = []Operation{
 	OperationRemoveConsumerGroupMember,
 	OperationCompleteConsumerGroupRevocation,
 	OperationTruncatePartition,
+	OperationFinalizeSession,
 	OperationCreateStream,
 	OperationUpdateStream,
 	OperationDeleteStream,
@@ -108,6 +111,7 @@ var allOperations = []Operation{
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
+	OperationRetireSession,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -188,7 +192,7 @@ func IsKnownOperation(operation Operation) bool {
 // IsInternal reports whether the operation belongs to the replica-internal
 // band, which a client never sends.
 func IsInternal(operation Operation) bool {
-	return operation >= internalBandStart && operation < metadataBandStart
+	return operation == OperationRetireSession || operation >= internalBandStart && operation < metadataBandStart
 }
 
 // IsMetadata reports whether the operation replicates through the metadata
@@ -197,7 +201,7 @@ func IsInternal(operation Operation) bool {
 // truncation server-side.
 func IsMetadata(operation Operation) bool {
 	if IsInternal(operation) {
-		return true
+		return operation < OperationSendMessages
 	}
 	if operation == OperationDeleteSegments {
 		return false

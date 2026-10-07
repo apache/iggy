@@ -386,7 +386,7 @@ impl ControlBlock {
             len,
             capacity,
         });
-        unsafe { NonNull::new_unchecked(Box::into_raw(ctrl)) }
+        Box::into_non_null(ctrl)
     }
 }
 
