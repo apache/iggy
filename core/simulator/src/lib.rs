@@ -1643,6 +1643,9 @@ fn materialise_partition(
 mod consumer_offset_history_tests;
 
 #[cfg(test)]
+mod stale_prepare_commit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::partition_repair_driver_tests::cluster;
     use super::*;

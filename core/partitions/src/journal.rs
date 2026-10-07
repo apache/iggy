@@ -426,6 +426,22 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// width of `ops`. Resident entries take precedence over retained repairs.
     #[must_use]
     pub fn repair_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
+        self.headers_in(ops, false)
+    }
+
+    /// Like [`Self::repair_headers_in`], but the FIRST resident header wins on a
+    /// duplicated op, as in [`Self::committed_headers_from`]: the entry proven is
+    /// the entry the commit walk would apply.
+    #[must_use]
+    pub fn walked_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
+        self.headers_in(ops, true)
+    }
+
+    fn headers_in(
+        &self,
+        ops: RangeInclusive<u64>,
+        first_wins: bool,
+    ) -> BTreeMap<u64, PrepareHeader> {
         let mut found = BTreeMap::new();
         if ops.is_empty() {
             return found;
@@ -433,7 +449,11 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         {
             let headers = unsafe { &*self.headers.get() };
             for header in headers.iter().filter(|header| ops.contains(&header.op)) {
-                found.insert(header.op, *header);
+                if first_wins {
+                    found.entry(header.op).or_insert(*header);
+                } else {
+                    found.insert(header.op, *header);
+                }
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };

@@ -4799,6 +4799,7 @@ where
             return;
         };
         partition.ensure_materialization_recovery();
+        let prior_log_view = partition.consensus().log_view();
         let actions =
             partition
                 .consensus()
@@ -4814,8 +4815,13 @@ where
             // like it, pending-less adoptions (empty StartView suffix) still sweep
             // the relics above the adopted head.
             let pending = partition.consensus().pending_view_log();
-            reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
+            // Consumed on every adoption, so a restart's flag never outlives the first.
+            let recovered = partition.take_recovered_unproven();
+            let fence_below = recovered || prior_log_view < partition.consensus().view();
+            reconcile_partition_view_divergence(self.id, partition, pending.as_ref(), fence_below)
+                .await;
         }
+        anchor_view_fence_from_start_view(self.id, partition, &header, suffix_body).await;
         let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
         // Locals go to the partition dispatcher ONLY: `RebuildPipeline`
@@ -4961,6 +4967,7 @@ where
                 if !partition.requires_state_transfer()
                     && partition.persist_superblock_if_needed().await
                 {
+                    refresh_partition_dvc_suffix(partition);
                     respond_start_view::<B, _, MJ>(consensus).await;
                 }
             }
@@ -5000,6 +5007,9 @@ where
         else {
             return;
         };
+        // The answer carries this suffix: empty, it names no header the prober can
+        // check its own entries against.
+        refresh_partition_dvc_suffix(partition);
         let consensus = partition.consensus();
         let actions = consensus.handle_request_start_view(PlaneKind::Partitions, &header);
         let (local_actions, wire_actions) = split_local_actions(actions);
@@ -5144,7 +5154,13 @@ where
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
             return;
         };
-        if !partition.consensus().is_normal() {
+        if !partition_serves_repair(
+            partition.consensus().status(),
+            header.replica,
+            partition
+                .consensus()
+                .primary_index(partition.consensus().view()),
+        ) {
             return;
         }
         let cluster = partition.consensus().cluster();
@@ -5183,10 +5199,15 @@ where
         // until the body is journaled, and the primary's retransmit is dropped
         // by the backup gap check (adoption already advanced its sequencer to
         // the head), so repair is the only channel that can deliver them.
-        let to_op = repair_serve_ceiling(
-            header.to_op,
-            partition.consensus().commit_max(),
-            partition.consensus().sequencer().current_sequence(),
+        let to_op = fenced_serve_ceiling(
+            repair_serve_ceiling(
+                header.to_op,
+                partition.consensus().commit_max(),
+                partition.consensus().sequencer().current_sequence(),
+            ),
+            partition
+                .view_fenced()
+                .then(|| partition.consensus().commit_min()),
         );
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
@@ -5960,7 +5981,13 @@ where
             // already holds a header for, so the scan would report a gap nothing
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
-            reconcile_partition_view_divergence(self.id, partition, Some(&pending)).await;
+            // `log_view` still names the old log here: it is raised only when the
+            // view starts.
+            let recovered = partition.take_recovered_unproven();
+            let fence_below =
+                recovered || partition.consensus().log_view() < partition.consensus().view();
+            reconcile_partition_view_divergence(self.id, partition, Some(&pending), fence_below)
+                .await;
             let consensus = partition.consensus();
             // Identity, not presence: see the metadata twin. The floor is the local
             // commit point, the partition twin of the metadata snapshot floor:
@@ -6005,6 +6032,11 @@ where
                 // the metadata plane's view repair.
                 self.request_partition_view_repair(partition, missing_op, pending.op_head, None)
                     .await;
+                return;
+            }
+            // Everything is held, but not yet proven to be the view's: starting
+            // now commits whatever this replica journaled in an older view.
+            if partition.view_fenced() {
                 return;
             }
 
@@ -8029,7 +8061,9 @@ where
                     repairs_live += 1;
                 }
                 let probe = partition_gap_probe(partition);
-                let walk_stalled = group_is_walk_stalled(&probe);
+                // A fenced walk takes nothing until the window is proven, and the
+                // events that prove it (repair, an anchor) re-drive it themselves.
+                let walk_stalled = group_is_walk_stalled(&probe) && !partition.view_fenced();
                 // The RATE cap only. The concurrency cap lives in the arm fn,
                 // which is the funnel every arming site goes through; resolved
                 // before the debounce either way, so a refusal keeps the group
@@ -8129,6 +8163,25 @@ where
                         continue;
                     }
                 }
+            }
+
+            // A fence with no anchor stays shut until the view's primary names the
+            // header above it; ask again rather than wait for the next prepare.
+            if let Some(partition) = partitions.get_mut_by_ns(&namespace)
+                && !partition
+                    .consensus()
+                    .is_primary_for_view(partition.consensus().view())
+                && partition.view_fence_probe_due(self.repair_retry_ticks.get())
+            {
+                // A probe promises nothing about this replica's view, so it skips the
+                // superblock gate, which cannot certify while the fence holds the
+                // WAL back.
+                let consensus = partition.consensus();
+                let probe = [VsrAction::SendRequestStartView {
+                    view: consensus.view(),
+                    group: consensus.group(),
+                }];
+                dispatch_vsr_actions::<B, _, MJ>(consensus, None, &probe).await;
             }
 
             // Transfer stall retry: descriptor and chunk frames are
@@ -10835,6 +10888,23 @@ fn repair_op_in_scope(
         })
 }
 
+/// Whether a partition replica in `status` answers a repair request from
+/// `requester`. `ViewChange` only for this view's primary-elect, whose fence
+/// proves what it is served: the senders it repairs from wait on its `StartView`.
+const fn partition_serves_repair(status: Status, requester: u8, view_primary: u8) -> bool {
+    match status {
+        Status::Normal => true,
+        Status::ViewChange => requester == view_primary,
+        Status::Recovering => false,
+    }
+}
+
+/// A fenced replica never hands out entries it has not proven: its serve stops at
+/// `fenced_floor`, its own commit point.
+fn fenced_serve_ceiling(ceiling: u64, fenced_floor: Option<u64>) -> u64 {
+    fenced_floor.map_or(ceiling, |floor| ceiling.min(floor))
+}
+
 /// Ceiling on the op range a repair request may ask this replica to walk.
 ///
 /// Not `commit_max` alone: a new primary repairing toward a merged log needs the
@@ -11228,7 +11298,10 @@ where
             .log
             .journal()
             .inner
-            .holds_op(commit_min.saturating_add(1));
+            .holds_op(commit_min.saturating_add(1))
+        // The fenced commit walk cannot reach a hole above the next op, so only
+        // repair fills it.
+        && partition.view_fence_hole().is_none();
     // Same discipline, one guard deeper: the suffix test walks the header vec,
     // so it runs only for a group that HAS an unfinished suffix and already
     // owes nothing else.
@@ -11422,11 +11495,16 @@ fn build_dvc_suffix(
 /// duplicate header and rewrites `op_to_storage_offset`, and `committed_prefix` walks
 /// positionally, so the stale entry is what `evict_prefix` flushes to the segment:
 /// durable divergent bytes, no error anywhere.
+///
+/// Below the view's canonical headers it cannot compare anything, so with
+/// `fence_below` (an adoption that replaces this replica's log) it fences that
+/// window instead; see [`fence_unproven_view_window`].
 #[allow(clippy::future_not_send)]
 async fn reconcile_partition_view_divergence<B, SB>(
     shard: u16,
     partition: &mut IggyPartition<B, SB>,
     pending: Option<&MergedLog>,
+    fence_below: bool,
 ) where
     B: MessageBus,
     SB: journal::superblock::SuperblockStore,
@@ -11481,9 +11559,26 @@ async fn reconcile_partition_view_divergence<B, SB>(
         repairable_from = Some(repairable_from.map_or(above_head, |op| op.min(above_head)));
     }
 
-    let Some(from_op) = repairable_from else {
-        return;
-    };
+    if let Some(from_op) = repairable_from {
+        drop_diverging_partition_suffix(shard, partition, from_op, op_head).await;
+    }
+    if fence_below {
+        fence_unproven_view_window(partition, pending).await;
+    }
+}
+
+/// Truncate the entries from `from_op` that the view's log names differently or
+/// does not name at all.
+#[allow(clippy::future_not_send)]
+async fn drop_diverging_partition_suffix<B, SB>(
+    shard: u16,
+    partition: &mut IggyPartition<B, SB>,
+    from_op: u64,
+    op_head: u64,
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
     match partition.truncate_uncommitted_from(from_op).await {
         Ok(removed) => {
             tracing::warn!(
@@ -11509,6 +11604,101 @@ async fn reconcile_partition_view_divergence<B, SB>(
             );
         }
     }
+}
+
+/// The lowest header in a view's suffix that can anchor a fence. A blank slot, or
+/// an unsealed one, names no identity: its zero `parent` would link anything
+/// below it. Op 1 is the one header whose real parent is zero.
+fn view_fence_anchor(headers: &[PrepareHeader]) -> Option<PrepareHeader> {
+    headers
+        .iter()
+        .filter(|header| {
+            matches!(dvc_header_kind(header), DvcHeaderKind::Valid)
+                && header.checksum != CHECKSUM_UNSEALED
+                && (header.parent != CHECKSUM_UNSEALED || header.op == 1)
+        })
+        .min_by_key(|header| header.op)
+        .copied()
+}
+
+/// Fence what this replica holds between its commit point and the view's lowest
+/// canonical header (or the adopted head, when the `StartView` named none), and
+/// try to prove it right away.
+///
+/// Those entries can come from a log the view discarded, and nothing else
+/// compares them before the commit walk applies them. Fencing, not truncating: a
+/// hole or a missing anchor is no evidence against an entry, and truncating on
+/// either drops entries this replica may be the only one to hold. An empty window
+/// is fenced too, so whatever repair puts there is proven before it is applied.
+#[allow(clippy::future_not_send)]
+async fn fence_unproven_view_window<B, SB>(
+    partition: &mut IggyPartition<B, SB>,
+    pending: Option<&MergedLog>,
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let anchor = pending.and_then(|pending| view_fence_anchor(&pending.headers));
+    // Without an anchor the window runs to the adopted head, which the pending log
+    // names; the sequencer can sit above it after an above-head truncation.
+    let through = match (anchor, pending) {
+        (Some(anchor), _) => anchor.op.saturating_sub(1),
+        (None, Some(pending)) => pending.op_head,
+        (None, None) => partition.consensus().sequencer().current_sequence(),
+    };
+    partition.fence_view_window(through, anchor);
+    partition.prove_view_window().await;
+}
+
+/// From this view's primary, and not behind what this replica already holds: an
+/// older frame would truncate above its own head.
+const fn start_view_may_anchor(
+    (frame_view, sender, frame_op): (u32, u8, u64),
+    view: u32,
+    primary: u8,
+    head: u64,
+) -> bool {
+    frame_view == view && sender == primary && frame_op >= head
+}
+
+/// Hand a fence still waiting for its anchor the headers a same-view `StartView`
+/// carries: the probe answer a fenced replica asked for.
+#[allow(clippy::future_not_send)]
+async fn anchor_view_fence_from_start_view<B, SB>(
+    shard: u16,
+    partition: &mut IggyPartition<B, SB>,
+    header: &StartViewHeader,
+    suffix_body: &[u8],
+) where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let consensus = partition.consensus();
+    if !partition.view_fence_unanchored()
+        || !start_view_may_anchor(
+            (header.view, header.replica, header.op),
+            consensus.view(),
+            consensus.primary_index(header.view),
+            consensus.sequencer().current_sequence(),
+        )
+    {
+        return;
+    }
+    let pending = match MergedLog::from_start_view(header, suffix_body) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                shard,
+                namespace_raw = consensus.group(),
+                view = header.view,
+                %error,
+                "start_view suffix did not decode, so the fence keeps waiting for an anchor"
+            );
+            return;
+        }
+    };
+    reconcile_partition_view_divergence(shard, partition, Some(&pending), true).await;
 }
 
 /// Whether a locally journaled header IS the entry the view's log names at that op.
@@ -12436,6 +12626,85 @@ mod view_coverage_tests {
             Some(2),
             "a peer no longer in the list means nothing here has been tried yet"
         );
+    }
+}
+
+#[cfg(test)]
+mod view_fence_gate_tests {
+    //! The gates around the partition view fence, apart from the partition.
+
+    use super::{
+        fenced_serve_ceiling, partition_serves_repair, start_view_may_anchor, view_fence_anchor,
+    };
+    use consensus::{Status, dvc_blank};
+    use iggy_binary_protocol::{Command, Operation, PrepareHeader};
+
+    fn sealed(op: u64, parent: u128) -> PrepareHeader {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            operation: Operation::SendMessages,
+            op,
+            parent,
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+        header
+    }
+
+    #[test]
+    fn given_a_blank_commit_point_when_choosing_an_anchor_should_take_the_lowest_sealed_header() {
+        let above = sealed(6, 7);
+        let headers = [sealed(7, above.checksum), above, dvc_blank(5)];
+        assert_eq!(
+            view_fence_anchor(&headers).map(|anchor| anchor.op),
+            Some(6),
+            "a blank's zero parent links any window below it"
+        );
+        assert_eq!(view_fence_anchor(&[dvc_blank(5)]), None);
+    }
+
+    #[test]
+    fn given_op_one_when_choosing_an_anchor_should_accept_its_zero_parent() {
+        assert_eq!(
+            view_fence_anchor(&[sealed(1, 0)]).map(|anchor| anchor.op),
+            Some(1)
+        );
+        assert_eq!(
+            view_fence_anchor(&[sealed(2, 0)]),
+            None,
+            "a zero parent above op 1 vouches for nothing"
+        );
+    }
+
+    #[test]
+    fn given_a_start_view_when_deciding_whether_it_anchors_should_require_this_views_primary_at_or_above_the_head()
+     {
+        let start_view = |view: u32, replica: u8, op: u64| (view, replica, op);
+        assert!(start_view_may_anchor(start_view(2, 1, 9), 2, 1, 9));
+        assert!(!start_view_may_anchor(start_view(1, 1, 9), 2, 1, 9));
+        assert!(!start_view_may_anchor(start_view(2, 0, 9), 2, 1, 9));
+        assert!(
+            !start_view_may_anchor(start_view(2, 1, 8), 2, 1, 9),
+            "an older frame truncates above its own head"
+        );
+    }
+
+    #[test]
+    fn given_a_view_change_when_asked_for_repair_should_serve_only_the_primary_elect() {
+        assert!(partition_serves_repair(Status::Normal, 2, 1));
+        assert!(partition_serves_repair(Status::ViewChange, 1, 1));
+        assert!(
+            !partition_serves_repair(Status::ViewChange, 2, 1),
+            "an unfenced requester would take this replica's unproven entries"
+        );
+        assert!(!partition_serves_repair(Status::Recovering, 1, 1));
+    }
+
+    #[test]
+    fn given_a_fenced_server_when_capping_a_repair_should_stop_at_its_commit_point() {
+        assert_eq!(fenced_serve_ceiling(9, None), 9);
+        assert_eq!(fenced_serve_ceiling(9, Some(4)), 4);
+        assert_eq!(fenced_serve_ceiling(3, Some(4)), 3);
     }
 }
 
