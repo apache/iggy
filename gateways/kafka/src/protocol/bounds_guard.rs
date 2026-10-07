@@ -1727,4 +1727,37 @@ mod tests {
         assert!(validate_leave_group_shape(4, &body, 8 * 1024 * 1024).is_ok());
         assert!(validate_leave_group_shape(4, &body, 1_024).is_err());
     }
+
+    /// `validate_describe_configs_shape` and `validate_alter_configs_shape` had no POC of their
+    /// own before this - every sibling guard above pins a rejection for both the legacy
+    /// (`i32`) and flexible (compact varint) count forms, and these two never did.
+    #[test]
+    fn describe_configs_v1_huge_legacy_count_rejected() {
+        let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_describe_configs_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The flexible (v4+) sibling of the legacy test above: a huge compact-array-count varint
+    /// for `resources` on its own, exceeding `MAX_COLLECTION_LEN` regardless of what bytes
+    /// remain in the frame.
+    #[test]
+    fn describe_configs_v4_huge_compact_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
+        assert!(validate_describe_configs_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn alter_configs_v0_huge_legacy_count_rejected() {
+        let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_alter_configs_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The flexible (v2+) sibling of the legacy test above: a huge compact-array-count varint
+    /// for `resources` on its own, exceeding `MAX_COLLECTION_LEN` regardless of what bytes
+    /// remain in the frame.
+    #[test]
+    fn alter_configs_v2_huge_compact_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
+        assert!(validate_alter_configs_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
 }

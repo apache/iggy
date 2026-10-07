@@ -32,8 +32,8 @@ use bytes::Bytes;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_NOT_CONTROLLER, GatewayState, handle_request, is_supported_version,
-    supported_api_ranges,
+    BrokerAdvertise, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, GatewayState, handle_request,
+    is_supported_version, supported_api_ranges,
 };
 use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
 
@@ -100,6 +100,7 @@ async fn alter_configs_without_a_bridge_returns_not_controller() {
         .with_validate_only(false);
     let outcome = alter_configs::handle(
         &state_without_bridge(),
+        None,
         ALTER_VERSION,
         encode(&request, ALTER_VERSION),
     )
@@ -127,4 +128,81 @@ fn incremental_alter_configs_is_not_advertised() {
 async fn incremental_alter_configs_closes_the_connection() {
     let outcome = handle_request(44, 1, Bytes::new(), &BrokerAdvertise::default()).await;
     assert!(outcome.is_close());
+}
+
+/// The over-100-distinct-topics cap is checked before the bridge-availability stub: with the
+/// bridge off (as every test in this file is), a request that would previously fall straight
+/// through to `NOT_CONTROLLER` must still be rejected `POLICY_VIOLATION` first. Before this, the
+/// cap lived inside `describe_all`/`alter_all`, past the bridge-off early return, so no
+/// bridge-off test could ever reach it.
+#[tokio::test]
+async fn describe_configs_over_the_cap_is_rejected_even_with_the_bridge_off() {
+    const OVER_CAP: usize = 101;
+    let resources = (0..OVER_CAP)
+        .map(|i| {
+            DescribeConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from(format!("topic-{i}")))
+                .with_configuration_keys(None)
+        })
+        .collect();
+    let request = DescribeConfigsRequest::default()
+        .with_resources(resources)
+        .with_include_synonyms(false)
+        .with_include_documentation(false);
+    let outcome = describe_configs::handle(
+        &state_without_bridge(),
+        DESCRIBE_VERSION,
+        encode(&request, DESCRIBE_VERSION),
+    )
+    .await;
+    let response: DescribeConfigsResponse = decode(
+        outcome.expect_response("DescribeConfigs answers"),
+        DESCRIBE_VERSION,
+    );
+    assert_eq!(response.results.len(), OVER_CAP);
+    assert!(
+        response
+            .results
+            .iter()
+            .all(|result| result.error_code == ERROR_POLICY_VIOLATION)
+    );
+}
+
+#[tokio::test]
+async fn alter_configs_over_the_cap_is_rejected_even_with_the_bridge_off() {
+    const OVER_CAP: usize = 101;
+    let resources = (0..OVER_CAP)
+        .map(|i| {
+            AlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from(format!("topic-{i}")))
+                .with_configs(vec![
+                    AlterableConfig::default()
+                        .with_name(StrBytes::from_static_str("retention.ms"))
+                        .with_value(Some(StrBytes::from_static_str("1000"))),
+                ])
+        })
+        .collect();
+    let request = AlterConfigsRequest::default()
+        .with_resources(resources)
+        .with_validate_only(false);
+    let outcome = alter_configs::handle(
+        &state_without_bridge(),
+        None,
+        ALTER_VERSION,
+        encode(&request, ALTER_VERSION),
+    )
+    .await;
+    let response: AlterConfigsResponse = decode(
+        outcome.expect_response("AlterConfigs answers"),
+        ALTER_VERSION,
+    );
+    assert_eq!(response.responses.len(), OVER_CAP);
+    assert!(
+        response
+            .responses
+            .iter()
+            .all(|r| r.error_code == ERROR_POLICY_VIOLATION)
+    );
 }

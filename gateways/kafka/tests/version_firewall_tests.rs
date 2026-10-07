@@ -868,10 +868,16 @@ async fn corrupt_describe_configs_truncated_body_returns_invalid_request_error()
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-/// A resource count past what the remaining frame can hold is rejected by the shape walk.
+/// A resource count past what the remaining frame can hold is rejected by the shape walk. Uses
+/// `i32::MAX` (the same boundary `metadata_v0_huge_topics_count_rejected` exercises in
+/// `bounds_guard.rs`'s own test module), not a value `kafka_protocol`'s own decode would already
+/// choke on first: a small frame declaring `100000` fails before this guard gets credit for
+/// catching anything, since the crate's own `Vec::with_capacity` path runs out of bytes to read
+/// well before it would allocate that much. `i32::MAX` is the actual amplification class this
+/// module exists to stop (see its module doc's `handle_alloc_error` reproduction).
 #[tokio::test]
 async fn corrupt_describe_configs_overlong_count_returns_invalid_request_error() {
-    let body = Bytes::from_static(&[0x00, 0x01, 0x86, 0xA0]);
+    let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_DESCRIBE_CONFIGS, 1, body, &default_broker())
         .await
         .expect_response("DescribeConfigs v1 has an encodable error response");
@@ -894,10 +900,12 @@ async fn corrupt_alter_configs_truncated_body_returns_invalid_request_error() {
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
-/// A resource count past what the remaining frame can hold is rejected by the shape walk.
+/// A resource count past what the remaining frame can hold is rejected by the shape walk. See
+/// `corrupt_describe_configs_overlong_count_returns_invalid_request_error`'s doc for why
+/// `i32::MAX`, not a smaller value `kafka_protocol`'s own decode would already fail on.
 #[tokio::test]
 async fn corrupt_alter_configs_overlong_count_returns_invalid_request_error() {
-    let body = Bytes::from_static(&[0x00, 0x01, 0x86, 0xA0]);
+    let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_ALTER_CONFIGS, 0, body, &default_broker())
         .await
         .expect_response("AlterConfigs v0 has an encodable error response");

@@ -20,8 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
-    Identifier, IggyError, IggyExpiry, ResourceOptions, StreamClient, Topic, TopicClient,
-    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyError, IggyExpiry, StreamClient, Topic, TopicClient, TopicCreateOptions,
+    TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 use super::{IggyBridge, with_request_timeout};
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
+use crate::protocol::handlers::topic_config::message_expiry_is_explicit;
 
 /// Outcome of [`IggyBridge::create_kafka_topic`].
 ///
@@ -535,13 +536,16 @@ impl IggyBridge {
     }
 }
 
-/// `message_expiry` and admission options from one `get_topics` row.
+/// `message_expiry` and whether it was set explicitly, from one `get_topics` row.
 ///
-/// Enough for `DescribeConfigs`. The partition list on `TopicDetails` is not loaded.
-#[derive(Debug, Clone)]
+/// Enough for `DescribeConfigs`. The partition list on `TopicDetails` is not loaded. Only
+/// [`message_expiry_is_explicit`] of the full `ResourceOptions` map a row carries is ever read
+/// downstream, so this stores that one bit instead of cloning the whole map into the cache for
+/// every topic in the stream, including every topic no describe ever names.
+#[derive(Debug, Clone, Copy)]
 pub struct TopicConfigSnapshot {
     pub message_expiry: IggyExpiry,
-    pub options: ResourceOptions,
+    pub message_expiry_explicit: bool,
 }
 
 /// One stream's `get_topics` result, shared by every Kafka name that resolves there.
@@ -575,6 +579,11 @@ impl StreamTopicCache {
     /// result. One `get_topics` call per distinct stream, including a stream that is missing.
     /// A stream whose first name arrives at or after `deadline` is [`TopicLoad::NotStarted`]
     /// and does not call Iggy. `api_name` is the handler in the deadline log line.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice: `stream` is inserted immediately above whenever it is not already a
+    /// key, so the lookup right after always finds it.
     pub async fn lookup<'a>(
         &'a mut self,
         bridge: &IggyBridge,
@@ -587,13 +596,20 @@ impl StreamTopicCache {
             let load = load_stream(bridge, kafka_topic, &stream, deadline, api_name).await;
             self.streams.insert(stream.clone(), load);
         }
-        match self.streams.get(&stream) {
-            Some(StreamLoad::Ready(topics)) => topics
+        // The branch above guarantees `stream` is now a key, whether it was already cached or
+        // just inserted - `None` is not a real outcome here, unlike the `StreamLoad` variants
+        // below, so it is not given one of its own.
+        match self
+            .streams
+            .get(&stream)
+            .expect("stream was just inserted, or was already present")
+        {
+            StreamLoad::Ready(topics) => topics
                 .get(&iggy_topic)
                 .map_or(TopicLoad::Missing, TopicLoad::Found),
-            Some(StreamLoad::Failed(error)) => TopicLoad::Failed(error),
-            Some(StreamLoad::NotStarted) => TopicLoad::NotStarted,
-            Some(StreamLoad::TimedOut) | None => TopicLoad::TimedOut,
+            StreamLoad::Failed(error) => TopicLoad::Failed(error),
+            StreamLoad::NotStarted => TopicLoad::NotStarted,
+            StreamLoad::TimedOut => TopicLoad::TimedOut,
         }
     }
 }
@@ -617,11 +633,12 @@ async fn load_stream(
             let ready = topics
                 .into_iter()
                 .map(|topic| {
+                    let message_expiry_explicit = message_expiry_is_explicit(&topic.options);
                     (
                         topic.name,
                         TopicConfigSnapshot {
                             message_expiry: topic.message_expiry,
-                            options: topic.options,
+                            message_expiry_explicit,
                         },
                     )
                 })

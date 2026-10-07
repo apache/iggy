@@ -136,7 +136,7 @@ async fn alter(
     let request = AlterConfigsRequest::default()
         .with_resources(resources)
         .with_validate_only(validate_only);
-    let outcome = alter_configs::handle(state, version, encode(&request, version)).await;
+    let outcome = alter_configs::handle(state, None, version, encode(&request, version)).await;
     decode(outcome.expect_response("AlterConfigs answers"), version)
 }
 

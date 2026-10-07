@@ -24,7 +24,7 @@ use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::create_topics_request::{CreatableReplicaAssignment, CreatableTopic};
 use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
-use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse, TopicName};
+use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse};
 use kafka_protocol::protocol::StrBytes;
 
 use tokio::time::Instant;
@@ -38,7 +38,9 @@ use crate::protocol::api::{
     ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
-use crate::protocol::handlers::topic_config::{MAX_CONFIG_TOPICS, topic_cap_message};
+use crate::protocol::handlers::topic_config::{
+    MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
+};
 use crate::protocol::handlers::{
     decode_guarded, encode_message, handle_versioned_request, is_supported_version,
     respond_or_close, unsupported_version_response,
@@ -116,13 +118,13 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
-    let duplicate_names = find_duplicate_names(&req.topics);
+    let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
+    let duplicate_names = find_duplicate_names(topic_names.iter().copied());
 
-    let distinct_bridge_backed: HashSet<&TopicName> = req
-        .topics
+    let distinct_bridge_backed: HashSet<&str> = topic_names
         .iter()
-        .map(|topic| &topic.name)
-        .filter(|name| !duplicate_names.contains(*name))
+        .copied()
+        .filter(|name| !duplicate_names.contains(name))
         .collect();
     if distinct_bridge_backed.len() > MAX_CONFIG_TOPICS {
         tracing::warn!(
@@ -178,13 +180,13 @@ async fn create_all_topics(
     bridge: &IggyBridge,
     api_version: i16,
     topics: &[CreatableTopic],
-    duplicate_names: &HashSet<TopicName>,
+    duplicate_names: &HashSet<&str>,
     validate_only: bool,
     deadline: Instant,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     for topic in topics {
-        let result = if duplicate_names.contains(&topic.name) {
+        let result = if duplicate_names.contains(topic.name.as_str()) {
             CreatableTopicResult::default()
                 .with_name(topic.name.clone())
                 .with_error_code(ERROR_INVALID_REQUEST)
@@ -213,21 +215,6 @@ async fn create_all_topics(
         results.push(result);
     }
     results
-}
-
-/// Every topic name that appears more than once in `topics` - real Kafka
-/// (`ControllerApis.createTopics`) refuses every occurrence of a duplicate name with
-/// `INVALID_REQUEST` (42) and creates nothing for it, rather than creating the first occurrence
-/// and reporting the rest as already existing.
-fn find_duplicate_names(topics: &[CreatableTopic]) -> HashSet<TopicName> {
-    let mut seen = HashSet::with_capacity(topics.len());
-    let mut duplicates = HashSet::new();
-    for topic in topics {
-        if !seen.insert(topic.name.clone()) {
-            duplicates.insert(topic.name.clone());
-        }
-    }
-    duplicates
 }
 
 /// Validates and, when the topic is not rejected outright, provisions one requested topic.
@@ -578,6 +565,8 @@ fn encode_inner(version: i16, topics: &[CreatableTopic], forced_error: i16) -> R
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::messages::TopicName;
+
     use super::*;
 
     fn topic_name(name: &str) -> TopicName {
@@ -758,25 +747,6 @@ mod tests {
             validate_create_topic_shape(5, &topic),
             Err(ERROR_INVALID_REQUEST)
         );
-    }
-
-    #[test]
-    fn find_duplicate_names_finds_a_name_repeated_across_two_requested_topics() {
-        let topics = vec![creatable_topic(1, 1), creatable_topic(1, 1)];
-        let duplicates = find_duplicate_names(&topics);
-        assert_eq!(duplicates, HashSet::from([topic_name("orders")]));
-    }
-
-    #[test]
-    fn find_duplicate_names_is_empty_when_every_name_is_unique() {
-        let topics = vec![
-            creatable_topic(1, 1),
-            CreatableTopic::default()
-                .with_name(topic_name("payments"))
-                .with_num_partitions(1)
-                .with_replication_factor(1),
-        ];
-        assert!(find_duplicate_names(&topics).is_empty());
     }
 
     #[test]

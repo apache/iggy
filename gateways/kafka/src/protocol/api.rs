@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -26,6 +26,7 @@ use kafka_protocol::messages::{
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
@@ -37,9 +38,6 @@ use crate::protocol::bounds_guard::{
     validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
-use crate::protocol::handlers::topic_config::{
-    IggyTopicKey, RetentionSynonymMemory, RetentionSynonyms,
-};
 use crate::protocol::handlers::{
     alter_configs, api_versions, create_topics, decode_guarded, describe_configs, dispatch, fetch,
     find_coordinator, heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata,
@@ -319,9 +317,6 @@ pub struct GatewayState {
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
-    /// `retention.minutes` and `retention.hours` from the last successful alter on this
-    /// process, keyed by Iggy stream and topic. Not stored in Iggy.
-    pub(crate) retention_synonym_memory: Mutex<RetentionSynonymMemory>,
     /// Per Kafka topic and partition, how long probes read it as loading. Fetch and `ListOffsets`
     /// share it, since every consumer sees the same probe.
     pub(crate) loading: Mutex<fetch::Spells>,
@@ -351,7 +346,6 @@ impl GatewayState {
             producer_ids: ProducerIdAllocator::new(instance_id),
             produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
             groups,
-            retention_synonym_memory: Mutex::default(),
             loading: Mutex::default(),
             probe_board: ProbeBoard::default(),
         }
@@ -370,20 +364,6 @@ impl GatewayState {
             0,
             GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
         )
-    }
-
-    pub(crate) fn remembered_retention_synonyms(&self, key: &IggyTopicKey) -> RetentionSynonyms {
-        self.retention_synonym_memory
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remembered(key)
-    }
-
-    pub(crate) fn record_retention_synonyms(&self, key: IggyTopicKey, synonyms: RetentionSynonyms) {
-        self.retention_synonym_memory
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .record_applied(key, synonyms);
     }
 }
 
@@ -434,18 +414,22 @@ pub async fn handle_request_bounded(
     body: Bytes,
 ) -> HandleOutcome {
     let connection = ConnectionState::default();
-    handle_connection_request(state, &connection, api_key, api_version, body).await
+    handle_connection_request(state, &connection, None, api_key, api_version, body).await
 }
 
 /// [`handle_request_bounded`] for one request of `connection`.
+///
+/// `principal` is `None` when SASL is off, or for a key the connection reached before
+/// authenticating - only [`crate::server::route_frame`] ever has a principal to pass.
 pub async fn handle_connection_request(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
-    dispatch(state, connection, api_key, api_version, body).await
+    dispatch(state, connection, principal, api_key, api_version, body).await
 }
 
 #[must_use]

@@ -17,6 +17,8 @@
 
 //! `AlterConfigs` (API key 33).
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::AlterConfigsRequest;
@@ -27,18 +29,19 @@ use kafka_protocol::messages::alter_configs_response::{
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
-    REQUEST_DEADLINE,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    GatewayState, HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_alter_configs_shape;
 use crate::protocol::handlers::topic_config::{
-    IggyTopicKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, exceeds_topic_cap,
-    find_duplicate_names, name_reason, plan_retention_update, static_text, topic_cap_message,
+    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, name_reason, plan_retention_update,
+    topic_cap_and_duplicates, topic_cap_message,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -51,7 +54,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 2,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_ALTER_CONFIGS, api_version) {
         return unsupported_version_response(API_KEY_ALTER_CONFIGS, api_version, |version| {
             encode_error_response(version, ERROR_INVALID_REQUEST)
@@ -71,6 +79,30 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
+    // Checked before the bridge-availability stub, not inside `alter_all`: a cap or an
+    // authorization decision does not depend on the controller being reachable, and a check
+    // that only runs once the bridge is up is never exercised by a serverless/stub test.
+    if let Some(responses) = authorize(principal, &req.resources) {
+        return respond_or_close(
+            encode_message(&response(responses), api_version, 256),
+            "AlterConfigs",
+        );
+    }
+    let (exceeds_cap, duplicate_names) = topic_cap_and_duplicates(&req.resources);
+    if exceeds_cap {
+        let message = StrBytes::from(topic_cap_message("AlterConfigs"));
+        tracing::warn!("AlterConfigs request addresses too many distinct topics; rejecting");
+        let responses = req
+            .resources
+            .iter()
+            .map(|resource| resource_error(resource, ERROR_POLICY_VIOLATION, Some(message.clone())))
+            .collect();
+        return respond_or_close(
+            encode_message(&response(responses), api_version, 256),
+            "AlterConfigs",
+        );
+    }
+
     let Some(bridge) = &state.bridge else {
         let responses = req
             .resources
@@ -84,10 +116,48 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let responses = alter_all(state, bridge, &req, deadline).await;
+    let responses = alter_all(bridge, &req, &duplicate_names, deadline).await;
     respond_or_close(
         encode_message(&response(responses), api_version, 256),
         "AlterConfigs",
+    )
+}
+
+/// Denies every resource when `principal` is known but is not allowed to alter topic
+/// configuration, or when its permissions could not be read. `None` means SASL is off, which
+/// this gateway treats as no principal to enforce against - the same choice the rest of this
+/// gateway makes when authentication itself is not configured.
+fn authorize(
+    principal: Option<&AuthenticatedPrincipal>,
+    resources: &[AlterConfigsResource],
+) -> Option<Vec<AlterConfigsResourceResponse>> {
+    let principal = principal?;
+    if principal.permissions_known && principal.permissions.manage_topics {
+        return None;
+    }
+    if !principal.permissions_known {
+        // The permission read failed after a successful login, so this connection holds no
+        // real answer. Denying is the fail-closed choice: granting would authorize a write off
+        // a value nothing ever actually read.
+        tracing::warn!(
+            principal = %principal.username,
+            "AlterConfigs asked on a connection whose permissions were never read; denying"
+        );
+    }
+    let message = StrBytes::from_static_str(
+        "the authenticated principal is not authorized to alter topic configuration",
+    );
+    Some(
+        resources
+            .iter()
+            .map(|resource| {
+                resource_error(
+                    resource,
+                    ERROR_TOPIC_AUTHORIZATION_FAILED,
+                    Some(message.clone()),
+                )
+            })
+            .collect(),
     )
 }
 
@@ -112,51 +182,11 @@ fn response(responses: Vec<AlterConfigsResourceResponse>) -> AlterConfigsRespons
 }
 
 async fn alter_all(
-    state: &GatewayState,
     bridge: &IggyBridge,
     req: &AlterConfigsRequest,
+    duplicate_names: &HashSet<&str>,
     deadline: Instant,
 ) -> Vec<AlterConfigsResourceResponse> {
-    if !req.unknown_tagged_fields.is_empty() {
-        let message = static_text("unknown tagged fields are not supported");
-        return if req.resources.is_empty() {
-            vec![
-                AlterConfigsResourceResponse::default()
-                    .with_error_code(ERROR_INVALID_REQUEST)
-                    .with_error_message(Some(message))
-                    .with_resource_type(RESOURCE_TYPE_TOPIC)
-                    .with_resource_name(StrBytes::from_static_str("")),
-            ]
-        } else {
-            req.resources
-                .iter()
-                .map(|resource| {
-                    resource_error(resource, ERROR_INVALID_REQUEST, Some(message.clone()))
-                })
-                .collect()
-        };
-    }
-
-    let topic_names: Vec<&str> = req
-        .resources
-        .iter()
-        .filter(|resource| resource.resource_type == RESOURCE_TYPE_TOPIC)
-        .map(|resource| resource.resource_name.as_str())
-        .collect();
-    if exceeds_topic_cap(topic_names.iter().copied()) {
-        let message = StrBytes::from(topic_cap_message("AlterConfigs"));
-        tracing::warn!("AlterConfigs request addresses too many distinct topics; rejecting");
-        return req
-            .resources
-            .iter()
-            .map(|resource| resource_error(resource, ERROR_POLICY_VIOLATION, Some(message.clone())))
-            .collect();
-    }
-
-    // Real Kafka refuses every occurrence of a duplicate resource name outright rather than
-    // picking a winner - the same choice CreateTopics makes for a repeated topic name.
-    let duplicate_names = find_duplicate_names(topic_names.iter().copied());
-
     let mut cache = StreamTopicCache::default();
     let mut responses = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
@@ -179,15 +209,7 @@ async fn alter_all(
             continue;
         }
 
-        let result = alter_one(
-            state,
-            bridge,
-            &mut cache,
-            resource,
-            req.validate_only,
-            deadline,
-        )
-        .await;
+        let result = alter_one(bridge, &mut cache, resource, req.validate_only, deadline).await;
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
@@ -197,30 +219,17 @@ async fn alter_all(
 }
 
 async fn alter_one(
-    state: &GatewayState,
     bridge: &IggyBridge,
     cache: &mut StreamTopicCache,
     resource: &AlterConfigsResource,
     validate_only: bool,
     deadline: Instant,
 ) -> AlterConfigsResourceResponse {
-    if !resource.unknown_tagged_fields.is_empty()
-        || resource
-            .configs
-            .iter()
-            .any(|config| !config.unknown_tagged_fields.is_empty())
-    {
-        return resource_error(
-            resource,
-            ERROR_INVALID_REQUEST,
-            Some(static_text("unknown tagged fields are not supported")),
-        );
-    }
     if resource.resource_type != RESOURCE_TYPE_TOPIC {
         return resource_error(
             resource,
             ERROR_INVALID_REQUEST,
-            Some(static_text(ONLY_TOPIC_RESOURCES)),
+            Some(StrBytes::from_static_str(ONLY_TOPIC_RESOURCES)),
         );
     }
     let name = resource.resource_name.as_str();
@@ -249,13 +258,13 @@ async fn alter_one(
         }
     }
 
-    let planned = match plan_retention_update(resource.configs.iter().map(|config| {
+    let expiry = match plan_retention_update(resource.configs.iter().map(|config| {
         (
             config.name.as_str(),
             config.value.as_ref().map(StrBytes::as_str),
         )
     })) {
-        Ok(planned) => planned,
+        Ok(expiry) => expiry,
         Err(fault) => {
             return resource_error(
                 resource,
@@ -267,18 +276,18 @@ async fn alter_one(
     // Kafka's AlterConfigs replaces the whole set, so an empty list is a reset.
     // This gateway patches named keys. Reporting success would hide that the
     // previous expiry is still stored.
-    let Some(planned) = planned else {
+    let Some(expiry) = expiry else {
         return resource_error(
             resource,
             ERROR_INVALID_CONFIG,
-            Some(static_text(
+            Some(StrBytes::from_static_str(
                 "an empty configs list is rejected because this gateway patches named keys and does not replace the topic configuration",
             )),
         );
     };
 
     // `validate_only` already performed the existence read and the same key checks.
-    // It does not call `update_topic` and does not change synonym memory.
+    // It does not call `update_topic`.
     if validate_only {
         return resource_error(resource, ERROR_NONE, None);
     }
@@ -286,7 +295,12 @@ async fn alter_one(
     // Do not start the write once the deadline has passed, and do not wrap it in
     // `timeout_at`. Dropping that future does not abort the SDK task, so
     // `UpdateTopic` can commit after this handler has already answered
-    // REQUEST_TIMED_OUT. A short retention then deletes sealed segments.
+    // REQUEST_TIMED_OUT. A short retention then deletes sealed segments. This is a
+    // policy choice about *this* handler's own deadline, independent of
+    // `update_kafka_topic_message_expiry` itself: that bridge call already wraps its
+    // SDK round trip in `with_request_timeout` (see `topics.rs`), so the write it
+    // starts is never unbounded - it can simply still be in flight when this
+    // handler's own, shorter deadline has already elapsed.
     if Instant::now() >= deadline {
         tracing::warn!(
             resource = name,
@@ -294,15 +308,8 @@ async fn alter_one(
         );
         return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
     }
-    match bridge
-        .update_kafka_topic_message_expiry(name, planned.expiry)
-        .await
-    {
+    match bridge.update_kafka_topic_message_expiry(name, expiry).await {
         Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
-            // Keyed by the mapped Iggy stream and topic, not the Kafka name.
-            let (stream, iggy_topic) = bridge.topic_identity(name);
-            state
-                .record_retention_synonyms(IggyTopicKey::new(stream, iggy_topic), planned.synonyms);
             resource_error(resource, ERROR_NONE, None)
         }
         Err(error) => {
@@ -322,4 +329,61 @@ fn resource_error(
         .with_error_message(error_message)
         .with_resource_type(resource.resource_type)
         .with_resource_name(resource.resource_name.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::acl::PrincipalPermissions;
+
+    fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            username: "alice".to_string(),
+            permissions: PrincipalPermissions {
+                manage_topics,
+                ..PrincipalPermissions::default()
+            },
+            permissions_known,
+        }
+    }
+
+    fn resource(name: &str) -> AlterConfigsResource {
+        AlterConfigsResource::default()
+            .with_resource_type(RESOURCE_TYPE_TOPIC)
+            .with_resource_name(StrBytes::from(name.to_string()))
+    }
+
+    #[test]
+    fn no_principal_is_not_gated() {
+        assert!(authorize(None, &[resource("orders")]).is_none());
+    }
+
+    #[test]
+    fn a_principal_with_manage_topics_is_allowed() {
+        let principal = principal(true, true);
+        assert!(authorize(Some(&principal), &[resource("orders")]).is_none());
+    }
+
+    #[test]
+    fn a_principal_without_manage_topics_is_denied_every_resource() {
+        let principal = principal(false, true);
+        let responses = authorize(
+            Some(&principal),
+            &[resource("orders"), resource("payments")],
+        )
+        .expect("denied");
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses
+                .iter()
+                .all(|r| r.error_code == ERROR_TOPIC_AUTHORIZATION_FAILED)
+        );
+    }
+
+    #[test]
+    fn unread_permissions_fail_closed() {
+        let principal = principal(true, false);
+        let responses = authorize(Some(&principal), &[resource("orders")]).expect("denied");
+        assert_eq!(responses[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
+    }
 }

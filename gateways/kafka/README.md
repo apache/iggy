@@ -6,10 +6,13 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > CreateTopics, DescribeConfigs and AlterConfigs use Iggy. With the bridge off (the default), those
 > seven are stubs: Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6),
 > CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), and Metadata reports
-> every requested topic unknown. **CreateTopics runs as the bridge's own
+> every requested topic unknown. **CreateTopics and AlterConfigs run as the bridge's own
 > Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that
-> can reach this port can create topics (up to 1000 partitions each). Every client reads and writes
-> as the bridge's Iggy user. See [docs/SCOPE.md](docs/SCOPE.md).
+> can reach this port can create topics (up to 1000 partitions each) or shorten a topic's
+> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With SASL on,
+> `AlterConfigs` additionally requires the authenticated principal to hold `manage_topics`; without
+> it every resource in the request fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written.
+> Every client reads and writes as the bridge's Iggy user. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
