@@ -65,7 +65,7 @@ flush_timeout = "30s"
 batch_size = 1000
 
 # Flush once the encoded buffer reaches this many bytes, regardless of
-# batch_size. QWP caps a single frame at roughly 2 MiB by default and the row
+# batch_size. QWP caps a single frame at roughly 4 MiB by default and the row
 # API does not split an oversized buffer, so this keeps a batch of wide rows
 # from being rejected whole.
 max_flush_bytes = 1000000

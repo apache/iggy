@@ -56,17 +56,18 @@ verbose_logging = false
 | `timestamp_source` | `message` | `message`, `origin`, `payload`, or `server`. |
 | `timestamp_field` | none | Payload field carrying the timestamp. Required when `timestamp_source = "payload"`. |
 | `timestamp_unit` | `auto` | `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers from magnitude. |
-| `symbol_columns` | `[]` | Payload fields stored as `SYMBOL` instead of `VARCHAR`. |
-| `uuid_columns` | `[]` | Payload fields holding canonical RFC-4122 strings, stored as `UUID`. |
+| `symbol_columns` | `[]` | Payload fields stored as `SYMBOL` instead of `VARCHAR`. A listed field must hold a scalar, and a record carrying an object or an array there is rejected rather than losing the value. Matched without regard to case. |
+| `uuid_columns` | `[]` | Payload fields holding canonical RFC-4122 strings, stored as `UUID`. A listed field must hold a string, and a record carrying another type there is rejected. Matched without regard to case, as QuestDB resolves column names. |
 | `include_stream_column` | `true` | Write the Iggy stream name as a `SYMBOL`. |
 | `include_topic_column` | `true` | Write the Iggy topic name as a `SYMBOL`. |
 | `include_partition_column` | `false` | Write `partition_id` as a `LONG`. |
 | `include_offset_column` | `false` | Write `offset` as a `LONG`. |
 | `include_headers` | `false` | Write each message header as a `header_<key>` `VARCHAR`. |
 | `ack_level` | `ok` | `ok` waits for server acceptance; `durable` waits for the Enterprise durable-ACK barrier. |
-| `flush_timeout` | `30s` | How long to wait for the configured ack level. |
+| `flush_timeout` | `30s` | How long to wait for the configured ack level, for the whole batch. `0s` at `ack_level = "ok"` means fire and forget: the sink publishes and does not wait. `0s` is refused at `ack_level = "durable"`, because a zero timeout never expires. |
 | `batch_size` | `1000` | Maximum rows per flush. |
 | `max_flush_bytes` | `1000000` | Flush once the encoded buffer reaches this many bytes, regardless of `batch_size`. See below. |
+| `numbers_as_double` | `false` | Write every JSON number as a `DOUBLE`. See the note below. |
 | `log_rejected_payload` | `false` | Include a truncated payload in the log line for a rejected message. Off by default because a rejected payload is still user data. |
 | `verbose_logging` | `false` | Raise per-batch logs from `debug` to `info`. |
 
@@ -172,8 +173,18 @@ since none of those can be inferred from a JSON payload.
 QuestDB stores only `DOUBLE` arrays, so integer arrays are widened. `BOOLEAN`
 has no null representation: an omitted boolean reads back as `false`.
 
+JSON carries a single number type, so a producer that writes `2` for a whole
+value and `2.5` for a fractional one gives the same field two different QuestDB
+types. QuestDB pins a column's type to whichever record created it and refuses
+the records that disagree, which the connector reports per record. Set
+`numbers_as_double = true` to make the type follow the column name instead.
+Integers are then stored as `DOUBLE`, which is exact only below 2^53.
+
 Every QuestDB table has a designated timestamp and the client cannot name it, so
-an auto-created table calls it `timestamp`. For a different name, pre-create the
+an auto-created table calls it `timestamp`. A payload field named `timestamp` is
+therefore written as an ordinary column beside it, which the server can refuse.
+Rename that field with a transform, or pre-create the table with an explicit
+`timestamp(<name>)` clause. For a different name, pre-create the
 table with an explicit `timestamp(<name>)` clause. The field named by
 `timestamp_field` is written only as the designated timestamp, never also as a
 data column.
