@@ -40,7 +40,10 @@ jobs:
   # Common checks - always run
   common:
     name: Common checks
+    needs: detect
     uses: ./.github/workflows/_common.yml
+    with:
+      validate-third-party-licenses: ${{ needs.detect.outputs.third_party_licenses == 'true' }}
     permissions:
       contents: read
       pull-requests: read
