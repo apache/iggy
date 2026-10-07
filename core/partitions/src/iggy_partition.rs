@@ -1957,7 +1957,7 @@ where
         if self.materialization_missing || !self.ensure_wal_view() {
             return;
         }
-        // The shard's bounded pre-pass owns superblock I/O across partitions.
+        // The file lane must persist the superblock before WAL acks can advance.
         if self.superblock.is_some() && self.consensus.needs_superblock_persist() {
             return;
         }
@@ -5848,6 +5848,7 @@ where
     pub fn interrupt_io(&mut self, identity: crate::PartitionIoIdentity) {
         if self.io_active.get() == Some(identity) {
             self.fence_flush_failure();
+            self.notify_io();
         }
     }
 
@@ -20170,6 +20171,42 @@ mod tests {
             &replies[0].1.as_slice()[..size_of::<ReplyHeader>()],
         );
         assert_eq!(reply.status, IggyError::TransientNotAccepted.as_code());
+    }
+
+    #[compio::test]
+    async fn given_shutdown_waiting_for_io_when_interrupted_should_notify_and_keep_resources() {
+        let mut partition = partition_at_view(1, 1);
+        partition.set_superblock(Rc::new(RecordingSuperblock::default()), None);
+        let notifications = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&notifications);
+        partition.set_io_notifier(
+            Rc::new(move |_, _| observed.set(observed.get() + 1)),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        assert!(!partition.persist_superblock_if_needed().await);
+        let config = repair_config();
+        let crate::PartitionIoStep::Ready(plan) = partition.resume_io(&config).await else {
+            panic!("view persistence must be ready");
+        };
+        let captured = partition.capture_io(plan, &config).unwrap().unwrap();
+
+        partition.begin_shutdown_io();
+        assert!(matches!(
+            partition.resume_io(&config).await,
+            crate::PartitionIoStep::Pending
+        ));
+        assert!(!partition.shutdown_io_complete());
+        notifications.set(0);
+
+        captured.quiescence.interrupt();
+        partition.interrupt_io(captured.identity);
+        assert!(notifications.get() > 0, "the shutdown owner must be ready");
+        partition.resume_io(&config).await;
+
+        assert!(partition.shutdown_io_complete());
+        assert_eq!(partition.io_active.get(), Some(captured.identity));
+        assert_eq!(captured.quiescence.get(), Some(captured.identity));
+        assert!(partition.superblock_lock.try_acquire().is_none());
     }
 
     #[compio::test]

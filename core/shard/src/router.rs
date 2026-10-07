@@ -588,12 +588,13 @@ where
             self.service_partition_io().await;
             self.process_loopback(loopback).await;
             let finished = !self.partition_io.has_ready()
+                && self.partition_io.outstanding() == 0
                 && namespaces.iter().all(|namespace| {
                     partitions
                         .get_io_owner(namespace)
                         .is_none_or(|partition| partition.shutdown_io_complete())
                 });
-            if finished && self.partition_io.outstanding() == 0 {
+            if finished {
                 break;
             }
             futures::select_biased! {
