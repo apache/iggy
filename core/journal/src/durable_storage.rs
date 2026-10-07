@@ -29,6 +29,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::warn;
 
@@ -71,6 +72,15 @@ pub trait DurableStorage {
     /// Returns an error if the absolute identity cannot be resolved.
     fn writer_identity(&self, _path: &Path) -> io::Result<Option<std::path::PathBuf>> {
         Ok(None)
+    }
+
+    /// Timer bounding a wait. The future must not resolve before `duration`
+    /// has elapsed, and one that never resolves disables the timeout. The
+    /// default needs a compio runtime and panics outside one. Only the
+    /// writer-lease drain wait on partition WAL reopen uses it, so overriding
+    /// it does not make other partition WAL timers executor-agnostic.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+        compio::runtime::time::sleep(duration)
     }
 
     /// # Errors

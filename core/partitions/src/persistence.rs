@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::ConsumerKind;
 use journal::PartitionPrepareJournal;
@@ -234,7 +234,7 @@ static WRITERS: LazyLock<Mutex<HashMap<PathBuf, WriterRegistration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl WriterLease {
-    async fn acquire(key: PathBuf) -> io::Result<Arc<Self>> {
+    async fn acquire<S: DurableStorage>(key: PathBuf, storage: &S) -> io::Result<Arc<Self>> {
         loop {
             let previous = {
                 let mut writers = WRITERS
@@ -281,32 +281,34 @@ impl WriterLease {
                     "partition WAL already has an active writer",
                 ));
             }
-            compio::runtime::time::timeout(
-                PERSISTENCE_DRAIN_TIMEOUT,
-                futures::future::poll_fn(|context| {
-                    let mut waiters = previous
-                        .waiters
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !previous.running.load(Ordering::Acquire) {
-                        return std::task::Poll::Ready(());
-                    }
-                    if !waiters
-                        .iter()
-                        .any(|waiter| waiter.will_wake(context.waker()))
-                    {
-                        waiters.push(context.waker().clone());
-                    }
-                    std::task::Poll::Pending
-                }),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "retired partition WAL writer did not stop",
-                )
-            })?;
+            let drained = futures::future::poll_fn(|context| {
+                let mut waiters = previous
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !previous.running.load(Ordering::Acquire) {
+                    return std::task::Poll::Ready(());
+                }
+                if !waiters
+                    .iter()
+                    .any(|waiter| waiter.will_wake(context.waker()))
+                {
+                    waiters.push(context.waker().clone());
+                }
+                std::task::Poll::Pending
+            })
+            .fuse();
+            let expired = storage.sleep(PERSISTENCE_DRAIN_TIMEOUT).fuse();
+            futures::pin_mut!(drained, expired);
+            futures::select_biased! {
+                () = drained => {}
+                () = expired => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "retired partition WAL writer did not stop",
+                    ));
+                }
+            }
             let mut writers = WRITERS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -562,7 +564,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             )
         })?;
         let lease = if let Some(key) = storage.writer_identity(partition_directory)? {
-            Some(WriterLease::acquire(key).await?)
+            Some(WriterLease::acquire(key, &storage).await?)
         } else {
             None
         };
