@@ -21,7 +21,7 @@ use crate::poll_plan::{PollPlan, PollReadResult};
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use crate::{PollCompletion, PollReplication};
-use ahash::AHashSet;
+use ahash::AHashMap;
 use consensus::{
     Consensus, Plane, PlaneIdentity, VsrConsensus, build_deny_reply_from_request_header,
 };
@@ -108,7 +108,7 @@ where
     /// `partitions` / `namespace_to_local` does NOT hold here. Compio's
     /// per-shard runtime is single-threaded, so runtime borrow checks
     /// suffice; callers must not hold a borrow across `.await`.
-    tombstoned: RefCell<AHashSet<IggyNamespace>>,
+    tombstoned: RefCell<AHashMap<IggyNamespace, Option<u64>>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
@@ -133,7 +133,7 @@ where
             config,
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
-            tombstoned: RefCell::new(AHashSet::new()),
+            tombstoned: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             persistence_notifier: RefCell::new(None),
             #[cfg(debug_assertions)]
@@ -149,7 +149,7 @@ where
             partitions: UnsafeCell::new(Vec::with_capacity(capacity)),
             // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
-            tombstoned: RefCell::new(AHashSet::new()),
+            tombstoned: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             persistence_notifier: RefCell::new(None),
             #[cfg(debug_assertions)]
@@ -447,21 +447,37 @@ where
     }
 
     pub fn is_tombstoned(&self, namespace: &IggyNamespace) -> bool {
-        self.tombstoned.borrow().contains(namespace)
+        self.tombstoned.borrow().contains_key(namespace)
     }
 
     /// Snapshot every tombstoned namespace, including ones never
     /// materialised: a boot-time damage verdict fences a namespace before
     /// any partition exists, so it appears in no other view of this map.
     pub fn tombstoned_namespaces(&self) -> Vec<IggyNamespace> {
-        self.tombstoned.borrow().iter().copied().collect()
+        self.tombstoned.borrow().keys().copied().collect()
     }
 
     /// Mark a namespace as tombstoned. Callable from any task on the
     /// shard's runtime (reconciler sets the fence synchronously before
     /// awaiting disk delete).
     pub fn tombstone(&self, namespace: IggyNamespace) {
-        self.tombstoned.borrow_mut().insert(namespace);
+        self.tombstoned
+            .borrow_mut()
+            .entry(namespace)
+            .or_insert(None);
+    }
+
+    /// A permanent recovery failure, unlike a temporary teardown tombstone.
+    /// Retirement must persist this incarnation's fence before reporting success.
+    pub fn fence(&self, namespace: IggyNamespace, created_revision: u64) {
+        self.tombstoned
+            .borrow_mut()
+            .insert(namespace, Some(created_revision));
+    }
+
+    #[must_use]
+    pub fn failed_revision(&self, namespace: &IggyNamespace) -> Option<u64> {
+        self.tombstoned.borrow().get(namespace).copied().flatten()
     }
 
     /// Clear a namespace tombstone. Pump-side hook called from

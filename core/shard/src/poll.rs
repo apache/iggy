@@ -31,7 +31,7 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
-use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
@@ -56,6 +56,18 @@ mod timeout_tests;
 pub struct ConsumerAttachment {
     pub session: SessionAttachment,
     pub metadata: PollMetadata,
+}
+
+impl ConsumerAttachment {
+    pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
+        if !is_partition_receipt_operation(operation) {
+            return Err(IggyError::InvalidCommand);
+        }
+        if !self.session.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        Ok(())
+    }
 }
 
 /// A read result awaiting acceptance by its partition owner.
@@ -86,20 +98,12 @@ where
     M: StreamsFrontend,
     SB: SuperblockStore,
 {
-    pub(crate) fn validate_offset_attachment(
+    pub(crate) fn validate_partition_attachment(
         &self,
         request: &Message<RoutedRequestHeader>,
         attachment: &ConsumerAttachment,
     ) -> Result<(), IggyError> {
-        if !matches!(
-            request.header().operation,
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-        ) {
-            return Err(IggyError::InvalidCommand);
-        }
-        if !attachment.session.is_valid() {
-            return Err(IggyError::StaleClient);
-        }
+        attachment.validate_write(request.header().operation)?;
         let namespace = IggyNamespace::from_raw(request.header().group);
         if !attachment
             .metadata
@@ -139,6 +143,20 @@ where
         reply: Sender<PartitionReadReply>,
     ) {
         let partitions = self.plane.partitions();
+        if matches!(read, PartitionRead::SessionRetired { .. }) {
+            let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
+                partitions
+                    .with_partition(&namespace, |partition| {
+                        partition.fatal().map(|_| partition.created_revision())
+                    })
+                    .flatten()
+            });
+            if let Some(created_revision) = failed_revision {
+                let _ = reply
+                    .try_send(PartitionReadReply::SessionRetirementFailed { created_revision });
+                return;
+            }
+        }
         let rejected = partitions
             .with_partition(&namespace, |partition| {
                 if partition.requires_state_transfer() {
@@ -172,6 +190,11 @@ where
             read => (read, None),
         };
         let result = match read {
+            PartitionRead::SessionRetired { identity } => partitions
+                .with_partition(&namespace, |partition| {
+                    PartitionReadReply::SessionRetired(partition.session_retired(identity))
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();

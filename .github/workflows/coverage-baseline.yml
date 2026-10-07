@@ -105,7 +105,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.18
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: cargo-llvm-cov
 
@@ -300,7 +300,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.18
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: cargo-llvm-cov
 
@@ -597,7 +597,7 @@ jobs:
           task: test
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.0.0
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/cpp-coverage.lcov

@@ -22,7 +22,9 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import org.apache.iggy.client.ConnectionInfo;
+import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
@@ -194,6 +196,11 @@ final class PollRouter {
             }
             Attachment attachment = new Attachment(
                     response.readLongLE(), response.readLongLE(), response.readLongLE(), response.readLongLE());
+            long generation = parent.sessionGeneration();
+            byte[] bindSecret = parent.bindSecret(attachment.clientLow, attachment.clientHigh, attachment.session);
+            if (generation != parent.sessionGeneration()) {
+                throw new IggyClientException("Parent session changed while decoding a poll route");
+            }
             var node = BytesDeserializer.readClusterNode(response);
             if (response.isReadable() || node.endpoints().tcp() == 0) {
                 throw new IggyClientException("Invalid TCP primary poll routing response");
@@ -204,7 +211,8 @@ final class PollRouter {
                         new ConnectionInfo(node.ip(), node.endpoints().tcp()),
                         attachment.withWatermark(metadataWatermark),
                         parent,
-                        parent.sessionGeneration());
+                        generation,
+                        bindSecret);
                 if (routes.size() >= MAX_ROUTES) {
                     routes.clear();
                 }
@@ -362,22 +370,17 @@ final class PollRouter {
             CompletableFuture<Void> ready;
             if (connection == null) {
                 AsyncTcpConnection data = connectData.apply(route.endpoint);
+                data.bindSharedSession(
+                        route.attachment.clientLow,
+                        route.attachment.clientHigh,
+                        route.attachment.session,
+                        route.bindSecret);
                 connection = data;
                 if (poll.result.isDone()) {
                     close();
                     return CompletableFuture.failedFuture(uncommitted());
                 }
-                ready = data.connect().thenCompose(ignored -> {
-                    if (poll.result.isDone()) {
-                        return CompletableFuture.failedFuture(uncommitted());
-                    }
-                    var authentication = route.parent.authenticationSnapshot();
-                    if (authentication.isEmpty()) {
-                        return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated"));
-                    }
-                    var login = authentication.get();
-                    return data.send(login.commandCode(), login.payload()).thenAccept(ByteBuf::release);
-                });
+                ready = data.connect();
             } else {
                 ready = CompletableFuture.completedFuture(null);
             }
@@ -396,7 +399,7 @@ final class PollRouter {
             if (current != null && current.covers(data, route.attachment)) {
                 return CompletableFuture.completedFuture(null);
             }
-            return data.send(CommandCode.System.ATTACH_CONSUMER_SESSION, route.attachment.encode())
+            return data.send(CommandCode.System.BIND_SESSION, route.attachment.encode(route.bindSecret))
                     .thenAccept(response -> {
                         response.release();
                         synchronized (this) {
@@ -480,9 +483,20 @@ final class PollRouter {
         }
     }
 
-    private record Route(ConnectionInfo endpoint, Attachment attachment, AsyncTcpConnection parent, long generation) {}
+    private record Route(
+            ConnectionInfo endpoint,
+            Attachment attachment,
+            AsyncTcpConnection parent,
+            long generation,
+            byte[] bindSecret) {}
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
+        private Attachment {
+            if ((clientLow == 0 && clientHigh == 0) || session == 0) {
+                throw new IggyClientException("Invalid primary poll session identity");
+            }
+        }
+
         boolean covers(Attachment required) {
             return clientLow == required.clientLow
                     && clientHigh == required.clientHigh
@@ -496,12 +510,9 @@ final class PollRouter {
                     : new Attachment(clientLow, clientHigh, session, floor);
         }
 
-        ByteBuf encode() {
-            return Unpooled.buffer(ATTACHMENT_BYTES)
-                    .writeLongLE(clientLow)
-                    .writeLongLE(clientHigh)
-                    .writeLongLE(session)
-                    .writeLongLE(watermark);
+        ByteBuf encode(byte[] bindSecret) {
+            return VsrRequestEncoder.bindSession(
+                    UnpooledByteBufAllocator.DEFAULT, clientLow, clientHigh, session, watermark, bindSecret);
         }
     }
 }

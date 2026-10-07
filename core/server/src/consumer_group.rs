@@ -382,11 +382,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
+        assert_eq!(
             ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&accepted))
                 .unwrap()
-                .in_flight
-                .is_empty()
+                .in_flight,
+            [] as [u32; 0]
         );
         apply_join(&shard, &accepted);
         assert_eq!(
@@ -699,7 +699,7 @@ mod tests {
     /// Create a group and routes for two partitions, with no members or local
     /// partitions. Tests install partition state and apply joins explicitly.
     fn group_shard() -> Rc<TestShard> {
-        let shard = partition_read_shard();
+        let shard = partition_read_shard(3);
         let mux = &shard.plane.metadata().mux_stm;
         mux.update(prepare_message(
             Operation::CreateStream,
@@ -758,7 +758,7 @@ mod tests {
 
     /// Build a shard with its own inbox so tests can serve group progress reads
     /// and clears through the production message pump.
-    fn partition_read_shard() -> Rc<TestShard> {
+    pub(super) fn partition_read_shard(replica_count: u8) -> Rc<TestShard> {
         // These tests do not dispatch disk polls, so keep that lane minimal.
         const POLL_COMPLETION_CAPACITY: usize = 1;
 
@@ -766,7 +766,7 @@ mod tests {
         let consensus = VsrConsensus::new(
             1,
             0,
-            3,
+            replica_count,
             server_common::sharding::METADATA_GROUP,
             bus.clone(),
             LocalPipeline::new(),
@@ -800,7 +800,7 @@ mod tests {
                 replies,
                 POLL_COMPLETION_CAPACITY,
                 PapayaShardsTable::new(),
-                PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
+                PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus),
                 None,
                 ShardMetrics::for_shard(),
             )
@@ -911,7 +911,7 @@ mod tests {
 
     /// Poll the shard's message pump alongside the operation until it finishes.
     /// This serves progress reads and also executes any requested stale clears.
-    async fn run_with_partition_message_pump<T>(
+    pub(super) async fn run_with_partition_message_pump<T>(
         shard: &Rc<TestShard>,
         operation: impl Future<Output = T>,
     ) -> T {

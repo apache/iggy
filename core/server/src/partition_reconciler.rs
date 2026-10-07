@@ -659,11 +659,15 @@ async fn reconcile_additions(
             // delete that failed leaves the tombstone standing with no
             // `ConfirmRemove` behind it -- the same permanent fence the in-map
             // branch above escapes, told apart by the same signal.
-            if ctx.has_pending_delete_failure(ns) {
+            if ctx.has_pending_delete_failure(ns)
+                || partitions
+                    .failed_revision(&ns)
+                    .is_some_and(|failed| failed < epoch)
+            {
                 trace!(
                     shard = shard_id,
                     ns_raw = ns.inner(),
-                    "additions: ns tombstoned before materialisation with a failed disk delete; re-driving teardown"
+                    "additions: removing fenced files of a superseded or incompletely deleted incarnation"
                 );
                 tear_down_owned_partition(ctx, ns, counters).await;
                 continue;
@@ -1497,10 +1501,9 @@ mod tests {
         PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
-        RequestPreparesHeader, RoutedRequestHeader, WireIdentifier, WireOptions,
+        AckLevel, Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestPreparesHeader, RoutedRequestHeader, WireConsumer, WireIdentifier, WireOptions,
     };
-    use journal::Journal;
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
     use metadata::MuxStateMachine;
@@ -1570,6 +1573,7 @@ mod tests {
         header.size = u32::try_from(total_size).expect("prepare size fits u32");
         header.op = op;
         header.operation = operation;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
         msg
     }
 
@@ -2348,14 +2352,11 @@ mod tests {
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
-        .await
-        .expect("redundant build succeeds over the live incarnation's path");
-        ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
-            namespace: ns,
-            partition: Box::new(redundant),
-            epoch: LIVE_EPOCH + 1,
-        });
-        ctx.shard.apply_reconcile_ops();
+        .await;
+        assert!(
+            redundant.is_err(),
+            "the live WAL must retain its exclusive writer"
+        );
 
         assert_eq!(
             shard.plane.partitions().len(),
@@ -3175,42 +3176,76 @@ mod tests {
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
-        let served = CreateStreamRequest {
-            name: WireName::new("served-op").expect("test stream name fits WireName"),
-            options: WireOptions::empty(),
+        let served = iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::NoAck,
         };
         {
             let partitions = shard.plane.partitions();
             let partition = partitions
                 .get_mut_by_ns(&ns)
                 .expect("partition is materialised");
-            // Ops 5..=7 committed and evicted after the request went out, op 8
-            // is the served remainder, and the window's first batch sits above
-            // the boot-recovered durable end.
-            partition.consensus().restore_commit_state(7, 8);
-            partition.recovered_durable_offset = Some(10);
-            partition
-                .log
-                .journal()
-                .inner
-                .append(build_prepare(8, Operation::CreateStream, &served).into_frozen())
-                .await
-                .expect("journal the served op");
             partition.repair = Some(RepairSession {
                 nonce: NONCE,
                 view: 0,
                 commit_to_op: 8,
                 fetch_to_op: 8,
-                floor: Some(5),
+                floor: None,
                 peer: 1,
-                first_batch_offset: Some(20),
+                first_batch_offset: None,
                 idle_ticks: 0,
             });
+            for op in 1..=8 {
+                let parent = partition.consensus().last_prepare_checksum();
+                let group = partition.consensus().group();
+                let cluster = partition.consensus().cluster();
+                let prepare = build_prepare(op, Operation::StoreConsumerOffset, &served)
+                    .transmute_header(|old, header| {
+                        *header = old;
+                        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+                        header.session = 1;
+                        header.request = op;
+                        header.parent = parent;
+                        header.group = group;
+                        header.cluster = cluster;
+                        header.checksum = header.identity_checksum();
+                    });
+                partition.apply_repaired_prepare(prepare).await;
+                if op < 8 {
+                    partition.consensus().advance_commit_max(op);
+                    partition.commit_journal(partitions.config()).await;
+                }
+            }
+            assert_eq!(partition.consensus().commit_min(), 7);
+            partition.consensus().advance_commit_max(8);
+            partition.recovered_durable_offset = Some(10);
+            let repair = partition.repair.as_mut().expect("repair remains armed");
+            repair.floor = Some(5);
+            repair.first_batch_offset = Some(20);
         }
 
-        shard
-            .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
-            .await;
+        compio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                shard
+                    .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+                    .await;
+                if shard
+                    .plane
+                    .partitions()
+                    .get_by_ns(&ns)
+                    .is_some_and(|partition| partition.repair.is_none())
+                {
+                    break;
+                }
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("repair finishes after its WAL becomes durable");
 
         let partitions = shard.plane.partitions();
         let partition = partitions
@@ -3314,6 +3349,15 @@ mod tests {
         assert!(partitions.contains(&ns));
         let partition_root = ctx.config.get_partition_path(0, 0, 0);
         assert!(std::path::Path::new(&partition_root).exists());
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-wedge",
+            vec![assignment(0, 1)],
+        );
 
         // Reconstruct the post-failed-teardown state: tombstone set +
         // shards_table row gone + a `FailureCause::Delete` record, but the
@@ -3521,6 +3565,47 @@ mod tests {
         assert!(!partitions.is_tombstoned(&ns));
     }
 
+    #[compio::test]
+    async fn given_retirement_fence_when_topic_recreated_between_passes_should_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "old", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let old_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| inner.revision);
+        shard.plane.partitions().fence(namespace, old_revision);
+        crate::partition_helpers::record_partition_retirement_fence(
+            &ctx.config.get_system_path(),
+            namespace,
+            old_revision,
+        )
+        .await
+        .unwrap();
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "new",
+            vec![assignment(0, 1)],
+        );
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(!shard.plane.partitions().is_tombstoned(&namespace));
+        assert!(
+            shard.plane.partitions().contains(&namespace),
+            "a fence for the deleted incarnation must not strand its replacement"
+        );
+    }
+
     /// The sibling guard: while the namespace is STILL in the committed
     /// target, the fenced-ghost sweep must not touch it -- only an operator
     /// delete authorises destroying the bytes the fence guards. (The
@@ -3627,6 +3712,15 @@ mod tests {
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         assert!(partitions.contains(&ns));
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-defer-skip",
+            vec![assignment(0, 1)],
+        );
 
         // Post-successful-teardown, pre-drain state: fenced, unlinked, and a
         // `ConfirmRemove` queued but not yet applied. `ns` is still in the

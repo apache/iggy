@@ -39,6 +39,7 @@ public final class VsrOperation {
     public static final int REMOVE_CONSUMER_GROUP_MEMBER = 66;
     public static final int COMPLETE_CONSUMER_GROUP_REVOCATION = 67;
     public static final int TRUNCATE_PARTITION = 68;
+    public static final int FINALIZE_SESSION = 70;
 
     public static final int CREATE_STREAM = 128;
     public static final int UPDATE_STREAM = 129;
@@ -66,6 +67,7 @@ public final class VsrOperation {
     public static final int SEND_MESSAGES = 160;
     public static final int STORE_CONSUMER_OFFSET = 161;
     public static final int DELETE_CONSUMER_OFFSET = 162;
+    public static final int RETIRE_SESSION = 166;
 
     private static final int INTERNAL_START = 64;
     private static final int METADATA_START = 128;
@@ -114,6 +116,8 @@ public final class VsrOperation {
         KNOWN_OPERATIONS.set(SEND_MESSAGES);
         KNOWN_OPERATIONS.set(STORE_CONSUMER_OFFSET);
         KNOWN_OPERATIONS.set(DELETE_CONSUMER_OFFSET);
+        KNOWN_OPERATIONS.set(FINALIZE_SESSION);
+        KNOWN_OPERATIONS.set(RETIRE_SESSION);
     }
 
     private VsrOperation() {}

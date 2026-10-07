@@ -25,6 +25,8 @@ import { COMMAND_CODE } from '../command.code.js';
 import { serializeSendMessages } from '../message/message.utils.js';
 import { Partitioning } from '../message/partitioning.utils.js';
 
+const BIND_SECRET = Buffer.alloc(32, 0x5a);
+
 describe('VSR custom request framing', () => {
   it('encodes a custom non-replicated code and opaque payload', () => {
     const session = new VsrSession();
@@ -47,12 +49,13 @@ describe('VSR custom request framing', () => {
 
   it('rejects a truncated legacy login payload locally', () => {
     assert.throws(
-      () => prepareVsrCommand(COMMAND_CODE.LoginUser, Buffer.alloc(0))
+      () => prepareVsrCommand(COMMAND_CODE.LoginUser, Buffer.alloc(0), BIND_SECRET)
     );
     assert.throws(
       () => prepareVsrCommand(
         COMMAND_CODE.LoginUser,
-        Buffer.from([4, 0x69, 0x67])
+        Buffer.from([4, 0x69, 0x67]),
+        BIND_SECRET
       )
     );
   });
@@ -61,7 +64,8 @@ describe('VSR custom request framing', () => {
     const token = Buffer.from('secret');
     const prepared = prepareVsrCommand(
       COMMAND_CODE.LoginWithAccessToken,
-      Buffer.concat([Buffer.from([token.length]), token])
+      Buffer.concat([Buffer.from([token.length]), token]),
+      BIND_SECRET
     );
     assert.equal(
       prepared.command,
