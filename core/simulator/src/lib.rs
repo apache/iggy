@@ -300,9 +300,9 @@ impl Simulator {
     /// `checkpoint_if_needed` returns immediately and nothing produces the snapshot a
     /// state transfer serves.
     ///
-    /// Opt-in, and separate from the other constructors, because the coordinator
-    /// persists through `std::fs`: a harness that touches nothing outside memory
-    /// should not start writing files by omission. Writes are synchronous and never
+    /// Opt-in, and separate from the other constructors, because checkpoints use
+    /// synchronous snapshot I/O: a harness that touches nothing outside memory
+    /// should not start writing files by omission. Writes never
     /// touch the executor, so replay stays deterministic; the caller owns the
     /// directory's lifetime.
     ///
@@ -4681,6 +4681,35 @@ mod tests {
             "the restarted replica assigned different slab ids than a peer holding \
              the same committed log, so a namespace names different streams on each"
         );
+    }
+
+    #[test]
+    fn given_checkpointing_cluster_when_replayed_should_preserve_the_schedule() {
+        const SEED: u64 = 0xC4E0_0005;
+        const REPLICAS: u8 = 3;
+        const STREAMS: u32 = 40;
+
+        let (first, first_client, _first_root) =
+            checkpointing_cluster(REPLICAS, SEED, "replay", STREAMS);
+        let (second, second_client, _second_root) =
+            checkpointing_cluster(REPLICAS, SEED, "replay", STREAMS);
+
+        assert_eq!(first.schedule_hash(), second.schedule_hash());
+        for replica in 0..usize::from(REPLICAS) {
+            assert!(snapshot_floor(&first, replica) > 0);
+            assert_eq!(
+                snapshot_floor(&first, replica),
+                snapshot_floor(&second, replica)
+            );
+            assert_eq!(
+                committed_stream_names(&first, replica),
+                committed_stream_names(&second, replica)
+            );
+            assert_eq!(
+                client_watermark(&first, replica, first_client),
+                client_watermark(&second, replica, second_client)
+            );
+        }
     }
 
     /// A solo replica that checkpointed recovers the state the checkpoint absorbed.

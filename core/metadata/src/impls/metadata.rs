@@ -70,6 +70,8 @@ use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use std::cell::{Cell, RefCell};
 use std::io;
+#[cfg(feature = "simulator")]
+use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
@@ -153,7 +155,7 @@ impl IggySnapshot {
         let (sender, receiver) = oneshot::channel();
         compio::runtime::spawn(async move {
             let _permit = permit;
-            let result = Self::write_durably_inner(&path, encoded).await;
+            let result = Self::write_durably_inner(&path, encoded, SnapshotIo::Compio).await;
             let _ = sender.send(result);
         })
         .detach();
@@ -163,21 +165,25 @@ impl IggySnapshot {
     }
 
     #[allow(clippy::future_not_send)]
-    async fn write_durably_inner(path: &Path, mut encoded: Vec<u8>) -> Result<(), SnapshotError> {
+    async fn write_durably_inner(
+        path: &Path,
+        mut encoded: Vec<u8>,
+        storage: SnapshotIo,
+    ) -> Result<(), SnapshotError> {
         let trailer = snapshot_trailer(&encoded);
         encoded.extend_from_slice(&trailer);
         let tmp_path = path.with_extension("bin.tmp");
 
-        let mut file = compio::fs::File::create(&tmp_path)
+        let mut file = storage
+            .create(&tmp_path)
             .await
             .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Write,
                 source: e,
             })?;
-        file.write_all_at(encoded, 0)
+        file.write_all(encoded)
             .await
-            .0
             .map_err(|source| SnapshotError::Persist {
                 stage: PersistStage::Write,
                 source,
@@ -188,7 +194,8 @@ impl IggySnapshot {
         })?;
         drop(file);
 
-        compio::fs::rename(&tmp_path, path)
+        storage
+            .rename(&tmp_path, path)
             .await
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Rename,
@@ -197,7 +204,8 @@ impl IggySnapshot {
 
         // Fsync the parent directory to ensure the rename is durable.
         if let Some(parent) = path.parent() {
-            let dir = compio::fs::File::open(parent)
+            let dir = storage
+                .open(parent)
                 .await
                 .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
                 .map_err(|e| SnapshotError::Persist {
@@ -234,6 +242,75 @@ impl IggySnapshot {
         let data = std::fs::read(path)?;
         let (payload, checksum) = split_trailer(&data)?;
         Ok((Self::decode(payload)?, checksum))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotIo {
+    Compio,
+    #[cfg(feature = "simulator")]
+    Synchronous,
+}
+
+enum SnapshotFile {
+    Compio(compio::fs::File),
+    #[cfg(feature = "simulator")]
+    Synchronous(std::fs::File),
+}
+
+#[allow(clippy::future_not_send)]
+impl SnapshotIo {
+    async fn create(self, path: &Path) -> io::Result<SnapshotFile> {
+        match self {
+            Self::Compio => compio::fs::File::create(path)
+                .await
+                .map(SnapshotFile::Compio),
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::File::create(path).map(SnapshotFile::Synchronous),
+        }
+    }
+
+    async fn open(self, path: &Path) -> io::Result<SnapshotFile> {
+        match self {
+            Self::Compio => compio::fs::File::open(path).await.map(SnapshotFile::Compio),
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::File::open(path).map(SnapshotFile::Synchronous),
+        }
+    }
+
+    async fn read(self, path: &Path) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Compio => compio::fs::read(path).await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::read(path),
+        }
+    }
+
+    async fn rename(self, source: &Path, target: &Path) -> io::Result<()> {
+        match self {
+            Self::Compio => compio::fs::rename(source, target).await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::rename(source, target),
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+impl SnapshotFile {
+    async fn write_all(&mut self, encoded: Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Compio(file) => file.write_all_at(encoded, 0).await.0,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous(file) => file.write_all(&encoded),
+        }
+    }
+
+    async fn sync_all(&self) -> io::Result<()> {
+        match self {
+            Self::Compio(file) => file.sync_all().await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous(file) => file.sync_all(),
+        }
     }
 }
 
@@ -349,6 +426,7 @@ impl Snapshot for IggySnapshot {
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
     create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+    io: SnapshotIo,
     /// Remaining-journal-slots threshold at which a checkpoint is forced.
     /// Defaults to [`Self::CHECKPOINT_MARGIN`]; bootstrap raises it to at
     /// least the configured prepare-queue depth (see the static assert and
@@ -378,9 +456,17 @@ impl<M> SnapshotCoordinator<M> {
         Self {
             data_dir,
             create_snapshot,
+            io: SnapshotIo::Compio,
             checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
             last_checkpoint: Cell::new((0, 0)),
         }
+    }
+
+    /// Complete snapshot I/O within one poll so host completions cannot change
+    /// the deterministic simulator's schedule. Select during replica construction.
+    #[cfg(feature = "simulator")]
+    pub const fn use_synchronous_io(&mut self) {
+        self.io = SnapshotIo::Synchronous;
     }
 
     /// Raise (never lower) the forced-checkpoint margin. Bootstrap calls
@@ -447,10 +533,21 @@ impl<M> SnapshotCoordinator<M> {
         // core, and the pairing is provably over the bytes that reach the file.
         let encoded = snapshot.encode()?;
         let checksum = checkpoint_checksum(&encoded);
-        let path = self.snapshot_path();
-        IggySnapshot::write_durably(&path, encoded).await?;
+        self.write_snapshot(encoded).await?;
         self.last_checkpoint.set((commit_op, checksum));
         Ok(checksum)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn write_snapshot(&self, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+        let path = self.snapshot_path();
+        match self.io {
+            SnapshotIo::Compio => IggySnapshot::write_durably(&path, encoded).await,
+            #[cfg(feature = "simulator")]
+            SnapshotIo::Synchronous => {
+                IggySnapshot::write_durably_inner(&path, encoded, self.io).await
+            }
+        }
     }
 
     /// Drain the snapshotted prefix below `last_op` to reclaim WAL space. Runs
@@ -1829,7 +1926,15 @@ where
         &self,
     ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
         let _checkpoint = self.checkpoint_lock.acquire().await;
-        let _snapshot_io = SNAPSHOT_IO.lock().await;
+        let _snapshot_io = if self
+            .coordinator
+            .as_ref()
+            .is_none_or(|coordinator| matches!(coordinator.io, SnapshotIo::Compio))
+        {
+            Some(SNAPSHOT_IO.lock().await)
+        } else {
+            None
+        };
         let consensus = self
             .consensus
             .as_ref()
@@ -1845,7 +1950,7 @@ where
             return Ok(Rc::clone(cached));
         }
         let path = coordinator.snapshot_path();
-        let sealed = compio::fs::read(&path).await.map_err(|source| {
+        let sealed = coordinator.io.read(&path).await.map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
                 StateTransferUnavailable::NoSnapshot
             } else {
@@ -2100,8 +2205,7 @@ where
                 );
                 let checksum = checkpoint_checksum(snapshot_bytes);
                 self.clear_state_transfer_offer_cache();
-                IggySnapshot::write_durably(&coordinator.snapshot_path(), snapshot_bytes.to_vec())
-                    .await?;
+                coordinator.write_snapshot(snapshot_bytes.to_vec()).await?;
                 coordinator.seed_last_checkpoint(snapshot_seq, checksum);
                 tracing::info!(
                     checkpoint_op = snapshot_seq,
