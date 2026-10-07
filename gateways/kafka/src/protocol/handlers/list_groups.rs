@@ -194,3 +194,53 @@ pub fn encode_error_response(version: i16, error_code: i16) -> Result<Bytes> {
     let response = ListGroupsResponse::default().with_error_code(error_code);
     encode_message(&response, version, 16)
 }
+
+#[cfg(test)]
+mod tests {
+    use kafka_protocol::protocol::StrBytes;
+
+    use super::{
+        API_KEY_LIST_GROUPS, GroupListing, encode_response, list_response_frame_len, listed_group,
+    };
+    use crate::protocol::header::response_header_version;
+
+    /// v0-v2 header is 4 bytes, v3+ is 5. v4 adds the state string and v3+ adds a tag byte.
+    /// Group id and protocol type sit past the compact-varint boundary so a 1-byte length
+    /// prefix cannot accidentally match.
+    #[test]
+    fn given_listings_when_pricing_v0_through_v5_should_match_the_encoder() {
+        let group_id = "g".repeat(200);
+        let protocol_type = "p".repeat(200);
+        let listings = vec![
+            GroupListing {
+                group_id: StrBytes::from_string(group_id.clone()),
+                protocol_type: StrBytes::from_string(protocol_type.clone()),
+                state: "CompletingRebalance",
+            },
+            GroupListing {
+                group_id: StrBytes::from_string(format!("!{group_id}")),
+                protocol_type: StrBytes::from_string(protocol_type),
+                state: "Empty",
+            },
+        ];
+        for version in 0..=5 {
+            let priced = list_response_frame_len(version, &listings);
+            let encoded = encode_response(
+                version,
+                listings.iter().cloned().map(listed_group).collect(),
+            )
+            .expect("list encodes");
+            let header = if response_header_version(API_KEY_LIST_GROUPS, version) >= 1 {
+                5
+            } else {
+                4
+            };
+            assert_eq!(
+                priced,
+                header + encoded.len(),
+                "version {version} priced {priced} encoded {}",
+                header + encoded.len()
+            );
+        }
+    }
+}

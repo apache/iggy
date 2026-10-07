@@ -15,7 +15,9 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
 > rebalances, graceful leave, session expiry and admin views of that membership
-> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
+> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list`,
+> `--describe --members` and `--describe --state` use those views. The default `--describe`
+> calls OffsetFetch (API key 9), which is not implemented, so that mode does not work. With the bridge off,
 > Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
 > Offset commit and fetch are not implemented yet, so a consumer must use `assign()` with explicit
 > start offsets and `enable.auto.commit=false`. The Java client needs no `group.id`. librdkafka

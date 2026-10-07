@@ -24,16 +24,32 @@ been manually tested.
 ## Admin views
 
 `DescribeGroups` and `ListGroups` read the same in-memory map the join path writes. State strings
-are `PreparingRebalance`, `CompletingRebalance` and `Stable`. `Empty` is not stored: a group with
-no members is removed. `Dead` is only the describe answer for an id that is not in the map.
+are `Empty`, `PreparingRebalance`, `CompletingRebalance` and `Stable`. `Empty` means the group
+has no joined members: a v4+ client has been handed a member id and has not rejoined with it yet.
+`Dead` is only the describe answer for an id that is not in the map.
 
-`ListGroups` does not expire sessions. Expiry runs when a request names a group, and a list names
-none, so a quiet group stays listed until something else touches it. `DescribeGroups` does tick
-each named group, so it reports the membership a heartbeat would see.
+A group with neither members nor pending member ids is removed. Kafka keeps an `Empty` group
+that only has committed offsets. Offsets are not stored here yet.
+TODO(#3542): once offset storage lands, keep those groups and report `Empty`.
+
+`ListGroups` does not tick. It leaves sessions, pending ids and phases untouched, and it omits a
+group whose member sessions and pending-id deadlines are all already past. `DescribeGroups` does
+tick each named group, so that same id is then `Dead`.
+
+While a group is not `Stable`, `DescribeGroups` leaves `protocol_data`, member metadata and
+member assignment empty. Kafka does the same: during `PreparingRebalance` the stored assignment
+is the previous generation, and a rejoined member has already replaced its subscription. A
+`Stable` group whose own description does not fit `max_frame_size` is returned in that same
+shape. Further groups that do not fit the remaining response are returned with a per-group
+`UNKNOWN_SERVER_ERROR` (-1). The connection stays open.
 
 A group id repeated in one `DescribeGroups` request is answered once, not once per repeat: a
 second snapshot of the same members would otherwise multiply the encoded response by the repeat
 count.
+
+`kafka-consumer-groups.sh --list`, `--describe --members` and `--describe --state` use these
+two APIs. The default `--describe` calls `OffsetFetch` (API key 9), which is not implemented,
+so that mode does not work. `--reset-offsets` needs the same API.
 
 Member `client_id` and `client_host` are empty. The coordinator does not keep the request
 header's client id or the connection's peer address. `include_authorized_operations` is answered
@@ -105,7 +121,9 @@ survivors keep the current generation and learn about the rebalance through
 rejoin rather than as lost partitions.
 
 When a group empties, by leave or by expiry, it is dropped, so the next group under that name
-starts again at generation 1. Kafka instead keeps the `Empty` group and its generation. This is
+starts again at generation 1. The pending-member-id window above is the one case that stays and
+reports `Empty`. Kafka also keeps an `Empty` group that only has committed offsets, and its
+generation with it. This coordinator does not, until offset storage lands (#3542). This is
 safe because member ids carry a UUID and every generation check is preceded by a membership
 check, so a stale client is told `UNKNOWN_MEMBER_ID` before its generation is ever compared.
 

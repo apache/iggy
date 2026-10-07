@@ -31,10 +31,10 @@ use kafka_protocol::messages::{DescribeGroupsRequest, DescribeGroupsResponse, Gr
 use kafka_protocol::protocol::StrBytes;
 
 use crate::error::Result;
-use crate::group::{DescribeGroupsView, GroupDescription, MemberDescription};
+use crate::group::{DESCRIBE_RESPONSE_TOO_LARGE, GroupDescription, MemberDescription};
 use crate::protocol::api::{
-    API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ERROR_GROUP_ID_NOT_FOUND, GatewayState,
-    HandleOutcome, is_supported_version,
+    API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ERROR_GROUP_ID_NOT_FOUND, ERROR_NONE,
+    ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_describe_groups_shape;
 use crate::protocol::dedup::dedup_first_seen;
@@ -86,39 +86,49 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // One result per distinct id. Repeating one group would otherwise copy its members into the
     // response once per copy, and the shape guard only charges the id strings.
     let group_ids = dedup_first_seen(&requested);
-    match state
+    let described = state
         .groups
         .describe_groups(&group_ids, api_version, state.max_frame_size)
-        .await
-    {
-        DescribeGroupsView::ExceedsFrame { encoded_bytes } => {
-            tracing::warn!(
-                encoded_bytes,
-                max_frame_size = state.max_frame_size,
-                "DescribeGroups response would exceed max_frame_size; closing connection"
-            );
-            HandleOutcome::Close
-        }
-        DescribeGroupsView::Groups(described) => {
-            let groups = group_ids
-                .iter()
-                .zip(described)
-                .map(|(group_id, group)| {
-                    group.map_or_else(|| missing_group(api_version, group_id), described_group)
-                })
-                .collect();
-            respond_or_close(encode_response(api_version, groups), "DescribeGroups")
-        }
-    }
+        .await;
+    let groups = group_ids
+        .iter()
+        .zip(described)
+        .map(|(group_id, group)| {
+            group.map_or_else(
+                || missing_group(api_version, group_id),
+                |group| described_group(api_version, group),
+            )
+        })
+        .collect();
+    respond_or_close(encode_response(api_version, groups), "DescribeGroups")
 }
 
-fn described_group(group: GroupDescription) -> DescribedGroup {
+pub(crate) fn described_group(version: i16, group: GroupDescription) -> DescribedGroup {
+    if group.error != ERROR_NONE {
+        return too_large_group(version, &group.group_id);
+    }
     DescribedGroup::default()
         .with_group_id(GroupId(group.group_id))
         .with_group_state(StrBytes::from_static_str(group.state))
         .with_protocol_type(group.protocol_type)
         .with_protocol_data(group.protocol_name.unwrap_or_default())
         .with_members(group.members.into_iter().map(described_member).collect())
+}
+
+/// Empty member list and empty strings, matching Kafka's `DescribeGroupsResponse.groupError`.
+/// The code is not retried by the admin tool, unlike closing the connection.
+fn too_large_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
+    let mut group = DescribedGroup::default()
+        .with_error_code(ERROR_UNKNOWN_SERVER_ERROR)
+        .with_group_id(GroupId(group_id.clone()))
+        .with_group_state(StrBytes::from_static_str(""))
+        .with_protocol_type(StrBytes::from_static_str(""))
+        .with_protocol_data(StrBytes::from_static_str(""));
+    if version >= FIRST_ERROR_MESSAGE_VERSION {
+        group =
+            group.with_error_message(Some(StrBytes::from_static_str(DESCRIBE_RESPONSE_TOO_LARGE)));
+    }
+    group
 }
 
 fn described_member(member: MemberDescription) -> DescribedGroupMember {
@@ -131,7 +141,7 @@ fn described_member(member: MemberDescription) -> DescribedGroupMember {
         .with_member_assignment(member.assignment)
 }
 
-fn missing_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
+pub(crate) fn missing_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
     let mut group = DescribedGroup::default()
         .with_group_id(GroupId(group_id.clone()))
         .with_group_state(StrBytes::from_static_str(DEAD));

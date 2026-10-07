@@ -54,7 +54,7 @@ use iggy_gateway_kafka::protocol::api::{
     ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST,
     ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
     ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_MEMBER_ID, GatewayState, handle_request_bounded,
+    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_SERVER_ERROR, GatewayState, handle_request_bounded,
 };
 use iggy_gateway_kafka::protocol::header::response_header_version;
 
@@ -1617,20 +1617,15 @@ async fn given_a_running_group_when_describing_and_listing_should_report_members
     assert_eq!(group.group_id, GROUP);
     assert_eq!(group.state, "CompletingRebalance");
     assert_eq!(group.protocol_type, "consumer");
-    assert_eq!(group.protocol_data, "range");
+    assert_eq!(group.protocol_data, "");
     assert_eq!(group.authorized_operations, Some(i32::MIN));
     assert_eq!(group.members.len(), 2);
     assert!(
         group
             .members
             .iter()
-            .any(|member| member.metadata.as_ref() == b"leader-subscription")
-    );
-    assert!(
-        group
-            .members
-            .iter()
-            .any(|member| member.metadata.as_ref() == b"follower-subscription")
+            .all(|member| member.metadata.is_empty()),
+        "metadata is the previous generation until the group is Stable"
     );
     assert!(
         group
@@ -1675,6 +1670,12 @@ async fn given_a_running_group_when_describing_and_listing_should_report_members
     assert_eq!(group.state, "Stable");
     assert_eq!(group.protocol_data, "range");
     assert!(group.authorized_operations.is_none());
+    assert!(
+        group
+            .members
+            .iter()
+            .any(|member| member.metadata.as_ref() == b"leader-subscription")
+    );
     assert!(
         group
             .members
@@ -1725,6 +1726,7 @@ async fn given_a_joining_member_when_describing_should_report_preparing_rebalanc
     assert_eq!(described.groups[0].state, "PreparingRebalance");
     assert_eq!(described.groups[0].protocol_data, "");
     assert_eq!(described.groups[0].members.len(), 1);
+    assert!(described.groups[0].members[0].metadata.is_empty());
     assert!(described.groups[0].members[0].assignment.is_empty());
 
     let listed = list_groups(&state, 4, &["preparingrebalance"], &[]).await;
@@ -1737,6 +1739,53 @@ async fn given_a_joining_member_when_describing_should_report_preparing_rebalanc
     advance(Duration::from_secs(3)).await;
     let joined = parked.await.expect("parked JoinGroup task");
     assert_eq!(joined.error, ERROR_NONE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_only_a_pending_member_when_listing_should_report_empty() {
+    let state = test_state(immediate_config());
+    let _member = claim_member_id(&state, b"sub").await;
+
+    let described = describe(&state, 6, &[GROUP]).await;
+    assert_eq!(described.groups[0].error, ERROR_NONE);
+    assert_eq!(described.groups[0].state, "Empty");
+    assert!(described.groups[0].members.is_empty());
+
+    let empty_only = list_groups(&state, 5, &["Empty"], &[]).await;
+    assert_eq!(empty_only.groups.len(), 1);
+    assert_eq!(empty_only.groups[0].state.as_deref(), Some("Empty"));
+    let preparing = list_groups(&state, 5, &["PreparingRebalance"], &[]).await;
+    assert!(preparing.groups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_expired_group_when_listing_should_omit_it_and_describing_should_report_dead() {
+    let state = test_state(immediate_config());
+    let (leader, _follower) = two_member_group(&state).await;
+    let synced = sync(
+        &state,
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: 2,
+            member_id: &leader,
+            assignments: &[(&leader, b"partitions-0")],
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(synced.error, ERROR_NONE);
+
+    advance(Duration::from_secs(11)).await;
+    let listed = list_groups(&state, 5, &[], &[]).await;
+    assert!(
+        listed.groups.is_empty(),
+        "a group whose sessions are all past is omitted, and listing does not have to tick"
+    );
+
+    let described = describe(&state, 6, &[GROUP]).await;
+    assert_eq!(described.groups[0].state, "Dead");
+    assert_eq!(described.groups[0].error, ERROR_GROUP_ID_NOT_FOUND);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1792,13 +1841,26 @@ async fn given_repeated_group_ids_when_describing_should_answer_each_distinct_id
 }
 
 #[tokio::test(start_paused = true)]
-async fn given_a_describe_response_at_the_frame_cap_when_one_byte_over_should_close() {
+async fn given_a_describe_response_one_byte_over_the_frame_when_describing_should_summarize() {
     let mut state = owned_state(immediate_config(), 8 * 1024 * 1024);
-    // Bigger than the shape guard's per-id charge, so a repeated id is not rejected as a
-    // malformed request before the response-size check can see that it is one group.
     let blob = vec![b'x'; 400];
     let protocols: &[(&str, &[u8])] = &[("range", blob.as_slice())];
-    join(&state, 3, &join_params("", protocols)).await;
+    let joined = join(&state, 3, &join_params("", protocols)).await;
+    assert_eq!(joined.error, ERROR_NONE);
+    let assignment = vec![b'y'; 400];
+    let synced = sync(
+        &state,
+        3,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: joined.generation_id,
+            member_id: &joined.member_id,
+            assignments: &[(&joined.member_id, assignment.as_slice())],
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(synced.error, ERROR_NONE);
 
     let version = 0;
     let encoded = handle_request_bounded(
@@ -1817,25 +1879,35 @@ async fn given_a_describe_response_at_the_frame_cap_when_one_byte_over_should_cl
         1,
         "a repeated id is one group, so it still fits the one-group frame"
     );
+    assert!(!repeated.groups[0].members[0].assignment.is_empty());
 
     state.max_frame_size = frame - 1;
-    assert!(
-        handle_request_bounded(
-            &state,
-            API_KEY_DESCRIBE_GROUPS,
-            version,
-            build_describe_groups_request(version, &[GROUP], false),
-        )
-        .await
-        .is_close(),
-        "DescribeGroups closes when the encoded frame would pass max_frame_size"
-    );
+    let summarized = describe(&state, version, &[GROUP]).await;
+    assert_eq!(summarized.groups[0].error, ERROR_NONE);
+    assert_eq!(summarized.groups[0].state, "Stable");
+    assert_eq!(summarized.groups[0].protocol_data, "");
+    assert!(summarized.groups[0].members[0].metadata.is_empty());
+    assert!(summarized.groups[0].members[0].assignment.is_empty());
+
+    let summary_body = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        version,
+        build_describe_groups_request(version, &[GROUP], false),
+    )
+    .await
+    .expect_response("a summarized DescribeGroups must answer");
+    let summary_frame = response_frame_len(API_KEY_DESCRIBE_GROUPS, version, &summary_body);
+    state.max_frame_size = summary_frame - 1;
+    let errored = describe(&state, version, &[GROUP]).await;
+    assert_eq!(errored.groups[0].error, ERROR_UNKNOWN_SERVER_ERROR);
+    assert!(errored.groups[0].members.is_empty());
 
     state.max_frame_size = frame;
     let again = describe(&state, version, &[GROUP]).await;
     assert_eq!(again.groups.len(), 1);
     assert_eq!(again.groups[0].group_id, GROUP);
-    assert_ne!(again.groups[0].state, "Dead");
+    assert_eq!(again.groups[0].state, "Stable");
 }
 
 #[tokio::test(start_paused = true)]

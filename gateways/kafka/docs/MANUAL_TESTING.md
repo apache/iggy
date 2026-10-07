@@ -315,6 +315,9 @@ success. This category predates the bridge landing: G2/G3's "fails at metadata" 
 | G6 | Graceful kcat exit | G3's two kcats, then Ctrl-C one (kcat closes its consumer, which sends LeaveGroup v0/v1) | The survivor rebalances within one heartbeat interval, not `session.timeout.ms`. Join, leave and sync are real, but the assignment is empty: the Metadata stub reports the topic unknown, so the assignor has no partitions to hand out |
 | G7 | Graceful Java exit | G5 in two terminals, then Ctrl-C one | Same as G6 |
 | G8 | Static member exit | G7 with `--consumer-property group.instance.id=x` on the one stopped | No LeaveGroup is sent; the survivor waits out the session timeout before rebalancing |
+| G9 | List groups | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list` after G5 has joined | Prints the group. `--list --state Empty` matches a group that was issued a member id and has not joined yet. A group whose members have all expired is absent |
+| G10 | Describe members | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --members --group g2` | Prints member ids. Assignment and protocol are filled only while the group is Stable |
+| G11 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch and fails, because that API is not implemented |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 
@@ -444,7 +447,7 @@ kcat version (if used): ___________
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
 [ ] F1–F6  TCP / connection behavior
-[ ] G1–G8  kcat / Java client (record errors for G2/G3)
+[ ] G1–G11  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3; G11's default `--describe` is expected to fail)
 [ ] H1–H6  Adversarial input
 [ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 
@@ -481,4 +484,4 @@ These are documented as TODO in [SCOPE.md](SCOPE.md) — do not fail #3421 valid
 - Accurate partition leadership / ISR
 - Transactional produce
 - Real offset commit semantics
-- Consumer group offset commit/fetch and admin group views (join/sync/heartbeat/leave themselves are covered by G3-G8)
+- Consumer group offset commit/fetch, including `kafka-consumer-groups.sh --describe` without `--members` or `--state` (list, `--describe --members` and `--describe --state` are G9-G11; join/sync/heartbeat/leave are G3-G8)

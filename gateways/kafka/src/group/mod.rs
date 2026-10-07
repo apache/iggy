@@ -39,14 +39,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::group::state::{GroupState, Step};
 use crate::protocol::api::{ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
-pub use state::DescribeGroupsView;
 
+/// `DescribeGroups` / `ListGroups` state string for a group with no joined members.
+pub const GROUP_STATE_EMPTY: &str = "Empty";
 /// `DescribeGroups` / `ListGroups` state string for a group preparing a rebalance.
 pub const GROUP_STATE_PREPARING_REBALANCE: &str = "PreparingRebalance";
 /// `DescribeGroups` / `ListGroups` state string for a group waiting on `SyncGroup`.
 pub const GROUP_STATE_COMPLETING_REBALANCE: &str = "CompletingRebalance";
 /// `DescribeGroups` / `ListGroups` state string for a group whose assignment is in effect.
 pub const GROUP_STATE_STABLE: &str = "Stable";
+
+/// v6 `error_message` when one `DescribeGroups` group does not fit the response budget.
+///
+/// `UNKNOWN_SERVER_ERROR` is not retried by `kafka-consumer-groups.sh`, so the tool prints this
+/// for the groups that did not fit and still shows the ones that did. A retriable code would
+/// send the same describe-all request back until the client timed out.
+pub const DESCRIBE_RESPONSE_TOO_LARGE: &str = "Group description exceeds the response size limit.";
 
 /// Kafka's own `group.min.session.timeout.ms` default.
 const DEFAULT_MIN_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
@@ -350,10 +358,14 @@ pub struct GroupListing {
 #[derive(Debug, Clone)]
 pub struct GroupDescription {
     pub group_id: StrBytes,
+    /// `ERROR_NONE`, or `ERROR_UNKNOWN_SERVER_ERROR` when this group does not fit the response.
+    /// A non-zero code is encoded as an empty group: the other fields are not put on the wire.
+    pub error: i16,
     /// One of the `GROUP_STATE_*` strings.
     pub state: &'static str,
     pub protocol_type: StrBytes,
-    /// Selected protocol name. `None` until the first join barrier completes.
+    /// Selected protocol name. `None` until the group is `Stable`, and `None` when the group is
+    /// described without member metadata.
     pub protocol_name: Option<StrBytes>,
     pub members: Vec<MemberDescription>,
 }
@@ -492,15 +504,15 @@ impl GroupCoordinator {
     /// Snapshot of each distinct group, in first-seen order. `None` means the group is not here.
     ///
     /// Ids are deduped before the lock is taken. Under the lock each remaining group is ticked
-    /// once and, when the encoded response fits `max_frame_size`, snapshotted once. Encoding
-    /// happens after this returns. `ExceedsFrame` means the lengths already stored would not
-    /// fit, and no member snapshot was built.
+    /// once and snapshotted once. A group that does not fit is returned with
+    /// `UNKNOWN_SERVER_ERROR` instead of failing the whole response. Encoding happens
+    /// after this returns.
     pub async fn describe_groups(
         &self,
         group_ids: &[StrBytes],
         version: i16,
         max_frame_size: usize,
-    ) -> DescribeGroupsView {
+    ) -> Vec<Option<GroupDescription>> {
         let mut groups = self.groups.lock().await;
         state::describe_groups(
             &mut groups,
@@ -513,11 +525,12 @@ impl GroupCoordinator {
 
     /// Every group currently in the map, ordered by group id.
     ///
-    /// Does not expire sessions. Expiry runs on the request that names a group; a list names
-    /// none, and sweeping every group here would open rebalances as a side effect of reading.
+    /// Does not tick. A list names no group, and sweeping here would open rebalances as a side
+    /// effect of reading. Groups whose sessions and pending ids are already past `now` are left
+    /// out, which is the same membership `DescribeGroups` would see after it did tick.
     pub async fn list_groups(&self) -> Vec<GroupListing> {
         let groups = self.groups.lock().await;
-        state::list_groups(&groups)
+        state::list_groups(&groups, Instant::now())
     }
 
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.
