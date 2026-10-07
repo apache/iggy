@@ -13696,16 +13696,14 @@ mod tests {
     #[compio::test]
     async fn recovered_empty_wal_reopens_elections_but_new_missing_history_stays_fenced() {
         let intact = tempfile::tempdir().unwrap();
-        let mut partition = partition_at_view(0, 0);
+        let mut partition = Box::new(partition_at_view(0, 0));
         partition.set_partition_dir(intact.path().to_string_lossy().into_owned());
         partition.runtime_options.durability = iggy_common::Durability::Persisted;
-        let journal = journal::PartitionPrepareJournal::open(
-            &intact.path().join("prepares-0"),
-            partition.consensus().group(),
-            0,
-        )
-        .await
-        .unwrap();
+        let group = partition.consensus().group();
+        let journal =
+            journal::PartitionPrepareJournal::open(&intact.path().join("prepares-0"), group, 0)
+                .await
+                .unwrap();
         assert!(!journal.recovered_frontier());
         drop(journal);
         partition.consensus.set_recovery_election_allowed(false);
@@ -13724,16 +13722,12 @@ mod tests {
             !wal.exists(),
             "the durable fence must precede replacement WAL creation"
         );
-        let replacement = journal::PartitionPrepareJournal::open(
-            &wal,
-            partition_at_view(0, 0).consensus().group(),
-            0,
-        )
-        .await
-        .unwrap();
+        let replacement = journal::PartitionPrepareJournal::open(&wal, group, 0)
+            .await
+            .unwrap();
         drop(replacement);
         for _ in 0..2 {
-            let mut replacement = partition_at_view(0, 0);
+            let mut replacement = Box::new(partition_at_view(0, 0));
             replacement.set_partition_dir(missing.path().to_string_lossy().into_owned());
             replacement.runtime_options.durability = iggy_common::Durability::Persisted;
             replacement.consensus.set_recovery_election_allowed(false);
@@ -22433,11 +22427,7 @@ mod tests {
         persistence.exhaust_capacity_for_test();
         partition.consensus.restore_commit_state(0, 4);
 
-        assert!(
-            partition
-                .select_persistable_commits(&repair_config())
-                .is_empty()
-        );
+        assert_eq!(partition.select_persistable_commits(&repair_config()), []);
         let journaled =
             partition.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config());
         assert_eq!(
@@ -22456,16 +22446,11 @@ mod tests {
             .handle_committed_entries(drained, &repair_config(), true)
             .await;
         assert_eq!(partition.consensus.commit_min(), 3);
-        assert!(
-            partition
-                .select_persistable_commits(&repair_config())
-                .is_empty()
-        );
+        assert_eq!(partition.select_persistable_commits(&repair_config()), []);
         assert_eq!(partition.consensus.pipeline_head_header().unwrap().op, 4);
-        assert!(
-            partition
-                .collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config())
-                .is_empty()
+        assert_eq!(
+            partition.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &repair_config()),
+            []
         );
         persistence.retire();
     }
