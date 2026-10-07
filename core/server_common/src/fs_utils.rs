@@ -181,7 +181,7 @@ pub async fn truncate_file(file: &fs::File, length: u64) -> io::Result<()> {
     .await
 }
 
-/// Run filesystem work unsupported by io_uring on one worker per calling shard.
+/// Run filesystem work unsupported by io_uring with one concurrent operation per shard.
 /// The operation owns its state and continues to completion if the caller is dropped.
 ///
 /// # Errors
@@ -190,6 +190,8 @@ pub async fn run_blocking<T: Send + 'static>(
     name: &'static str,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
+    // TODO: Separate bounded bulk cleanup from short calls without releasing
+    // either permit before its filesystem operation has actually completed.
     // Cancellation must not admit another operation while this one owns filesystem state.
     thread_local! {
         static WORKER: Arc<Mutex<()>> = Arc::new(Mutex::new(()));

@@ -1529,6 +1529,7 @@ where
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
+    shutting_down: Cell<bool>,
 
     /// Partition-plane frames that arrived before this shard's reconciler
     /// materialised the namespace (post-`CreateTopic` convergence window).
@@ -1765,6 +1766,8 @@ where
     /// fit in `u16`. Both are bootstrap programming errors: the
     /// permutation would silently misroute every inter-shard frame, or
     /// addressing space (u16) would wrap.
+    /// Returns [`ShardCtorError::PartitionIoLimits`] if the default I/O limits
+    /// cannot represent the compiled job sizes.
     ///
     /// # Panics
     ///
@@ -1796,10 +1799,13 @@ where
         let ShardIdentity { id, name } = identity;
         let poll_completions =
             poll::completion::PollCompletionLane::new(poll_completion_capacity, &metrics);
-        let partition_io = partition_io::PartitionIoLane::new(match partition_io_limits {
-            Some(limits) => limits,
-            None => PartitionIoLimits::new(partition_io::DEFAULT_PARTITION_IO_CAPACITY, None)?,
-        });
+        let partition_io = partition_io::PartitionIoLane::new(
+            match partition_io_limits {
+                Some(limits) => limits,
+                None => PartitionIoLimits::new(partition_io::DEFAULT_PARTITION_IO_CAPACITY, None)?,
+            },
+            &metrics,
+        );
         Ok(Self {
             id,
             name,
@@ -1821,6 +1827,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            shutting_down: Cell::new(false),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
@@ -2381,6 +2388,7 @@ where
             partition_io: partition_io::PartitionIoLane::new(
                 PartitionIoLimits::new(partition_io::DEFAULT_PARTITION_IO_CAPACITY, None)
                     .expect("simulator supports the production partition I/O limits"),
+                &metrics,
             ),
             cooperative_events: Cell::new(0),
             shards_table,
@@ -2388,6 +2396,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            shutting_down: Cell::new(false),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
@@ -2623,6 +2632,10 @@ where
                     partition,
                     epoch,
                 } => {
+                    // The shutdown drain owns a fixed set of partition owners.
+                    if self.shutting_down.get() {
+                        continue;
+                    }
                     // Idempotent apply, mirroring `ConfirmRemove` (idempotent
                     // via `remove`'s `None` early-return). An unconditional
                     // `insert` over a live namespace would push a duplicate
@@ -4542,6 +4555,9 @@ where
             namespace,
             "keyed partition lookup must match the frame namespace"
         );
+        if view < partition.consensus().view() {
+            return None;
+        }
         Some(partition)
     }
 
@@ -4581,6 +4597,9 @@ where
         ) else {
             return;
         };
+        if header.view == partition.consensus().view() && partition.consensus().is_normal() {
+            return;
+        }
         if partition.history_is_busy() {
             partition.defer_view_transition(MessageBag::StartViewChange(msg));
             return;
@@ -4855,12 +4874,14 @@ where
         MJ: JournalHandle,
         MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
+        // Count before borrowing one owner mutably: the scan visits every owner.
         let transfers_inflight =
             if Self::may_arm_partition_transfer(self.plane.partitions(), namespace.inner()) {
                 self.partition_transfers_inflight()
             } else {
                 0
             };
+        // A rejected StartView must not replace an existing transfer session.
         let adopted = !actions.is_empty();
         let partitions = self.plane.partitions();
         let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
@@ -4868,6 +4889,7 @@ where
         };
         let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
+        // RebuildPipeline needs the partition dispatcher; metadata has no journal here.
         dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
         dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
         if adopted
@@ -6876,7 +6898,7 @@ where
                     shard = self.id,
                     requester = header.replica,
                     %reason,
-                    "cannot serve metadata state transfer; requester falls back"
+                    "cannot serve metadata state transfer"
                 );
                 self.send_state_transfer_target(
                     cluster,
@@ -6885,7 +6907,7 @@ where
                     header.nonce,
                     header.group,
                     TransferDescriptor::unavailable(
-                        false,
+                        matches!(reason, metadata::impls::metadata::StateTransferUnavailable::CheckpointInProgress),
                         consensus.view(),
                         consensus.commit_max(),
                     ),
@@ -6942,6 +6964,18 @@ where
         }
 
         if header.available == 0 {
+            if header.unavailable_transient == 1 {
+                let mut transfer = self.metadata_transfer.borrow_mut();
+                if let Some(session) = transfer.as_mut()
+                    && !session.target_accepted
+                {
+                    // The checkpoint writer owns the snapshot temporarily.
+                    // Keep the nonce and let the tick pace the next request.
+                    session.idle_ticks = 0;
+                    self.metadata_transfer_attempts.set(0);
+                    return;
+                }
+            }
             // The peer cannot serve. If we have never installed anything the
             // local recovery stands; run the deferred commit walk and let
             // journal repair cover the gap (a peer that never checkpointed
@@ -8936,6 +8970,9 @@ where
     where
         B: MessageBus,
     {
+        if self.shutting_down.get() || partition.is_shutting_down() {
+            return false;
+        }
         if partition.transfer.is_none()
             && transfers_inflight >= Self::PARTITION_TRANSFERS_INFLIGHT_MAX
         {
@@ -9466,6 +9503,9 @@ where
         let Some(partition) = planes.1.0.get_mut_by_ns(&target_namespace) else {
             return;
         };
+        if self.shutting_down.get() || partition.is_shutting_down() {
+            return;
+        }
         // Stage/session desync bail: the probe-exhausted election fallback in
         // core/consensus clears the stage without being able to reach this
         // session; completing into an illegal Idle -> Installing transition

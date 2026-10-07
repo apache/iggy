@@ -120,6 +120,7 @@ where
         }
     }
 
+    /// Override the shard defaults with prevalidated partition I/O limits.
     #[must_use]
     pub const fn with_partition_io_limits(mut self, limits: crate::PartitionIoLimits) -> Self {
         self.partition_io_limits = Some(limits);
@@ -138,6 +139,8 @@ where
     /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
+    /// Returns [`ShardCtorError::PartitionIoLimits`] if the default I/O limits
+    /// cannot represent the compiled job sizes.
     ///
     /// # Panics
     ///

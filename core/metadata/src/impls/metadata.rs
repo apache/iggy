@@ -173,6 +173,7 @@ impl IggySnapshot {
         storage: SnapshotIo,
     ) -> Result<(), SnapshotError> {
         let trailer = snapshot_trailer(&encoded);
+        // TODO: Write payload and trailer as separate buffers to avoid growing the payload.
         encoded.extend_from_slice(&trailer);
         let tmp_path = path.with_extension("bin.tmp");
 

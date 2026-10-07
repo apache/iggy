@@ -129,6 +129,7 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
     },
 }
 
+// TODO: Preserve typed operation, path, and I/O causes until the reply boundary.
 pub enum PartitionIoResult {
     Materialize(MaterializationIoResult),
     OffsetWrite(OffsetIoResult),
@@ -1125,15 +1126,19 @@ impl TransferFileJob {
                         let Some(path) = path else {
                             continue;
                         };
-                        let entries = match std::fs::read_dir(&path) {
-                            Ok(entries) => entries,
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(_) => return Err(IggyError::CannotReadFile),
-                        };
-                        for entry in entries {
-                            let entry = entry.map_err(|_| IggyError::CannotReadFile)?;
-                            let path = entry.path();
-                            let Some(path) = path.to_str() else {
+                        let entries =
+                            futures::stream::once(DiskStorage.regular_files(Path::new(&path)))
+                                .try_flatten();
+                        futures::pin_mut!(entries);
+                        while let Some(entry) = entries.next().await {
+                            let entry = match entry {
+                                Ok(entry) => entry,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    continue;
+                                }
+                                Err(_) => return Err(IggyError::CannotReadFile),
+                            };
+                            let Some(path) = entry.to_str() else {
                                 continue;
                             };
                             if let Some(id) = crate::state_transfer::numeric_offset_id(path) {
@@ -1149,9 +1154,14 @@ impl TransferFileJob {
                                 if stranded_offsets[kind].remove(&id) {
                                     released.push((ConsumerKind::ALL[kind], id));
                                 }
-                            } else if entry.file_name().to_str().is_some_and(|name| {
-                                crate::offset_storage::offset_replacement_id(name).is_some()
-                            }) && let Err(error) = compio::fs::remove_file(path).await {
+                            } else if entry
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| {
+                                    crate::offset_storage::offset_replacement_id(name).is_some()
+                                })
+                                && let Err(error) = compio::fs::remove_file(path).await
+                            {
                                 warn!(%path, %error, "cannot remove abandoned offset replacement during convergence");
                             }
                         }
@@ -1161,6 +1171,7 @@ impl TransferFileJob {
                             Err(_) => return Err(IggyError::CannotSyncFile),
                         }
                     }
+                    // TODO: Bound off-shard segment enumeration while preserving symlink cleanup.
                     for entry in std::fs::read_dir(&directory)
                         .map_err(|_| IggyError::CannotReadPartitions)?
                     {
@@ -1298,7 +1309,10 @@ impl OffsetIoJob {
                                 && self.permit.is_none()
                             {
                                 // Checkpoint cannot retain this inode when the handle budget is full.
-                                result.and(file.sync_data().await)
+                                match result {
+                                    Ok(()) => file.sync_data().await,
+                                    Err(error) => Err(error),
+                                }
                             } else {
                                 self.file = Some(file);
                                 result
@@ -1476,6 +1490,85 @@ mod tests {
         assert_eq!(result.released, [99]);
         assert!(directory.path().join("1").is_file());
         assert!(!directory.path().join("99").exists());
+    }
+
+    #[cfg(unix)]
+    #[compio::test]
+    async fn given_non_file_offsets_when_converging_should_remove_only_regular_offsets() {
+        const OFFSET_ID: u32 = 1;
+        const DIRECTORY_ID: u32 = 2;
+        const SYMLINK_ID: u32 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let offsets = directory.path().join("consumers");
+        std::fs::create_dir(&offsets).unwrap();
+        let offset = offsets.join(OFFSET_ID.to_string());
+        std::fs::write(&offset, crate::offset_storage::encode_offset_record(0)).unwrap();
+        let offset_directory = offsets.join(DIRECTORY_ID.to_string());
+        std::fs::create_dir(&offset_directory).unwrap();
+        let replacement_directory = offsets.join(format!("{DIRECTORY_ID}.tmp"));
+        std::fs::create_dir(&replacement_directory).unwrap();
+        let preserved = directory.path().join("preserved");
+        std::fs::write(&preserved, b"preserved").unwrap();
+        let offset_symlink = offsets.join(SYMLINK_ID.to_string());
+        std::os::unix::fs::symlink(&preserved, &offset_symlink).unwrap();
+        let replacement_symlink = offsets.join(format!("{SYMLINK_ID}.tmp"));
+        std::os::unix::fs::symlink(&preserved, &replacement_symlink).unwrap();
+        let stale_segment = directory.path().join("stale.log");
+        std::fs::write(&stale_segment, b"stale").unwrap();
+        let segment_symlink = directory.path().join("linked.log");
+        std::os::unix::fs::symlink(&preserved, &segment_symlink).unwrap();
+        let mut offset_directories = std::array::from_fn(|_| None);
+        offset_directories[ConsumerKind::Consumer.index()] =
+            Some(offsets.to_string_lossy().into_owned());
+        offset_directories[ConsumerKind::ConsumerGroup.index()] = Some(
+            directory
+                .path()
+                .join("missing")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut stranded_offsets = Box::new(std::array::from_fn(|_| HashSet::new()));
+        stranded_offsets[ConsumerKind::Consumer.index()].insert(OFFSET_ID);
+        let messages_path = directory.path().join("00000000000000000000.log");
+        let index_path = directory.path().join("00000000000000000000.index");
+        let result = TransferFileJob::Converge {
+            directory: directory.path().to_string_lossy().into_owned(),
+            offset_directories,
+            stranded_offsets,
+            segment: SegmentIoJob {
+                messages_path: messages_path.to_string_lossy().into_owned(),
+                index_path: index_path.to_string_lossy().into_owned(),
+                start_offset: 0,
+                segment_size: IggyByteSize::default(),
+                persisted: false,
+                preallocate: false,
+                segment_bodies: false,
+                old_index: None,
+            },
+        }
+        .execute()
+        .await;
+        let TransferFileResult::Converged {
+            segment,
+            stranded,
+            released,
+        } = result
+        else {
+            panic!("convergence returned another result");
+        };
+        assert!(segment.is_ok(), "convergence failed: {:?}", segment.err());
+        assert_eq!(stranded, None);
+        assert_eq!(released, [(ConsumerKind::Consumer, OFFSET_ID)]);
+        assert!(!offset.exists());
+        assert!(offset_directory.is_dir());
+        assert!(replacement_directory.is_dir());
+        assert!(offset_symlink.is_symlink());
+        assert!(replacement_symlink.is_symlink());
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"preserved");
+        assert!(!stale_segment.exists());
+        assert!(!segment_symlink.exists());
+        assert!(messages_path.is_file());
+        assert!(index_path.is_file());
     }
 
     #[test]

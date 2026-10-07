@@ -358,6 +358,8 @@ pub async fn persist_offset_with_storage<S: DurableStorage>(
 /// No barrier runs here. For either offset durability policy, the caller must
 /// retain the writer and sync it and its directory before reclaiming the WAL
 /// history that protects the update.
+/// Records have fixed [`OFFSET_RECORD_SIZE`] length, so overwrites need no
+/// truncation. A size change must use replacement to avoid leaving stale bytes.
 ///
 /// # Errors
 /// The outer error reports directory/open failures before writing begins.

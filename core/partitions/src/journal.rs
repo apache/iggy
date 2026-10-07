@@ -830,7 +830,9 @@ where
             return headers.first().copied();
         }
         let index = *self.first_header_by_op.borrow().get(&op)?;
-        headers.get(index).copied()
+        let header = headers.get(index);
+        debug_assert!(header.is_some_and(|header| header.op == op));
+        header.copied()
     }
 
     pub(crate) fn headers_for_commit(

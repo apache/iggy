@@ -1693,6 +1693,7 @@ pub struct PartitionInstallOutcome {
 /// alter live files.
 #[derive(Debug)]
 pub enum PartitionInstallError {
+    ShuttingDown,
     NoPartitionDir,
     NoOffsetDir {
         kind: ConsumerKind,
@@ -1779,6 +1780,7 @@ pub enum PartitionInstallError {
 impl fmt::Display for PartitionInstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ShuttingDown => write!(f, "partition is shutting down"),
             Self::NoPartitionDir => write!(f, "partition has no on-disk directory"),
             Self::NoOffsetDir { kind } => {
                 write!(f, "partition has no {kind:?} offset directory configured")
@@ -2448,6 +2450,21 @@ where
                 .retain(|start_offset, _| live.contains_key(start_offset));
         }
 
+        // A completed hash can outlive the repair tail its snapshot needs.
+        // Re-pin while keeping the memos, so only newly appended bytes are hashed.
+        if self.consensus().commit_min() > plan.commit_op
+            && self
+                .log
+                .journal()
+                .inner
+                .repair_retained_from()
+                .is_none_or(|retained_from| retained_from > plan.commit_op.saturating_add(1))
+        {
+            *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
+            self.notify_io();
+            return Err(PartitionTransferUnavailable::FlushPending);
+        }
+
         // An empty chain at frontier 0 tells the receiver to unlink its own, so
         // serve it only when a recorded purge says the emptiness is the truth.
         // Offset-only ops, such as external group commits, move the commit
@@ -2946,7 +2963,8 @@ where
     /// (see the swap ordering comments); boot re-derives from surviving files.
     ///
     /// # Errors
-    /// [`PartitionInstallError`]; check-phase variants mutate nothing.
+    /// [`PartitionInstallError`]; check-phase variants mutate nothing. Shutdown
+    /// refuses new installs without changing an install already in progress.
     #[allow(clippy::too_many_lines)]
     pub fn queue_state_transfer_install(
         &mut self,
@@ -2956,6 +2974,9 @@ where
         committed_purge_generation: u64,
         peer: u8,
     ) -> Result<(), PartitionInstallError> {
+        if self.is_shutting_down() {
+            return Err(PartitionInstallError::ShuttingDown);
+        }
         let pending = self.prepare_state_transfer_install(
             commit_op,
             staged,
@@ -3854,6 +3875,7 @@ where
         // Same as a completed install: no chain an unrecorded purge reset
         // survives this, so a purge still owed here has to run whole.
         self.unrecorded_purge_generation = None;
+        self.clear_install_journal();
         self.clear_install_offsets();
         self.segment_checksum_cache.borrow_mut().clear();
         self.reuse_scan_memo.borrow_mut().take();

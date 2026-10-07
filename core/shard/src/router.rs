@@ -528,6 +528,7 @@ where
         // on the gap the fault left. Those requests go unanswered and their
         // clients time out, which is what a node stopping on a durability
         // fault owes them.
+        self.shutting_down.set(true);
         if fatal.is_none() {
             fatal = self
                 .drain_queued_frames_for_shutdown(&mut loopback_buf)
@@ -571,6 +572,7 @@ where
         M: RestorableMetadataStm,
         SB: 'static,
     {
+        self.shutting_down.set(true);
         let partitions = self.plane.partitions();
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
         for namespace in &namespaces {

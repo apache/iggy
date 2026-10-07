@@ -180,6 +180,7 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
 pub struct PersistenceDrain {
     instance: u64,
     epoch: u64,
+    // TODO: Use injected monotonic time so owner-observed drains follow simulated time.
     started: Instant,
 }
 
