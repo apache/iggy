@@ -881,14 +881,8 @@ where
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`
     /// in ONE pass over the header vec.
     ///
-    /// [`Self::header_by_op`] is a linear scan with no index, so asking it
-    /// op-by-op over a window is O(window x headers): on the floor-refusal path
-    /// the replica is gap-stopped, so nothing evicts and the header vec grows
-    /// with the live tail, and even a 4096-op window over ~100k resident
-    /// headers is on the order of 4e8 comparisons -- synchronous, on the shard
-    /// pump, per repair round. Long enough to miss heartbeat and view-change
-    /// deadlines for every group on the core and turn one rejoin into an
-    /// election storm.
+    /// Work and scratch space are bounded by resident headers, even when the
+    /// requested op window is much larger than the local journal.
     ///
     /// The evicted ring is deliberately NOT consulted, matching the op-by-op
     /// form: consulting it would change the floor-refusal verdict.
@@ -946,8 +940,7 @@ where
     /// can recover from a log alone: a prepare records the primary's commit point
     /// at send time, so the true point may be one higher.
     ///
-    /// Exists so callers do not walk `1..=head` through [`Self::header_by_op`],
-    /// which is a linear scan per op and so quadratic in the head.
+    /// Scans resident headers without probing every op up to the log head.
     pub fn max_commit_watermark(&self) -> u64 {
         let headers = unsafe { &*self.headers.get() };
         headers
@@ -976,11 +969,6 @@ where
         // streaming) with repaired window ops, so append order is no longer
         // op-ascending and a positional sequential scan would break at the
         // first interleave boundary forever.
-        //
-        // ONE pass over the headers, like `repaired_window_shape`, not a
-        // `header_by_op` probe per op: that probe is itself a linear scan, so
-        // probing walked the window against the whole vec, and the walk this
-        // feeds runs per group per tick over a rejoin's entire backlog.
         if from_op > commit_max {
             return Vec::new();
         }
@@ -1009,8 +997,7 @@ where
             }
             #[allow(clippy::cast_possible_truncation)]
             let slot = (header.op - from_op) as usize;
-            // First writer wins, matching the `header_by_op` probe this
-            // replaces (`find` returns the earliest match).
+            // Keep the first resident occurrence, matching `header_by_op`.
             slots[slot].get_or_insert(*header);
         }
         // Stops at the first hole: a replication gap must not be skipped, or
@@ -1173,6 +1160,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         };
         {
             unsafe { &mut *self.headers.get() }.clear();
+            self.first_header_by_op.borrow_mut().clear();
             unsafe { &mut *self.op_to_storage_offset.get() }.clear();
             unsafe { &mut *self.offset_to_op.get() }.clear();
             unsafe { &mut *self.timestamp_to_op.get() }.clear();
@@ -1554,6 +1542,58 @@ mod tests {
             .await
             .expect("a truncated op must be appendable again");
         assert_eq!(journal.last_op(), Some(4));
+    }
+
+    #[compio::test]
+    async fn given_reordered_duplicates_when_truncating_should_index_retained_headers() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for (op, checksum) in [(3, 30), (1, 10), (4, 40), (2, 20), (1, 11), (2, 21)] {
+            let entry = build_prepare(op, HEADER_SIZE).transmute_header(
+                |mut old, header: &mut PrepareHeader| {
+                    old.checksum = checksum;
+                    *header = old;
+                },
+            );
+            journal.append(entry.into_frozen()).await.unwrap();
+        }
+
+        assert_eq!(journal.truncate_from(3).await.unwrap(), 2);
+        for (op, checksum) in [(1, 10), (2, 20)] {
+            let header = journal.header_by_op(op).expect("retained header");
+            assert_eq!(header.op, op);
+            assert_eq!(header.checksum, checksum, "the first duplicate must win");
+            assert!(journal.entry(&header).await.is_some());
+        }
+        for op in [3, 4] {
+            assert!(journal.header_by_op(op).is_none(), "op {op} was removed");
+        }
+    }
+
+    #[compio::test]
+    async fn given_truncated_journal_when_repairing_out_of_order_should_keep_frontier_checksum() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 2, 3] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE).into_frozen())
+                .await
+                .unwrap();
+        }
+        journal.truncate_from(2).await.unwrap();
+        for op in [3, 2] {
+            let entry = build_prepare(op, HEADER_SIZE).transmute_header(
+                |mut old, header: &mut PrepareHeader| {
+                    old.checksum = u128::from(op);
+                    *header = old;
+                },
+            );
+            journal.append(entry.into_frozen()).await.unwrap();
+        }
+
+        assert_eq!(
+            consensus::repaired_frontier_update(3, |op| journal.header_by_op(op)),
+            Some((3, 3)),
+            "repair must pair the frontier op with its own checksum"
+        );
     }
 
     #[compio::test]
