@@ -81,7 +81,7 @@ async fn describe_configs_without_a_bridge_returns_not_controller() {
     );
     assert_eq!(response.results.len(), 1);
     assert_eq!(response.results[0].error_code, ERROR_NOT_CONTROLLER);
-    assert!(response.results[0].configs.is_empty());
+    assert_eq!(response.results[0].configs, [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult; 0]);
 }
 
 #[tokio::test]
