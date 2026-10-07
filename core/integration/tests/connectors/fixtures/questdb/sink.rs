@@ -382,194 +382,127 @@ fn toml_list(values: &[String]) -> String {
 }
 
 // ── Named variants ────────────────────────────────────────────────────────────
+/// Declares a named fixture that delegates to [`QuestDbSinkFixture`].
+///
+/// Each variant differs only by its options, so the two delegating methods are
+/// written once here. The same shape as `fixtures/influxdb/sink.rs`.
+macro_rules! delegate_fixture {
+    ($(#[$meta:meta])* $wrapper:ident, $opts:expr) => {
+        $(#[$meta])*
+        pub struct $wrapper(pub QuestDbSinkFixture);
 
-pub struct QuestDbSinkTypedFixture(pub QuestDbSinkFixture);
+        #[async_trait]
+        impl TestFixture for $wrapper {
+            async fn setup() -> Result<Self, TestBinaryError> {
+                QuestDbSinkFixture::setup_with_options($opts)
+                    .await
+                    .map(Self)
+            }
 
-#[async_trait]
-impl TestFixture for QuestDbSinkTypedFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            symbol_columns: Some(vec!["side".to_string()]),
-            uuid_columns: Some(vec!["trade_id".to_string()]),
-            include_partition_column: Some(true),
-            include_offset_column: Some(true),
-            log_rejected_payload: Some(true),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
-    }
+            fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+                self.0.connectors_runtime_envs()
+            }
+        }
+    };
 }
 
-/// Store-and-forward enabled, with a flush timeout short enough that an
-/// outage surfaces quickly instead of stalling the test.
-pub struct QuestDbSinkStoreAndForwardFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkStoreAndForwardFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            store_and_forward: true,
-            flush_timeout: Some("5s".to_string()),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
+delegate_fixture!(
+    QuestDbSinkTypedFixture,
+    QuestDbSinkOptions {
+        symbol_columns: Some(vec!["side".to_string()]),
+        uuid_columns: Some(vec!["trade_id".to_string()]),
+        include_partition_column: Some(true),
+        include_offset_column: Some(true),
+        log_rejected_payload: Some(true),
+        ..Default::default()
     }
+);
 
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
+delegate_fixture!(
+    /// Store-and-forward enabled, with a flush timeout short enough that an
+    /// outage surfaces quickly instead of stalling the test.
+    QuestDbSinkStoreAndForwardFixture,
+    QuestDbSinkOptions {
+        store_and_forward: true,
+        flush_timeout: Some("5s".to_string()),
+        ..Default::default()
     }
-}
+);
 
-/// A batch size far below the message count, so `consume` must chunk.
-pub struct QuestDbSinkSmallBatchFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkSmallBatchFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            batch_size: Some(7),
-            include_offset_column: Some(true),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
+delegate_fixture!(
+    /// A batch size far below the message count, so `consume` must chunk.
+    QuestDbSinkSmallBatchFixture,
+    QuestDbSinkOptions {
+        batch_size: Some(7),
+        include_offset_column: Some(true),
+        ..Default::default()
     }
+);
 
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
+delegate_fixture!(
+    /// Lets QuestDB stamp the designated timestamp on arrival.
+    QuestDbSinkServerTimestampFixture,
+    QuestDbSinkOptions {
+        timestamp_source: Some("server".to_string()),
+        ..Default::default()
     }
-}
+);
 
-/// Lets QuestDB stamp the designated timestamp on arrival.
-pub struct QuestDbSinkServerTimestampFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkServerTimestampFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            timestamp_source: Some("server".to_string()),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
+delegate_fixture!(
+    /// Text-schema stream, which has no field structure and lands in `payload`.
+    QuestDbSinkTextFixture,
+    QuestDbSinkOptions {
+        schema: Some("text".to_string()),
+        ..Default::default()
     }
+);
 
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
+delegate_fixture!(
+    /// Raw-schema stream: the payload arrives as bytes with no field structure.
+    QuestDbSinkRawFixture,
+    QuestDbSinkOptions {
+        schema: Some("raw".to_string()),
+        ..Default::default()
     }
-}
+);
 
-/// Text-schema stream, which has no field structure and lands in `payload`.
-pub struct QuestDbSinkTextFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkTextFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            schema: Some("text".to_string()),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
+delegate_fixture!(
+    /// Table pre-created with `DEDUP UPSERT KEYS`, which is the recipe the README
+    /// gives operators for the at-least-once delivery model.
+    QuestDbSinkDedupFixture,
+    QuestDbSinkOptions {
+        timestamp_source: Some("payload".to_string()),
+        timestamp_field: Some("event_time".to_string()),
+        timestamp_unit: Some("micros".to_string()),
+        include_stream_column: Some(false),
+        include_topic_column: Some(false),
+        pre_create_ddl: Some(format!(
+            // `revision` is deliberately outside the dedup keys: a second
+            // delivery carrying a higher revision proves it reached the
+            // table, which a row count alone cannot show.
+            "create table {SINK_TABLE} (seq LONG, revision LONG, timestamp TIMESTAMP_NS) \
+             timestamp(timestamp) partition by DAY WAL \
+             DEDUP UPSERT KEYS(timestamp, seq)"
+        )),
+        ..Default::default()
     }
+);
 
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
+delegate_fixture!(
+    /// Writes each Apache Iggy message header as its own `header_*` column.
+    QuestDbSinkHeadersFixture,
+    QuestDbSinkOptions {
+        include_headers: Some(true),
+        ..Default::default()
     }
-}
+);
 
-/// Raw-schema stream: the payload arrives as bytes with no field structure.
-pub struct QuestDbSinkRawFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkRawFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            schema: Some("raw".to_string()),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
+delegate_fixture!(
+    QuestDbSinkPayloadTimestampFixture,
+    QuestDbSinkOptions {
+        timestamp_source: Some("payload".to_string()),
+        timestamp_field: Some("event_time".to_string()),
+        timestamp_unit: Some("micros".to_string()),
+        ..Default::default()
     }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
-    }
-}
-
-/// Table pre-created with `DEDUP UPSERT KEYS`, which is the recipe the README
-/// gives operators for the at-least-once delivery model.
-pub struct QuestDbSinkDedupFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkDedupFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            timestamp_source: Some("payload".to_string()),
-            timestamp_field: Some("event_time".to_string()),
-            timestamp_unit: Some("micros".to_string()),
-            include_stream_column: Some(false),
-            include_topic_column: Some(false),
-            pre_create_ddl: Some(format!(
-                // `revision` is deliberately outside the dedup keys: a second
-                // delivery carrying a higher revision proves it reached the
-                // table, which a row count alone cannot show.
-                "create table {SINK_TABLE} (seq LONG, revision LONG, timestamp TIMESTAMP_NS) \
-                 timestamp(timestamp) partition by DAY WAL \
-                 DEDUP UPSERT KEYS(timestamp, seq)"
-            )),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
-    }
-}
-
-/// Writes each Apache Iggy message header as its own `header_*` column.
-pub struct QuestDbSinkHeadersFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkHeadersFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            include_headers: Some(true),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
-    }
-}
-
-pub struct QuestDbSinkPayloadTimestampFixture(pub QuestDbSinkFixture);
-
-#[async_trait]
-impl TestFixture for QuestDbSinkPayloadTimestampFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
-            timestamp_source: Some("payload".to_string()),
-            timestamp_field: Some("event_time".to_string()),
-            timestamp_unit: Some("micros".to_string()),
-            ..Default::default()
-        })
-        .await
-        .map(Self)
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.0.connectors_runtime_envs()
-    }
-}
+);

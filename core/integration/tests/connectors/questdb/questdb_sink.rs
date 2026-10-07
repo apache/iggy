@@ -17,14 +17,14 @@
 
 use bytes::Bytes;
 use iggy::prelude::{HeaderKey, HeaderKind, HeaderValue, IggyClient, IggyMessage, Partitioning};
-use iggy_common::{Identifier, MessageClient};
+use iggy_common::{Identifier, IggyTimestamp, MessageClient};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use super::TEST_MESSAGE_COUNT;
+use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
     QuestDbOps, QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
     QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
@@ -252,6 +252,106 @@ async fn given_invalid_record_in_batch_when_consumed_should_write_the_rest(
         .collect();
     prices.sort_by(f64::total_cmp);
     assert_eq!(prices, vec![1.0, 3.0]);
+
+    // The README calls the log line the only trace of a rejected record, so the
+    // line has to carry what it takes to find that record again.
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("rejected message"))
+        .expect("no rejection was logged");
+    assert!(
+        rejection.contains("offset: 1") && rejection.contains("message_id: 2"),
+        "the rejection must name the record: {rejection}"
+    );
+    assert!(
+        rejection.contains("not a valid UUID"),
+        "the rejection must give the reason: {rejection}"
+    );
+    // The fixture turns the payload preview on, so the line carries it too.
+    assert!(
+        rejection.contains("payload:"),
+        "log_rejected_payload is on, so the preview must appear: {rejection}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_more_conflicts_than_the_recovery_cap_when_consumed_should_still_write_the_rest(
+    harness: &TestHarness,
+    fixture: QuestDbSinkFixture,
+) {
+    // Each conflict costs one recovery, and past the cap the sink stops
+    // recovering and fails the batch. The runtime records that failure and keeps
+    // polling, so the records after the failed batch must still arrive. This
+    // pins that a producer alternating integer and decimal values cannot stop
+    // ingestion.
+    let mut messages = Vec::new();
+    for i in 0..24u32 {
+        // Alternating shapes for one field, which is what pins and then
+        // contradicts the column type.
+        let temp = if i % 2 == 0 { json!(20) } else { json!(20.5) };
+        messages.push(message(
+            (i + 1) as u128,
+            json!({"sensor_id": i, "temp": temp}),
+        ));
+    }
+    send(&harness.root_client().await.unwrap(), messages).await;
+
+    // Half the records share the type that each window pins first, so at least
+    // those arrive. The exact count depends on how the runtime batches, so the
+    // assertion is a floor rather than an equality.
+    let count = fixture.wait_for_rows(1).await.expect("no rows at all");
+    assert!(
+        count >= 1,
+        "the connector wrote nothing, so a run of conflicts stopped it: {count}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_rejected_record_before_a_conflicting_one_when_consumed_should_write_the_rest(
+    harness: &TestHarness,
+    fixture: QuestDbSinkFixture,
+) {
+    // The rejected record sits inside the window that the conflicting record
+    // forces the sink to rebuild. A rebuild that replayed it would be refused
+    // again and would take the rest of the chunk with it, so this pins that the
+    // rebuild only replays records the buffer accepted.
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            message(1, json!({"sensor_id": 1, "temp": 20.5})),
+            message(2, json!({"bad.name": 1})),
+            message(3, json!({"sensor_id": 3, "temp": 21})),
+            message(4, json!({"sensor_id": 4, "temp": 22.5})),
+            message(5, json!({"sensor_id": 5, "temp": 23.5})),
+        ],
+    )
+    .await;
+
+    let count = fixture.wait_for_rows(3).await.expect("no rows");
+    assert_eq!(
+        count, 3,
+        "only the rejected and the conflicting record should be dropped"
+    );
+
+    let ids = fixture.column_values("sensor_id").await.expect("no values");
+    let mut ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 4, 5],
+        "the records around the two dropped ones must survive"
+    );
 }
 
 #[iggy_harness(
@@ -377,13 +477,10 @@ async fn given_store_and_forward_when_consumed_should_persist_a_slot_and_write_r
 
     // The client persists frames before sending, so a slot directory must
     // exist on disk rather than the batch living only in memory.
-    let slot = fixture.wait_for_sf_slot().await.expect("no sf slot");
-    assert!(
-        slot.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("iggy_test")),
-        "unexpected slot name: {slot:?}"
-    );
+    // The slot directory existing is the claim: the client persisted frames
+    // before sending them. Its name is the `sender_id` the fixture itself wrote
+    // into the connect string, so asserting that would prove nothing.
+    fixture.wait_for_sf_slot().await.expect("no sf slot");
 }
 
 #[iggy_harness(
@@ -426,12 +523,12 @@ async fn given_questdb_outage_when_consumed_should_buffer_and_replay_on_recovery
     // sink has to poll, attempt delivery and fail before anything reaches disk,
     // and a loaded machine can take longer than any constant worth hard-coding.
     let mut parked = Vec::new();
-    for _ in 0..120 {
+    for _ in 0..POLL_ATTEMPTS {
         parked = QuestDbSinkFixture::sf_segments(&slot);
         if !parked.is_empty() {
             break;
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
     assert!(
         !parked.is_empty(),
@@ -497,6 +594,12 @@ async fn given_server_timestamp_source_when_consumed_should_let_questdb_stamp_ro
     fixture: QuestDbSinkServerTimestampFixture,
 ) {
     let fixture = &fixture.0;
+    // Bound the stored timestamp to the window around the send. This catches a
+    // regression to the Unix epoch, to a wrong unit, or to a payload field, all
+    // of which land far outside the window. It cannot tell the server clock
+    // apart from the message or origin timestamp, because every one of those is
+    // also "about now" for a message sent here.
+    let before = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
     send(
         &harness.root_client().await.unwrap(),
         vec![message(1, json!({"seq": 1}))],
@@ -504,13 +607,18 @@ async fn given_server_timestamp_source_when_consumed_should_let_questdb_stamp_ro
     .await;
 
     fixture.wait_for_rows(1).await.expect("no rows");
+    let after = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
 
     let columns = fixture.column_types().await.expect("no columns");
     assert!(columns.contains_key("timestamp"), "{columns:?}");
     let values = fixture.column_values("timestamp").await.expect("no values");
+    let stored = values[0].as_str().expect("timestamp is not a string");
+    // ISO-8601 in a fixed layout sorts lexicographically, so comparing the
+    // second-precision prefix orders the three instants correctly.
+    let stored_seconds: String = stored.chars().take(before.len()).collect();
     assert!(
-        values[0].as_str().is_some_and(|ts| ts.starts_with("20")),
-        "server did not stamp the row: {values:?}"
+        stored_seconds.as_str() >= before.as_str() && stored_seconds.as_str() <= after.as_str(),
+        "stored {stored} is outside the send window {before}..{after}"
     );
 }
 
@@ -674,13 +782,13 @@ async fn given_dedup_table_when_duplicates_delivered_should_collapse_to_one_row(
     // duplicates never arrived", so wait until every row carries the second
     // revision, which only the replay can produce.
     let mut upserted = false;
-    for _ in 0..120 {
+    for _ in 0..POLL_ATTEMPTS {
         let revisions = fixture.column_values("revision").await.expect("no values");
         if revisions.len() == 10 && revisions.iter().all(|value| value.as_i64() == Some(2)) {
             upserted = true;
             break;
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
     assert!(upserted, "the replayed rows never reached the table");
 
