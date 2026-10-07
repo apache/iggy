@@ -139,7 +139,7 @@ pub(crate) struct PartitionConsensusState {
 /// A pipeline head the commit walk is holding on: covered by the commit frontier,
 /// but not the op the state machine is next owed.
 ///
-/// What `drain_committable_prefix` / `peek_committable_head` refuse to drain. Two
+/// What `peek_committable_head` refuses to drain. Two
 /// different faults share that refusal and need different thresholds, so
 /// [`CommitPrefixHole::kind`] keeps them apart.
 #[derive(Debug, Clone, Copy)]

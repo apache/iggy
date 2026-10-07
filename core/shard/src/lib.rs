@@ -6035,9 +6035,6 @@ where
             // only, while `commit_messages` evicts up to `commit_max` (the cluster
             // frontier), so a primary-elect with an apply backlog reads `None` for
             // ops it holds in the repair ring and parks on a hole that is not one.
-            // One pass also because `header_by_op` is a linear scan and this window
-            // is the apply backlog, not the `prepare_queue_max` span the merge
-            // bounds -- probing per op is quadratic.
             let missing = {
                 let journal = partition.log.journal();
                 let window = journal
@@ -10832,16 +10829,14 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 /// Commit walks the partition tick sweep will RUN per pass.
 ///
 /// Same correlated-fan-out argument as the repair arm, and the walk is the
-/// costlier half: `commit_journal` reaches `commit_messages`, which flushes a
-/// segment and synchronizes it under `durability=persisted`.
+/// costlier half: `commit_journal` applies committed state and schedules
+/// segment persistence.
 ///
 /// The two caps together are what bound the tick: this one bounds how many
 /// groups a sweep walks, [`partitions::COMMIT_WALK_OPS_MAX`] bounds how far
 /// each walk goes (for every caller of `commit_journal`, not just this one),
-/// and the product is the sweep's worst case. Deliberately NOT the
-/// superblock pre-pass's number: that one runs its fan-out CONCURRENTLY under
-/// `join_all` and drains every group in the same body, while these walks are
-/// serial and what is over budget waits for the next tick.
+/// and the product is the sweep's worst case. File jobs are bounded separately
+/// by the partition I/O lane; commit walks over budget wait for the next tick.
 ///
 /// Capping cannot starve a partition: the walk carries no debounce counter and
 /// clears its own predicate (a walk either advances `commit_min` or fences the

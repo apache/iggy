@@ -211,7 +211,7 @@ impl Invariants {
 
     /// Catch a commit walk permanently held below a committable pipeline head.
     ///
-    /// The state `drain_committable_prefix` and `peek_committable_head` refuse to
+    /// The state `peek_committable_head` refuses to
     /// drain. Two faults share that refusal and they are not the same wait, so they
     /// are counted apart (see [`CommitHoldKind`]):
     ///

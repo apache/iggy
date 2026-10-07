@@ -2171,7 +2171,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Stops the timer on an empty pipeline; otherwise restarts it so it times
     /// the current oldest entry from now. Exposed for the plane-side drains that
-    /// pop through [`Pipeline`] directly (`drain_committable_prefix`) rather than
+    /// pop through [`Pipeline`] directly rather than
     /// through [`Self::pop_committed_prepare`].
     pub fn sync_prepare_timeout(&self) {
         let empty = self.pipeline.borrow().is_empty();
