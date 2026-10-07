@@ -642,7 +642,7 @@ impl Sink for QuestDbSink {
         // different topics run at the same time.
         if self
             .server_rejections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_sub(1)
             })
             .is_ok()
