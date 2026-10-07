@@ -217,6 +217,7 @@ class IggyErrorCodeTest {
         // Partition errors
         "3007, PARTITION_NOT_FOUND",
         "3013, PARTITION_ID_SPACE_EXHAUSTED",
+        "3014, PARTITION_HISTORY_CHANGED",
         "3024, TOO_MANY_CONSUMER_OFFSETS",
 
         // Segment errors

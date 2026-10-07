@@ -682,6 +682,10 @@ mod tests {
             partition_id_space_exhausted,
             IggyError::TooManyPartitions.as_code(),
         );
+        assert_eq!(
+            u32::from(TruncatePartitionResult::HistoryChanged),
+            IggyError::PartitionHistoryChanged.as_code(),
+        );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.
         assert_eq!(UNAUTHORIZED_CODE, IggyError::Unauthorized.as_code());

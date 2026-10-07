@@ -1628,6 +1628,17 @@ func (e PartitionIdSpaceExhausted) Is(target error) bool {
 	return ok
 }
 
+type PartitionHistoryChanged struct{}
+
+func (e PartitionHistoryChanged) Error() string {
+	return "partition history changed after the request was resolved"
+}
+func (e PartitionHistoryChanged) Code() Code { return 3014 }
+func (e PartitionHistoryChanged) Is(target error) bool {
+	_, ok := target.(PartitionHistoryChanged)
+	return ok
+}
+
 type SegmentNotFound struct{}
 
 func (e SegmentNotFound) Error() string { return "segment not found" }
@@ -2844,6 +2855,7 @@ var (
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
 	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
+	ErrPartitionHistoryChanged                    = PartitionHistoryChanged{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
 	ErrInvalidSegmentSize                         = InvalidSegmentSize{}
@@ -3092,6 +3104,7 @@ const (
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
 	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
+	PartitionHistoryChangedCode                    Code = 3014
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
 	InvalidSegmentSizeCode                         Code = 4002
@@ -3483,6 +3496,8 @@ func (c Code) String() string {
 		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
+	case PartitionHistoryChangedCode:
+		return "PartitionHistoryChanged"
 	case SegmentNotFoundCode:
 		return "SegmentNotFound"
 	case SegmentClosedCode:
@@ -3976,6 +3991,8 @@ func FromCode(code Code) IggyError {
 		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
+	case PartitionHistoryChangedCode:
+		return ErrPartitionHistoryChanged
 	case SegmentNotFoundCode:
 		return ErrSegmentNotFound
 	case SegmentClosedCode:
