@@ -952,12 +952,12 @@ mod tests {
             expire_sessions(&shard, &tracker, &receiver, &shutdown, TIMEOUT, expired_at).await,
             Pass::Drained
         );
-        assert!(
+        assert_eq!(
             metadata
                 .mux_stm
                 .streams()
-                .consumer_group_memberships(CLIENT)
-                .is_empty()
+                .consumer_group_memberships(CLIENT),
+            []
         );
     }
 

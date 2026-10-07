@@ -382,11 +382,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
+        assert_eq!(
             ReplicatedJoinConsumerGroupRequest::decode_from(request_body(&accepted))
                 .unwrap()
-                .in_flight
-                .is_empty()
+                .in_flight,
+            [] as [u32; 0]
         );
         apply_join(&shard, &accepted);
         assert_eq!(
