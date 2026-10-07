@@ -195,6 +195,29 @@ pub fn build_delete_topics_empty_request(version: i16) -> Bytes {
     enc.freeze()
 }
 
+/// `DeleteTopics` request naming one topic, for supported versions (v1-v5).
+///
+/// Unlike [`build_delete_topics_empty_request`], this actually produces a per-topic result -
+/// an empty request's response has zero entries, so no error code in it is ever observed.
+pub fn build_delete_topics_request_with_name(version: i16, name: &str) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(32);
+
+    if flexible {
+        enc.write_varint(2); // one topic_names entry (N+1 = 2)
+        enc.write_compact_nullable_string(Some(name));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(name)).expect("name fits");
+    }
+    enc.write_i32(5_000); // timeout_ms
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
 /// Produce v2–v8 legacy request with optional transactional id and topic.
 pub fn build_produce_legacy_request(
     version: i16,

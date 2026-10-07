@@ -45,6 +45,7 @@ use kafka_protocol::messages::TransactionalId;
 use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS, API_KEY_FETCH,
@@ -92,6 +93,7 @@ pub(crate) fn off_worker<T>(heavy: bool, work: impl FnOnce() -> T) -> T {
 pub async fn dispatch(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
@@ -103,7 +105,7 @@ pub async fn dispatch(
         API_KEY_METADATA => metadata::handle(state, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(state, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
-        API_KEY_DELETE_TOPICS => delete_topics::handle(state, api_version, body).await,
+        API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
         API_KEY_FIND_COORDINATOR => find_coordinator::handle(state, api_version, body).await,
         API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, api_version, body).await,

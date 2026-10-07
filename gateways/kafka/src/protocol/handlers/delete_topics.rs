@@ -27,6 +27,8 @@
 //! silently dropped. Unlike `CreateTopics`, whose equivalent field is encoded at every version it
 //! supports.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
@@ -35,12 +37,13 @@ use kafka_protocol::protocol::StrBytes;
 
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_DELETE_TOPICS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, GatewayState,
-    HandleOutcome,
+    ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_delete_topics_shape;
 use crate::protocol::handlers::{
@@ -66,7 +69,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// rather than the distinct one `CreateTopics` charges.
 const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
         return handle_versioned_request(
             API_KEY_DELETE_TOPICS,
@@ -103,6 +111,11 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
+    if let Some(results) = authorize(principal, &req.topic_names) {
+        let resp = DeleteTopicsResponse::default().with_responses(results);
+        return respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics");
+    }
+
     // RANGE caps at v5, so req.topics (the v6 topic-id shape) is always empty - topic_names is
     // the only populated field at any version this bridge advertises.
     if req.topic_names.len() > MAX_BRIDGE_BACKED_TOPICS {
@@ -128,10 +141,64 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         return respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics");
     }
 
+    // Real Kafka (`ControllerApis.deleteTopics`) refuses every occurrence of a duplicate name
+    // with `INVALID_REQUEST` (42) and deletes nothing for it, the same choice this gateway's own
+    // `CreateTopics` already makes for a repeated topic name.
+    let duplicate_names = find_duplicate_names(&req.topic_names);
+
     let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
-    let results = delete_all_topics(bridge, &req.topic_names, deadline).await;
+    let results = delete_all_topics(bridge, &req.topic_names, &duplicate_names, deadline).await;
     let resp = DeleteTopicsResponse::default().with_responses(results);
     respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics")
+}
+
+/// Denies every requested topic when `principal` is known but is not allowed to delete topic
+/// data, or when its permissions could not be read. `None` means SASL is off, which this
+/// gateway treats as no principal to enforce against - the same choice the rest of this
+/// gateway makes when authentication itself is not configured.
+fn authorize(
+    principal: Option<&AuthenticatedPrincipal>,
+    topic_names: &[TopicName],
+) -> Option<Vec<DeletableTopicResult>> {
+    let principal = principal?;
+    if principal.permissions_known && principal.permissions.manage_topics {
+        return None;
+    }
+    if !principal.permissions_known {
+        // The permission read failed after a successful login, so this connection holds no real
+        // answer. Denying is the fail-closed choice: granting would authorize an irreversible
+        // delete off a value nothing ever actually read.
+        tracing::warn!(
+            principal = %principal.username,
+            "DeleteTopics asked on a connection whose permissions were never read; denying"
+        );
+    }
+    let message =
+        StrBytes::from_static_str("the authenticated principal is not authorized to delete topics");
+    Some(
+        topic_names
+            .iter()
+            .map(|name| {
+                DeletableTopicResult::default()
+                    .with_name(Some(name.clone()))
+                    .with_error_code(ERROR_TOPIC_AUTHORIZATION_FAILED)
+                    .with_error_message(Some(message.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// Every topic name that appears more than once in `topic_names` - mirrors
+/// `create_topics::find_duplicate_names`.
+fn find_duplicate_names(topic_names: &[TopicName]) -> HashSet<TopicName> {
+    let mut seen = HashSet::with_capacity(topic_names.len());
+    let mut duplicates = HashSet::new();
+    for name in topic_names {
+        if !seen.insert(name.clone()) {
+            duplicates.insert(name.clone());
+        }
+    }
+    duplicates
 }
 
 /// Deletes every requested topic, independently of the others.
@@ -141,21 +208,51 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// entire call would discard every already-resolved result the moment one topic's call ran
 /// long, answering a retriable code even for topics that had already deleted cleanly.
 ///
-/// A name repeated within the same request is not specially rejected the way `CreateTopics`
-/// rejects a duplicate: deleting the same topic twice has no race to protect against the way
-/// creating it twice does - the first occurrence deletes it, the second then answers
-/// `UNKNOWN_TOPIC_OR_PARTITION` because by the time it runs, the topic genuinely doesn't exist
-/// any more. That's the correct answer for a duplicate, not a special case.
+/// `tokio::time::timeout_at` polls the inner future before it ever checks the deadline (see
+/// `Timeout::poll`), so once `deadline` has already passed, wrapping a fresh bridge call in it
+/// still starts that call - a name past the deadline would both answer `REQUEST_TIMED_OUT` *and*
+/// actually delete the topic. The `Instant::now() >= deadline` check below must run and must
+/// skip the call itself, the same pattern `list_offsets.rs` uses, not rely on `timeout_at` to
+/// skip it.
 async fn delete_all_topics(
     bridge: &IggyBridge,
     topic_names: &[TopicName],
+    duplicate_names: &HashSet<TopicName>,
     deadline: Instant,
 ) -> Vec<DeletableTopicResult> {
     let mut results = Vec::with_capacity(topic_names.len());
+    let mut deadline_exceeded = false;
     for name in topic_names {
+        if duplicate_names.contains(name) {
+            results.push(
+                DeletableTopicResult::default()
+                    .with_name(Some(name.clone()))
+                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_message(None),
+            );
+            continue;
+        }
+        if deadline_exceeded || Instant::now() >= deadline {
+            if !deadline_exceeded {
+                deadline_exceeded = true;
+                tracing::warn!(
+                    "DeleteTopics deadline passed; answering remaining topics retriable \
+                     instead of starting new Iggy calls"
+                );
+            }
+            results.push(
+                DeletableTopicResult::default()
+                    .with_name(Some(name.clone()))
+                    .with_error_code(ERROR_REQUEST_TIMED_OUT)
+                    .with_error_message(None),
+            );
+            continue;
+        }
+
         let result = match tokio::time::timeout_at(deadline, delete_one_topic(bridge, name)).await {
             Ok(result) => result,
             Err(_elapsed) => {
+                deadline_exceeded = true;
                 tracing::warn!(
                     kafka_topic = name.as_str(),
                     "DeleteTopics: this topic's bridge work exceeded the request deadline; \

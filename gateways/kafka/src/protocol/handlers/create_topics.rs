@@ -168,9 +168,13 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// `deadline` bounds each topic's own bridge work individually (`timeout_at`), not the whole
 /// loop: a single `timeout` around the entire call would discard every already-resolved result
 /// the moment one topic's call ran long, answering `REQUEST_TIMED_OUT` even for topics that had
-/// already committed. Once `deadline` passes, every remaining topic's own `timeout_at` elapses
-/// immediately rather than making a fresh bridge call, so a stuck topic near the front of a large
-/// batch does not turn into one slow round trip per topic behind it.
+/// already committed.
+///
+/// `tokio::time::timeout_at` polls the inner future before it ever checks the deadline (see
+/// `Timeout::poll`), so once `deadline` has already passed, wrapping a fresh bridge call in it
+/// still starts that call - a topic past the deadline would both answer `REQUEST_TIMED_OUT` *and*
+/// actually get created. The `Instant::now() >= deadline` check below must run and must skip the
+/// call itself, the same pattern `list_offsets.rs` uses, not rely on `timeout_at` to skip it.
 async fn create_all_topics(
     bridge: &IggyBridge,
     api_version: i16,
@@ -180,31 +184,52 @@ async fn create_all_topics(
     deadline: Instant,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
+    let mut deadline_exceeded = false;
     for topic in topics {
-        let result = if duplicate_names.contains(&topic.name) {
-            CreatableTopicResult::default()
-                .with_name(topic.name.clone())
-                .with_error_code(ERROR_INVALID_REQUEST)
-                .with_error_message(None)
-        } else {
-            match tokio::time::timeout_at(
-                deadline,
-                create_one_topic(bridge, api_version, topic, validate_only),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        kafka_topic = topic.name.as_str(),
-                        "CreateTopics: this topic's bridge work exceeded the request deadline; \
-                         answering retriable instead of blocking further"
-                    );
-                    CreatableTopicResult::default()
-                        .with_name(topic.name.clone())
-                        .with_error_code(ERROR_REQUEST_TIMED_OUT)
-                        .with_error_message(None)
-                }
+        if duplicate_names.contains(&topic.name) {
+            results.push(
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_message(None),
+            );
+            continue;
+        }
+        if deadline_exceeded || Instant::now() >= deadline {
+            if !deadline_exceeded {
+                deadline_exceeded = true;
+                tracing::warn!(
+                    "CreateTopics deadline passed; answering remaining topics retriable \
+                     instead of starting new Iggy calls"
+                );
+            }
+            results.push(
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_REQUEST_TIMED_OUT)
+                    .with_error_message(None),
+            );
+            continue;
+        }
+
+        let result = match tokio::time::timeout_at(
+            deadline,
+            create_one_topic(bridge, api_version, topic, validate_only),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                deadline_exceeded = true;
+                tracing::warn!(
+                    kafka_topic = topic.name.as_str(),
+                    "CreateTopics: this topic's bridge work exceeded the request deadline; \
+                     answering retriable instead of blocking further"
+                );
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_REQUEST_TIMED_OUT)
+                    .with_error_message(None)
             }
         };
         results.push(result);

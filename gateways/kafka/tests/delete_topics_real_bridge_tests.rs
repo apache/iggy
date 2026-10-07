@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState,
+    BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::delete_topics;
 
@@ -94,7 +94,7 @@ fn decode_first_result(body: Bytes) -> (i16, Option<String>) {
 
 async fn send(state: &GatewayState, names: &[&str]) -> Vec<(Option<String>, i16)> {
     let body = build_request(names);
-    let outcome = delete_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome = delete_topics::handle(state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("DeleteTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -201,11 +201,15 @@ async fn delete_topics_on_a_nonexistent_topic_returns_unknown_topic_or_partition
     );
 }
 
-/// A name repeated in the same request is not specially rejected the way `CreateTopics` rejects
-/// a duplicate - the first occurrence deletes the topic, so the second genuinely finds nothing.
+/// A name repeated in the same request is rejected outright for every occurrence, the same
+/// choice `CreateTopics` makes for a repeated topic name (real Kafka's `ControllerApis.deleteTopics`
+/// answers `INVALID_REQUEST`(42) "Duplicate topic name" for every occurrence and deletes nothing -
+/// a first-occurrence-wins split would let an `AdminClient` caller observe a delete it never got
+/// a clean answer for, since the client keys its futures by name and silently discards the second
+/// per-name result regardless of which occurrence this bridge picked).
 #[tokio::test]
 #[serial]
-async fn delete_topics_second_occurrence_of_a_duplicate_name_is_unknown_topic_or_partition() {
+async fn delete_topics_every_occurrence_of_a_duplicate_name_is_rejected() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
@@ -221,9 +225,19 @@ async fn delete_topics_second_occurrence_of_a_duplicate_name_is_unknown_topic_or
     assert_eq!(
         results,
         vec![
-            (Some("orders".to_string()), ERROR_NONE),
-            (Some("orders".to_string()), ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            (Some("orders".to_string()), ERROR_INVALID_REQUEST),
+            (Some("orders".to_string()), ERROR_INVALID_REQUEST),
         ]
+    );
+
+    // Neither occurrence deleted anything - the topic must still exist.
+    let topic = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup should not fail");
+    assert!(
+        topic.is_some(),
+        "a duplicate name must not delete the topic it names"
     );
 }
 
@@ -311,7 +325,7 @@ async fn delete_topics_over_cap_error_message_names_the_limit() {
     let names: Vec<String> = (0..101).map(|i| format!("topic-{i}")).collect();
     let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let body = build_request(&name_refs);
-    let outcome = delete_topics::handle(&state, REQUEST_VERSION, body).await;
+    let outcome = delete_topics::handle(&state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("DeleteTopics request always answers");
     let (error_code, error_message) = decode_first_result(resp_body);
     assert_eq!(error_code, ERROR_POLICY_VIOLATION);

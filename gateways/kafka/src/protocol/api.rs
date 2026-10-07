@@ -26,6 +26,7 @@ use kafka_protocol::messages::{
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
@@ -407,18 +408,22 @@ pub async fn handle_request_bounded(
     body: Bytes,
 ) -> HandleOutcome {
     let connection = ConnectionState::default();
-    handle_connection_request(state, &connection, api_key, api_version, body).await
+    handle_connection_request(state, &connection, None, api_key, api_version, body).await
 }
 
 /// [`handle_request_bounded`] for one request of `connection`.
+///
+/// `principal` is `None` when SASL is off, or for a key the connection reached before
+/// authenticating - only [`crate::server::route_frame`] ever has a principal to pass.
 pub async fn handle_connection_request(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
-    dispatch(state, connection, api_key, api_version, body).await
+    dispatch(state, connection, principal, api_key, api_version, body).await
 }
 
 #[must_use]

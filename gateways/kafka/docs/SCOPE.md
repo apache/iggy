@@ -243,13 +243,21 @@ below it are still open for the issues that build on top of it.
     [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md).
   - Per-topic results are independent: one missing or invalid name in a batch does not block an
     existing, validly-named topic elsewhere in the same request from being deleted.
-  - A name repeated within one request is not specially rejected the way `CreateTopics` rejects a
-    duplicate - deleting the same topic twice has no race to protect against the way creating it
-    twice does, so the first occurrence deletes it and the second then correctly answers
-    `UNKNOWN_TOPIC_OR_PARTITION` (3) because the topic genuinely no longer exists.
+  - A name repeated within one request is rejected outright for every occurrence
+    (`INVALID_REQUEST`, 42, no bridge call for any occurrence), the same choice `CreateTopics`
+    makes for a repeated topic name: real Kafka's `ControllerApis.deleteTopics` answers
+    `INVALID_REQUEST` "Duplicate topic name" for every occurrence and deletes nothing, rather
+    than a first-occurrence-wins split that would let an `AdminClient` caller observe a delete it
+    never got a clean per-name answer for.
   - Same bridge-fan-out bounds as CreateTopics: a request naming more than 100 topic names is
     rejected outright (`POLICY_VIOLATION`, no bridge call for any of them), and the wire
-    `timeout_ms` (clamped to `[1s, 30s]`) bounds the whole handler's aggregate bridge work.
+    `timeout_ms` (clamped to `[1s, 30s]`) bounds the whole handler's aggregate bridge work. The
+    deadline is checked before each name's own bridge call starts, not only inside the
+    `timeout_at` wrapping it - `timeout_at` polls its inner future before it checks the delay, so
+    a deadline that already passed would otherwise still start a real delete.
+  - With SASL on, the authenticated principal must hold `manage_topics` - without it every name
+    in the request fails `TOPIC_AUTHORIZATION_FAILED` (29) and `delete_kafka_topic` is never
+    called. With SASL off there is no principal to check, and the request is not gated here.
   - v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape) is not advertised - this bridge
     has no concept of a Kafka topic id, only the Kafka-side name `TopicMapping` resolves.
 - [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
