@@ -195,9 +195,11 @@ pub struct PartitionIoQuiescence {
     waiter: RefCell<Option<Waker>>,
 }
 
+#[derive(Clone)]
 pub struct PartitionTeardown {
     pub(crate) io: Rc<PartitionIoQuiescence>,
     pub(crate) persistence: Option<Rc<crate::PartitionPersistence>>,
+    pub(crate) offset_files: Rc<crate::offset_storage::RetainedOffsetFiles<compio::fs::File>>,
 }
 
 impl PartitionIoQuiescence {
@@ -266,6 +268,16 @@ impl PartitionIoQuiescence {
 }
 
 impl PartitionTeardown {
+    pub(crate) fn retire(&self) {
+        self.io.retire();
+        self.offset_files.clear();
+    }
+
+    pub(crate) fn delete(&self) {
+        self.io.delete();
+        self.offset_files.clear();
+    }
+
     /// # Errors
     /// A failed or interrupted writer keeps the tombstone and its files intact.
     pub async fn drain(self) -> std::io::Result<()> {
@@ -1139,7 +1151,7 @@ impl TransferFileJob {
                             [
                                 ".log",
                                 ".index",
-                                ".staging",
+                                crate::state_transfer::STAGING_SUFFIX,
                                 crate::segment_anchor::ANCHOR_SUFFIX,
                             ]
                             .iter()

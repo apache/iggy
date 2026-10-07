@@ -1014,9 +1014,9 @@ async fn tear_down_owned_partition(
         return;
     }
 
-    // Fence writes BEFORE awaiting disk delete. Tombstone is RefCell
-    // (cross-task callable) and shards_table is papaya, both safe to mutate
-    // directly from the reconciler. Routing through the pump's ReconcileOp
+    // Fence through detached handles before awaiting disk delete. The pump
+    // may hold a mutable partition borrow, so this must not access its vec.
+    // Routing through the pump's ReconcileOp
     // queue here would race the unlink against in-flight on_request /
     // on_replicate / on_ack frames that haven't observed the queued
     // tombstone yet. Idempotent on retry: already-tombstoned namespace

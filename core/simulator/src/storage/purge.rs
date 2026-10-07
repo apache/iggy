@@ -41,8 +41,8 @@
 //! replays a durable journal into a new partition. No partition memory survives
 //! recovery. The two controls inject no sync failures. A retry within one
 //! process runs through `IggyPartition::purge`, so the partition crate tests it.
-//! A separate test fails one unlink and checks that the surviving bookmark keeps
-//! its consumer offset slot until a later purge removes the file.
+//! A failed unlink leaves the generation unrecorded, including for bookmarks not
+//! loaded into memory. Restart must complete that purge before fresh history.
 
 use super::tests::owned_prepare;
 use super::{Crash, FaultMode, SimStorage, StorageOperation};
@@ -50,7 +50,8 @@ use configs::server::ServerConfig;
 use consensus::{LocalPipeline, Sequencer, VsrConsensus};
 use futures::executor::block_on;
 use iggy_common::{
-    ConsumerKind, Durability, IggyByteSize, PartitionStats, PollingStrategy, TopicRuntimeOptions,
+    ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize, PartitionStats,
+    PollingStrategy, TopicRuntimeOptions,
 };
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
 use journal::{DurableAppend, PartitionPrepareJournal};
@@ -633,74 +634,82 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
     });
 }
 
-/// A bookmark the purge cannot unlink survives on disk, so its key must keep a
-/// consumer offset slot. The next purge that removes the file releases the slot.
 #[test]
-fn given_unremovable_bookmark_when_purge_completes_should_strand_it_until_a_later_purge_removes_it()
-{
+fn given_unremovable_bookmark_when_power_is_lost_should_require_purge_before_fresh_history() {
     block_on(async {
         for policy in [Durability::Replicated, Durability::Persisted] {
-            let harness = PurgeStorageHarness::with_stored_progress(policy).await;
-            let mut partition = harness.empty_partition();
-            harness
-                .recover_progress(&mut partition, STORED_OFFSET)
-                .await;
-            let directory = harness.offset_directory(ConsumerKind::Consumer);
+            for loaded in [false, true] {
+                let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+                let mut partition = harness.empty_partition();
+                if loaded {
+                    harness
+                        .recover_progress(&mut partition, STORED_OFFSET)
+                        .await;
+                } else {
+                    partition.configure_consumer_offset_storage(
+                        ConsumerKind::ALL.map(|kind| {
+                            harness
+                                .offset_directory(kind)
+                                .to_string_lossy()
+                                .into_owned()
+                        }),
+                        ConsumerOffsets::with_capacity(1),
+                        ConsumerGroupOffsets::with_capacity(1),
+                    );
+                }
+                // The consumer directory scan precedes its only bookmark unlink.
+                harness.storage.fail_at(1, FaultMode::Before);
+                let result = partition
+                    .complete_purge_with_storage(
+                        &partition_config(),
+                        &harness.storage,
+                        NEW_GENERATION,
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(PurgeError::OffsetsNotDurable(_))),
+                    "{policy:?}, loaded={loaded}: a surviving bookmark must prevent purge completion: {result:?}"
+                );
+                assert_ne!(partition.applied_purge_generation(), NEW_GENERATION);
+                assert_eq!(
+                    partition.stranded_consumer_offset_count(ConsumerKind::Consumer),
+                    1
+                );
+                drop(partition);
 
-            // Operation 0 lists the consumer directory; operation 1 unlinks its
-            // only bookmark.
-            harness.storage.fail_at(1, FaultMode::Before);
-            partition
-                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
-                .await
-                .expect("a failed unlink must not fail the purge");
-            assert_eq!(
-                partition.applied_purge_generation(),
-                NEW_GENERATION,
-                "{policy:?}: the purge must still record its generation"
-            );
-            assert_eq!(
-                partition.stranded_consumer_offset_count(ConsumerKind::Consumer),
-                1,
-                "{policy:?}: the surviving bookmark must keep its slot"
-            );
-            assert_eq!(
-                partition.stranded_consumer_offset_count(ConsumerKind::ConsumerGroup),
-                0,
-                "{policy:?}: the removed group bookmark must not keep a slot"
-            );
-            let remaining: Vec<_> = harness
-                .storage
-                .entries(&directory)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|entry| entry.name.into_string().unwrap())
-                .collect();
-            assert_eq!(remaining, [CONSUMER_ID.to_string()], "{policy:?}");
-
-            partition
-                .complete_purge_with_storage(
-                    &partition_config(),
-                    &harness.storage,
-                    NEW_GENERATION + 1,
-                )
-                .await
-                .expect("complete the later purge");
-            assert_eq!(
-                partition.stranded_consumer_offset_count(ConsumerKind::Consumer),
-                0,
-                "{policy:?}: removing the file must release the slot"
-            );
-            assert!(
+                harness.storage.crash(Crash::PowerLoss);
+                let mut recovered = harness.empty_partition();
                 harness
-                    .storage
-                    .entries(&directory)
+                    .recover_progress(&mut recovered, STORED_OFFSET)
+                    .await;
+                assert_eq!(recovered.applied_purge_generation(), OLD_GENERATION);
+                recovered
+                    .complete_purge_with_storage(
+                        &partition_config(),
+                        &harness.storage,
+                        NEW_GENERATION,
+                    )
                     .await
-                    .unwrap()
-                    .is_empty(),
-                "{policy:?}: the later purge must remove the bookmark"
-            );
+                    .expect("restart must finish the same purge before accepting fresh history");
+                assert_eq!(
+                    recovered.stranded_consumer_offset_count(ConsumerKind::Consumer),
+                    0
+                );
+                assert_bookmarks(
+                    &recovered,
+                    None,
+                    "completed retry removes every old bookmark",
+                );
+                drop(recovered);
+
+                harness.persist_fresh_history().await;
+                harness.storage.crash(Crash::PowerLoss);
+                let recovered = harness.recover_partition().await;
+                assert_eq!(recovered.applied_purge_generation(), NEW_GENERATION);
+                harness
+                    .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
+                    .await;
+            }
         }
     });
 }

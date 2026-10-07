@@ -110,6 +110,8 @@ where
     /// per-shard runtime is single-threaded, so runtime borrow checks
     /// suffice; callers must not hold a borrow across `.await`.
     tombstoned: RefCell<AHashMap<IggyNamespace, Option<u64>>>,
+    /// Reconciler fences must not borrow a partition held by the pump across await.
+    teardown: RefCell<AHashMap<IggyNamespace, crate::PartitionTeardown>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
@@ -152,6 +154,7 @@ where
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashMap::new()),
+            teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
@@ -170,6 +173,7 @@ where
             // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashMap::new()),
+            teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
@@ -205,8 +209,9 @@ where
 
     /// Capture writer ownership even when a previous teardown already tombstoned it.
     pub fn capture_teardown(&self, namespace: &IggyNamespace) -> Option<crate::PartitionTeardown> {
-        let local = self.namespace_map().get(namespace).copied()?;
-        self.get(local).map(IggyPartition::capture_teardown)
+        let teardown = self.teardown.borrow().get(namespace)?.clone();
+        teardown.delete();
+        Some(teardown)
     }
 
     #[must_use]
@@ -242,9 +247,13 @@ where
     ) {
         let ready = Rc::clone(&self.loopback_ready);
         let incarnation = partition.incarnation();
+        let io = partition.teardown_handle().io;
         partition
             .consensus()
             .set_loopback_notifier(Some(consensus::LoopbackNotifier::new(move || {
+                if io.is_retiring() {
+                    return;
+                }
                 ready.partitions.borrow_mut().insert(namespace, incarnation);
                 ready.wake();
             })));
@@ -310,6 +319,7 @@ where
     /// `PartitionStats` ([`IggyPartition::publish_current_offset`]). No
     /// earlier point is safe: a build that is never adopted must leave the
     /// live incarnation's counters alone.
+    /// Configure persistence before insertion; teardown retains the mounted writer.
     ///
     /// # Safety discipline (compiler cannot enforce)
     ///
@@ -346,6 +356,9 @@ where
         partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
             &self.consumer_group_offsets_reconcile_epoch,
         ));
+        self.teardown
+            .borrow_mut()
+            .insert(namespace, partition.teardown_handle());
         // Safety: pump-only invariant, caller responsibility.
         let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
@@ -505,6 +518,7 @@ where
         );
 
         let partition = partitions.swap_remove(idx);
+        self.teardown.borrow_mut().remove(namespace);
         partition.invalidate_workerless_offset_files();
         partition.consensus().set_loopback_notifier(None);
         self.loopback_ready
@@ -555,10 +569,8 @@ where
     /// shard's runtime (reconciler sets the fence synchronously before
     /// awaiting disk delete).
     pub fn tombstone(&self, namespace: IggyNamespace) {
-        if let Some(partition) = self.get_by_ns(&namespace) {
-            partition.stop_io_admission();
-            partition.invalidate_workerless_offset_files();
-            partition.consensus().set_loopback_notifier(None);
+        if let Some(teardown) = self.teardown.borrow().get(&namespace) {
+            teardown.retire();
         }
         self.loopback_ready
             .partitions
@@ -991,12 +1003,26 @@ mod tests {
         );
         assert!(!partitions.has_ready_loopbacks());
 
+        let mut messages = Vec::new();
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        partition.consensus().drain_loopback_into(&mut messages);
+        consensus::send_prepare_ok(partition.consensus(), &header, true).await;
+        assert!(partitions.has_ready_loopbacks());
         partitions.tombstone(namespace);
         assert!(!partitions.has_ready_loopbacks());
-        let retired = partitions.remove(&namespace).unwrap();
+        assert!(partition.teardown_handle().io.is_retiring());
+        partition.consensus().drain_loopback_into(&mut messages);
+        consensus::send_prepare_ok(partition.consensus(), &header, true).await;
+        assert!(
+            !partitions.has_ready_loopbacks(),
+            "tombstoned owners cannot notify"
+        );
+        let teardown = partitions.capture_teardown(&namespace).unwrap();
+        assert!(partition.teardown_handle().io.is_deleting());
+        teardown.drain().await.unwrap();
+        let retired = Box::new(partitions.remove(&namespace).unwrap());
         partitions.untombstone(&namespace);
         assert!(!partitions.has_ready_loopbacks());
-        let mut messages = Vec::new();
         retired.consensus().drain_loopback_into(&mut messages);
         consensus::send_prepare_ok(retired.consensus(), &header, true).await;
         assert!(
@@ -1012,6 +1038,18 @@ mod tests {
         assert_eq!(
             partitions.take_ready_loopbacks().get(&namespace),
             Some(&replacement_incarnation)
+        );
+        let replacement = partitions.get_mut_by_ns(&namespace).unwrap();
+        replacement.consensus().drain_loopback_into(&mut messages);
+        consensus::send_prepare_ok(replacement.consensus(), &header, true).await;
+        assert!(partitions.has_ready_loopbacks());
+        let removed = Box::new(partitions.remove(&namespace).unwrap());
+        assert!(!partitions.has_ready_loopbacks());
+        removed.consensus().drain_loopback_into(&mut messages);
+        consensus::send_prepare_ok(removed.consensus(), &header, true).await;
+        assert!(
+            !partitions.has_ready_loopbacks(),
+            "removed notifier was detached"
         );
     }
 

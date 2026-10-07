@@ -76,6 +76,8 @@ impl LocalGate {
 
     fn release(&self) {
         self.busy.set(false);
+        // Move waiters out before waking: a waker that polls inline can
+        // re-enter acquire and borrow the waiter list again.
         let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
         for waker in waiters {
             waker.wake();
@@ -136,9 +138,6 @@ pub struct LocalGateGuard<'a> {
 
 impl Drop for LocalGateGuard<'_> {
     fn drop(&mut self) {
-        // Move the waiters out before waking: `wake()` only schedules under
-        // compio today, but a waker that ever polled a waiter inline would
-        // re-enter `acquire`'s `waiters.borrow_mut()` and panic the RefCell.
         self.gate.release();
     }
 }

@@ -761,11 +761,12 @@ reply_inbox_capacity = 1024
 poll_completion_capacity = 1024
 
 # Active partition file jobs plus results awaiting owner acceptance per shard (1..=256).
+# Exhausting either limit queues partition file work until capacity is released.
 partition_io_capacity = 16
 # Omission selects the largest legal job charge, slightly above 4 GiB per shard.
 # This is an admission ceiling, not an eager allocation. A smaller budget fails boot.
-# partition_io_bytes_max = "8 GiB"
 # Charges include retained backing allocations, even for small visible slices.
+# partition_io_bytes_max = "8 GiB"
 
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized

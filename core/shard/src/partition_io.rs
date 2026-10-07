@@ -238,7 +238,10 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             return;
         }
         if let Some(owner) = self.ready.waiting.borrow().front().copied() {
-            self.ready.queue.borrow_mut().push_back(owner);
+            let mut queue = self.ready.queue.borrow_mut();
+            // Release can run while its caller still owns the queue head.
+            let position = usize::from(!queue.is_empty());
+            queue.insert(position, owner);
             self.ready.waiting_ready.set(true);
         }
     }
@@ -2028,6 +2031,48 @@ mod tests {
         lane.pop_ready(namespace, old);
         lane.release(slot);
         assert_eq!(lane.head(), Some((namespace, replacement)));
+    }
+
+    #[test]
+    fn released_capacity_retries_the_oldest_waiter_behind_the_active_head() {
+        let limits = super::PartitionIoLimits::new(2, None).unwrap();
+        let lane = super::PartitionIoLane::<HeldSuperblock>::new(limits);
+        let owners: [_; 5] = std::array::from_fn(|index| {
+            (
+                IggyNamespace::new(0, 0, index),
+                partitions::PartitionIncarnation::default(),
+            )
+        });
+        let occupied = lane
+            .try_reserve(owners[0].0, owners[0].1, limits.bytes_max())
+            .unwrap();
+        for owner in &owners[1..=2] {
+            lane.reschedule(owner.0, owner.1);
+            assert!(lane.try_reserve(owner.0, owner.1, 1).is_none());
+            lane.wait_for_capacity(owner.0, owner.1);
+        }
+        for owner in &owners[3..] {
+            lane.reschedule(owner.0, owner.1);
+        }
+
+        lane.release(occupied);
+        assert_eq!(
+            lane.head(),
+            Some(owners[3]),
+            "release must preserve the head held by its caller"
+        );
+        lane.pop_ready(owners[3].0, owners[3].1);
+        assert_eq!(
+            lane.head(),
+            Some(owners[1]),
+            "a capacity waiter must not wait for every runnable owner"
+        );
+        assert!(lane.try_reserve(owners[1].0, owners[1].1, 1).is_some());
+        lane.pop_ready(owners[1].0, owners[1].1);
+        assert_eq!(lane.head(), Some(owners[4]));
+        lane.pop_ready(owners[4].0, owners[4].1);
+        assert_eq!(lane.head(), Some(owners[2]));
+        assert!(lane.try_reserve(owners[2].0, owners[2].1, 1).is_some());
     }
 
     #[test]
