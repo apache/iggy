@@ -39,7 +39,6 @@ base64 = { workspace = true }
 gcloud-bigquery = { workspace = true }
 gcloud-gax = { workspace = true }
 gcloud-googleapis = { workspace = true }
-hex = { workspace = true }
 humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 reqwest = { workspace = true }

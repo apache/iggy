@@ -269,6 +269,20 @@ async fn given_transient_failure_should_retry_and_succeed() {
 }
 
 #[tokio::test]
+async fn given_cancelled_timeout_should_retry_and_succeed() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.script(&[AppendScript::CallError(Code::Cancelled), AppendScript::Ok]);
+    let sink = open_sink(&fake, "").await;
+
+    sink.consume(&topic(), metadata(), events(0..2))
+        .await
+        .expect("cancelled client timeout should be retried");
+
+    assert_eq!(offsets(&fake.stored()), vec![0, 1]);
+    assert_eq!(fake.pending_script(), 0);
+}
+
+#[tokio::test]
 async fn given_transient_failure_beyond_retry_budget_should_fail() {
     let fake = FakeBigQuery::start(EVENTS_TABLE).await;
     fake.script(&[

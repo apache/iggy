@@ -284,19 +284,32 @@ impl BigQuerySink {
         )
         .await
         .map_err(|failure| {
-            self.counters
-                .rows_failed
-                .fetch_add(chunk.offsets.len() as u64, Ordering::Relaxed);
-            error!(
-                "BigQuery sink ID: {} lost {} rows (offsets {}..={}) of {}/{} partition {}: {failure}",
-                self.id,
-                chunk.offsets.len(),
-                chunk.offsets.first().copied().unwrap_or_default(),
-                chunk.offsets.last().copied().unwrap_or_default(),
-                topic.stream,
-                topic.topic,
-                messages.partition_id
-            );
+            if failure.error.is_retryable() {
+                error!(
+                    "BigQuery sink ID: {} append outcome is unknown for {} rows (offsets {}..={}) of {}/{} partition {} after the retry budget was exhausted: {failure}",
+                    self.id,
+                    chunk.offsets.len(),
+                    chunk.offsets.first().copied().unwrap_or_default(),
+                    chunk.offsets.last().copied().unwrap_or_default(),
+                    topic.stream,
+                    topic.topic,
+                    messages.partition_id
+                );
+            } else {
+                self.counters
+                    .rows_failed
+                    .fetch_add(chunk.offsets.len() as u64, Ordering::Relaxed);
+                error!(
+                    "BigQuery sink ID: {} dropped {} rows (offsets {}..={}) of {}/{} partition {} after a permanent append failure: {failure}",
+                    self.id,
+                    chunk.offsets.len(),
+                    chunk.offsets.first().copied().unwrap_or_default(),
+                    chunk.offsets.last().copied().unwrap_or_default(),
+                    topic.stream,
+                    topic.topic,
+                    messages.partition_id
+                );
+            }
             Error::from(failure.error)
         })
     }

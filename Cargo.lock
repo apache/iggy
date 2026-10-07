@@ -7228,7 +7228,6 @@ dependencies = [
  "gcloud-bigquery",
  "gcloud-gax",
  "gcloud-googleapis",
- "hex",
  "humantime",
  "iggy_common",
  "iggy_connector_sdk",

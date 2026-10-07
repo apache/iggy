@@ -142,7 +142,7 @@ With `include_metadata = true` the table must contain these columns. A missing c
 
 ### Errors and retries
 
-- `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `INTERNAL`, `ABORTED` and `RESOURCE_EXHAUSTED` are retried up to `max_retries` attempts in total.
+- `UNAVAILABLE`, `CANCELLED`, `DEADLINE_EXCEEDED`, `INTERNAL`, `ABORTED` and `RESOURCE_EXHAUSTED` are retried up to `max_retries` attempts in total.
 - Every other gRPC error, including `INVALID_ARGUMENT`, `PERMISSION_DENIED` and `UNAUTHENTICATED`, fails the request without a retry.
 - `tables.get` retries HTTP 429, 5xx and transport errors. A 403 or 404 fails `open()` immediately.
 
@@ -156,7 +156,8 @@ Every dropped row is logged at `warn` with its stream, topic, partition and offs
 
 The connector runtime commits consumer group offsets when messages are polled, before `consume()` runs, and a batch for which `consume()` returns an error is not redelivered. As a result:
 
-- A batch that still fails after the last retry, or hits a permanent error, is lost.
+- Rows in a request that hits a permanent error are lost. Requests split from the same polled batch are attempted independently, so earlier or later chunks may still be written.
+- When the retry budget is exhausted after an ambiguous transport failure, the connector cannot know whether that request was written. Its rows may be absent or duplicated.
 - A process crash between the offset commit and a successful append also loses that batch.
 - The `_default` stream has no append offsets. When an append result is lost and the request is retried, rows can be written twice. Deduplicate downstream on `iggy_stream`, `iggy_topic`, `iggy_partition_id` and `iggy_offset`, for example:
 

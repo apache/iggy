@@ -71,6 +71,7 @@ pub(crate) fn is_retryable_code(code: Code) -> bool {
     matches!(
         code,
         Code::Unavailable
+            | Code::Cancelled
             | Code::DeadlineExceeded
             | Code::Internal
             | Code::Aborted
@@ -140,6 +141,7 @@ mod tests {
     fn given_transient_codes_should_be_retryable() {
         for code in [
             Code::Unavailable,
+            Code::Cancelled,
             Code::DeadlineExceeded,
             Code::Internal,
             Code::Aborted,

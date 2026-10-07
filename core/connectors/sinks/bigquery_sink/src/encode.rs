@@ -31,13 +31,16 @@
 //! row in the run sets. Columns no row mentions are left out, so BigQuery
 //! fills them according to `missing_value` (the column default, or NULL).
 
-use crate::schema::{BqType, Column, MetaColumn, Mode, RawKind, TableLayout, UTC};
+use std::fmt::Write as _;
+use std::io;
+use std::sync::Arc;
+
 use arrow::array::{
-    ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray, StringBuilder,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryBuilder, Int64Array, ListArray, RecordBatch, StringArray, StringBuilder,
+    StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Fields, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::ipc::writer::{
     CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
@@ -46,9 +49,10 @@ use arrow::json::ReaderBuilder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, TopicMetadata};
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use simd_json::{OwnedValue, StaticNode};
-use std::fmt::Write as _;
-use std::sync::Arc;
+
+use crate::schema::{BqType, Column, MetaColumn, Mode, RawKind, TableLayout, UTC};
 
 const HEADER_ENCODING_BASE64: &str = "base64";
 const UTC_OFFSET: &str = "+00:00";
@@ -223,8 +227,8 @@ fn json_object(payload: Payload) -> Result<OwnedValue, String> {
 /// - a REQUIRED column without a default must be present and non-null,
 /// - REPEATED columns that are absent or null become `[]`,
 /// - JSON column values become their JSON text,
-/// - BYTES column values are base64 in JSON and become hex, which is what
-///   `arrow-json` decodes into binary.
+/// - BYTES column values remain base64 until they are decoded directly into
+///   Arrow binary buffers.
 fn normalize_row(row: &mut OwnedValue, layout: &TableLayout) -> Result<(), String> {
     let OwnedValue::Object(object) = row else {
         return Err("payload is not a JSON object".to_owned());
@@ -274,13 +278,9 @@ fn normalize_scalar(value: &mut OwnedValue, column: &Column) -> Result<(), Strin
             *value = OwnedValue::String(text);
         }
         BqType::Bytes => {
-            let OwnedValue::String(text) = value else {
+            let OwnedValue::String(_) = value else {
                 return Err(format!("column '{}' expects a base64 string", column.name));
             };
-            let bytes = BASE64
-                .decode(text.as_bytes())
-                .map_err(|e| format!("column '{}': invalid base64: {e}", column.name))?;
-            *value = OwnedValue::String(hex::encode(bytes));
         }
         BqType::Record(children) => {
             let OwnedValue::Object(object) = value else {
@@ -299,6 +299,73 @@ fn normalize_scalar(value: &mut OwnedValue, column: &Column) -> Result<(), Strin
         _ => {}
     }
     Ok(())
+}
+
+/// Serialize a row for `arrow-json` while substituting empty strings for BYTES.
+/// The decoder still builds the correct null and list structure, and the binary
+/// leaves are replaced from the original base64 values afterwards.
+struct ArrowObject<'a> {
+    value: &'a OwnedValue,
+    fields: &'a Fields,
+}
+
+impl Serialize for ArrowObject<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let OwnedValue::Object(object) = self.value else {
+            return self.value.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
+        for field in self.fields {
+            if let Some(value) = object.get(field.name().as_str()) {
+                map.serialize_entry(
+                    field.name(),
+                    &ArrowValue {
+                        value,
+                        data_type: field.data_type(),
+                    },
+                )?;
+            }
+        }
+        map.end()
+    }
+}
+
+struct ArrowValue<'a> {
+    value: &'a OwnedValue,
+    data_type: &'a DataType,
+}
+
+impl Serialize for ArrowValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if matches!(self.value, OwnedValue::Static(StaticNode::Null)) {
+            return self.value.serialize(serializer);
+        }
+        match (self.data_type, self.value) {
+            (DataType::Binary, OwnedValue::String(_)) => serializer.serialize_str(""),
+            (DataType::List(field), OwnedValue::Array(items)) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for value in items.iter() {
+                    sequence.serialize_element(&ArrowValue {
+                        value,
+                        data_type: field.data_type(),
+                    })?;
+                }
+                sequence.end()
+            }
+            (DataType::Struct(fields), OwnedValue::Object(_)) => ArrowObject {
+                value: self.value,
+                fields,
+            }
+            .serialize(serializer),
+            _ => self.value.serialize(serializer),
+        }
+    }
 }
 
 /// Indexes of the layout columns that at least one row sets, in table order.
@@ -463,14 +530,178 @@ fn to_target(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch, Arro
     RecordBatch::try_new(target.clone(), columns)
 }
 
-fn decode<S: serde::Serialize>(schema: &SchemaRef, rows: &[S]) -> Result<RecordBatch, ArrowError> {
+fn decode(schema: &SchemaRef, rows: &[&OwnedValue]) -> Result<RecordBatch, ArrowError> {
     let mut decoder = ReaderBuilder::new(schema.clone())
         .with_batch_size(rows.len().max(1))
         .build_decoder()?;
-    decoder.serialize(rows)?;
-    decoder
+    let arrow_rows: Vec<_> = rows
+        .iter()
+        .map(|row| ArrowObject {
+            value: row,
+            fields: schema.fields(),
+        })
+        .collect();
+    decoder.serialize(&arrow_rows)?;
+    let batch = decoder
         .flush()?
-        .ok_or_else(|| ArrowError::JsonError("decoder produced no rows".to_owned()))
+        .ok_or_else(|| ArrowError::JsonError("decoder produced no rows".to_owned()))?;
+    replace_binary_columns(batch, rows)
+}
+
+fn replace_binary_columns(
+    batch: RecordBatch,
+    rows: &[&OwnedValue],
+) -> Result<RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, array) in schema.fields().iter().zip(batch.columns()) {
+        if contains_binary(field.data_type()) {
+            let values = rows
+                .iter()
+                .map(|row| object_value(Some(row), field.name()))
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.push(replace_binary_values(field, array, &values)?);
+        } else {
+            columns.push(array.clone());
+        }
+    }
+    RecordBatch::try_new(schema, columns)
+}
+
+fn replace_binary_values(
+    field: &FieldRef,
+    array: &ArrayRef,
+    values: &[Option<&OwnedValue>],
+) -> Result<ArrayRef, ArrowError> {
+    if array.len() != values.len() {
+        return Err(ArrowError::ComputeError(format!(
+            "column '{}' has {} Arrow values for {} JSON values",
+            field.name(),
+            array.len(),
+            values.len()
+        )));
+    }
+    match field.data_type() {
+        DataType::Binary => binary_array(field.name(), values),
+        DataType::List(item) if contains_binary(item.data_type()) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| type_mismatch(field, array))?;
+            let mut child_values = Vec::with_capacity(list.values().len());
+            for value in values {
+                match value {
+                    None | Some(OwnedValue::Static(StaticNode::Null)) => {}
+                    Some(OwnedValue::Array(items)) => {
+                        child_values.extend(items.iter().map(Some));
+                    }
+                    Some(_) => {
+                        return Err(ArrowError::JsonError(format!(
+                            "column '{}' expects an array",
+                            field.name()
+                        )));
+                    }
+                }
+            }
+            let child = replace_binary_values(item, list.values(), &child_values)?;
+            Ok(Arc::new(ListArray::try_new(
+                item.clone(),
+                list.offsets().clone(),
+                child,
+                list.nulls().cloned(),
+            )?))
+        }
+        DataType::Struct(fields) if contains_binary(field.data_type()) => {
+            let structure = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| type_mismatch(field, array))?;
+            let mut children = Vec::with_capacity(fields.len());
+            for (index, child_field) in fields.iter().enumerate() {
+                if contains_binary(child_field.data_type()) {
+                    let child_values = values
+                        .iter()
+                        .map(|value| object_value(*value, child_field.name()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    children.push(replace_binary_values(
+                        child_field,
+                        structure.column(index),
+                        &child_values,
+                    )?);
+                } else {
+                    children.push(structure.column(index).clone());
+                }
+            }
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                children,
+                structure.nulls().cloned(),
+            )?))
+        }
+        _ => Ok(array.clone()),
+    }
+}
+
+fn binary_array(name: &str, values: &[Option<&OwnedValue>]) -> Result<ArrayRef, ArrowError> {
+    let data_capacity = values
+        .iter()
+        .filter_map(|value| match value {
+            Some(OwnedValue::String(text)) => Some(text.len().saturating_mul(3) / 4),
+            _ => None,
+        })
+        .sum();
+    let mut builder = BinaryBuilder::with_capacity(values.len(), data_capacity);
+    for value in values {
+        match value {
+            None | Some(OwnedValue::Static(StaticNode::Null)) => builder.append_null(),
+            Some(OwnedValue::String(text)) => {
+                let mut decoder = base64::read::DecoderReader::new(text.as_bytes(), &BASE64);
+                io::copy(&mut decoder, &mut builder).map_err(|error| {
+                    ArrowError::JsonError(format!("column '{name}': invalid base64: {error}"))
+                })?;
+                builder.append_value(&[] as &[u8]);
+            }
+            Some(_) => {
+                return Err(ArrowError::JsonError(format!(
+                    "column '{name}' expects a base64 string"
+                )));
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn object_value<'a>(
+    value: Option<&'a OwnedValue>,
+    name: &str,
+) -> Result<Option<&'a OwnedValue>, ArrowError> {
+    match value {
+        None | Some(OwnedValue::Static(StaticNode::Null)) => Ok(None),
+        Some(OwnedValue::Object(object)) => Ok(object.get(name)),
+        Some(_) => Err(ArrowError::JsonError(format!(
+            "column '{name}' has a non-object parent"
+        ))),
+    }
+}
+
+fn contains_binary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Binary => true,
+        DataType::List(field) => contains_binary(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_binary(field.data_type())),
+        _ => false,
+    }
+}
+
+fn type_mismatch(field: &FieldRef, array: &ArrayRef) -> ArrowError {
+    ArrowError::ComputeError(format!(
+        "column '{}' has Arrow type {}, expected {}",
+        field.name(),
+        array.data_type(),
+        field.data_type()
+    ))
 }
 
 // ─── Raw mode ────────────────────────────────────────────────────────────────
@@ -485,11 +716,12 @@ fn encode_raw(
     let mut kept = Vec::with_capacity(messages.len());
     let payload_column: ArrayRef = match kind {
         RawKind::Bytes => {
-            let mut values = Vec::with_capacity(messages.len());
-            for message in messages {
-                match message.payload.try_to_bytes() {
+            let mut builder = BinaryBuilder::with_capacity(messages.len(), 0);
+            for mut message in messages {
+                let payload = std::mem::replace(&mut message.payload, Payload::Raw(Vec::new()));
+                match payload.try_into_vec() {
                     Ok(bytes) => {
-                        values.push(bytes);
+                        builder.append_value(bytes);
                         kept.push(message);
                     }
                     Err(e) => rejected.push(Rejected {
@@ -498,7 +730,7 @@ fn encode_raw(
                     }),
                 }
             }
-            Arc::new(BinaryArray::from_iter_values(values))
+            Arc::new(builder.finish())
         }
         RawKind::Json | RawKind::String => {
             let mut values = Vec::with_capacity(messages.len());
@@ -550,7 +782,7 @@ fn raw_text(payload: Payload, kind: RawKind) -> Result<String, String> {
     };
     if kind == RawKind::Json {
         let mut bytes = text.as_bytes().to_vec();
-        simd_json::to_owned_value(&mut bytes)
+        simd_json::to_borrowed_value(&mut bytes)
             .map_err(|e| format!("payload is not valid JSON: {e}"))?;
     }
     Ok(text)
@@ -1075,6 +1307,44 @@ mod tests {
             r#"{"k":[1,2]}"#
         );
         assert_eq!(batch.column(1).as_binary::<i32>().value(0), b"hello");
+    }
+
+    #[test]
+    fn given_repeated_and_nested_bytes_should_decode_values() {
+        let layout = layout(
+            r#"{"name":"blobs","type":"BYTES","mode":"REPEATED"},
+               {"name":"details","type":"RECORD","fields":[
+                   {"name":"blob","type":"BYTES"}
+               ]}"#,
+            WriteMode::Mapped,
+            false,
+        );
+        let encoded = run(
+            &layout,
+            vec![
+                json(1, r#"{"blobs":["AQI=","AwQ="],"details":{"blob":"aGk="}}"#),
+                json(2, r#"{"blobs":[],"details":{}}"#),
+                json(3, r#"{"blobs":["not base64!"],"details":{}}"#),
+            ],
+        );
+
+        assert_eq!(encoded.rejected.len(), 1);
+        assert_eq!(encoded.rejected[0].offset, 3);
+        let batch = &encoded.chunks[0].batch;
+        let blobs = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let blob_values = blobs.values().as_binary::<i32>();
+        assert_eq!(blob_values.value(0), &[1, 2]);
+        assert_eq!(blob_values.value(1), &[3, 4]);
+        assert_eq!(blobs.value_length(1), 0);
+
+        let details = batch.column(1).as_struct();
+        let nested_blob = details.column(0).as_binary::<i32>();
+        assert_eq!(nested_blob.value(0), b"hi");
+        assert!(nested_blob.is_null(1));
     }
 
     #[test]
