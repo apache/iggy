@@ -1729,7 +1729,7 @@ impl Streams {
             }
             let current = topic
                 .round_robin_counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                     Some((c + 1) % count)
                 })
                 .unwrap_or(0);

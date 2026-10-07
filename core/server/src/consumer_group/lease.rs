@@ -340,14 +340,14 @@ mod tests {
         tracker.observe_local_session(&activity);
         let now = Instant::now();
         assert_eq!(tracker.local_activity(now, TIMEOUT), vec![identity]);
-        assert!(tracker.local_activity(now + TIMEOUT, TIMEOUT).is_empty());
+        assert_eq!(tracker.local_activity(now + TIMEOUT, TIMEOUT), []);
         activity.touch();
         assert_eq!(
             tracker.local_activity(Instant::now(), TIMEOUT),
             vec![identity]
         );
         drop(activity);
-        assert!(tracker.local_activity(now, TIMEOUT).is_empty());
+        assert_eq!(tracker.local_activity(now, TIMEOUT), []);
         assert!(tracker.local_sessions.is_empty());
     }
 }
