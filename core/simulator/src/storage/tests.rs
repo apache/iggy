@@ -892,7 +892,6 @@ fn first_open_recovers_after_each_initialization_fault() {
 }
 
 #[test]
-#[ignore = "PR #4092 review: PRE-EXISTING test. It passed vacuously while `SimStorage::writer_identity` returned `None` and never took a lease; now that the lease is real it is blocked on the compio-bound drain wait"]
 fn deleting_and_recreating_a_partition_fences_an_old_writer_completion() {
     block_on(async {
         let storage = storage_for_partition().await;
@@ -919,15 +918,18 @@ fn deleting_and_recreating_a_partition_fences_an_old_writer_completion() {
             .await
             .unwrap();
         storage.sync_directory(Path::new("/")).await.unwrap();
-        let (new, _) = PartitionPersistence::open_with_storage(
+        let mut reopen = Box::pin(PartitionPersistence::open_with_storage(
             Path::new("/partition/prepares-8"),
             42,
             8,
             storage.clone(),
-        )
-        .await
-        .unwrap();
-        writer.await;
+        ));
+        assert!(
+            poll!(&mut reopen).is_pending(),
+            "a retired writer still mid-write must fence the recreated partition"
+        );
+        let (reopened, ()) = futures::join!(reopen, writer);
+        let (new, _) = reopened.unwrap();
         assert!(!old.is_durable(original.header()));
         let replacement = prepare_with_payload(1, 0, b"new incarnation");
         new.append(replacement.clone().into_frozen(), true).unwrap();
@@ -3104,7 +3106,6 @@ async fn read_all(storage: &SimStorage, path: &Path) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "PR #4092 review: `WriterLease::acquire` drains through `compio::runtime::time::timeout`, so the writer fence cannot be driven by the deterministic executor"]
 fn given_a_retired_writer_when_reacquiring_then_the_drain_wait_should_be_executor_agnostic() {
     block_on(async {
         let storage = storage_for_partition().await;
@@ -3119,17 +3120,24 @@ fn given_a_retired_writer_when_reacquiring_then_the_drain_wait_should_be_executo
         assert!(poll!(&mut writer).is_pending());
         first.retire();
 
-        // `WriterLease::acquire` waits for the previous writer to drain through
-        // `compio::runtime::time::timeout` (`persistence.rs:220`), so the fence
-        // cannot be driven by the deterministic executor at all. Every
-        // simulator fault case runs with `lease = None` for this reason.
-        let reacquired =
-            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 8, storage.clone()).await;
-        storage.resume();
-        writer.await;
+        let mut reacquire = Box::pin(PartitionPersistence::open_with_storage(
+            Path::new(WAL),
+            42,
+            7,
+            storage.clone(),
+        ));
         assert!(
-            reacquired.is_ok(),
-            "retired writer could not be replaced under the deterministic executor"
+            poll!(&mut reacquire).is_pending(),
+            "a retired writer still mid-write must fence its replacement"
+        );
+        storage.resume();
+        let (reacquired, ()) = futures::join!(reacquire, writer);
+        let (new, _) = reacquired.unwrap_or_else(|error| {
+            panic!("retired writer could not be replaced under a non-compio executor: {error}")
+        });
+        assert!(
+            new.is_durable(prepare(1, 0).header()),
+            "replacement must recover the write the retired writer finished"
         );
     });
 }
