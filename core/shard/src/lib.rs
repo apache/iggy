@@ -65,7 +65,7 @@ use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfi
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
-use metadata::{BoundSession, MetadataSubmitError};
+use metadata::{BoundSession, CommitWalkStop, MetadataSubmitError};
 use partitions::state_transfer::TransferArtifact;
 use partitions::{
     FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
@@ -1438,10 +1438,10 @@ where
     /// metadata group per node (precedent: [`Self::metadata_transfer_attempts`]).
     metadata_gap_ticks: Cell<u32>,
 
-    /// Op the tick's commit walk last stopped on without moving, or `0`. The
-    /// journal names it but cannot produce its body, so the gap probe counts it
-    /// as absent and lets repair fetch it. Cleared implicitly: any advance of
-    /// `commit_min` makes it stop matching `commit_min + 1`.
+    /// Op of the commit walk's last `BodyMissing` stop, or `0`. The gap probe
+    /// counts it as absent so repair can refetch it. Zeroed by any other
+    /// walk-arm stop; an advance of `commit_min` past it also stops it
+    /// matching `commit_min + 1`.
     metadata_walk_stuck_op: Cell<u64>,
 
     /// Serving-side cache of state-transfer offers, both planes, keyed by
@@ -10129,8 +10129,9 @@ where
     ///
     /// Nothing else clears it: `on_repair_prepare` returns early for an op
     /// whose header is resident, and the append under it is refused anyway.
-    /// `stuck_op` is at `commit_min + 1` under `commit_max`, so a quorum holds
-    /// it and repair can serve it back.
+    /// `stuck_op` is the op the walk stopped on: `commit_min + 1` once this
+    /// tick's walk has advanced, and at or under `commit_max`, so a quorum
+    /// holds it and repair can serve it back.
     ///
     /// SERIALIZATION: same argument as `reconcile_metadata_view_divergence`,
     /// which is the other shard-side `truncate_from` caller. This runs on the
@@ -10202,14 +10203,14 @@ where
         //
         // The header ring is only half of what the walk needs. `commit_journal`
         // reads the BODY through `entry()`, which answers `None` for an op the
-        // ring names but the WAL cannot produce, and then breaks without moving
-        // `commit_min`. Reading the body here instead is not an option (it is an
-        // async WAL read, per tick, on the walk's fast path), so the walk
-        // reports the op it stopped on and this treats that op as absent --
-        // which it is, for every purpose this probe serves. Without it the two
-        // disagree forever: the walk cannot move, the probe keeps calling the
-        // group walk-stalled, the debounce keeps resetting, and repair never
-        // arms.
+        // ring names but the WAL cannot produce, and stops there with
+        // `CommitWalkStop::BodyMissing`. Reading the body here instead is not an
+        // option (it is an async WAL read, per tick, on the walk's fast path),
+        // so the walk reports the op it stopped on and this treats that op as
+        // absent, which it is for every purpose this probe serves. Without it
+        // the two disagree forever: the walk cannot move, the probe keeps
+        // calling the group walk-stalled, the debounce keeps resetting, and
+        // repair never arms.
         //
         // Self-clearing: any path that advances `commit_min` past the stuck op
         // leaves `stuck_op != commit_min + 1`, so nothing has to retract it.
@@ -10375,15 +10376,17 @@ where
                     commit_max = probe.commit_max,
                     "metadata commit walk parked over resident committed ops; resuming"
                 );
-                metadata.commit_journal().await;
-                // A walk that moved nothing found the header and not the body.
+                // Truncate on `BodyMissing` alone. A walk that moved nothing is
+                // not proof: `PipelineHead` moves nothing either, and dropping
+                // that prepare panics the pipeline driver that commits it next.
+                //
                 // Recording the op stops the detector calling this a parked
                 // walk, but arming repair alone cannot refill it: the ingest
                 // skips an op whose header is resident and `append` refuses the
                 // slot under it, so the header has to go first.
-                let walked = consensus.commit_min();
-                if walked == probe.commit_min {
-                    let stuck_op = walked.saturating_add(1);
+                if let CommitWalkStop::BodyMissing { op: stuck_op } =
+                    metadata.commit_journal().await
+                {
                     // Once per op: a failed truncation leaves the header where
                     // it is, and retrying every tick only repeats the error.
                     if self.metadata_walk_stuck_op.replace(stuck_op) != stuck_op {
