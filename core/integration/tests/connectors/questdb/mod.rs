@@ -18,3 +18,9 @@
 mod questdb_sink;
 
 const TEST_MESSAGE_COUNT: usize = 3;
+
+/// Shared poll budget for the waits in this suite, matching `postgres/mod.rs`.
+/// 120 attempts at 100 ms gives twelve seconds, which covers a container that is
+/// slow to apply a write without masking a real stall.
+const POLL_ATTEMPTS: usize = 120;
+const POLL_INTERVAL_MS: u64 = 100;
