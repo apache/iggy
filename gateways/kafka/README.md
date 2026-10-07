@@ -481,9 +481,9 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 - One `IggyClient` serves Produce, Metadata and CreateTopics for every Kafka connection, one Iggy
   request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more. Offset
-  calls use 4 more, one per offset slot.
+  calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
-  cluster, an offset slot's client can also open one connection per node for stores.
+  cluster, an offset commit client can also open one connection per node for stores.
 - `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in
   [docs/SCOPE.md](docs/SCOPE.md).
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
