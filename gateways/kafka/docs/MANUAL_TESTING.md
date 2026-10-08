@@ -317,6 +317,7 @@ success. This category predates the bridge landing: G2/G3's "fails at metadata" 
 | G8 | Static member exit | G7 with `--consumer-property group.instance.id=x` on the one stopped | No LeaveGroup is sent; the survivor waits out the session timeout before rebalancing |
 | G9 | Group resumes from its commit | Bridge on and topic `orders` made as in Category I. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g9 --topic orders --from-beginning`, stop it, produce one record, run it again | The second run prints only the new record. `--from-beginning` applies only to a group with no committed offset |
 | G10 | Resume after a gateway restart | G9 with a gateway restart before the second run | Same as G9, because the offsets live in Iggy ([#3542](https://github.com/apache/iggy/issues/3542)) |
+| G11 | Two members share a topic | Bridge on and a topic with 2 partitions. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g11 --topic <topic> --property print.partition=true --property print.offset=true` in two terminals, produce to both partitions, stop one, produce again | Each prints one partition. After the stop, the other prints the new records of both partitions, and none twice |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 

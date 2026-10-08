@@ -213,6 +213,26 @@ Produce request carrying a `transactional_id` gets `UNSUPPORTED_VERSION` (35) on
 rather than having its records stored as if they were ordinary ones. None of those closes the
 connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
+## Consumer groups ([#3544](https://github.com/apache/iggy/issues/3544))
+
+A stock consumer with a `group.id` joins, takes the partitions its own assignor hands it, commits,
+and resumes from its commit. With the bridge on, commits live in Iggy, so a group also resumes after
+a gateway restart. `tests/kafka_client_e2e_tests.rs` checks both with the Java consumer, and a
+member that leaves hands its partition to the other at its commit.
+
+Limits:
+
+- One gateway per bootstrap endpoint. Group membership is gateway memory
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
+- Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
+- `group.instance.id` is accepted but not honoured. A static member that restarts causes two
+  rebalances.
+- No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
+  `kafka-consumer-groups.sh` cannot list or describe a group.
+- No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
+  in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
+- Delivery is at-least-once. A consumer that stops before it commits reads those records again.
+
 ## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
 
 Off by default. With `IGGY_KAFKA_SASL_ENABLED=true` the gateway requires SASL/PLAIN before it serves

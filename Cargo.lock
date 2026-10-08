@@ -7031,6 +7031,7 @@ dependencies = [
  "lz4",
  "secrecy",
  "serde",
+ "serde_json",
  "serial_test",
  "snap",
  "socket2 0.6.5",

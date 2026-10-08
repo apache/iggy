@@ -73,6 +73,8 @@ zstd = { workspace = true }
 crc32c = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
+# Reads the JSON events that kafka-verifiable-consumer.sh prints.
+serde_json = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
