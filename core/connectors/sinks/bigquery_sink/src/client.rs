@@ -22,9 +22,10 @@
 //! through `gcloud-bigquery`, which owns the gRPC channel pool and token
 //! refresh for the Storage Write API.
 
-use crate::encode::Chunk;
-use crate::error::{AppendError, TableError};
-use crate::{BigQuerySinkConfig, Settings};
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
 use gcloud_bigquery::client::google_cloud_auth::credentials::CredentialsFile;
 use gcloud_bigquery::client::google_cloud_auth::token::DefaultTokenSourceProvider;
 use gcloud_bigquery::client::{
@@ -36,12 +37,17 @@ use gcloud_googleapis::cloud::bigquery::storage::v1::append_rows_response::Respo
 use iggy_connector_sdk::Error;
 use reqwest::header::AUTHORIZATION;
 use secrecy::{ExposeSecret, SecretString};
-use std::fmt;
-use std::sync::Arc;
 use token_source::{TokenSource, TokenSourceProvider};
+use tokio::time::timeout;
 use tracing::info;
 
+use crate::encode::Chunk;
+use crate::error::{AppendError, TableError};
+use crate::{BigQuerySinkConfig, Settings};
+
 const BIGQUERY_REST_ENDPOINT: &str = "https://bigquery.googleapis.com";
+const GRPC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const GRPC_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where credentials come from. Resolved from the config without I/O so the
 /// selection can be unit tested.
@@ -73,12 +79,16 @@ pub(crate) struct BigQueryClient {
     stream: Option<DefaultStream>,
     write_client: Client,
     table_path: String,
+    write_stream_name: String,
     missing_value: i32,
+    timeout: Duration,
 }
 
 impl CredentialSource {
     pub(crate) fn from_config(config: &BigQuerySinkConfig) -> Self {
-        if let (Some(rest), Some(grpc)) = (&config.endpoint, &config.grpc_endpoint) {
+        if let (Some(rest), Some(grpc)) =
+            (&config.emulator_endpoint, &config.emulator_grpc_endpoint)
+        {
             return CredentialSource::Emulator {
                 rest: rest.trim_end_matches('/').to_owned(),
                 grpc: grpc.clone(),
@@ -95,7 +105,7 @@ impl CredentialSource {
 
     pub(crate) fn label(&self) -> &'static str {
         match self {
-            CredentialSource::Emulator { .. } => "none (endpoint override)",
+            CredentialSource::Emulator { .. } => "none (emulator endpoint override)",
             CredentialSource::KeyFile(_) => "service account key file",
             CredentialSource::InlineKey(_) => "inline service account key",
             CredentialSource::ApplicationDefault => "application default credentials",
@@ -107,15 +117,21 @@ impl BigQueryClient {
     /// Build credentials and the gRPC channel pool. No BigQuery API call is
     /// made yet.
     pub(crate) async fn connect(
+        id: u32,
         config: &BigQuerySinkConfig,
         settings: &Settings,
     ) -> Result<Self, Error> {
         install_crypto_provider();
         let source = CredentialSource::from_config(config);
-        info!("BigQuery sink: using {}", source.label());
+        info!("BigQuery sink ID: {id}: using {}", source.label());
 
-        let write_config = StreamingWriteConfig::default()
-            .with_channel_config(ChannelConfig::default().with_timeout(settings.timeout));
+        let channel_config = ChannelConfig::default()
+            .with_connect_timeout(settings.timeout)
+            .with_timeout(settings.timeout)
+            .with_http2_keep_alive_interval(GRPC_KEEP_ALIVE_INTERVAL)
+            .with_keep_alive_timeout(GRPC_KEEP_ALIVE_TIMEOUT)
+            .with_keep_alive_while_idle(true);
+        let write_config = StreamingWriteConfig::default().with_channel_config(channel_config);
 
         let (client_config, rest_base, token) = match &source {
             CredentialSource::Emulator { rest, grpc } => (
@@ -165,6 +181,10 @@ impl BigQueryClient {
             .build()
             .map_err(|e| Error::InitError(format!("cannot build HTTP client: {e}")))?;
 
+        let table_path = format!(
+            "projects/{}/datasets/{}/tables/{}",
+            config.project_id, config.dataset, config.table
+        );
         Ok(BigQueryClient {
             http,
             table_url: format!(
@@ -174,11 +194,10 @@ impl BigQueryClient {
             token,
             stream: None,
             write_client,
-            table_path: format!(
-                "projects/{}/datasets/{}/tables/{}",
-                config.project_id, config.dataset, config.table
-            ),
+            write_stream_name: format!("{table_path}/streams/_default"),
+            table_path,
             missing_value: settings.missing_value.as_proto(),
+            timeout: settings.timeout,
         })
     }
 
@@ -213,27 +232,44 @@ impl BigQueryClient {
     /// Resolve the table's `_default` write stream. Also proves the
     /// credentials can reach the Storage Write API.
     pub(crate) async fn resolve_write_stream(&self) -> Result<DefaultStream, AppendError> {
-        Ok(self
-            .write_client
-            .default_storage_writer()
-            .create_write_stream(&self.table_path)
-            .await?)
+        timeout(
+            self.timeout,
+            self.write_client
+                .default_storage_writer()
+                .create_write_stream(&self.table_path),
+        )
+        .await
+        .map_err(|_| deadline_exceeded("write stream setup", self.timeout))?
+        .map_err(AppendError::from)
     }
 
     pub(crate) fn set_write_stream(&mut self, stream: DefaultStream) {
         self.stream = Some(stream);
     }
 
+    pub(crate) fn write_stream_name(&self) -> &str {
+        &self.write_stream_name
+    }
+
     /// One `AppendRows` request for one chunk.
     pub(crate) async fn append(&self, chunk: &Chunk) -> Result<AppendOutcome, AppendError> {
-        let stream = self.stream.as_ref().ok_or(AppendError::NoResponse)?;
+        timeout(self.timeout, self.append_inner(chunk))
+            .await
+            .map_err(|_| deadline_exceeded("AppendRows", self.timeout))?
+    }
+
+    async fn append_inner(&self, chunk: &Chunk) -> Result<AppendOutcome, AppendError> {
+        let stream = self.stream.as_ref().ok_or(AppendError::MissingStream)?;
         let request = AppendRowsRequestBuilder::new_arrow(
             chunk.schema_bytes.clone(),
             chunk.batch_bytes.clone(),
         )
         .with_default_missing_value_interpretation(self.missing_value);
         let mut responses = stream.append_rows(vec![request]).await?;
-        let response = responses.message().await?.ok_or(AppendError::NoResponse)?;
+        let response = responses
+            .message()
+            .await?
+            .ok_or(AppendError::ResponseStreamClosed)?;
 
         if !response.row_errors.is_empty() {
             let rows = response
@@ -255,6 +291,13 @@ impl BigQueryClient {
             }),
             Some(Response::AppendResult(_)) | None => Ok(AppendOutcome::Appended),
         }
+    }
+}
+
+fn deadline_exceeded(operation: &str, duration: Duration) -> AppendError {
+    AppendError::Rpc {
+        code: gcloud_gax::grpc::Code::DeadlineExceeded,
+        message: format!("{operation} timed out after {duration:?}"),
     }
 }
 
@@ -346,14 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn given_endpoint_overrides_should_skip_credentials() {
+    fn given_emulator_endpoint_overrides_should_skip_credentials() {
         let mut config = config();
-        config.endpoint = Some("http://127.0.0.1:9050/".into());
-        config.grpc_endpoint = Some("127.0.0.1:9060".into());
-        config.credentials_path = Some("/ignored.json".into());
+        config.emulator_endpoint = Some("http://127.0.0.1:9050/".into());
+        config.emulator_grpc_endpoint = Some("127.0.0.1:9060".into());
         let CredentialSource::Emulator { rest, grpc } = CredentialSource::from_config(&config)
         else {
-            panic!("expected endpoint override");
+            panic!("expected emulator endpoint override");
         };
         assert_eq!(rest, "http://127.0.0.1:9050");
         assert_eq!(grpc, "127.0.0.1:9060");
@@ -376,8 +418,8 @@ mod tests {
     async fn given_missing_key_file_should_fail_to_connect() {
         let mut config = config();
         config.credentials_path = Some("/definitely/not/here.json".into());
-        let settings = Settings::from_config(&config);
-        let error = BigQueryClient::connect(&config, &settings)
+        let settings = Settings::from_config(1, &config);
+        let error = BigQueryClient::connect(1, &config, &settings)
             .await
             .unwrap_err();
         assert!(
@@ -390,8 +432,8 @@ mod tests {
     async fn given_invalid_inline_key_should_fail_to_connect() {
         let mut config = config();
         config.credentials_json = Some(SecretString::from("not json"));
-        let settings = Settings::from_config(&config);
-        let error = BigQueryClient::connect(&config, &settings)
+        let settings = Settings::from_config(1, &config);
+        let error = BigQueryClient::connect(1, &config, &settings)
             .await
             .unwrap_err();
         let Error::InitError(reason) = &error else {

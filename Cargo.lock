@@ -7231,6 +7231,7 @@ dependencies = [
  "humantime",
  "iggy_common",
  "iggy_connector_sdk",
+ "prost",
  "reqwest 0.13.5",
  "rustls",
  "secrecy",

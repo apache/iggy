@@ -43,6 +43,7 @@ use gcloud_googleapis::cloud::bigquery::storage::v1::{
 use gcloud_googleapis::rpc::Status as RpcStatus;
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::future;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,8 @@ pub enum AppendScript {
     ResponseError(Code),
     /// The RPC itself fails.
     CallError(Code),
+    /// The RPC accepts the request but never produces a response.
+    Hang,
 }
 
 /// One `AppendRows` request as the fake saw it.
@@ -310,6 +313,9 @@ impl StreamingService<AppendRowsRequest> for AppendRowsHandler {
                 if let AppendScript::CallError(code) = script {
                     return Err(Status::new(code, "scripted AppendRows failure"));
                 }
+                if let AppendScript::Hang = &script {
+                    future::pending::<()>().await;
+                }
                 let batch = decode_arrow(&append);
                 let stored = matches!(script, AppendScript::Ok);
                 state.appends.lock().unwrap().push(ReceivedAppend {
@@ -329,7 +335,7 @@ impl StreamingService<AppendRowsRequest> for AppendRowsHandler {
 
 fn response_for(script: AppendScript, write_stream: String) -> AppendRowsResponse {
     match script {
-        AppendScript::Ok | AppendScript::CallError(_) => AppendRowsResponse {
+        AppendScript::Ok | AppendScript::CallError(_) | AppendScript::Hang => AppendRowsResponse {
             write_stream,
             response: Some(Response::AppendResult(AppendResult { offset: None })),
             ..Default::default()

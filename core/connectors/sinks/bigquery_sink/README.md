@@ -52,21 +52,21 @@ include_metadata = true
 | `credentials_json` | string | none | Inline service account key. Mutually exclusive with `credentials_path` |
 | `include_metadata` | bool | `true` | Write the `iggy_*` metadata columns listed below |
 | `include_headers` | bool | `false` | Write message headers into `iggy_headers` |
-| `missing_value` | string | `"default"` | How BigQuery fills columns no row in a request sets: `default` or `null` |
+| `missing_value` | string | `"default"` | How BigQuery fills columns omitted from a row group: `default` or `null` |
 | `max_request_bytes` | usize | `8388608` | Upper bound for one `AppendRows` request, clamped to 64 KiB..9 MiB |
 | `max_retries` | u32 | `3` | Total attempts per call, including the first |
 | `retry_delay` | string | `"1s"` | Base retry delay |
 | `max_retry_delay` | string | `"30s"` | Upper bound for one retry delay |
-| `timeout` | string | `"30s"` | Timeout for `tables.get` and each `AppendRows` call |
+| `timeout` | string | `"30s"` | Overall startup timeout and deadline for each `tables.get`, write-stream setup and `AppendRows` operation |
 | `verbose_logging` | bool | `false` | Log each batch at info level instead of debug |
-| `endpoint` | string | none | REST endpoint override, for local fakes and emulators. Must be set with `grpc_endpoint`; no credentials are used |
-| `grpc_endpoint` | string | none | Storage Write API `host:port` override |
+| `emulator_endpoint` | string | none | REST endpoint override for local fakes and emulators. Must be set with `emulator_grpc_endpoint`; no credentials are used |
+| `emulator_grpc_endpoint` | string | none | Storage Write API emulator `host:port` override |
 
 ## Authentication
 
 The connector picks the first source that applies:
 
-1. `endpoint` and `grpc_endpoint`: no credentials, plain-text connections. For tests only.
+1. `emulator_endpoint` and `emulator_grpc_endpoint`: no credentials, plain-text connections. For tests only. Combining emulator endpoint overrides with either credential option is rejected.
 2. `credentials_path`: a service account key file.
 3. `credentials_json`: an inline service account key.
 4. Application Default Credentials: `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`, or the metadata server on GCE, GKE and Cloud Run.
@@ -90,8 +90,7 @@ The identity needs `bigquery.tables.get` (read the schema) and `bigquery.tables.
 Each payload must be a JSON object. Top-level fields map to table columns by name. Fields that match no column are ignored.
 
 - **Payload types**: `Json`, `Text` and `Proto` text are accepted when they hold a JSON object. `Raw`, `FlatBuffer` and `Avro` payloads are rejected.
-- **Missing columns**: a column that no row in a request sets is left out of the request, and BigQuery fills it according to `missing_value`. A REQUIRED column without a default value must be present in every row.
-- **Defaults apply per request, not per row**: Arrow has no "unset" marker, so once one row in a request sets a column, the other rows send NULL for it. For a REQUIRED column with a default, rows that omit it while other rows in the same batch set it are rejected. Set such columns in every message or in none.
+- **Missing columns and defaults**: rows are grouped by which defaulted columns they set. Each writer schema omits the defaulted columns absent from that group, so BigQuery applies defaults per row. An explicit `null` for a REQUIRED column with a default is treated as omitted. A REQUIRED column without a default value must be present and non-null in every row.
 - **REPEATED** columns that are absent or `null` are written as empty arrays.
 
 ### `raw`
@@ -127,7 +126,7 @@ With `include_metadata = true` the table must contain these columns. A missing c
 | `INT64` | integer, or a string holding one |
 | `FLOAT64` | number, or a string holding one |
 | `BOOL` | `true` / `false` |
-| `NUMERIC`, `BIGNUMERIC` | number or string. Prefer strings to avoid float rounding |
+| `NUMERIC`, `BIGNUMERIC` | number or string, using the table column's declared precision and scale. Prefer strings to avoid float rounding |
 | `TIMESTAMP` | RFC 3339 string, or an integer in microseconds since the epoch |
 | `DATETIME` | `YYYY-MM-DDTHH:MM:SS[.ffffff]` string |
 | `DATE` | `YYYY-MM-DD` string |
@@ -142,29 +141,29 @@ With `include_metadata = true` the table must contain these columns. A missing c
 
 ### Errors and retries
 
-- `UNAVAILABLE`, `CANCELLED`, `DEADLINE_EXCEEDED`, `INTERNAL`, `ABORTED` and `RESOURCE_EXHAUSTED` are retried up to `max_retries` attempts in total.
-- Every other gRPC error, including `INVALID_ARGUMENT`, `PERMISSION_DENIED` and `UNAUTHENTICATED`, fails the request without a retry.
+- `UNAVAILABLE`, `UNKNOWN`, `CANCELLED`, `DEADLINE_EXCEEDED`, `INTERNAL`, `ABORTED`, `RESOURCE_EXHAUSTED` and `UNAUTHENTICATED` are retried up to `max_retries` attempts in total. This covers connection resets and transient token refresh failures; the configured timeout keeps permanently invalid credentials bounded.
+- Every other gRPC error, including `INVALID_ARGUMENT` and `PERMISSION_DENIED`, fails the request without a retry.
 - `tables.get` retries HTTP 429, 5xx and transport errors. A 403 or 404 fails `open()` immediately.
 
 ### Bad rows
 
 A message that cannot become a row (wrong payload type, a value that does not fit its column, a missing REQUIRED value, a row larger than `max_request_bytes`) is dropped before the request is sent. When BigQuery reports row-level errors, it appends nothing from that request: the connector drops the reported rows and appends the remaining rows once more. If that second append also reports row errors, the remaining rows of that request are dropped and the batch returns an error.
 
-Every dropped row is logged at `warn` with its stream, topic, partition and offset. There is no dead-letter queue. On shutdown the connector logs rows written, rejected and failed.
+Every dropped row is logged at `warn` with its stream, topic, partition and offset. If every row is rejected, `consume()` returns an error so the runtime does not count the batch as processed. There is no dead-letter queue. On shutdown the connector logs rows written, rejected, failed and unconfirmed.
 
 ### Delivery semantics
 
-The connector runtime commits consumer group offsets when messages are polled, before `consume()` runs, and a batch for which `consume()` returns an error is not redelivered. As a result:
+The connector runtime commits consumer group offsets when messages are polled, before `consume()` runs. If `consume()` returns an error, that batch is not redelivered and the affected consumer task stops until an operator restarts the connector. As a result:
 
 - Rows in a request that hits a permanent error are lost. Requests split from the same polled batch are attempted independently, so earlier or later chunks may still be written.
-- When the retry budget is exhausted after an ambiguous transport failure, the connector cannot know whether that request was written. Its rows may be absent or duplicated.
+- When the retry budget is exhausted after an ambiguous transport failure, the connector cannot know whether that request was written. Its rows may be absent or duplicated and are counted as unconfirmed. The runtime increments `iggy_connector_errors_total`, marks the connector as errored and stops the affected consumer task.
 - A process crash between the offset commit and a successful append also loses that batch.
 - The `_default` stream has no append offsets. When an append result is lost and the request is retried, rows can be written twice. Deduplicate downstream on `iggy_stream`, `iggy_topic`, `iggy_partition_id` and `iggy_offset`, for example:
 
 ```sql
 SELECT * EXCEPT(rn) FROM (
   SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY iggy_stream, iggy_topic, iggy_partition_id, iggy_offset
+    PARTITION BY iggy_stream, iggy_topic, iggy_partition_id, iggy_offset, iggy_timestamp
     ORDER BY iggy_timestamp
   ) AS rn
   FROM `my-project.iggy.events`
@@ -243,7 +242,7 @@ The fake cannot check what only BigQuery knows: that it accepts the Arrow encodi
 3. Start the server, create the stream, then start the runtime:
 
     ```bash
-    ./target/debug/iggy-server                                   # terminal 1
+    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ./target/debug/iggy-server   # terminal 1
     ./target/debug/iggy -u iggy -p iggy stream create demo_stream   # terminal 2
     ./target/debug/iggy -u iggy -p iggy topic create demo_stream demo_topic 1 none
     IGGY_CONNECTORS_CONFIG_PATH=/tmp/bq-sink-test/config.toml ./target/debug/iggy-connectors

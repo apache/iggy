@@ -15,16 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+
+use async_trait::async_trait;
+use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
+
 use crate::client::{AppendOutcome, BigQueryClient};
 use crate::encode::{self, Chunk, RunContext};
 use crate::error::{AppendError, TableError};
 use crate::schema::{TableLayout, parse_table_schema};
 use crate::{BigQuerySink, OpenState};
-use async_trait::async_trait;
-use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
-use std::sync::atomic::Ordering;
-use tracing::{debug, error, info, warn};
 
 #[async_trait]
 impl Sink for BigQuerySink {
@@ -70,6 +74,8 @@ impl Sink for BigQuerySink {
             topic: topic_metadata,
             messages: &messages_metadata,
             max_request_bytes: self.settings.max_request_bytes,
+            write_stream: state.client.write_stream_name(),
+            missing_value: self.settings.missing_value.as_proto(),
         };
         let encoded = encode::encode(&ctx, messages).map_err(|e| {
             self.counters
@@ -96,6 +102,11 @@ impl Sink for BigQuerySink {
         self.counters
             .rows_rejected
             .fetch_add(encoded.rejected.len() as u64, Ordering::Relaxed);
+        if encoded.chunks.is_empty() {
+            return Err(Error::InvalidRecordValue(format!(
+                "all {received} messages were rejected before AppendRows"
+            )));
+        }
 
         let mut written = 0u64;
         let mut last_error = None;
@@ -141,11 +152,12 @@ impl Sink for BigQuerySink {
     async fn close(&mut self) -> Result<(), Error> {
         self.state = None;
         info!(
-            "Closed BigQuery sink connector ID: {}, rows written: {}, rows rejected: {}, rows failed: {}",
+            "Closed BigQuery sink connector ID: {}, rows written: {}, rows rejected: {}, rows failed: {}, rows unconfirmed: {}",
             self.id,
             self.counters.rows_written.load(Ordering::Relaxed),
             self.counters.rows_rejected.load(Ordering::Relaxed),
-            self.counters.rows_failed.load(Ordering::Relaxed)
+            self.counters.rows_failed.load(Ordering::Relaxed),
+            self.counters.rows_unconfirmed.load(Ordering::Relaxed)
         );
         Ok(())
     }
@@ -154,8 +166,18 @@ impl Sink for BigQuerySink {
 impl BigQuerySink {
     async fn try_open(&mut self) -> Result<(), Error> {
         self.config.validate()?;
+        let timeout_duration = self.settings.timeout;
+        timeout(timeout_duration, self.try_open_inner())
+            .await
+            .map_err(|_| {
+                Error::InitError(format!(
+                    "opening BigQuery sink timed out after {timeout_duration:?}"
+                ))
+            })?
+    }
 
-        let mut client = BigQueryClient::connect(&self.config, &self.settings).await?;
+    async fn try_open_inner(&mut self) -> Result<(), Error> {
+        let mut client = BigQueryClient::connect(self.id, &self.config, &self.settings).await?;
         let policy = self.retry_policy();
 
         let context = format!("BigQuery sink ID: {} tables.get", self.id);
@@ -165,9 +187,9 @@ impl BigQuerySink {
         .await
         .map_err(|failure| Error::InitError(format!("cannot read the table schema: {failure}")))?;
 
-        let columns = parse_table_schema(&body).map_err(|e| Error::from(TableError::Schema(e)))?;
+        let columns = parse_table_schema(&body).map_err(|e| Error::InitError(e.to_string()))?;
         let layout = TableLayout::build(columns, &self.settings)
-            .map_err(|e| Error::from(TableError::Schema(e)))?;
+            .map_err(|e| Error::InitError(e.to_string()))?;
 
         let context = format!("BigQuery sink ID: {} write stream setup", self.id);
         let stream = retry_async(policy, &context, AppendError::is_retryable, || {
@@ -214,6 +236,12 @@ impl BigQuerySink {
             AppendOutcome::RowErrors(row_errors) => row_errors,
         };
 
+        let row_errors =
+            validate_row_errors(row_errors, chunk.offsets.len()).inspect_err(|_| {
+                self.counters
+                    .rows_failed
+                    .fetch_add(chunk.offsets.len() as u64, Ordering::Relaxed);
+            })?;
         let mut dropped = Vec::with_capacity(row_errors.len());
         for (row, reason) in row_errors {
             let offset = chunk.offsets.get(row).copied();
@@ -234,7 +262,9 @@ impl BigQuerySink {
         let Some(retry) = encode::without_rows(chunk, &dropped)
             .map_err(|e| Error::Serialization(e.to_string()))?
         else {
-            return Ok(0);
+            return Err(Error::InvalidRecordValue(
+                "BigQuery rejected every row in the AppendRows request".into(),
+            ));
         };
         match self
             .append_with_retry(client, &retry, topic, messages)
@@ -242,6 +272,21 @@ impl BigQuerySink {
         {
             AppendOutcome::Appended => Ok(retry.offsets.len() as u64),
             AppendOutcome::RowErrors(again) => {
+                let again = validate_row_errors(again, retry.offsets.len()).inspect_err(|_| {
+                    self.counters
+                        .rows_failed
+                        .fetch_add(retry.offsets.len() as u64, Ordering::Relaxed);
+                })?;
+                for (row, reason) in &again {
+                    error!(
+                        "BigQuery sink ID: {} row remained rejected after retry stream={} topic={} partition={} offset={}: {reason}",
+                        self.id,
+                        topic.stream,
+                        topic.topic,
+                        messages.partition_id,
+                        retry.offsets[*row]
+                    );
+                }
                 self.counters
                     .rows_failed
                     .fetch_add(retry.offsets.len() as u64, Ordering::Relaxed);
@@ -285,6 +330,9 @@ impl BigQuerySink {
         .await
         .map_err(|failure| {
             if failure.error.is_retryable() {
+                self.counters
+                    .rows_unconfirmed
+                    .fetch_add(chunk.offsets.len() as u64, Ordering::Relaxed);
                 error!(
                     "BigQuery sink ID: {} append outcome is unknown for {} rows (offsets {}..={}) of {}/{} partition {} after the retry budget was exhausted: {failure}",
                     self.id,
@@ -312,5 +360,48 @@ impl BigQuerySink {
             }
             Error::from(failure.error)
         })
+    }
+}
+
+fn validate_row_errors(
+    row_errors: Vec<(usize, String)>,
+    row_count: usize,
+) -> Result<Vec<(usize, String)>, Error> {
+    let mut unique = BTreeMap::new();
+    for (row, reason) in row_errors {
+        if row >= row_count {
+            return Err(Error::PermanentHttpError(format!(
+                "BigQuery returned row error index {row} for a request with {row_count} rows"
+            )));
+        }
+        unique.entry(row).or_insert(reason);
+    }
+    Ok(unique.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_duplicate_row_errors_should_deduplicate_them() {
+        let errors = validate_row_errors(
+            vec![
+                (2, "first".into()),
+                (0, "zero".into()),
+                (2, "second".into()),
+            ],
+            3,
+        )
+        .expect("indexes are valid");
+        assert_eq!(errors, vec![(0, "zero".into()), (2, "first".into())]);
+    }
+
+    #[test]
+    fn given_out_of_range_row_error_should_fail_validation() {
+        assert!(matches!(
+            validate_row_errors(vec![(3, "bad".into())], 3),
+            Err(Error::PermanentHttpError(_))
+        ));
     }
 }

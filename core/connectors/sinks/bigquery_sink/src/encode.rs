@@ -23,12 +23,12 @@
 //! its own and reported back with its offset. The rest of the batch is still
 //! written.
 //!
-//! Mapped mode decodes JSON objects with `arrow-json`. The fast path decodes
-//! the whole run at once. When that fails, bisection isolates the offending
-//! rows before the survivors are decoded together.
+//! Mapped mode decodes JSON objects with `arrow-json`. Rows are first grouped
+//! by adjacent default-column presence. Each group is decoded at once, and
+//! bisection isolates offending rows when a group fails.
 //!
 //! The writer schema of a request only contains the columns that at least one
-//! row in the run sets. Columns no row mentions are left out, so BigQuery
+//! row in its group sets. Columns no row mentions are left out, so BigQuery
 //! fills them according to `missing_value` (the column default, or NULL).
 
 use std::fmt::Write as _;
@@ -58,6 +58,7 @@ const HEADER_ENCODING_BASE64: &str = "base64";
 const UTC_OFFSET: &str = "+00:00";
 const IPC_BATCH_OVERHEAD: usize = 1024;
 const IPC_COLUMN_OVERHEAD: usize = 128;
+const GRPC_FRAME_HEADER_BYTES: usize = 5;
 
 /// One `AppendRows` request worth of rows.
 #[derive(Debug)]
@@ -88,6 +89,8 @@ pub(crate) struct RunContext<'a> {
     pub topic: &'a TopicMetadata,
     pub messages: &'a MessagesMetadata,
     pub max_request_bytes: usize,
+    pub write_stream: &'a str,
+    pub missing_value: i32,
 }
 
 /// Encode a run of messages. Fails only on an internal Arrow error, which
@@ -98,19 +101,25 @@ pub(crate) fn encode(
     messages: Vec<ConsumedMessage>,
 ) -> Result<Encoded, ArrowError> {
     let mut rejected = Vec::new();
-    let batch = match &ctx.layout.raw {
-        Some((kind, field)) => encode_raw(ctx, *kind, field, messages, &mut rejected)?,
-        None => encode_mapped(ctx, messages, &mut rejected)?,
-    };
     let mut chunks = Vec::new();
-    if let Some((batch, offsets)) = batch {
-        split_into_chunks(
-            batch,
-            offsets,
-            ctx.max_request_bytes,
-            &mut chunks,
-            &mut rejected,
-        )?;
+    for messages in group_messages(ctx, messages, &mut rejected) {
+        let batches = match &ctx.layout.raw {
+            Some((kind, field)) => encode_raw(ctx, *kind, field, messages, &mut rejected)?
+                .into_iter()
+                .collect(),
+            None => encode_mapped(ctx, messages, &mut rejected)?,
+        };
+        for (batch, offsets) in batches {
+            split_into_chunks(
+                batch,
+                offsets,
+                ctx.max_request_bytes,
+                ctx.write_stream,
+                ctx.missing_value,
+                &mut chunks,
+                &mut rejected,
+            )?;
+        }
     }
     Ok(Encoded { chunks, rejected })
 }
@@ -118,9 +127,16 @@ pub(crate) fn encode(
 /// Build a new chunk holding only the rows of `chunk` whose index is not in
 /// `drop`. Used after BigQuery reports row-level errors.
 pub(crate) fn without_rows(chunk: &Chunk, drop: &[usize]) -> Result<Option<Chunk>, ArrowError> {
-    let keep: Vec<bool> = (0..chunk.batch.num_rows())
-        .map(|row| !drop.contains(&row))
-        .collect();
+    let mut keep = vec![true; chunk.batch.num_rows()];
+    for &row in drop {
+        let Some(value) = keep.get_mut(row) else {
+            return Err(ArrowError::ComputeError(format!(
+                "cannot remove row {row} from a {}-row batch",
+                keep.len()
+            )));
+        };
+        *value = false;
+    }
     let offsets: Vec<u64> = chunk
         .offsets
         .iter()
@@ -141,13 +157,119 @@ pub(crate) fn without_rows(chunk: &Chunk, drop: &[usize]) -> Result<Option<Chunk
     }))
 }
 
+/// Keep the amount handed to any Arrow builder below the request budget.
+/// A single mapped row is inspected again after normalization because fields
+/// that do not exist in the table are not written.
+fn group_messages(
+    ctx: &RunContext<'_>,
+    messages: Vec<ConsumedMessage>,
+    rejected: &mut Vec<Rejected>,
+) -> Vec<Vec<ConsumedMessage>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0usize;
+    for message in messages {
+        if let Some(reason) = invalid_metadata(ctx.layout, &message) {
+            rejected.push(Rejected {
+                offset: message.offset,
+                reason,
+            });
+            continue;
+        }
+
+        let estimated = estimated_message_size(ctx, &message).max(1);
+        if ctx.layout.raw.is_some() && estimated > ctx.max_request_bytes {
+            rejected.push(Rejected {
+                offset: message.offset,
+                reason: format!(
+                    "row input is at least {estimated} bytes, above max_request_bytes ({})",
+                    ctx.max_request_bytes
+                ),
+            });
+            continue;
+        }
+        if !current.is_empty() && current_bytes.saturating_add(estimated) > ctx.max_request_bytes {
+            groups.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(estimated);
+        current.push(message);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn invalid_metadata(layout: &TableLayout, message: &ConsumedMessage) -> Option<String> {
+    for (meta, _) in &layout.metadata {
+        let (name, value) = match meta {
+            MetaColumn::Offset => (meta.name(), message.offset),
+            MetaColumn::Timestamp => (meta.name(), message.timestamp),
+            _ => continue,
+        };
+        if i64::try_from(value).is_err() {
+            return Some(format!("{name} value {value} does not fit INT64"));
+        }
+    }
+    None
+}
+
+fn estimated_message_size(ctx: &RunContext<'_>, message: &ConsumedMessage) -> usize {
+    let payload = match &message.payload {
+        Payload::Json(value) => estimated_json_size(value),
+        Payload::Raw(value) | Payload::FlatBuffer(value) | Payload::Avro(value) => value.len(),
+        Payload::Text(value) | Payload::Proto(value) => value.len(),
+    };
+    payload.saturating_add(estimated_metadata_size(ctx, message))
+}
+
+fn estimated_metadata_size(ctx: &RunContext<'_>, message: &ConsumedMessage) -> usize {
+    ctx.layout.metadata.iter().fold(0usize, |size, (meta, _)| {
+        size.saturating_add(match meta {
+            MetaColumn::Stream => ctx.topic.stream.len(),
+            MetaColumn::Topic => ctx.topic.topic.len(),
+            MetaColumn::PartitionId | MetaColumn::Offset | MetaColumn::Timestamp => 8,
+            MetaColumn::Id => 39,
+            MetaColumn::Headers => estimated_headers_size(message),
+        })
+    })
+}
+
+fn estimated_headers_size(message: &ConsumedMessage) -> usize {
+    message.headers.as_ref().map_or(0, |headers| {
+        headers.iter().fold(0usize, |size, (key, value)| {
+            let value_size = value
+                .as_raw()
+                .map_or_else(|_| value.to_string_value().len(), |raw| raw.len());
+            size.saturating_add(key.to_string_value().len())
+                .saturating_add(value_size.saturating_mul(2))
+        })
+    })
+}
+
+fn estimated_json_size(value: &OwnedValue) -> usize {
+    match value {
+        OwnedValue::Static(_) => 24,
+        OwnedValue::String(value) => value.len(),
+        OwnedValue::Array(values) => values.iter().fold(2usize, |size, value| {
+            size.saturating_add(estimated_json_size(value).saturating_add(1))
+        }),
+        OwnedValue::Object(values) => values.iter().fold(2usize, |size, (key, value)| {
+            size.saturating_add(key.len())
+                .saturating_add(estimated_json_size(value))
+                .saturating_add(4)
+        }),
+    }
+}
+
 // ─── Mapped mode ─────────────────────────────────────────────────────────────
 
 fn encode_mapped(
     ctx: &RunContext<'_>,
     messages: Vec<ConsumedMessage>,
     rejected: &mut Vec<Rejected>,
-) -> Result<Option<(RecordBatch, Vec<u64>)>, ArrowError> {
+) -> Result<Vec<(RecordBatch, Vec<u64>)>, ArrowError> {
     let layout = ctx.layout;
     let mut rows = Vec::with_capacity(messages.len());
     let mut kept = Vec::with_capacity(messages.len());
@@ -155,6 +277,13 @@ fn encode_mapped(
         let payload = std::mem::replace(&mut message.payload, Payload::Raw(Vec::new()));
         match json_object(payload).and_then(|mut row| {
             normalize_row(&mut row, layout)?;
+            let estimated = estimated_mapped_row_size(&row, layout, ctx, &message);
+            if estimated > ctx.max_request_bytes {
+                return Err(format!(
+                    "row input is at least {estimated} bytes, above max_request_bytes ({})",
+                    ctx.max_request_bytes
+                ));
+            }
             Ok(row)
         }) {
             Ok(row) => {
@@ -168,8 +297,56 @@ fn encode_mapped(
         }
     }
     if rows.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
+
+    let mut groups = Vec::<(Vec<usize>, Vec<OwnedValue>, Vec<ConsumedMessage>)>::new();
+    for (row, message) in rows.into_iter().zip(kept) {
+        let signature = default_signature(&row, layout);
+        if let Some((last_signature, rows, messages)) = groups.last_mut()
+            && *last_signature == signature
+        {
+            rows.push(row);
+            messages.push(message);
+        } else {
+            groups.push((signature, vec![row], vec![message]));
+        }
+    }
+
+    let mut batches = Vec::with_capacity(groups.len());
+    for (_, rows, kept) in groups {
+        if let Some(batch) = encode_mapped_group(ctx, rows, kept, rejected)? {
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
+
+fn estimated_mapped_row_size(
+    row: &OwnedValue,
+    layout: &TableLayout,
+    ctx: &RunContext<'_>,
+    message: &ConsumedMessage,
+) -> usize {
+    let OwnedValue::Object(object) = row else {
+        return 0;
+    };
+    let payload = layout.columns.iter().fold(0usize, |size, column| {
+        object.get(column.name.as_str()).map_or(size, |value| {
+            size.saturating_add(estimated_json_size(value))
+                .saturating_add(column.name.len())
+        })
+    });
+    payload.saturating_add(estimated_metadata_size(ctx, message))
+}
+
+fn encode_mapped_group(
+    ctx: &RunContext<'_>,
+    rows: Vec<OwnedValue>,
+    kept: Vec<ConsumedMessage>,
+    rejected: &mut Vec<Rejected>,
+) -> Result<Option<(RecordBatch, Vec<u64>)>, ArrowError> {
+    let layout = ctx.layout;
 
     let present = present_columns(&rows, layout);
     if present.is_empty() && layout.metadata.is_empty() {
@@ -200,6 +377,20 @@ fn encode_mapped(
     Ok(Some((batch, offsets)))
 }
 
+fn default_signature(row: &OwnedValue, layout: &TableLayout) -> Vec<usize> {
+    let OwnedValue::Object(object) = row else {
+        return Vec::new();
+    };
+    layout
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            (column.has_default && object.contains_key(column.name.as_str())).then_some(index)
+        })
+        .collect()
+}
+
 /// Take the JSON object out of a payload. Text and proto text must parse as
 /// a JSON object.
 fn json_object(payload: Payload) -> Result<OwnedValue, String> {
@@ -213,7 +404,7 @@ fn json_object(payload: Payload) -> Result<OwnedValue, String> {
         other => {
             return Err(format!(
                 "{} payload is not supported in mapped mode",
-                payload_kind(&other)
+                other.schema()
             ));
         }
     };
@@ -225,6 +416,7 @@ fn json_object(payload: Payload) -> Result<OwnedValue, String> {
 
 /// Prepare one row for `arrow-json`:
 /// - a REQUIRED column without a default must be present and non-null,
+/// - null in a REQUIRED column with a default is treated as absent,
 /// - REPEATED columns that are absent or null become `[]`,
 /// - JSON column values become their JSON text,
 /// - BYTES column values remain base64 until they are decoded directly into
@@ -234,21 +426,27 @@ fn normalize_row(row: &mut OwnedValue, layout: &TableLayout) -> Result<(), Strin
         return Err("payload is not a JSON object".to_owned());
     };
     for column in &layout.columns {
-        let value = object.get_mut(column.name.as_str());
-        match (value, column.mode) {
-            (None | Some(OwnedValue::Static(StaticNode::Null)), Mode::Repeated) => {
-                object.insert(column.name.clone(), empty_array());
-            }
-            (None | Some(OwnedValue::Static(StaticNode::Null)), Mode::Required)
-                if !column.has_default =>
-            {
+        let absent_or_null = matches!(
+            object.get(column.name.as_str()),
+            None | Some(OwnedValue::Static(StaticNode::Null))
+        );
+        if absent_or_null && column.mode == Mode::Repeated {
+            object.insert(column.name.clone(), empty_array());
+            continue;
+        }
+        if absent_or_null && column.mode == Mode::Required {
+            if column.has_default {
+                object.remove(column.name.as_str());
+            } else {
                 return Err(format!(
                     "missing value for REQUIRED column '{}'",
                     column.name
                 ));
             }
-            (Some(value), _) => normalize_value(value, column)?,
-            (None, _) => {}
+            continue;
+        }
+        if let Some(value) = object.get_mut(column.name.as_str()) {
+            normalize_value(value, column)?;
         }
     }
     Ok(())
@@ -296,9 +494,32 @@ fn normalize_scalar(value: &mut OwnedValue, column: &Column) -> Result<(), Strin
                 }
             }
         }
+        BqType::Int64 | BqType::Timestamp | BqType::Date | BqType::Time => {
+            validate_integral_number(value, column)?;
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn validate_integral_number(value: &OwnedValue, column: &Column) -> Result<(), String> {
+    match value {
+        OwnedValue::Static(StaticNode::F64(number))
+            if number.fract() != 0.0
+                || *number < i64::MIN as f64
+                || *number >= -(i64::MIN as f64) =>
+        {
+            Err(format!(
+                "column '{}' expects an integral value in the INT64 range",
+                column.name
+            ))
+        }
+        OwnedValue::Static(StaticNode::U64(number)) if *number > i64::MAX as u64 => Err(format!(
+            "column '{}' value {number} does not fit INT64",
+            column.name
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Serialize a row for `arrow-json` while substituting empty strings for BYTES.
@@ -776,7 +997,7 @@ fn raw_text(payload: Payload, kind: RawKind) -> Result<String, String> {
         other => {
             return Err(format!(
                 "{} payload cannot be written to a text column",
-                payload_kind(&other)
+                other.schema()
             ));
         }
     };
@@ -811,15 +1032,20 @@ fn append_metadata(
                 i64::from(ctx.messages.partition_id),
                 rows,
             ))),
-            MetaColumn::Offset => Arc::new(Int64Array::from_iter_values(
-                messages.iter().map(|m| saturating_i64(m.offset)),
-            )),
-            MetaColumn::Timestamp => Arc::new(
-                TimestampMicrosecondArray::from_iter_values(
-                    messages.iter().map(|m| saturating_i64(m.timestamp)),
-                )
-                .with_timezone(UTC),
-            ),
+            MetaColumn::Offset => {
+                let values = messages
+                    .iter()
+                    .map(|message| checked_i64(message.offset, MetaColumn::Offset.name()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Arc::new(Int64Array::from(values))
+            }
+            MetaColumn::Timestamp => {
+                let values = messages
+                    .iter()
+                    .map(|message| checked_i64(message.timestamp, MetaColumn::Timestamp.name()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone(UTC))
+            }
             MetaColumn::Id => {
                 let mut builder = StringBuilder::with_capacity(rows, rows.saturating_mul(39));
                 for message in messages {
@@ -865,6 +1091,11 @@ fn headers_json(message: &ConsumedMessage, required: bool) -> Option<String> {
     Some(serde_json::Value::Object(object).to_string())
 }
 
+fn checked_i64(value: u64, name: &str) -> Result<i64, ArrowError> {
+    i64::try_from(value)
+        .map_err(|_| ArrowError::ComputeError(format!("{name} value {value} does not fit INT64")))
+}
+
 // ─── Request sizing ──────────────────────────────────────────────────────────
 
 /// Estimate the rows per request from the Arrow allocation, then encode each
@@ -873,31 +1104,51 @@ fn split_into_chunks(
     batch: RecordBatch,
     offsets: Vec<u64>,
     max_bytes: usize,
+    write_stream: &str,
+    missing_value: i32,
     chunks: &mut Vec<Chunk>,
     rejected: &mut Vec<Rejected>,
 ) -> Result<(), ArrowError> {
     let schema_bytes = encode_schema(batch.schema_ref())?;
+    let limits = RequestLimits {
+        max_bytes,
+        write_stream,
+        missing_value,
+    };
     split_into_chunks_with(
         batch,
         offsets,
-        max_bytes,
         schema_bytes,
+        limits,
         chunks,
         rejected,
         encode_batch,
     )
 }
 
+#[derive(Clone, Copy)]
+struct RequestLimits<'a> {
+    max_bytes: usize,
+    write_stream: &'a str,
+    missing_value: i32,
+}
+
 fn split_into_chunks_with(
     batch: RecordBatch,
     offsets: Vec<u64>,
-    max_bytes: usize,
     schema_bytes: Vec<u8>,
+    limits: RequestLimits<'_>,
     chunks: &mut Vec<Chunk>,
     rejected: &mut Vec<Rejected>,
     mut encoder: impl FnMut(&RecordBatch) -> Result<Vec<u8>, ArrowError>,
 ) -> Result<(), ArrowError> {
-    let rows_per_chunk = estimated_rows_per_chunk(&batch, schema_bytes.len(), max_bytes);
+    let rows_per_chunk = estimated_rows_per_chunk(
+        &batch,
+        schema_bytes.len(),
+        limits.max_bytes,
+        limits.write_stream,
+        limits.missing_value,
+    )?;
     let mut start = 0;
     while start < batch.num_rows() {
         let remaining = batch.num_rows() - start;
@@ -905,8 +1156,13 @@ fn split_into_chunks_with(
         loop {
             let candidate = batch.slice(start, row_count);
             let batch_bytes = encoder(&candidate)?;
-            let size = schema_bytes.len() + batch_bytes.len();
-            if size <= max_bytes {
+            let size = encoded_append_request_size(
+                limits.write_stream,
+                limits.missing_value,
+                schema_bytes.len(),
+                batch_bytes.len(),
+            );
+            if size <= limits.max_bytes {
                 chunks.push(Chunk {
                     batch: candidate,
                     offsets: offsets[start..start + row_count].to_vec(),
@@ -920,14 +1176,15 @@ fn split_into_chunks_with(
                 rejected.push(Rejected {
                     offset: offsets[start],
                     reason: format!(
-                        "row is {size} bytes encoded, above max_request_bytes ({max_bytes})"
+                        "row is {size} bytes encoded, above max_request_bytes ({})",
+                        limits.max_bytes
                     ),
                 });
                 start += 1;
                 break;
             }
 
-            let batch_budget = max_bytes.saturating_sub(schema_bytes.len());
+            let batch_budget = limits.max_bytes.saturating_sub(schema_bytes.len());
             let smaller = row_count.saturating_mul(batch_budget) / batch_bytes.len().max(1);
             row_count = smaller.clamp(1, row_count - 1);
         }
@@ -935,18 +1192,72 @@ fn split_into_chunks_with(
     Ok(())
 }
 
-fn estimated_rows_per_chunk(batch: &RecordBatch, schema_bytes: usize, max_bytes: usize) -> usize {
+fn estimated_rows_per_chunk(
+    batch: &RecordBatch,
+    schema_bytes: usize,
+    max_bytes: usize,
+    write_stream: &str,
+    missing_value: i32,
+) -> Result<usize, ArrowError> {
     if batch.num_rows() == 0 {
-        return 0;
+        return Ok(0);
     }
     let overhead =
         IPC_BATCH_OVERHEAD.saturating_add(batch.num_columns().saturating_mul(IPC_COLUMN_OVERHEAD));
-    let batch_budget = max_bytes.saturating_sub(schema_bytes.saturating_add(overhead));
-    let bytes_per_row = batch
-        .get_array_memory_size()
-        .div_ceil(batch.num_rows())
-        .max(1);
-    (batch_budget / bytes_per_row).max(1).min(batch.num_rows())
+    let request_overhead =
+        encoded_append_request_size(write_stream, missing_value, schema_bytes, 0);
+    let batch_budget = max_bytes.saturating_sub(request_overhead.saturating_add(overhead));
+    let array_bytes = batch.columns().iter().try_fold(0usize, |size, array| {
+        Ok::<_, ArrowError>(size.saturating_add(array.to_data().get_slice_memory_size()?))
+    })?;
+    let bytes_per_row = array_bytes.div_ceil(batch.num_rows()).max(1);
+    Ok((batch_budget / bytes_per_row).max(1).min(batch.num_rows()))
+}
+
+fn encoded_append_request_size(
+    write_stream: &str,
+    missing_value: i32,
+    schema_bytes: usize,
+    batch_bytes: usize,
+) -> usize {
+    let schema = encoded_len_delimited_field(schema_bytes);
+    let record_batch = encoded_len_delimited_field(batch_bytes);
+    let arrow_data =
+        encoded_len_message_field(schema).saturating_add(encoded_len_message_field(record_batch));
+    let missing_value_size = if missing_value != 0 {
+        1 + encoded_len_varint(missing_value as usize)
+    } else {
+        0
+    };
+    GRPC_FRAME_HEADER_BYTES
+        .saturating_add(encoded_len_delimited_field(write_stream.len()))
+        .saturating_add(missing_value_size)
+        .saturating_add(encoded_len_message_field(arrow_data))
+}
+
+fn encoded_len_delimited_field(value_len: usize) -> usize {
+    if value_len == 0 {
+        0
+    } else {
+        1usize
+            .saturating_add(encoded_len_varint(value_len))
+            .saturating_add(value_len)
+    }
+}
+
+fn encoded_len_message_field(message_len: usize) -> usize {
+    1usize
+        .saturating_add(encoded_len_varint(message_len))
+        .saturating_add(message_len)
+}
+
+fn encoded_len_varint(mut value: usize) -> usize {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
+    }
+    bytes
 }
 
 /// Serialize the schema and the batch as Arrow IPC stream messages, the
@@ -970,55 +1281,43 @@ fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
     let generator = IpcDataGenerator::default();
     let mut tracker = DictionaryTracker::new(true);
     let mut compression = CompressionContext::default();
-    let _ = generator.schema_to_bytes_with_dictionary_tracker(
-        batch.schema_ref(),
-        &mut tracker,
-        &options,
-    );
-
     let (dictionaries, encoded) =
         generator.encode(batch, &mut tracker, &options, &mut compression)?;
-    let mut batch_bytes = Vec::new();
-    for dictionary in dictionaries {
-        write_message(&mut batch_bytes, dictionary, &options)?;
+    if !dictionaries.is_empty() {
+        return Err(ArrowError::IpcError(
+            "BigQuery writer schema unexpectedly produced dictionary batches".to_owned(),
+        ));
     }
+    let mut batch_bytes = Vec::new();
     write_message(&mut batch_bytes, encoded, &options)?;
     Ok(batch_bytes)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn payload_kind(payload: &Payload) -> &'static str {
-    match payload {
-        Payload::Json(_) => "JSON",
-        Payload::Raw(_) => "raw",
-        Payload::Text(_) => "text",
-        Payload::Proto(_) => "proto",
-        Payload::FlatBuffer(_) => "FlatBuffer",
-        Payload::Avro(_) => "Avro",
-    }
-}
-
 fn empty_array() -> OwnedValue {
     OwnedValue::Array(Box::default())
 }
 
-fn saturating_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    use arrow::array::{Array, AsArray, ListArray};
+    use arrow::datatypes::Int64Type;
+    use gcloud_googleapis::cloud::bigquery::storage::v1::append_rows_request::{ArrowData, Rows};
+    use gcloud_googleapis::cloud::bigquery::storage::v1::{
+        AppendRowsRequest, ArrowRecordBatch, ArrowSchema,
+    };
+    use iggy_common::{HeaderKey, HeaderValue};
+    use iggy_connector_sdk::Schema as PayloadSchema;
+    use prost::Message;
+
     use super::*;
     use crate::WriteMode;
     use crate::schema::parse_table_schema;
     use crate::test_support::settings;
-    use arrow::array::{Array, AsArray, ListArray};
-    use arrow::datatypes::Int64Type;
-    use iggy_common::{HeaderKey, HeaderValue};
-    use iggy_connector_sdk::Schema as PayloadSchema;
-    use std::collections::BTreeMap;
-    use std::str::FromStr;
 
     const METADATA_FIELDS: &str = r#"
         {"name":"iggy_stream","type":"STRING"},
@@ -1027,6 +1326,7 @@ mod tests {
         {"name":"iggy_offset","type":"INTEGER"},
         {"name":"iggy_timestamp","type":"TIMESTAMP"},
         {"name":"iggy_id","type":"STRING"}"#;
+    const WRITE_STREAM: &str = "projects/proj/datasets/ds/tables/events/streams/_default";
 
     fn layout(fields: &str, mode: WriteMode, include_metadata: bool) -> TableLayout {
         let body = format!(r#"{{"schema":{{"fields":[{fields}]}}}}"#);
@@ -1085,6 +1385,8 @@ mod tests {
             topic: &topic,
             messages: &metadata,
             max_request_bytes,
+            write_stream: WRITE_STREAM,
+            missing_value: 2,
         };
         encode(&ctx, messages).unwrap()
     }
@@ -1256,6 +1558,78 @@ mod tests {
         assert_eq!(encoded.rejected[0].offset, 2);
         assert!(encoded.rejected[0].reason.contains("REQUIRED column 'id'"));
         assert_eq!(column_names(&encoded.chunks[0].batch), vec!["id"]);
+    }
+
+    #[test]
+    fn given_defaulted_column_present_in_some_rows_should_use_separate_writer_schemas() {
+        let layout = layout(
+            r#"{"name":"id","type":"INT64","mode":"REQUIRED"},
+               {"name":"created","type":"TIMESTAMP","mode":"REQUIRED","defaultValueExpression":"CURRENT_TIMESTAMP()"}"#,
+            WriteMode::Mapped,
+            false,
+        );
+        let encoded = run(
+            &layout,
+            vec![
+                json(1, r#"{"id":1,"created":"2024-01-02T03:04:05Z"}"#),
+                json(2, r#"{"id":2}"#),
+                json(3, r#"{"id":3,"created":"2024-01-03T03:04:05Z"}"#),
+            ],
+        );
+        assert!(encoded.rejected.is_empty(), "{:?}", encoded.rejected);
+        assert_eq!(encoded.chunks.len(), 3);
+        assert_eq!(encoded.chunks[0].offsets, vec![1]);
+        assert_eq!(
+            column_names(&encoded.chunks[0].batch),
+            vec!["id", "created"]
+        );
+        assert_eq!(encoded.chunks[1].offsets, vec![2]);
+        assert_eq!(column_names(&encoded.chunks[1].batch), vec!["id"]);
+        assert_eq!(encoded.chunks[2].offsets, vec![3]);
+        assert_eq!(
+            column_names(&encoded.chunks[2].batch),
+            vec!["id", "created"]
+        );
+    }
+
+    #[test]
+    fn given_null_required_defaulted_column_should_omit_it() {
+        let layout = layout(
+            r#"{"name":"id","type":"INT64","mode":"REQUIRED"},
+               {"name":"created","type":"TIMESTAMP","mode":"REQUIRED","defaultValueExpression":"CURRENT_TIMESTAMP()"}"#,
+            WriteMode::Mapped,
+            false,
+        );
+        let encoded = run(&layout, vec![json(1, r#"{"id":1,"created":null}"#)]);
+        assert!(encoded.rejected.is_empty(), "{:?}", encoded.rejected);
+        assert_eq!(column_names(&encoded.chunks[0].batch), vec!["id"]);
+    }
+
+    #[test]
+    fn given_fractional_integral_values_should_reject_each_row() {
+        let layout = layout(
+            r#"{"name":"id","type":"INT64"},{"name":"day","type":"DATE"},{"name":"at","type":"TIME"}"#,
+            WriteMode::Mapped,
+            false,
+        );
+        let encoded = run(
+            &layout,
+            vec![
+                json(1, r#"{"id":1.5,"day":"2024-01-01","at":"12:00:00"}"#),
+                json(2, r#"{"id":2,"day":1.5,"at":"12:00:00"}"#),
+                json(3, r#"{"id":3,"day":"2024-01-01","at":1.5}"#),
+                json(4, r#"{"id":4,"day":"2024-01-01","at":"12:00:00"}"#),
+            ],
+        );
+        assert_eq!(
+            encoded
+                .rejected
+                .iter()
+                .map(|row| row.offset)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(encoded.chunks[0].offsets, vec![4]);
     }
 
     #[test]
@@ -1470,8 +1844,12 @@ mod tests {
         split_into_chunks_with(
             source.batch,
             source.offsets,
-            64 * 1024,
             schema_bytes,
+            RequestLimits {
+                max_bytes: 64 * 1024,
+                write_stream: WRITE_STREAM,
+                missing_value: 2,
+            },
             &mut chunks,
             &mut rejected,
             |batch| {
@@ -1485,7 +1863,14 @@ mod tests {
         assert!(chunks.len() > 1);
         assert_eq!(encode_calls, chunks.len());
         for chunk in &chunks {
-            assert!(chunk.schema_bytes.len() + chunk.batch_bytes.len() <= 64 * 1024);
+            assert!(
+                encoded_append_request_size(
+                    WRITE_STREAM,
+                    2,
+                    chunk.schema_bytes.len(),
+                    chunk.batch_bytes.len()
+                ) <= 64 * 1024
+            );
             assert_eq!(chunk.batch.num_rows(), chunk.offsets.len());
         }
         let offsets: Vec<u64> = chunks.iter().flat_map(|c| c.offsets.clone()).collect();
@@ -1514,6 +1899,21 @@ mod tests {
     }
 
     #[test]
+    fn given_metadata_outside_int64_should_reject_the_row() {
+        let layout = layout(
+            &format!(r#"{{"name":"value","type":"STRING"}},{METADATA_FIELDS}"#),
+            WriteMode::Mapped,
+            true,
+        );
+        let mut overflow = json(1, r#"{"value":"x"}"#);
+        overflow.offset = u64::MAX;
+        let encoded = run(&layout, vec![overflow]);
+        assert!(encoded.chunks.is_empty());
+        assert_eq!(encoded.rejected.len(), 1);
+        assert!(encoded.rejected[0].reason.contains("does not fit INT64"));
+    }
+
+    #[test]
     fn given_row_errors_should_rebuild_chunk_without_those_rows() {
         let layout = layout(
             r#"{"name":"payload","type":"STRING"}"#,
@@ -1531,6 +1931,49 @@ mod tests {
         let payload = chunk.batch.column(0).as_string::<i32>();
         assert_eq!(payload.value(1), "row-2");
         assert!(without_rows(&chunk, &[0, 1]).unwrap().is_none());
+        assert!(without_rows(&chunk, &[2]).is_err());
+    }
+
+    #[test]
+    fn given_sliced_batch_should_estimate_only_visible_array_memory() {
+        let values = StringArray::from_iter_values(
+            (0..100).map(|index| format!("{index}-{}", "x".repeat(4096))),
+        );
+        let batch = RecordBatch::try_from_iter(vec![("value", Arc::new(values) as ArrayRef)])
+            .expect("batch should build")
+            .slice(0, 10);
+        let schema_bytes = encode_schema(batch.schema_ref()).expect("schema should encode");
+        let rows = estimated_rows_per_chunk(&batch, schema_bytes.len(), 64 * 1024, WRITE_STREAM, 2)
+            .expect("memory estimate should succeed");
+        assert!(
+            rows > 1,
+            "slice backing capacity must not dominate the estimate"
+        );
+    }
+
+    #[test]
+    fn given_append_payload_should_account_for_protobuf_and_grpc_framing() {
+        let schema = vec![1; 130];
+        let batch = vec![2; 16_400];
+        let request = AppendRowsRequest {
+            write_stream: WRITE_STREAM.into(),
+            default_missing_value_interpretation: 2,
+            rows: Some(Rows::ArrowRows(ArrowData {
+                writer_schema: Some(ArrowSchema {
+                    serialized_schema: schema.clone(),
+                }),
+                rows: Some(ArrowRecordBatch {
+                    serialized_record_batch: batch.clone(),
+                    #[allow(deprecated)]
+                    row_count: 0,
+                }),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            encoded_append_request_size(WRITE_STREAM, 2, schema.len(), batch.len()),
+            GRPC_FRAME_HEADER_BYTES + request.encoded_len()
+        );
     }
 
     #[test]

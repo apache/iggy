@@ -48,12 +48,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 token-source = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
 iggy_common = { workspace = true }
-tokio = { workspace = true }
+prost = { workspace = true }
 tokio-stream = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }

@@ -27,13 +27,16 @@
 //! - `error`: gRPC status classification into retryable and permanent.
 //! - `sink`: the `Sink` trait implementation.
 
+use std::fmt;
+use std::str::FromStr;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+
+use gcloud_googleapis::cloud::bigquery::storage::v1::append_rows_request::MissingValueInterpretation;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{Error, sink_connector};
 use secrecy::SecretString;
 use serde::Deserialize;
-use std::str::FromStr;
-use std::sync::atomic::AtomicU64;
-use std::time::Duration;
 use tracing::warn;
 
 mod client;
@@ -61,7 +64,7 @@ const DEFAULT_TIMEOUT: &str = "30s";
 ///
 /// `Deserialize` only. Nothing re-serializes a plugin config, and leaving
 /// `Serialize` off is what keeps `credentials_json` unserializable.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct BigQuerySinkConfig {
     pub project_id: String,
     pub dataset: String,
@@ -96,12 +99,12 @@ pub struct BigQuerySinkConfig {
     pub timeout: Option<String>,
     /// Log every batch at info level instead of debug (default `false`).
     pub verbose_logging: Option<bool>,
-    /// REST endpoint override, e.g. `http://127.0.0.1:9050`. Must be set
-    /// together with `grpc_endpoint`; when both are set no credentials are
-    /// used. Intended for local fakes and emulators.
-    pub endpoint: Option<String>,
-    /// gRPC `host:port` override for the Storage Write API.
-    pub grpc_endpoint: Option<String>,
+    /// REST endpoint override for an emulator, e.g. `http://127.0.0.1:9050`.
+    /// Must be set together with `emulator_grpc_endpoint`; when both are set
+    /// no credentials are used.
+    pub emulator_endpoint: Option<String>,
+    /// Emulator gRPC `host:port` override for the Storage Write API.
+    pub emulator_grpc_endpoint: Option<String>,
 }
 
 /// How message payloads map onto table columns.
@@ -128,8 +131,8 @@ impl MissingValue {
     /// Wire value of `AppendRowsRequest.MissingValueInterpretation`.
     pub(crate) fn as_proto(self) -> i32 {
         match self {
-            MissingValue::Null => 1,
-            MissingValue::Default => 2,
+            MissingValue::Null => MissingValueInterpretation::NullValue as i32,
+            MissingValue::Default => MissingValueInterpretation::DefaultValue as i32,
         }
     }
 }
@@ -156,6 +159,7 @@ pub(crate) struct Counters {
     pub rows_written: AtomicU64,
     pub rows_rejected: AtomicU64,
     pub rows_failed: AtomicU64,
+    pub rows_unconfirmed: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -177,7 +181,7 @@ pub struct BigQuerySink {
 
 impl BigQuerySink {
     pub fn new(id: u32, config: BigQuerySinkConfig) -> Self {
-        let settings = Settings::from_config(&config);
+        let settings = Settings::from_config(id, &config);
         let target = format!("{}.{}.{}", config.project_id, config.dataset, config.table);
         BigQuerySink {
             id,
@@ -191,13 +195,17 @@ impl BigQuerySink {
 }
 
 impl Settings {
-    fn from_config(config: &BigQuerySinkConfig) -> Self {
-        let mut retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
-        let mut max_retry_delay =
-            parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+    fn from_config(id: u32, config: &BigQuerySinkConfig) -> Self {
+        let mut retry_delay =
+            parse_duration(id, config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let mut max_retry_delay = parse_duration(
+            id,
+            config.max_retry_delay.as_deref(),
+            DEFAULT_MAX_RETRY_DELAY,
+        );
         if retry_delay > max_retry_delay {
             warn!(
-                "BigQuery sink: retry_delay ({retry_delay:?}) is greater than max_retry_delay ({max_retry_delay:?}), swapping them"
+                "BigQuery sink ID: {id}: retry_delay ({retry_delay:?}) is greater than max_retry_delay ({max_retry_delay:?}), swapping them"
             );
             std::mem::swap(&mut retry_delay, &mut max_retry_delay);
         }
@@ -208,7 +216,7 @@ impl Settings {
         let max_request_bytes = requested.clamp(MIN_REQUEST_BYTES, MAX_REQUEST_BYTES_CEILING);
         if max_request_bytes != requested {
             warn!(
-                "BigQuery sink: max_request_bytes {requested} is outside [{MIN_REQUEST_BYTES}, {MAX_REQUEST_BYTES_CEILING}], using {max_request_bytes}"
+                "BigQuery sink ID: {id}: max_request_bytes {requested} is outside [{MIN_REQUEST_BYTES}, {MAX_REQUEST_BYTES_CEILING}], using {max_request_bytes}"
             );
         }
 
@@ -225,7 +233,7 @@ impl Settings {
             max_retries: config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             retry_delay,
             max_retry_delay,
-            timeout: parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT),
+            timeout: parse_duration(id, config.timeout.as_deref(), DEFAULT_TIMEOUT),
             verbose: config.verbose_logging.unwrap_or(false),
         }
     }
@@ -251,9 +259,16 @@ impl BigQuerySinkConfig {
                 "set either credentials_path or credentials_json, not both".into(),
             ));
         }
-        if self.endpoint.is_some() != self.grpc_endpoint.is_some() {
+        if self.emulator_endpoint.is_some() != self.emulator_grpc_endpoint.is_some() {
             return Err(Error::InvalidConfigValue(
-                "endpoint and grpc_endpoint must be set together".into(),
+                "emulator_endpoint and emulator_grpc_endpoint must be set together".into(),
+            ));
+        }
+        if self.emulator_endpoint.is_some()
+            && (self.credentials_path.is_some() || self.credentials_json.is_some())
+        {
+            return Err(Error::InvalidConfigValue(
+                "emulator endpoint overrides cannot be combined with credentials_path or credentials_json".into(),
             ));
         }
         if let Some(column) = &self.payload_column
@@ -267,12 +282,45 @@ impl BigQuerySinkConfig {
     }
 }
 
-fn parse_duration(input: Option<&str>, default: &str) -> Duration {
+impl fmt::Debug for BigQuerySinkConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BigQuerySinkConfig")
+            .field("project_id", &self.project_id)
+            .field("dataset", &self.dataset)
+            .field("table", &self.table)
+            .field("mode", &self.mode)
+            .field(
+                "credentials_path",
+                &self.credentials_path.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "credentials_json",
+                &self.credentials_json.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("payload_column", &self.payload_column)
+            .field("include_metadata", &self.include_metadata)
+            .field("include_headers", &self.include_headers)
+            .field("missing_value", &self.missing_value)
+            .field("max_request_bytes", &self.max_request_bytes)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field("max_retry_delay", &self.max_retry_delay)
+            .field("timeout", &self.timeout)
+            .field("verbose_logging", &self.verbose_logging)
+            .field("emulator_endpoint", &self.emulator_endpoint)
+            .field("emulator_grpc_endpoint", &self.emulator_grpc_endpoint)
+            .finish()
+    }
+}
+
+fn parse_duration(id: u32, input: Option<&str>, default: &str) -> Duration {
     let raw = input.unwrap_or(default);
     HumanDuration::from_str(raw)
         .map(|d| *d)
         .unwrap_or_else(|e| {
-            warn!("BigQuery sink: invalid duration '{raw}': {e}, using default '{default}'");
+            warn!(
+                "BigQuery sink ID: {id}: invalid duration '{raw}': {e}, using default '{default}'"
+            );
             HumanDuration::from_str(default)
                 .map(|d| *d)
                 .unwrap_or(Duration::from_secs(1))
@@ -301,8 +349,8 @@ pub(crate) mod test_support {
             max_retry_delay: None,
             timeout: None,
             verbose_logging: None,
-            endpoint: None,
-            grpc_endpoint: None,
+            emulator_endpoint: None,
+            emulator_grpc_endpoint: None,
         }
     }
 
@@ -310,18 +358,20 @@ pub(crate) mod test_support {
         let mut config = config();
         config.mode = Some(mode);
         config.include_metadata = Some(include_metadata);
-        Settings::from_config(&config)
+        Settings::from_config(1, &config)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::test_support::config as test_config;
 
     #[test]
     fn given_minimal_config_should_apply_defaults() {
-        let settings = Settings::from_config(&test_config());
+        let settings = Settings::from_config(1, &test_config());
         assert_eq!(settings.mode, WriteMode::Mapped);
         assert_eq!(settings.payload_column, "payload");
         assert!(settings.include_metadata);
@@ -400,9 +450,9 @@ mod tests {
     }
 
     #[test]
-    fn given_only_rest_endpoint_should_fail_validation() {
+    fn given_only_rest_emulator_endpoint_should_fail_validation() {
         let mut config = test_config();
-        config.endpoint = Some("http://127.0.0.1:9050".into());
+        config.emulator_endpoint = Some("http://127.0.0.1:9050".into());
         assert!(matches!(
             config.validate(),
             Err(Error::InvalidConfigValue(_))
@@ -424,7 +474,7 @@ mod tests {
         let mut config = test_config();
         config.retry_delay = Some("10s".into());
         config.max_retry_delay = Some("2s".into());
-        let settings = Settings::from_config(&config);
+        let settings = Settings::from_config(1, &config);
         assert_eq!(settings.retry_delay, Duration::from_secs(2));
         assert_eq!(settings.max_retry_delay, Duration::from_secs(10));
     }
@@ -433,7 +483,7 @@ mod tests {
     fn given_oversized_request_budget_should_clamp_below_api_limit() {
         let mut config = test_config();
         config.max_request_bytes = Some(50 * 1024 * 1024);
-        let settings = Settings::from_config(&config);
+        let settings = Settings::from_config(1, &config);
         assert_eq!(settings.max_request_bytes, MAX_REQUEST_BYTES_CEILING);
     }
 
@@ -441,21 +491,44 @@ mod tests {
     fn given_invalid_duration_should_fall_back_to_default() {
         let mut config = test_config();
         config.timeout = Some("soon".into());
-        let settings = Settings::from_config(&config);
+        let settings = Settings::from_config(1, &config);
         assert_eq!(settings.timeout, Duration::from_secs(30));
     }
 
     #[test]
     fn given_debug_format_should_not_leak_inline_credentials() {
         let mut config = test_config();
+        config.credentials_path = Some("/secrets/sensitive-project/key.json".into());
         config.credentials_json = Some(SecretString::from("super-secret-key"));
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("super-secret-key"));
+        assert!(!rendered.contains("sensitive-project"));
+    }
+
+    #[test]
+    fn given_emulator_endpoint_overrides_and_credentials_should_fail_validation() {
+        let mut config = test_config();
+        config.emulator_endpoint = Some("http://127.0.0.1:9050".into());
+        config.emulator_grpc_endpoint = Some("127.0.0.1:9060".into());
+        config.credentials_path = Some("/secrets/key.json".into());
+        assert!(matches!(
+            config.validate(),
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 
     #[test]
     fn given_missing_value_should_map_to_proto_enum() {
         assert_eq!(MissingValue::Null.as_proto(), 1);
         assert_eq!(MissingValue::Default.as_proto(), 2);
+    }
+
+    #[test]
+    fn given_new_counters_should_all_start_at_zero() {
+        let counters = Counters::default();
+        assert_eq!(counters.rows_written.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rows_rejected.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rows_failed.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rows_unconfirmed.load(Ordering::Relaxed), 0);
     }
 }

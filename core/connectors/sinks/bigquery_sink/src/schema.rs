@@ -31,8 +31,8 @@
 //! | INT64      | Int64                          |
 //! | FLOAT64    | Float64                        |
 //! | BOOL       | Boolean                        |
-//! | NUMERIC    | Decimal128(38, 9)              |
-//! | BIGNUMERIC | Decimal256(76, 38)             |
+//! | NUMERIC    | Decimal128(table precision/scale) |
+//! | BIGNUMERIC | Decimal256(table precision/scale) |
 //! | TIMESTAMP  | Timestamp(Microsecond, "UTC")  |
 //! | DATETIME   | Timestamp(Microsecond, none)   |
 //! | DATE       | Date32                         |
@@ -42,12 +42,14 @@
 //! | RECORD     | Struct                         |
 //! | REPEATED   | List                           |
 
-use crate::{Settings, WriteMode};
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
+use serde::Deserialize;
+
+use crate::{Settings, WriteMode};
 
 pub(crate) const UTC: &str = "UTC";
 const LIST_ITEM: &str = "item";
@@ -68,8 +70,8 @@ pub(crate) enum BqType {
     Int64,
     Float64,
     Bool,
-    Numeric,
-    BigNumeric,
+    Numeric { precision: u8, scale: i8 },
+    BigNumeric { precision: u8, scale: i8 },
     Timestamp,
     Datetime,
     Date,
@@ -373,8 +375,8 @@ impl BqType {
             BqType::Int64 => DataType::Int64,
             BqType::Float64 => DataType::Float64,
             BqType::Bool => DataType::Boolean,
-            BqType::Numeric => DataType::Decimal128(38, 9),
-            BqType::BigNumeric => DataType::Decimal256(76, 38),
+            BqType::Numeric { precision, scale } => DataType::Decimal128(*precision, *scale),
+            BqType::BigNumeric { precision, scale } => DataType::Decimal256(*precision, *scale),
             BqType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
             BqType::Datetime => DataType::Timestamp(TimeUnit::Microsecond, None),
             BqType::Date => DataType::Date32,
@@ -392,8 +394,8 @@ impl BqType {
             BqType::Int64 => "INT64",
             BqType::Float64 => "FLOAT64",
             BqType::Bool => "BOOL",
-            BqType::Numeric => "NUMERIC",
-            BqType::BigNumeric => "BIGNUMERIC",
+            BqType::Numeric { .. } => "NUMERIC",
+            BqType::BigNumeric { .. } => "BIGNUMERIC",
             BqType::Timestamp => "TIMESTAMP",
             BqType::Datetime => "DATETIME",
             BqType::Date => "DATE",
@@ -441,6 +443,8 @@ struct RestField {
     #[serde(default)]
     fields: Vec<RestField>,
     default_value_expression: Option<String>,
+    precision: Option<String>,
+    scale: Option<String>,
 }
 
 impl TryFrom<&RestField> for Column {
@@ -453,8 +457,14 @@ impl TryFrom<&RestField> for Column {
             "INTEGER" | "INT64" => BqType::Int64,
             "FLOAT" | "FLOAT64" => BqType::Float64,
             "BOOLEAN" | "BOOL" => BqType::Bool,
-            "NUMERIC" | "DECIMAL" => BqType::Numeric,
-            "BIGNUMERIC" | "BIGDECIMAL" => BqType::BigNumeric,
+            "NUMERIC" | "DECIMAL" => {
+                let (precision, scale) = decimal_parameters(field, 38, 9)?;
+                BqType::Numeric { precision, scale }
+            }
+            "BIGNUMERIC" | "BIGDECIMAL" => {
+                let (precision, scale) = decimal_parameters(field, 76, 38)?;
+                BqType::BigNumeric { precision, scale }
+            }
             "TIMESTAMP" => BqType::Timestamp,
             "DATETIME" => BqType::Datetime,
             "DATE" => BqType::Date,
@@ -506,6 +516,48 @@ impl TryFrom<&RestField> for Column {
             has_default: field.default_value_expression.is_some(),
         })
     }
+}
+
+fn decimal_parameters(
+    field: &RestField,
+    default_precision: u8,
+    default_scale: u8,
+) -> Result<(u8, i8), SchemaError> {
+    let precision = parse_decimal_parameter(field, "precision", field.precision.as_deref())?
+        .unwrap_or(default_precision);
+    let scale = parse_decimal_parameter(field, "scale", field.scale.as_deref())?.unwrap_or(
+        if field.precision.is_some() {
+            0
+        } else {
+            default_scale
+        },
+    );
+    let max_integer_digits = default_precision - default_scale;
+    let max_precision = default_precision.min(scale.saturating_add(max_integer_digits));
+    if precision == 0 || precision > max_precision || scale > default_scale || scale > precision {
+        return Err(SchemaError::Malformed(format!(
+            "column '{}' has invalid {} precision {precision} and scale {scale}",
+            field.name, field.field_type
+        )));
+    }
+    Ok((precision, scale as i8))
+}
+
+fn parse_decimal_parameter(
+    field: &RestField,
+    name: &str,
+    value: Option<&str>,
+) -> Result<Option<u8>, SchemaError> {
+    value
+        .map(|value| {
+            value.parse::<u8>().map_err(|error| {
+                SchemaError::Malformed(format!(
+                    "column '{}' has invalid {name} '{value}': {error}",
+                    field.name
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -566,6 +618,51 @@ mod tests {
                 DataType::Utf8,
             ]
         );
+    }
+
+    #[test]
+    fn given_parameterized_decimals_should_preserve_precision_and_scale() {
+        let columns = parse_table_schema(&schema_json(
+            r#"{"name":"amount","type":"NUMERIC","precision":"12","scale":"4"},
+               {"name":"huge","type":"BIGNUMERIC","precision":"58","scale":"20"}"#,
+        ))
+        .expect("parameterized decimals should parse");
+        assert_eq!(
+            columns[0].arrow_field().data_type(),
+            &DataType::Decimal128(12, 4)
+        );
+        assert_eq!(
+            columns[1].arrow_field().data_type(),
+            &DataType::Decimal256(58, 20)
+        );
+    }
+
+    #[test]
+    fn given_invalid_decimal_parameters_should_fail_schema_parsing() {
+        let result = parse_table_schema(&schema_json(
+            r#"{"name":"amount","type":"NUMERIC","precision":"4","scale":"9"}"#,
+        ));
+        assert!(matches!(result, Err(SchemaError::Malformed(_))));
+    }
+
+    #[test]
+    fn given_decimal_precision_without_scale_should_use_zero_scale() {
+        let columns = parse_table_schema(&schema_json(
+            r#"{"name":"amount","type":"NUMERIC","precision":"12"}"#,
+        ))
+        .expect("precision-only NUMERIC should parse");
+        assert_eq!(
+            columns[0].arrow_field().data_type(),
+            &DataType::Decimal128(12, 0)
+        );
+    }
+
+    #[test]
+    fn given_non_json_table_response_should_fail_as_malformed() {
+        assert!(matches!(
+            parse_table_schema(b"not json"),
+            Err(SchemaError::Malformed(_))
+        ));
     }
 
     #[test]

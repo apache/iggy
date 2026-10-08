@@ -20,10 +20,10 @@
 //! Only transient failures are retried. Retrying a permanent one (bad
 //! schema, missing permission) cannot succeed and only delays the error.
 
-use crate::schema::SchemaError;
+use std::fmt;
+
 use gcloud_gax::grpc::{Code, Status};
 use iggy_connector_sdk::Error;
-use std::fmt;
 
 /// An `AppendRows` call that did not append. Row-level errors are not part
 /// of this type: they are an expected outcome the caller handles by
@@ -32,8 +32,10 @@ use std::fmt;
 pub(crate) enum AppendError {
     /// The call failed, or the response carried an error status.
     Rpc { code: Code, message: String },
+    /// Append was attempted before the write stream was initialized.
+    MissingStream,
     /// The response stream closed without a response.
-    NoResponse,
+    ResponseStreamClosed,
 }
 
 /// A `tables.get` call that did not return a usable schema.
@@ -42,7 +44,6 @@ pub(crate) enum TableError {
     Http { status: u16, body: String },
     Transport(String),
     Token(String),
-    Schema(SchemaError),
 }
 
 impl AppendError {
@@ -51,7 +52,8 @@ impl AppendError {
             AppendError::Rpc { code, .. } => is_retryable_code(*code),
             // The append may or may not have landed. Retrying risks a
             // duplicate, which the delivery guarantees allow.
-            AppendError::NoResponse => true,
+            AppendError::ResponseStreamClosed => true,
+            AppendError::MissingStream => false,
         }
     }
 }
@@ -61,12 +63,11 @@ impl TableError {
         match self {
             TableError::Http { status, .. } => *status == 429 || *status >= 500,
             TableError::Transport(_) | TableError::Token(_) => true,
-            TableError::Schema(_) => false,
         }
     }
 }
 
-/// gRPC codes BigQuery documents as safe to retry for `AppendRows`.
+/// gRPC codes retried for connection, timeout, capacity and token failures.
 pub(crate) fn is_retryable_code(code: Code) -> bool {
     matches!(
         code,
@@ -76,6 +77,8 @@ pub(crate) fn is_retryable_code(code: Code) -> bool {
             | Code::Internal
             | Code::Aborted
             | Code::ResourceExhausted
+            | Code::Unknown
+            | Code::Unauthenticated
     )
 }
 
@@ -108,7 +111,10 @@ impl fmt::Display for AppendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AppendError::Rpc { code, message } => write!(f, "AppendRows {code:?}: {message}"),
-            AppendError::NoResponse => write!(f, "AppendRows stream closed without a response"),
+            AppendError::MissingStream => write!(f, "AppendRows write stream is not initialized"),
+            AppendError::ResponseStreamClosed => {
+                write!(f, "AppendRows stream closed without a response")
+            }
         }
     }
 }
@@ -121,7 +127,6 @@ impl fmt::Display for TableError {
             }
             TableError::Transport(reason) => write!(f, "tables.get failed: {reason}"),
             TableError::Token(reason) => write!(f, "cannot obtain an access token: {reason}"),
-            TableError::Schema(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -146,6 +151,8 @@ mod tests {
             Code::Internal,
             Code::Aborted,
             Code::ResourceExhausted,
+            Code::Unknown,
+            Code::Unauthenticated,
         ] {
             assert!(rpc(code).is_retryable(), "{code:?}");
         }
@@ -156,7 +163,6 @@ mod tests {
         for code in [
             Code::InvalidArgument,
             Code::PermissionDenied,
-            Code::Unauthenticated,
             Code::NotFound,
             Code::FailedPrecondition,
         ] {
@@ -166,7 +172,8 @@ mod tests {
 
     #[test]
     fn given_missing_response_should_be_retryable() {
-        assert!(AppendError::NoResponse.is_retryable());
+        assert!(AppendError::ResponseStreamClosed.is_retryable());
+        assert!(!AppendError::MissingStream.is_retryable());
     }
 
     #[test]

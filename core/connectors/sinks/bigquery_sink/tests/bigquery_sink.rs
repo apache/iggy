@@ -31,7 +31,7 @@ use tonic::Code;
 const EVENTS_TABLE: &str = r#"
     {"name":"user_id","type":"INT64","mode":"REQUIRED"},
     {"name":"event","type":"STRING"},
-    {"name":"created","type":"TIMESTAMP","defaultValueExpression":"CURRENT_TIMESTAMP()"},
+    {"name":"created","type":"TIMESTAMP","mode":"REQUIRED","defaultValueExpression":"CURRENT_TIMESTAMP()"},
     {"name":"iggy_stream","type":"STRING"},
     {"name":"iggy_topic","type":"STRING"},
     {"name":"iggy_partition_id","type":"INT64"},
@@ -45,10 +45,11 @@ fn config(fake: &FakeBigQuery, extra: &str) -> BigQuerySinkConfig {
         project_id = "proj"
         dataset = "ds"
         table = "events"
-        endpoint = "{}"
-        grpc_endpoint = "{}"
+        emulator_endpoint = "{}"
+        emulator_grpc_endpoint = "{}"
         retry_delay = "5ms"
         max_retry_delay = "20ms"
+        timeout = "500ms"
         {extra}
         "#,
         fake.rest_url, fake.grpc_addr
@@ -235,6 +236,46 @@ async fn given_row_errors_should_reappend_without_rejected_rows() {
 }
 
 #[tokio::test]
+async fn given_duplicate_row_errors_should_drop_each_row_once() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.script(&[AppendScript::RowErrors(vec![1, 1])]);
+    let sink = open_sink(&fake, "").await;
+
+    sink.consume(&topic(), metadata(), events(10..13))
+        .await
+        .expect("duplicate indexes should be deduplicated");
+
+    assert_eq!(offsets(&fake.stored()), vec![10, 12]);
+}
+
+#[tokio::test]
+async fn given_out_of_range_row_error_should_fail_the_chunk() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.script(&[AppendScript::RowErrors(vec![10])]);
+    let sink = open_sink(&fake, "").await;
+
+    let result = sink.consume(&topic(), metadata(), events(0..2)).await;
+
+    assert!(
+        matches!(result, Err(Error::PermanentHttpError(_))),
+        "{result:?}"
+    );
+    assert!(fake.stored().is_empty());
+}
+
+#[tokio::test]
+async fn given_all_rows_rejected_by_bigquery_should_fail_the_batch() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.script(&[AppendScript::RowErrors(vec![0, 1])]);
+    let sink = open_sink(&fake, "").await;
+
+    let result = sink.consume(&topic(), metadata(), events(0..2)).await;
+
+    assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+    assert!(fake.stored().is_empty());
+}
+
+#[tokio::test]
 async fn given_row_errors_twice_should_fail_the_chunk() {
     let fake = FakeBigQuery::start(EVENTS_TABLE).await;
     fake.script(&[
@@ -283,6 +324,40 @@ async fn given_cancelled_timeout_should_retry_and_succeed() {
 }
 
 #[tokio::test]
+async fn given_unknown_and_unauthenticated_failures_should_retry() {
+    for code in [Code::Unknown, Code::Unauthenticated] {
+        let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+        fake.script(&[AppendScript::CallError(code), AppendScript::Ok]);
+        let sink = open_sink(&fake, "").await;
+
+        sink.consume(&topic(), metadata(), events(0..1))
+            .await
+            .expect("transient connection and token failures should retry");
+
+        assert_eq!(offsets(&fake.stored()), vec![0], "{code:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_append_response_hangs_should_fail_at_the_configured_deadline() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.script(&[AppendScript::Hang]);
+    let sink = open_sink(&fake, "max_retries = 1").await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sink.consume(&topic(), metadata(), events(0..1)),
+    )
+    .await
+    .expect("connector deadline should finish before the test timeout");
+
+    assert!(
+        matches!(result, Err(Error::CannotStoreData(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn given_transient_failure_beyond_retry_budget_should_fail() {
     let fake = FakeBigQuery::start(EVENTS_TABLE).await;
     fake.script(&[
@@ -318,20 +393,22 @@ async fn given_invalid_argument_should_fail_without_retry() {
 }
 
 #[tokio::test]
-async fn given_permission_and_auth_errors_should_be_permanent() {
-    for code in [Code::PermissionDenied, Code::Unauthenticated] {
-        let fake = FakeBigQuery::start(EVENTS_TABLE).await;
-        fake.script(&[AppendScript::CallError(code), AppendScript::Ok]);
-        let sink = open_sink(&fake, "").await;
+async fn given_permission_error_should_be_permanent() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.script(&[
+        AppendScript::CallError(Code::PermissionDenied),
+        AppendScript::Ok,
+    ]);
+    let sink = open_sink(&fake, "").await;
 
-        let result = sink.consume(&topic(), metadata(), events(0..1)).await;
+    let result = sink.consume(&topic(), metadata(), events(0..1)).await;
 
-        assert!(
-            matches!(result, Err(Error::PermanentHttpError(_))),
-            "{code:?}: {result:?}"
-        );
-        assert!(fake.stored().is_empty(), "{code:?} must not be retried");
-    }
+    assert!(
+        matches!(result, Err(Error::PermanentHttpError(_))),
+        "{result:?}"
+    );
+    assert!(fake.stored().is_empty());
+    assert_eq!(fake.pending_script(), 1, "permission error must not retry");
 }
 
 #[tokio::test]
@@ -395,6 +472,21 @@ async fn given_write_stream_permission_denied_should_fail_open() {
 }
 
 #[tokio::test]
+async fn given_write_stream_setup_keeps_retrying_should_hit_overall_open_timeout() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    fake.fail_get_write_stream(Code::Unknown);
+    let mut sink_config = config(&fake, "");
+    sink_config.timeout = Some("100ms".into());
+    let mut sink = BigQuerySink::new(1, sink_config);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), sink.open())
+        .await
+        .expect("open deadline should finish before the test timeout");
+
+    assert!(matches!(result, Err(Error::InitError(_))), "{result:?}");
+}
+
+#[tokio::test]
 async fn given_raw_mode_should_store_payload_column() {
     let fake = FakeBigQuery::start(r#"{"name":"payload","type":"JSON"}"#).await;
     let sink = open_sink(&fake, "mode = \"raw\"\ninclude_metadata = false").await;
@@ -413,6 +505,42 @@ async fn given_raw_mode_should_store_payload_column() {
     let payload = stored[0].column(0).as_string::<i32>();
     assert_eq!(payload.len(), 1);
     assert_eq!(payload.value(0), r#"{"a":1}"#);
+}
+
+#[tokio::test]
+async fn given_all_rows_rejected_locally_should_fail_the_batch() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    let sink = open_sink(&fake, "").await;
+    let messages = vec![
+        json_message(0, r#"{"event":"missing id"}"#),
+        json_message(1, r#"{"user_id":1.5}"#),
+    ];
+
+    let result = sink.consume(&topic(), metadata(), messages).await;
+
+    assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+    assert!(fake.appends().is_empty());
+}
+
+#[tokio::test]
+async fn given_rows_with_different_default_presence_should_use_separate_appends() {
+    let fake = FakeBigQuery::start(EVENTS_TABLE).await;
+    let sink = open_sink(&fake, "").await;
+    let messages = vec![
+        json_message(0, r#"{"user_id":0,"created":"2024-01-02T03:04:05Z"}"#),
+        json_message(1, r#"{"user_id":1}"#),
+        json_message(2, r#"{"user_id":2,"created":null}"#),
+    ];
+
+    sink.consume(&topic(), metadata(), messages)
+        .await
+        .expect("each default-presence group should append");
+
+    let appends = fake.appends();
+    assert_eq!(appends.len(), 2);
+    assert!(appends[0].batch.column_by_name("created").is_some());
+    assert!(appends[1].batch.column_by_name("created").is_none());
+    assert_eq!(offsets(&fake.stored()), vec![0, 1, 2]);
 }
 
 #[tokio::test]
