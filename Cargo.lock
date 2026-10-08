@@ -7728,6 +7728,7 @@ name = "iggy_connector_questdb_sink"
 version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "humantime",
  "iggy",
  "iggy_connector_sdk",

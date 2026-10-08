@@ -17,6 +17,9 @@
 
 use std::borrow::Cow;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
 use iggy_connector_sdk::{ConsumedMessage, Payload};
 use questdb::ingress::{Buffer, ColumnName, TimestampMicros, TimestampNanos};
 use simd_json::OwnedValue;
@@ -113,13 +116,17 @@ pub enum RowError {
     /// Caught before the first write, so the buffer is untouched and the batch
     /// continues.
     Invalid(String),
-    /// The write pass refused a record that validation accepted, so the two
-    /// passes disagree and the buffer can hold a partial row. Unreachable while
-    /// they agree, and recovered the same way as a client rejection.
-    Drift(String),
     /// The QuestDB client rejected the row. Carries the underlying error so the
     /// caller can decide whether it is transient.
+    ///
+    /// Every column and symbol setter rolls the half-written row back before
+    /// returning, so the buffer is still usable and only this record is lost.
     Client(questdb::Error),
+    /// `Buffer::at` refused the row. It is the one call that returns without
+    /// rolling back, so the buffer can hold a partial row and the caller has to
+    /// drop it. [`Mapping::prepare_timestamp`] rejects every value `at` would
+    /// refuse, which is what keeps this unreachable.
+    Unrecoverable(questdb::Error),
 }
 
 impl From<questdb::Error> for RowError {
@@ -173,6 +180,8 @@ pub struct Mapping {
     pub table: String,
     pub symbol_columns: ColumnNames,
     pub uuid_columns: ColumnNames,
+    /// Columns that stay `LONG` while [`Mapping::numbers_as_double`] is on.
+    pub integer_columns: ColumnNames,
     pub timestamp_source: TimestampSource,
     pub timestamp_field: Option<String>,
     pub timestamp_unit: TimestampUnit,
@@ -183,12 +192,18 @@ pub struct Mapping {
     pub include_headers: bool,
     /// Write every JSON number as a `DOUBLE`.
     ///
-    /// JSON carries one number type, so a producer that emits `2` for a whole
-    /// value and `2.5` for a fractional one makes the column type depend on
-    /// whichever record defined the column first. The client pins that type for
-    /// the rest of the buffer and refuses the records that disagree. Turning
-    /// this on makes the type a function of the column name instead, at the cost
-    /// of storing integers as doubles, which loses exactness above 2^53.
+    /// JSON carries one number type and a serializer writes `2.0` as `2`, so a
+    /// producer whose values are sometimes whole makes a column's type depend on
+    /// which record reached the buffer first. The client pins that type for the
+    /// rest of the buffer and refuses every record of that window which
+    /// disagrees, so the records lost depend on where the flush boundary fell.
+    ///
+    /// On by default, so a column holding a measurement is always a `DOUBLE`.
+    /// The cost is exactness above 2^53: a column holding a nanosecond epoch, a
+    /// snowflake identifier or a hash goes in [`Mapping::integer_columns`]
+    /// rather than turning this off. Turning it off is only safe when every
+    /// numeric field is a genuine integer and the table was pre-created, since
+    /// otherwise a whole-valued first window creates the column as a `LONG`.
     pub numbers_as_double: bool,
 }
 
@@ -203,8 +218,11 @@ pub struct RowContext<'a> {
 impl Mapping {
     /// Appends one row.
     ///
-    /// The message is validated in full before the first write, so a message
-    /// this mapping rejects never touches the buffer.
+    /// The row is built in full before the first write, so a message this
+    /// mapping rejects never touches the buffer. Building is what validates: a
+    /// ragged array, a malformed UUID and an object that will not serialize all
+    /// fail while the row is being assembled, which is why there is no separate
+    /// validation pass to keep in step.
     ///
     /// That ordering is what the caller relies on, and the reason is narrower
     /// than it looks. The client rolls back a row it refuses itself, on every
@@ -213,41 +231,31 @@ impl Mapping {
     /// mapping's own: once an earlier column of the row is written, nothing
     /// removes it. The public `set_marker` API would, but on this transport it
     /// snapshots every buffered table, which makes building a batch quadratic in
-    /// its length. Validating first is the cheap way to get the same guarantee.
+    /// its length.
     pub fn append_row(
         &self,
         buffer: &mut Buffer,
         message: &ConsumedMessage,
         context: RowContext<'_>,
     ) -> Result<(), RowError> {
-        // Resolved once and shared by both passes. `json_document` parses proto
-        // text that carries a JSON document, so doing this per pass would parse
-        // such a payload twice.
+        // `json_document` parses proto text that carries a JSON document, so it
+        // is resolved once here rather than per field.
         let document = message.payload.json_document();
-        let fields =
-            match document.as_deref() {
-                Some(value) => Some(value.as_object().ok_or_else(|| {
-                    RowError::Invalid("JSON payload is not an object".to_owned())
-                })?),
-                None => None,
-            };
-        self.validate_row(message, fields)?;
-        self.append_row_inner(buffer, message, fields, context)
-            .map_err(|error| match error {
-                RowError::Invalid(reason) => RowError::Drift(reason),
-                other => other,
-            })
+        // A document that is not an object carries no fields to map, so it takes
+        // the payload column rather than being rejected. That covers a JSON
+        // array or scalar from the `json` decoder as well as proto text holding
+        // one.
+        let fields = document.as_deref().and_then(|value| value.as_object());
+        let row = self.prepare_row(message, fields)?;
+        self.write_row(buffer, &row, message, context)
     }
 
-    /// Rejects every record the write path would refuse, on the same terms, so
-    /// that `append_row_inner` can only fail on a client error. Keep the two in
-    /// step: a check that exists only in the write path can abandon a partial
-    /// row.
-    fn validate_row(
+    /// Builds every value of one row, rejecting anything QuestDB would refuse.
+    fn prepare_row<'m>(
         &self,
-        message: &ConsumedMessage,
-        fields: Option<&simd_json::owned::Object>,
-    ) -> Result<(), RowError> {
+        message: &'m ConsumedMessage,
+        fields: Option<&'m simd_json::owned::Object>,
+    ) -> Result<PreparedRow<'m>, RowError> {
         // QuestDB resolves column names case-insensitively, so two fields that
         // differ only in case are one column and the second value would be
         // dropped without a word. The claimed names are borrowed and compared in
@@ -261,10 +269,30 @@ impl Mapping {
             columns += 1;
         }
 
+        let mut row = PreparedRow {
+            symbols: Vec::new(),
+            columns: Vec::new(),
+            payload: None,
+            headers: Vec::new(),
+            timestamp: PreparedTimestamp::Now,
+        };
+
         match fields {
             Some(fields) => {
+                // The timestamp field is matched without regard to case, like
+                // QuestDB's own column lookup, so two fields can both claim to
+                // be the timestamp. Stamping the row from whichever was read
+                // last would be a silent choice, so the row is rejected.
+                let mut timestamp_fields = 0usize;
                 for (name, value) in fields {
                     if self.is_timestamp_field(name) {
+                        timestamp_fields += 1;
+                        if timestamp_fields > 1 {
+                            return Err(RowError::Invalid(format!(
+                                "two fields match timestamp_field {}, so the row has no single timestamp",
+                                self.timestamp_field.as_deref().unwrap_or_default()
+                            )));
+                        }
                         continue;
                     }
                     if self.symbol_columns.contains(name.as_str()) {
@@ -272,15 +300,16 @@ impl Mapping {
                         // value silently would also mean that listing a field
                         // in `symbol_columns` quietly discards data the default
                         // path would have kept as JSON text.
-                        if !is_symbol_scalar(value) {
+                        let Some(text) = scalar_to_symbol(value) else {
                             if matches!(value, OwnedValue::Static(StaticNode::Null)) {
                                 continue;
                             }
                             return Err(RowError::Invalid(format!(
                                 "column {name} is listed in symbol_columns but its value is not a scalar"
                             )));
-                        }
+                        };
                         self.claim_column(name.as_str(), &mut seen, &mut columns)?;
+                        row.symbols.push((name.as_str(), text));
                         continue;
                     }
                     if matches!(value, OwnedValue::Static(StaticNode::Null)) {
@@ -288,34 +317,37 @@ impl Mapping {
                         continue;
                     }
                     self.claim_column(name.as_str(), &mut seen, &mut columns)?;
-                    self.validate_column(name.as_str(), value)?;
+                    row.columns
+                        .push((name.as_str(), self.prepare_value(name.as_str(), value)?));
                 }
             }
             None => {
-                self.payload_text(message)?;
+                row.payload = Some(self.payload_text(message)?);
                 columns += 1;
             }
         }
 
-        // The prefixed names are owned, so they are built into a local that
-        // outlives the scan above. Only built when headers are enabled, and the
-        // write pass needs the same strings anyway.
-        let header_columns: Vec<String> = if self.include_headers {
-            message
-                .headers
-                .as_ref()
-                .map(|headers| {
-                    headers
-                        .keys()
-                        .map(|key| format!("header_{}", key.to_string_value()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for column in &header_columns {
-            self.claim_column(column, &mut seen, &mut columns)?;
+        if self.include_headers
+            && let Some(headers) = message.headers.as_ref()
+        {
+            row.headers.reserve(headers.len());
+            for (key, value) in headers {
+                let column = format!("header_{}", key.to_string_value());
+                // `to_string_value` Debug-formats a `Raw` value, which would
+                // store the literal text `b"\x01\x02"`. Base64 keeps the bytes
+                // recoverable, and matches what the HTTP sink writes for that
+                // kind.
+                let text = match value.as_raw() {
+                    Ok(bytes) => BASE64_STANDARD.encode(bytes),
+                    Err(_) => value.to_string_value(),
+                };
+                row.headers.push((column, text));
+            }
+            // The prefixed names are owned, so they are claimed from the vector
+            // that already holds them rather than being built a second time.
+            for (column, _) in &row.headers {
+                self.claim_column(column, &mut seen, &mut columns)?;
+            }
         }
 
         // Every QuestDB row needs at least one symbol or column before its
@@ -326,7 +358,8 @@ impl Mapping {
             ));
         }
 
-        self.validate_timestamp(message, fields)
+        row.timestamp = self.prepare_timestamp(message, fields)?;
+        Ok(row)
     }
 
     /// Column names this connector emits itself for every row.
@@ -363,19 +396,15 @@ impl Mapping {
         Ok(())
     }
 
-    /// The caller skips nulls and has already validated the name, so neither is
-    /// rechecked here.
-    /// Rejects a value the write pass would refuse, before anything is written.
+    /// Turns one JSON value into the column the write pass will set.
     ///
-    /// This repeats work the write pass does again, and that is deliberate. The
-    /// client rolls back a row it refuses itself, but it cannot roll back a
-    /// refusal of ours: by the time this mapping decides an array is ragged or a
-    /// UUID is malformed, the row's earlier columns are already in the buffer,
-    /// and nothing would remove them. Checking first is what keeps a bad value
-    /// to one rejected record instead of a partial row. The cost is one extra
-    /// build per array, per nested object and per UUID column, and only for
-    /// records that carry them.
-    fn validate_column(&self, name: &str, value: &OwnedValue) -> Result<(), RowError> {
+    /// The caller skips nulls and has already claimed the name, so neither is
+    /// rechecked here.
+    fn prepare_value<'v>(
+        &self,
+        name: &str,
+        value: &'v OwnedValue,
+    ) -> Result<PreparedValue<'v>, RowError> {
         // A column declared as a UUID has to hold one. A number or a boolean
         // there creates a column of the wrong type, which the client accepts and
         // the server then refuses for every later row.
@@ -385,239 +414,86 @@ impl Mapping {
                     "column {name} is listed in uuid_columns but its value is not a string"
                 )));
             };
-            return parse_uuid(text)
-                .map(|_| ())
-                .ok_or_else(|| RowError::Invalid(format!("column {name} is not a valid UUID")));
+            let (lo, hi) = parse_uuid(text)
+                .ok_or_else(|| RowError::Invalid(format!("column {name} is not a valid UUID")))?;
+            return Ok(PreparedValue::Uuid(lo, hi));
         }
+        let as_double = self.numbers_as_double && !self.integer_columns.contains(name);
         match value {
-            OwnedValue::Array(items) => parse_array(name, items).map(|_| ()),
-            OwnedValue::Object(_) => simd_json::to_string(value)
-                .map(|_| ())
-                .map_err(|_| RowError::Invalid(format!("column {name} is not serializable"))),
-            _ => Ok(()),
-        }
-    }
-
-    fn validate_timestamp(
-        &self,
-        message: &ConsumedMessage,
-        fields: Option<&simd_json::owned::Object>,
-    ) -> Result<(), RowError> {
-        // `Buffer::at` is the one call that refuses a value without rolling the
-        // row back, so a timestamp it would refuse is the only input that can
-        // leave a partial row. Every source has to be checked, not just the
-        // payload one: `origin_timestamp` comes from the producer, and a value
-        // above `i64::MAX` wraps negative in the cast that follows.
-        match self.timestamp_source {
-            TimestampSource::Server => return Ok(()),
-            TimestampSource::Message => {
-                return validate_micros("message timestamp", message.timestamp);
+            OwnedValue::Static(StaticNode::Bool(flag)) => Ok(PreparedValue::Bool(*flag)),
+            OwnedValue::Static(StaticNode::I64(number)) if as_double => {
+                Ok(PreparedValue::F64(*number as f64))
             }
-            TimestampSource::Origin => {
-                return validate_micros("origin timestamp", message.origin_timestamp);
+            OwnedValue::Static(StaticNode::U64(number)) if as_double => {
+                Ok(PreparedValue::F64(*number as f64))
             }
-            TimestampSource::Payload => {}
-        }
-        let field = self
-            .timestamp_field
-            .as_deref()
-            .ok_or_else(|| RowError::Invalid("timestamp_field is not set".to_owned()))?;
-        let raw = fields
-            .and_then(|fields| field_value(fields, field))
-            .ok_or_else(|| RowError::Invalid(format!("timestamp field {field} is missing")))?;
-        let number = timestamp_number(raw)
-            .ok_or_else(|| RowError::Invalid(format!("timestamp field {field} is not a number")))?;
-        // The designated timestamp is refused below zero, and the conversion to
-        // nanoseconds has to happen here for the sign to be the one the buffer
-        // will see.
-        match self.timestamp_unit.to_nanos(number) {
-            None => Err(RowError::Invalid(format!(
-                "timestamp field {field} is out of range for its unit"
-            ))),
-            Some(nanos) if nanos < 0 => Err(RowError::Invalid(format!(
-                "timestamp field {field} is before the Unix epoch"
-            ))),
-            Some(_) => Ok(()),
-        }
-    }
-
-    fn append_row_inner(
-        &self,
-        buffer: &mut Buffer,
-        message: &ConsumedMessage,
-        fields: Option<&simd_json::owned::Object>,
-        context: RowContext<'_>,
-    ) -> Result<(), RowError> {
-        buffer.table(self.table.as_str())?;
-
-        // QuestDB requires every symbol to precede every non-symbol column, so
-        // the payload is walked twice rather than once.
-        if self.include_stream_column {
-            buffer.symbol("stream", context.stream)?;
-        }
-        if self.include_topic_column {
-            buffer.symbol("topic", context.topic)?;
-        }
-        if let Some(fields) = fields {
-            for (name, value) in fields {
-                if self.is_timestamp_field(name) || !self.symbol_columns.contains(name.as_str()) {
-                    continue;
-                }
-                if let Some(text) = scalar_to_symbol(value) {
-                    buffer.symbol(name.as_str(), text.as_ref())?;
-                }
-            }
-        }
-
-        if self.include_partition_column {
-            buffer.column_i64("partition_id", i64::from(context.partition_id))?;
-        }
-        if self.include_offset_column {
-            buffer.column_i64("offset", message.offset as i64)?;
-        }
-        if self.include_headers {
-            self.append_headers(buffer, message)?;
-        }
-
-        match fields {
-            Some(fields) => {
-                for (name, value) in fields {
-                    if self.is_timestamp_field(name) || self.symbol_columns.contains(name.as_str())
-                    {
-                        continue;
-                    }
-                    self.append_column(buffer, name.as_str(), value)?;
-                }
-            }
-            None => {
-                // Raw / Text payloads have no field structure, so they land in
-                // a single column rather than being silently dropped.
-                let text = self.payload_text(message)?;
-                buffer.column_str("payload", text)?;
-            }
-        }
-
-        self.append_timestamp(buffer, message, fields)
-    }
-
-    fn is_timestamp_field(&self, name: &str) -> bool {
-        self.timestamp_source == TimestampSource::Payload
-            && self
-                .timestamp_field
-                .as_deref()
-                .is_some_and(|field| field.eq_ignore_ascii_case(name))
-    }
-
-    /// `Some` for JSON object payloads, `None` for payloads with no field
-    /// structure.
-    /// The payload of a record that carries no field structure, borrowed.
-    ///
-    /// Both passes call this, so the UTF-8 rule lives in one place and neither
-    /// pass copies the payload. A JSON payload never reaches it, because the
-    /// caller takes the field path for those, and it is reported rather than
-    /// asserted so that a future caller cannot turn a mistake into a panic
-    /// crossing the plugin boundary.
-    fn payload_text<'m>(&self, message: &'m ConsumedMessage) -> Result<&'m str, RowError> {
-        match &message.payload {
-            Payload::Text(text) | Payload::Proto(text) => Ok(text.as_str()),
-            Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
-                std::str::from_utf8(bytes)
-                    .map_err(|_| RowError::Invalid("payload is not valid UTF-8".to_owned()))
-            }
-            Payload::Json(_) => Err(RowError::Invalid(
-                "a JSON payload takes the field path, not the payload column".to_owned(),
-            )),
-        }
-    }
-
-    fn append_headers(
-        &self,
-        buffer: &mut Buffer,
-        message: &ConsumedMessage,
-    ) -> Result<(), RowError> {
-        let Some(headers) = message.headers.as_ref() else {
-            return Ok(());
-        };
-        for (key, value) in headers {
-            let column = format!("header_{}", key.to_string_value());
-            buffer.column_str(column.as_str(), value.to_string_value().as_str())?;
-        }
-        Ok(())
-    }
-
-    fn append_column(
-        &self,
-        buffer: &mut Buffer,
-        name: &str,
-        value: &OwnedValue,
-    ) -> Result<(), RowError> {
-        match value {
-            // Omitting the column is how QWP encodes a null.
-            OwnedValue::Static(StaticNode::Null) => {}
-            OwnedValue::Static(StaticNode::Bool(flag)) => {
-                buffer.column_bool(name, *flag)?;
-            }
-            OwnedValue::Static(StaticNode::I64(number)) if self.numbers_as_double => {
-                buffer.column_f64(name, *number as f64)?;
-            }
-            OwnedValue::Static(StaticNode::U64(number)) if self.numbers_as_double => {
-                buffer.column_f64(name, *number as f64)?;
-            }
-            OwnedValue::Static(StaticNode::I64(number)) => {
-                buffer.column_i64(name, *number)?;
-            }
-            OwnedValue::Static(StaticNode::U64(number)) => {
-                // QuestDB has no unsigned 64-bit column; anything past i64::MAX
-                // would wrap, so it degrades to DOUBLE rather than corrupting.
-                // That makes the column type depend on the value, which
-                // `numbers_as_double` exists to avoid.
-                match i64::try_from(*number) {
-                    Ok(number) => buffer.column_i64(name, number)?,
-                    Err(_) => buffer.column_f64(name, *number as f64)?,
-                };
-            }
-            OwnedValue::Static(StaticNode::F64(number)) => {
-                buffer.column_f64(name, *number)?;
-            }
-            OwnedValue::String(text) => {
-                if self.uuid_columns.contains(name) {
-                    let (lo, hi) = parse_uuid(text).ok_or_else(|| {
-                        RowError::Invalid(format!("column {name} is not a valid UUID"))
-                    })?;
-                    buffer.column_uuid(name, lo, hi)?;
+            OwnedValue::Static(StaticNode::I64(number)) => Ok(PreparedValue::I64(*number)),
+            // QuestDB has no unsigned 64-bit column, so anything past `i64::MAX`
+            // would wrap. A column the operator declared an integer is refused
+            // rather than silently sent as a `DOUBLE`, which would change the
+            // type the declaration pinned. Otherwise it degrades to `DOUBLE`,
+            // which is what `numbers_as_double` would have done anyway.
+            OwnedValue::Static(StaticNode::U64(number)) => match i64::try_from(*number) {
+                Ok(number) => Ok(PreparedValue::I64(number)),
+                Err(_) if self.integer_columns.contains(name) => Err(RowError::Invalid(format!(
+                    "column {name} is listed in integer_columns but {number} is larger than a QuestDB LONG"
+                ))),
+                Err(_) => Ok(PreparedValue::F64(*number as f64)),
+            },
+            // A declared integer column takes a float whose value is whole,
+            // because JSON gives no way to tell `20` from `20.0`. A genuinely
+            // fractional value is refused: rounding it would store something the
+            // producer did not send, and sending it as a `DOUBLE` would break
+            // the type the declaration pinned.
+            OwnedValue::Static(StaticNode::F64(number)) if self.integer_columns.contains(name) => {
+                let number = *number;
+                if number.fract() == 0.0 && number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+                    Ok(PreparedValue::I64(number as i64))
                 } else {
-                    buffer.column_str(name, text.as_str())?;
+                    Err(RowError::Invalid(format!(
+                        "column {name} is listed in integer_columns but {number} is not a whole number in range"
+                    )))
                 }
             }
-            OwnedValue::Array(items) => {
-                append_array(buffer, name, items)?;
-            }
-            OwnedValue::Object(_) => {
-                // Nested objects have no QuestDB column type; store the JSON
-                // text so the data is preserved rather than dropped.
-                let encoded = simd_json::to_string(value)
-                    .map_err(|_| RowError::Invalid(format!("column {name} is not serializable")))?;
-                buffer.column_str(name, encoded.as_str())?;
-            }
+            OwnedValue::Static(StaticNode::F64(number)) => Ok(PreparedValue::F64(*number)),
+            OwnedValue::String(text) => Ok(PreparedValue::Str(text.as_str())),
+            OwnedValue::Array(items) => parse_array(name, items).map(PreparedValue::Array),
+            // Nested objects have no QuestDB column type; store the JSON text so
+            // the data is preserved rather than dropped.
+            OwnedValue::Object(_) => simd_json::to_string(value)
+                .map(PreparedValue::Json)
+                .map_err(|_| RowError::Invalid(format!("column {name} is not serializable"))),
+            // The caller skips a null before reaching this.
+            OwnedValue::Static(StaticNode::Null) => Err(RowError::Invalid(format!(
+                "column {name} holds a null that should have been skipped"
+            ))),
         }
-        Ok(())
     }
 
-    fn append_timestamp(
+    /// Resolves the designated timestamp, rejecting a value `Buffer::at` would
+    /// refuse.
+    ///
+    /// Every source is checked, not just the payload one: `origin_timestamp`
+    /// comes from the producer, and a value above `i64::MAX` wraps negative in
+    /// the cast that follows. `at` is the one call that refuses a value without
+    /// rolling the row back, so a timestamp it would refuse is the only input
+    /// that could leave a partial row.
+    fn prepare_timestamp(
         &self,
-        buffer: &mut Buffer,
         message: &ConsumedMessage,
         fields: Option<&simd_json::owned::Object>,
-    ) -> Result<(), RowError> {
+    ) -> Result<PreparedTimestamp, RowError> {
         match self.timestamp_source {
-            TimestampSource::Server => {
-                buffer.at_now()?;
-            }
+            TimestampSource::Server => Ok(PreparedTimestamp::Now),
             TimestampSource::Message => {
-                buffer.at(micros_or_now(message.timestamp))?;
+                validate_micros("message timestamp", message.timestamp)?;
+                Ok(PreparedTimestamp::Micros(micros_or_now(message.timestamp)))
             }
             TimestampSource::Origin => {
-                buffer.at(micros_or_now(message.origin_timestamp))?;
+                validate_micros("origin timestamp", message.origin_timestamp)?;
+                Ok(PreparedTimestamp::Micros(micros_or_now(
+                    message.origin_timestamp,
+                )))
             }
             TimestampSource::Payload => {
                 let field = self
@@ -632,20 +508,151 @@ impl Mapping {
                 let number = timestamp_number(raw).ok_or_else(|| {
                     RowError::Invalid(format!("timestamp field {field} is not a number"))
                 })?;
+                // The conversion to nanoseconds happens here so the sign is the
+                // one the buffer will see.
                 let nanos = self.timestamp_unit.to_nanos(number).ok_or_else(|| {
                     RowError::Invalid(format!(
                         "timestamp field {field} is out of range for its unit"
                     ))
                 })?;
-                buffer.at(TimestampNanos::new(nanos))?;
+                if nanos < 0 {
+                    return Err(RowError::Invalid(format!(
+                        "timestamp field {field} is before the Unix epoch"
+                    )));
+                }
+                Ok(PreparedTimestamp::Nanos(TimestampNanos::new(nanos)))
             }
         }
-        Ok(())
+    }
+
+    /// Writes a prepared row. Every failure here belongs to the client.
+    fn write_row(
+        &self,
+        buffer: &mut Buffer,
+        row: &PreparedRow<'_>,
+        message: &ConsumedMessage,
+        context: RowContext<'_>,
+    ) -> Result<(), RowError> {
+        buffer.table(self.table.as_str())?;
+
+        // QuestDB requires every symbol to precede every non-symbol column.
+        if self.include_stream_column {
+            buffer.symbol("stream", context.stream)?;
+        }
+        if self.include_topic_column {
+            buffer.symbol("topic", context.topic)?;
+        }
+        for (name, text) in &row.symbols {
+            buffer.symbol(*name, text.as_ref())?;
+        }
+
+        if self.include_partition_column {
+            buffer.column_i64("partition_id", i64::from(context.partition_id))?;
+        }
+        if self.include_offset_column {
+            buffer.column_i64("offset", message.offset as i64)?;
+        }
+        for (column, text) in &row.headers {
+            buffer.column_str(column.as_str(), text.as_str())?;
+        }
+        for (name, value) in &row.columns {
+            match value {
+                PreparedValue::Bool(flag) => {
+                    buffer.column_bool(*name, *flag)?;
+                }
+                PreparedValue::I64(number) => {
+                    buffer.column_i64(*name, *number)?;
+                }
+                PreparedValue::F64(number) => {
+                    buffer.column_f64(*name, *number)?;
+                }
+                PreparedValue::Str(text) => {
+                    buffer.column_str(*name, *text)?;
+                }
+                PreparedValue::Uuid(lo, hi) => {
+                    buffer.column_uuid(*name, *lo, *hi)?;
+                }
+                PreparedValue::Array(values) => write_array(buffer, name, values)?,
+                PreparedValue::Json(text) => {
+                    buffer.column_str(*name, text.as_str())?;
+                }
+            }
+        }
+        // A record with no field structure lands in a single column rather than
+        // being silently dropped.
+        if let Some(payload) = &row.payload {
+            buffer.column_str("payload", payload.as_ref())?;
+        }
+
+        // `at` is the one call that refuses a value without rolling the row
+        // back, so its failure leaves a partial row and the caller has to drop
+        // the buffer. `prepare_timestamp` covers every value that would be
+        // refused, which is what keeps this unreachable.
+        match row.timestamp {
+            PreparedTimestamp::Now => buffer.at_now(),
+            PreparedTimestamp::Micros(micros) => buffer.at(micros),
+            PreparedTimestamp::Nanos(nanos) => buffer.at(nanos),
+        }
+        .map_err(RowError::Unrecoverable)
+    }
+
+    fn is_timestamp_field(&self, name: &str) -> bool {
+        self.timestamp_source == TimestampSource::Payload
+            && self
+                .timestamp_field
+                .as_deref()
+                .is_some_and(|field| field.eq_ignore_ascii_case(name))
+    }
+
+    /// The payload of a record that carries no field structure.
+    ///
+    /// Nothing copies a payload that is already text. A `Payload::Json` reaches
+    /// this only when the document is not an object, which has no fields to map,
+    /// and is rendered back to JSON text.
+    fn payload_text<'m>(&self, message: &'m ConsumedMessage) -> Result<Cow<'m, str>, RowError> {
+        match &message.payload {
+            Payload::Text(text) | Payload::Proto(text) => Ok(Cow::Borrowed(text.as_str())),
+            Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
+                std::str::from_utf8(bytes)
+                    .map(Cow::Borrowed)
+                    .map_err(|_| RowError::Invalid("payload is not valid UTF-8".to_owned()))
+            }
+            Payload::Json(value) => simd_json::to_string(value)
+                .map(Cow::Owned)
+                .map_err(|error| {
+                    RowError::Invalid(format!("payload cannot be rendered as JSON text: {error}"))
+                }),
+        }
     }
 }
 
-/// `timestamp == 0` means unset in Apache Iggy, so the row falls back to the
-/// server clock rather than landing at the Unix epoch.
+/// One row with every value built, ready to write.
+struct PreparedRow<'m> {
+    symbols: Vec<(&'m str, Cow<'m, str>)>,
+    columns: Vec<(&'m str, PreparedValue<'m>)>,
+    payload: Option<Cow<'m, str>>,
+    headers: Vec<(String, String)>,
+    timestamp: PreparedTimestamp,
+}
+
+/// A column value in the shape the client's setter takes.
+enum PreparedValue<'m> {
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Str(&'m str),
+    Uuid(u64, u64),
+    Array(ArrayValues),
+    Json(String),
+}
+
+/// Which `Buffer::at` call closes the row.
+enum PreparedTimestamp {
+    Now,
+    Micros(TimestampMicros),
+    Nanos(TimestampNanos),
+}
+
 /// Rejects a microsecond timestamp the buffer would refuse.
 ///
 /// Apache Iggy carries these as `u64` and the client takes an `i64`, so a value
@@ -661,6 +668,8 @@ fn validate_micros(label: &str, micros: u64) -> Result<(), RowError> {
     Ok(())
 }
 
+/// `timestamp == 0` means unset in Apache Iggy, so the row falls back to the
+/// server clock rather than landing at the Unix epoch.
 fn micros_or_now(micros: u64) -> TimestampMicros {
     if micros == 0 {
         TimestampMicros::now()
@@ -669,11 +678,6 @@ fn micros_or_now(micros: u64) -> TimestampMicros {
     }
 }
 
-/// `None` for anything that is not a usable timestamp.
-///
-/// A float needs the range test: `as i64` turns `NaN` into zero, which would
-/// stamp the row at the epoch, and saturates a large value, which would stamp it
-/// centuries away. Both would pass validation and store a wrong time.
 /// Looks a payload field up without regard to case, which is how QuestDB
 /// resolves a column name and therefore how `timestamp_field` has to match.
 fn field_value<'m>(fields: &'m simd_json::owned::Object, name: &str) -> Option<&'m OwnedValue> {
@@ -685,6 +689,11 @@ fn field_value<'m>(fields: &'m simd_json::owned::Object, name: &str) -> Option<&
     })
 }
 
+/// `None` for anything that is not a usable timestamp.
+///
+/// A float needs the range test: `as i64` turns `NaN` into zero, which would
+/// stamp the row at the epoch, and saturates a large value, which would stamp it
+/// centuries away. Both would pass validation and store a wrong time.
 fn timestamp_number(value: &OwnedValue) -> Option<i64> {
     match value {
         OwnedValue::Static(StaticNode::I64(number)) => Some(*number),
@@ -696,18 +705,6 @@ fn timestamp_number(value: &OwnedValue) -> Option<i64> {
         }
         _ => None,
     }
-}
-
-/// Whether `value` is something [`scalar_to_symbol`] would render, without
-/// rendering it. Validation only needs the answer, and this runs per symbol
-/// field per row.
-fn is_symbol_scalar(value: &OwnedValue) -> bool {
-    matches!(
-        value,
-        OwnedValue::Static(
-            StaticNode::Bool(_) | StaticNode::I64(_) | StaticNode::U64(_) | StaticNode::F64(_)
-        ) | OwnedValue::String(_)
-    )
 }
 
 /// Borrows a string value and renders the rest, so the common case of a string
@@ -739,7 +736,6 @@ fn validate_name(name: &str) -> Result<(), RowError> {
         .map_err(|error| RowError::Invalid(format!("column {name} is not a valid name: {error}")))
 }
 
-/// Mirrors the shape checks in [`append_array`] without writing anything.
 /// A numeric array shaped for the client, by nesting depth.
 ///
 /// QuestDB stores only `DOUBLE` arrays, so integer input is widened. Nesting is
@@ -751,11 +747,10 @@ enum ArrayValues {
     Three(Vec<Vec<Vec<f64>>>),
 }
 
-/// Builds the array once, for both passes.
+/// Builds the array the write pass will hand to the client.
 ///
-/// Validation throws the value away and the write pass keeps it, so the shape
-/// rules live in one place. Holding them twice meant the two copies had to agree
-/// by hand, and the rectangularity rule was missing from one of them.
+/// Building it is what checks its shape, so the rules cannot be held in two
+/// places that have to agree by hand.
 fn parse_array(name: &str, items: &[OwnedValue]) -> Result<ArrayValues, RowError> {
     let not_numeric = || RowError::Invalid(format!("column {name} is not a numeric array"));
     // QuestDB arrays are rectangular: every sibling must have the same length,
@@ -815,11 +810,11 @@ fn parse_array(name: &str, items: &[OwnedValue]) -> Result<ArrayValues, RowError
     }
 }
 
-fn append_array(buffer: &mut Buffer, name: &str, items: &[OwnedValue]) -> Result<(), RowError> {
-    match parse_array(name, items)? {
-        ArrayValues::One(values) => buffer.column_arr(name, &values)?,
-        ArrayValues::Two(rows) => buffer.column_arr(name, &rows)?,
-        ArrayValues::Three(cubes) => buffer.column_arr(name, &cubes)?,
+fn write_array(buffer: &mut Buffer, name: &str, values: &ArrayValues) -> Result<(), RowError> {
+    match values {
+        ArrayValues::One(values) => buffer.column_arr(name, values)?,
+        ArrayValues::Two(rows) => buffer.column_arr(name, rows)?,
+        ArrayValues::Three(cubes) => buffer.column_arr(name, cubes)?,
     };
     Ok(())
 }
@@ -913,6 +908,7 @@ mod tests {
             table: "events".to_owned(),
             symbol_columns: ColumnNames::default(),
             uuid_columns: ColumnNames::default(),
+            integer_columns: ColumnNames::default(),
             timestamp_source: TimestampSource::Message,
             timestamp_field: None,
             timestamp_unit: TimestampUnit::Auto,
@@ -921,7 +917,9 @@ mod tests {
             include_partition_column: false,
             include_offset_column: false,
             include_headers: false,
-            numbers_as_double: false,
+            // The production default, so the common path is what the tests
+            // exercise. The tests that pin integer typing set it back.
+            numbers_as_double: true,
         }
     }
 
@@ -1098,25 +1096,93 @@ mod tests {
     }
 
     #[test]
-    fn given_non_object_payload_when_appending_should_reject_row() {
+    fn given_non_object_json_payload_when_appending_should_take_the_payload_column() {
         let mut buffer = buffer();
-        let error = mapping()
+        mapping()
             .append_row(&mut buffer, &json_message("[1,2,3]"), context())
+            .expect("a JSON array has no fields to map, so it takes the payload column");
+
+        let line = rendered(&buffer);
+        assert!(line.contains("payload="), "{line}");
+        assert!(line.contains("[1,2,3]"), "{line}");
+    }
+
+    #[test]
+    fn given_scalar_json_payload_when_appending_should_take_the_payload_column() {
+        let mut buffer = buffer();
+        mapping()
+            .append_row(&mut buffer, &json_message("42"), context())
+            .expect("a JSON scalar has no fields to map, so it takes the payload column");
+
+        assert!(rendered(&buffer).contains("payload=\"42\""));
+    }
+
+    #[test]
+    fn given_two_fields_matching_the_timestamp_field_when_appending_should_reject_the_row() {
+        // QuestDB resolves a column name without regard to case, so `ts` and
+        // `TS` are one column and one of the two values would be dropped.
+        let mut mapping = mapping();
+        mapping.timestamp_source = TimestampSource::Payload;
+        mapping.timestamp_field = Some("ts".to_owned());
+        let mut buffer = qwp_buffer();
+
+        let error = mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"ts":1700000000000000,"TS":1800000000000000,"price":1.5}"#),
+                context(),
+            )
             .unwrap_err();
 
-        assert!(matches!(error, RowError::Invalid(_)));
-        assert!(buffer.is_empty());
+        assert!(matches!(error, RowError::Invalid(_)), "{error:?}");
+        assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_message_timestamp_above_the_client_range_when_appending_should_reject_the_row() {
+        // `Buffer::at` refuses a negative value without rolling the row back, so
+        // this is the one input that could leave a partial row behind.
+        let mut message = json_message(r#"{"price":1.5}"#);
+        message.timestamp = i64::MAX as u64 + 1;
+        let mut buffer = qwp_buffer();
+
+        let error = mapping()
+            .append_row(&mut buffer, &message, context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)), "{error:?}");
+        assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_origin_timestamp_above_the_client_range_when_appending_should_reject_the_row() {
+        // `origin_timestamp` is producer-supplied, so this one is reachable from
+        // outside the server.
+        let mut mapping = mapping();
+        mapping.timestamp_source = TimestampSource::Origin;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        message.origin_timestamp = u64::MAX;
+        let mut buffer = qwp_buffer();
+
+        let error = mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)), "{error:?}");
+        assert_eq!(buffer.row_count(), 0);
     }
 
     #[test]
     fn given_mid_row_failure_when_appending_should_leave_the_buffer_untouched() {
         // The bad UUID sits after fields that would already have been encoded,
         // so this pins the guarantee that validation runs before any write
-        // rather than being rolled back afterwards.
+        // rather than being rolled back afterwards. It runs on the buffer
+        // production uses: the ILP buffer rolls a refused row back by itself, so
+        // it cannot tell whether the guarantee holds.
         let mut mapping = mapping();
         mapping.symbol_columns.insert("side".to_owned());
         mapping.uuid_columns.insert("trade_id".to_owned());
-        let mut buffer = buffer();
+        let mut buffer = qwp_buffer();
 
         mapping
             .append_row(
@@ -1125,7 +1191,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        let after_good = rendered(&buffer);
+        assert_eq!(buffer.row_count(), 1);
 
         let error = mapping
             .append_row(
@@ -1136,12 +1202,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, RowError::Invalid(_)));
         assert_eq!(
-            rendered(&buffer),
-            after_good,
+            buffer.row_count(),
+            1,
             "rejected row must not reach the buffer"
         );
 
-        // The buffer is still usable for the next record.
+        // The buffer is still usable for the next record, which it would not be
+        // if the rejection had left a half-written row behind.
         mapping
             .append_row(
                 &mut buffer,
@@ -1524,7 +1591,10 @@ mod tests {
         // holds because the client rolls the half-written row back itself before
         // returning the error. Pin that: the rejected row leaves no trace and the
         // next record still writes.
-        let mapping = mapping();
+        let mut mapping = mapping();
+        // Mixed numbers are the cheapest way to make the client refuse a row,
+        // and the default resolves them, so this opts out of that.
+        mapping.numbers_as_double = false;
         let mut buffer = qwp_buffer();
         mapping
             .append_row(&mut buffer, &json_message(r#"{"temp":21.5}"#), context())
@@ -1570,11 +1640,28 @@ mod tests {
     }
 
     #[test]
-    fn given_the_default_when_appending_mixed_numbers_should_still_conflict() {
-        // The guard above is opt-in, so the default keeps integers as LONG and
-        // the conflict stays visible as a client rejection the caller recovers
-        // from.
+    fn given_the_default_when_appending_mixed_numbers_should_accept_both() {
+        // JSON writes 21.0 as 21, so one field arriving whole and fractional is
+        // ordinary data rather than a producer mistake. The default has to take
+        // both, because which one the buffer saw first is an accident of
+        // batching.
         let mapping = mapping();
+        let mut buffer = qwp_buffer();
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"temp":21}"#), context())
+            .unwrap();
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"temp":21.5}"#), context())
+            .unwrap();
+        assert_eq!(buffer.row_count(), 2);
+    }
+
+    #[test]
+    fn given_numbers_as_double_off_when_appending_mixed_numbers_should_conflict() {
+        // Opting out is what reintroduces the conflict, which is the cost the
+        // README names for keeping integers exact without naming the columns.
+        let mut mapping = mapping();
+        mapping.numbers_as_double = false;
         let mut buffer = qwp_buffer();
         mapping
             .append_row(&mut buffer, &json_message(r#"{"temp":21}"#), context())
@@ -1583,6 +1670,55 @@ mod tests {
             .append_row(&mut buffer, &json_message(r#"{"temp":21.5}"#), context())
             .unwrap_err();
         assert!(matches!(error, RowError::Client(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn given_an_integer_column_when_appending_should_keep_it_exact() {
+        // A column named in integer_columns stays LONG while every other number
+        // is a DOUBLE, so an identifier past 2^53 survives the round trip.
+        let mut mapping = mapping();
+        mapping.integer_columns.insert("trade_id".to_owned());
+        let mut buffer = buffer();
+        mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"trade_id":9007199254740993,"price":1.5}"#),
+                context(),
+            )
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("trade_id=9007199254740993i"), "{line}");
+        assert!(line.contains("price=1.5"), "{line}");
+    }
+
+    #[test]
+    fn given_an_integer_column_holding_a_whole_float_when_appending_should_accept_it() {
+        // JSON gives no way to tell 20 from 20.0, so a whole float in a declared
+        // integer column is the same value and must not cost the record.
+        let mut mapping = mapping();
+        mapping.integer_columns.insert("count".to_owned());
+        let mut buffer = buffer();
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"count":20.0}"#), context())
+            .unwrap();
+
+        assert!(rendered(&buffer).contains("count=20i"));
+    }
+
+    #[test]
+    fn given_an_integer_column_holding_a_fraction_when_appending_should_reject_the_row() {
+        // Rounding would store a value the producer never sent, and sending a
+        // DOUBLE would break the type the declaration pinned.
+        let mut mapping = mapping();
+        mapping.integer_columns.insert("count".to_owned());
+        let mut buffer = qwp_buffer();
+        let error = mapping
+            .append_row(&mut buffer, &json_message(r#"{"count":20.5}"#), context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+        assert_eq!(buffer.row_count(), 0);
     }
 
     #[test]

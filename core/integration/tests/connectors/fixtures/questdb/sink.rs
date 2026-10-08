@@ -28,12 +28,13 @@ use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BATCH_SIZE, ENV_SINK_CONNECTION_STRING,
     ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS, ENV_SINK_INCLUDE_OFFSET_COLUMN,
     ENV_SINK_INCLUDE_PARTITION_COLUMN, ENV_SINK_INCLUDE_STREAM_COLUMN,
-    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_LOG_REJECTED_PAYLOAD, ENV_SINK_NUMBERS_AS_DOUBLE,
-    ENV_SINK_PATH, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
-    ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE,
-    ENV_SINK_TIMESTAMP_FIELD, ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT,
-    ENV_SINK_UUID_COLUMNS, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer,
-    QuestDbOps, SINK_PLUGIN_PATH, create_http_client, ensure_plugin_built,
+    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_INTEGER_COLUMNS, ENV_SINK_LOG_REJECTED_PAYLOAD,
+    ENV_SINK_NUMBERS_AS_DOUBLE, ENV_SINK_PATH, ENV_SINK_STREAMS_0_CONSUMER_GROUP,
+    ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS,
+    ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD, ENV_SINK_TIMESTAMP_SOURCE,
+    ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS, HEALTH_CHECK_ATTEMPTS,
+    HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps, SINK_PLUGIN_PATH, create_http_client,
+    ensure_plugin_built,
 };
 
 const POLL_ATTEMPTS: usize = 120;
@@ -51,6 +52,7 @@ pub struct QuestDbSinkOptions {
     pub timestamp_unit: Option<String>,
     pub symbol_columns: Option<Vec<String>>,
     pub uuid_columns: Option<Vec<String>>,
+    pub integer_columns: Option<Vec<String>>,
     pub include_stream_column: Option<bool>,
     pub include_topic_column: Option<bool>,
     pub include_partition_column: Option<bool>,
@@ -339,6 +341,9 @@ impl TestFixture for QuestDbSinkFixture {
         if let Some(values) = &self.options.uuid_columns {
             envs.insert(ENV_SINK_UUID_COLUMNS.to_string(), toml_list(values));
         }
+        if let Some(values) = &self.options.integer_columns {
+            envs.insert(ENV_SINK_INTEGER_COLUMNS.to_string(), toml_list(values));
+        }
         if let Some(value) = self.options.include_stream_column {
             envs.insert(
                 ENV_SINK_INCLUDE_STREAM_COLUMN.to_string(),
@@ -411,11 +416,30 @@ macro_rules! delegate_fixture {
 }
 
 delegate_fixture!(
-    /// Every JSON number written as a DOUBLE, so a column's type follows its
-    /// name rather than whichever record defined it first.
-    QuestDbSinkNumbersAsDoubleFixture,
+    /// `numbers_as_double` turned off, so a column's type follows whichever
+    /// record defined it first. This is the opt-out, not the default.
+    QuestDbSinkTypedNumbersFixture,
     QuestDbSinkOptions {
-        numbers_as_double: Some(true),
+        numbers_as_double: Some(false),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// A pre-created table whose declared types are deliberately the opposite of
+    /// what the connector sends, so one record exercises both coercion
+    /// directions: `measured` is a DOUBLE column receiving a LONG frame, and
+    /// `counted` is a LONG column receiving a DOUBLE frame.
+    QuestDbSinkCoercionFixture,
+    QuestDbSinkOptions {
+        integer_columns: Some(vec!["measured".to_string()]),
+        include_stream_column: Some(false),
+        include_topic_column: Some(false),
+        pre_create_ddl: Some(format!(
+            "create table {SINK_TABLE} (measured DOUBLE, counted LONG, \
+             big LONG, timestamp TIMESTAMP) \
+             timestamp(timestamp) partition by DAY WAL"
+        )),
         ..Default::default()
     }
 );
@@ -425,6 +449,7 @@ delegate_fixture!(
     QuestDbSinkOptions {
         symbol_columns: Some(vec!["side".to_string()]),
         uuid_columns: Some(vec!["trade_id".to_string()]),
+        integer_columns: Some(vec!["amount".to_string()]),
         include_partition_column: Some(true),
         include_offset_column: Some(true),
         log_rejected_payload: Some(true),

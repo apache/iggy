@@ -36,6 +36,7 @@ timestamp_source = "message"
 timestamp_unit = "auto"
 symbol_columns = ["region", "device"]
 uuid_columns = []
+integer_columns = []
 include_stream_column = true
 include_topic_column = true
 include_partition_column = false
@@ -46,6 +47,7 @@ flush_timeout = "30s"
 batch_size = 1000
 max_flush_bytes = 1000000
 log_rejected_payload = false
+numbers_as_double = true
 verbose_logging = false
 ```
 
@@ -58,6 +60,7 @@ verbose_logging = false
 | `timestamp_unit` | `auto` | `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers from magnitude. |
 | `symbol_columns` | `[]` | Payload fields stored as `SYMBOL` instead of `VARCHAR`. A listed field must hold a scalar, and a record carrying an object or an array there is rejected rather than losing the value. Matched without regard to case. |
 | `uuid_columns` | `[]` | Payload fields holding canonical RFC-4122 strings, stored as `UUID`. A listed field must hold a string, and a record carrying another type there is rejected. Matched without regard to case, as QuestDB resolves column names. |
+| `integer_columns` | `[]` | Payload fields kept as `LONG` while `numbers_as_double` is on, for values a `DOUBLE` cannot hold exactly. A fractional value in a listed field is rejected. Matched without regard to case. |
 | `include_stream_column` | `true` | Write the Iggy stream name as a `SYMBOL` named `stream`. |
 | `include_topic_column` | `true` | Write the Iggy topic name as a `SYMBOL` named `topic`. |
 | `include_partition_column` | `false` | Write `partition_id` as a `LONG`. |
@@ -67,7 +70,7 @@ verbose_logging = false
 | `flush_timeout` | `30s` | How long one flush waits for the configured ack level, measured as time without progress rather than as a total budget. `0s` at `ack_level = "ok"` means fire and forget: the sink publishes and does not wait. `0s` is refused at `ack_level = "durable"`, because a zero timeout never expires. A batch that flushes several times can therefore wait this long more than once. |
 | `batch_size` | `1000` | Maximum rows per flush. |
 | `max_flush_bytes` | `1000000` | Flush once the encoded buffer reaches this many bytes, regardless of `batch_size`. See below. |
-| `numbers_as_double` | `false` | Write every JSON number as a `DOUBLE`. See the note below. |
+| `numbers_as_double` | `true` | Write every JSON number as a `DOUBLE`, so a column holding a measurement is always a `DOUBLE` rather than taking its type from the first value that defined it. Turn it off only on a pre-created table whose every numeric field is a genuine integer. See [Numbers](#numbers). |
 | `log_rejected_payload` | `false` | Include a truncated payload in the log line for a rejected message. Off by default because a rejected payload is still user data. |
 | `verbose_logging` | `false` | Raise per-batch logs from `debug` to `info`. |
 
@@ -124,6 +127,22 @@ runtime replays that same frame from disk and latches the sender again before
 any new data can flow. Recovering means clearing the affected slot directory
 under `<sf_dir>/<sender_id>-ingest-*/`.
 
+## Connection pool
+
+The client pools connections, and the connector borrows one for each chunk it
+writes. The runtime runs one `consume()` per stream and topic pair against the
+same connector instance, so the number of borrows held at once is the number of
+topic tasks writing at that moment.
+
+`sender_pool_max` in the connect string caps the pool, and defaults to 4. Past
+the cap a borrow waits `acquire_timeout_ms`, five seconds by default, and then
+fails. The batch is lost at offsets the runtime already committed, so **set
+`sender_pool_max` to at least the number of topics this connector consumes**:
+
+```toml
+connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
+```
+
 ## Enterprise
 
 - **Multi-host failover**: list several endpoints, `addr=node-a:9000,node-b:9000`.
@@ -131,11 +150,16 @@ under `<sf_dir>/<sender_id>-ingest-*/`.
   promotion.
 - **TLS**: use `wss://` with `tls_roots` / `tls_roots_password` for a private CA.
   `tls_verify=unsafe_off` disables verification and is for controlled test
-  environments only.
+  environments only. A default build refuses it: the key needs the connector's
+  `insecure-skip-verify` feature, which is off so that a released plugin cannot
+  be redirected to another server by configuration alone.
 - **Durable ACK**: `request_durable_ack=on` in the connect string plus
-  `ack_level = "durable"`. Both are required and the connector refuses to start
-  with only one, because QuestDB rejects a durable wait that the connect string
-  did not ask for, which would fail every batch while the rows themselves landed.
+  `ack_level = "durable"`. Both are required. The connector refuses to start on
+  `ack_level = "durable"` without the connect-string key, because QuestDB rejects
+  a durable wait the connect string did not ask for, which would fail every batch
+  while the rows themselves landed. The opposite pairing starts: the key without
+  `ack_level = "durable"` asks the server for durable acknowledgement and then
+  waits only for acceptance.
   This also needs replication configured on the server: on a node without WAL
   shipping the rows are accepted but the durable watermark never advances, so no
   flush is ever acknowledged within `flush_timeout`.
@@ -167,8 +191,7 @@ since none of those can be inferred from a JSON payload.
 | JSON | QuestDB |
 | ---- | ------- |
 | string | `VARCHAR`, or `SYMBOL` / `UUID` when listed in `symbol_columns` / `uuid_columns` |
-| integer | `LONG` |
-| float | `DOUBLE` |
+| number | `DOUBLE`, or `LONG` when listed in `integer_columns` |
 | boolean | `BOOLEAN` |
 | array of numbers | `DOUBLE[]`, nesting up to 3 dimensions |
 | object | `VARCHAR` holding the JSON text |
@@ -177,12 +200,82 @@ since none of those can be inferred from a JSON payload.
 QuestDB stores only `DOUBLE` arrays, so integer arrays are widened. `BOOLEAN`
 has no null representation: an omitted boolean reads back as `false`.
 
-JSON carries a single number type, so a producer that writes `2` for a whole
-value and `2.5` for a fractional one gives the same field two different QuestDB
-types. QuestDB pins a column's type to whichever record created it and refuses
-the records that disagree, which the connector reports per record. Set
-`numbers_as_double = true` to make the type follow the column name instead.
-Integers are then stored as `DOUBLE`, which is exact only below 2^53.
+### Numbers
+
+JSON has one number type, and a serializer writes `2.0` as `2`. A field holding
+20.0 and 20.5 therefore arrives as an integer and as a float, for the same
+column. That is ordinary data, not a producer mistake, and the connector must
+not let the difference decide the column's type.
+
+**`numbers_as_double` is on by default. Every number is written as a `DOUBLE`,
+so a field that holds a measurement is always stored as a `DOUBLE`,** whatever
+its values happen to look like and however the batches fall. This is the
+guarantee the default exists to give.
+
+The cost is exactness. A `DOUBLE` carries integers exactly only up to 2^53,
+which is 9007199254740992. Below that an integer survives the round trip bit for
+bit: the conversion to a `DOUBLE` is lossless, and QuestDB coerces the value to
+the column's declared type on the way in, so a `LONG` column stores the integer.
+Above 2^53 the value is rounded in the connector, before the frame is built, so
+the column type cannot recover it. In practice:
+
+| Value | Magnitude | Safe as a `DOUBLE` |
+| ----- | --------- | ------------------ |
+| counts, row ids | up to ~9.0e15 | yes |
+| millisecond epoch | ~1.8e12 | yes |
+| microsecond epoch | ~1.8e15 | yes |
+| nanosecond epoch | ~1.8e18 | **no** |
+| snowflake id, hash | ~7e17 and up | **no** |
+
+**Name those columns in `integer_columns` and they stay `LONG`:**
+
+```toml
+numbers_as_double = true
+integer_columns = ["trade_id", "event_nanos"]
+```
+
+A whole value written as `20.0` is accepted in an `integer_columns` field, since
+JSON gives no way to tell it from `20`. A genuinely fractional value there is
+rejected per record, because rounding it would store something the producer never
+sent and sending it as a `DOUBLE` would break the type the declaration pinned.
+
+#### Turning it off
+
+`numbers_as_double = false` types each value by its own JSON shape: an integer
+becomes a `LONG` and a float a `DOUBLE`. **It forfeits the guarantee above, so a
+column holding a measurement is no longer certain to be a `DOUBLE`.** Two things
+go wrong, both driven by values the producer never meant to distinguish:
+
+- **Records are lost inside a flush window.** The client pins a column's type to
+  the first record that defines it and refuses every later record of that window
+  that disagrees. The refusal happens in the client, before anything reaches the
+  server, so an existing `DOUBLE` column does not help: that record is never
+  sent. Which shape survives depends on which one the window saw first, so the
+  same stream loses different records when the batching changes.
+- **An auto-created column can be created as the wrong type.** If the first
+  window to define a column happens to carry only whole values, the connector
+  sends a `LONG` and QuestDB creates a `LONG` column. A field that was always
+  meant to be a `DOUBLE` is then a `LONG` for the lifetime of the table.
+
+Turn it off only when both of these hold:
+
+1. **Every numeric field is a genuine integer**, so no column needs fractional
+   values at all. A field that is sometimes fractional does not qualify, even if
+   it is usually whole.
+2. **The table is pre-created with explicit column types**, so no column's type
+   is inferred from whichever values arrived first.
+
+If only the exactness matters to you, leave `numbers_as_double` on and list the
+columns in `integer_columns` instead. That keeps the guarantee for every other
+column.
+
+Across flush windows there is no type conflict either way, because QuestDB
+coerces an incoming value to the column's declared type.
+
+Both coercion directions and the rounding above 2^53 are pinned by
+`given_a_declared_table_when_consumed_should_coerce_both_number_directions` in
+`core/integration/tests/connectors/questdb/questdb_sink.rs`, against a table
+whose declared types are the opposite of what the connector sends.
 
 Every QuestDB table has a designated timestamp and the client cannot name it, so
 an auto-created table calls it `timestamp`. A payload field named `timestamp` is
@@ -192,8 +285,11 @@ Rename that field with a transform, or pre-create the table with an explicit
 `timestamp_field` is written only as the designated timestamp, never also as a
 data column.
 
-Payloads that are not JSON objects (`Raw`, `Text`, `Proto`, `FlatBuffer`,
-`Avro`) land in a single `payload` `VARCHAR` column.
+Payloads with no field structure land in a single `payload` `VARCHAR` column:
+`Raw`, `Text`, `FlatBuffer` and `Avro`, proto text that does not parse as JSON,
+and a JSON document that is an array or a scalar rather than an object. Proto
+text that holds a JSON object takes the field path instead, so its fields become
+columns.
 
 ## Delivery semantics
 
@@ -218,6 +314,30 @@ Two further rules keep a retry from duplicating data:
   well. On the row API this sink uses, a publish failure is always reported as
   not delivered, so the guard is a safeguard against a future change rather than
   a condition that fires today.
+
+Three further conditions fail a batch:
+
+- **A terminal server rejection.** The client reports one on its own thread,
+  where it cannot know which batch caused it, so the connector counts the
+  rejection and fails one batch for each. When the flush that triggered it
+  already failed, that batch is the one, and the count is not spent twice.
+- **A run of unacknowledged flushes.** One flush whose acknowledgement does not
+  arrive within `flush_timeout` is delivery lag, and the frames stay queued, so
+  it is a warning. After 10 consecutive such batches on one topic the connector
+  reports an error instead, because nothing is being committed and reporting
+  success would leave the runtime's metrics showing a healthy connector.
+- **A chunk that fails.** `batch_size` splits a runtime batch into chunks. A
+  chunk that fails permanently does not stop the ones behind it, because its
+  failure belongs to the frame it carried. A chunk that fails transiently does
+  stop them, because the connection is at fault and each remaining chunk would
+  spend its own `flush_timeout` finding that out. Their offsets and message IDs
+  are logged at `error`, since the runtime committed them already.
+
+`flush_timeout` also sets the worst-case shutdown delay. The runtime allows a
+sink five seconds to stop, and does not interrupt a flush that is already in
+progress, so a 30 second timeout can hold shutdown open for 30 seconds per
+chunk still in flight. Lower it if shutdown latency matters more than ack
+confirmation.
 
 The classification decides how a batch is reported: whether it is counted as
 failed, and how loudly it is logged. The runtime reads the return value, logs
@@ -256,8 +376,11 @@ existing `LogCallback`, or an FFI return carrying the written and rejected
 counts.
 
 Until then, **alert on the connector's logs rather than on
-`iggy_connector_errors_total`**. Every rejection is logged at `error` with the
-stream, topic, partition, offset and message ID.
+`iggy_connector_errors_total`**. A rejection is logged with the stream, topic,
+partition, offset and message ID. The first 20 of a batch are logged at `error`
+and the rest at `debug`, so that one bad producer cannot flood the error log.
+Raise the log level to `debug` to see every record of a batch that rejects more
+than 20.
 
 ### Reserved column names
 
@@ -271,12 +394,18 @@ case, as QuestDB resolves them.
 | `topic` | `include_topic_column = true`, the default |
 | `partition_id` | `include_partition_column = true` |
 | `offset` | `include_offset_column = true` |
-| `payload` | the record carries no field structure |
 | `header_<key>` | `include_headers = true` |
 
 A producer whose records carry their own `stream` or `topic` field therefore
 loses every record under the defaults. Turn the matching flag off, or rename the
 field with a transform.
+
+Two names are deliberately not reserved. `payload` is written only for a record
+with no field structure, which by definition carries no field that could collide
+with it, so a JSON field named `payload` is stored as an ordinary column.
+`timestamp` is not reserved either, because it is a valid data column on a table
+whose designated timestamp was pre-created under another name; see Timestamps
+for the auto-created case.
 
 Rejections come in three kinds, and only the first two name a record:
 
@@ -292,11 +421,10 @@ Rejections come in three kinds, and only the first two name a record:
 - **Refused by the client at write time.** Some rules are only knowable to the
   buffer. The important one is column type: QuestDB pins a column's type to
   whatever the first row defined it as, so a later record disagreeing cannot be
-  judged from that record alone. JSON has one number type, so a producer writing
-  `2` and `2.5` for the same field reaches this on ordinary data. The client
-  rolls the half-written row back before reporting the error, so the cost stays
-  at that one record and the rest of the batch is written. Set
-  `numbers_as_double = true` to stop it happening at all.
+  judged from that record alone. The client rolls the half-written row back
+  before reporting the error, so the cost stays at that one record and the rest
+  of the batch is written. The default `numbers_as_double = true` keeps mixed
+  numbers from reaching this at all.
 - **Rejected by the server, at flush.** QuestDB acknowledges and rejects whole
   frames, not rows: a rejection carries frame sequence numbers
   (`from_fsn` / `to_fsn`), not a row index. The connector reports the failure for

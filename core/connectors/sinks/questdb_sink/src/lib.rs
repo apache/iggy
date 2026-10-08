@@ -118,6 +118,8 @@ pub struct QuestDbSinkConfig {
     pub timestamp_unit: Option<String>,
     pub symbol_columns: Option<Vec<String>>,
     pub uuid_columns: Option<Vec<String>>,
+    /// Payload fields to store as `LONG` while `numbers_as_double` is on.
+    pub integer_columns: Option<Vec<String>>,
     pub include_stream_column: Option<bool>,
     pub include_topic_column: Option<bool>,
     pub include_partition_column: Option<bool>,
@@ -133,9 +135,9 @@ pub struct QuestDbSinkConfig {
     /// Off by default: a rejected payload is still user data and may carry
     /// personal or otherwise sensitive fields.
     pub log_rejected_payload: Option<bool>,
-    /// Write every JSON number as a `DOUBLE`, so a column's type follows its
-    /// name rather than whichever record defined it first. Off by default,
-    /// because it stores integers as doubles.
+    /// Write every JSON number as a `DOUBLE`, so a column holding a measurement
+    /// is always a `DOUBLE`. On by default. Name the columns that must stay
+    /// exact past 2^53 in `integer_columns` rather than turning this off.
     pub numbers_as_double: Option<bool>,
     pub verbose_logging: Option<bool>,
 }
@@ -243,6 +245,11 @@ impl QuestDbSink {
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
+            integer_columns: config
+                .integer_columns
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             timestamp_source,
             timestamp_field: config.timestamp_field,
             timestamp_unit,
@@ -251,7 +258,7 @@ impl QuestDbSink {
             include_partition_column: config.include_partition_column.unwrap_or(false),
             include_offset_column: config.include_offset_column.unwrap_or(false),
             include_headers: config.include_headers.unwrap_or(false),
-            numbers_as_double: config.numbers_as_double.unwrap_or(false),
+            numbers_as_double: config.numbers_as_double.unwrap_or(true),
         };
         if let Err(error) = validate_column_overlap(&mapping) {
             reject(error);
@@ -288,9 +295,9 @@ impl QuestDbSink {
         }
     }
 
-    /// `already_logged` is the number of rejections logged individually by
-    /// earlier chunks of the same runtime batch, so the per-batch log cap spans
-    /// the batch rather than restarting for each chunk.
+    /// `already_logged` is the number of records earlier chunks of the same
+    /// runtime batch rejected, so the per-batch log cap spans the batch rather
+    /// than restarting for each chunk.
     async fn write_batch(
         &self,
         db: Arc<QuestDb>,
@@ -321,23 +328,19 @@ impl QuestDbSink {
             };
 
             let mut outcome = BatchOutcome::default();
-            // Indices of the messages sitting in the current buffer, in the
-            // order they were appended. Only the `Drift` path rebuilds from
-            // these, and a record this mapping rejected is never among them, so
-            // a rebuild cannot replay one and fail again.
-            let mut buffered: Vec<usize> = Vec::new();
+            // How many rows are sitting in the current buffer, unflushed.
+            let mut buffered = 0usize;
             let flush_context = FlushContext {
                 id,
                 stream: &stream,
                 topic: &topic,
                 partition_id,
             };
-            for index in 0..messages.len() {
-                let message = &messages[index];
+            for message in &messages {
                 // Flush before the buffer can outgrow the QWP per-frame cap.
                 // `batch_size` bounds rows, not bytes, so a batch of wide rows
                 // would otherwise be rejected whole and lose every row in it.
-                if !buffered.is_empty() && buffer.len() >= max_flush_bytes {
+                if buffered > 0 && buffer.len() >= max_flush_bytes {
                     flush_window(
                         &mut sender,
                         &mut buffer,
@@ -346,13 +349,13 @@ impl QuestDbSink {
                         &mut outcome,
                         &flush_context,
                     )?;
-                    buffered.clear();
+                    buffered = 0;
                 }
 
                 let reason = match mapping.append_row(&mut buffer, message, context) {
                     Ok(()) => {
                         outcome.rows_written += 1;
-                        buffered.push(index);
+                        buffered += 1;
                         continue;
                     }
                     Err(RowError::Invalid(reason)) => reason,
@@ -364,40 +367,25 @@ impl QuestDbSink {
                     // on every column and symbol setter, so the buffer is still
                     // usable and only this record is lost.
                     Err(RowError::Client(error)) => error.to_string(),
-                    // The two mapping passes disagreed. That is the one case that
-                    // can leave a partial row, because `Buffer::at` refuses a
-                    // value without rolling back, so the buffer is rebuilt from
-                    // the records it accepted. Validation covers every input that
-                    // reaches `at`, which is what keeps this unreachable.
-                    Err(RowError::Drift(reason)) => {
-                        warn!(
-                            "{CONNECTOR_NAME} ID: {id} rebuilt a batch window after the mapping passes disagreed, stream: {stream}, topic: {topic}, partition_id: {partition_id}: {reason}"
+                    // `Buffer::at` refused the row without rolling it back, so
+                    // the buffer holds a partial row and nothing can remove it.
+                    // The rows already accepted are still good, so flush them
+                    // and start a fresh buffer rather than losing the window.
+                    // `Mapping::prepare_timestamp` rejects every value `at`
+                    // would refuse, which is what keeps this unreachable.
+                    Err(RowError::Unrecoverable(error)) => {
+                        // The partial row cannot be removed, and publishing the
+                        // buffer would risk carrying it along, so the whole
+                        // window goes. The rows already counted as written are
+                        // uncounted again rather than reported as delivered.
+                        error!(
+                            "{CONNECTOR_NAME} ID: {id} discarded {buffered} unflushed rows after the client refused a designated timestamp, stream: {stream}, topic: {topic}, partition_id: {partition_id}: {error}"
                         );
+                        outcome.rows_written -= buffered;
+                        outcome.rejected_rows += buffered;
+                        buffered = 0;
                         buffer = sender.new_buffer();
-                        for prior in &buffered {
-                            mapping
-                                .append_row(&mut buffer, &messages[*prior], context)
-                                .map_err(|error| {
-                                    FlushError::publishing(match error {
-                                        RowError::Client(error) => error,
-                                        RowError::Invalid(reason) | RowError::Drift(reason) => {
-                                            rebuild_failed(&reason)
-                                        }
-                                    })
-                                })?;
-                        }
-                        if !buffered.is_empty() {
-                            flush_window(
-                                &mut sender,
-                                &mut buffer,
-                                ack_level,
-                                flush_timeout,
-                                &mut outcome,
-                                &flush_context,
-                            )?;
-                            buffered.clear();
-                        }
-                        rebuild_failed(&reason).to_string()
+                        error.to_string()
                     }
                 };
 
@@ -407,7 +395,7 @@ impl QuestDbSink {
                 // survives. Log the identity needed to find the message,
                 // one line per record rather than a batch summary.
                 outcome.rejected_rows += 1;
-                if already_logged + outcome.rejected_rows <= MAX_LOGGED_REJECTIONS_PER_BATCH {
+                if should_log_rejection(already_logged, outcome.rejected_rows) {
                     let payload = if log_payload {
                         format!(", payload: {}", payload_preview(&message.payload))
                     } else {
@@ -417,11 +405,20 @@ impl QuestDbSink {
                         "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}{payload}",
                         message.offset, message.id
                     );
+                } else {
+                    // Past the cap the line drops to `debug` rather than
+                    // disappearing. The record is unrecoverable either way, so
+                    // an operator tracing a bad producer still needs its
+                    // identity, while `error` stays bounded for alerting.
+                    debug!(
+                        "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}",
+                        message.offset, message.id
+                    );
                 }
                 outcome.last_rejection = Some(reason);
             }
 
-            if !buffered.is_empty() {
+            if buffered > 0 {
                 flush_window(
                     &mut sender,
                     &mut buffer,
@@ -440,6 +437,42 @@ impl QuestDbSink {
                 Error::CannotStoreData(format!("blocking flush task failed: {error}"))
             })?
             .map_err(|error| self.map_client_error(error))
+    }
+
+    /// Takes one token from the terminal-rejection count, if the handler left
+    /// one. Returns whether a token was taken.
+    fn spend_server_rejection(&self) -> bool {
+        self.server_rejections
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    /// Names the messages a transient failure left unattempted.
+    ///
+    /// Their offsets are already committed and the runtime does not replay a
+    /// failed batch (#2927), so this line is the only record that they existed.
+    fn log_abandoned(
+        &self,
+        topic_metadata: &TopicMetadata,
+        partition_id: u32,
+        abandoned: &[ConsumedMessage],
+    ) {
+        let (Some(first), Some(last)) = (abandoned.first(), abandoned.last()) else {
+            return;
+        };
+        error!(
+            "{CONNECTOR_NAME} ID: {} abandoned {} messages without a write attempt after a transient failure, stream: {}, topic: {}, partition_id: {partition_id}, offsets: [{}, {}], message_ids: [{}, {}]",
+            self.id,
+            abandoned.len(),
+            topic_metadata.stream,
+            topic_metadata.topic,
+            first.offset,
+            last.offset,
+            first.id,
+            last.id
+        );
     }
 
     fn map_client_error(&self, failure: FlushError) -> Error {
@@ -474,17 +507,29 @@ impl Sink for QuestDbSink {
         if uses_tls {
             ensure_crypto_provider();
         }
-        // A connect string that disables verification is a test convenience, so
-        // say so once rather than letting a production deployment carry it
-        // silently.
+        // A connect string that disables verification is a test convenience, and
+        // the client only honours it when this crate was built with the
+        // `insecure-skip-verify` feature. Say which of the two applies rather
+        // than letting a production deployment carry it silently, or letting a
+        // default build fail with the client's generic configuration error.
         if connection_string
             .to_ascii_lowercase()
             .contains("tls_verify=unsafe_off")
         {
-            warn!(
-                "{CONNECTOR_NAME} ID: {} has TLS certificate verification disabled through tls_verify=unsafe_off; use this only against a test server",
-                self.id
-            );
+            if cfg!(feature = "insecure-skip-verify") {
+                warn!(
+                    "{CONNECTOR_NAME} ID: {} has TLS certificate verification disabled through tls_verify=unsafe_off; use this only against a test server",
+                    self.id
+                );
+            } else {
+                return Err(Error::InvalidConfigValue(
+                    "the connection string sets tls_verify=unsafe_off, which this build of \
+                     the connector does not accept; rebuild it with the \
+                     insecure-skip-verify feature if a test server with a self-signed \
+                     certificate needs it"
+                        .to_owned(),
+                ));
+            }
         }
         // Durable acks are refused outright unless the connect string asks the
         // server for them, so a config that sets one without the other fails
@@ -524,8 +569,14 @@ impl Sink for QuestDbSink {
         .map_err(|error| Error::InitError(format!("cannot connect to QuestDB: {}", error)))?;
         self.db = Some(Arc::new(db));
         info!(
-            "Opened {CONNECTOR_NAME} connector ID: {}, table: {}, ack_level: {:?}",
-            self.id, self.mapping.table, self.ack_level
+            "Opened {CONNECTOR_NAME} connector ID: {}, table: {}, ack_level: {:?}, numbers_as_double: {}, symbol_columns: {:?}, uuid_columns: {:?}, integer_columns: {:?}",
+            self.id,
+            self.mapping.table,
+            self.ack_level,
+            self.mapping.numbers_as_double,
+            self.mapping.symbol_columns.iter().collect::<Vec<_>>(),
+            self.mapping.uuid_columns.iter().collect::<Vec<_>>(),
+            self.mapping.integer_columns.iter().collect::<Vec<_>>()
         );
         if self.ack_level == AckLevel::Durable {
             // A node without WAL shipping accepts the rows and simply never
@@ -573,10 +624,11 @@ impl Sink for QuestDbSink {
         }
 
         let mut total = BatchOutcome::default();
+        let mut failure: Option<Error> = None;
         while !messages.is_empty() {
             let take = self.batch_size.min(messages.len());
             let batch: Vec<ConsumedMessage> = messages.drain(..take).collect();
-            let outcome = self
+            match self
                 .write_batch(
                     Arc::clone(db),
                     batch,
@@ -584,8 +636,29 @@ impl Sink for QuestDbSink {
                     messages_metadata.partition_id,
                     total.rejected_rows,
                 )
-                .await?;
-            total.merge(outcome);
+                .await
+            {
+                Ok(outcome) => total.merge(outcome),
+                Err(error) => {
+                    // Returning here would discard every chunk still queued
+                    // behind this one, at offsets the runtime committed before
+                    // `consume` ran (#2928). A permanent failure belongs to the
+                    // frame that carried it, so the chunks behind it are still
+                    // worth attempting. A transient one is a connection fault,
+                    // so they would fail the same way and each would spend its
+                    // own `flush_timeout` doing it.
+                    let transient = matches!(error, Error::CannotStoreData(_));
+                    failure.get_or_insert(error);
+                    if transient {
+                        self.log_abandoned(
+                            topic_metadata,
+                            messages_metadata.partition_id,
+                            &messages,
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         if total.rejected_rows > 0 {
@@ -598,7 +671,7 @@ impl Sink for QuestDbSink {
         }
         if total.rejected_rows > MAX_LOGGED_REJECTIONS_PER_BATCH {
             error!(
-                "{CONNECTOR_NAME} ID: {} did not log {} of those rejections individually",
+                "{CONNECTOR_NAME} ID: {} logged {} of those rejections at debug level only, to keep the error log bounded",
                 self.id,
                 total.rejected_rows - MAX_LOGGED_REJECTIONS_PER_BATCH
             );
@@ -635,25 +708,30 @@ impl Sink for QuestDbSink {
         // healthy connector while nothing is being committed. Escalate so the
         // error counter moves; the rows stay queued either way, and the runtime
         // does not replay a failed batch, so nothing is lost by saying so.
+        if let Some(error) = failure {
+            // The flush that failed reported its own rejection, and the handler
+            // counted the same one. Spend that token here so it does not go on
+            // to fail a second batch for a rejection already reported.
+            self.spend_server_rejection();
+            return Err(error);
+        }
         // A terminal rejection reported through the handler has to fail a batch.
         // The handler runs on the client's thread and cannot know which batch
         // caused it, so this counts them and spends one per batch. A flag would
         // collapse several rejections into one failure when batches for
-        // different topics run at the same time.
-        if self
-            .server_rejections
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(Error::CannotStoreData(format!(
+        // different topics run at the same time. The count stays per instance
+        // rather than per topic, because the handler sees a connection and a
+        // frame range and has no way to name the topic that filled it; a
+        // rejection raised with no flush error therefore fails whichever
+        // topic's batch observes it next.
+        if self.spend_server_rejection() {
+            return Err(Error::PermanentHttpError(format!(
                 "{CONNECTOR_NAME} ID: {}: QuestDB terminally rejected a frame from this connector; the preceding log line carries the category and the frame range",
                 self.id
             )));
         }
         if should_escalate_stall(stalled) {
-            return Err(Error::CannotStoreData(format!(
+            return Err(Error::PermanentHttpError(format!(
                 "{CONNECTOR_NAME} ID: {}: the last {stalled} batches were flushed without QuestDB acknowledging them at ack_level {:?}; the frames are queued but nothing is being committed",
                 self.id, self.ack_level
             )));
@@ -666,12 +744,17 @@ impl Sink for QuestDbSink {
             // Dropping the pool drains what it still holds, bounded by the
             // connect string's `close_flush_timeout`, and discards the rest.
             //
-            // There is no useful wait to add here. `borrow_sender` hands back a
-            // fresh lease, and a wait on a lease observes only the frames that
-            // lease published, so it returns at once and proves nothing about
-            // the frames earlier batches left queued. Set `sf_dir` in the
-            // connect string for a tail that survives both the drain window and
-            // a restart; the README says so under Store-and-forward.
+            // There is no useful wait to add here. `borrow_sender` rebases the
+            // new lease onto the connection's current published frame number,
+            // so a wait on it returns at once and proves nothing about the
+            // frames earlier batches left queued. The drop is the drain:
+            // `Drop for QuestDb` walks every idle store-and-forward connection
+            // under one shared `close_flush_timeout` deadline. What it cannot
+            // deliver it reports through the `log` crate, which the connectors
+            // runtime does not bridge, so that warning never reaches an
+            // operator. Set `sf_dir` in the connect string for a tail that
+            // survives both the drain window and a restart; the README says so
+            // under Store-and-forward.
             if let Err(error) = tokio::task::spawn_blocking(move || drop(db)).await {
                 warn!(
                     "{CONNECTOR_NAME} ID: {} close task failed: {error}",
@@ -748,23 +831,29 @@ fn parse_ack_level(raw: Option<&str>) -> Option<AckLevel> {
     }
 }
 
-/// A column cannot be both a `SYMBOL` and a `UUID`, and neither can double as
-/// the designated timestamp. Catching it here beats a per-row failure later.
+/// A column has one type. It cannot be two of `SYMBOL`, `UUID` and `LONG`, and
+/// none of them can double as the designated timestamp. Catching it here beats a
+/// per-row failure later.
 fn validate_column_overlap(mapping: &Mapping) -> Result<(), Error> {
-    if let Some(column) = mapping
-        .symbol_columns
-        .iter()
-        .find(|column| mapping.uuid_columns.contains(column))
-    {
-        return Err(Error::InvalidConfigValue(format!(
-            "column {column} is listed in both symbol_columns and uuid_columns"
-        )));
+    let lists = [
+        ("symbol_columns", &mapping.symbol_columns),
+        ("uuid_columns", &mapping.uuid_columns),
+        ("integer_columns", &mapping.integer_columns),
+    ];
+    for (index, (name, columns)) in lists.iter().enumerate() {
+        for (other_name, other) in &lists[index + 1..] {
+            if let Some(column) = columns.iter().find(|column| other.contains(column)) {
+                return Err(Error::InvalidConfigValue(format!(
+                    "column {column} is listed in both {name} and {other_name}"
+                )));
+            }
+        }
     }
     if let Some(field) = mapping.timestamp_field.as_deref()
-        && (mapping.symbol_columns.contains(field) || mapping.uuid_columns.contains(field))
+        && let Some((name, _)) = lists.iter().find(|(_, columns)| columns.contains(field))
     {
         return Err(Error::InvalidConfigValue(format!(
-            "timestamp_field {field} cannot also be a symbol or uuid column"
+            "timestamp_field {field} cannot also be listed in {name}"
         )));
     }
     Ok(())
@@ -804,6 +893,16 @@ impl FlushError {
             error,
         }
     }
+}
+
+/// Whether this rejection still fits the batch's `error` budget.
+///
+/// `already_logged` carries the rejections of earlier chunks of the same runtime
+/// batch, so the budget spans the batch rather than restarting for each chunk.
+/// Past it the record is logged at `debug` instead, which bounds the error log
+/// without losing the record's identity.
+fn should_log_rejection(already_logged: usize, rejected_in_chunk: usize) -> bool {
+    already_logged + rejected_in_chunk <= MAX_LOGGED_REJECTIONS_PER_BATCH
 }
 
 /// Whether a run of unacknowledged batches has gone on long enough to report.
@@ -907,15 +1006,6 @@ fn report_server_rejection(id: u32, rejections: &Arc<AtomicU64>, error: &QwpWsSe
     }
 }
 
-/// A rebuilt window hit an error the original append did not, which means the
-/// two passes disagree and the batch can no longer be trusted.
-fn rebuild_failed(reason: &str) -> questdb::Error {
-    questdb::Error::new(
-        ErrorCode::InvalidApiCall,
-        format!("rebuilding a batch window after a rejection failed: {reason}"),
-    )
-}
-
 /// A `wait` that timed out without the server advancing its watermark.
 ///
 /// The frames are already in the publication log, and the client keeps
@@ -961,6 +1051,11 @@ fn is_retryable(code: ErrorCode, in_doubt: bool) -> bool {
             | ErrorCode::ServerFlushError
             | ErrorCode::ServerInternalError
             | ErrorCode::CouldNotResolveAddr
+            // A full symbol dictionary belongs to one connection. The frame is
+            // refused before any byte reaches the wire and the buffer is rolled
+            // back, and returning the sender retires that connection, so the
+            // next batch borrows a fresh one and succeeds.
+            | ErrorCode::SymbolDictFull
     )
 }
 
@@ -977,6 +1072,7 @@ mod tests {
             timestamp_unit: None,
             symbol_columns: None,
             uuid_columns: None,
+            integer_columns: None,
             include_stream_column: None,
             include_topic_column: None,
             include_partition_column: None,
@@ -1032,6 +1128,24 @@ mod tests {
     }
 
     #[test]
+    fn given_rejections_spread_over_chunks_when_deciding_should_cap_across_the_batch() {
+        // The budget spans the runtime batch, so a later chunk inherits what the
+        // earlier ones spent rather than starting over.
+        assert!(should_log_rejection(0, 1));
+        assert!(should_log_rejection(0, MAX_LOGGED_REJECTIONS_PER_BATCH));
+        assert!(!should_log_rejection(
+            0,
+            MAX_LOGGED_REJECTIONS_PER_BATCH + 1
+        ));
+        assert!(should_log_rejection(MAX_LOGGED_REJECTIONS_PER_BATCH - 1, 1));
+        assert!(!should_log_rejection(
+            MAX_LOGGED_REJECTIONS_PER_BATCH - 1,
+            2
+        ));
+        assert!(!should_log_rejection(MAX_LOGGED_REJECTIONS_PER_BATCH, 1));
+    }
+
+    #[test]
     fn given_a_run_of_unacknowledged_batches_when_deciding_should_escalate_at_the_threshold() {
         assert!(!should_escalate_stall(0));
         assert!(!should_escalate_stall(
@@ -1062,31 +1176,28 @@ mod tests {
 
     #[test]
     fn given_a_multibyte_boundary_when_previewing_should_not_split_a_character() {
-        // The cut lands inside a multi-byte character, so the walk has to step
-        // back to a boundary rather than slicing a char in half.
-        let text = "é".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES);
+        // Three bytes per character puts the boundaries on multiples of three.
+        // The cut is at 512, which is not one of them, so the walk has to step
+        // back rather than slicing a character in half. A two-byte character
+        // would not test this: every boundary would be even, and so is the cut.
+        assert_ne!(
+            REJECTED_PAYLOAD_PREVIEW_BYTES % "€".len(),
+            0,
+            "the cut has to land inside a character for this test to mean anything"
+        );
+        let text = "€".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES);
         let preview = payload_preview(&Payload::Text(text));
-        assert!(preview.contains('é'));
+        assert!(preview.contains('€'));
+        assert!(
+            preview.starts_with(&"€".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES / "€".len())),
+            "the preview keeps every whole character before the cut"
+        );
     }
 
     #[test]
     fn given_a_binary_payload_when_previewing_should_report_the_byte_count_only() {
         let preview = payload_preview(&Payload::Raw(vec![0xff, 0xfe, 0xfd]));
         assert_eq!(preview, "<3 bytes>");
-    }
-
-    #[test]
-    fn given_zero_flush_timeout_when_consuming_should_reach_the_flush_unchanged() {
-        // The fire-and-forget branch in `flush_window` tests the value it is
-        // handed, so anything that rewrites the timeout on the way in silences
-        // it. An earlier version floored the value just above zero for a batch
-        // deadline, which made the branch unreachable and turned every window
-        // into a one-millisecond wait that reported a stall.
-        let mut config = config();
-        config.flush_timeout = Some("0s".to_owned());
-        let sink = QuestDbSink::new(1, config);
-        assert_eq!(sink.flush_timeout, Duration::ZERO);
-        assert!(sink.init_error.is_none());
     }
 
     #[tokio::test]
@@ -1135,6 +1246,22 @@ mod tests {
         assert!(matches!(sink.open().await, Err(Error::InitError(_))));
     }
 
+    #[cfg(not(feature = "insecure-skip-verify"))]
+    #[tokio::test]
+    async fn given_the_tls_bypass_without_the_feature_when_opened_should_fail() {
+        // The default build must not accept a connect string that would skip
+        // certificate verification, and must say why rather than reporting the
+        // client's generic configuration error.
+        let mut config = config();
+        config.connection_string =
+            SecretString::from("wss::addr=localhost:9000;tls_verify=unsafe_off;");
+        let mut sink = QuestDbSink::new(1, config);
+        let Err(Error::InvalidConfigValue(message)) = sink.open().await else {
+            panic!("a default build must refuse tls_verify=unsafe_off");
+        };
+        assert!(message.contains("insecure-skip-verify"), "{message}");
+    }
+
     #[tokio::test]
     async fn given_unsupported_transport_when_opened_should_fail() {
         // The sink is QWP-only. An ILP connect string parses but must not be
@@ -1142,7 +1269,15 @@ mod tests {
         let mut config = config();
         config.connection_string = SecretString::from("http::addr=localhost:9000;");
         let mut sink = QuestDbSink::new(1, config);
-        assert!(matches!(sink.open().await, Err(Error::InitError(_))));
+        let Err(Error::InitError(message)) = sink.open().await else {
+            panic!("an ILP connect string must not be accepted");
+        };
+        // Without this the test would pass on a failed dial to a free port,
+        // which reports the same variant.
+        assert!(
+            message.contains("QWP/WebSocket"),
+            "the error must name the protocol the sink requires: {message}"
+        );
     }
 
     #[tokio::test]
@@ -1218,6 +1353,40 @@ mod tests {
     }
 
     #[test]
+    fn given_minimal_config_when_constructed_should_write_numbers_as_doubles() {
+        // The default has to be the one that does not depend on where the flush
+        // boundary fell, so a mixed-number producer loses nothing.
+        let sink = QuestDbSink::new(1, config());
+        assert!(sink.mapping.numbers_as_double);
+    }
+
+    #[test]
+    fn given_a_column_in_two_type_lists_when_constructed_should_record_init_error() {
+        // A column has one type, so overlapping declarations are a config error
+        // rather than a per-record failure forever.
+        for (first, second) in [
+            ("symbol_columns", "uuid_columns"),
+            ("symbol_columns", "integer_columns"),
+            ("uuid_columns", "integer_columns"),
+        ] {
+            let mut config = config();
+            for name in [first, second] {
+                let list = Some(vec!["trade_id".to_owned()]);
+                match name {
+                    "symbol_columns" => config.symbol_columns = list,
+                    "uuid_columns" => config.uuid_columns = list,
+                    _ => config.integer_columns = list,
+                }
+            }
+            let sink = QuestDbSink::new(1, config);
+            assert!(
+                matches!(sink.init_error, Some(Error::InvalidConfigValue(_))),
+                "{first} and {second} must not be allowed to overlap"
+            );
+        }
+    }
+
+    #[test]
     fn given_timestamp_field_also_listed_as_symbol_when_constructed_should_record_init_error() {
         let mut config = config();
         config.timestamp_source = Some("payload".to_owned());
@@ -1281,6 +1450,8 @@ mod tests {
             timestamp_source = "payload"
             timestamp_field = "ts"
             symbol_columns = ["symbol", "side"]
+            integer_columns = ["trade_id"]
+            numbers_as_double = false
             batch_size = 500
         "#;
         let config: QuestDbSinkConfig = toml::from_str(raw).unwrap();
@@ -1289,6 +1460,8 @@ mod tests {
         assert_eq!(sink.batch_size, 500);
         assert_eq!(sink.mapping.table, "trades");
         assert!(sink.mapping.symbol_columns.contains("side"));
+        assert!(sink.mapping.integer_columns.contains("trade_id"));
+        assert!(!sink.mapping.numbers_as_double);
     }
 
     #[test]
