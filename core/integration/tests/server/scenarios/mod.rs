@@ -33,6 +33,7 @@ pub mod consumer_timestamp_polling_scenario;
 pub mod cross_protocol_pat_scenario;
 pub mod delete_stats_rollback_scenario;
 pub mod encryption_scenario;
+pub mod external_group_offsets_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;

@@ -34,6 +34,7 @@ public sealed partial class TcpMessageStream
     internal const int MAX_POLL_CONNECTIONS = 256;
     private const int PollRoutingRetryIntervalMs = 50;
     private const int ConsumerSessionSize = 32;
+    private const int ConsumerSessionEpochOffset = 16;
     private const int ConsumerSessionWatermarkOffset = 24;
 
     private readonly object _pollRoutingGate = new();
@@ -140,7 +141,7 @@ public sealed partial class TcpMessageStream
 
             if (slot.Connection is null)
             {
-                var connection = await ConnectPollConnectionAsync(route.Endpoint, deadline, token);
+                var connection = await ConnectPollConnectionAsync(route, token);
                 lock (_pollRoutingGate)
                 {
                     if (slot.Retired || _disposed)
@@ -157,7 +158,13 @@ public sealed partial class TcpMessageStream
             if (slot.Attachment is null || !slot.Attachment.AsSpan().SequenceEqual(route.Attachment))
             {
                 using var attached = await SendPollExchangeAsync(slot.Connection,
-                    CommandCodes.ATTACH_CONSUMER_SESSION_CODE, route.Attachment, deadline, token);
+                    CommandCodes.BIND_SESSION_CODE,
+                    LoginRegister.SerializeBindSession(route.Attachment, _consensusSession.BindSecret), deadline, token);
+                var binding = LoginRegister.Deserialize(attached.Memory.Span);
+                if (binding.Session != BinaryPrimitives.ReadUInt64LittleEndian(route.Attachment.AsSpan(ConsumerSessionEpochOffset)))
+                {
+                    throw VsrError.Exception(VsrError.INVALID_FORMAT, "BindSession reply carried a different session epoch.");
+                }
                 slot.Attachment = route.Attachment;
             }
 
@@ -275,7 +282,7 @@ public sealed partial class TcpMessageStream
         var generation = _consensusSession.Generation;
         var session = _consensusSession.Resolve(VsrOperation.NonReplicated);
         var clientId = BinaryPrimitives.ReadUInt128LittleEndian(attachment);
-        var epoch = BinaryPrimitives.ReadUInt64LittleEndian(attachment.AsSpan(16));
+        var epoch = BinaryPrimitives.ReadUInt64LittleEndian(attachment.AsSpan(ConsumerSessionEpochOffset));
         if (clientId != session.ClientId || epoch != session.SessionId || epoch == 0)
         {
             throw PollNotAccepted();
@@ -323,10 +330,9 @@ public sealed partial class TcpMessageStream
         return attempt.Response!;
     }
 
-    private async Task<VsrConnection> ConnectPollConnectionAsync(string endpoint, long deadline, CancellationToken token)
+    private async Task<VsrConnection> ConnectPollConnectionAsync(PollRoute route, CancellationToken token)
     {
-        var credentials = _rememberedLogin ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
-            "Primary polling requires the credentials of the authenticated coordinator.");
+        var endpoint = route.Endpoint;
         if (!ServerAddress.TryParse(endpoint, out var host, out var port))
         {
             throw new InvalidBaseAddressException();
@@ -354,17 +360,11 @@ public sealed partial class TcpMessageStream
                 ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, dialCancellation.Token)
                 : new NetworkStream(socket, true);
             socket = null;
-            var session = new ConsensusSession();
+            var session = new ConsensusSession(BinaryPrimitives.ReadUInt128LittleEndian(route.Attachment),
+                BinaryPrimitives.ReadUInt64LittleEndian(route.Attachment.AsSpan(ConsumerSessionEpochOffset)),
+                _consensusSession.BindSecret);
             connection = new VsrConnection(stream, session, _configuration.MaxResponseFrameSize,
                 VsrRequestTimeoutMs, dropped => dropped.Dispose(), _logger);
-            var useToken = !string.IsNullOrEmpty(credentials.PersonalAccessToken);
-            var body = useToken
-                ? LoginRegister.SerializeWithPersonalAccessToken(credentials.PersonalAccessToken)
-                : LoginRegister.Serialize(credentials.Username, credentials.Password);
-            using var response = await SendPollExchangeAsync(connection,
-                useToken ? CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE : CommandCodes.LOGIN_REGISTER_CODE,
-                body, deadline, token);
-            session.Bind(LoginRegister.Deserialize(response.Memory.Span).Session);
             return connection;
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
@@ -427,7 +427,7 @@ public sealed partial class TcpMessageStream
         }
     }
 
-    private void RefreshPollCredentials(Identifier user, string? username, string? password)
+    private void RefreshRememberedCredentials(Identifier user, string? username, string? password)
     {
         lock (_pollRoutingGate)
         {

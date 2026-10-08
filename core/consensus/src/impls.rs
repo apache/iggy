@@ -39,9 +39,29 @@ use server_common::Message;
 use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::time::Duration;
+
+#[derive(Clone)]
+pub struct LoopbackNotifier(Rc<dyn Fn()>);
+
+impl LoopbackNotifier {
+    pub fn new(notify: impl Fn() + 'static) -> Self {
+        Self(Rc::new(notify))
+    }
+
+    fn notify(&self) {
+        self.0();
+    }
+}
+
+impl std::fmt::Debug for LoopbackNotifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LoopbackNotifier")
+    }
+}
 
 /// Injected time source for primary-stamped prepare timestamps.
 ///
@@ -72,6 +92,18 @@ impl ConsensusClock {
 
     fn realtime(&self) -> IggyTimestamp {
         self.0.realtime()
+    }
+}
+
+#[cfg(test)]
+pub struct FixedClock(pub u64);
+
+#[cfg(test)]
+impl Clock for FixedClock {
+    type Realtime = IggyTimestamp;
+
+    fn realtime(&self) -> Self::Realtime {
+        IggyTimestamp::from(self.0)
     }
 }
 
@@ -174,7 +206,7 @@ pub const PREPARE_QUEUE_CEILING: usize = DVC_HEADERS_MAX - 1;
 pub const PROBE_ATTEMPTS_MAX: u32 = 5;
 
 /// Maximum number of clients tracked in the clients table.
-/// When exceeded, the client with the oldest committed request is evicted.
+/// New sessions are refused at capacity; ended sessions retain protection until retirement.
 pub const CLIENTS_TABLE_MAX: usize = 8192;
 
 /// Default live dedup entries per PARTITION consensus group.
@@ -185,9 +217,14 @@ pub const CLIENTS_TABLE_MAX: usize = 8192;
 /// `[partition] dedup_clients_max` default by a bootstrap assert.
 pub const PARTITION_DEDUP_CLIENTS_MAX: usize = 4096;
 
+/// Admission order on one partition owner. It is never replicated or recovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalRequestOrder(pub NonZeroU64);
+
 #[derive(Debug)]
 pub struct PipelineEntry {
     pub header: PrepareHeader,
+    pub local_order: Option<LocalRequestOrder>,
     /// Bitmap of replicas that have acknowledged this prepare.
     pub ok_from_replicas: BitSet<u32>,
     /// Whether we've received a quorum of `prepare_ok` messages.
@@ -205,6 +242,7 @@ impl PipelineEntry {
     pub fn new(header: PrepareHeader) -> Self {
         Self {
             header,
+            local_order: None,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
             reply_sender: None,
@@ -229,6 +267,7 @@ impl PipelineEntry {
     pub fn with_sender(header: PrepareHeader, sender: Sender<Message<ReplyHeader>>) -> Self {
         Self {
             header,
+            local_order: None,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
             reply_sender: Some(sender),
@@ -281,6 +320,7 @@ pub struct AutoCommitRequestContext {
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
+    pub local_order: Option<LocalRequestOrder>,
     /// Automatic commit context owned by this entry until promotion or removal.
     auto_commit: Option<AutoCommitRequestContext>,
     /// Offset writes must not cross a reset of the owner's message history.
@@ -379,6 +419,7 @@ impl RequestEntry {
         Self {
             auto_commit: None,
             consumer_offset_history: None,
+            local_order: None,
             message,
             received_at: 0,
             reply_sender,
@@ -416,6 +457,51 @@ where
     pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
         entry.received_at = self.clock_realtime_micros();
         self.pipeline.borrow_mut().push_request(entry)
+    }
+}
+
+impl<B, P> VsrConsensus<B, P>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    #[must_use]
+    pub fn retry_capacity(&self, table: &crate::ClientTable) -> usize {
+        if table.capacity_committed() {
+            return table.capacity();
+        }
+        self.pipeline
+            .borrow()
+            .head()
+            .filter(|entry| entry.header.retry_capacity != 0)
+            .map_or_else(
+                || table.capacity(),
+                |entry| entry.header.retry_capacity as usize,
+            )
+    }
+
+    /// Both queues own reservations. Clearing or refusing an entry releases it
+    /// automatically, and a commit replaces its reservation with live protection.
+    #[must_use]
+    pub fn has_retry_capacity(&self, table: &crate::ClientTable, client: u128) -> bool {
+        if table.contains(client) || message_bus::is_auto_commit_client(client) {
+            return true;
+        }
+        let capacity = self.retry_capacity(table);
+        let pipeline = self.pipeline.borrow();
+        // Queue lengths bound distinct reservations without scanning either queue.
+        if pipeline.len() + pipeline.request_queue_len() < capacity.saturating_sub(table.count()) {
+            return true;
+        }
+        let pending: HashSet<_> = pipeline
+            .pending_client_ids()
+            .filter(|candidate| {
+                *candidate != 0
+                    && !message_bus::is_auto_commit_client(*candidate)
+                    && !table.contains(*candidate)
+            })
+            .collect();
+        pending.contains(&client) || table.count() + pending.len() < capacity
     }
 }
 
@@ -538,6 +624,23 @@ impl LocalPipeline {
     }
 
     #[must_use]
+    pub const fn request_queue_capacity(&self) -> usize {
+        self.request_queue_max
+    }
+
+    /// Rebuilt entries have no local marker and precede new local requests.
+    #[must_use]
+    pub fn has_request_before(&self, order: LocalRequestOrder) -> bool {
+        self.prepare_queue
+            .iter()
+            .any(|entry| entry.local_order.is_none_or(|admitted| admitted < order))
+            || self
+                .request_queue
+                .iter()
+                .any(|entry| entry.local_order.is_none_or(|admitted| admitted < order))
+    }
+
+    #[must_use]
     pub fn request_queue_full(&self) -> bool {
         self.request_queue.len() >= self.request_queue_max
     }
@@ -562,6 +665,15 @@ impl LocalPipeline {
     /// Pop request-queue head. Called when a prepare commits and frees a slot.
     pub fn pop_request(&mut self) -> Option<RequestEntry> {
         self.request_queue.pop_front()
+    }
+
+    pub fn pending_requests(&self) -> impl Iterator<Item = &RequestEntry> {
+        self.request_queue.iter()
+    }
+
+    #[must_use]
+    pub fn request_head(&self) -> Option<&RequestEntry> {
+        self.request_queue.front()
     }
 
     /// True iff `prepare_queue` is full (NOT including `request_queue`).
@@ -728,24 +840,6 @@ impl LocalPipeline {
                 .any(|r| r.message.header().client == client)
     }
 
-    /// True if either queue already holds this exact `(client, request)`.
-    ///
-    /// The partition-plane in-flight check. Narrower than
-    /// [`Self::has_message_from_client`] on purpose: the partition pipeline is
-    /// depth-`prepare_queue_depth` by design, so blocking every concurrent
-    /// request from one client would serialize it to one in-flight write per
-    /// group. Only an exact replay needs absorbing.
-    #[must_use]
-    pub fn has_message_from_client_request(&self, client: u128, request: u64) -> bool {
-        self.prepare_queue
-            .iter()
-            .any(|p| p.header.client == client && p.header.request == request)
-            || self.request_queue.iter().any(|r| {
-                let header = r.message.header();
-                header.client == client && header.request == request
-            })
-    }
-
     /// Verify pipeline invariants.
     ///
     /// # Panics
@@ -807,8 +901,43 @@ impl LocalPipeline {
 }
 
 impl Pipeline for LocalPipeline {
+    fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)> {
+        self.prepare_queue
+            .iter()
+            .find(|entry| entry.header.client == client_id)
+            .map(|entry| {
+                (
+                    entry.header.session,
+                    entry.header.request,
+                    entry.header.operation,
+                )
+            })
+            .or_else(|| {
+                self.request_queue
+                    .iter()
+                    .find(|entry| entry.message.header().client == client_id)
+                    .map(|entry| {
+                        let header = entry.message.header();
+                        (header.session, header.request, header.operation)
+                    })
+            })
+    }
     type Entry = PipelineEntry;
     type Request = RequestEntry;
+
+    fn pending_client_ids(&self) -> impl Iterator<Item = u128> {
+        self.prepare_queue
+            .iter()
+            .map(|entry| entry.header.client)
+            .chain(
+                self.request_queue
+                    .iter()
+                    .map(|entry| entry.message.header().client),
+            )
+    }
 
     fn push(&mut self, entry: Self::Entry) {
         Self::push(self, entry);
@@ -866,10 +995,6 @@ impl Pipeline for LocalPipeline {
         Self::has_message_from_client(self, client_id)
     }
 
-    fn has_message_from_client_request(&self, client_id: u128, request: u64) -> bool {
-        Self::has_message_from_client_request(self, client_id, request)
-    }
-
     fn cancel_all_subscribers(&mut self) {
         Self::cancel_all_subscribers(self);
     }
@@ -884,6 +1009,10 @@ impl Pipeline for LocalPipeline {
 
     fn pop_request(&mut self) -> Option<Self::Request> {
         Self::pop_request(self)
+    }
+
+    fn request_head(&self) -> Option<&Self::Request> {
+        Self::request_head(self)
     }
 
     fn request_queue_len(&self) -> usize {
@@ -1158,6 +1287,7 @@ where
 
     message_bus: B,
     loopback_queue: RefCell<VecDeque<Message<GenericHeader>>>,
+    loopback_notifier: RefCell<Option<LoopbackNotifier>>,
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
     /// Consecutive unanswered `RequestStartView` probes while Recovering;
@@ -1169,6 +1299,7 @@ where
     /// `[cluster] view_probe_attempts_max`. The simulator and tests keep the
     /// built-in default.
     probe_attempts_max: Cell<u32>,
+    recovery_election_allowed: Cell<bool>,
 
     /// This replica's own uncommitted suffix, with the head, commit point and
     /// mutation count the journal was at when it was read.
@@ -1555,9 +1686,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             prepare_queue_max,
             message_bus,
             loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
+            loopback_notifier: RefCell::new(None),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
+            recovery_election_allowed: Cell::new(true),
             local_dvc_suffix: RefCell::new(None),
             journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
@@ -1632,6 +1765,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// run before `init` / `init_as_backup`.
     pub fn set_probe_attempts_max(&self, max: u32) {
         self.probe_attempts_max.set(max);
+    }
+
+    pub fn set_recovery_election_allowed(&self, allowed: bool) {
+        self.recovery_election_allowed.set(allowed);
+    }
+
+    #[must_use]
+    pub const fn recovery_election_allowed(&self) -> bool {
+        self.recovery_election_allowed.get()
     }
 
     pub fn init(&self) {
@@ -1971,14 +2113,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.pipeline.borrow().has_message_from_client(client_id)
     }
 
-    /// True iff this exact `(client, request)` is already in flight. The
-    /// partition plane's in-flight dedup: absorbs a replay without serializing
-    /// a client's pipeline depth.
     #[must_use]
-    pub fn pipeline_has_message_from_client_request(&self, client_id: u128, request: u64) -> bool {
-        self.pipeline
-            .borrow()
-            .has_message_from_client_request(client_id, request)
+    pub fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)> {
+        self.pipeline.borrow().pending_request(client_id)
     }
 
     /// Header of the oldest in-flight prepare.
@@ -2031,7 +2171,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Stops the timer on an empty pipeline; otherwise restarts it so it times
     /// the current oldest entry from now. Exposed for the plane-side drains that
-    /// pop through [`Pipeline`] directly (`drain_committable_prefix`) rather than
+    /// pop through [`Pipeline`] directly rather than
     /// through [`Self::pop_committed_prepare`].
     pub fn sync_prepare_timeout(&self) {
         let empty = self.pipeline.borrow().is_empty();
@@ -2199,6 +2339,25 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         sender: Sender<Message<ReplyHeader>>,
     ) {
         let entry = PipelineEntry::with_sender(*message.header(), sender);
+        self.push_prepare_entry(plane, message, entry);
+    }
+
+    /// Preserve local admission order when a queued request becomes a prepare.
+    ///
+    /// # Panics
+    /// If not primary, as with other pipeline insertion methods.
+    pub fn pipeline_message_with_order(
+        &self,
+        plane: PlaneKind,
+        message: &Message<PrepareHeader>,
+        sender: Option<Sender<Message<ReplyHeader>>>,
+        order: Option<LocalRequestOrder>,
+    ) {
+        let mut entry = sender.map_or_else(
+            || PipelineEntry::new(*message.header()),
+            |sender| PipelineEntry::with_sender(*message.header(), sender),
+        );
+        entry.local_order = order;
         self.push_prepare_entry(plane, message, entry);
     }
 
@@ -2489,6 +2648,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
     pub fn tick(&self, plane: PlaneKind) -> Vec<VsrAction> {
+        self.tick_with_history_fence(plane, false)
+    }
+
+    /// Timers and retransmissions continue while storage leases defer history changes.
+    pub fn tick_with_history_fence(
+        &self,
+        plane: PlaneKind,
+        history_fenced: bool,
+    ) -> Vec<VsrAction> {
         let mut actions = Vec::new();
         let mut timeouts = self.timeouts.borrow_mut();
 
@@ -2496,7 +2664,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         timeouts.tick();
 
         // Phase 2: Handle fired timeouts
-        if timeouts.fired(TimeoutKind::NormalHeartbeat) {
+        if !history_fenced && timeouts.fired(TimeoutKind::NormalHeartbeat) {
             drop(timeouts);
             actions.extend(self.handle_normal_heartbeat_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
@@ -2526,7 +2694,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
-        if timeouts.fired(TimeoutKind::RequestStartViewMessage) {
+        if !history_fenced && timeouts.fired(TimeoutKind::RequestStartViewMessage) {
             drop(timeouts);
             // Two probers share this timeout, both asking "resend me the
             // current StartView":
@@ -2549,9 +2717,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     // rejoined journal-less elects on equal terms and stands
                     // on its recovered durable state. Any still-live settled
                     // primary answers well before the fallback fires.
-                    let attempts = self.probe_attempts.get() + 1;
+                    let attempts = self.probe_attempts.get().saturating_add(1);
                     self.probe_attempts.set(attempts);
-                    if attempts >= self.probe_attempts_max.get() {
+                    if attempts >= self.probe_attempts_max.get()
+                        && self.recovery_election_allowed.get()
+                    {
                         // Nobody answered: full-cluster bootstrap, so there
                         // is no live primary to fetch state from. Local
                         // recovery is authoritative; abandon the transfer
@@ -2599,7 +2769,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
-        if timeouts.fired(TimeoutKind::ViewChangeStatus) {
+        if !history_fenced && timeouts.fired(TimeoutKind::ViewChangeStatus) {
             drop(timeouts);
             actions.extend(self.handle_view_change_status_timeout(plane));
             // timeouts = self.timeouts.borrow_mut(); // Not needed if last
@@ -4091,22 +4261,25 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
-    /// Enqueue a self-addressed message for processing in the next loopback drain.
-    ///
-    /// Only `PrepareOk` reaches here (via `send_or_loopback`), and deliberately:
-    /// it is a message to a peer that happens to be this replica, so a one-drain
-    /// delay costs nothing. A replica's own SVC/DVC is not that shape -- it is the
-    /// local decision to change view, recorded synchronously with the view and
-    /// status writes in [`Self::enter_view_change`]. Routing it here instead would
-    /// leave a window where the replica has entered a view change without counting
-    /// itself, which on a solo group is the entire quorum.
+    /// Enqueue a self-ack for the next owner service round.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
-        assert!(
-            self.loopback_queue.borrow().len() < self.prepare_queue_max,
-            "loopback queue overflow: {} items",
-            self.loopback_queue.borrow().len()
-        );
-        self.loopback_queue.borrow_mut().push_back(message);
+        let notify = {
+            let mut queue = self.loopback_queue.borrow_mut();
+            assert!(
+                queue.len() < self.prepare_queue_max,
+                "loopback queue overflow: {} items",
+                queue.len()
+            );
+            let was_empty = queue.is_empty();
+            queue.push_back(message);
+            was_empty
+        };
+        if notify {
+            let notifier = self.loopback_notifier.borrow().clone();
+            if let Some(notifier) = notifier {
+                notifier.notify();
+            }
+        }
     }
 
     /// Drain all pending loopback messages into `buf`, leaving the queue empty.
@@ -4114,6 +4287,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// The caller must dispatch each drained message to the appropriate handler.
     pub fn drain_loopback_into(&self, buf: &mut Vec<Message<GenericHeader>>) {
         buf.extend(self.loopback_queue.borrow_mut().drain(..));
+    }
+
+    /// Registers existing work as well as future empty-to-nonempty edges.
+    pub fn set_loopback_notifier(&self, notifier: Option<LoopbackNotifier>) {
+        self.loopback_notifier.borrow_mut().clone_from(&notifier);
+        if self.has_loopback()
+            && let Some(notifier) = notifier
+        {
+            notifier.notify();
+        }
+    }
+
+    #[must_use]
+    pub fn has_loopback(&self) -> bool {
+        !self.loopback_queue.borrow().is_empty()
     }
 
     /// Send a message to `target`, routing self-addressed messages through the loopback queue.
@@ -4223,6 +4411,7 @@ where
                 parent: consensus.last_prepare_checksum(),
                 request_checksum: old.request_checksum,
                 request: old.request,
+                session: old.session,
                 commit: consensus.commit_max.get(),
                 op,
                 timestamp,
@@ -4399,7 +4588,9 @@ mod fresh_group_start_tests {
 
 #[cfg(test)]
 mod request_queue_tests {
+    use super::test_bus::NoopBus;
     use super::*;
+    use crate::client_table::{ClientTable, ClientTableMode};
     use iggy_binary_protocol::{Command, Operation};
     use iggy_common::ConsumerKind;
     use server_common::poll::AutoCommitReservationToken;
@@ -4422,6 +4613,59 @@ mod request_queue_tests {
             ..RoutedRequestHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_pending_clients_when_checking_capacity_should_reserve_distinct_unprotected_clients() {
+        const CAPACITY: usize = 3;
+        let mut table = ClientTable::with_mode(CAPACITY, ClientTableMode::PartitionSlice);
+        table.commit_capacity(CAPACITY).unwrap();
+        table.commit_request(1, 1, 1, 1).unwrap();
+        let consensus = VsrConsensus::new(1, 0, 1, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        assert!(consensus.has_retry_capacity(&table, 2));
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.push(PipelineEntry::new(PrepareHeader {
+                client: 2,
+                op: 1,
+                ..PrepareHeader::default()
+            }));
+            for client in [0, message_bus::AUTO_COMMIT_CLIENT_ID, 1, 2] {
+                pipeline
+                    .push_request(RequestEntry::new(make_request(client, 1)))
+                    .unwrap();
+            }
+        });
+        assert!(
+            consensus.has_retry_capacity(&table, 3),
+            "only client 2 reserves a new slot"
+        );
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline
+                .push_request(RequestEntry::new(make_request(3, 1)))
+                .unwrap();
+        });
+        assert!(
+            !consensus.has_retry_capacity(&table, 4),
+            "both queues must reserve capacity"
+        );
+        assert!(
+            consensus.has_retry_capacity(&table, 1),
+            "committed protection is reusable"
+        );
+        assert!(
+            consensus.has_retry_capacity(&table, 2),
+            "a pending client already owns its reservation"
+        );
+        consensus.with_pipeline_mut(LocalPipeline::clear_request_queue);
+        assert!(
+            consensus.has_retry_capacity(&table, 3),
+            "queue reset must release its reservations"
+        );
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the prepare reservation must survive queue reset"
+        );
     }
 
     #[test]
@@ -4817,18 +5061,6 @@ mod timestamp_clamp_tests {
 
     use super::*;
     use crate::LocalPipeline;
-
-    /// Clock frozen at a fixed instant, standing in for a lagging wall
-    /// clock on a freshly elected primary.
-    struct FixedClock(u64);
-
-    impl clock::Clock for FixedClock {
-        type Realtime = IggyTimestamp;
-
-        fn realtime(&self) -> Self::Realtime {
-            IggyTimestamp::from(self.0)
-        }
-    }
 
     use crate::test_bus::{NoopBus, make_start_view};
 
@@ -5452,7 +5684,7 @@ mod vsr_consensus_tests {
             panic!("the settled primary must answer the backup's probe: {replies:?}");
         };
         assert_eq!(*target, Some(REJOINING_REPLICA));
-        assert!(suffix.is_empty());
+        assert_eq!(suffix.as_slice(), []);
         let response = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
             .transmute_header(|_, header: &mut StartViewHeader| {
                 header.command = Command::StartView;
@@ -5634,7 +5866,6 @@ mod vsr_consensus_tests {
         consensus.pipeline_message(PlaneKind::Metadata, message);
     }
 
-    use crate::drain_committable_prefix;
     use iggy_binary_protocol::Operation;
 
     /// Clock frozen at a fixed instant, so a stamp read off it is assertable.
@@ -5694,8 +5925,7 @@ mod vsr_consensus_tests {
         // Committing the head leaves op 2 in flight, so the timer stays armed --
         // now measuring op 2 rather than carrying op 1's elapsed ticks.
         consensus.advance_commit_max(1);
-        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
-        // As real callers do, per entry: the next drain starts at the op now owed.
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 1);
         consensus.advance_commit_min(1);
         assert!(
             prepare_ticking(&consensus),
@@ -5703,7 +5933,7 @@ mod vsr_consensus_tests {
         );
 
         consensus.advance_commit_max(2);
-        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 2);
         consensus.advance_commit_min(2);
         assert!(
             !prepare_ticking(&consensus),

@@ -108,11 +108,13 @@ pub struct MetadataConfig {
     /// restore the previous value to recover.
     pub journal_slots: usize,
 
-    /// Slot count of the VSR client table: how many distinct clients
-    /// (TCP/QUIC/WS virtual clients and HTTP sessions together) hold live
-    /// session state before the oldest-committed entry is evicted. The
-    /// HTTP session cap tracks this at half, so raising it lifts
-    /// both.
+    /// Initial capacity of the metadata session registry, shared by binary
+    /// clients and HTTP sessions. Live and unretired sessions occupy slots;
+    /// a full registry refuses new sessions instead of evicting retry protection.
+    /// The first committed operation fixes this capacity. Changing configuration
+    /// does not resize an existing registry, including after restart or transfer.
+    /// The HTTP cache cap uses half the configured value, but cannot raise the
+    /// committed registry limit.
     pub clients_table_max: usize,
 
     /// Cap on the partitions of all streams and topics. A CreateTopic or

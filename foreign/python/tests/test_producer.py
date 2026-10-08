@@ -78,7 +78,7 @@ def spawn_restartable_server(
             "IGGY_LOGGING_LEVEL": "error",
         }
     )
-    with (data_path / "server.log").open("ab") as server_log:
+    with data_path.with_suffix(".log").open("ab") as server_log:
         return subprocess.Popen(  # noqa: S603
             [str(SERVER_BINARY), "--with-default-root-credentials"],
             cwd=REPOSITORY_ROOT,
@@ -109,7 +109,7 @@ async def discover_server_address(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            server_log = (data_path / "server.log").read_text(errors="replace")
+            server_log = data_path.with_suffix(".log").read_text(errors="replace")
             raise RuntimeError(
                 f"Restartable Iggy server exited with code {process.returncode}:\n"
                 f"{server_log[-4_000:]}"
@@ -1466,51 +1466,60 @@ class TestProducerValidationAndRetries:
             await producer.shutdown()
 
     @pytest.mark.asyncio
-    async def test_custom_retry_interval_paces_later_retries(
+    async def test_terminal_error_does_not_wait_for_custom_retry_interval(
         self, iggy_client: IggyClient, unique_name
     ):
+        stream = unique_name()
+        topic = unique_name()
         producer = await iggy_client.producer(
-            unique_name(),
-            unique_name(),
+            stream,
+            topic,
             send_retries=2,
-            send_retry_interval=timedelta(milliseconds=150),
+            send_retry_interval=timedelta(seconds=5),
         )
         try:
-            started_at = time.monotonic()
-            with pytest.raises(RuntimeError):
-                await producer.send_to(
-                    unique_name(), unique_name(), [SendMessage("paced retries")]
-                )
-            elapsed = time.monotonic() - started_at
-
-            assert elapsed >= 0.1
-        finally:
-            await producer.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_default_retry_policy_retains_the_rust_interval(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        producer = await iggy_client.producer(unique_name(), unique_name())
-        try:
-            started_at = time.monotonic()
-            with pytest.raises(RuntimeError):
+            with pytest.raises(ProducerSendError) as raised:
                 await asyncio.wait_for(
                     producer.send_to(
-                        unique_name(), unique_name(), [SendMessage("default retries")]
+                        unique_name(), unique_name(), [SendMessage("terminal failure")]
                     ),
-                    timeout=6,
+                    timeout=1,
                 )
-            elapsed = time.monotonic() - started_at
-
-            # The first retry is immediate. Three retries with the one-second
-            # default wait for two later interval ticks.
-            assert elapsed >= 1.5
+            assert raised.value.committed == []
+            assert len(raised.value.failed) == 1
+            await producer.send(raised.value.failed)
+            assert await wait_for_payloads(
+                iggy_client, stream, topic, ["terminal failure"]
+            ) == ["terminal failure"]
         finally:
             await producer.shutdown()
 
     @pytest.mark.asyncio
-    async def test_background_write_retries_until_a_destination_appears(
+    async def test_terminal_error_ignores_default_retry_budget(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        stream = unique_name()
+        topic = unique_name()
+        producer = await iggy_client.producer(stream, topic)
+        try:
+            with pytest.raises(ProducerSendError) as raised:
+                await asyncio.wait_for(
+                    producer.send_to(
+                        unique_name(), unique_name(), [SendMessage("terminal failure")]
+                    ),
+                    timeout=1,
+                )
+            assert raised.value.committed == []
+            assert len(raised.value.failed) == 1
+            await producer.send(raised.value.failed)
+            assert await wait_for_payloads(
+                iggy_client, stream, topic, ["terminal failure"]
+            ) == ["terminal failure"]
+        finally:
+            await producer.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_background_terminal_error_does_not_wait_for_destination_creation(
         self, iggy_client: IggyClient, unique_name
     ):
         destination_stream = unique_name("retry-stream-", min_bytes=24, max_bytes=24)
@@ -1523,7 +1532,7 @@ class TestProducerValidationAndRetries:
                 batch_length=1,
             ),
             send_retries=10,
-            send_retry_interval=timedelta(milliseconds=100),
+            send_retry_interval=timedelta(seconds=5),
         )
         try:
             response = await producer.send_to(
@@ -1533,14 +1542,19 @@ class TestProducerValidationAndRetries:
             )
             assert response.confirmations == []
 
-            # The first retry is immediate. Create the destination before a
-            # later interval tick so the worker can recover asynchronously.
-            await asyncio.sleep(0.03)
-            await iggy_client.create_stream(destination_stream)
-            await iggy_client.create_topic(destination_stream, destination_topic, 1)
+            await asyncio.wait_for(producer.shutdown(), timeout=1)
         finally:
             await producer.shutdown()
 
+        await iggy_client.create_stream(destination_stream)
+        await iggy_client.create_topic(destination_stream, destination_topic, 1)
+        assert (
+            await poll_payloads(iggy_client, destination_stream, destination_topic)
+            == []
+        )
+        retry = await iggy_client.producer(destination_stream, destination_topic)
+        async with retry:
+            await retry.send_one(SendMessage("eventual destination"))
         assert await wait_for_payloads(
             iggy_client,
             destination_stream,

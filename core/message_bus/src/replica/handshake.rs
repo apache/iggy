@@ -36,8 +36,8 @@
 //! cannot MAC one id and announce another), but the MAC key is a single
 //! cluster-wide PSK-derived subkey, not a per-replica key, so any PSK
 //! holder can mint a valid MAC for any (smaller) replica id - there is
-//! no anti-Sybil guarantee. With auth disabled the acceptor stays in
-//! legacy mode: the `ReplicaHello` id is trusted unverified.
+//! no anti-Sybil guarantee. With auth disabled the `ReplicaHello` id is
+//! trusted unverified after the build-identity check.
 //!
 //! Enabling auth is a coordinated-restart change, and not the only one:
 //! the consensus `cluster_id` is derived from the cluster name
@@ -83,6 +83,7 @@ use tracing::{debug, warn};
 /// `Rc`-shared clones are cheap.
 #[derive(Clone)]
 pub struct ReplicaHandshakeCtx {
+    pub binary_identity: [u8; auth::IDENTITY_LEN],
     pub cluster_id: u128,
     pub self_id: u8,
     pub replica_count: u8,
@@ -113,23 +114,22 @@ pub struct ReplicaTlsCtx {
 }
 
 /// Run the acceptor half on a delegated inbound stream and return the
-/// verified peer id.
+/// compatible peer id.
 ///
-/// Reads the 256 B `ReplicaHello` frame, enforces command + cluster
-/// match and the directional rule, then (when `auth` is configured)
-/// runs the acceptor side of the mutual MAC handshake with `binding`
+/// Reads the 256 B `ReplicaHello` frame, enforces command, cluster and
+/// build-identity matches and the directional rule, then (when `auth` is
+/// configured) runs the acceptor side of the mutual MAC handshake with `binding`
 /// folded into every MAC (the TLS exporter on a TLS link, see
-/// [`ChannelBinding`]). With `auth = None` the acceptor stays in legacy
-/// mode and returns the announced id unverified.
+/// [`ChannelBinding`]). With `auth = None` it sends a build-identity
+/// challenge and returns the announced id without authenticating it.
 ///
 /// The dialer (the peer) holds the strictly lower id; this acceptor
 /// holds the higher id (see the directional rule). The transcript
 /// therefore binds `dialer_id = peer_id`, `acceptor_id = self_id`.
 ///
-/// On a rejection an authenticated, still-waiting dialer is answered
-/// with a nonzero-status `build_challenge_message` (see `reject`) so
-/// it learns the cause from its own logs rather than seeing a bare
-/// connection close.
+/// Command, cluster, build-identity and direction rejections send a
+/// nonzero-status `ReplicaChallenge`, including when auth is disabled.
+/// Missing-nonce and post-challenge failures close without a response.
 ///
 /// # Errors
 ///
@@ -149,10 +149,8 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let header = msg.header();
     let peer_id = header.replica;
     let has_nonce = auth::has_nonce(&header.reserved_command);
-    // Only a peer that sent a nonce speaks the authenticated protocol and is
-    // waiting to read our response; a legacy (no-nonce) dialer delegates its
-    // fd without reading, so a reject frame would land in its VSR reader instead.
-    let nackable = auth.is_some() && has_nonce;
+    // Modern peers read the build-gate response even with auth disabled.
+    // Legacy unauthenticated peers discard the challenge in consensus dispatch.
 
     if header.command != Command::ReplicaHello {
         return reject(
@@ -161,7 +159,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::UnknownCommand,
-            nackable,
+            true,
         )
         .await;
     }
@@ -172,7 +170,20 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::ClusterMismatch,
-            nackable,
+            true,
+        )
+        .await;
+    }
+    if header.reserved_command[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+        != ctx.binary_identity
+    {
+        return reject(
+            stream,
+            our_cluster,
+            self_id,
+            peer_id,
+            HandshakeStatus::IncompatibleBuild,
+            true,
         )
         .await;
     }
@@ -186,19 +197,24 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
             self_id,
             peer_id,
             HandshakeStatus::DirectionalRule,
-            nackable,
+            true,
         )
         .await;
     }
 
     let Some(auth) = auth else {
+        framing::write_message(
+            stream,
+            with_identity(
+                build_challenge_message(our_cluster, self_id, HandshakeStatus::Ok, None),
+                &ctx.binary_identity,
+            ),
+        )
+        .await?;
         return Ok(peer_id);
     };
 
     if !has_nonce {
-        // Auth is enabled and enforced: a legacy (no-nonce) peer is rejected.
-        // No reject frame: a legacy dialer delegates its fd without reading a
-        // response.
         return reject(
             stream,
             our_cluster,
@@ -213,6 +229,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let nonce_d = auth::read_nonce(&header.reserved_command);
     let nonce_a = auth::random_nonce()?;
     let transcript = Transcript {
+        binary_identity: ctx.binary_identity,
         cluster_id: our_cluster,
         dialer_id: peer_id,
         acceptor_id: self_id,
@@ -223,11 +240,14 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let mac_a = auth.acceptor_mac(&transcript);
     framing::write_message(
         stream,
-        build_challenge_message(
-            our_cluster,
-            self_id,
-            HandshakeStatus::Ok,
-            Some((&nonce_a, &mac_a)),
+        with_identity(
+            build_challenge_message(
+                our_cluster,
+                self_id,
+                HandshakeStatus::Ok,
+                Some((&nonce_a, &mac_a)),
+            ),
+            &ctx.binary_identity,
         ),
     )
     .await?;
@@ -238,7 +258,13 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     // reject here is log-only (no frame).
     // Check the command before the MAC: the finish frame is identified by its
     // own discriminant, not by handshake position.
-    if finish.header().command != Command::ReplicaFinish {
+    if finish.header().command != Command::ReplicaFinish
+        || finish.header().cluster != our_cluster
+        || finish.header().replica != peer_id
+        || finish.header().reserved_command
+            [auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+            != ctx.binary_identity
+    {
         return reject(
             stream,
             our_cluster,
@@ -268,9 +294,9 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
 ///
 /// Logs and returns `Err(())` on any failure; the caller drops the
 /// stream and the shard-0 periodic sweep retries once the pending-dial
-/// entry clears. With `auth = None` it sends a single plaintext
-/// `ReplicaHello`. `binding` is folded into every MAC; both ends must
-/// derive it from the same channel (see [`ChannelBinding`]).
+/// entry clears. With `auth = None` it sends `ReplicaHello` and waits
+/// for a compatible build-identity challenge. `binding` is folded into every
+/// MAC; both ends must derive it from the same channel (see [`ChannelBinding`]).
 ///
 /// The dialer holds the strictly lower id, the acceptor the higher; the
 /// transcript binds `dialer_id = self_id`, `acceptor_id = peer_id`. If
@@ -291,23 +317,22 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
 ) -> Result<(), ()> {
     let cluster_id = ctx.cluster_id;
     let self_id = ctx.self_id;
-    let Some(auth) = ctx.auth.as_deref() else {
-        let hello = build_hello_message(cluster_id, self_id, None);
-        if let Err(e) = framing::write_message(stream, hello).await {
-            warn!(replica = peer_id, "handshake write failed: {e}");
-            return Err(());
-        }
-        return Ok(());
-    };
-
-    let nonce_d = match auth::random_nonce() {
+    let auth = ctx.auth.as_deref();
+    let nonce_d = match if auth.is_some() {
+        auth::random_nonce()
+    } else {
+        Ok([0; auth::NONCE_LEN])
+    } {
         Ok(nonce) => nonce,
         Err(e) => {
             warn!(replica = peer_id, "nonce generation failed: {e}");
             return Err(());
         }
     };
-    let hello = build_hello_message(cluster_id, self_id, Some(&nonce_d));
+    let hello = with_identity(
+        build_hello_message(cluster_id, self_id, auth.map(|_| &nonce_d)),
+        &ctx.binary_identity,
+    );
     if let Err(e) = framing::write_message(stream, hello).await {
         warn!(replica = peer_id, "handshake write failed: {e}");
         return Err(());
@@ -339,9 +364,25 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
         );
         return Err(());
     }
+    if challenge.header().cluster != cluster_id
+        || challenge.header().replica != peer_id
+        || challenge.header().reserved_command
+            [auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+            != ctx.binary_identity
+    {
+        warn!(
+            replica = peer_id,
+            "incompatible replica identity in handshake response"
+        );
+        return Err(());
+    }
+    let Some(auth) = auth else {
+        return Ok(());
+    };
     let nonce_a = auth::read_nonce(&challenge.header().reserved_command);
     let mac_a = auth::read_mac(&challenge.header().reserved_command);
     let transcript = Transcript {
+        binary_identity: ctx.binary_identity,
         cluster_id,
         dialer_id: self_id,
         acceptor_id: peer_id,
@@ -357,8 +398,14 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
         return Err(());
     }
     let mac_d = auth.dialer_mac(&transcript);
-    if let Err(e) =
-        framing::write_message(stream, build_finish_message(cluster_id, self_id, &mac_d)).await
+    if let Err(e) = framing::write_message(
+        stream,
+        with_identity(
+            build_finish_message(cluster_id, self_id, &mac_d),
+            &ctx.binary_identity,
+        ),
+    )
+    .await
     {
         warn!(replica = peer_id, "handshake finish write failed: {e}");
         return Err(());
@@ -368,10 +415,11 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
 
 /// Log a rejected handshake with its `reason` and, when `nack` is set, send a
 /// best-effort reject [`build_challenge_message`] (a `ReplicaChallenge` with a
-/// nonzero status and no nonce/MAC) so an authenticated, still-waiting dialer
-/// learns the cause. `nack` is false for legacy (no-nonce) and post-challenge
-/// rejects, whose peer is not reading a response (a frame would reach its VSR
-/// reader instead). Always returns `Err` so callers `return`.
+/// nonzero status and no nonce/MAC) so a waiting dialer learns the cause.
+/// Early validation rejects send a frame even to legacy unauthenticated
+/// peers, whose consensus dispatch safely discards the unexpected challenge.
+/// Missing-nonce and post-challenge rejects set `nack` to false.
+/// Always returns `Err` so callers `return`.
 #[allow(clippy::future_not_send, clippy::similar_names)]
 async fn reject<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
@@ -431,8 +479,8 @@ fn build_challenge_message(
 
 /// Build a `ReplicaHello` frame announcing this replica's id and `cluster_id`.
 /// When `nonce_d` is set it is placed in `reserved_command[0..32]` to open
-/// the authenticated handshake; otherwise the frame is the legacy plaintext
-/// announce.
+/// the authenticated handshake; otherwise the caller adds only the build
+/// identity for the unauthenticated exchange.
 fn build_hello_message(
     cluster_id: u128,
     replica_id: u8,
@@ -470,4 +518,86 @@ fn build_finish_message(
                 .copy_from_slice(mac_d);
         },
     )
+}
+
+fn with_identity(
+    message: Message<GenericHeader>,
+    identity: &[u8; auth::IDENTITY_LEN],
+) -> Message<GenericHeader> {
+    message.transmute_header(|old, new: &mut GenericHeader| {
+        *new = old;
+        new.reserved_command[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+            .copy_from_slice(identity);
+    })
+}
+
+/// Protocol, release and storage identity, independent of executable packaging.
+#[must_use]
+pub fn binary_identity(release: &str, storage_format: &[u8]) -> [u8; auth::IDENTITY_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key("apache.iggy replica identity v2");
+    hasher.update(&iggy_binary_protocol::IGGY_PROTOCOL_VERSION.to_le_bytes());
+    hasher.update(&(release.len() as u64).to_le_bytes());
+    hasher.update(release.as_bytes());
+    hasher.update(&(storage_format.len() as u64).to_le_bytes());
+    hasher.update(storage_format);
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::binary_identity;
+    use std::io::Write;
+    use std::process::Command;
+
+    #[test]
+    fn given_identical_release_when_executable_bytes_differ_should_keep_peer_identity() {
+        const OUTPUT_ENV: &str = "IGGY_TEST_PEER_IDENTITY_OUTPUT";
+        const RELEASE: &str = "test-release";
+        let identity = binary_identity(RELEASE, b"test-storage");
+        if let Some(output) = std::env::var_os(OUTPUT_ENV) {
+            std::fs::write(output, identity).unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("identity-probe");
+        let output = directory.path().join("identity");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        // Trailing bytes change the artifact digest without changing the ELF program.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&executable)
+            .unwrap()
+            .write_all(b"different packaging")
+            .unwrap();
+        let probe = Command::new(executable)
+            .args([
+                "--exact",
+                "replica::handshake::tests::given_identical_release_when_executable_bytes_differ_should_keep_peer_identity",
+            ])
+            .env(OUTPUT_ENV, &output)
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "identity probe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(
+            std::fs::read(output).unwrap(),
+            identity,
+            "packaging bytes must not make compatible replicas reject each other"
+        );
+    }
+
+    #[test]
+    fn given_different_release_or_storage_when_identifying_peers_should_reject_mixing() {
+        let identity = binary_identity("release-1", b"storage-1");
+        assert_ne!(identity, binary_identity("release-2", b"storage-1"));
+        assert_ne!(identity, binary_identity("release-1", b"storage-2"));
+        assert_ne!(
+            binary_identity("release", b"-storage"),
+            binary_identity("release-", b"storage")
+        );
+    }
 }

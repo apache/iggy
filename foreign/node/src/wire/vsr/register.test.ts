@@ -19,49 +19,76 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   deserializeLoginRegister,
+  BIND_SECRET_BYTES,
   IGGY_PROTOCOL_VERSION,
+  serializeBindSession,
   serializeLoginRegister,
   serializeLoginRegisterWithPat
 } from './register.js';
 
+const BIND_SECRET = Buffer.alloc(BIND_SECRET_BYTES, 0x5a);
+
 describe('VSR register payloads', () => {
   it('encodes protocol, SDK, credentials, and empty context', () => {
-    const body = serializeLoginRegister('iggy', 'secret', '0.8.1-edge.3');
+    const body = serializeLoginRegister('iggy', 'secret', '0.8.1-edge.3', BIND_SECRET);
     assert.equal(body.readUInt32LE(0), IGGY_PROTOCOL_VERSION);
     assert.match(body.toString('utf8'), /node-sdk/);
     assert.match(body.toString('utf8'), /0\.8\.1-edge\.3/);
     assert.match(body.toString('utf8'), /iggy/);
     assert.match(body.toString('utf8'), /secret/);
+    const secretOffset = 4 + 1 + Buffer.byteLength('node-sdk')
+      + 1 + Buffer.byteLength('0.8.1-edge.3');
+    assert.deepEqual(body.subarray(secretOffset, secretOffset + BIND_SECRET_BYTES), BIND_SECRET);
     assert.equal(body.readUInt32LE(body.length - 4), 0);
   });
 
   it('uses UTF-8 byte lengths and enforces one-byte bounds', () => {
-    const body = serializeLoginRegister('żółw', 'hasło', '版本');
+    const body = serializeLoginRegister('żółw', 'hasło', '版本', BIND_SECRET);
     assert.equal(body.readUInt8(4), Buffer.byteLength('node-sdk'));
     assert.match(body.toString('utf8'), /żółw/);
     assert.throws(
-      () => serializeLoginRegister('', 'secret', '1.0.0'),
+      () => serializeLoginRegister('', 'secret', '1.0.0', BIND_SECRET),
       /1\.\.255 bytes/
     );
     assert.throws(
-      () => serializeLoginRegister('x'.repeat(256), 'secret', '1.0.0'),
+      () => serializeLoginRegister('x'.repeat(256), 'secret', '1.0.0', BIND_SECRET),
       /1\.\.255 bytes/
     );
     const maximum = serializeLoginRegister(
       'x'.repeat(255),
       'secret',
-      '1.0.0'
+      '1.0.0',
+      BIND_SECRET
     );
     assert.match(maximum.toString('utf8'), /x{255}/);
   });
 
   it('encodes PAT registration and rejects oversized tokens', () => {
-    const body = serializeLoginRegisterWithPat('token', '0.8.1-edge.3');
+    const body = serializeLoginRegisterWithPat('token', '0.8.1-edge.3', BIND_SECRET);
     assert.match(body.toString('utf8'), /token/);
     assert.throws(
-      () => serializeLoginRegisterWithPat('x'.repeat(256), '0.8.1-edge.3'),
+      () => serializeLoginRegisterWithPat('x'.repeat(256), '0.8.1-edge.3', BIND_SECRET),
       /token exceeds/
     );
+    const secretOffset = 4 + 1 + Buffer.byteLength('node-sdk')
+      + 1 + Buffer.byteLength('0.8.1-edge.3');
+    assert.deepEqual(body.subarray(secretOffset, secretOffset + BIND_SECRET_BYTES), BIND_SECRET);
+    assert.equal(body.readUInt32LE(body.length - 4), 0);
+  });
+
+  it('encodes version, shared identity and proof and rejects invalid bounds', () => {
+    const identity = Buffer.alloc(32);
+    identity.writeBigUInt64LE(42n, 16);
+    const body = serializeBindSession(identity, '1.0.0', BIND_SECRET);
+    assert.equal(body.readUInt32LE(0), IGGY_PROTOCOL_VERSION);
+    assert.deepEqual(body.subarray(-64, -32), identity);
+    assert.deepEqual(body.subarray(-32), BIND_SECRET);
+    for (const length of [0, 31, 33]) {
+      assert.throws(() => serializeBindSession(Buffer.alloc(length), '1.0.0', BIND_SECRET),
+        /identity must be 32/);
+      assert.throws(() => serializeLoginRegister('iggy', 'iggy', '1.0.0', Buffer.alloc(length)),
+        /secret must be 32/);
+    }
   });
 
   it('decodes a complete login response', () => {

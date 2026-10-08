@@ -143,6 +143,52 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
     }
 
+    /// Move the physical append point over a reserved offset gap.
+    /// The complete preceding chain must already be durably checkpointed.
+    ///
+    /// # Errors
+    /// Returns an error for an uncheckpointed tail, a regressing offset, or a failed barrier.
+    pub async fn reanchor_segment_storage(&mut self, next_offset: u64) -> io::Result<()> {
+        self.ensure_healthy()?;
+        let mut segments = self
+            .state
+            .segment_storage
+            .ok_or_else(|| invalid("segment storage is not enabled"))?;
+        if self.state.checkpoint != self.state.head || self.durable_head != self.state.head {
+            return Err(invalid("cannot reanchor an uncheckpointed segment tail"));
+        }
+        if next_offset < segments.tail.position.next_offset {
+            return Err(invalid(
+                "reserved segment offset regresses the physical tail",
+            ));
+        }
+        if next_offset == segments.tail.position.next_offset {
+            return Ok(());
+        }
+        segments.reset_position(SegmentPosition {
+            start_offset: next_offset,
+            length: 0,
+            next_offset,
+        })?;
+        let state = JournalState {
+            segment_storage: Some(segments),
+            ..self.state
+        };
+        self.poisoned = true;
+        self.open_segment_file(
+            segments.tail.generation,
+            next_offset,
+            0,
+            self.preallocate_segments.then_some(segments.max_size),
+        )
+        .await?;
+        self.publish(state).await?;
+        self.state = state;
+        self.retain_active_segment_file();
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub fn segment_reference(&self, header: &PrepareHeader) -> Option<SegmentReference> {
         if !self.contains(header) {
             return None;
@@ -229,7 +275,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             ));
         }
         if self.preallocate_segments {
-            installed_file.preallocate(&cursor.path(&self.directory), max_size);
+            installed_file
+                .preallocate(&cursor.path(&self.directory), max_size)
+                .await;
         }
         let checkpoint_prepare = if let Some(prepare) = prepare {
             let header = self.validate_checkpoint_prepare(&prepare)?;
@@ -541,9 +589,19 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 ));
             }
             if length > cursor.position.length {
+                tracing::warn!(
+                    group = self.state.group,
+                    incarnation = self.state.incarnation,
+                    start_offset = cursor.position.start_offset,
+                    durable_bytes = cursor.position.length,
+                    discarded_bytes = length - cursor.position.length,
+                    "discarding unpublished segment bytes beyond the durable WAL frontier"
+                );
                 file.truncate(cursor.position.length).await?;
+                self.segment_files_dirty = true;
                 if self.preallocate_segments {
-                    file.preallocate(&cursor.path(&self.directory), segments.max_size);
+                    file.preallocate(&cursor.path(&self.directory), segments.max_size)
+                        .await;
                 }
             }
             self.sync_segment_files().await?;
@@ -628,44 +686,47 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if self.segment_files.contains_key(&key) {
             return Ok(());
         }
-        let parent = self.segment_directory()?.to_path_buf();
         let retained = segment_path(&self.directory, generation, start_offset);
+        if self.storage.exists(&retained).await? {
+            let file = self.storage.open(&retained, OpenMode::ReadWrite).await?;
+            self.segment_files.insert(key, file);
+            return Ok(());
+        }
+        let parent = self.segment_directory()?.to_path_buf();
         let public = parent.join(format!("{start_offset:020}.log"));
-        let file = if self.storage.exists(&retained).await? {
-            self.storage.open(&retained, OpenMode::ReadWrite).await?
+        if length == 0
+            && self.storage.exists(&public).await?
+            && self
+                .storage
+                .open(&public, OpenMode::Read)
+                .await?
+                .length()
+                .await?
+                > 0
+        {
+            // A purged inode can still be retained by older prepares.
+            self.remove_segment_name(&public).await?;
+        }
+        // Segment roll can create the public name during any await. Both
+        // creators must open that inode without truncation, then retain it.
+        let mode = if length == 0 {
+            OpenMode::CreateOrOpen
         } else {
-            if length == 0
-                && self.storage.exists(&public).await?
-                && self
-                    .storage
-                    .open(&public, OpenMode::Read)
-                    .await?
-                    .length()
-                    .await?
-                    > 0
-            {
-                // A purged inode can still be retained by older prepares.
-                self.remove_segment_name(&public).await?;
-            }
-            // Segment roll can create the public name during any await. Both
-            // creators must open that inode without truncation, then retain it.
-            let mode = if length == 0 {
-                OpenMode::CreateOrOpen
-            } else {
-                OpenMode::ReadWrite
-            };
-            let file = self.storage.open(&public, mode).await?;
-            self.storage.hard_link(&public, &retained).await?;
-            if length == 0
-                && let Some(size) = preallocate_size
-            {
-                file.preallocate(&retained, size);
-            }
-            file
+            OpenMode::ReadWrite
         };
+        let file = self.storage.open(&public, mode).await?;
+        self.storage.hard_link(&public, &retained).await?;
+        if length == 0
+            && let Some(size) = preallocate_size
+        {
+            file.preallocate(&retained, size).await;
+        }
         self.segment_files_dirty = true;
         self.segment_links_dirty = true;
         self.segment_files.insert(key, file);
+        // Establish the inode and links before buffered appends can be acknowledged.
+        // A later shutdown barrier must not need a new directory descriptor.
+        self.sync_segment_files().await?;
         Ok(())
     }
 

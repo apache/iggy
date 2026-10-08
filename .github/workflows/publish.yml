@@ -241,7 +241,7 @@ jobs:
 
             // Parse Docker images
             ('${{ inputs.publish_dockerhub }}').split(',').map(s => s.trim()).filter(Boolean).forEach(img => {
-              if (['rust-server','rust-mcp','rust-bench-dashboard','rust-connectors','web-ui'].includes(img)) wants.push(img);
+              if (cfg[img]?.registry === 'dockerhub') wants.push(img);
               else core.warning(`Unknown Docker image: ${img}`);
             });
 
