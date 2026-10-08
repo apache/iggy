@@ -1339,14 +1339,15 @@ struct InstanceHealth {
     /// Whether a poll has run recently enough to believe one still will.
     ///
     /// `state_submitted` says a change was handed over; this says whether
-    /// anything is still there to hand the next one to. A configured NACK
-    /// limit can stop polling without calling `close()`,
-    /// leaving registered routes that cannot drain or persist mutations.
+    /// the poll path has advanced recently. A configured NACK limit can stop
+    /// polling without calling `close()`, leaving registered routes that
+    /// cannot drain or persist mutations. A pending runtime result can also
+    /// stall the path beyond the readiness window.
     ///
     /// Read it with `has_polled`, which separates the two ways this can be
     /// false. `has_polled` false alongside it is an instance still starting
     /// up, and the listener is not held to that one. `has_polled` true
-    /// alongside it is a poll task that stopped, which is what takes the whole
+    /// alongside it is a stalled or stopped poll path, which takes the whole
     /// listener out of rotation. This one true with `has_polled` false is
     /// simply a first poll in flight.
     poll_is_live: bool,

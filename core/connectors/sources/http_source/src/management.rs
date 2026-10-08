@@ -483,7 +483,7 @@ fn warn_if_poll_cannot_forward(instance: &Arc<SharedState>, action: &str, endpoi
     // Without this line nothing at all reports that.
     if instance.has_polled() {
         warn!(
-            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while its poll task looks stopped; the change is in memory but nothing is carrying it to the runtime",
+            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while its poll path has not advanced; the task may be stopped or awaiting a runtime batch result, and the change cannot reach the runtime yet",
             instance.id
         );
     } else {

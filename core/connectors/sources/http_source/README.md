@@ -23,7 +23,7 @@ What mitigates this in practice is the caller: webhook senders such as GitHub, S
 
 1. A caller times out after the connector enqueued the message but before the 200 reached it, retries, and the payload lands twice.
 2. A load balancer or proxy retries a POST after a hiccup downstream of a successful enqueue.
-3. A NACK does not mean the batch never landed. The runtime NACKs a batch it sent but whose state it could not persist, and the SDK NACKs on its own result timeout while the send may still have succeeded, so the replay on the next `poll()` re-sends messages that are already on the topic. This is the window the connector itself creates, and it is the price of not dropping post-200 data.
+3. A NACK does not mean the batch never landed. The runtime NACKs a batch it sent but whose state it could not persist, so the replay on the next `poll()` may re-send messages already on the topic. This is the window the connector itself creates, and it is the price of not dropping post-200 data.
 
 So the guarantee is best-effort in both directions: no silent-loss guarantee and no dedup guarantee.
 
@@ -111,11 +111,11 @@ The stream's `schema` **must be `raw`**. This connector always produces raw bodi
 
 The batch is then replayed on every poll. This source disables the SDK's consecutive-NACK breaker by default because accepted webhooks exist only in its in-memory bridge. Repeated failures back off to a five-second retry delay, and the listener answers 429 once the bridge fills.
 
-Empty bodies are rejected with 400. `max_body_size_bytes` cannot exceed Iggy's 64,000,000-byte payload cap; requests above the configured limit are rejected with 413. A staged batch that keeps failing for more than 60 seconds makes `/health` answer 503 while retries continue. `/admin/health` still answers 200, but reports `"status":"degraded"` and marks that instance's `staged_batch_is_stuck` true while `poll_is_live` remains true.
+Empty bodies are rejected with 400. `max_body_size_bytes` cannot exceed Iggy's 64,000,000-byte payload cap; requests above the configured limit are rejected with 413.
 
 Set `max_consecutive_nacks` in `[plugin_config]` to a positive integer only if an external replay mechanism makes stopping safe. This does not make a mismatched stream schema valid: `schema` lives under `[[streams]]` and the plugin only receives `[plugin_config]`.
 
-Rebuild the HTTP source plugin with SDK 0.6 to get this behavior and the `iggy_source_register_stop_callback` export. An older plugin binary still uses the five-NACK limit and cannot notify the runtime when its poll task stops; the runtime warns when the export is absent.
+Rebuild the HTTP source plugin with SDK 0.5.1-edge.2 to get this behavior and the `iggy_source_register_stop_callback` export. An older plugin binary still uses the five-NACK limit and cannot notify the runtime when its poll task stops; the runtime warns when the export is absent.
 
 ### Options
 
@@ -197,7 +197,7 @@ Content-Type: application/json
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 405 | A known path with the wrong method | `{"error":"method not allowed"}` |
 | 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
-| 503 | `GET /health` when an instance has stopped polling or its staged batch has failed for more than 60 seconds; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
+| 503 | `GET /health` when an instance's poll path has stopped or stalled for more than 60 seconds, or its staged batch has kept receiving NACKs for that long; a named-path POST whose route changed hands while the body was still arriving; a POST whose instance left the listener mid-request; or a POST whose instance bridge has no receiver | `{"status":"unavailable"}`, `{"error":"route unavailable"}`, `{"error":"instance is closing"}` or `{"error":"service unavailable"}` |
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
 
@@ -305,7 +305,7 @@ The chain below holds end to end. It did not always: the runtime's forwarding ch
 
 What closed the gap instead was #3855. The SDK now keeps one batch in flight and will not call `poll()` again until the runtime acknowledges the last one, so a slow Iggy stalls the poll loop directly. The bridge then fills on arrival and the handlers answer 429, which is the coupling that was missing.
 
-That coupling holds only while the runtime answers inside the SDK's batch-result timeout, 30s. Past it the SDK stops waiting, NACKs, and polls again. The HTTP source replays its staged batch first, so the bridge does not drain while that batch keeps failing; the same batch can be queued repeatedly in the runtime's unbounded forwarding channel. Tracked in #3981.
+After 30 seconds without a batch result, the SDK warns but continues waiting on the same batch. It does not poll again or enqueue a second copy. The bridge fills and handlers return 429 until the runtime replies. A prolonged stall makes readiness fail after 60 seconds.
 
 ```text
 Iggy slow -> forwarding loop blocks -> batch stays unacknowledged -> poll() stalls
@@ -330,7 +330,9 @@ Size all of them together.
 
 ## Observability
 
-`GET /admin/health` returns per-instance JSON: queue depth and capacity, serving endpoint counts by origin plus expired and revoked counts, `state_submitted`, and header loss counters.
+`GET /admin/health` returns per-instance JSON: queue depth and capacity, serving endpoint counts by origin plus expired and revoked counts, `state_submitted`, and header loss counters. It answers 200 with `"status":"degraded"` when an instance is not ready.
+
+`poll_is_live` describes the poll path; `staged_batch_is_stuck` separately flags a staged batch that has kept receiving NACKs for more than 60 seconds. In that case polling continues, but public `/health` answers 503. A batch still awaiting its first runtime result instead makes `poll_is_live` false after 60 seconds without marking `staged_batch_is_stuck`.
 
 `GET /admin/metrics` returns Prometheus text format. The runtime's own stage histograms begin at `poll()`, so they see nothing a sender experiences; these cover the gateway's own handling. The clock starts after the request body has been read, so a slow or large upload is not counted in `http_source_request_duration_seconds`.
 

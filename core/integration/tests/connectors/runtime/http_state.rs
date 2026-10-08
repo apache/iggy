@@ -354,7 +354,7 @@ async fn given_conflict_mid_stream_should_nack_and_latch(
         if source
             .last_error
             .as_ref()
-            .is_some_and(|error| error.message.contains("NackLimit"))
+            .is_some_and(|error| error.message.contains("consecutive NACK limit reached"))
         {
             break;
         }

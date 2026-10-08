@@ -604,12 +604,17 @@ pub(crate) async fn source_forwarding_loop(
     };
 
     let mut stop_reason = None;
+    let mut stop_receiver_open = true;
     loop {
         let produced_batch = tokio::select! {
             biased;
-            stopped = stop_receiver.recv() => {
-                stop_reason = stopped;
-                break;
+            stopped = stop_receiver.recv(), if stop_receiver_open => {
+                if let Some(reason) = stopped {
+                    stop_reason = Some(reason);
+                    break;
+                }
+                stop_receiver_open = false;
+                continue;
             },
             batch = receiver.recv_async() => batch,
         };
@@ -843,10 +848,11 @@ pub(crate) async fn source_forwarding_loop(
     }
 
     info!("Source connector with ID: {plugin_id} stopped.");
+    // A self-stopped source must release its sender even when no manager stop follows.
     cleanup_sender(plugin_id);
     if let Some(reason) = stop_reason {
         let error_msg = format!(
-            "Source polling stopped for connector with ID: {plugin_id} ({reason:?}); restart required"
+            "Source polling stopped for connector with ID: {plugin_id}: {reason}; restart required"
         );
         match context
             .sources
@@ -1216,11 +1222,13 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::ready;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
     static HANDLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DRAINED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+    static DRAINED_BATCH_RESULT: AtomicU32 = AtomicU32::new(u32::MAX);
 
     extern "C" fn reject_stop_registration(_: u32, _: SourceStoppedCallback) -> i32 {
         -1
@@ -1240,6 +1248,12 @@ mod tests {
     }
 
     extern "C" fn ignore_batch_result(_: u32, _: u64, _: u8) -> i32 {
+        0
+    }
+
+    extern "C" fn record_drained_batch_result(_: u32, batch_id: u64, result: u8) -> i32 {
+        DRAINED_BATCH_RESULT.store(u32::from(result), Ordering::SeqCst);
+        DRAINED_BATCH_ID.store(batch_id, Ordering::SeqCst);
         0
     }
 
@@ -1340,7 +1354,7 @@ mod tests {
             .as_ref()
             .expect("stop should record the reason")
             .message;
-        assert!(message.contains(&format!("{expected_reason:?}")));
+        assert!(message.contains(&expected_reason.to_string()));
         assert!(message.contains("restart required"));
         assert_eq!(context.metrics.get_sources_running(), 0);
         assert_eq!(
@@ -1697,6 +1711,14 @@ mod tests {
         let (sender, receiver) = flume::unbounded();
         let queued = receiver.clone();
         let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender: sender.clone(),
+                stop_sender: stop_sender.clone(),
+                error_counter: Counter::default(),
+            },
+        );
         let labels = Arc::new(SourceLabels::new(&plugin_key));
         let forwarding = tokio::spawn(source_forwarding_loop(
             plugin_id,
@@ -1758,10 +1780,69 @@ mod tests {
                 .as_ref()
                 .expect("stop reason should replace the prior error")
                 .message
-                .contains("NackLimit")
+                .contains("consecutive NACK limit reached")
         );
         assert_eq!(context.metrics.get_sources_running(), 0);
         assert_eq!(context.metrics.error_counter(&labels.counter).get(), 0);
+        assert!(!SOURCE_SENDERS.contains_key(&plugin_id));
+    }
+
+    #[tokio::test]
+    async fn given_queued_batch_when_stop_channel_closes_should_deliver_result_before_stopping() {
+        DRAINED_BATCH_ID.store(0, Ordering::SeqCst);
+        DRAINED_BATCH_RESULT.store(u32::MAX, Ordering::SeqCst);
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        sender
+            .send(ProducedBatch {
+                id: 41,
+                messages: ProducedMessages {
+                    schema: Schema::Raw,
+                    messages: vec![],
+                    state: None,
+                },
+            })
+            .expect("batch should enter the queue");
+        drop(sender);
+        drop(stop_sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            source_forwarding_loop(
+                plugin_id,
+                plugin_key.clone(),
+                false,
+                false,
+                producer,
+                Schema::Raw.encoder(),
+                vec![],
+                state_storage,
+                receiver,
+                stop_receiver,
+                record_drained_batch_result,
+                Arc::clone(&context),
+                Arc::new(SourceLabels::new(&plugin_key)),
+            ),
+        )
+        .await
+        .expect("forwarding loop should drain and stop");
+
+        assert_eq!(DRAINED_BATCH_ID.load(Ordering::SeqCst), 41);
+        assert_eq!(
+            DRAINED_BATCH_RESULT.load(Ordering::SeqCst),
+            u32::from(SourceBatchResult::Ack as u8)
+        );
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should remain registered");
+        assert_eq!(source.lock().await.info.status, ConnectorStatus::Stopped);
     }
 
     #[test]

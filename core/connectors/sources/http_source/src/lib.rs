@@ -79,9 +79,8 @@ pub const MAX_BODY_SIZE_BYTES_LIMIT: usize = MAX_PAYLOAD_SIZE as usize;
 pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
 
-/// How long after a poll returns the source still counts as live. Generous
-/// against the SDK's 30s batch-result timeout, which is the longest a healthy
-/// source sits between polls.
+/// How long after a poll returns the source still counts as live. A stalled
+/// runtime can keep one batch awaiting its result beyond this window.
 pub(crate) const POLL_LIVENESS_SECONDS: u64 = 60;
 
 /// HTTP handler side of an instance's bridge. The pair comes from
@@ -384,12 +383,13 @@ impl SharedState {
         }
     }
 
-    /// Whether the poll task still looks alive.
+    /// Whether the poll path has advanced within the readiness window.
     ///
     /// An in-flight poll counts even when it has been blocked on an empty
     /// bridge for hours, which is the normal state of a quiet gateway. The
     /// timestamp covers the other case, where the SDK is between polls waiting
-    /// for a batch result. Neither advances once the poll task has stopped.
+    /// for a batch result. A stopped task or a result stalled beyond the
+    /// readiness window both make this false.
     pub fn poll_is_live(&self, now_seconds: u64) -> bool {
         self.poll_active.load(Ordering::Acquire)
             || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
@@ -1110,9 +1110,8 @@ impl Source for HttpSource {
     /// the staged copy is free.
     ///
     /// A Nack does not mean neither happened. The runtime NACKs a batch it sent
-    /// successfully but whose state it could not persist, and the SDK NACKs on
-    /// its own result timeout while that send may still have landed. Holding
-    /// the copy and replaying it is therefore at-least-once by construction:
+    /// successfully but whose state it could not persist. Holding the copy
+    /// and replaying it is therefore at-least-once by construction:
     /// the alternative, dropping it, would turn every one of those into
     /// silent loss.
     async fn on_batch_result(&self, result: source::SourceBatchResult) -> Result<(), Error> {
@@ -1184,8 +1183,8 @@ impl Source for HttpSource {
 /// Backoff before re-posting a state flush the runtime refused.
 ///
 /// The first retry is immediate, so an isolated refusal costs nothing. Past
-/// that it doubles to an eight second ceiling, which is inside the SDK's
-/// result timeout, so a store that recovers is picked up promptly.
+/// that it doubles to an eight second ceiling, so a store that recovers is
+/// picked up promptly.
 ///
 /// A store that never recovers is retried at the ceiling. The HTTP source has
 /// no default NACK stop limit because its accepted webhooks exist only here.
@@ -1752,7 +1751,7 @@ mod tests {
         assert_eq!(
             *delays.last().expect("range is not empty"),
             Duration::from_secs(8),
-            "the delay must stop growing well inside the SDK's result timeout"
+            "the delay must stop growing at the configured ceiling"
         );
     }
 

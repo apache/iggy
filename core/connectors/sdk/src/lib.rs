@@ -113,6 +113,7 @@ pub trait Source: Send + Sync {
     ///
     /// The default stops after five consecutive NACKs. Sources that hold accepted input only in
     /// memory can disable that limit so a transient broker outage does not strand their input.
+    /// The SDK reads this policy once after `open()`; later changes have no effect.
     fn batch_policy(&self) -> source::BatchPolicy {
         source::BatchPolicy::default()
     }
