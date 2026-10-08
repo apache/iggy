@@ -214,11 +214,6 @@ pub struct Simulator {
     /// steps the simulator and drops workload expectations, neither of which belongs
     /// inside packet delivery.
     evicted: Vec<u128>,
-    /// Whether a rebuilt partition recovers its consensus frontier from the carried
-    /// log. OFF by default: production restores the view alone (`load_partition`), so
-    /// a run with it on studies a system more durable than Iggy is. See
-    /// `IggyShard::init_partition`.
-    restore_partition_frontier: bool,
     /// The view each namespace was created in, what production records on the
     /// committed partition and every replica seeds its group from. Read from the
     /// metadata plane once, at the first seed, and reused for every later seed
@@ -532,7 +527,6 @@ impl Simulator {
             executor,
             entry_rng: Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).entry_shard),
             evicted: Vec::new(),
-            restore_partition_frontier: false,
             partition_created_views: HashMap::new(),
             deferred_client_replies: Vec::new(),
             seed,
@@ -598,13 +592,7 @@ impl Simulator {
             if self.crashed.contains(&(i as u8)) {
                 continue;
             }
-            materialise_partition(
-                replica,
-                namespace,
-                self.restore_partition_frontier,
-                created_view,
-                self.consumer_offsets_max,
-            );
+            materialise_partition(replica, namespace, created_view, self.consumer_offsets_max);
         }
     }
 
@@ -828,7 +816,9 @@ impl Simulator {
                                 replica.shards[entry]
                                     .deliver_client_request(client_id, packet.message.deep_copy());
                             }
-                            _ => replica.shards[entry].dispatch(packet.message.deep_copy()),
+                            ProcessId::Client(_) | ProcessId::Replica(_) => {
+                                replica.shards[entry].dispatch(packet.message.deep_copy());
+                            }
                         }
                     }
                     // Crashed or missing: packet silently dropped.
@@ -942,19 +932,6 @@ impl Simulator {
         let header = reply.header();
         let session = if self.shell { header.op } else { header.commit };
         (session > 0).then_some(session)
-    }
-
-    /// Have a rebuilt partition recover `(sequencer, commit, checksum)` from the log
-    /// this harness carried across the restart.
-    ///
-    /// Off by default, deliberately: the partition journal is in-memory and segments
-    /// carry no op numbers, so a real replica cannot do this and instead boots
-    /// quorum-invisible and asks the view's primary. Turn it on only to look past the
-    /// empty-frontier restart, which trips `advance_commit_min`'s sequential-advance
-    /// assert, at something later in the run; the run then tests a durability
-    /// guarantee production does not offer.
-    pub const fn set_restore_partition_frontier(&mut self, restore: bool) {
-        self.restore_partition_frontier = restore;
     }
 
     /// Take the clients evicted since the last call.
@@ -1321,7 +1298,6 @@ impl Simulator {
             materialise_partition(
                 &self.replicas[idx],
                 namespace,
-                self.restore_partition_frontier,
                 created_view,
                 self.consumer_offsets_max,
             );
@@ -1354,23 +1330,7 @@ impl Simulator {
             let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                 continue;
             };
-            let offsets = partition.offsets();
-            // `offset_space_used` off the RETIRING partition: an untouched one and
-            // one holding a single message at offset 0 both report `(0, 0)`, and only
-            // this instance still knows which it is.
-            retained.insert(
-                namespace,
-                RetainedPartitionState {
-                    consumer_offsets: partition
-                        .retained_consumer_offsets(iggy_common::ConsumerKind::Consumer),
-                    consumer_group_offsets: partition
-                        .retained_consumer_offsets(iggy_common::ConsumerKind::ConsumerGroup),
-                    log: std::mem::take(&mut partition.log),
-                    durable_offset: offsets.commit_offset,
-                    write_offset: offsets.write_offset,
-                    offset_space_used: partition.offset_space_used(),
-                },
-            );
+            retained.insert(namespace, partition.take_retained_state());
         }
         retained
     }
@@ -1620,7 +1580,6 @@ impl Simulator {
 fn materialise_partition(
     replica: &SimReplica,
     namespace: IggyNamespace,
-    restore_frontier: bool,
     created_view: u32,
     consumer_offsets_max: usize,
 ) {
@@ -1669,7 +1628,6 @@ fn materialise_partition(
         Some(superblock),
         recovered_state,
         retained,
-        restore_frontier,
         PartitionMaterialisation::new(epoch, created_view)
             .with_consumer_offsets_max(consumer_offsets_max),
     );
@@ -1742,33 +1700,44 @@ mod tests {
     }
 
     #[test]
-    fn given_evicted_client_table_entry_when_disconnected_session_expires_should_reassign_partition()
-     {
+    fn given_full_registry_when_another_client_logs_in_should_preserve_the_live_session() {
         let (mut sim, original, replacement) = consumer_group_disconnect_fixture(1, 1);
-        sim.shell_login(&replacement);
+        sim.submit_handshake(&replacement, 0);
+        let refused = (0..DISCONNECT_PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().client == replacement.client_id())
+            })
+            .expect("full registry replies with an admission refusal");
         assert_eq!(
+            iggy_binary_protocol::consensus::result_code(refused.body()),
+            Some(IggyError::TransientNotAccepted.as_code())
+        );
+        assert!(
             sim.replicas[0].shards[0]
                 .plane
                 .metadata()
                 .client_table
                 .borrow()
-                .get_epoch(original.client_id()),
-            None,
-            "the new registration must evict the original client-table entry"
+                .get_epoch(original.client_id())
+                .is_some()
+        );
+        assert_eq!(
+            disconnect_group_assignment(&sim, original.client_id()),
+            Some(vec![0])
         );
         sim.outboxes[0].notify_client_connection_lost(original.client_id());
         sim.run_pumps();
-        let joined = submit_and_wait_for_reply(
-            &mut sim,
-            replacement.client_id(),
-            0,
-            replacement.join_consumer_group(DISCONNECT_STREAM, DISCONNECT_TOPIC, DISCONNECT_GROUP),
+        assert!(
+            sim.replicas[0].shards[0]
+                .plane
+                .metadata()
+                .client_table
+                .borrow()
+                .get_epoch(original.client_id())
+                .is_some()
         );
-        assert_eq!(joined.header().status, 0);
-        for _ in 0..DISCONNECT_PROGRESS_STEPS {
-            sim.step();
-        }
-        recover_disconnected_group(&mut sim, &original, &replacement);
     }
 
     fn consumer_group_disconnect_fixture(
@@ -2131,7 +2100,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn given_small_offset_limit_when_using_quorum_and_no_ack_should_bound_every_replica() {
+    fn given_small_offset_limit_when_using_quorum_should_bound_every_replica() {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -2163,7 +2132,7 @@ mod tests {
         );
         assert_eq!(produced.header().status, 0);
 
-        for (consumer_id, ack) in [(1, AckLevel::Quorum), (2, AckLevel::NoAck)] {
+        for (consumer_id, ack) in [(1, AckLevel::Quorum), (2, AckLevel::Quorum)] {
             let reply = submit_and_wait_for_reply(
                 &mut sim,
                 client_id,
@@ -2177,7 +2146,7 @@ mod tests {
             &mut sim,
             client_id,
             0,
-            client.store_consumer_offset(namespace, 1, 3, 0, AckLevel::NoAck),
+            client.store_consumer_offset(namespace, 1, 3, 0, AckLevel::Quorum),
         );
         assert_eq!(
             denied.header().status,
@@ -2188,7 +2157,7 @@ mod tests {
             &mut sim,
             client_id,
             0,
-            client.delete_consumer_offset(namespace, 1, 1, AckLevel::NoAck),
+            client.delete_consumer_offset(namespace, 1, 1, AckLevel::Quorum),
         );
         assert_eq!(deleted.header().status, 0);
         let replacement = submit_and_wait_for_reply(
@@ -2821,9 +2790,9 @@ mod tests {
         // together remap every stream; and partition ops drawing from the one shared
         // request counter instead of a separate sequence based at `1<<63`, which
         // renumbers every partition request id and so every reply header in the trace.
-        // Multi-replica consumer-offset requests carrying `NoAck` now enter
-        // VSR, so their scheduling and committed replies contribute to the
-        // deterministic trace instead of taking the primary-local fast path.
+        // NoAck explicit offsets use the primary-local path. Ordinary Replicated
+        // writes remain admitted, so their policy-scoped replies contribute to
+        // the deterministic trace.
         assert_eq!(
             h1, 0x31C2_ADA9_9411_FCD4,
             "workload reply hash drifted from locked baseline"
@@ -3186,10 +3155,12 @@ mod tests {
         // `handle_client_request` path. Write and poll both hit real dispatch.
         let payload = Bytes::from_static(b"shell-poll-payload");
         let produce = client.send_messages(ns, std::slice::from_ref(&payload));
-        sim.submit_request(client_id, 0, produce.into_generic());
-        for _ in 0..200 {
-            sim.step();
-        }
+        let produced = submit_and_wait_for_reply(&mut sim, client_id, 0, produce);
+        assert_eq!(
+            produced.header().status,
+            0,
+            "the produced message must commit"
+        );
 
         // Poll through the dispatch shell (`on_client_request`, drain,
         // `handle_poll_messages`, `partition_read`, the owning shard), running as a
@@ -3294,9 +3265,9 @@ mod tests {
         sim.register_client_with_primary(&client);
         let delayed = client.send_messages(namespace, &[Bytes::from_static(b"delayed")]);
         let later = client.send_messages(namespace, &[Bytes::from_static(b"later")]);
-        let committed =
+        let later_receipt =
             submit_and_wait_for_reply(&mut sim, client.client_id(), 0, later.deep_copy());
-        assert_eq!(committed.header().status, 0);
+        assert_eq!(later_receipt.header().status, 0);
         let committed =
             submit_and_wait_for_reply(&mut sim, client.client_id(), 0, delayed.deep_copy());
         assert_eq!(committed.header().status, 0);
@@ -3305,15 +3276,98 @@ mod tests {
             expected.commit_offset, 1,
             "both reordered requests must append"
         );
-        for replay in [delayed, later] {
+        for (replay, expected_status) in [(delayed, IggyError::RequestTooOld.as_code()), (later, 0)]
+        {
             let duplicate = submit_and_wait_for_reply(&mut sim, client.client_id(), 0, replay);
-            assert_eq!(duplicate.header().status, 0);
+            assert_eq!(duplicate.header().status, expected_status);
+            if expected_status == 0 {
+                assert_eq!(
+                    duplicate.as_slice(),
+                    later_receipt.as_slice(),
+                    "the lower request must preserve the higher request's original receipt"
+                );
+            }
             assert_eq!(
                 sim.offsets(0, namespace),
                 Some(expected),
                 "a retained duplicate must not append again"
             );
         }
+    }
+
+    #[test]
+    fn given_different_dedup_limits_when_primary_fails_should_not_append_a_replay() {
+        const REPLICA_COUNT: u8 = 3;
+        const CLIENTS: [u128; 2] = [1, 2];
+        const DEDUP_CAPACITIES: [usize; REPLICA_COUNT as usize] = [2, 1, 1];
+        const PROGRESS_STEPS: usize = 800;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::new(
+            usize::from(REPLICA_COUNT),
+            CLIENTS.iter().copied(),
+            packet::PacketSimulatorOptions {
+                node_count: REPLICA_COUNT,
+                client_count: u8::try_from(CLIENTS.len()).expect("test clients fit u8"),
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        for (replica, capacity) in sim.replicas.iter().zip(DEDUP_CAPACITIES) {
+            replica
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_mut_by_ns(&namespace)
+                .expect("materialized partition")
+                .set_dedup_clients_max(capacity);
+        }
+        let clients = CLIENTS.map(SimClient::new);
+        for client in &clients {
+            sim.register_client_with_primary(client);
+        }
+        let original = clients[0].send_messages(namespace, &[Bytes::from_static(b"first-client")]);
+        let replay = original.deep_copy();
+        let first = submit_and_wait_for_reply(&mut sim, CLIENTS[0], 0, original);
+        assert_eq!(first.header().status, 0);
+        let original_result = first.body().to_vec();
+        let second = clients[1].send_messages(namespace, &[Bytes::from_static(b"second-client")]);
+        let second = submit_and_wait_for_reply(&mut sim, CLIENTS[1], 0, second);
+        assert_eq!(second.header().status, 0);
+        let expected = sim.offsets(0, namespace).expect("primary offsets");
+        assert!((0..PROGRESS_STEPS).any(|_| {
+            sim.step();
+            (0..DEDUP_CAPACITIES.len())
+                .all(|replica| sim.offsets(replica, namespace) == Some(expected))
+        }));
+
+        sim.replica_crash(0);
+        let primary = (0..PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                (1..DEDUP_CAPACITIES.len()).find_map(|replica| {
+                    sim.partition_consensus_state(replica, namespace)
+                        .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                        .then(|| u8::try_from(replica).expect("replica ID fits u8"))
+                })
+            })
+            .expect("surviving replicas must elect a primary");
+        let response = submit_and_wait_for_reply(&mut sim, CLIENTS[0], primary, replay);
+        assert_eq!(response.header().status, 0);
+        assert_eq!(
+            sim.offsets(usize::from(primary), namespace),
+            Some(expected),
+            "a smaller backup dedup limit must not turn an acknowledged send into a new append"
+        );
+        assert_eq!(
+            response.body(),
+            original_result.as_slice(),
+            "promotion must preserve the original append receipt"
+        );
     }
 
     #[test]
@@ -3328,13 +3382,7 @@ mod tests {
             sim.partition_created_views.insert(namespace, created_view);
             sim.seed_stream_topic_partition(namespace);
             for replica in &sim.replicas[..2] {
-                materialise_partition(
-                    replica,
-                    namespace,
-                    false,
-                    created_view,
-                    sim.consumer_offsets_max,
-                );
+                materialise_partition(replica, namespace, created_view, sim.consumer_offsets_max);
                 assert!(
                     replica.partition_superblocks.borrow()[&namespace]
                         .read_latest_sync()
@@ -3369,7 +3417,6 @@ mod tests {
             materialise_partition(
                 &sim.replicas[2],
                 namespace,
-                false,
                 created_view,
                 sim.consumer_offsets_max,
             );
@@ -3471,47 +3518,37 @@ mod tests {
         materialise_partition(
             &sim.replicas[0],
             namespace,
-            false,
             created_view,
             sim.consumer_offsets_max,
         );
         materialise_partition(
             &sim.replicas[2],
             namespace,
-            false,
             created_view,
             sim.consumer_offsets_max,
         );
 
         let client = SimClient::new(CLIENT_ID);
         sim.shell_login(&client);
-        // Both sends in flight at once. The simulated link delays each packet
-        // independently, so the lower request id can reach the primary after
-        // the higher one committed; the dedup slice's committed-id window is
-        // what keeps that reordered arrival a new write rather than an absorbed
-        // duplicate, and this loop is the check that both payloads commit.
         for payload in [
             Bytes::from_static(b"parked-redispatch-0"),
             Bytes::from_static(b"parked-redispatch-1"),
         ] {
             let request = client.send_messages(namespace, std::slice::from_ref(&payload));
-            sim.submit_request(CLIENT_ID, 0, request.into_generic());
+            let reply = submit_and_wait_for_reply(&mut sim, CLIENT_ID, 0, request);
+            assert_eq!(reply.header().status, 0);
         }
 
         let lagging_shard = Rc::clone(&sim.replicas[1].shards[0]);
-        let mut successful_replies = 0usize;
+        let mut successful_replies = 2usize;
         let mut parked = 0usize;
         for _ in 0..500 {
-            successful_replies += successful_send_reply_count(&sim.step());
+            sim.step();
             parked = lagging_shard.parked_frame_count(namespace);
-            if successful_replies >= 2 && parked >= 2 {
+            if parked >= 2 {
                 break;
             }
         }
-        assert!(
-            successful_replies >= 2,
-            "primary never committed both sends"
-        );
         assert!(parked >= 2, "lagging backup never parked both prepares");
 
         // Keep the third prepare off replica 1's network path. Replica 0 can
@@ -3536,7 +3573,6 @@ mod tests {
         materialise_partition(
             &sim.replicas[1],
             namespace,
-            false,
             created_view,
             sim.consumer_offsets_max,
         );
@@ -3809,7 +3845,6 @@ mod tests {
                     None,
                     None,
                     None,
-                    false,
                     PartitionMaterialisation::new(0, 0),
                 );
             });
@@ -3851,7 +3886,6 @@ mod tests {
                 None,
                 None,
                 None,
-                false,
                 PartitionMaterialisation::new(0, 0),
             );
         });
@@ -5592,21 +5626,26 @@ mod tests {
         let client_id: u128 = 1;
         let network_opts = packet::PacketSimulatorOptions {
             node_count: replica_count,
-            client_count: 1,
+            client_count: u8::try_from(PIPELINE_PREPARE_QUEUE_MAX).unwrap(),
             seed: 0x5EED_0066,
             ..packet::PacketSimulatorOptions::default()
         };
         let mut sim = Simulator::new(
             replica_count as usize,
-            std::iter::once(client_id),
+            1..=PIPELINE_PREPARE_QUEUE_MAX as u128,
             network_opts,
         );
-        let client = SimClient::new(client_id);
+        let clients = (1..=PIPELINE_PREPARE_QUEUE_MAX as u128)
+            .map(SimClient::new)
+            .collect::<Vec<_>>();
+        let client = &clients[0];
         let ns_a = IggyNamespace::new(1, 1, 0);
         let ns_b = IggyNamespace::new(1, 1, 1);
         sim.init_partition(ns_a);
         sim.init_partition(ns_b);
-        sim.register_client_with_primary(&client);
+        for client in &clients {
+            sim.register_client_with_primary(client);
+        }
         BLOCKED_NS.store(ns_a.inner(), Ordering::Relaxed);
 
         // Block every backup's PrepareOk for ns_a toward the primary: the
@@ -5621,9 +5660,9 @@ mod tests {
         // Fill ns_a's pipeline exactly to the cap (one more would be
         // rejected at preflight and generate a reply, muddying the
         // no-replies assertion below).
-        for sequence in 0..PIPELINE_PREPARE_QUEUE_MAX {
+        for (sequence, client) in clients.iter().enumerate() {
             let msg = client.send_messages(ns_a, &[Bytes::from(format!("wedged-{sequence}"))]);
-            sim.submit_request(client_id, 0, msg.into_generic());
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
         }
         for _ in 0..100 {
             assert!(
@@ -5811,6 +5850,11 @@ mod view_change_data_loss_tests {
         // next primary's journal, then the old primary dies before the commit
         // makes it back.
         let straggler = SimClient::new(straggler_client);
+        let straggler_verifier = straggler
+            .register()
+            .body()
+            .try_into()
+            .expect("registration carries a verifier");
         sim.submit_request(straggler_client, 0, straggler.register().into_generic());
         let mut staged = None;
         for _ in 0..200 {
@@ -5848,7 +5892,7 @@ mod view_change_data_loss_tests {
                     match submit_shard
                         .plane
                         .metadata()
-                        .submit_register_in_process(straggler_client, 0)
+                        .submit_register_in_process(straggler_client, 0, straggler_verifier)
                         .await
                     {
                         Ok(_) => {
@@ -6619,7 +6663,7 @@ mod partition_repair_driver_tests {
                 .is_none(),
             "resident operations must not consume a repair session while waiting for the next walk"
         );
-        assert!(repair_requests(&sim).is_empty());
+        assert_eq!(repair_requests(&sim), []);
 
         let mut namespace_scratch = Vec::new();
         assert!(
@@ -6630,7 +6674,7 @@ mod partition_repair_driver_tests {
             (Status::Normal, 0, OPS as u64, OPS as u64),
             "the existing tick must finish the resident backlog without peer repair"
         );
-        assert!(repair_requests(&sim).is_empty());
+        assert_eq!(repair_requests(&sim), []);
     }
 
     #[test]
@@ -8264,15 +8308,6 @@ mod metadata_read_frontier_tests {
              distinguish the two states"
         );
 
-        // Re-home the same client onto the backup. The login is forwarded, so
-        // the session it binds IS a committed op above the delete while the
-        // backup's own applied frontier is still below it.
-        sim.shell_login_via(&client, LAGGING);
-        assert!(
-            sim.network.delivered_any(Command::ForwardRegister),
-            "no ForwardRegister crossed the wire: the backup answered the login \
-             itself, so the client never re-homed"
-        );
         let lagging_commit = metadata_commit(&sim, usize::from(LAGGING));
         assert!(
             (created..deleted).contains(&lagging_commit),
@@ -8298,7 +8333,7 @@ mod metadata_read_frontier_tests {
         let (mut sim, client, deleted) =
             backup_behind_a_deleted_stream(0x1A7E_0F31, stream_name, client_id);
 
-        let read = client.get_stream(stream_name);
+        let read = client.bind_session_request(deleted);
         let request_id = read.header().request;
         sim.submit_request(client_id, LAGGING, read.into_generic());
 
@@ -8318,11 +8353,9 @@ mod metadata_read_frontier_tests {
         if let Some(reply) = early {
             panic!(
                 "the backup answered a metadata read while its applied frontier \
-                 ({}) was below the client's committed epoch ({deleted}): status={}, \
-                 stream={:?}",
+                 ({}) was below the client's committed epoch ({deleted}): status={}",
                 metadata_commit(&sim, usize::from(LAGGING)),
                 reply.header().status,
-                read_stream_name(&reply),
             );
         }
 
@@ -8343,8 +8376,14 @@ mod metadata_read_frontier_tests {
                      of which phase 1 spent {STALE_WINDOW_STEPS}, so repair was slower \
                      than the budget rather than the gate being wrong"
                 );
+                let read = super::tests::submit_and_wait_for_reply(
+                    &mut sim,
+                    client_id,
+                    LAGGING,
+                    client.get_stream(stream_name),
+                );
                 assert_eq!(
-                    read_stream_name(&reply),
+                    read_stream_name(&read),
                     None,
                     "the converged backup still serves the deleted stream"
                 );
@@ -8371,7 +8410,7 @@ mod metadata_read_frontier_tests {
         let (mut sim, client, deleted) =
             backup_behind_a_deleted_stream(0x1A7E_0F32, stream_name, client_id);
 
-        let read = client.get_stream(stream_name);
+        let read = client.bind_session_request(deleted);
         let request_id = read.header().request;
         sim.submit_request(client_id, LAGGING, read.into_generic());
 
@@ -8386,9 +8425,7 @@ mod metadata_read_frontier_tests {
                 assert_ne!(
                     reply.header().status,
                     0,
-                    "the cut-off backup answered a read below the client's committed \
-                     epoch ({deleted}) instead of refusing it: stream={:?}",
-                    read_stream_name(&reply),
+                    "the cut-off backup accepted a binding below the required metadata op {deleted}",
                 );
                 assert_eq!(read_stream_name(&reply), None, "a refusal carries no body");
                 return;
@@ -8593,7 +8630,6 @@ mod review_4092_dst_tests {
     use super::*;
 
     #[test]
-    #[ignore = "PR #4092 review: no simulator API can seed a persisted topic, and `init_partition` asserts them out of the cluster simulator entirely"]
     fn given_the_cluster_simulator_when_seeding_a_topic_then_a_persisted_policy_should_be_expressible()
      {
         let replica_count = 3u8;
@@ -8628,8 +8664,8 @@ mod review_4092_dst_tests {
             });
 
         assert!(
-            options.durability.is_persisted() || options.consumer_offset_durability.is_persisted(),
-            "no simulator API can seed a persisted topic, so the durability guarantee this PR adds is unreachable from the deterministic simulator and `init_partition` asserts it out anyway"
+            options.durability.is_persisted() && options.consumer_offset_durability.is_persisted(),
+            "ideal storage must support the durable retry policy for messages and offsets"
         );
     }
 }

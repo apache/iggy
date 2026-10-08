@@ -398,7 +398,7 @@ async fn metadata_all_topics_null_array_e2e_returns_broker() {
     assert_eq!(d.read_i32().unwrap(), 1, "one stub broker");
     d.read_i32().unwrap(); // node_id
     let host = d.read_nullable_string().unwrap().expect("broker host");
-    assert!(!host.is_empty());
+    assert_ne!(host, "");
     let port = d.read_i32().unwrap();
     assert!(port > 0);
 }

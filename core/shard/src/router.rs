@@ -852,17 +852,8 @@ where
                 // `route_typed`). Every refusal answers on `reply`, so the
                 // awaiting shard never waits out its budget on a decision
                 // already made.
-                if let Some(attachment) = attachment
-                    && let Err(error) = self.validate_offset_attachment(&request, &attachment)
-                {
-                    let deny = consensus::build_deny_reply_from_request_header(
-                        request.header(),
-                        error.as_code(),
-                    );
-                    let _ = reply.try_send(Some(deny.into_generic()));
-                } else {
-                    self.on_partition_submit(request, reply).await;
-                }
+                self.dispatch_partition_submit(request, reply, None, attachment)
+                    .await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
@@ -883,8 +874,11 @@ where
             }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
-                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    partition.on_persistence_completed(completion).await;
+                let partitions = self.plane.partitions();
+                if let Some(partition) = partitions.get_mut_by_ns(&namespace) {
+                    partition
+                        .on_persistence_completed(completion, partitions.config())
+                        .await;
                 }
             }
             LifecycleFrame::ReconcileApply => {
@@ -1021,9 +1015,10 @@ where
                         Err(error @ partitions::PurgeError::GenerationNotRecorded(_)) => {
                             // NOT fenced: the wipe ran and a fresh chain is
                             // planted, so the partition is serviceable; only
-                            // the durable generation record failed, which
-                            // leaves `applied_purge_generation` unmoved and
-                            // the reconciler re-issuing the (now cheap) purge.
+                            // the durable record failed, which leaves
+                            // `applied_purge_generation` unmoved and the
+                            // reconciler re-issuing the purge, which redoes
+                            // only the record.
                             // Same pacing argument as the frontier deferral
                             // above; the caches already describe wiped bytes.
                             self.drop_partition_transfer_state(namespace, partition);
@@ -1035,6 +1030,22 @@ where
                                 "purge-partition deferred: reset applied but the generation \
                                  record failed; the reconciler re-issues it"
                             );
+                        }
+                        Err(error @ partitions::PurgeError::OffsetsNotDurable(_)) => {
+                            // The chain is serviceable, but the unlinks of the
+                            // offset files may not be durable, and no retried
+                            // sync can prove them. Fence it like the arm below,
+                            // so the rebuild replaces those files.
+                            tracing::error!(
+                                shard = self.id,
+                                namespace_raw = namespace.inner(),
+                                generation,
+                                %error,
+                                "purge-partition could not sync an offsets dir; fencing it for rebuild"
+                            );
+                            self.drop_partition_transfer_state(namespace, partition);
+                            self.fence_partition_for_rebuild(namespace, partition, None)
+                                .await;
                         }
                         Err(error @ partitions::PurgeError::Unserviceable(_)) => {
                             // Past the drain, so this group has no serviceable

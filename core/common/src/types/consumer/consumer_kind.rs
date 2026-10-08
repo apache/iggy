@@ -24,13 +24,13 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 /// `Consumer` represents the type of consumer that is consuming a message.
-/// It can be either a `Consumer` or a `ConsumerGroup`.
+/// It can be a `Consumer`, a `ConsumerGroup`, or an `ExternalGroup`.
 /// It consists of the following fields:
-/// - `kind`: the type of consumer. It can be either `Consumer` or `ConsumerGroup`.
+/// - `kind`: the type of consumer.
 /// - `id`: the unique identifier of the consumer.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct Consumer {
-    /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`.
+    /// The type of consumer.
     #[serde(skip)]
     pub kind: ConsumerKind,
     /// The unique identifier of the consumer.
@@ -52,6 +52,9 @@ pub enum ConsumerKind {
     /// `ConsumerGroup` represents a consumer group.
     #[value(name = "consumer-group", alias = "cg")]
     ConsumerGroup,
+    /// `ExternalGroup` holds the offsets of a group managed outside Iggy, such as a Kafka group
+    #[value(name = "external-group", alias = "eg")]
+    ExternalGroup,
 }
 
 fn default_id() -> Identifier {
@@ -88,15 +91,57 @@ impl Consumer {
             id,
         }
     }
+
+    /// Creates a new `ExternalGroup` from the `Identifier` of an Iggy consumer group.
+    ///
+    /// For offset calls only: no membership check, no range check, never polled, and no hold on
+    /// retention. Deleting the group deletes its offsets. A poll with it returns
+    /// [`IggyError::FeatureUnavailable`], and so does every call over HTTP, because the REST API
+    /// cannot name a consumer kind.
+    pub fn external_group(id: Identifier) -> Self {
+        Self {
+            kind: ConsumerKind::ExternalGroup,
+            id,
+        }
+    }
 }
 
 /// `ConsumerKind` is an enum that represents the type of consumer.
 impl ConsumerKind {
+    /// The number of kinds.
+    pub const COUNT: usize = 3;
+
+    /// Every kind, in [`ConsumerKind::index`] order.
+    pub const ALL: [ConsumerKind; Self::COUNT] = [
+        ConsumerKind::Consumer,
+        ConsumerKind::ConsumerGroup,
+        ConsumerKind::ExternalGroup,
+    ];
+
+    /// The position of the kind in [`ConsumerKind::ALL`], for arrays with one slot per kind.
+    pub const fn index(self) -> usize {
+        match self {
+            ConsumerKind::Consumer => 0,
+            ConsumerKind::ConsumerGroup => 1,
+            ConsumerKind::ExternalGroup => 2,
+        }
+    }
+
+    /// The name that [`Display`] writes, as a static string for labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ConsumerKind::Consumer => "consumer",
+            ConsumerKind::ConsumerGroup => "consumer_group",
+            ConsumerKind::ExternalGroup => "external_group",
+        }
+    }
+
     /// Returns the code of the `ConsumerKind`.
     pub fn as_code(&self) -> u8 {
         match self {
             ConsumerKind::Consumer => 1,
             ConsumerKind::ConsumerGroup => 2,
+            ConsumerKind::ExternalGroup => 3,
         }
     }
 
@@ -105,6 +150,7 @@ impl ConsumerKind {
         match code {
             1 => Ok(ConsumerKind::Consumer),
             2 => Ok(ConsumerKind::ConsumerGroup),
+            3 => Ok(ConsumerKind::ExternalGroup),
             _ => Err(IggyError::InvalidCommand),
         }
     }
@@ -118,10 +164,7 @@ impl Display for Consumer {
 
 impl Display for ConsumerKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConsumerKind::Consumer => write!(f, "consumer"),
-            ConsumerKind::ConsumerGroup => write!(f, "consumer_group"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -197,4 +240,25 @@ where
     }
 
     deserializer.deserialize_any(IdentifierVisitor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_round_trips_through_its_code() {
+        for kind in ConsumerKind::ALL {
+            assert_eq!(ConsumerKind::from_code(kind.as_code()).unwrap(), kind);
+        }
+        assert!(ConsumerKind::from_code(4).is_err());
+    }
+
+    #[test]
+    fn every_kind_sits_at_its_index_and_displays_its_name() {
+        for (index, kind) in ConsumerKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), index);
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+    }
 }

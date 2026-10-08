@@ -41,6 +41,15 @@ fn eager_flush_options() -> TopicCreateOptions {
 pub async fn run_producer(harness: &mut TestHarness) {
     let client = create_client(harness);
     Client::connect(&client).await.expect("Failed to connect");
+    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &eager_flush_options(),
+        )
+        .await
+        .unwrap();
 
     let producer = client
         .producer(STREAM_NAME, TOPIC_NAME)
@@ -68,7 +77,9 @@ pub async fn run_producer(harness: &mut TestHarness) {
 
     let send_handle = tokio::spawn(async move {
         let msg = IggyMessage::from_str("after-restart").unwrap();
-        producer.send(vec![msg]).await
+        producer.send(vec![msg]).await?;
+        let later = IggyMessage::from_str("after-resume").unwrap();
+        producer.send(vec![later]).await
     });
 
     sleep(Duration::from_secs(1)).await;
@@ -101,10 +112,19 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .await
         .expect("Failed to poll messages after restart");
 
-    assert!(
-        !polled.messages.is_empty(),
-        "Expected at least one message after server restart"
+    assert_eq!(
+        polled.messages.len(),
+        3,
+        "reconnect must preserve the original send and reopen the producer gate"
     );
+    for (message, expected) in
+        polled
+            .messages
+            .iter()
+            .zip(["before-restart", "after-restart", "after-resume"])
+    {
+        assert_eq!(message.payload.as_ref(), expected.as_bytes());
+    }
 }
 
 pub async fn run_consumer(harness: &mut TestHarness) {
@@ -124,6 +144,7 @@ pub async fn run_consumer(harness: &mut TestHarness) {
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy_common::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

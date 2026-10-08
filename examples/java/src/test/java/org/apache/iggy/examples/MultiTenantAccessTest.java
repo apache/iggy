@@ -88,8 +88,8 @@ class MultiTenantAccessTest {
     }
 
     private static <T> T lookupService(Class<T> service, LookupResult foreignResult) {
-        return service.cast(
-                Proxy.newProxyInstance(service.getClassLoader(), new Class<?>[] {service}, (proxy, method, args) -> {
+        return service.cast(Proxy.newProxyInstance(
+                service.getClassLoader(), new Class<?>[] {service}, (proxy, method, args) -> {
                     if (!method.getName().equals("getStream")
                             && !method.getName().equals("getTopic")) {
                         throw new AssertionError("Unexpected operation: " + method.getName());

@@ -25,13 +25,13 @@
 //! of that replica protocol on this page. Terminal failures surface as typed
 //! `Eviction` frames, transient ones as result-framed replay hints.
 //!
-//! Deliberate asymmetry (the two session stores): the per-shard
-//! `SessionManager` owns transport sessions (connection -> user binding,
-//! heartbeats, SDK info) and is never replicated; the consensus `ClientTable`
-//! owns replicated VSR sessions and their dedup watermarks. Login binds the
-//! two together, so logout and eviction must release BOTH -- every teardown
-//! path below pairs `remove_connection` with a replicated `Logout`.
+//! The per-shard `SessionManager` owns local connection bindings, heartbeats,
+//! and SDK info; the consensus `ClientTable` owns replicated logical sessions
+//! and retry protection. Disconnect and heartbeat eviction remove only the
+//! local binding. Explicit logout or committed lease expiry retires the shared
+//! session and its consumer-group membership.
 
+use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
     FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
@@ -42,8 +42,11 @@ use crate::reply_frame::{
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;
-use consensus::{Consensus, DISCONNECT_LOGOUT_REQUEST_ID, MetadataHandle};
+use consensus::client_table::{BIND_SECRET_BYTES, bind_verifier};
+use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::requests::system::SessionIdentity;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::{
     ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
@@ -196,7 +199,7 @@ where
     })
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn complete_login_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -205,6 +208,7 @@ async fn complete_login_register<B, MJ, S, SB>(
     request_header: &RoutedRequestHeader,
     user_id: u32,
     client_version: &ClientVersionInfo,
+    secret: &BindSecret,
 ) -> Result<(), LoginRegisterError>
 where
     B: ShellBus,
@@ -218,40 +222,13 @@ where
         sdk_version: client_version.sdk_version.as_str().to_owned(),
         protocol_version: client_version.protocol_version,
     };
-    let existing_session = {
-        let sessions = sessions.borrow();
-        sessions
-            .get_session(transport_client_id)
-            .map(|(_, session)| session)
-    };
-    if let Some(session) = existing_session {
-        // Re-login on a bound connection: refresh the recorded SDK info
-        // (a reconnecting client may have been upgraded) and replay.
-        sessions
-            .borrow_mut()
-            .record_sdk_info(transport_client_id, sdk_info);
-        // A lagging backup's commit_max can sit below the epoch this session
-        // already bound; never advertise a commit behind the session itself.
-        let commit = current_metadata_commit(shard).max(session);
-        let reply =
-            build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-        send_host_frame(
-            &shard.bus,
-            transport_client_id,
-            reply.into_generic().into_frozen(),
-            FrameChannel::Reply,
-            "login_replay_reply",
-        )
-        .await;
-        return Ok(());
-    }
-
     // Submit Register and await the commit. The SessionManager is left
     // untouched until the op commits cluster-wide (post-quorum): there is no
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
+    let verifier = bind_verifier(vsr_client_id, user_id, secret.expose_secret());
+    let session = match submit_register_on_owner(shard, vsr_client_id, user_id, verifier).await {
         // The wire reply carries only the fence epoch; the SDK numbers its
         // own requests, so the bind watermark is not surfaced (see the
         // BoundSession doc for who does consume it).
@@ -261,25 +238,22 @@ where
         }
     };
 
-    // Post-commit: Connected -> Authenticated -> Bound in a single borrow with
-    // no await in between, so the intermediate Authenticated state is never
-    // observable to a concurrent request on this connection.
-    {
-        let mut sessions = sessions.borrow_mut();
-        sessions
-            .login(transport_client_id, user_id)
-            .map_err(LoginRegisterError::Session)?;
-        sessions.record_sdk_info(transport_client_id, sdk_info);
-        if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
-            // No local rollback: `submit_register_in_process` above has
-            // already committed cluster-wide. A local-only
-            // `remove_client_session` here would diverge peers (they retain
-            // the slot until they evict the client themselves). The
-            // transport-disconnect callback owns local cleanup once the
-            // socket closes.
-            return Err(LoginRegisterError::Session(error));
-        }
-    }
+    complete_session_binding(
+        shard,
+        sessions,
+        transport_client_id,
+        SessionIdentity {
+            client_id: vsr_client_id,
+            session,
+            metadata_watermark: session,
+        },
+        secret.clone(),
+    )
+    .await
+    .map_err(LoginRegisterError::Binding)?;
+    sessions
+        .borrow_mut()
+        .record_sdk_info(transport_client_id, sdk_info);
 
     // `session` IS the register's commit op, and on a backup that forwarded
     // the proposal the local applied commit still lags it. Reporting the
@@ -359,14 +333,18 @@ async fn surface_login_failure<B, MJ, S, SB>(
 /// UNKNOWN outcome, so none can ride that assertion. `TransientNotCommitted`
 /// pins the replay to this connection and its client id, where a register that
 /// did commit rebinds its own client-table entry. Re-issuing under a freshly
-/// minted id would instead orphan that entry until capacity eviction reclaims
-/// it.
+/// minted id would instead orphan that entry until ordered retirement reclaims
+/// it. Binding follows a committed Register, so a transient bind refusal also
+/// retains the registration identity.
 const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
     match error {
         LoginRegisterError::Transient(
             MetadataSubmitError::ForwardTimedOut
             | MetadataSubmitError::InProgress
             | MetadataSubmitError::Canceled,
+        )
+        | LoginRegisterError::Binding(
+            IggyError::TransientNotCommitted | IggyError::TransientNotAccepted,
         ) => IggyError::TransientNotCommitted,
         _ => IggyError::TransientNotAccepted,
     }
@@ -387,9 +365,9 @@ const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
 
 /// Per-shard heartbeat verifier: evict connections that have not pinged within
 /// `1.2 x interval`. Mirrors the legacy `verify_heartbeats` periodic task.
-/// Eviction reuses the disconnect path (drops the client from its consumer
-/// groups + rebalances via the replicated `Logout`) and sends a session-
-/// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
+/// Eviction removes the connection binding and sends `Eviction(StaleClient)`.
+/// The shared logical session and its group membership remain until committed
+/// lease expiry or explicit logout.
 #[allow(clippy::future_not_send)]
 pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
@@ -424,14 +402,8 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
             .borrow()
             .collect_stale(max_age, std::time::Instant::now());
         for transport_client_id in stale {
-            // The heartbeat verifier exists to release a dead client's
-            // consumer-group membership (so the group rebalances off it). A
-            // connection that holds no membership has nothing for the eviction
-            // to clean up; reaping it would only drop a still-usable session
-            // (e.g. an idle admin connection that polls between long gaps),
-            // which the legacy server tolerates. The real transport-disconnect
-            // path still reaps it on socket close. So only evict a stale
-            // connection that is actually a group member.
+            // Preserve idle admin connections. Group-member connections get an
+            // eviction notice; membership ends through committed lease expiry.
             let is_group_member = sessions
                 .borrow()
                 .bound_client_id(transport_client_id)
@@ -451,9 +423,7 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     }
 }
 
-/// Evict one stale connection: drop its session (releasing consumer-group
-/// membership through a replicated `Logout`) and notify the client with a
-/// session-terminal `Eviction(StaleClient)`.
+/// Remove one stale connection binding and notify it with `Eviction(StaleClient)`.
 #[allow(clippy::future_not_send)]
 async fn evict_stale_client<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -466,13 +436,7 @@ async fn evict_stale_client<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let bound = sessions.borrow_mut().remove_connection(transport_client_id);
-    if let Some((vsr_client_id, session)) = bound {
-        submit_disconnect_logout(Rc::clone(shard), vsr_client_id, session);
-    }
-    // The eviction itself is done and observed at this point (session
-    // dropped, `Logout` submitted). The client notice below is best-effort
-    // and logs its own send failure, so this line must not claim it.
+    sessions.borrow_mut().remove_connection(transport_client_id);
     warn!(
         transport_client_id,
         "evicted stale client (missed heartbeat); sending the eviction notice"
@@ -498,6 +462,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    verifier: [u8; BIND_SECRET_BYTES],
     nonce: u128,
     origin_replica: u8,
 ) where
@@ -520,7 +485,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     let bound = shard
         .plane
         .metadata()
-        .submit_register_in_process(vsr_client_id, user_id)
+        .submit_register_in_process(vsr_client_id, user_id, verifier)
         .await;
     // `view` predates the await above, which parks with no deadline, so the
     // sealed value can be stale by send time. The origin routes the result by
@@ -591,6 +556,7 @@ pub(in crate::dispatch) async fn submit_register_local_or_forward<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    verifier: [u8; BIND_SECRET_BYTES],
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -615,15 +581,22 @@ where
         return shard
             .plane
             .metadata()
-            .submit_register_in_process(vsr_client_id, user_id)
+            .submit_register_in_process(vsr_client_id, user_id, verifier)
             .await;
     }
 
     let nonce = shard.next_forward_nonce(self_replica);
     let (reply, outcome) = shard::channel::<ForwardRegisterResultHeader>(1);
     shard.park_register_forward(nonce, vsr_client_id, reply);
-    let forward =
-        build_forward_register_message(cluster, view, self_replica, vsr_client_id, nonce, user_id);
+    let forward = build_forward_register_message(
+        cluster,
+        view,
+        self_replica,
+        vsr_client_id,
+        nonce,
+        user_id,
+        verifier,
+    );
     if let Err(error) = shard
         .bus
         .send_to_replica(target, forward.into_generic().into_frozen())
@@ -702,20 +675,22 @@ fn build_forward_register_message(
     client: u128,
     nonce: u128,
     user_id: u32,
+    verifier: [u8; BIND_SECRET_BYTES],
 ) -> Message<ForwardRegisterHeader> {
-    Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
-        |_, header: &mut ForwardRegisterHeader| {
-            header.command = Command::ForwardRegister;
-            header.cluster = cluster;
-            header.view = view;
-            header.replica = replica;
-            header.client = client;
-            header.nonce = nonce;
-            header.user_id = user_id;
-            header.size = HEADER_SIZE as u32;
-            header.seal();
-        },
-    )
+    let mut message = Message::<ForwardRegisterHeader>::new(HEADER_SIZE + BIND_SECRET_BYTES);
+    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&verifier);
+    message.transmute_header(|_, header: &mut ForwardRegisterHeader| {
+        header.command = Command::ForwardRegister;
+        header.cluster = cluster;
+        header.view = view;
+        header.replica = replica;
+        header.client = client;
+        header.nonce = nonce;
+        header.user_id = user_id;
+        header.size = (HEADER_SIZE + BIND_SECRET_BYTES) as u32;
+        header.checksum_body = u128::from(iggy_common::calculate_checksum(&verifier));
+        header.seal();
+    })
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -867,6 +842,8 @@ const fn forward_logout_result(
         ForwardLogoutOutcome::PipelineFull => Err(MetadataSubmitError::PipelineFull),
         ForwardLogoutOutcome::InProgress => Err(MetadataSubmitError::InProgress),
         ForwardLogoutOutcome::Canceled => Err(MetadataSubmitError::Canceled),
+        ForwardLogoutOutcome::RequestTooOld => Err(MetadataSubmitError::RequestTooOld),
+        ForwardLogoutOutcome::OperationMismatch => Err(MetadataSubmitError::OperationMismatch),
     }
 }
 
@@ -878,6 +855,8 @@ const fn forward_logout_outcome(
         Err(MetadataSubmitError::NotPrimary) => (0, ForwardLogoutOutcome::NotPrimary),
         Err(MetadataSubmitError::PipelineFull) => (0, ForwardLogoutOutcome::PipelineFull),
         Err(MetadataSubmitError::InProgress) => (0, ForwardLogoutOutcome::InProgress),
+        Err(MetadataSubmitError::RequestTooOld) => (0, ForwardLogoutOutcome::RequestTooOld),
+        Err(MetadataSubmitError::OperationMismatch) => (0, ForwardLogoutOutcome::OperationMismatch),
         Err(_) => (0, ForwardLogoutOutcome::Canceled),
     }
 }
@@ -949,6 +928,7 @@ pub async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    verifier: [u8; BIND_SECRET_BYTES],
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -958,12 +938,13 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return submit_register_local_or_forward(shard, vsr_client_id, user_id).await;
+        return submit_register_local_or_forward(shard, vsr_client_id, user_id, verifier).await;
     }
     let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
+        verifier,
         reply,
     });
     // The owner's outcome, verbatim in both directions. `Canceled` is only for a
@@ -1002,64 +983,6 @@ where
         .await
         .unwrap_or(Err(MetadataSubmitError::Canceled))
 }
-
-/// Release the client-table slot for a disconnected transport, cluster-wide.
-///
-/// The local `SessionManager` connection is already dropped by the caller;
-/// this is what drops the replicated entry, so a peer replica does not keep an
-/// orphaned session until it evicts one under capacity pressure.
-///
-/// Unconditional, and deliberately so. Holding the slot open for a grace
-/// window would let a reconnecting client resume onto its entry with its
-/// watermark and reply ring intact, but nothing in tree re-presents a
-/// `client_id` after a disconnect (the Rust SDK mints a fresh one on
-/// re-login), so the window buys nothing today and the slot it holds is not
-/// free: the client table's eviction point moves from concurrent connections
-/// to CUMULATIVE connects, and every capacity eviction silently erases a
-/// dedup watermark.
-///
-/// A resume window becomes worth having once SDK-side identity stability
-/// lands, at which point it needs a timer of its own -- riding the heartbeat
-/// verifier would tie the grace period to heartbeat configuration, since
-/// `collect_stale` keys off `heartbeat.interval` and the verifier does not run
-/// at all when `heartbeat.enabled` is false.
-/// Deliberately does NOT drop the local `ClientTable` slot first:
-/// `submit_logout_*` short-circuits when the slot is already gone, so a
-/// pre-emptive local removal would suppress the `Logout` and leave peer
-/// replicas with an orphaned session until they evict it themselves -- the
-/// exact divergence this avoids. `submit_logout_on_owner` runs in-process on
-/// shard 0 and forwards for peer-homed connections; its session guard drops a
-/// stale logout for a reused client id.
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) fn submit_disconnect_logout<B, MJ, S, SB>(
-    shard: Rc<ShellShard<B, MJ, S, SB>>,
-    vsr_client_id: u128,
-    session: u64,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    // The sentinel request id is what the apply path reads to keep, rather
-    // than drop, the session's dedup fence: the client may be reconnecting
-    // under the same key, and its retry must still be answered.
-    let bus = shard.bus.clone();
-    bus.spawn(async move {
-        if let Err(error) =
-            submit_logout_on_owner(&shard, vsr_client_id, session, DISCONNECT_LOGOUT_REQUEST_ID)
-                .await
-        {
-            warn!(
-                vsr_client_id,
-                ?error,
-                "disconnect logout submit failed; consumer-group cleanup will retry after session expiry"
-            );
-        }
-    });
-}
-
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -1102,14 +1025,14 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
             // Deny as transient instead of dropping the frame: the submit
             // usually fails because this replica is not the metadata owner
             // right now, and the SDK replays a transient rejection.
-            warn!(transport_client_id, error = %error, "logout/unregister failed; denying transient");
+            warn!(transport_client_id, error = %error, "logout/unregister failed; denying logout");
             let commit = current_metadata_commit(shard);
             let reply = build_deny_reply(
                 request.header(),
                 vsr_client_id,
                 session,
                 commit,
-                transient_logout_code(&error).as_code(),
+                logout_deny_code(&error).as_code(),
             );
             send_host_frame(
                 &shard.bus,
@@ -1139,8 +1062,10 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
 /// Preserve the client identity when a Logout may already have entered the
 /// primary's pipeline. Moving an unknown-outcome replay to another connection
 /// could race a later Register and obscure whether the old epoch was removed.
-const fn transient_logout_code(error: &MetadataSubmitError) -> IggyError {
+const fn logout_deny_code(error: &MetadataSubmitError) -> IggyError {
     match error {
+        MetadataSubmitError::RequestTooOld => IggyError::RequestTooOld,
+        MetadataSubmitError::OperationMismatch => IggyError::InvalidCommand,
         MetadataSubmitError::ForwardTimedOut
         | MetadataSubmitError::InProgress
         | MetadataSubmitError::Canceled => IggyError::TransientNotCommitted,
@@ -1224,6 +1149,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &wire_request.version_info,
+                    &wire_request.bind_secret,
                 )
                 .await
                 {
@@ -1262,6 +1188,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     request.header(),
                     user_id,
                     &wire_request.version_info,
+                    &wire_request.bind_secret,
                 )
                 .await
                 {
@@ -1324,7 +1251,6 @@ mod tests {
         FIRST_BOOT, SECOND_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply,
         request_message, test_shard,
     };
-    use crate::session_manager::SessionError;
     use consensus::{LocalPipeline, Plane as _, PlaneKind, VsrConsensus};
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -1347,7 +1273,7 @@ mod tests {
         assert!(LoginRegisterError::InvalidCredentials.is_terminal());
         assert!(LoginRegisterError::InvalidToken.is_terminal());
         assert!(LoginRegisterError::UserInactive.is_terminal());
-        assert!(LoginRegisterError::Session(SessionError::ConnectionNotFound(0)).is_terminal());
+        assert!(LoginRegisterError::Binding(IggyError::Unauthenticated).is_terminal());
         // Transient is the only recoverable variant: never terminal.
         assert!(!LoginRegisterError::Transient(MetadataSubmitError::PipelineFull).is_terminal());
     }
@@ -1383,6 +1309,16 @@ mod tests {
 
     #[test]
     fn unknown_register_outcomes_pin_the_client_identity() {
+        for error in [
+            IggyError::TransientNotAccepted,
+            IggyError::TransientNotCommitted,
+        ] {
+            assert_eq!(
+                transient_login_code(&LoginRegisterError::Binding(error)),
+                IggyError::TransientNotCommitted,
+                "a post-commit bind refusal must retain the registration identity",
+            );
+        }
         for error in [
             MetadataSubmitError::ForwardTimedOut,
             MetadataSubmitError::InProgress,
@@ -1486,11 +1422,15 @@ mod tests {
 
         // A and B hold committed sessions (as after their CLI logins).
         for client in [CLIENT_A, CLIENT_B] {
-            md.client_table.borrow_mut().commit_register(
-                client,
-                ACTING_USER,
-                register_reply(client, SESSION),
-            );
+            md.client_table
+                .borrow_mut()
+                .commit_register(
+                    client,
+                    ACTING_USER,
+                    [0x5a; 32],
+                    register_reply(client, SESSION),
+                )
+                .unwrap();
         }
         // A's transport connection, authenticated + bound — the state a
         // CLI connection is in right after its create-stream reply.
@@ -1500,13 +1440,21 @@ mod tests {
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
         );
-        sessions
+        let attachment = md
+            .client_table
             .borrow_mut()
-            .login(TRANSPORT_A, ACTING_USER)
+            .attach_session(CLIENT_A, SESSION, ACTING_USER)
             .unwrap();
         sessions
             .borrow_mut()
-            .bind_session(TRANSPORT_A, CLIENT_A, SESSION)
+            .bind_authenticated_connection(
+                TRANSPORT_A,
+                CLIENT_A,
+                SESSION,
+                ACTING_USER,
+                attachment,
+                SESSION,
+            )
             .unwrap();
 
         // Sibling B's op: prepared, journaled, self-acked through the real
@@ -1520,7 +1468,12 @@ mod tests {
             options: WireOptions::empty(),
         }
         .to_bytes();
-        let prepare = prepare_message(Operation::CreateStream, CLIENT_B, 1, &create_body);
+        let prepare = prepare_message(Operation::CreateStream, CLIENT_B, 1, &create_body)
+            .transmute_header(|old, header| {
+                *header = old;
+                header.user_id = ACTING_USER;
+                header.checksum = header.identity_checksum();
+            });
         consensus.pipeline_message(PlaneKind::Metadata, &prepare);
         md.on_replicate(prepare).await;
         let mut loopback = Vec::new();
@@ -1583,7 +1536,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, USER).await
+                submit_register_local_or_forward(&shard, CLIENT, USER, [0x5a; 32]).await
             })
         };
         await_forward(&bus).await;
@@ -1675,20 +1628,14 @@ mod tests {
             MetadataSubmitError::InProgress,
             MetadataSubmitError::Canceled,
         ] {
-            assert_eq!(
-                transient_logout_code(&error),
-                IggyError::TransientNotCommitted
-            );
+            assert_eq!(logout_deny_code(&error), IggyError::TransientNotCommitted);
         }
         for error in [
             MetadataSubmitError::NotPrimary,
             MetadataSubmitError::PipelineFull,
             MetadataSubmitError::PrimaryUnreachable,
         ] {
-            assert_eq!(
-                transient_logout_code(&error),
-                IggyError::TransientNotAccepted
-            );
+            assert_eq!(logout_deny_code(&error), IggyError::TransientNotAccepted);
         }
     }
 
@@ -1701,7 +1648,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, 0xCAFE, 7).await
+                submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]).await
             })
         };
         await_forward(&bus).await;
@@ -1730,7 +1677,7 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
 
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]).await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         assert!(
             outcome.unwrap_err().is_transient(),
@@ -1829,7 +1776,7 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, 7).await
+                submit_register_local_or_forward(&shard, CLIENT, 7, [0x5a; 32]).await
             })
         };
         await_forward(&bus).await;
@@ -1876,7 +1823,7 @@ mod tests {
         // matters is that nothing left over the interconnect.
         let _ = compio::time::timeout(
             Duration::from_millis(50),
-            submit_register_local_or_forward(&shard, 0xCAFE, 7),
+            submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]),
         )
         .await;
         assert!(
@@ -1892,7 +1839,7 @@ mod tests {
         let bus = SpyBus::default();
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, incarnation));
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]).await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         bus.sole_replica_send::<ForwardRegisterHeader>().1.nonce
     }

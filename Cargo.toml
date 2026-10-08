@@ -161,7 +161,6 @@ cyper-core = { version = "0.9.0", default-features = false }
 darling = "0.24"
 dashmap = "6.2.1"
 deltalake = { version = "0.32.4", features = ["azure", "gcs", "s3"] }
-derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
 dircpy = "0.3.20"

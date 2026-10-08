@@ -1198,7 +1198,7 @@ mod tests {
         let fault = FatalCommit {
             namespace_raw: 42,
             op: 7,
-            operation: iggy_binary_protocol::Operation::SendMessages,
+            operation: Some(iggy_binary_protocol::Operation::SendMessages),
         };
         let pump = compio::runtime::spawn(async move { Some(fault) });
 

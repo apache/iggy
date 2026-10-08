@@ -266,6 +266,8 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case alreadyAuthenticated = 14000
     case invalidSession = 14001
     case incompatibleProtocolVersion = 14003
+    case sessionMismatch = 14004
+    case requestIdExhausted = 14005
 }
 
 extension IggyErrorCode {
@@ -514,6 +516,8 @@ extension IggyErrorCode {
         case .alreadyAuthenticated: "already_authenticated"
         case .invalidSession: "invalid_session"
         case .incompatibleProtocolVersion: "incompatible_protocol_version"
+        case .sessionMismatch: "session_mismatch"
+        case .requestIdExhausted: "request_id_exhausted"
         }
     }
 }
