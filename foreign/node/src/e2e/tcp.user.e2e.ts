@@ -23,6 +23,15 @@ describe('e2e -> user', async () => {
 
   const c = getTestClient();
 
+  // The server refuses a grant on a stream or topic that does not exist.
+  const stream = await c.stream.create({ name: 'e2e-tcp-user-stream' });
+  const topic = await c.topic.create({
+    streamId: stream.id,
+    name: 'e2e-tcp-user-topic',
+    partitionCount: 1,
+    compressionAlgorithm: 1
+  });
+
   const userId = 42;
   const username = 'test-user';
   const password = 'test-pwd123$!';
@@ -42,7 +51,7 @@ describe('e2e -> user', async () => {
     },
     streams: [
       {
-        streamId: 1,
+        streamId: stream.id,
         permissions: {
           manageStream: true,
           readStream: true,
@@ -53,7 +62,7 @@ describe('e2e -> user', async () => {
         },
         topics: [
           {
-            topicId: 1,
+            topicId: topic.id,
             permissions: {
               manage: true,
               read: true,
@@ -134,7 +143,8 @@ describe('e2e -> user', async () => {
     assert.ok(await c.user.delete({ userId: user.id }));
   });
 
-  it('e2e -> user::logout', async () => {
+  it('e2e -> user::cleanup', async () => {
+    assert.ok(await c.stream.delete({ streamId: stream.id }));
     assert.ok(await c.session.logout());
   });
 

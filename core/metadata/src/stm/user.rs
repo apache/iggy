@@ -19,7 +19,8 @@ use crate::permissioner::Permissioner;
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
-    DeletePersonalAccessTokenResult, DeleteUserResult, UpdatePermissionsResult, UpdateUserResult,
+    DeletePersonalAccessTokenResult, DeleteUserResult, DeletedResource, UpdatePermissionsResult,
+    UpdateUserResult,
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::stm::{ApplyContext, StateHandler};
@@ -126,6 +127,7 @@ collect_handlers! {
         CreatePersonalAccessToken,
         DeletePersonalAccessToken,
     }
+    internal { RemoveGrants }
 }
 
 impl UsersInner {
@@ -233,6 +235,68 @@ impl UsersInner {
             .get(&user_id)
             .map_or(0, |user_tokens| user_tokens.len())
     }
+
+    /// The checks `CreateUserRequest::apply` makes before it mutates state, and
+    /// the decoded options when they pass. `reject_dangling_grant` runs them
+    /// before it checks the grants, so their refusal wins.
+    pub(crate) fn validate_create_user(
+        &self,
+        request: &CreateUserRequest,
+    ) -> Result<ResourceOptions, CreateUserResult> {
+        // `WireName` permits 1..=255 bytes, so a raw binary client bypasses the
+        // length bound the edges (HTTP DTO, SDK, login) enforce. Re-check in the
+        // replicated apply -- the choke point every transport shares -- so state
+        // never holds a username no ingress considers valid. Rejected before any
+        // mutation, committing as a deterministic no-op.
+        if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&request.username.as_str().len()) {
+            return Err(CreateUserResult::InvalidUsername);
+        }
+        if self.index.contains_key(request.username.as_str()) {
+            return Err(CreateUserResult::UserAlreadyExists);
+        }
+        resource_options_from_wire(&request.options, true)
+            .map_err(|_| CreateUserResult::InvalidOptionValue)
+    }
+
+    /// Slab id of the user whose grants `UpdatePermissionsRequest::apply`
+    /// replaces, or the refusal of that apply. `reject_dangling_grant` runs this
+    /// before it checks the grants, so the refusal wins.
+    pub(crate) fn permissions_target(
+        &self,
+        identifier: &WireIdentifier,
+    ) -> Result<usize, UpdatePermissionsResult> {
+        let user_id = self
+            .resolve_user_id(identifier)
+            .ok_or(UpdatePermissionsResult::UserNotFound)?;
+        // Root (slab id 0) permissions are immutable, matching legacy
+        // `CannotChangePermissions`. Rejected before any mutation, so the op is a
+        // committed no-op: root keeps its full grants and the permissioner index
+        // is untouched.
+        if user_id == DEFAULT_ROOT_USER_ID as usize {
+            return Err(UpdatePermissionsResult::CannotChangePermissions);
+        }
+        Ok(user_id)
+    }
+
+    /// Drop the token map of `user_id` with the index and expiry entries of
+    /// every token in it.
+    fn remove_personal_access_tokens(&mut self, user_id: UserId) {
+        let Some(tokens) = self.personal_access_tokens.remove(&user_id) else {
+            return;
+        };
+        // Removals commute, so the per-replica iteration order of `tokens`
+        // cannot make replicas diverge.
+        for pat in tokens.values() {
+            self.personal_access_token_index.remove(&pat.token);
+            if let Some(expiry_at) = pat.expiry_at {
+                self.personal_access_token_expiry_index.remove(&(
+                    expiry_at.as_micros(),
+                    user_id,
+                    Arc::clone(&pat.name),
+                ));
+            }
+        }
+    }
 }
 
 impl Users {
@@ -258,6 +322,21 @@ impl Users {
         rule: impl FnOnce(&Permissioner) -> Result<(), IggyError>,
     ) -> Result<(), IggyError> {
         self.read(|inner| rule(&inner.permissioner))
+    }
+
+    /// Drop every grant on a stream or topic that a committed delete removed.
+    /// Applied through the writer as a deterministic side effect of that delete
+    /// on each replica (not a separate replicated op), so WAL replay repeats it.
+    pub(crate) fn remove_grants(
+        &self,
+        deleted: DeletedResource,
+        timestamp: IggyTimestamp,
+        context: ApplyContext,
+    ) {
+        let cmd = UsersCommand::RemoveGrants(RemoveGrantsRequest { deleted }, timestamp, context);
+        if let Err(error) = self.inner.try_apply(cmd) {
+            tracing::error!(?deleted, %error, "remove_grants dispatched to reader-only Users STM");
+        }
     }
 
     /// Ensures a root user exists in an empty user set.
@@ -439,28 +518,17 @@ impl StateHandler for CreateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {
-        // `WireName` permits 1..=255 bytes, so a raw binary client bypasses the
-        // length bound the edges (HTTP DTO, SDK, login) enforce. Re-check in the
-        // replicated apply -- the choke point every transport shares -- so state
-        // never holds a username no ingress considers valid. Rejected before any
-        // mutation, committing as a deterministic no-op.
-        if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&self.username.as_str().len()) {
-            return ApplyReply::err(CreateUserResult::InvalidUsername);
-        }
+        let options = match state.validate_create_user(self) {
+            Ok(options) => options,
+            Err(result) => return ApplyReply::err(result),
+        };
 
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
-        if state.index.contains_key(&username_arc) {
-            return ApplyReply::err(CreateUserResult::UserAlreadyExists);
-        }
-
         let status = UserStatus::from_code(self.status).unwrap_or_default();
         let permissions = self
             .permissions
             .as_ref()
             .map(|p| Arc::new(Permissions::from(p.clone())));
-        let Ok(options) = resource_options_from_wire(&self.options, true) else {
-            return ApplyReply::err(CreateUserResult::InvalidOptionValue);
-        };
 
         let user = User {
             id: 0,
@@ -478,6 +546,9 @@ impl StateHandler for CreateUserRequest {
         }
 
         state.index.insert(username_arc, id as UserId);
+        // A token create admitted before the delete of the last holder of this
+        // id can commit after it. Its tokens must not resolve to the new holder.
+        state.remove_personal_access_tokens(id as UserId);
         state
             .personal_access_tokens
             .insert(id as UserId, AHashMap::default());
@@ -578,18 +649,7 @@ impl StateHandler for DeleteUserRequest {
             let username = user.username.clone();
             state.items.remove(user_id);
             state.index.remove(&username);
-            if let Some(tokens) = state.personal_access_tokens.remove(&(user_id as UserId)) {
-                for pat in tokens.values() {
-                    state.personal_access_token_index.remove(&pat.token);
-                    if let Some(expiry_at) = pat.expiry_at {
-                        state.personal_access_token_expiry_index.remove(&(
-                            expiry_at.as_micros(),
-                            user_id as UserId,
-                            Arc::clone(&pat.name),
-                        ));
-                    }
-                }
-            }
+            state.remove_personal_access_tokens(user_id as UserId);
             state
                 .permissioner
                 .delete_permissions_for_user(user_id as UserId);
@@ -629,17 +689,10 @@ impl StateHandler for UpdatePermissionsRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return ApplyReply::err(UpdatePermissionsResult::UserNotFound);
+        let user_id = match state.permissions_target(&self.user_id) {
+            Ok(user_id) => user_id,
+            Err(result) => return ApplyReply::err(result),
         };
-
-        // Root (slab id 0) permissions are immutable, matching legacy
-        // `CannotChangePermissions`. Rejected before any mutation, so the op is a
-        // committed no-op: root keeps its full grants and the permissioner index
-        // is untouched.
-        if user_id == DEFAULT_ROOT_USER_ID as usize {
-            return ApplyReply::err(UpdatePermissionsResult::CannotChangePermissions);
-        }
 
         if let Some(user) = state.items.get_mut(user_id) {
             user.permissions = self
@@ -653,6 +706,82 @@ impl StateHandler for UpdatePermissionsRequest {
             .update_permissions_for_user(user_id as UserId, user_permissions);
         ApplyReply::ok(Bytes::new())
     }
+}
+
+/// Server-originated request that drops every grant on a deleted resource.
+///
+/// Never decoded from the wire: `gated_apply` applies it right after the
+/// delete, so every replica and WAL replay remove the same grants.
+#[derive(Debug, Clone)]
+pub struct RemoveGrantsRequest {
+    pub deleted: DeletedResource,
+}
+
+impl StateHandler for RemoveGrantsRequest {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        let mut pruned_any = false;
+        for (_, user) in &mut state.items {
+            let Some(pruned) = user
+                .permissions
+                .as_deref()
+                .and_then(|permissions| without_grant(permissions, self.deleted))
+            else {
+                continue;
+            };
+            user.permissions = Some(Arc::new(pruned));
+            pruned_any = true;
+        }
+        if pruned_any {
+            state.permissioner = permissioner_of(&state.items);
+        }
+        ApplyReply::ok(Bytes::new())
+    }
+}
+
+/// `permissions` without its grant on `deleted`, `None` when it holds none. An
+/// emptied map becomes `None`, the shape a wire decode of an empty list gives.
+fn without_grant(permissions: &Permissions, deleted: DeletedResource) -> Option<Permissions> {
+    let (DeletedResource::Stream(stream_id) | DeletedResource::Topic { stream_id, .. }) = deleted;
+    let stream = permissions.streams.as_ref()?.get(&stream_id)?;
+    // Most users hold no grant on the deleted resource: check before cloning.
+    if let DeletedResource::Topic { topic_id, .. } = deleted
+        && !stream.topics.as_ref()?.contains_key(&topic_id)
+    {
+        return None;
+    }
+    let mut pruned = permissions.clone();
+    let streams = pruned.streams.as_mut()?;
+    match deleted {
+        DeletedResource::Stream(_) => {
+            streams.remove(&stream_id);
+        }
+        DeletedResource::Topic { topic_id, .. } => {
+            let stream = streams.get_mut(&stream_id)?;
+            let topics = stream.topics.as_mut()?;
+            topics.remove(&topic_id)?;
+            if topics.is_empty() {
+                stream.topics = None;
+            }
+        }
+    }
+    if streams.is_empty() {
+        pruned.streams = None;
+    }
+    Some(pruned)
+}
+
+/// The permissioner is a denormalized index of `User.permissions`, so it is
+/// built from the users alone and cannot drift from them. Slab iteration is
+/// ascending by key, so the build is deterministic.
+#[allow(clippy::cast_possible_truncation)]
+fn permissioner_of(items: &IdSlab<User>) -> Permissioner {
+    let mut permissioner = Permissioner::new();
+    for (user_id, user) in items {
+        permissioner
+            .init_permissions_for_user(user_id as UserId, user.permissions.as_deref().cloned());
+    }
+    permissioner
 }
 
 /// The success reply here is deliberately empty: the raw token the caller needs
@@ -950,12 +1079,7 @@ impl UsersInner {
 
         // Rebuild the permissioner from the restored users rather than the
         // snapshot vecs, which are intentionally empty (see `to_snapshot`).
-        // Slab iteration is ascending by key, so the build is deterministic.
-        let mut permissioner = Permissioner::new();
-        for (user_id, user) in &items {
-            permissioner
-                .init_permissions_for_user(user_id as UserId, user.permissions.as_deref().cloned());
-        }
+        let permissioner = permissioner_of(&items);
 
         Self {
             index,
@@ -975,7 +1099,9 @@ impl_fill_restore!(Users, users);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::primitives::permissions::WireStreamPermissions;
+    use iggy_binary_protocol::primitives::permissions::{
+        WireStreamPermissions, WireTopicPermissions,
+    };
     use iggy_common::IggyError;
 
     #[test]
@@ -1511,6 +1637,178 @@ mod tests {
                 .users_that_can_send_messages_to_specific_streams
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn given_tokens_left_at_a_freed_id_when_create_user_reuses_it_should_drop_their_index_entries()
+    {
+        let mut users = UsersInner::new();
+        create_user_with(&mut users, "iggy", None);
+        let alice = create_user_with(&mut users, "alice", None);
+        let delete = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(alice),
+        };
+        let reply = StateHandler::apply(&delete, &mut users, IggyTimestamp::now());
+        assert_eq!(reply.code, 0);
+
+        // A token create admitted before the delete applied commits after it.
+        let reply = CreatePersonalAccessTokenRequest {
+            user_id: alice,
+            name: WireName::new("ci").unwrap(),
+            expiry: 1,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+        assert_eq!(reply.code, 0);
+        assert_eq!(users.personal_access_token_index.len(), 1);
+        assert_eq!(users.personal_access_token_expiry_index.len(), 1);
+
+        let bob = create_user_with(&mut users, "bob", None);
+        assert_eq!(bob, alice, "bob must take the freed id");
+        assert!(users.personal_access_token_index.is_empty());
+        assert!(users.personal_access_token_expiry_index.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_shared_grants_when_removing_resource_should_preserve_other_permissions() {
+        const DELETED_STREAM: usize = 4;
+        const KEPT_STREAM: usize = 5;
+        const TOPIC: usize = 2;
+
+        for deleted in [
+            DeletedResource::Stream(DELETED_STREAM),
+            DeletedResource::Topic {
+                stream_id: DELETED_STREAM,
+                topic_id: TOPIC,
+            },
+        ] {
+            let mut inner = UsersInner::new();
+            create_user_with(&mut inner, "iggy", None);
+            let permissions = WirePermissions {
+                global: empty_global(),
+                streams: [DELETED_STREAM, KEPT_STREAM]
+                    .into_iter()
+                    .map(|stream_id| WireStreamPermissions {
+                        stream_id: u32::try_from(stream_id).unwrap(),
+                        manage_stream: false,
+                        read_stream: stream_id == KEPT_STREAM,
+                        manage_topics: false,
+                        read_topics: false,
+                        poll_messages: true,
+                        send_messages: true,
+                        topics: vec![WireTopicPermissions {
+                            topic_id: u32::try_from(TOPIC).unwrap(),
+                            manage_topic: false,
+                            read_topic: true,
+                            poll_messages: false,
+                            send_messages: false,
+                        }],
+                    })
+                    .collect(),
+            };
+            let alice = create_user_with(&mut inner, "alice", Some(permissions.clone()));
+            let bob = create_user_with(&mut inner, "bob", Some(permissions));
+            let mut global = empty_global();
+            global.poll_messages = true;
+            global.send_messages = true;
+            let global_user = create_user_with(
+                &mut inner,
+                "global",
+                Some(WirePermissions {
+                    global,
+                    streams: Vec::new(),
+                }),
+            );
+            let stream_only = create_user_with(
+                &mut inner,
+                "stream-only",
+                Some(WirePermissions {
+                    global: empty_global(),
+                    streams: vec![WireStreamPermissions {
+                        stream_id: u32::try_from(DELETED_STREAM).unwrap(),
+                        manage_stream: false,
+                        read_stream: false,
+                        manage_topics: false,
+                        read_topics: false,
+                        poll_messages: true,
+                        send_messages: false,
+                        topics: Vec::new(),
+                    }],
+                }),
+            );
+            let stream_only_record = |inner: &UsersInner| {
+                inner
+                    .items
+                    .get(stream_only as usize)
+                    .and_then(|user| user.permissions.clone())
+                    .unwrap()
+            };
+            let stream_only_before = stream_only_record(&inner);
+            let keeps_stream = matches!(deleted, DeletedResource::Topic { .. });
+
+            let reply = RemoveGrantsRequest { deleted }.apply(&mut inner, IggyTimestamp::now());
+            assert_eq!(reply.code, 0);
+            assert_eq!(
+                Arc::ptr_eq(&stream_only_before, &stream_only_record(&inner)),
+                keeps_stream,
+                "a stream delete must replace the stream-only record, a topic delete must keep it"
+            );
+            let users: Users = inner.into();
+            let restored = Users::from_snapshot(users.to_snapshot()).unwrap();
+            for users in [&users, &restored] {
+                let () = users.read(|inner| {
+                    let permissioner = &inner.permissioner;
+                    assert_eq!(
+                        permissioner
+                            .poll_messages(stream_only, DELETED_STREAM, TOPIC)
+                            .is_ok(),
+                        keeps_stream
+                    );
+                    for user_id in [alice, bob] {
+                        assert!(
+                            permissioner
+                                .get_topic(user_id, DELETED_STREAM, TOPIC)
+                                .is_err()
+                        );
+                        assert_eq!(
+                            permissioner
+                                .poll_messages(user_id, DELETED_STREAM, TOPIC)
+                                .is_ok(),
+                            keeps_stream
+                        );
+                        assert_eq!(
+                            permissioner
+                                .append_messages(user_id, DELETED_STREAM, TOPIC)
+                                .is_ok(),
+                            keeps_stream
+                        );
+                        assert!(permissioner.get_stream(user_id, KEPT_STREAM).is_ok());
+                        assert!(permissioner.get_topic(user_id, KEPT_STREAM, TOPIC).is_ok());
+                        assert!(
+                            permissioner
+                                .poll_messages(user_id, KEPT_STREAM, TOPIC)
+                                .is_ok()
+                        );
+                        assert!(
+                            permissioner
+                                .append_messages(user_id, KEPT_STREAM, TOPIC)
+                                .is_ok()
+                        );
+                    }
+                    assert!(
+                        permissioner
+                            .poll_messages(global_user, DELETED_STREAM, TOPIC)
+                            .is_ok()
+                    );
+                    assert!(
+                        permissioner
+                            .append_messages(global_user, DELETED_STREAM, TOPIC)
+                            .is_ok()
+                    );
+                });
+            }
+        }
     }
 
     #[test]

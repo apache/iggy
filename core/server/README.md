@@ -44,7 +44,7 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-5` storage gate also
+complete partition view changes. The `IGGY-BOUND-GRANTS-1` storage gate also
 rejects older data directories without modifying them. Existing data requires a
 separately validated offline migration or restore procedure before this release
 can use it.
@@ -199,7 +199,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-OWNERSHIP-HISTORY-5` requires this initialization contract;
+Storage format `IGGY-BOUND-GRANTS-1` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

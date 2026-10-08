@@ -38,13 +38,18 @@ use std::time::{Duration, Instant};
 
 /// What the request funnel resolves from one `connections` lookup per frame.
 ///
-/// The bound consensus session, the acting user, the transport peer address
-/// and the read-your-writes floor. `Default` (everything absent, no address,
-/// floor `0`) stands for a connection neither this map nor the bus knows.
-#[derive(Debug, Clone, Copy, Default)]
+/// The bound consensus session and its attachment, the acting user, the
+/// transport peer address and the read-your-writes floor. `Default`
+/// (everything absent, no address, floor `0`) stands for a connection neither
+/// this map nor the bus knows.
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionContext {
     /// `(client_id, session)` once register committed, `None` before.
     pub bound: Option<(u128, u64)>,
+    /// The attachment of the bound session, `None` before register committed.
+    /// The session can end while a read waits, so a read checks it again
+    /// after every await.
+    pub attachment: Option<SessionAttachment>,
     /// Acting user from `login`, `None` while still `Connected`.
     pub user_id: Option<u32>,
     /// Peer address recorded by [`SessionManager::ensure_connection`]; the
@@ -199,6 +204,10 @@ impl SessionManager {
         };
         Some(ConnectionContext {
             bound,
+            attachment: conn
+                .consumer_session
+                .as_ref()
+                .map(|(_, attachment)| attachment.clone()),
             user_id,
             address: Some(conn.address),
             metadata_watermark: conn.metadata_watermark,

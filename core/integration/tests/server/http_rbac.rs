@@ -42,6 +42,7 @@ use iggy_common::create_topic::CreateTopic;
 use integration::iggy_harness;
 use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 // Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
@@ -247,6 +248,13 @@ async fn pat_names(response: Response) -> Vec<String> {
         .collect()
 }
 
+/// The server-assigned id from a `POST /users` response, asserting 200 first.
+async fn created_user_id(response: Response) -> u64 {
+    assert_eq!(response.status(), StatusCode::OK, "create user");
+    let details: Value = response.json().await.expect("created user JSON");
+    details["id"].as_u64().expect("created user id")
+}
+
 // === Denials carry the exact HTTP status + typed JSON error body ============
 
 /// The SDK reconstructs only 401/403/404 as typed errors and collapses every
@@ -417,6 +425,182 @@ async fn given_unexpired_jwts_when_user_revoked_should_reject_reads_and_writes(
                 .await;
             }
         }
+    }
+}
+
+/// A delete frees the user's id for the next create. A token issued to the
+/// deleted account must not refresh while the id is free, and must not
+/// authenticate or refresh as the account that takes the id.
+#[iggy_harness]
+async fn given_deleted_users_jwt_when_new_user_takes_its_id_should_reject_reads_writes_and_refresh(
+    harness: &TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    let former_id = created_user_id(
+        root.create_user("former-user", "former-password", no_permissions())
+            .await,
+    )
+    .await;
+    let former = root.login("former-user", "former-password").await;
+
+    assert_eq!(
+        root.delete(&format!("/users/{former_id}")).await.status(),
+        StatusCode::NO_CONTENT,
+        "delete the former user"
+    );
+    let refresh_while_free = root.refresh(&former.token).await;
+    assert_eq!(
+        refresh_while_free.status(),
+        StatusCode::UNAUTHORIZED,
+        "a deleted user's JWT must not refresh while its id is free"
+    );
+
+    // The successor may read and create streams, so a stale token that
+    // authenticated as the successor would get a success status below.
+    let permissions = Permissions {
+        global: GlobalPermissions {
+            manage_streams: true,
+            read_streams: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let successor_id = created_user_id(
+        root.create_user(
+            "successor-user",
+            "successor-password",
+            serde_json::to_value(permissions).unwrap(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        successor_id, former_id,
+        "the successor must take the freed id"
+    );
+    let successor = root.login("successor-user", "successor-password").await;
+    assert_eq!(
+        successor.get("/streams").await.status(),
+        StatusCode::OK,
+        "the successor's own JWT must authenticate"
+    );
+
+    let read = former.get("/streams").await;
+    let write = former
+        .post_json("/streams", &json!({ "name": "stale-token-stream" }))
+        .await;
+    let refresh = root.refresh(&former.token).await;
+    for (operation, response) in [("read", read), ("write", write), ("refresh", refresh)] {
+        let context = format!("deleted user's JWT after its id is reused: {operation}");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{context} must be rejected"
+        );
+        assert_error_body(response, UNAUTHENTICATED_ID, UNAUTHENTICATED_CODE, &context).await;
+    }
+}
+
+/// A raw personal access token sent as the bearer fails the JWT decode and
+/// resolves through the PAT index instead. Its reads and writes must act as its
+/// owner, and it must stop authenticating once the owner is deleted.
+#[iggy_harness]
+async fn given_raw_pat_bearer_when_reading_and_writing_should_act_as_its_owner(
+    harness: &TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    let stream_id = root.create_stream("pat-stream").await;
+    root.create_topic("pat-stream", "pat-topic", 1).await;
+    // One stream grant and no global permission: a request that ran as root, or
+    // as a user without this grant, would get another status below.
+    let permissions = Permissions {
+        streams: Some(BTreeMap::from([(
+            stream_id as usize,
+            StreamPermissions {
+                send_messages: true,
+                ..Default::default()
+            },
+        )])),
+        ..Default::default()
+    };
+    let owner_id = created_user_id(
+        root.create_user(
+            "pat-owner",
+            "pat-owner-password",
+            serde_json::to_value(permissions).unwrap(),
+        )
+        .await,
+    )
+    .await;
+    let owner = root.login("pat-owner", "pat-owner-password").await;
+    let created = owner
+        .post_json(
+            "/personal-access-tokens",
+            &json!({ "name": "pat-bearer", "expiry": 0 }),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::OK, "create the owner's PAT");
+    let raw: Value = created.json().await.expect("raw PAT JSON");
+    let pat = owner.with_token(raw["token"].as_str().expect("raw PAT").to_owned());
+
+    let me = pat.get("/users/me").await;
+    assert_eq!(me.status(), StatusCode::OK, "a PAT read must authenticate");
+    let me: Value = me.json().await.expect("users/me JSON");
+    assert_eq!(
+        (me["id"].as_u64(), me["username"].as_str()),
+        (Some(owner_id), Some("pat-owner")),
+        "a PAT read must act as its owner"
+    );
+    assert_eq!(
+        pat.produce(
+            "pat-stream",
+            "pat-topic",
+            PARTITION_ID,
+            vec![text_message(1, "pat-msg")],
+        )
+        .await
+        .status(),
+        StatusCode::CREATED,
+        "a PAT write must carry its owner's grant"
+    );
+    let ungranted = pat
+        .post_json("/streams", &json!({ "name": "pat-owner-stream" }))
+        .await;
+    assert_eq!(
+        ungranted.status(),
+        StatusCode::FORBIDDEN,
+        "a PAT write must not act beyond its owner's grants"
+    );
+    assert_error_body(
+        ungranted,
+        UNAUTHORIZED_ID,
+        UNAUTHORIZED_CODE,
+        "PAT write without a grant",
+    )
+    .await;
+
+    assert_eq!(
+        root.delete(&format!("/users/{owner_id}")).await.status(),
+        StatusCode::NO_CONTENT,
+        "delete the owner"
+    );
+    let read = pat.get("/users/me").await;
+    let write = pat
+        .produce(
+            "pat-stream",
+            "pat-topic",
+            PARTITION_ID,
+            vec![text_message(2, "pat-msg")],
+        )
+        .await;
+    for (operation, response) in [("read", read), ("write", write)] {
+        let context = format!("deleted owner's PAT: {operation}");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{context} must be rejected"
+        );
+        assert_error_body(response, UNAUTHENTICATED_ID, UNAUTHENTICATED_CODE, &context).await;
     }
 }
 

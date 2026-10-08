@@ -746,6 +746,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     }
     let ConnectionContext {
         bound,
+        attachment,
         user_id,
         address: client_address,
         metadata_watermark,
@@ -816,6 +817,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // the per-op authz gates resolve.
             let context = ConnectionContext {
                 bound,
+                attachment,
                 user_id,
                 address: client_address,
                 metadata_watermark,
@@ -1157,24 +1159,28 @@ mod tests {
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
         FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, create_one_partition,
-        prepare_message, register_reply, request_message, test_shard,
+        create_reader_request, prepare_message, register_reply, request_message, test_shard,
     };
+    use bytes::Bytes;
     use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
-        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, POLL_MESSAGES_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE,
+        GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
+        GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE,
+        GET_POLL_ROUTING_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
     };
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
-    use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+    use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::requests::system::BindSessionRequest;
+    use iggy_binary_protocol::requests::system::{
+        BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
+    };
     use iggy_binary_protocol::requests::users::{
-        CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
+        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
     };
     use iggy_binary_protocol::{
         AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
@@ -1182,6 +1188,7 @@ mod tests {
     };
     use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
     use iggy_common::Identifier;
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
@@ -1391,6 +1398,270 @@ mod tests {
         )
         .minimum_metadata_op = metadata_op;
         read.into_generic()
+    }
+
+    #[compio::test]
+    async fn given_a_read_held_at_the_frontier_when_the_session_ends_should_refuse_stale_client() {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+
+        host.on_client_request(ROOT_TRANSPORT, held_get_me(1, UNAPPLIED_OP));
+        settle().await;
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "the read must wait for op {UNAPPLIED_OP}"
+        );
+        let metadata = shard.plane.metadata();
+        assert!(metadata.client_table.borrow_mut().end_session(
+            ROOT_CLIENT,
+            DEFAULT_ROOT_USER_ID,
+            ROOT_SESSION,
+            UNAPPLIED_OP
+        ));
+        metadata.applied_frontier().advance(UNAPPLIED_OP);
+
+        await_replies(&bus, 1).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            reply_status(&replies[0].1),
+            IggyError::StaleClient.as_code()
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_read_waiting_on_a_shard_when_the_session_ends_should_refuse_stale_client() {
+        for (code, body) in shard_waiting_reads() {
+            assert_read_refused_after_shard_wait(code, &body, true).await;
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_read_waiting_on_a_shard_when_grants_are_revoked_should_refuse_unauthorized() {
+        for (code, body) in shard_waiting_reads() {
+            assert_read_refused_after_shard_wait(code, &body, false).await;
+        }
+    }
+
+    /// Every read that asks another shard before it answers: the client reads
+    /// ask every shard, the rest ask the owner of the partition.
+    fn shard_waiting_reads() -> [(u32, Bytes); 7] {
+        let offset = GetConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+        }
+        .to_bytes();
+        [
+            (GET_CLIENTS_CODE, GetClientsRequest.to_bytes()),
+            (
+                GET_CLIENT_CODE,
+                GetClientRequest { client_id: 1 }.to_bytes(),
+            ),
+            (GET_STATS_CODE, GetStatsRequest.to_bytes()),
+            (
+                GET_PARTITION_ROUTE_CODE,
+                GetPartitionRouteRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: 0,
+                }
+                .to_bytes(),
+            ),
+            (
+                GET_POLL_ROUTING_CODE,
+                PollMessagesRequest {
+                    consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: Some(0),
+                    strategy: WirePollingStrategy::offset(0),
+                    count: 1,
+                    auto_commit: false,
+                }
+                .to_bytes(),
+            ),
+            (GET_CONSUMER_OFFSET_ROUTING_CODE, offset.clone()),
+            (GET_CONSUMER_OFFSET_CODE, offset),
+        ]
+    }
+
+    /// Send `code` from the session of a user that may read the server and
+    /// poll every stream. While the read waits on a shard, end that session or
+    /// revoke the user's grants, then let the shard answer: the read must
+    /// refuse with `StaleClient` or `Unauthorized`.
+    async fn assert_read_refused_after_shard_wait(code: u32, body: &[u8], session_ends: bool) {
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        let sessions = bind_reader_session(&shard).await;
+        let mut read = wire_request(
+            Operation::NonReplicated,
+            READER_CLIENT,
+            READER_SESSION,
+            1,
+            body,
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&code.to_le_bytes());
+        let server_config = Arc::new(ServerConfig::default());
+
+        handle_client_request(
+            &shard,
+            &sessions,
+            &server_config,
+            1,
+            &Rc::new(ClientDrain::new(&server_config)),
+            READER_TRANSPORT,
+            read.into_generic(),
+            None,
+        )
+        .await;
+        settle().await;
+        let Ok(ShardFrame::Lifecycle(frame)) = shard_inbox.try_recv() else {
+            panic!("code {code} must wait on a shard");
+        };
+        assert!(bus.client_replies.borrow().is_empty());
+        let metadata = shard.plane.metadata();
+        if session_ends {
+            assert!(metadata.client_table.borrow_mut().end_session(
+                READER_CLIENT,
+                READER,
+                READER_SESSION,
+                READER_SESSION + 1
+            ));
+        } else {
+            let revoke = UpdatePermissionsRequest {
+                user_id: WireIdentifier::numeric(READER),
+                permissions: None,
+            };
+            let revoked = metadata
+                .mux_stm
+                .update(prepare_message(
+                    Operation::UpdatePermissions,
+                    0,
+                    4,
+                    &revoke.to_bytes(),
+                ))
+                .unwrap();
+            assert_eq!(revoked.code, 0);
+        }
+        answer_shard_read(code, frame);
+
+        await_replies(&bus, 1).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "code {code} must answer once");
+        let refusal = if session_ends {
+            IggyError::StaleClient
+        } else {
+            IggyError::Unauthorized
+        };
+        assert_eq!(
+            reply_status(&replies[0].1),
+            refusal.as_code(),
+            "code {code} must refuse once its {} ended",
+            if session_ends { "session" } else { "grants" }
+        );
+    }
+
+    /// The user of [`create_reader_request`], the first one after root, and
+    /// its session.
+    const READER: u32 = 1;
+    const READER_CLIENT: u128 = 10;
+    const READER_TRANSPORT: u128 = 20;
+    const READER_SESSION: u64 = 1;
+    const READER_SECRET: [u8; 32] = [0x5a; 32];
+
+    /// Create the reader, commit its session, and bind `READER_TRANSPORT` to
+    /// that session.
+    async fn bind_reader_session(shard: &Rc<TestShard>) -> Rc<RefCell<SessionManager>> {
+        let metadata = shard.plane.metadata();
+        let created = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                0,
+                3,
+                &create_reader_request().to_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(created.code, 0);
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                READER_CLIENT,
+                READER,
+                bind_verifier(READER_CLIENT, READER, &READER_SECRET),
+                register_reply(READER_CLIENT, READER_SESSION),
+            )
+            .unwrap();
+        metadata.applied_frontier().advance(READER_SESSION);
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            READER_TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+        complete_session_binding(
+            shard,
+            &sessions,
+            READER_TRANSPORT,
+            SessionIdentity {
+                client_id: READER_CLIENT,
+                session: READER_SESSION,
+                metadata_watermark: READER_SESSION,
+            },
+            BindSecret::new(Box::new(READER_SECRET)),
+        )
+        .await
+        .unwrap();
+        sessions
+    }
+
+    /// Answer `frame` of the read `code` the way a shard does when it has no
+    /// clients, is the partition primary and holds a stored offset.
+    fn answer_shard_read(code: u32, frame: LifecycleFrame) {
+        const STORED_OFFSET: u64 = 5;
+        match frame {
+            LifecycleFrame::ListClients {
+                reply: ListClientsReply::Clients(reply),
+            } => reply.try_send(Vec::new()).unwrap(),
+            LifecycleFrame::ListClients {
+                reply: ListClientsReply::Count(reply),
+            } => reply.try_send(0).unwrap(),
+            LifecycleFrame::PartitionRead {
+                read: PartitionRead::Primary,
+                reply,
+                ..
+            } => reply
+                .try_send(PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                })
+                .unwrap(),
+            LifecycleFrame::PartitionRead {
+                read: PartitionRead::ConsumerOffset { .. },
+                reply,
+                ..
+            } => reply
+                .try_send(PartitionReadReply::ConsumerOffset {
+                    stored: Some(STORED_OFFSET),
+                    current_offset: STORED_OFFSET,
+                })
+                .unwrap(),
+            _ => panic!("code {code} sent an unexpected frame"),
+        }
     }
 
     #[compio::test]

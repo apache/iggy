@@ -141,17 +141,19 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
+    verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _, _)| user_id)
 }
 
-/// Like [`verify_pat_credentials`] but also surfaces the token's expiry (unix
-/// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
-/// per-token VSR session table on this expiry for lazy eviction; the wire and
-/// login paths only need the user id and go through [`verify_pat_credentials`].
+/// Like [`verify_pat_credentials`] but also surfaces the owner's `created_at`,
+/// from the same read so it names the token's owner, and the token's expiry
+/// (unix seconds, `u64::MAX` when the PAT never expires). The HTTP extractor
+/// keys a per-token VSR session table on this expiry for lazy eviction; the
+/// wire and login paths only need the user id and go through
+/// [`verify_pat_credentials`].
 pub fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<(u32, u64), LoginRegisterError>
+) -> Result<(u32, IggyTimestamp, u64), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -195,7 +197,7 @@ where
         let expiry = pat
             .expiry_at
             .map_or(u64::MAX, |expiry_at| expiry_at.to_secs());
-        Ok((user.id, expiry))
+        Ok((user.id, user.created_at, expiry))
     })
 }
 
