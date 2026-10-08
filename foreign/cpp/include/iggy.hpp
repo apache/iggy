@@ -718,11 +718,10 @@ class Permissions final {
  * other has not read yet. Give every independent consumer its own name.
  *
  * @code{.cpp}
- * const auto strategy{iggy::PollingStrategy::Next()};
- * const auto polled{client->poll_messages(stream, topic, iggy::kAnyPartitionId,
- *                                         iggy::Consumer::Group("my-group"),
- *                                         std::string(strategy.Kind()),
- *                                         strategy.Value(), 10, true)};
+ * const auto polled{client.PollMessages(
+ *     stream, topic, std::nullopt,
+ *     iggy::Consumer::Group(iggy::Identifier::String("my-group")),
+ *     iggy::PollingStrategy::Next(), 10, true)};
  * @endcode
  */
 class Consumer final {
@@ -738,41 +737,11 @@ class Consumer final {
     static Consumer Single(Identifier id) { return Consumer(Kind::Single, std::move(id)); }
 
     /**
-     * @brief Creates a named consumer for the low-level client.
-     * @param id Consumer name.
-     * @return Consumer accepted by the low-level client.
-     * @throws IggyException if @p id is empty or longer than 255 bytes.
-     */
-    static ffi::Consumer Single(std::string id) { return ToFfi(Kind::Single, Identifier::String(std::move(id))); }
-
-    /**
-     * @brief Creates a numbered consumer for the low-level client.
-     * @param id Consumer number.
-     * @return Consumer accepted by the low-level client.
-     */
-    static ffi::Consumer Single(std::uint32_t id) { return ToFfi(Kind::Single, Identifier::Numeric(id)); }
-
-    /**
      * @brief Identifies a consumer group.
      * @param id Consumer group ID or name.
      * @return Consumer group identity.
      */
     static Consumer Group(Identifier id) { return Consumer(Kind::Group, std::move(id)); }
-
-    /**
-     * @brief Creates a named consumer group for the low-level client.
-     * @param id Consumer group name.
-     * @return Consumer group accepted by the low-level client.
-     * @throws IggyException if @p id is empty or longer than 255 bytes.
-     */
-    static ffi::Consumer Group(std::string id) { return ToFfi(Kind::Group, Identifier::String(std::move(id))); }
-
-    /**
-     * @brief Creates a numbered consumer group for the low-level client.
-     * @param id Consumer group number.
-     * @return Consumer group accepted by the low-level client.
-     */
-    static ffi::Consumer Group(std::uint32_t id) { return ToFfi(Kind::Group, Identifier::Numeric(id)); }
 
     /**
      * @brief Returns the kind of consumer represented by this value.
@@ -791,12 +760,10 @@ class Consumer final {
   private:
     Consumer(Kind kind, Identifier id) : kind_(kind), id_(std::move(id)) {}
 
-    [[nodiscard]] ffi::Consumer ToFfi() const { return ToFfi(kind_, id_); }
-
-    [[nodiscard]] static ffi::Consumer ToFfi(Kind kind, const Identifier &id) {
+    [[nodiscard]] ffi::Consumer ToFfi() const {
         ffi::Consumer consumer{};
-        consumer.kind = kind == Kind::Single ? ffi::ConsumerKind::Consumer : ffi::ConsumerKind::ConsumerGroup;
-        consumer.id   = id.ToFfi();
+        consumer.kind = kind_ == Kind::Single ? ffi::ConsumerKind::Consumer : ffi::ConsumerKind::ConsumerGroup;
+        consumer.id   = id_.ToFfi();
         return consumer;
     }
 
@@ -3291,11 +3258,12 @@ class PollingStrategy final {
 /**
  * @brief Partition value that names no partition.
  *
- * Polling a consumer group with it reads one of the partitions assigned to the
- * polling member, taking the next one on every call. Polling a regular consumer
- * with it reads partition 0, and so does `get_consumer_offset(...)`.
+ * Low-level polling of a consumer group with it reads one of the partitions
+ * assigned to the polling member, taking the next one on every call. A regular
+ * consumer reads partition 0, and so does `get_consumer_offset(...)`.
  * `store_consumer_offset(...)` and `delete_consumer_offset(...)` reject it and
- * need an explicit partition.
+ * need an explicit partition. High-level calls express the same omission with
+ * `std::nullopt`.
  */
 inline constexpr std::uint32_t kAnyPartitionId{std::numeric_limits<std::uint32_t>::max()};
 
