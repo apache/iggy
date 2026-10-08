@@ -21,7 +21,6 @@ enabled = true
 version = 0
 name = "QuestDB sink"
 path = "../../target/release/libiggy_connector_questdb_sink"
-plugin_config_format = "toml"
 verbose = false
 
 [[streams]]
@@ -33,11 +32,14 @@ poll_interval = "5ms"
 consumer_group = "questdb_sink"
 
 [plugin_config]
-# QuestDB connect string. Use `wss::` for TLS. Store-and-forward is opt-in via
-# `sf_dir`: with it set, frames are persisted before being sent and replayed
-# after a disconnect or a runtime restart. See
+# QuestDB connect string. Use `wss::` for TLS. See
 # https://questdb.com/docs/connect/clients/connect-string/
-connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
+connection_string = "ws::addr=localhost:9000;"
+# Store-and-forward is opt-in through `sf_dir`: frames are persisted before
+# they are sent and replayed after a disconnect or a runtime restart. The
+# directory's parent must exist and be writable by the runtime, and each
+# connector instance needs its own `sender_id` or its own `sf_dir`.
+# connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
 table = "iggy_events"
 
 # message | origin | payload | server
@@ -90,7 +92,8 @@ max_flush_bytes = 1000000
 #
 # A DOUBLE is exact for integers only up to 2^53. For a nanosecond epoch, a
 # snowflake id or a hash, name the column in integer_columns above rather than
-# turning this off.
+# turning this off. The first value past that limit is reported once per
+# connector as a warning naming the column.
 #
 # Turn it off only when every numeric field is a genuine integer AND the table
 # is pre-created with explicit column types. Otherwise a column holding a

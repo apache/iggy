@@ -16,6 +16,7 @@
 // under the License.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -25,6 +26,8 @@ use questdb::ingress::{Buffer, ColumnName, TimestampMicros, TimestampNanos};
 use simd_json::OwnedValue;
 use simd_json::prelude::{ValueAsArray, ValueAsObject};
 use simd_json::value::StaticNode;
+use tracing::warn;
+use uuid::Uuid;
 
 /// Where the designated timestamp comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,7 +109,7 @@ impl TimestampUnit {
 /// server's `cairo.max.file.name.length`, whose default this matches; a server
 /// configured lower will refuse a name this accepts, which the caller recovers
 /// from as an ordinary rejection.
-const MAX_COLUMN_NAME_LEN: usize = 127;
+pub(crate) const MAX_NAME_LEN: usize = 127;
 
 /// A message that could not be turned into a row. The batch continues; the
 /// caller counts and logs these.
@@ -155,6 +158,7 @@ impl ColumnNames {
             .any(|configured| configured.eq_ignore_ascii_case(name))
     }
 
+    #[cfg(test)]
     pub fn insert(&mut self, name: String) {
         if !self.contains(&name) {
             self.0.push(name);
@@ -181,6 +185,10 @@ pub struct Mapping {
     pub symbol_columns: ColumnNames,
     pub uuid_columns: ColumnNames,
     /// Columns that stay `LONG` while [`Mapping::numbers_as_double`] is on.
+    ///
+    /// The list also pins the type when `numbers_as_double` is off: a
+    /// fractional value in a listed column is rejected either way, because
+    /// storing it as a `DOUBLE` would break the type the declaration pinned.
     pub integer_columns: ColumnNames,
     pub timestamp_source: TimestampSource,
     pub timestamp_field: Option<String>,
@@ -205,6 +213,9 @@ pub struct Mapping {
     /// numeric field is a genuine integer and the table was pre-created, since
     /// otherwise a whole-valued first window creates the column as a `LONG`.
     pub numbers_as_double: bool,
+    /// Set once the first integer was rounded on its way to a `DOUBLE`, so the
+    /// warning about it is logged once per connector rather than per row.
+    pub precision_warned: AtomicBool,
 }
 
 /// Per-batch context that is constant across every row.
@@ -363,7 +374,7 @@ impl Mapping {
     }
 
     /// Column names this connector emits itself for every row.
-    fn reserved_columns(&self) -> impl Iterator<Item = &'static str> {
+    pub(crate) fn reserved_columns(&self) -> impl Iterator<Item = &'static str> {
         [
             ("stream", self.include_stream_column),
             ("topic", self.include_topic_column),
@@ -418,15 +429,31 @@ impl Mapping {
                 .ok_or_else(|| RowError::Invalid(format!("column {name} is not a valid UUID")))?;
             return Ok(PreparedValue::Uuid(lo, hi));
         }
-        let as_double = self.numbers_as_double && !self.integer_columns.contains(name);
+        // A column declared an integer has to hold a number, for the same
+        // reason as the UUID guard above: any other type would create or pin
+        // the column as something the declaration ruled out.
+        let declared_integer = self.integer_columns.contains(name);
+        if declared_integer
+            && !matches!(
+                value,
+                OwnedValue::Static(StaticNode::I64(_) | StaticNode::U64(_) | StaticNode::F64(_))
+            )
+        {
+            return Err(RowError::Invalid(format!(
+                "column {name} is listed in integer_columns but its value is not a number"
+            )));
+        }
+        // The rejection reasons below name the column and never the value: the
+        // reason reaches the error log whatever `log_rejected_payload` says.
+        let as_double = self.numbers_as_double && !declared_integer;
         match value {
             OwnedValue::Static(StaticNode::Bool(flag)) => Ok(PreparedValue::Bool(*flag)),
-            OwnedValue::Static(StaticNode::I64(number)) if as_double => {
-                Ok(PreparedValue::F64(*number as f64))
-            }
-            OwnedValue::Static(StaticNode::U64(number)) if as_double => {
-                Ok(PreparedValue::F64(*number as f64))
-            }
+            OwnedValue::Static(StaticNode::I64(number)) if as_double => Ok(PreparedValue::F64(
+                self.widen(name, *number as f64, *number as f64 as i64 == *number),
+            )),
+            OwnedValue::Static(StaticNode::U64(number)) if as_double => Ok(PreparedValue::F64(
+                self.widen(name, *number as f64, *number as f64 as u64 == *number),
+            )),
             OwnedValue::Static(StaticNode::I64(number)) => Ok(PreparedValue::I64(*number)),
             // QuestDB has no unsigned 64-bit column, so anything past `i64::MAX`
             // would wrap. A column the operator declared an integer is refused
@@ -435,23 +462,23 @@ impl Mapping {
             // which is what `numbers_as_double` would have done anyway.
             OwnedValue::Static(StaticNode::U64(number)) => match i64::try_from(*number) {
                 Ok(number) => Ok(PreparedValue::I64(number)),
-                Err(_) if self.integer_columns.contains(name) => Err(RowError::Invalid(format!(
-                    "column {name} is listed in integer_columns but {number} is larger than a QuestDB LONG"
+                Err(_) if declared_integer => Err(RowError::Invalid(format!(
+                    "column {name} is listed in integer_columns but its value is larger than a QuestDB LONG"
                 ))),
-                Err(_) => Ok(PreparedValue::F64(*number as f64)),
+                Err(_) => Ok(PreparedValue::F64(self.widen(name, *number as f64, false))),
             },
             // A declared integer column takes a float whose value is whole,
             // because JSON gives no way to tell `20` from `20.0`. A genuinely
             // fractional value is refused: rounding it would store something the
             // producer did not send, and sending it as a `DOUBLE` would break
             // the type the declaration pinned.
-            OwnedValue::Static(StaticNode::F64(number)) if self.integer_columns.contains(name) => {
+            OwnedValue::Static(StaticNode::F64(number)) if declared_integer => {
                 let number = *number;
                 if number.fract() == 0.0 && number >= i64::MIN as f64 && number <= i64::MAX as f64 {
                     Ok(PreparedValue::I64(number as i64))
                 } else {
                     Err(RowError::Invalid(format!(
-                        "column {name} is listed in integer_columns but {number} is not a whole number in range"
+                        "column {name} is listed in integer_columns but its value is not a whole number in range"
                     )))
                 }
             }
@@ -470,6 +497,22 @@ impl Mapping {
         }
     }
 
+    /// Hands back the widened number, and says so once if the widening lost
+    /// precision.
+    ///
+    /// A `DOUBLE` carries integers exactly only up to 2^53. The README states
+    /// the limit, but an operator who missed it would otherwise get rounded
+    /// identifiers with no signal at all, so the first lossy conversion is
+    /// logged, once per connector, naming the column and the remedy.
+    fn widen(&self, name: &str, widened: f64, exact: bool) -> f64 {
+        if !exact && !self.precision_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; list the column in integer_columns to keep it exact. This is reported once per connector."
+            );
+        }
+        widened
+    }
+
     /// Resolves the designated timestamp, rejecting a value `Buffer::at` would
     /// refuse.
     ///
@@ -485,16 +528,14 @@ impl Mapping {
     ) -> Result<PreparedTimestamp, RowError> {
         match self.timestamp_source {
             TimestampSource::Server => Ok(PreparedTimestamp::Now),
-            TimestampSource::Message => {
-                validate_micros("message timestamp", message.timestamp)?;
-                Ok(PreparedTimestamp::Micros(micros_or_now(message.timestamp)))
-            }
-            TimestampSource::Origin => {
-                validate_micros("origin timestamp", message.origin_timestamp)?;
-                Ok(PreparedTimestamp::Micros(micros_or_now(
-                    message.origin_timestamp,
-                )))
-            }
+            TimestampSource::Message => Ok(PreparedTimestamp::Micros(micros_timestamp(
+                "message timestamp",
+                message.timestamp,
+            )?)),
+            TimestampSource::Origin => Ok(PreparedTimestamp::Micros(micros_timestamp(
+                "origin timestamp",
+                message.origin_timestamp,
+            )?)),
             TimestampSource::Payload => {
                 let field = self
                     .timestamp_field
@@ -653,28 +694,24 @@ enum PreparedTimestamp {
     Nanos(TimestampNanos),
 }
 
-/// Rejects a microsecond timestamp the buffer would refuse.
+/// Turns an Apache Iggy microsecond timestamp into one the buffer will accept.
 ///
 /// Apache Iggy carries these as `u64` and the client takes an `i64`, so a value
 /// above `i64::MAX` wraps negative. `Buffer::at` refuses a negative value
 /// without rolling the row back, which is the one input that leaves a partial
-/// row, so it is caught before anything is written.
-fn validate_micros(label: &str, micros: u64) -> Result<(), RowError> {
+/// row, so it is caught before anything is written. `0` means unset in Apache
+/// Iggy, so the row falls back to the server clock rather than landing at the
+/// Unix epoch.
+fn micros_timestamp(label: &str, micros: u64) -> Result<TimestampMicros, RowError> {
     if micros > i64::MAX as u64 {
         return Err(RowError::Invalid(format!(
             "{label} {micros} is too large for a QuestDB timestamp"
         )));
     }
-    Ok(())
-}
-
-/// `timestamp == 0` means unset in Apache Iggy, so the row falls back to the
-/// server clock rather than landing at the Unix epoch.
-fn micros_or_now(micros: u64) -> TimestampMicros {
     if micros == 0 {
-        TimestampMicros::now()
+        Ok(TimestampMicros::now())
     } else {
-        TimestampMicros::new(micros as i64)
+        Ok(TimestampMicros::new(micros as i64))
     }
 }
 
@@ -726,9 +763,9 @@ fn scalar_to_symbol(value: &OwnedValue) -> Option<Cow<'_, str>> {
 /// so without this an over-long name is only refused once the row is half
 /// written.
 fn validate_name(name: &str) -> Result<(), RowError> {
-    if name.len() > MAX_COLUMN_NAME_LEN {
+    if name.len() > MAX_NAME_LEN {
         return Err(RowError::Invalid(format!(
-            "column {name} is longer than the {MAX_COLUMN_NAME_LEN} characters QuestDB allows"
+            "column {name} is longer than the {MAX_NAME_LEN} bytes QuestDB allows"
         )));
     }
     ColumnName::new(name)
@@ -846,31 +883,9 @@ fn flat_array(items: &[OwnedValue]) -> Option<Vec<f64>> {
 /// doc comment describes the little-endian *wire* layout instead, and taking
 /// that literally writes a byte-reversed UUID with no error.
 fn parse_uuid(text: &str) -> Option<(u64, u64)> {
-    let mut bytes = [0u8; 16];
-    let mut written = 0usize;
-    let mut nibble: Option<u8> = None;
-    for character in text.chars() {
-        if character == '-' {
-            continue;
-        }
-        let value = character.to_digit(16)? as u8;
-        match nibble {
-            None => nibble = Some(value),
-            Some(high) => {
-                if written == bytes.len() {
-                    return None;
-                }
-                bytes[written] = (high << 4) | value;
-                written += 1;
-                nibble = None;
-            }
-        }
-    }
-    if written != bytes.len() || nibble.is_some() {
-        return None;
-    }
-    let hi = u64::from_be_bytes(bytes[0..8].try_into().ok()?);
-    let lo = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+    // `as_u64_pair` is `(most significant, least significant)`, so the halves
+    // are swapped into the `(lo, hi)` order `column_uuid` takes.
+    let (hi, lo) = Uuid::parse_str(text).ok()?.as_u64_pair();
     Some((lo, hi))
 }
 
@@ -889,7 +904,7 @@ mod tests {
     /// the first write when a column is repeated in a row. The ILP buffer has
     /// none of those rules, so a test that needs them cannot use `buffer()`.
     fn qwp_buffer() -> Buffer {
-        Buffer::qwp_ws_with_max_name_len(MAX_COLUMN_NAME_LEN)
+        Buffer::qwp_ws_with_max_name_len(MAX_NAME_LEN)
     }
 
     /// `Buffer::new` yields an ILP buffer, which is what makes the rendering
@@ -920,6 +935,7 @@ mod tests {
             // The production default, so the common path is what the tests
             // exercise. The tests that pin integer typing set it back.
             numbers_as_double: true,
+            precision_warned: AtomicBool::new(false),
         }
     }
 
@@ -1250,7 +1266,7 @@ mod tests {
     /// them is visible as a change of error kind, not only of message.
     #[test]
     fn given_inputs_the_client_would_refuse_when_appending_should_reject_the_row() {
-        let long_name = "a".repeat(MAX_COLUMN_NAME_LEN + 1);
+        let long_name = "a".repeat(MAX_NAME_LEN + 1);
         let cases: &[(&str, Mapping, String)] = &[
             (
                 "name longer than the column limit",
@@ -1704,6 +1720,135 @@ mod tests {
             .unwrap();
 
         assert!(rendered(&buffer).contains("count=20i"));
+    }
+
+    #[test]
+    fn given_an_integer_column_holding_a_non_number_when_appending_should_reject_the_row() {
+        // Any other type would create or pin the declared LONG column as
+        // something else, which is the same harm the uuid_columns guard
+        // prevents, so every non-numeric variant is refused before a write.
+        for payload in [
+            r#"{"count":"20"}"#,
+            r#"{"count":true}"#,
+            r#"{"count":[1,2]}"#,
+            r#"{"count":{"n":1}}"#,
+        ] {
+            let mut mapping = mapping();
+            mapping.integer_columns.insert("count".to_owned());
+            let mut buffer = qwp_buffer();
+            let error = mapping
+                .append_row(&mut buffer, &json_message(payload), context())
+                .unwrap_err();
+            assert!(
+                matches!(&error, RowError::Invalid(reason) if reason.contains("not a number")),
+                "{payload}: {error:?}"
+            );
+            assert_eq!(buffer.row_count(), 0, "{payload}");
+        }
+    }
+
+    #[test]
+    fn given_an_integer_column_rejection_when_logged_should_not_carry_the_value() {
+        // The reason reaches the error log whatever log_rejected_payload says,
+        // so it names the column and never the payload value.
+        for (payload, value) in [
+            (r#"{"count":20.5}"#, "20.5"),
+            (r#"{"count":18446744073709551615}"#, "18446744073709551615"),
+            (r#"{"count":"20"}"#, "\"20\""),
+        ] {
+            let mut mapping = mapping();
+            mapping.integer_columns.insert("count".to_owned());
+            let error = mapping
+                .append_row(&mut qwp_buffer(), &json_message(payload), context())
+                .unwrap_err();
+            let RowError::Invalid(reason) = error else {
+                panic!("{payload}: expected a mapping rejection, got {error:?}");
+            };
+            assert!(
+                reason.contains("count") && !reason.contains(value),
+                "{payload}: the reason must name the column and not the value: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_number_past_2_to_53_when_widened_should_warn_once_per_connector() {
+        // The README states the limit; this is the runtime signal for an
+        // operator who missed it. The flag is what the test can observe.
+        let mapping = mapping();
+        mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"small":42,"temp":20.5}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(
+            !mapping.precision_warned.load(Ordering::Relaxed),
+            "an exact widening must not warn"
+        );
+
+        mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"big":9007199254740993}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(mapping.precision_warned.load(Ordering::Relaxed));
+
+        // A declared integer column is never widened, so it never trips it.
+        let mut declared = Mapping {
+            precision_warned: AtomicBool::new(false),
+            ..mapping
+        };
+        declared.integer_columns.insert("big".to_owned());
+        declared
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"big":9007199254740993}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(!declared.precision_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn given_a_raw_header_when_appending_should_write_it_as_base64() {
+        // `to_string_value` Debug-formats a Raw value, which would store the
+        // literal text b"\x01\x02\xff"; base64 keeps the bytes recoverable.
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::from_raw(HeaderKind::String, b"bin").unwrap(),
+            HeaderValue::from_raw(HeaderKind::Raw, &[1, 2, 255]).unwrap(),
+        );
+        message.headers = Some(headers);
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("header_bin=\"AQL/\""), "{line}");
+    }
+
+    #[test]
+    fn given_an_over_long_column_name_when_appending_should_say_bytes() {
+        // The check counts bytes, which matches the client and the server
+        // limit, so the message says bytes rather than characters.
+        let name = "é".repeat(64);
+        let payload = format!(r#"{{"{name}":1}}"#);
+        let error = mapping()
+            .append_row(&mut qwp_buffer(), &json_message(&payload), context())
+            .unwrap_err();
+        let RowError::Invalid(reason) = error else {
+            panic!("expected a mapping rejection, got {error:?}");
+        };
+        assert!(reason.contains("bytes QuestDB allows"), "{reason}");
     }
 
     #[test]

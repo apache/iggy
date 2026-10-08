@@ -20,7 +20,7 @@ mod mapping;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
@@ -40,15 +40,13 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-pub use mapping::{Mapping, RowContext, RowError, TimestampSource, TimestampUnit};
+use mapping::{MAX_NAME_LEN, Mapping, RowContext, RowError, TimestampSource, TimestampUnit};
 
 sink_connector!(QuestDbSink);
 
 const CONNECTOR_NAME: &str = "QuestDB sink";
 const DEFAULT_BATCH_SIZE: u32 = 1000;
-const DEFAULT_FLUSH_TIMEOUT: &str = "30s";
-/// `DEFAULT_FLUSH_TIMEOUT` parsed, so the text and the fallback cannot drift.
-const DEFAULT_FLUSH_TIMEOUT_DURATION: Duration = Duration::from_secs(30);
+const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Rejections are logged one line per record so a bad message can be traced
 /// back to its offset. A batch where every record is malformed would otherwise
@@ -72,13 +70,11 @@ const PENDING_ACK_BATCHES_BEFORE_ESCALATION: u64 = 10;
 /// an error, taking down any `wss://` connection attempt. Installing one up
 /// front makes the choice explicit.
 ///
-/// The slot is process-wide and shared. The Apache Iggy client installs into it
-/// too, `aws-lc-rs` from `core/sdk/src/tcp/tcp_client.rs` and `ring` from
-/// `core/sdk/src/quic/quic_client.rs`, so whichever runs first decides for the
-/// whole process. Every one of those providers is correct, and the first install
-/// wins rather than failing. This runs only for a connect string that needs TLS,
-/// which keeps a plain `ws://` sink from deciding TLS for a component that does
-/// use it.
+/// The plugin is a dlopened cdylib with its own copy of `rustls`, so this
+/// install reaches the plugin's slot only and cannot affect the host. Inside
+/// the plugin the slot is still process-wide, which is why the install runs
+/// once and ignores a second attempt. This runs only for a connect string that
+/// needs TLS, so a plain `ws://` sink makes no choice it does not use.
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
 fn ensure_crypto_provider() {
@@ -202,18 +198,18 @@ impl QuestDbSink {
             AckLevel::Ok
         });
 
-        let raw_timeout = config
-            .flush_timeout
-            .as_deref()
-            .unwrap_or(DEFAULT_FLUSH_TIMEOUT);
-        let flush_timeout = HumanDuration::from_str(raw_timeout)
-            .map(|duration| *duration)
-            .unwrap_or_else(|_| {
-                warn!(
-                    "Invalid flush_timeout for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_FLUSH_TIMEOUT}"
-                );
-                DEFAULT_FLUSH_TIMEOUT_DURATION
-            });
+        let flush_timeout = match config.flush_timeout.as_deref() {
+            None => DEFAULT_FLUSH_TIMEOUT,
+            Some(raw) => HumanDuration::from_str(raw)
+                .map(|duration| *duration)
+                .unwrap_or_else(|_| {
+                    warn!(
+                        "Invalid flush_timeout for {CONNECTOR_NAME} ID: {id}, defaulting to {}",
+                        humantime::format_duration(DEFAULT_FLUSH_TIMEOUT)
+                    );
+                    DEFAULT_FLUSH_TIMEOUT
+                }),
+        };
         // The client reads a zero timeout as "no deadline". At the default ack
         // level the sink treats it as fire and forget and never calls `wait`,
         // but a durable ack level has to wait, so the pair would block the FFI
@@ -226,7 +222,14 @@ impl QuestDbSink {
 
         // A bad table name fails on every row of every batch, so it is caught
         // once at construction instead of being reported per record forever.
-        if let Err(error) = TableName::new(config.table.as_str()) {
+        // `TableName::new` checks the characters only; the length limit lives
+        // on the buffer, so it is checked here against the same bound.
+        if config.table.len() > MAX_NAME_LEN {
+            reject(Error::InvalidConfigValue(format!(
+                "table {} is longer than the {MAX_NAME_LEN} bytes QuestDB allows",
+                config.table
+            )));
+        } else if let Err(error) = TableName::new(config.table.as_str()) {
             reject(Error::InvalidConfigValue(format!(
                 "table {} is not a valid QuestDB table name: {error}",
                 config.table
@@ -259,6 +262,7 @@ impl QuestDbSink {
             include_offset_column: config.include_offset_column.unwrap_or(false),
             include_headers: config.include_headers.unwrap_or(false),
             numbers_as_double: config.numbers_as_double.unwrap_or(true),
+            precision_warned: AtomicBool::new(false),
         };
         if let Err(error) = validate_column_overlap(&mapping) {
             reject(error);
@@ -305,7 +309,7 @@ impl QuestDbSink {
         topic_metadata: &TopicMetadata,
         partition_id: u32,
         already_logged: usize,
-    ) -> Result<BatchOutcome, Error> {
+    ) -> Result<BatchOutcome, ChunkFailure> {
         let mapping = Arc::clone(&self.mapping);
         let stream = topic_metadata.stream.clone();
         let topic = topic_metadata.topic.clone();
@@ -318,29 +322,118 @@ impl QuestDbSink {
         // `questdb-rs` is synchronous: the QWP driver owns its own I/O thread
         // and `flush` / `wait` block. Row building is cheap but is done here
         // too, so the whole batch crosses the boundary exactly once.
-        let handle = tokio::task::spawn_blocking(move || -> Result<BatchOutcome, FlushError> {
-            let mut sender = db.borrow_sender().map_err(FlushError::publishing)?;
-            let mut buffer = sender.new_buffer();
+        let handle = tokio::task::spawn_blocking(move || -> Result<BatchOutcome, ChunkStop> {
             let context = RowContext {
                 stream: &stream,
                 topic: &topic,
                 partition_id,
             };
-
-            let mut outcome = BatchOutcome::default();
-            // How many rows are sitting in the current buffer, unflushed.
-            let mut buffered = 0usize;
             let flush_context = FlushContext {
                 id,
                 stream: &stream,
                 topic: &topic,
                 partition_id,
             };
-            for message in &messages {
-                // Flush before the buffer can outgrow the QWP per-frame cap.
-                // `batch_size` bounds rows, not bytes, so a batch of wide rows
-                // would otherwise be rejected whole and lose every row in it.
-                if buffered > 0 && buffer.len() >= max_flush_bytes {
+            // The loop borrows `messages`; the error path needs to hand them
+            // back whole, so the loop runs in its own scope and reports where
+            // it stopped rather than returning the failure directly.
+            let stopped = (|| -> Result<BatchOutcome, (FlushError, usize, usize)> {
+                let mut sender = db
+                    .borrow_sender()
+                    .map_err(|error| (FlushError::borrowing(error), 0, 0))?;
+                let mut buffer = sender.new_buffer();
+                let mut outcome = BatchOutcome::default();
+                // Index of the first message in the buffer. Only read when the
+                // buffer is not empty, and set when a row makes it so.
+                let mut window_start = 0usize;
+                for (index, message) in messages.iter().enumerate() {
+                    // Flush before the buffer can outgrow the QWP per-frame
+                    // cap. `batch_size` bounds rows, not bytes, so a batch of
+                    // wide rows would otherwise be rejected whole and lose
+                    // every row in it.
+                    if buffer.row_count() > 0 && buffer.len() >= max_flush_bytes {
+                        flush_window(
+                            &mut sender,
+                            &mut buffer,
+                            ack_level,
+                            flush_timeout,
+                            &mut outcome,
+                            &flush_context,
+                        )
+                        .map_err(|failure| (failure, window_start, index))?;
+                    }
+
+                    let reason = match mapping.append_row(&mut buffer, message, context) {
+                        Ok(()) => {
+                            if buffer.row_count() == 1 {
+                                window_start = index;
+                            }
+                            outcome.rows_written += 1;
+                            continue;
+                        }
+                        Err(RowError::Invalid(reason)) => reason,
+                        // The record reached the buffer and was refused there, by
+                        // a rule only the buffer knows: a column's type is pinned by
+                        // whichever row defined it first, so a later row disagreeing
+                        // with it cannot be judged from that row alone. The client
+                        // rolls the half-written row back before returning the error,
+                        // on every column and symbol setter, so the buffer is still
+                        // usable and only this record is lost.
+                        Err(RowError::Client(error)) => error.to_string(),
+                        // `Buffer::at` refused the row without rolling it back, so
+                        // the buffer holds a partial row and nothing can remove it.
+                        // The rows already accepted are still good, so flush them
+                        // and start a fresh buffer rather than losing the window.
+                        // `Mapping::prepare_timestamp` rejects every value `at`
+                        // would refuse, which is what keeps this unreachable.
+                        Err(RowError::Unrecoverable(error)) => {
+                            // The partial row cannot be removed, and publishing
+                            // the buffer would risk carrying it along, so the
+                            // whole window goes. The rows already counted as
+                            // written are uncounted again rather than reported
+                            // as delivered.
+                            let discarded = buffer.row_count();
+                            error!(
+                                "{CONNECTOR_NAME} ID: {id} discarded {discarded} unflushed rows after the client refused a designated timestamp, stream: {stream}, topic: {topic}, partition_id: {partition_id}: {error}"
+                            );
+                            outcome.rows_written -= discarded;
+                            outcome.rejected_rows += discarded;
+                            buffer = sender.new_buffer();
+                            error.to_string()
+                        }
+                    };
+
+                    // A rejected record is unrecoverable: the runtime commits
+                    // the offset before `consume` runs (#2928) and never
+                    // replays a batch (#2927), so this log line is the only
+                    // trace that survives. Log the identity needed to find the
+                    // message, one line per record rather than a batch summary.
+                    outcome.rejected_rows += 1;
+                    if should_log_rejection(already_logged, outcome.rejected_rows) {
+                        let payload = if log_payload {
+                            format!(", payload: {}", payload_preview(&message.payload))
+                        } else {
+                            String::new()
+                        };
+                        error!(
+                            "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}{payload}",
+                            message.offset, message.id
+                        );
+                    } else {
+                        // Past the cap the line drops to `debug` rather than
+                        // disappearing. The record is unrecoverable either
+                        // way, so an operator tracing a bad producer still
+                        // needs its identity, while `error` stays bounded for
+                        // alerting.
+                        debug!(
+                            "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}",
+                            message.offset, message.id
+                        );
+                    }
+                    outcome.last_rejection = Some(reason);
+                }
+
+                if buffer.row_count() > 0 {
                     flush_window(
                         &mut sender,
                         &mut buffer,
@@ -348,95 +441,69 @@ impl QuestDbSink {
                         flush_timeout,
                         &mut outcome,
                         &flush_context,
-                    )?;
-                    buffered = 0;
+                    )
+                    .map_err(|failure| (failure, window_start, messages.len()))?;
                 }
+                Ok(outcome)
+            })();
 
-                let reason = match mapping.append_row(&mut buffer, message, context) {
-                    Ok(()) => {
-                        outcome.rows_written += 1;
-                        buffered += 1;
-                        continue;
-                    }
-                    Err(RowError::Invalid(reason)) => reason,
-                    // The record reached the buffer and was refused there, by
-                    // a rule only the buffer knows: a column's type is pinned by
-                    // whichever row defined it first, so a later row disagreeing
-                    // with it cannot be judged from that row alone. The client
-                    // rolls the half-written row back before returning the error,
-                    // on every column and symbol setter, so the buffer is still
-                    // usable and only this record is lost.
-                    Err(RowError::Client(error)) => error.to_string(),
-                    // `Buffer::at` refused the row without rolling it back, so
-                    // the buffer holds a partial row and nothing can remove it.
-                    // The rows already accepted are still good, so flush them
-                    // and start a fresh buffer rather than losing the window.
-                    // `Mapping::prepare_timestamp` rejects every value `at`
-                    // would refuse, which is what keeps this unreachable.
-                    Err(RowError::Unrecoverable(error)) => {
-                        // The partial row cannot be removed, and publishing the
-                        // buffer would risk carrying it along, so the whole
-                        // window goes. The rows already counted as written are
-                        // uncounted again rather than reported as delivered.
-                        error!(
-                            "{CONNECTOR_NAME} ID: {id} discarded {buffered} unflushed rows after the client refused a designated timestamp, stream: {stream}, topic: {topic}, partition_id: {partition_id}: {error}"
-                        );
-                        outcome.rows_written -= buffered;
-                        outcome.rejected_rows += buffered;
-                        buffered = 0;
-                        buffer = sender.new_buffer();
-                        error.to_string()
-                    }
-                };
-
-                // A rejected record is unrecoverable: the runtime commits
-                // the offset before `consume` runs (#2928) and never replays a
-                // batch (#2927), so this log line is the only trace that
-                // survives. Log the identity needed to find the message,
-                // one line per record rather than a batch summary.
-                outcome.rejected_rows += 1;
-                if should_log_rejection(already_logged, outcome.rejected_rows) {
-                    let payload = if log_payload {
-                        format!(", payload: {}", payload_preview(&message.payload))
-                    } else {
-                        String::new()
-                    };
-                    error!(
-                        "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}{payload}",
-                        message.offset, message.id
-                    );
-                } else {
-                    // Past the cap the line drops to `debug` rather than
-                    // disappearing. The record is unrecoverable either way, so
-                    // an operator tracing a bad producer still needs its
-                    // identity, while `error` stays bounded for alerting.
-                    debug!(
-                        "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}",
-                        message.offset, message.id
-                    );
-                }
-                outcome.last_rejection = Some(reason);
-            }
-
-            if buffered > 0 {
-                flush_window(
-                    &mut sender,
-                    &mut buffer,
-                    ack_level,
-                    flush_timeout,
-                    &mut outcome,
-                    &flush_context,
-                )?;
-            }
-            Ok(outcome)
+            stopped.map_err(|(failure, undelivered_from, attempted)| ChunkStop {
+                failure,
+                undelivered_from,
+                attempted,
+                messages,
+            })
         });
 
-        handle
-            .await
-            .map_err(|error| {
-                Error::CannotStoreData(format!("blocking flush task failed: {error}"))
-            })?
-            .map_err(|error| self.map_client_error(error))
+        match handle.await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(stop)) => Err(self.chunk_failure(stop)),
+            // The blocking task panicked, so nothing about the chunk is known.
+            // Treat every message as undelivered and the connection as
+            // suspect, which is the conservative reading of both unknowns.
+            Err(error) => Err(ChunkFailure {
+                error: Error::CannotStoreData(format!(
+                    "{CONNECTOR_NAME} ID: {}: blocking flush task failed: {error}",
+                    self.id
+                )),
+                stops_batch: true,
+                server_rejection: false,
+                undelivered: Vec::new(),
+                attempted: 0,
+            }),
+        }
+    }
+
+    /// Classifies a stopped chunk for the caller.
+    ///
+    /// Three things are decided here and nowhere else. Whether the error is
+    /// reported as transient or permanent follows [`is_transient`], with the
+    /// borrow phase included so a connection the pool failed to hand out is
+    /// classified by its own code rather than lumped in with a publish failure.
+    /// Whether the batch stops is a different question: a failure that belongs
+    /// to the connection, which is every borrow failure and every transient
+    /// code, would recur on the next chunk and cost it a timeout, so the loop
+    /// ends. A failure that belongs to the frame, such as a server rejection,
+    /// does not stop the chunks behind it. Whether a token has to be spent is
+    /// the third: the handler counts a terminal rejection on its own thread,
+    /// so a chunk that failed on one has to retire that count.
+    fn chunk_failure(&self, stop: ChunkStop) -> ChunkFailure {
+        let ChunkStop {
+            failure,
+            undelivered_from,
+            attempted,
+            mut messages,
+        } = stop;
+        let stops_batch = failure.phase == FlushPhase::Borrowing || is_transient(&failure.error);
+        let server_rejection = failure.error.code() == ErrorCode::ServerRejection;
+        let undelivered = messages.split_off(undelivered_from.min(messages.len()));
+        ChunkFailure {
+            error: self.map_client_error(failure),
+            stops_batch,
+            server_rejection,
+            undelivered,
+            attempted,
+        }
     }
 
     /// Takes one token from the terminal-rejection count, if the handler left
@@ -449,23 +516,27 @@ impl QuestDbSink {
             .is_ok()
     }
 
-    /// Names the messages a transient failure left unattempted.
+    /// Names the messages a chunk failure left undelivered.
     ///
     /// Their offsets are already committed and the runtime does not replay a
     /// failed batch (#2927), so this line is the only record that they existed.
-    fn log_abandoned(
+    /// `what` says which kind: the failed chunk's own tail, which was in the
+    /// buffer the flush refused or was never appended, or the chunks behind it
+    /// that the loop did not attempt because the connection was at fault.
+    fn log_undelivered(
         &self,
         topic_metadata: &TopicMetadata,
         partition_id: u32,
-        abandoned: &[ConsumedMessage],
+        what: &str,
+        undelivered: &[ConsumedMessage],
     ) {
-        let (Some(first), Some(last)) = (abandoned.first(), abandoned.last()) else {
+        let (Some(first), Some(last)) = (undelivered.first(), undelivered.last()) else {
             return;
         };
         error!(
-            "{CONNECTOR_NAME} ID: {} abandoned {} messages without a write attempt after a transient failure, stream: {}, topic: {}, partition_id: {partition_id}, offsets: [{}, {}], message_ids: [{}, {}]",
+            "{CONNECTOR_NAME} ID: {} {what}: {} messages, stream: {}, topic: {}, partition_id: {partition_id}, offsets: [{}, {}], message_ids: [{}, {}]",
             self.id,
-            abandoned.len(),
+            undelivered.len(),
             topic_metadata.stream,
             topic_metadata.topic,
             first.offset,
@@ -478,7 +549,10 @@ impl QuestDbSink {
     fn map_client_error(&self, failure: FlushError) -> Error {
         let FlushError { phase, error } = failure;
         let message = format!("{CONNECTOR_NAME} ID: {}: {error}", self.id);
-        if phase == FlushPhase::Publishing && is_transient(&error) {
+        // A borrow failure is classified by its own code, because `borrow_sender`
+        // also dials: a refused certificate or a bad credential arrives here and
+        // is permanent, while an exhausted pool or a dead host is transient.
+        if phase != FlushPhase::Awaiting && is_transient(&error) {
             return Error::CannotStoreData(message);
         }
         // `ServerSchemaMismatch` is a query-path code and never reaches a
@@ -625,34 +699,55 @@ impl Sink for QuestDbSink {
 
         let mut total = BatchOutcome::default();
         let mut failure: Option<Error> = None;
+        // Messages the chunk loop appended or individually rejected, which is
+        // what `messages_processed` means. A chunk that stopped early and the
+        // chunks behind a connection failure were never processed.
+        let mut attempted = 0usize;
+        // One per chunk that failed on a terminal server rejection. The
+        // handler counted each of them on the client's thread, so each has to
+        // be retired or it goes on to fail a later healthy batch.
+        let mut rejections_to_spend = 0u64;
         while !messages.is_empty() {
             let take = self.batch_size.min(messages.len());
-            let batch: Vec<ConsumedMessage> = messages.drain(..take).collect();
+            let chunk: Vec<ConsumedMessage> = messages.drain(..take).collect();
+            let chunk_len = chunk.len();
             match self
                 .write_batch(
                     Arc::clone(db),
-                    batch,
+                    chunk,
                     topic_metadata,
                     messages_metadata.partition_id,
                     total.rejected_rows,
                 )
                 .await
             {
-                Ok(outcome) => total.merge(outcome),
-                Err(error) => {
+                Ok(outcome) => {
+                    total.merge(outcome);
+                    attempted += chunk_len;
+                }
+                Err(chunk_failure) => {
+                    attempted += chunk_failure.attempted;
+                    if chunk_failure.server_rejection {
+                        rejections_to_spend += 1;
+                    }
+                    self.log_undelivered(
+                        topic_metadata,
+                        messages_metadata.partition_id,
+                        "QuestDB did not confirm writing",
+                        &chunk_failure.undelivered,
+                    );
+                    failure.get_or_insert(chunk_failure.error);
                     // Returning here would discard every chunk still queued
                     // behind this one, at offsets the runtime committed before
-                    // `consume` ran (#2928). A permanent failure belongs to the
-                    // frame that carried it, so the chunks behind it are still
-                    // worth attempting. A transient one is a connection fault,
-                    // so they would fail the same way and each would spend its
-                    // own `flush_timeout` doing it.
-                    let transient = matches!(error, Error::CannotStoreData(_));
-                    failure.get_or_insert(error);
-                    if transient {
-                        self.log_abandoned(
+                    // `consume` ran (#2928). Only a failure that belongs to the
+                    // connection stops the loop, because the chunks behind it
+                    // would fail the same way and each would spend its own
+                    // timeout finding out.
+                    if chunk_failure.stops_batch {
+                        self.log_undelivered(
                             topic_metadata,
                             messages_metadata.partition_id,
+                            "abandoned without a write attempt after a connection failure",
                             &messages,
                         );
                         break;
@@ -678,7 +773,7 @@ impl Sink for QuestDbSink {
         }
 
         let mut state = self.state.lock().await;
-        state.messages_processed += received as u64;
+        state.messages_processed += attempted as u64;
         state.rows_written += total.rows_written as u64;
         state.rejected_rows += total.rejected_rows as u64;
         state.pending_acks += total.pending_acks as u64;
@@ -709,10 +804,13 @@ impl Sink for QuestDbSink {
         // error counter moves; the rows stay queued either way, and the runtime
         // does not replay a failed batch, so nothing is lost by saying so.
         if let Some(error) = failure {
-            // The flush that failed reported its own rejection, and the handler
-            // counted the same one. Spend that token here so it does not go on
-            // to fail a second batch for a rejection already reported.
-            self.spend_server_rejection();
+            // Each chunk that failed on a server rejection reported it through
+            // its own error, and the handler counted the same event. Retire
+            // exactly those tokens, so a rejection is neither reported twice
+            // nor retired by a transport failure that had nothing to do with it.
+            for _ in 0..rejections_to_spend {
+                self.spend_server_rejection();
+            }
             return Err(error);
         }
         // A terminal rejection reported through the handler has to fail a batch.
@@ -856,6 +954,17 @@ fn validate_column_overlap(mapping: &Mapping) -> Result<(), Error> {
             "timestamp_field {field} cannot also be listed in {name}"
         )));
     }
+    // The connector writes the enabled metadata columns itself, and a payload
+    // field of the same name is rejected per record. A configured column of
+    // that name would therefore reject every record that carries it, which is
+    // a configuration mistake rather than a data one.
+    for reserved in mapping.reserved_columns() {
+        if let Some((name, _)) = lists.iter().find(|(_, columns)| columns.contains(reserved)) {
+            return Err(Error::InvalidConfigValue(format!(
+                "column {reserved} is listed in {name} but the connector writes a metadata column of that name; turn the include_{reserved}_column flag off or rename the field"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -869,6 +978,9 @@ fn validate_column_overlap(mapping: &Mapping) -> Result<(), Error> {
 /// watermark never advances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushPhase {
+    /// `borrow_sender` failed, before any row was built. The pool was
+    /// exhausted, or the dial it makes for a new connection was refused.
+    Borrowing,
     Publishing,
     Awaiting,
 }
@@ -880,6 +992,13 @@ struct FlushError {
 }
 
 impl FlushError {
+    fn borrowing(error: questdb::Error) -> Self {
+        Self {
+            phase: FlushPhase::Borrowing,
+            error,
+        }
+    }
+
     fn publishing(error: questdb::Error) -> Self {
         Self {
             phase: FlushPhase::Publishing,
@@ -893,6 +1012,36 @@ impl FlushError {
             error,
         }
     }
+}
+
+/// Where a chunk stopped, as the blocking task reports it.
+///
+/// `undelivered_from` is the index of the first message that did not reach
+/// the server: everything from there to the end was either in the buffer the
+/// flush refused or never appended. `attempted` is the index at which the loop
+/// stopped appending, so the messages before it were written or individually
+/// rejected and logged. The messages come back whole so the caller can name
+/// the undelivered ones without copying anything on the success path.
+struct ChunkStop {
+    failure: FlushError,
+    undelivered_from: usize,
+    attempted: usize,
+    messages: Vec<ConsumedMessage>,
+}
+
+/// A failed chunk, classified for `consume`.
+struct ChunkFailure {
+    error: Error,
+    /// The failure belongs to the connection rather than to the frame, so the
+    /// chunks behind this one would fail the same way.
+    stops_batch: bool,
+    /// The failure was a terminal server rejection, which the handler counted
+    /// as well, so one token has to be retired for it.
+    server_rejection: bool,
+    /// The messages of this chunk that did not reach the server.
+    undelivered: Vec<ConsumedMessage>,
+    /// How many messages of this chunk were appended or individually rejected.
+    attempted: usize,
 }
 
 /// Whether this rejection still fits the batch's `error` budget.
@@ -1358,6 +1507,146 @@ mod tests {
         // boundary fell, so a mixed-number producer loses nothing.
         let sink = QuestDbSink::new(1, config());
         assert!(sink.mapping.numbers_as_double);
+    }
+
+    #[test]
+    fn given_a_column_named_like_a_metadata_column_when_constructed_should_record_init_error() {
+        // The connector writes `stream` itself while the flag is on, so a
+        // symbol column of that name would reject every record carrying it.
+        let mut config = config();
+        config.symbol_columns = Some(vec!["Stream".to_owned()]);
+        let sink = QuestDbSink::new(1, config);
+        assert!(
+            matches!(&sink.init_error, Some(Error::InvalidConfigValue(reason)) if reason.contains("include_stream_column")),
+            "{:?}",
+            sink.init_error
+        );
+
+        // With the flag off the name is free.
+        let mut flag_off = self::tests::config();
+        flag_off.symbol_columns = Some(vec!["stream".to_owned()]);
+        flag_off.include_stream_column = Some(false);
+        assert!(QuestDbSink::new(1, flag_off).init_error.is_none());
+    }
+
+    #[test]
+    fn given_an_over_long_table_name_when_constructed_should_record_init_error() {
+        // `TableName::new` checks characters only; the length limit is the
+        // same one the column names get, and it fails per row otherwise.
+        let mut config = config();
+        config.table = "t".repeat(MAX_NAME_LEN + 1);
+        let sink = QuestDbSink::new(1, config);
+        assert!(
+            matches!(&sink.init_error, Some(Error::InvalidConfigValue(reason)) if reason.contains("bytes")),
+            "{:?}",
+            sink.init_error
+        );
+        let mut at_limit = self::tests::config();
+        at_limit.table = "t".repeat(MAX_NAME_LEN);
+        assert!(QuestDbSink::new(1, at_limit).init_error.is_none());
+    }
+
+    fn stop(
+        phase: FlushPhase,
+        code: ErrorCode,
+        messages: usize,
+        undelivered_from: usize,
+    ) -> ChunkStop {
+        let messages = (0..messages as u64)
+            .map(|offset| ConsumedMessage {
+                id: u128::from(offset) + 1,
+                offset,
+                checksum: 0,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Text("x".to_owned()),
+            })
+            .collect();
+        ChunkStop {
+            failure: FlushError {
+                phase,
+                error: questdb::Error::new(code, "failed"),
+            },
+            undelivered_from,
+            attempted: undelivered_from,
+            messages,
+        }
+    }
+
+    #[test]
+    fn given_a_borrow_failure_when_classified_should_stop_the_batch_by_its_own_code() {
+        // Pool exhaustion arrives as InvalidApiCall and is permanent, but the
+        // next chunk would wait the acquire timeout again, so the loop stops.
+        // A refused dial is permanent too, and must not read as transient just
+        // because it happened while borrowing.
+        let sink = QuestDbSink::new(1, config());
+        let exhausted =
+            sink.chunk_failure(stop(FlushPhase::Borrowing, ErrorCode::InvalidApiCall, 0, 0));
+        assert!(exhausted.stops_batch);
+        assert!(!exhausted.server_rejection);
+        assert!(matches!(exhausted.error, Error::PermanentHttpError(_)));
+
+        let refused = sink.chunk_failure(stop(FlushPhase::Borrowing, ErrorCode::TlsError, 0, 0));
+        assert!(refused.stops_batch);
+        assert!(matches!(refused.error, Error::PermanentHttpError(_)));
+
+        let dead_host =
+            sink.chunk_failure(stop(FlushPhase::Borrowing, ErrorCode::SocketError, 0, 0));
+        assert!(dead_host.stops_batch);
+        assert!(matches!(dead_host.error, Error::CannotStoreData(_)));
+    }
+
+    #[test]
+    fn given_a_server_rejection_when_classified_should_continue_and_flag_the_token() {
+        // The rejection belongs to the frame, so the chunks behind it are
+        // still worth attempting, and the handler counted the same event.
+        let sink = QuestDbSink::new(1, config());
+        for phase in [FlushPhase::Publishing, FlushPhase::Awaiting] {
+            let failure = sink.chunk_failure(stop(phase, ErrorCode::ServerRejection, 0, 0));
+            assert!(!failure.stops_batch, "{phase:?}");
+            assert!(failure.server_rejection, "{phase:?}");
+            assert!(matches!(failure.error, Error::PermanentHttpError(_)));
+        }
+    }
+
+    #[test]
+    fn given_a_transient_failure_when_classified_should_stop_the_batch() {
+        // A connection fault recurs on the next chunk. In the awaiting phase
+        // it is still a connection fault, but never reported as retryable,
+        // because the frame is already published.
+        let sink = QuestDbSink::new(1, config());
+        let publishing =
+            sink.chunk_failure(stop(FlushPhase::Publishing, ErrorCode::SocketError, 0, 0));
+        assert!(publishing.stops_batch);
+        assert!(!publishing.server_rejection);
+        assert!(matches!(publishing.error, Error::CannotStoreData(_)));
+
+        let awaiting = sink.chunk_failure(stop(FlushPhase::Awaiting, ErrorCode::SocketError, 0, 0));
+        assert!(awaiting.stops_batch);
+        assert!(matches!(awaiting.error, Error::PermanentHttpError(_)));
+    }
+
+    #[test]
+    fn given_a_stopped_chunk_when_classified_should_hand_back_the_undelivered_tail() {
+        // Messages before the window were written or individually logged;
+        // from the window start on, nothing reached the server.
+        let sink = QuestDbSink::new(1, config());
+        let failure = sink.chunk_failure(stop(
+            FlushPhase::Publishing,
+            ErrorCode::ServerRejection,
+            5,
+            2,
+        ));
+        assert_eq!(failure.attempted, 2);
+        assert_eq!(
+            failure
+                .undelivered
+                .iter()
+                .map(|message| message.offset)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
     }
 
     #[test]

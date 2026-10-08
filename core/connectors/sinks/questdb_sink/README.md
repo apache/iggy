@@ -65,7 +65,7 @@ verbose_logging = false
 | `include_topic_column` | `true` | Write the Iggy topic name as a `SYMBOL` named `topic`. |
 | `include_partition_column` | `false` | Write `partition_id` as a `LONG`. |
 | `include_offset_column` | `false` | Write `offset` as a `LONG`. |
-| `include_headers` | `false` | Write each message header as a `header_<key>` `VARCHAR`. |
+| `include_headers` | `false` | Write each message header as a `header_<key>` `VARCHAR`. A binary (`Raw`) header value is base64-encoded. |
 | `ack_level` | `ok` | `ok` waits for server acceptance; `durable` waits for the Enterprise durable-ACK barrier. |
 | `flush_timeout` | `30s` | How long one flush waits for the configured ack level, measured as time without progress rather than as a total budget. `0s` at `ack_level = "ok"` means fire and forget: the sink publishes and does not wait. `0s` is refused at `ack_level = "durable"`, because a zero timeout never expires. A batch that flushes several times can therefore wait this long more than once. |
 | `batch_size` | `1000` | Maximum rows per flush. |
@@ -193,7 +193,7 @@ since none of those can be inferred from a JSON payload.
 | string | `VARCHAR`, or `SYMBOL` / `UUID` when listed in `symbol_columns` / `uuid_columns` |
 | number | `DOUBLE`, or `LONG` when listed in `integer_columns` |
 | boolean | `BOOLEAN` |
-| array of numbers | `DOUBLE[]`, nesting up to 3 dimensions |
+| array of numbers | `DOUBLE[]`, nesting up to 3 dimensions. An empty array has no element type, so it is rejected rather than omitted like `null` |
 | object | `VARCHAR` holding the JSON text |
 | `null` | column omitted |
 
@@ -238,6 +238,11 @@ A whole value written as `20.0` is accepted in an `integer_columns` field, since
 JSON gives no way to tell it from `20`. A genuinely fractional value there is
 rejected per record, because rounding it would store something the producer never
 sent and sending it as a `DOUBLE` would break the type the declaration pinned.
+A string, boolean, array or object in a listed field is rejected for the same
+reason. Both rejections apply whatever `numbers_as_double` is set to.
+
+When a number past 2^53 is widened to a `DOUBLE`, the connector logs a warning
+naming the column, once per connector, so the rounding is not silent.
 
 #### Turning it off
 
@@ -280,10 +285,19 @@ whose declared types are the opposite of what the connector sends.
 Every QuestDB table has a designated timestamp and the client cannot name it, so
 an auto-created table calls it `timestamp`. A payload field named `timestamp` is
 therefore written as an ordinary column beside it, which the server can refuse.
+That refusal is of the whole frame, so it costs every row of the flush window
+that carried the field, not just the record.
 Rename that field with a transform, or pre-create the table with an explicit
 `timestamp(<name>)` clause. The field named by
 `timestamp_field` is written only as the designated timestamp, never also as a
 data column.
+
+The designated timestamp's resolution follows `timestamp_source`. `message`
+and `origin` carry microseconds, so an auto-created table gets a `TIMESTAMP`
+column. `payload` converts the field to nanoseconds through `timestamp_unit`,
+so the column is `TIMESTAMP_NS`. Pre-create the table with the matching type
+when it has to be one or the other, and keep one source per table: a table
+created by one source does not take the other's resolution.
 
 Payloads with no field structure land in a single `payload` `VARCHAR` column:
 `Raw`, `Text`, `FlatBuffer` and `Avro`, proto text that does not parse as JSON,
@@ -319,19 +333,23 @@ Three further conditions fail a batch:
 
 - **A terminal server rejection.** The client reports one on its own thread,
   where it cannot know which batch caused it, so the connector counts the
-  rejection and fails one batch for each. When the flush that triggered it
-  already failed, that batch is the one, and the count is not spent twice.
+  rejection and fails one batch for each. When a chunk's own flush failed on
+  that rejection, that chunk is the one, and the count is retired for it rather
+  than failing a later healthy batch. A transport failure retires nothing.
 - **A run of unacknowledged flushes.** One flush whose acknowledgement does not
   arrive within `flush_timeout` is delivery lag, and the frames stay queued, so
   it is a warning. After 10 consecutive such batches on one topic the connector
   reports an error instead, because nothing is being committed and reporting
   success would leave the runtime's metrics showing a healthy connector.
 - **A chunk that fails.** `batch_size` splits a runtime batch into chunks. A
-  chunk that fails permanently does not stop the ones behind it, because its
-  failure belongs to the frame it carried. A chunk that fails transiently does
-  stop them, because the connection is at fault and each remaining chunk would
-  spend its own `flush_timeout` finding that out. Their offsets and message IDs
-  are logged at `error`, since the runtime committed them already.
+  failure that belongs to the frame, such as a server rejection, does not stop
+  the chunks behind it. A failure that belongs to the connection does: a
+  transport error, or a borrow the pool could not satisfy, which includes an
+  exhausted `sender_pool_max` and a refused dial. Each remaining chunk would
+  otherwise spend its own timeout finding that out. Two `error` lines name
+  what was lost, by offset and message ID, since the runtime committed them
+  already: the failed chunk's own messages that QuestDB did not confirm, and
+  the chunks behind it that were never attempted.
 
 `flush_timeout` also sets the worst-case shutdown delay. The runtime allows a
 sink five seconds to stop, and does not interrupt a flush that is already in
@@ -410,7 +428,8 @@ for the auto-created case.
 Rejections come in three kinds, and only the first two name a record:
 
 - **Validated before the wire.** A payload that is not a JSON object, a
-  malformed UUID, a non-rectangular or too deeply nested array, a missing or
+  malformed UUID, an empty, non-rectangular or too deeply nested array, a
+  non-numeric value in an `integer_columns` field, a missing or
   out-of-range timestamp field, a name QuestDB will not accept or that collides
   with another column of the same row, a non-scalar value in a `symbol_columns`
   field, or a row that would have no columns at all. Each record is validated in
@@ -450,16 +469,19 @@ build it for you.
 
 ```bash
 cargo build -p iggy_connector_questdb_sink
-cargo nextest run -p integration -E 'test(/connectors::questdb::/)'
+cargo test -p integration -- connectors::questdb::
 ```
 
-The fixture checks for the built plugin before starting anything and fails in
-well under a second naming the build command, rather than starting a container
-and timing out waiting for rows that were never going to arrive.
+`cargo nextest run -p integration -E 'test(/connectors::questdb::/)'` runs the
+same tests. The harness resolves the server and runtime binaries by path under
+`target/`, so both runners find them, and both need those binaries built first.
 
-They need Docker. `cargo nextest` rather than `cargo test` because the harness
-resolves the server and runtime binaries through `CARGO_BIN_EXE_*`, which
-plain `cargo test` does not set for another package's binaries.
+The fixture checks that the plugin exists and is newer than its sources before
+starting anything, and fails in well under a second naming the build command.
+`cargo test` rebuilds the test binary but never the plugin, so without that
+check an edit to the sink left the runtime loading the previous build.
+
+They need Docker.
 
 ### Enterprise behaviour
 
