@@ -392,10 +392,10 @@ async fn given_an_empty_member_id_when_joining_at_v9_should_require_a_member_id(
     let response = join(&state, 9, &join_params("", protocols)).await;
 
     assert_eq!(response.error, ERROR_MEMBER_ID_REQUIRED);
-    assert!(!response.member_id.is_empty());
+    assert_ne!(response.member_id, "");
     assert_eq!(response.generation_id, -1);
-    assert!(response.leader.is_empty());
-    assert!(response.members.is_empty());
+    assert_eq!(response.leader, "");
+    assert_eq!(response.members, []);
     assert_eq!(
         response.protocol_name, None,
         "v9 encodes an absent protocol name as null"
@@ -426,7 +426,7 @@ async fn given_an_empty_member_id_when_joining_at_v3_should_admit_the_member_dir
 
     assert_eq!(response.error, ERROR_NONE);
     assert_eq!(response.generation_id, 1);
-    assert!(!response.member_id.is_empty());
+    assert_ne!(response.member_id, "");
     assert_eq!(response.leader, response.member_id);
     assert_eq!(response.protocol_name.as_deref(), Some("range"));
     assert_eq!(response.members.len(), 1);
@@ -1459,7 +1459,7 @@ async fn given_two_tcp_clients_when_they_join_and_sync_should_each_receive_their
     assert_eq!(rejoined.members.len(), 2);
     let follower_join = read_join(&mut follower_stream).await;
     assert_eq!(follower_join.generation_id, 2);
-    assert!(follower_join.members.is_empty());
+    assert_eq!(follower_join.members, []);
 
     write_request(
         &mut follower_stream,

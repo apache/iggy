@@ -100,35 +100,20 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         if token.is_empty() || token.len() > MAX_WIRE_NAME_LENGTH {
             return Err(IggyError::InvalidFormat);
         }
-        let response = match self
+        let response = self
             .send_raw_with_response(
                 LOGIN_REGISTER_WITH_PAT_CODE,
                 LoginRegisterWithPatRequest {
                     version_info: super::rust_sdk_version_info(self.sdk_version())?,
+                    bind_secret: self.session_bind_secret().await?,
                     token: SecretString::from(token.to_string()),
                     client_context: None,
                 }
                 .to_bytes(),
             )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
-            Ok(wire_resp) => wire_resp,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
-            self.reset_vsr_session().await?;
-            return Err(error);
-        }
+            .await?;
+        let wire_resp = super::decode_response::<LoginRegisterResponse>(&response)?;
+        self.bind_vsr_session(wire_resp.session).await?;
         tracing::debug!(
             server_version = %wire_resp.server_version,
             server_protocol_version = wire_resp.server_protocol_version,

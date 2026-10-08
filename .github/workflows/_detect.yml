@@ -20,6 +20,9 @@ name: _detect
 on:
   workflow_call:
     outputs:
+      third_party_licenses:
+        description: "Whether third-party license inputs changed"
+        value: ${{ jobs.detect.outputs.third_party_licenses }}
       rust_matrix:
         description: "Matrix for Rust components"
         value: ${{ jobs.detect.outputs.rust_matrix }}
@@ -64,6 +67,7 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
+      third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
       rust_matrix: ${{ steps.mk.outputs.rust_matrix }}
       python_matrix: ${{ steps.mk.outputs.python_matrix }}
       php_matrix: ${{ steps.mk.outputs.php_matrix }}
@@ -88,6 +92,29 @@ jobs:
           filters: |
             all:
               - '**'
+            third_party_licenses:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '**/.cargo/**'
+              - 'rust-toolchain*'
+              - '.npmrc'
+              - 'web/package.json'
+              - 'web/package-lock.json'
+              - 'web/npm-shrinkwrap.json'
+              - 'web/.npmrc'
+              - '**/LICENSE*'
+              - '**/NOTICE*'
+              - 'about.toml'
+              - 'about.hbs'
+              - 'scripts/ci/third-party-licenses.sh'
+              - 'scripts/ci/render-node-licenses.mjs'
+              - 'scripts/ci/apt-install.sh'
+              - '.github/actions/utils/validate-third-party-licenses/**'
+              - '.github/actions/utils/setup-rust-with-cache/**'
+              - '.github/actions/utils/free-disk-space/**'
+              - '.github/workflows/_detect.yml'
+              - '.github/workflows/_common.yml'
+              - '.github/workflows/pre-merge.yml'
           list-files: json
 
       - name: Load components config

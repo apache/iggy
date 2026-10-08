@@ -22,7 +22,7 @@
 //! Parked in either spine it would make one import the other's session module
 //! for a type neither owns.
 
-use crate::session_manager::SessionError;
+use iggy_common::IggyError;
 use metadata::MetadataSubmitError;
 
 /// Login/register failure.
@@ -34,7 +34,7 @@ pub enum LoginRegisterError {
     InvalidCredentials,
     InvalidToken,
     UserInactive,
-    Session(SessionError),
+    Binding(IggyError),
     /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays.
     Transient(MetadataSubmitError),
@@ -53,6 +53,10 @@ impl LoginRegisterError {
             // by replaying anywhere, and surfacing it as transient would make
             // the SDK spin on it forever.
             Self::Transient(error) => !error.is_transient(),
+            Self::Binding(error) => !matches!(
+                error,
+                IggyError::TransientNotAccepted | IggyError::TransientNotCommitted
+            ),
             _ => true,
         }
     }
@@ -64,7 +68,7 @@ impl std::fmt::Display for LoginRegisterError {
             Self::InvalidCredentials => write!(f, "invalid username or password"),
             Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
-            Self::Session(e) => write!(f, "session error: {e}"),
+            Self::Binding(error) => write!(f, "session binding: {error}"),
             Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
         }
     }

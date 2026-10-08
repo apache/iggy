@@ -24,7 +24,7 @@ internal static class CommandCodes
     internal const int GET_SNAPSHOT_CODE = 11;
     internal const int GET_CLUSTER_METADATA_CODE = 12;
     internal const int DESCRIBE_OPTIONS_CODE = 13;
-    internal const int ATTACH_CONSUMER_SESSION_CODE = 14;
+    internal const int BIND_SESSION_CODE = 15;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;

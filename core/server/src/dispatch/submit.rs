@@ -33,9 +33,9 @@ use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard};
 use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
-use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -70,6 +70,9 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
                 let metadata = shard.plane.metadata();
                 if let Some(consensus) = metadata.consensus.as_ref() {
+                    if message.header().replica >= consensus.replica_count() {
+                        return;
+                    }
                     liveness.borrow_mut().receive(
                         consensus.cluster(),
                         (consensus.is_primary()
@@ -82,10 +85,10 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     );
                 }
             }
-            shard::MetadataSubmit::AttachConsumerSession {
+            shard::MetadataSubmit::BindSession {
                 vsr_client_id,
                 session,
-                user_id,
+                secret,
                 reply,
             } => {
                 let attached = shard
@@ -93,26 +96,36 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .metadata()
                     .client_table
                     .borrow_mut()
-                    .attach_session(vsr_client_id, session, user_id)
-                    .ok_or(IggyError::StaleClient);
+                    .bind_session(vsr_client_id, session, secret.expose_secret());
                 let _ = reply.try_send(attached);
             }
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,
+                verifier,
                 reply,
             } => {
-                let bound = submit_register_local_or_forward(&shard, vsr_client_id, user_id).await;
+                let bound =
+                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, verifier)
+                        .await;
                 let _ = reply.try_send(bound);
             }
             shard::MetadataSubmit::ForwardedRegister {
                 vsr_client_id,
                 user_id,
+                verifier,
                 nonce,
                 origin_replica,
             } => {
-                answer_forwarded_register(&shard, vsr_client_id, user_id, nonce, origin_replica)
-                    .await;
+                answer_forwarded_register(
+                    &shard,
+                    vsr_client_id,
+                    user_id,
+                    verifier,
+                    nonce,
+                    origin_replica,
+                )
+                .await;
             }
             shard::MetadataSubmit::ForwardedLogout {
                 vsr_client_id,
