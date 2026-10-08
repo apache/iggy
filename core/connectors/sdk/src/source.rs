@@ -726,7 +726,7 @@ async fn apply_batch_result<T: Source>(
             0
         }
         SourceBatchResult::Nack => consecutive_nacks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(count.saturating_add(1))
             })
             .map_or(u32::MAX, |previous| previous.saturating_add(1)),
