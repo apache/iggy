@@ -9585,6 +9585,91 @@ mod tests {
         );
     }
 
+    /// A replica that needs state transfer while producers keep writing. The
+    /// serving primary builds its offer at its `commit_min`. The pull takes
+    /// seconds for a large active segment, and meanwhile the primary's commit
+    /// heartbeats raise the receiver's `commit_max` past the offer. The
+    /// receiver's journal stopped at the gap, so its sequencer is below the
+    /// offer and the install erases nothing it journaled. The committed tail
+    /// above the offer is what journal repair fetches after the install.
+    ///
+    /// Refusing such an offer is a livelock: under sustained load every offer
+    /// is below `commit_max` by the time it lands, every round is refused with
+    /// "transfer frontier X is below the local commit frontier Y", and the
+    /// replica keeps serving reads from its stale prefix.
+    ///
+    /// TODO(#4438): `install_state_transfer` refuses `commit_op < commit_max`.
+    /// The guard exists so the rewind to `commit_op` never erases an op that
+    /// this replica may have acked and knows is committed. A backup acks only
+    /// ops at or below its sequencer, so those ops are in
+    /// `(commit_op, min(commit_max, sequencer)]`. Bounding the check by
+    /// `min(commit_max, sequencer)` keeps that protection and lets this offer
+    /// land. A primary's sequencer is at least its `commit_max`, so primaries
+    /// keep the current behavior.
+    #[compio::test]
+    #[ignore = "#4438: a state transfer is refused once commit_max moves past the offer during the pull"]
+    async fn given_commit_max_advanced_during_the_pull_when_installing_should_land_and_leave_the_tail_to_repair()
+     {
+        let origin_directory = tempfile::tempdir().unwrap();
+        let receiver_directory = tempfile::tempdir().unwrap();
+        let (mut origin, _) = recording_partition_at(0, 3);
+        origin.set_partition_dir(origin_directory.path().to_string_lossy().into_owned());
+        let committed = checksummed_segment_prepare(1, 0, 0, b"committed");
+        origin
+            .log
+            .journal()
+            .inner
+            .append(committed.clone().into_frozen())
+            .await
+            .unwrap();
+        origin.consensus().sequencer().set_sequence(1);
+        origin
+            .consensus()
+            .set_last_prepare_checksum(committed.header().checksum);
+        origin.consensus().advance_commit_max(1);
+        origin.consensus().advance_commit_min(1);
+        origin
+            .dedup_mut()
+            .commit_capacity(usize::try_from(committed.header().retry_capacity).unwrap())
+            .unwrap();
+        origin.offset_space.committed_seeded = true;
+        origin.offset.store(0, Ordering::Relaxed);
+        origin.log.journal().inner.evict_prefix(1).await;
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        assert_eq!(offer.commit_op, 1);
+
+        let (mut receiver, _) = recording_partition_at(1, 3);
+        receiver.set_partition_dir(receiver_directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut receiver, receiver_directory.path());
+        // Learned from the primary's commit heartbeats while the pull ran. The
+        // journal never got past the gap, so nothing above the offer is
+        // journaled here.
+        receiver.consensus().advance_commit_max(4);
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 0);
+
+        let installed = receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+                0,
+            )
+            .await;
+
+        assert!(
+            installed.is_ok(),
+            "an offer that erases no journaled op must install, got {installed:?}"
+        );
+        assert_eq!(receiver.consensus().commit_min(), 1);
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 1);
+        assert_eq!(
+            receiver.consensus().commit_max(),
+            4,
+            "the committed tail above the offer stays known for journal repair to fetch"
+        );
+    }
+
     #[compio::test]
     async fn transfer_establishes_wal_body_ownership_without_losing_the_active_index_writer() {
         for durability in [
@@ -18002,6 +18087,69 @@ mod tests {
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_some());
+    }
+
+    /// The repair window `(floor, to_op]` is longer than one repair chunk
+    /// (128 ops). Its first chunk arrived: the first repaired batch (op 7)
+    /// starts at offset 7, above the recovered durable end (offset 3), and
+    /// every op between the floor and that batch is resident. Offsets rise with ops, so
+    /// no frame still to come can lower the first batch offset into
+    /// connection. The refusal is final and must hand recovery to state
+    /// transfer.
+    ///
+    /// Waiting for the whole window instead is a livelock once the floor stops
+    /// moving: the next chunk is requested only when the commit walk advances,
+    /// which a refused floor never allows, so every stall retry re-fetches the
+    /// same first chunk and the window never completes. The replica refuses
+    /// the floor every retry, never asks for a state transfer, and keeps
+    /// serving reads from its stale prefix.
+    ///
+    /// TODO(#4438): `complete_repair` treats a floor refusal as definitive
+    /// only when the whole committed window is resident. Recording the op
+    /// whose batch set `first_batch_offset` in `apply_repaired_prepare`, and
+    /// also treating the refusal as definitive once every op in
+    /// `(floor, that op)` is resident, would let this case escalate.
+    #[compio::test]
+    #[ignore = "#4438: a refused commit floor never escalates to state transfer when the repair window spans several chunks"]
+    async fn given_a_resident_leading_edge_above_durable_end_when_the_window_is_longer_than_a_chunk_should_refuse_commit_floor()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, 5, None));
+        // The first served chunk: ops 6..=133. Op 6 carries no messages, and
+        // the first batch is op 7 at offset 7. Ops 134..=300 are requested
+        // only after the walk advances.
+        journal_prepare(&partition, 6, Operation::CreateStream).await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(7, 0, 0x77))
+            .await;
+        for op in 8..=133 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        assert_eq!(
+            partition
+                .repair
+                .and_then(|session| session.first_batch_offset),
+            Some(7),
+            "the first repaired batch anchors the floor-connect check"
+        );
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 300
+            },
+            "a resident leading edge fixes where the window starts, so the \
+             refusal is final"
+        );
+        assert!(
+            partition.repair.is_none(),
+            "a definitive refusal hands recovery to state transfer"
+        );
     }
 
     /// A `RangeEvicted` floor arrives above `commit_min`, and the walk passes
