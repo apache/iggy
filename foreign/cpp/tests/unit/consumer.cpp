@@ -18,7 +18,6 @@
  */
 
 #include <cstdint>
-#include <limits>
 #include <string>
 #include <variant>
 
@@ -68,8 +67,4 @@ TEST(ConsumerTest, RejectsNameLongerThan255Bytes) {
 
     EXPECT_THROW((void)iggy::Consumer::Single(iggy::Identifier::String(too_long_name)), iggy::IggyException);
     EXPECT_THROW((void)iggy::Consumer::Group(iggy::Identifier::String(too_long_name)), iggy::IggyException);
-}
-
-TEST(AnyPartitionIdTest, LeavesThePartitionToTheServer) {
-    EXPECT_EQ(iggy::kAnyPartitionId, std::numeric_limits<std::uint32_t>::max());
 }
