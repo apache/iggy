@@ -105,9 +105,9 @@ async fn e2e_unsupported_api_key_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // Unknown api key (16, ListGroups) has no response schema this gateway can encode, so the
+    // Unknown api key (20, DeleteTopics) has no response schema this gateway can encode, so the
     // server closes the connection without a (misparseable) response body.
-    let frame1 = build_request_frame(16, 2, 99, Some("e2e-test"), &[]);
+    let frame1 = build_request_frame(20, 2, 99, Some("e2e-test"), &[]);
     stream.write_all(&frame1).await.unwrap();
 
     assert_eq!(

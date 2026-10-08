@@ -1116,6 +1116,57 @@ pub fn validate_offset_commit_shape(
     Ok(())
 }
 
+/// Mirrors the field order `OffsetFetchRequest::decode` walks: one group up to v7, a `groups`
+/// array from v8.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_offset_fetch_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 6;
+
+    if version <= 7 {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let topics_count = if flexible {
+            c.compact_array_count_nullable()?
+        } else if version >= 2 {
+            c.legacy_array_count_nullable()?
+        } else {
+            c.legacy_array_count()?
+        };
+        walk_offset_fetch_topics(&mut c, topics_count, flexible)?;
+    } else {
+        let groups_count = c.compact_array_count()?;
+        for _ in 0..groups_count {
+            c.compact_string(false)?;
+            if version >= 9 {
+                c.compact_string(true)?;
+                let _member_epoch = c.read_i32()?;
+            }
+            let topics_count = c.compact_array_count_nullable()?;
+            walk_offset_fetch_topics(&mut c, topics_count, flexible)?;
+            c.tagged_fields()?;
+        }
+    }
+    if version >= 7 {
+        let _require_stable = c.read_bool()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `DescribeGroupsRequest::decode` walks.
 ///
 /// Group ids are echoed, so their lengths count toward the projected response.
@@ -1293,7 +1344,10 @@ fn walk_offset_fetch_topics(
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
-    use kafka_protocol::messages::{DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest,OffsetCommitRequest, OffsetFetchRequest};
+    use kafka_protocol::messages::{
+        DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest, OffsetCommitRequest,
+        OffsetFetchRequest,
+    };
 
     use super::*;
     use crate::protocol::handlers::decode_exhaustive;
@@ -1839,6 +1893,9 @@ mod tests {
     fn list_groups_v4_huge_states_filter_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
         assert!(validate_list_groups_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
     fn offset_commit_v2_null_metadata_accepted() {
         let body = Bytes::from_static(&[
             0x00, 0x01, b'g', // group_id

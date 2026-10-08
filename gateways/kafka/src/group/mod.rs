@@ -581,7 +581,7 @@ impl GroupCoordinator {
         };
         let groups = self.groups.lock().await;
         state::offset_hold(&groups, member, hold, Instant::now())
-  }
+    }
     /// Every group currently in the map, ordered by group id.
     ///
     /// Does not tick. A list names no group, and sweeping here would open rebalances as a side

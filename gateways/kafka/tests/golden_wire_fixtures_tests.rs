@@ -41,11 +41,11 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=14 (compact array: N+1=15)
+    // error_code=0, api_count=16 (compact array: N+1=17)
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 106] = [
+    let expected: [u8; 120] = [
         0x00, 0x00, // error_code
-        0x0F, // compact array count (14+1)
+        0x11, // compact array count (16+1)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets     1-6
@@ -75,10 +75,10 @@ async fn golden_apiversions_v1_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=14; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
-    let expected: [u8; 94] = [
+    // error_code=0, api_count=16; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
+    let expected: [u8; 106] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x0E, // api count = 14
+        0x00, 0x00, 0x00, 0x10, // api count = 16
         0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce         0-9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch           4-12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets     1-6

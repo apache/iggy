@@ -36,10 +36,11 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::group::{
-    DESCRIBE_RESPONSE_TOO_LARGE, GROUP_STATE_COMPLETING_REBALANCE, GROUP_STATE_EMPTY,
-    GROUP_STATE_PREPARING_REBALANCE, GROUP_STATE_STABLE, CommitRequest, GroupCoordinatorConfig, GroupDescription,
-    GroupListing, GroupMember, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult, LeavingMember,
-    LeftMember, MemberDescription, SyncRequest, SyncResult, owned_str,
+    CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE, GROUP_STATE_COMPLETING_REBALANCE,
+    GROUP_STATE_EMPTY, GROUP_STATE_PREPARING_REBALANCE, GROUP_STATE_STABLE, GroupCoordinatorConfig,
+    GroupDescription, GroupListing, GroupMember, JoinRequest, JoinResult, JoinedMember,
+    LeaveRequest, LeaveResult, LeavingMember, LeftMember, MemberDescription, SyncRequest,
+    SyncResult, owned_str,
 };
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID,
