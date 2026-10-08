@@ -20,8 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
-    Identifier,IggyClient,  IggyError, IggyExpiry, StreamClient, Topic, TopicClient, TopicCreateOptions,
-    TopicDetails, TopicUpdateOptions,
+    Identifier, IggyClient, IggyError, IggyExpiry, StreamClient, Topic, TopicClient,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};

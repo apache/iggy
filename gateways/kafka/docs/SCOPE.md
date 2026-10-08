@@ -4,11 +4,11 @@
 
 A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DescribeConfigs and AlterConfigs use Iggy.
 
-**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards 
-the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6 
-too. CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so clients do not believe 
+**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards
+the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6
+too. CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so clients do not believe
 topics were created or configs were read or changed. OffsetCommit and OffsetFetch answer retriable `COORDINATOR_LOAD_IN_PROGRESS`
-(14). Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records once you configure 
+(14). Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records once you configure
 a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
 
 | Deliverable | Status | Location |

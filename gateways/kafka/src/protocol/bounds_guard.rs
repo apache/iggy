@@ -1909,6 +1909,8 @@ mod tests {
     fn alter_configs_v2_huge_compact_count_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
         assert!(validate_alter_configs_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
     #[test]
     fn offset_commit_v2_null_metadata_accepted() {
         let body = Bytes::from_static(&[

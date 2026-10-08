@@ -39,10 +39,10 @@ use tokio::net::TcpStream;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_CONFIGS,
     API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID,
-    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH,
-    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
-    supported_api_ranges,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
+    API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION, advertised_min_version,
+    handle_request, is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -66,8 +66,8 @@ use wire::{
 };
 
 #[test]
-fn supported_ranges_table_has_fourteen_entries() {
-    assert_eq!(supported_api_ranges().len(), 14);
+fn supported_ranges_table_has_sixteen_entries() {
+    assert_eq!(supported_api_ranges().len(), 16);
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn is_supported_version_matches_scope_table() {
 ///
 /// The wire rows are `supported_api_ranges()` sorted by `api_key` (`api_versions.rs`).
 /// `SCOPED_API_KEYS` is already in that ascending order, and this test reads the response
-/// in that order. `supported_ranges_table_has_fourteen_entries` and
+/// in that order. `supported_ranges_table_has_sixteen_entries` and
 /// `is_supported_version_matches_scope_table` pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
