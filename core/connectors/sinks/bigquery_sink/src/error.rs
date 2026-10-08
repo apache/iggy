@@ -101,12 +101,6 @@ impl From<AppendError> for Error {
     }
 }
 
-impl From<TableError> for Error {
-    fn from(error: TableError) -> Self {
-        Error::InitError(error.to_string())
-    }
-}
-
 impl fmt::Display for AppendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
