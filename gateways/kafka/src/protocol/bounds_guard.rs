@@ -1039,6 +1039,132 @@ pub fn validate_sync_group_shape(version: i16, body: &Bytes, max_frame_size: usi
     Ok(())
 }
 
+/// Mirrors the field order `OffsetCommitRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_offset_commit_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 8;
+
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    let _generation_id_or_member_epoch = c.read_i32()?;
+    if flexible {
+        c.compact_string(false)?;
+    } else {
+        c.legacy_string(false)?;
+    }
+    if version >= 7 {
+        if flexible {
+            c.compact_string(true)?;
+        } else {
+            c.legacy_string(true)?;
+        }
+    }
+    if version <= 4 {
+        let _retention_time_ms = c.read_i64()?;
+    }
+
+    let topics_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..topics_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let partitions_count = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..partitions_count {
+            let _partition_index = c.read_i32()?;
+            let _committed_offset = c.read_i64()?;
+            if version >= 6 {
+                let _committed_leader_epoch = c.read_i32()?;
+            }
+            if flexible {
+                c.compact_string(true)?;
+                c.tagged_fields()?;
+            } else {
+                c.legacy_string(true)?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `OffsetFetchRequest::decode` walks: one group up to v7, a `groups`
+/// array from v8.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_offset_fetch_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 6;
+
+    if version <= 7 {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let topics_count = if flexible {
+            c.compact_array_count_nullable()?
+        } else if version >= 2 {
+            c.legacy_array_count_nullable()?
+        } else {
+            c.legacy_array_count()?
+        };
+        walk_offset_fetch_topics(&mut c, topics_count, flexible)?;
+    } else {
+        let groups_count = c.compact_array_count()?;
+        for _ in 0..groups_count {
+            c.compact_string(false)?;
+            if version >= 9 {
+                c.compact_string(true)?;
+                let _member_epoch = c.read_i32()?;
+            }
+            let topics_count = c.compact_array_count_nullable()?;
+            walk_offset_fetch_topics(&mut c, topics_count, flexible)?;
+            c.tagged_fields()?;
+        }
+    }
+    if version >= 7 {
+        let _require_stable = c.read_bool()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Cap on a whole `SaslAuthenticate` body.
 ///
 /// The body is one length-prefixed blob, so capping it is the same as capping `auth_bytes`.
@@ -1229,10 +1355,34 @@ pub fn validate_sasl_authenticate_shape(version: i16, body: &Bytes) -> Result<()
     Ok(())
 }
 
+/// One `OffsetFetch` topic list: each topic's name and its partition indexes.
+fn walk_offset_fetch_topics(
+    c: &mut ShapeCursor,
+    topics_count: usize,
+    flexible: bool,
+) -> Result<()> {
+    for _ in 0..topics_count {
+        let partitions_count = if flexible {
+            c.compact_string(false)?;
+            c.compact_array_count()?
+        } else {
+            c.legacy_string(false)?;
+            c.legacy_array_count()?
+        };
+        for _ in 0..partitions_count {
+            let _partition_index = c.read_i32()?;
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
-    use kafka_protocol::messages::LeaveGroupRequest;
+    use kafka_protocol::messages::{LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest};
 
     use super::*;
     use crate::protocol::handlers::decode_exhaustive;
@@ -1759,5 +1909,115 @@ mod tests {
     fn alter_configs_v2_huge_compact_count_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
         assert!(validate_alter_configs_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    #[test]
+    fn offset_commit_v2_null_metadata_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0xFF, 0xFF, 0xFF, 0xFF, // generation_id
+            0x00, 0x00, // member_id
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // retention_time_ms
+            0x00, 0x00, 0x00, 0x01, // topics: 1
+            0x00, 0x01, b't', // name
+            0x00, 0x00, 0x00, 0x01, // partitions: 1
+            0x00, 0x00, 0x00, 0x00, // partition_index
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // committed_offset
+            0xFF, 0xFF, // committed_metadata null
+        ]);
+        assert!(validate_offset_commit_shape(2, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetCommitRequest>(2, body).expect("kafka_protocol agrees");
+    }
+
+    #[test]
+    fn offset_commit_v8_flexible_body_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // generation_id
+            0x02, b'm', // member_id
+            0x00, // group_instance_id null
+            0x02, // topics: 1
+            0x02, b't', // name
+            0x02, // partitions: 1
+            0x00, 0x00, 0x00, 0x00, // partition_index
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // committed_offset
+            0xFF, 0xFF, 0xFF, 0xFF, // committed_leader_epoch
+            0x01, // committed_metadata ""
+            0x00, // partition tagged fields
+            0x00, // topic tagged fields
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_offset_commit_shape(8, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetCommitRequest>(8, body).expect("kafka_protocol agrees");
+    }
+
+    #[test]
+    fn offset_commit_v9_huge_partitions_count_rejected() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // generation_id
+            0x02, b'm', // member_id
+            0x00, // group_instance_id null
+            0x02, // topics: 1
+            0x02, b't', // name
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // partitions count
+        ]);
+        assert!(validate_offset_commit_shape(9, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn offset_fetch_v1_partition_indexes_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x01, b'g', // group_id
+            0x00, 0x00, 0x00, 0x01, // topics: 1
+            0x00, 0x01, b't', // name
+            0x00, 0x00, 0x00, 0x02, // partition_indexes: 2
+            0x00, 0x00, 0x00, 0x00, // 0
+            0x00, 0x00, 0x00, 0x01, // 1
+        ]);
+        assert!(validate_offset_fetch_shape(1, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetFetchRequest>(1, body).expect("kafka_protocol agrees");
+    }
+
+    #[test]
+    fn offset_fetch_v7_null_topics_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, b'g', // group_id
+            0x00, // topics null: every committed offset
+            0x01, // require_stable
+            0x00, // tagged fields
+        ]);
+        assert!(validate_offset_fetch_shape(7, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetFetchRequest>(7, body).expect("kafka_protocol agrees");
+    }
+
+    #[test]
+    fn offset_fetch_v9_group_with_member_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // groups: 1
+            0x02, b'g', // group_id
+            0x00, // member_id null
+            0xFF, 0xFF, 0xFF, 0xFF, // member_epoch
+            0x02, // topics: 1
+            0x02, b't', // name
+            0x02, // partition_indexes: 1
+            0x00, 0x00, 0x00, 0x00, // 0
+            0x00, // topic tagged fields
+            0x00, // group tagged fields
+            0x00, // require_stable
+            0x00, // tagged fields
+        ]);
+        assert!(validate_offset_fetch_shape(9, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<OffsetFetchRequest>(9, body).expect("kafka_protocol agrees");
+    }
+
+    #[test]
+    fn offset_fetch_v6_huge_topics_count_rejected() {
+        let body = Bytes::from_static(&[0x02, b'g', 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_offset_fetch_shape(6, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn offset_fetch_v1_null_topics_rejected() {
+        let body = Bytes::from_static(&[0x00, 0x01, b'g', 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_offset_fetch_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 }

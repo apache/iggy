@@ -853,6 +853,9 @@ define_state! {
         // it onto each new Partition::created_revision. Deterministic across
         // replicas: same ops, same order.
         pub revision: u64,
+        // Retirement proofs survive truncation and purge, but not a changed
+        // set of partition incarnations.
+        pub namespace_revision: u64,
         // Total pending cooperative revocations across all groups, recomputed
         // once per commit by `post_apply`. The consensus tick reads it O(1)
         // every 10ms instead of walking every stream/topic/group/member to
@@ -880,11 +883,20 @@ pub struct TruncatePartitionRequest {
     pub topic_id: WireIdentifier,
     pub partition_id: u32,
     pub up_to_offset: u64,
+    /// `(created_revision, purge_generation)` captured with the offset on its owner.
+    /// Absent in legacy records, unresolved-target rejections, and owner-missing no-ops.
+    /// Older decoders ignore this trailing guard; mixed-release replication
+    /// cannot enforce it.
+    pub expected_history: Option<(u64, u64)>,
 }
 
 impl WireEncode for TruncatePartitionRequest {
     fn encoded_size(&self) -> usize {
-        self.stream_id.encoded_size() + self.topic_id.encoded_size() + 4 + 8
+        self.stream_id.encoded_size()
+            + self.topic_id.encoded_size()
+            + 4
+            + 8
+            + self.expected_history.map_or(0, |_| 2 * size_of::<u64>())
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -892,6 +904,10 @@ impl WireEncode for TruncatePartitionRequest {
         self.topic_id.encode(buf);
         buf.put_u32_le(self.partition_id);
         buf.put_u64_le(self.up_to_offset);
+        if let Some((created_revision, purge_generation)) = self.expected_history {
+            buf.put_u64_le(created_revision);
+            buf.put_u64_le(purge_generation);
+        }
     }
 }
 
@@ -918,12 +934,30 @@ impl WireDecode for TruncatePartitionRequest {
         })?;
         let up_to_offset = u64::from_le_bytes(offset_slice.try_into().expect("8 bytes"));
         pos += 8;
+        let expected_history = if pos == buf.len() {
+            None
+        } else {
+            let history_size = 2 * size_of::<u64>();
+            let history = buf.get(pos..pos + history_size).ok_or_else(|| {
+                iggy_binary_protocol::WireError::UnexpectedEof {
+                    offset: pos,
+                    need: history_size,
+                    have: buf.len().saturating_sub(pos),
+                }
+            })?;
+            pos += history_size;
+            Some((
+                u64::from_le_bytes(history[..8].try_into().expect("8 bytes")),
+                u64::from_le_bytes(history[8..].try_into().expect("8 bytes")),
+            ))
+        };
         Ok((
             Self {
                 stream_id,
                 topic_id,
                 partition_id,
                 up_to_offset,
+                expected_history,
             },
             pos,
         ))
@@ -957,7 +991,12 @@ impl StateHandler for TruncatePartitionRequest {
             else {
                 return ApplyReply::err(TruncatePartitionResult::PartitionNotFound);
             };
-            // Monotonic: a stale or duplicate replay never rewinds the watermark.
+            if self.expected_history.is_some_and(|history| {
+                history != (partition.created_revision, partition.purge_generation)
+            }) {
+                return ApplyReply::err(TruncatePartitionResult::HistoryChanged);
+            }
+            // Monotonic within the resolved history.
             if self.up_to_offset > partition.deleted_up_to_offset {
                 partition.deleted_up_to_offset = self.up_to_offset;
             }
@@ -1726,7 +1765,7 @@ impl Streams {
             }
             let current = topic
                 .round_robin_counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                     Some((c + 1) % count)
                 })
                 .unwrap_or(0);
@@ -1873,7 +1912,13 @@ impl Streams {
                                 .expect("sim partition count fits u32"),
                             name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
                                 .expect("sim topic name is valid"),
-                            options: WireOptions::empty(),
+                            options: iggy_common::TopicCreateOptions {
+                                durability: iggy_common::Durability::Persisted,
+                                consumer_offset_durability: iggy_common::Durability::Persisted,
+                                ..Default::default()
+                            }
+                            .to_wire()
+                            .expect("valid simulator durability options"),
                         },
                         derived_options: WireOptions::empty(),
                         partitions,
@@ -2157,6 +2202,7 @@ impl StateHandler for DeleteStreamRequest {
         state.items.remove(stream_id);
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
+        state.namespace_revision = state.revision;
         // The dropped stream may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
@@ -2268,6 +2314,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         // monotonic revision and stamp every new partition with it.
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
+        state.namespace_revision = state.revision;
 
         // Share one `Arc<TopicStats>` across both left-right buffers via the
         // registry, parented to the stream's shared `Arc<StreamStats>`. The id
@@ -2487,6 +2534,7 @@ impl StateHandler for DeleteTopicRequest {
             .stats_registry
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
+        state.namespace_revision = state.revision;
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
         ApplyReply::ok(Bytes::new())
@@ -2606,6 +2654,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
 
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
+        state.namespace_revision = state.revision;
 
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
@@ -2675,6 +2724,7 @@ impl StateHandler for DeletePartitionsRequest {
                 .stats_registry
                 .remove_partitions(stream_id, topic_id, &removed_ids);
             state.revision = state.revision.wrapping_add(1);
+            state.namespace_revision = state.revision;
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -2693,6 +2743,7 @@ pub struct StreamsSnapshot {
     /// `#[serde(default)]` so older snapshots restore at revision 0.
     #[serde(default)]
     pub revision: u64,
+    pub namespace_revision: u64,
 }
 
 impl Snapshotable for Streams {
@@ -2771,6 +2822,7 @@ impl Snapshotable for Streams {
             StreamsSnapshot {
                 items,
                 revision: inner.revision,
+                namespace_revision: inner.namespace_revision,
             }
         })
     }
@@ -2915,6 +2967,7 @@ impl StreamsInner {
             index,
             items,
             revision: snapshot.revision,
+            namespace_revision: snapshot.namespace_revision,
             // Recomputed from the restored groups just below.
             pending_revocations_count: 0,
             consumer_group_members: AHashMap::new(),
@@ -2953,6 +3006,7 @@ mod tests {
             topic_id: WireIdentifier::numeric(3),
             partition_id: 5,
             up_to_offset: 1234,
+            expected_history: Some((42, 7)),
         };
         let bytes = request.to_bytes();
         let (decoded, consumed) = TruncatePartitionRequest::decode(&bytes).expect("decode");
@@ -2961,6 +3015,19 @@ mod tests {
         assert_eq!(decoded.topic_id, request.topic_id);
         assert_eq!(decoded.partition_id, request.partition_id);
         assert_eq!(decoded.up_to_offset, request.up_to_offset);
+        assert_eq!(decoded.expected_history, request.expected_history);
+        let legacy = TruncatePartitionRequest {
+            expected_history: None,
+            ..request
+        };
+        let legacy_bytes = legacy.to_bytes();
+        let (decoded, consumed) =
+            TruncatePartitionRequest::decode(&legacy_bytes).expect("legacy decode");
+        assert_eq!(consumed, legacy_bytes.len());
+        assert_eq!(decoded.expected_history, None);
+        for truncated_len in legacy_bytes.len() + 1..bytes.len() {
+            assert!(TruncatePartitionRequest::decode(&bytes[..truncated_len]).is_err());
+        }
     }
 
     fn create_stream(inner: &mut StreamsInner, name: &str) {
@@ -3654,11 +3721,12 @@ mod tests {
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
 
-        let truncate = TruncatePartitionRequest {
+        let mut truncate = TruncatePartitionRequest {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
             partition_id: 0,
             up_to_offset: 500,
+            expected_history: Some((inner.items[0].topics[0].partitions[0].created_revision, 0)),
         };
         let apply = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
         assert_eq!(apply.code, 0);
@@ -3682,7 +3750,19 @@ mod tests {
             "the purge generation still advances"
         );
 
-        // Same for the stream-wide purge, which walks every topic.
+        let revision_after_purge = inner.revision;
+        let stale = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            stale.code,
+            u32::from(TruncatePartitionResult::HistoryChanged)
+        );
+        assert_eq!(inner.revision, revision_after_purge);
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
+            0
+        );
+
+        truncate.expected_history.as_mut().unwrap().1 = 1;
         let _ = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
         assert_eq!(
             inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
@@ -3695,6 +3775,18 @@ mod tests {
         assert_eq!(
             inner.items[0].topics[0].partitions[0].deleted_up_to_offset, 0,
             "a stream purge clears the watermark on every partition it walks"
+        );
+        let history = truncate.expected_history.as_mut().unwrap();
+        history.1 = 2;
+        history.0 = history.0.wrapping_sub(1);
+        let recreated = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            recreated.code,
+            u32::from(TruncatePartitionResult::HistoryChanged)
+        );
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
+            0
         );
     }
 

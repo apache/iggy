@@ -4,7 +4,12 @@
 
 A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DescribeConfigs and AlterConfigs use Iggy.
 
-**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6 too. CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so clients do not believe topics were created or configs were read or changed. Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
+**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards 
+the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6 
+too. CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so clients do not believe 
+topics were created or configs were read or changed. OffsetCommit and OffsetFetch answer retriable `COORDINATOR_LOAD_IN_PROGRESS`
+(14). Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records once you configure 
+a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
@@ -29,7 +34,7 @@ Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiV
 **Every unsupported-version case closes the connection, for every listed key** - not just above
 the encoder max. `kafka_protocol`'s schema floor for each supported message happens to equal
 `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0, ApiVersions 0,
-CreateTopics 2, InitProducerId 0, DescribeConfigs 1, AlterConfigs 0, and 0 for the four consumer-group keys), so there is no version below an API's
+CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1,DescribeConfigs 1, AlterConfigs 0, and 0 for the five coordination  keys), so there is no version below an API's
 min that the crate can actually encode a response for either - `unsupported_version_response`
 still tries, but the encode attempt fails and the connection closes rather than sending a
 malformed body.
@@ -49,6 +54,8 @@ it knows the server supports flexible encoding.
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
+| 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
+| 9 | OffsetFetch | 1 | 9 | 1 … 9 | With a bridge: reads each offset, -1 when none is stored, and a null topic list reads every topic that holds the group. Without one: 14. Flexible encoding at v6+ |
 | 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
 | 11 | JoinGroup | 0 | 9 | 0 … 9 | Real membership; parks on the group's join barrier; flexible encoding at v6+ |
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
@@ -72,6 +79,8 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 1 | Fetch | 4–12 | v12 |
 | 2 | ListOffsets | 1–6 | v6 |
 | 3 | Metadata | 0–9 | v9 |
+| 8 | OffsetCommit | 2–9 | v8 |
+| 9 | OffsetFetch | 1–9 | v6 |
 | 10 | FindCoordinator | 0–4 | v3 |
 | 11 | JoinGroup | 0–9 | v6 |
 | 12 | Heartbeat | 0–4 | v4 |
@@ -91,8 +100,6 @@ All API keys not listed above close the connection (see Governance model above) 
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
-| 8 | OffsetCommit | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542) |
-| 9 | OffsetFetch | Consumer group offsets — [#3542](https://github.com/apache/iggy/issues/3542); sent right after SyncGroup, so a joined consumer loops on it today ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)) |
 | 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
 | 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
@@ -338,7 +345,8 @@ decoded) on the Produce/Fetch hot paths, preserving the one property this TODO w
 `bounds_guard.rs` covers the DoS-bound gap the crate itself leaves open (see Governance model
 above).
 
-- [ ] Offset-related consumer-group API keys (8, 9) and real Metadata topology remain unimplemented (see Phase 3 below) - the crate can decode them when that phase starts
+- [x] Offset-related consumer-group API keys (8, 9) - see Phase 3 below
+- [ ] Real Metadata topology
 
 ### Phase 3 — Consumer groups (~7 API keys)
 
@@ -351,7 +359,8 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 - [x] FindCoordinator (10), JoinGroup (11), Heartbeat (12), SyncGroup (14) -
       [#3541](https://github.com/apache/iggy/issues/3541); LeaveGroup (13) -
       [#3543](https://github.com/apache/iggy/issues/3543); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
-- [ ] OffsetCommit (8), OffsetFetch (9)
+- [x] OffsetCommit (8), OffsetFetch (9) - [#3542](https://github.com/apache/iggy/issues/3542);
+      offsets live in Iggy, see [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning

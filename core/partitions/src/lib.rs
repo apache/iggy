@@ -24,6 +24,7 @@ mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
 pub mod install_backup;
+mod io;
 mod journal;
 mod log;
 mod messages_writer;
@@ -34,6 +35,7 @@ mod persistence;
 mod poll_plan;
 #[cfg(feature = "simulator")]
 pub use persistence::CheckpointBarrier;
+pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
@@ -51,6 +53,13 @@ pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
+pub(crate) use io::PartitionIoVerdict;
+pub use io::{
+    CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
+    PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
+    PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+};
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
@@ -75,7 +84,8 @@ pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
     CREATED_REVISION_FILE, configure_consumer_offsets, configure_consumer_offsets_with_storage,
     create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
-    hydrate_partition_log, read_created_revision, write_created_revision,
+    hydrate_partition_log, read_created_revision, read_revision_record, write_created_revision,
+    write_revision_record,
 };
 pub use poll_plan::{PollPlan, PollReadResult};
 pub use segment::Segment;
@@ -108,6 +118,12 @@ pub type RetainedPartitionLog =
 #[cfg(any(test, feature = "simulator"))]
 pub struct RetainedPartitionState {
     pub log: RetainedPartitionLog,
+    pub head_op: u64,
+    pub applied_op: u64,
+    pub prepare_checksum: u128,
+    pub retry_capacity: Option<usize>,
+    pub retry_protection: Vec<consensus::DedupWatermark>,
+    pub required_metadata_frontier: u64,
     /// Offset counter the previous incarnation had proved durable.
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.
@@ -117,6 +133,7 @@ pub struct RetainedPartitionState {
     pub offset_space_used: bool,
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
+    pub external_group_offsets: Vec<(u32, u64)>,
 }
 
 /// Partition-level data plane operations.

@@ -27,6 +27,16 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServerError {
+    #[error(
+        "storage at {path} does not match the durable-session format; offline migration or explicit --fresh initialization is required"
+    )]
+    UnsupportedStorage { path: PathBuf },
+    #[error("cannot validate or publish the storage format at {path}: {source}")]
+    StorageFormatIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
     #[error("failed to load server config")]
@@ -48,6 +58,11 @@ pub enum ServerError {
     #[error("failed to spawn OS thread for shard {shard_id}")]
     ShardSpawnFailed {
         shard_id: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to spawn the system stats sampler: {source}")]
+    SystemStatsSamplerSpawnFailed {
         #[source]
         source: std::io::Error,
     },
@@ -107,6 +122,8 @@ pub enum ServerError {
     InvalidReplyInboxCapacity { value: usize, max: usize },
     #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
     InvalidPollCompletionCapacity { value: usize, max: usize },
+    #[error(transparent)]
+    InvalidPartitionIoLimits(#[from] shard::PartitionIoLimitsError),
     #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
@@ -175,6 +192,19 @@ pub enum ServerError {
         dir: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to read or write partition retirement fence at {dir}: {source}")]
+    PartitionRetirementFenceIo {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "partition {namespace_raw} incarnation {created_revision} is durably fenced for session retirement"
+    )]
+    PartitionRetirementFenced {
+        namespace_raw: u64,
+        created_revision: u64,
     },
     // Quarantines the one partition rather than treating the group as fresh or
     // reading through to a superseded view: mirrors the metadata plane's

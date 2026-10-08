@@ -184,7 +184,7 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(LOGIN_REGISTER_WITH_PAT_CODE, "user.login_register_with_pat"),
     // Options catalog discovery
     CommandMeta::non_replicated(DESCRIBE_OPTIONS_CODE, "options.describe"),
-    CommandMeta::non_replicated(ATTACH_CONSUMER_SESSION_CODE, "consumer_session.attach"),
+    CommandMeta::non_replicated(BIND_SESSION_CODE, "session.bind"),
     CommandMeta::non_replicated(GET_POLL_ROUTING_CODE, "message.poll_routing"),
     CommandMeta::non_replicated(POLL_MESSAGES_ON_PRIMARY_CODE, "message.poll_primary"),
     CommandMeta::non_replicated(GET_CONSUMER_OFFSET_ROUTING_CODE, "consumer_offset.routing"),
@@ -249,7 +249,7 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         SYNC_CONSUMER_GROUP_CODE => 47,
         LOGIN_REGISTER_WITH_PAT_CODE => 48,
         DESCRIBE_OPTIONS_CODE => 49,
-        ATTACH_CONSUMER_SESSION_CODE => 50,
+        BIND_SESSION_CODE => 50,
         GET_POLL_ROUTING_CODE => 51,
         POLL_MESSAGES_ON_PRIMARY_CODE => 52,
         GET_CONSUMER_OFFSET_ROUTING_CODE => 53,
@@ -299,7 +299,9 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::Reserved
         | Operation::Register
         | Operation::Logout
-        | Operation::NonReplicated => return None,
+        | Operation::NonReplicated
+        | Operation::FinalizeSession
+        | Operation::RetireSession => return None,
     };
     Some(&COMMAND_TABLE[idx])
 }

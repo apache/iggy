@@ -36,21 +36,26 @@ pub mod join_group;
 pub mod leave_group;
 pub mod list_offsets;
 pub mod metadata;
+pub mod offset_commit;
+pub mod offset_fetch;
 pub mod produce;
 pub mod sync_group;
 pub(crate) mod topic_config;
 
 use bytes::{Buf, Bytes, BytesMut};
+use iggy::prelude::IggyError;
 use kafka_protocol::messages::TransactionalId;
 use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::bridge::BridgeError;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_CONFIGS,
     API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID,
-    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH,
     API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST,
     ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
     supported_max_version,
@@ -90,13 +95,15 @@ pub async fn dispatch(
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, api_version, body).await,
+        API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
+        API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(state, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
         API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
         API_KEY_FIND_COORDINATOR => find_coordinator::handle(state, api_version, body).await,
         API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
-        API_KEY_HEARTBEAT => heartbeat::handle(state, api_version, body).await,
+        API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
@@ -111,6 +118,28 @@ pub async fn dispatch(
 /// name either way.
 pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bool {
     transactional_id.is_some_and(|id| !id.is_empty())
+}
+
+/// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.
+async fn offset_deadline(state: &GatewayState, connection: &ConnectionState) -> Instant {
+    let member = connection.heartbeat_member();
+    let hold = state.groups.offset_hold(member.as_ref()).await;
+    Instant::now() + hold
+}
+
+/// What the operator can do about an offset call that the client sees as -1. The client sees no
+/// more, so the log is the one place the cause shows.
+const fn offset_refusal_cause(error: &BridgeError) -> &'static str {
+    match error {
+        BridgeError::Iggy(IggyError::TooManyConsumerOffsets) => {
+            "the partition holds partition.consumer_offsets_max keys"
+        }
+        BridgeError::Iggy(IggyError::InvalidCommand) => {
+            "a server without the external group kind answers this"
+        }
+        error if error.is_bridge_login_rejected() => "Iggy rejected the bridge's credentials",
+        _ => "no Kafka code fits this Iggy error",
+    }
 }
 
 /// Encode a `kafka_protocol` message, mapping its `anyhow::Error` (the crate has no stable

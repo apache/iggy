@@ -701,6 +701,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::RemoveConsumerGroupMember => "remove_consumer_group_member",
         Operation::CompleteConsumerGroupRevocation => "complete_consumer_group_revocation",
         Operation::TruncatePartition => "truncate_partition",
+        Operation::FinalizeSession => "finalize_session",
+        Operation::RetireSession => "retire_session",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",

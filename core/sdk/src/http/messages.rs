@@ -38,6 +38,7 @@ impl MessageClient for HttpClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        crate::http::consumer_offsets::refuse_external_group(consumer)?;
         let response = self
             .get_with_query(
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),

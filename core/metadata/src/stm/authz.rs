@@ -334,6 +334,8 @@ pub(crate) fn authorize(
         | Operation::Logout
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation
+        | Operation::FinalizeSession
+        | Operation::RetireSession
         | Operation::CreateTopic
         | Operation::CreatePartitions
         | Operation::DeleteSegments

@@ -46,8 +46,6 @@ pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
-    (8, "OffsetCommit"),
-    (9, "OffsetFetch"),
     (15, "DescribeGroups"),
     (16, "ListGroups"),
     (20, "DeleteTopics"),
@@ -645,6 +643,107 @@ pub fn build_heartbeat_request(
     if flexible {
         enc.write_empty_tagged_fields();
     }
+    enc.freeze()
+}
+
+/// `OffsetCommit` request for partition 0 of `topic`, made outside the group protocol.
+pub fn build_offset_commit_request(
+    version: i16,
+    group_id: &str,
+    topic: &str,
+    offset: i64,
+) -> Bytes {
+    let flexible = version >= 8;
+    let mut enc = Encoder::with_capacity(64);
+
+    write_string(&mut enc, flexible, Some(group_id));
+    enc.write_i32(-1); // generation_id_or_member_epoch
+    write_string(&mut enc, flexible, Some("")); // member_id
+    if version >= 7 {
+        write_string(&mut enc, flexible, None); // group_instance_id
+    }
+    if version <= 4 {
+        enc.write_i64(-1); // retention_time_ms
+    }
+    write_array_count(&mut enc, flexible, 1);
+    write_string(&mut enc, flexible, Some(topic));
+    write_array_count(&mut enc, flexible, 1);
+    enc.write_i32(0); // partition_index
+    enc.write_i64(offset);
+    if version >= 6 {
+        enc.write_i32(-1); // committed_leader_epoch
+    }
+    write_string(&mut enc, flexible, None); // committed_metadata
+    if flexible {
+        enc.write_empty_tagged_fields(); // partition
+        enc.write_empty_tagged_fields(); // topic
+        enc.write_empty_tagged_fields(); // request
+    }
+    enc.freeze()
+}
+
+/// `OffsetFetch` request for one group: top level below v8, the `groups` array from v8.
+/// `Some(topic)` asks for partition 0 of `topic`. `None` sends a null topic list, which asks for
+/// every offset of the group, from version 2.
+pub fn build_offset_fetch_request(version: i16, group_id: &str, topic: Option<&str>) -> Bytes {
+    let flexible = version >= 6;
+    let mut enc = Encoder::with_capacity(64);
+
+    if version >= 8 {
+        write_array_count(&mut enc, true, 1); // groups
+    }
+    write_string(&mut enc, flexible, Some(group_id));
+    if version >= 9 {
+        write_string(&mut enc, true, None); // member_id
+        enc.write_i32(-1); // member_epoch
+    }
+    match topic {
+        Some(topic) => {
+            write_array_count(&mut enc, flexible, 1); // topics
+            write_string(&mut enc, flexible, Some(topic));
+            write_array_count(&mut enc, flexible, 1); // partition_indexes
+            enc.write_i32(0);
+            if flexible {
+                enc.write_empty_tagged_fields(); // topic
+            }
+        }
+        None if flexible => enc.write_varint(0), // topics: null
+        None => enc.write_i32(-1),               // topics: null
+    }
+    if version >= 8 {
+        enc.write_empty_tagged_fields(); // group
+    }
+    if version >= 7 {
+        enc.write_bool(false); // require_stable
+    }
+    if flexible {
+        enc.write_empty_tagged_fields(); // request
+    }
+    enc.freeze()
+}
+
+/// `OffsetFetch` request, v8 or later, for every group of `groups`. Each asks for partition 0 of
+/// `topic`.
+pub fn build_offset_fetch_groups_request(version: i16, groups: &[&str], topic: &str) -> Bytes {
+    assert!(version >= 8, "only v8 and later name several groups");
+    let mut enc = Encoder::with_capacity(64);
+
+    write_array_count(&mut enc, true, groups.len());
+    for group_id in groups {
+        write_string(&mut enc, true, Some(group_id));
+        if version >= 9 {
+            write_string(&mut enc, true, None); // member_id
+            enc.write_i32(-1); // member_epoch
+        }
+        write_array_count(&mut enc, true, 1); // topics
+        write_string(&mut enc, true, Some(topic));
+        write_array_count(&mut enc, true, 1); // partition_indexes
+        enc.write_i32(0);
+        enc.write_empty_tagged_fields(); // topic
+        enc.write_empty_tagged_fields(); // group
+    }
+    enc.write_bool(false); // require_stable
+    enc.write_empty_tagged_fields(); // request
     enc.freeze()
 }
 

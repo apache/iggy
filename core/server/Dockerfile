@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.98
+ARG RUST_VERSION=1.99
 ARG ALPINE_VERSION=3.23
 
 # ── from-source path ─────────────────────────────────────────────────────────

@@ -30,6 +30,8 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (1, "Fetch", 4, 12),
     (2, "ListOffsets", 1, 6),
     (3, "Metadata", 0, 9),
+    (8, "OffsetCommit", 2, 9),
+    (9, "OffsetFetch", 1, 9),
     (10, "FindCoordinator", 0, 4),
     (11, "JoinGroup", 0, 9),
     (12, "Heartbeat", 0, 4),
