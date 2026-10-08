@@ -3075,6 +3075,7 @@ mod tests {
             peer: 1,
             first_batch_offset: None,
             idle_ticks: 0,
+            requested_from: 1,
         });
 
         // Committed purge: generation 1 > applied 0.
@@ -3198,6 +3199,7 @@ mod tests {
                 peer: 1,
                 first_batch_offset: None,
                 idle_ticks: 0,
+                requested_from: 1,
             });
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();

@@ -306,6 +306,144 @@ fn given_an_old_primary_holding_an_uncommitted_prepare_when_it_is_elected_over_a
     );
 }
 
+/// A rejoining replica fences everything above its commit point, and while fenced
+/// its commit point cannot move. Repair must still walk a window wider than one
+/// served chunk instead of re-requesting the first chunk forever.
+#[test]
+fn given_a_fenced_window_wider_than_a_repair_chunk_when_the_old_primary_rejoins_should_catch_up() {
+    const CHUNK: u64 = 2;
+    let (mut sim, client) = cluster(0x5EED_57A1);
+    let namespace = IggyNamespace::new(1, 1, 0);
+    sim.init_partition(namespace);
+    sim.register_client_with_primary(&client);
+    for replica in &sim.replicas {
+        for shard in &replica.shards {
+            shard.set_repair_chunk_max(CHUNK);
+        }
+    }
+    for index in 0..3 {
+        send(
+            &mut sim,
+            &client,
+            namespace,
+            OLD_PRIMARY,
+            &format!("warmup-{index}"),
+        );
+    }
+    isolate(&mut sim, OLD_PRIMARY, true);
+    send(&mut sim, &client, namespace, OLD_PRIMARY, "stale");
+    let new_view = (0..ELECTION_STEPS)
+        .find_map(|_| {
+            sim.step();
+            let (status, view, _, _) = group_state(&sim, 1, namespace);
+            (status == Status::Normal && view > 0).then_some(view)
+        })
+        .expect("replicas 1 and 2 never elected a new view");
+    let new_primary = primary_of(&sim, 1, namespace, new_view);
+    for index in 0..12 {
+        send(
+            &mut sim,
+            &client,
+            namespace,
+            new_primary,
+            &format!("fresh-{index}"),
+        );
+    }
+    let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
+    assert!(
+        majority_commit > 3 + 4 * CHUNK,
+        "the new view committed only through {majority_commit}"
+    );
+
+    isolate(&mut sim, OLD_PRIMARY, false);
+    for _ in 0..SETTLE_STEPS {
+        sim.step();
+    }
+    let (_, _, rejoined_commit, _) = group_state(&sim, OLD_PRIMARY, namespace);
+    assert!(
+        rejoined_commit >= majority_commit,
+        "the old primary never caught up: committed {rejoined_commit} of {majority_commit}"
+    );
+    let reference = polled(&mut sim, new_primary, namespace);
+    let rejoined = polled(&mut sim, OLD_PRIMARY, namespace);
+    assert_eq!(
+        rejoined, reference,
+        "the rejoined replica serves a committed log that differs from the view's"
+    );
+}
+
+/// Each proof that breaks drops the stale suffix above the break, so several
+/// stale entries take several rounds of proof and refetch. Every round must
+/// re-request at once instead of waiting out the repair retry timer.
+#[test]
+fn given_an_old_primary_holding_several_stale_prepares_when_it_rejoins_should_catch_up() {
+    let (mut sim, client) = cluster(0x5EED_57A2);
+    let namespace = IggyNamespace::new(1, 1, 0);
+    sim.init_partition(namespace);
+    sim.register_client_with_primary(&client);
+    for index in 0..3 {
+        send(
+            &mut sim,
+            &client,
+            namespace,
+            OLD_PRIMARY,
+            &format!("warmup-{index}"),
+        );
+    }
+    isolate(&mut sim, OLD_PRIMARY, true);
+    for index in 0..3 {
+        send(
+            &mut sim,
+            &client,
+            namespace,
+            OLD_PRIMARY,
+            &format!("stale-{index}"),
+        );
+    }
+    let new_view = (0..ELECTION_STEPS)
+        .find_map(|_| {
+            sim.step();
+            let (status, view, _, _) = group_state(&sim, 1, namespace);
+            (status == Status::Normal && view > 0).then_some(view)
+        })
+        .expect("replicas 1 and 2 never elected a new view");
+    let new_primary = primary_of(&sim, 1, namespace, new_view);
+    for index in 0..6 {
+        send(
+            &mut sim,
+            &client,
+            namespace,
+            new_primary,
+            &format!("fresh-{index}"),
+        );
+    }
+    let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
+
+    isolate(&mut sim, OLD_PRIMARY, false);
+    let caught_up = (0..SETTLE_STEPS).find(|_| {
+        sim.step();
+        group_state(&sim, OLD_PRIMARY, namespace).2 >= majority_commit
+    });
+    let caught_up =
+        caught_up.unwrap_or_else(|| panic!("the old primary never caught up to {majority_commit}"));
+    assert!(
+        caught_up < usize::try_from(partitions::REPAIR_RETRY_TICKS).unwrap(),
+        "catching up took {caught_up} steps: a broken proof waited out the repair retry timer"
+    );
+    let reference = polled(&mut sim, new_primary, namespace);
+    let rejoined = polled(&mut sim, OLD_PRIMARY, namespace);
+    assert!(
+        !reference
+            .iter()
+            .any(|(_, payload)| payload.starts_with("stale")),
+        "the new view committed the isolated primary's requests: {reference:?}"
+    );
+    assert_eq!(
+        rejoined, reference,
+        "the rejoined replica serves a committed log that differs from the view's"
+    );
+}
+
 fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32) -> u8 {
     sim.replicas[usize::from(replica)]
         .partition_shard(namespace)

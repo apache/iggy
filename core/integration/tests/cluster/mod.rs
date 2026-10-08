@@ -32,4 +32,5 @@ mod partition_primary_routing;
 mod partition_state_transfer;
 mod register_forwarding;
 mod replica_read_batching;
+mod rolling_sigkill_repro;
 mod staggered_bootstrap;

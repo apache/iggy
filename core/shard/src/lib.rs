@@ -966,8 +966,8 @@ impl ShardFrame {
 ///
 /// The per-peer bus queues are bounded (`peer_queue_capacity`)
 /// and overrun frames drop silently, so an unbounded burst loses its own tail;
-/// the receiver pulls the window chunk by chunk instead (each walked
-/// `RepairDone` immediately requests the next chunk while progress holds).
+/// the receiver pulls the window chunk by chunk instead (each `RepairDone`
+/// whose held run reached the requested chunk asks for the next).
 ///
 /// Runtime default; the server overrides the live ceiling per shard from
 /// `[cluster] repair_chunk_max` at bootstrap.
@@ -5205,9 +5205,7 @@ where
                 partition.consensus().commit_max(),
                 partition.consensus().sequencer().current_sequence(),
             ),
-            partition
-                .view_fenced()
-                .then(|| partition.consensus().commit_min()),
+            partition.view_fenced().then(|| partition.fence_floor()),
         );
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
@@ -5751,10 +5749,9 @@ where
                 // `complete_repair` walks the window and clears the session
                 // only when the LOCAL commit frontier reached the requested
                 // op (the peer's served-through claim proves nothing about
-                // delivery on a lossy bus). While the walk makes progress
-                // the next chunk is pulled immediately; a stalled window is
+                // delivery on a lossy bus). The next chunk is pulled once the
+                // held run reaches the chunk just requested; a shorter run is
                 // left to the retry timer.
-                let before = partition.consensus().commit_min();
                 if let partitions::RepairConclusion::FloorRefused { floor, to_op } =
                     partition.complete_repair(&config).await
                 {
@@ -5814,10 +5811,15 @@ where
                         "partition journal repair complete"
                     );
                 } else {
-                    let commit_min = partition.consensus().commit_min();
-                    let next = partition.repair.as_ref().and_then(|live| {
-                        partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
-                            .map(|from_op| (live.peer, live.nonce, from_op, live.fetch_to_op))
+                    let repaired_through = partition.held_through();
+                    let next = partition.repair.as_mut().and_then(|live| {
+                        let from_op = partition_repair_next_chunk(
+                            live.requested_from,
+                            repaired_through,
+                            live.fetch_to_op,
+                        )?;
+                        live.requested_from = from_op;
+                        Some((live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
                     let self_id = partition.consensus().replica();
@@ -7891,6 +7893,19 @@ where
                         walk_cursor.get_or_insert(namespace);
                     }
                 }
+                // Entries that filled the window after its last proof re-drive
+                // nothing themselves once there is nothing left to fetch. A backup
+                // in a view change must not truncate what its DVC reported.
+                if consensus::repair_session_live(partition.consensus())
+                    && partition.view_fence_provable()
+                {
+                    if walks < PARTITION_WALKS_PER_TICK_MAX {
+                        walks += 1;
+                        partition.commit_journal(partitions.config()).await;
+                    } else {
+                        walk_cursor.get_or_insert(namespace);
+                    }
+                }
                 if let Some(fault) = partition.fatal() {
                     if fatal.is_none() {
                         fatal = Some(fault.clone());
@@ -7938,19 +7953,25 @@ where
                     );
                     continue;
                 }
+                let journal = &partition.log.journal().inner;
                 let due = partition.repair.as_mut().and_then(|session| {
                     if !session_live {
                         return None;
                     }
                     session.idle_ticks += 1;
-                    if session.idle_ticks < repair_retry_ticks {
+                    // 0 marks a proof that dropped held entries: refetch at once.
+                    if session.requested_from != 0 && session.idle_ticks < repair_retry_ticks {
                         return None;
                     }
                     session.idle_ticks = 0;
+                    session.requested_from = journal.held_through(commit_min).saturating_add(1);
+                    if session.requested_from > session.fetch_to_op {
+                        return None;
+                    }
                     Some((
                         session.peer,
                         session.nonce,
-                        commit_min.saturating_add(1),
+                        session.requested_from,
                         session.fetch_to_op,
                         cluster,
                         self_id,
@@ -8061,9 +8082,10 @@ where
                     repairs_live += 1;
                 }
                 let probe = partition_gap_probe(partition);
-                // A fenced walk takes nothing until the window is proven, and the
-                // events that prove it (repair, an anchor) re-drive it themselves.
-                let walk_stalled = group_is_walk_stalled(&probe) && !partition.view_fenced();
+                // A fenced walk takes only the recovered committed prefix; the
+                // proof, re-driven by repair and the anchor, releases the rest.
+                let walk_stalled = group_is_walk_stalled(&probe)
+                    && (!partition.view_fenced() || partition.recovered_prefix_pending());
                 // The RATE cap only. The concurrency cap lives in the arm fn,
                 // which is the funnel every arming site goes through; resolved
                 // before the debounce either way, so a refusal keeps the group
@@ -9229,6 +9251,7 @@ where
             peer,
             first_batch_offset: None,
             idle_ticks: 0,
+            requested_from: from_op,
         });
         tracing::info!(
             shard = self.id,
@@ -9315,6 +9338,7 @@ where
             peer,
             first_batch_offset: None,
             idle_ticks: 0,
+            requested_from: from_op,
         });
         tracing::info!(
             shard = self.id,
@@ -11220,15 +11244,20 @@ fn partition_repair_fetch_to_op(
 }
 
 /// Start of the next chunk to pull after a `RepairDone`, or `None` when the
-/// walk made no progress (the stall retry owns the remainder) or already
-/// stands at the session's fetch ceiling. The sweep closes such a session,
-/// because `fetch_to_op` never sits below `commit_to_op`.
+/// held run did not reach the chunk just requested (the stall retry owns the
+/// remainder) or already stands at the session's fetch ceiling. The sweep
+/// closes such a session, because `fetch_to_op` never sits below
+/// `commit_to_op`.
 ///
 /// A session can outlive its last fetchable op until that close, and
 /// `from_op > to_op` fails `RequestPreparesHeader::validate` on the serving
 /// peer, which drops the frame as unparsable.
-fn partition_repair_next_chunk(before: u64, commit_min: u64, fetch_to_op: u64) -> Option<u64> {
-    (commit_min > before && commit_min < fetch_to_op).then_some(commit_min + 1)
+fn partition_repair_next_chunk(
+    requested_from: u64,
+    held_through: u64,
+    fetch_to_op: u64,
+) -> Option<u64> {
+    (held_through >= requested_from && held_through < fetch_to_op).then_some(held_through + 1)
 }
 
 /// Highest adopted suffix op whose bodies are not all present above `commit_max`.
@@ -11512,7 +11541,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
     let announced_commit = pending.map_or(0, |pending| pending.commit_max);
-    let applied_floor = partition.consensus().commit_min();
+    let applied_floor = partition.fence_floor();
 
     let mut repairable_from: Option<u64> = None;
     for canonical in pending.map_or(&[][..], |pending| &pending.headers) {
@@ -12360,8 +12389,9 @@ mod repair_scope_tests {
     #[test]
     fn given_a_walk_at_the_fetch_ceiling_when_repair_done_lands_should_not_request_a_chunk() {
         assert_eq!(super::partition_repair_next_chunk(4, 7, 8), Some(8));
-        // No progress leaves the remainder to the stall retry.
-        assert_eq!(super::partition_repair_next_chunk(7, 7, 8), None);
+        // A held run short of the requested chunk leaves the remainder to the
+        // stall retry, so a peer with nothing new to serve is not re-asked at once.
+        assert_eq!(super::partition_repair_next_chunk(8, 7, 9), None);
         // Progress that reached the ceiling has nothing left to ask for: the
         // sweep closes the session, and `9..=8` is not a range.
         assert_eq!(super::partition_repair_next_chunk(7, 8, 8), None);

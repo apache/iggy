@@ -3777,6 +3777,7 @@ where
         consensus.advance_commit_max(commit_op);
         self.observed_view = self.consensus().view();
         self.repair = None;
+        self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
 
         Ok(PartitionInstallOutcome {

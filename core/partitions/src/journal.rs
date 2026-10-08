@@ -868,6 +868,22 @@ where
         op_to_storage_offset.contains_key(&op)
     }
 
+    /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
+    pub fn held_through(&self, floor: u64) -> u64 {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let mut through = floor;
+        for op in op_to_storage_offset
+            .range(floor.saturating_add(1)..)
+            .map(|(op, _)| *op)
+        {
+            if op != through + 1 {
+                break;
+            }
+            through = op;
+        }
+        through
+    }
+
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`
     /// in ONE pass over the header vec.
     ///

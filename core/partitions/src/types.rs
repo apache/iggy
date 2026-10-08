@@ -313,6 +313,9 @@ pub struct RepairSession {
     /// Ticks since the stream last made progress; at
     /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
     pub idle_ticks: u32,
+    /// First op of the latest request. The next chunk is pulled once the held
+    /// run reaches it, which works while a fenced commit point cannot move.
+    pub requested_from: u64,
 }
 
 /// How a repair-window commit walk concluded, decided by
