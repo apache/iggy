@@ -27,10 +27,10 @@ use tokio::time::sleep;
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
     QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
-    QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture,
-    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
-    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
-    QuestDbSinkTypedNumbersFixture,
+    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture,
+    QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
+    QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
+    QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -132,6 +132,13 @@ async fn given_typed_payload_when_consumed_should_map_questdb_column_types(
     assert!(
         !columns.contains_key("missing"),
         "null field created a column: {columns:?}"
+    );
+    // The message source carries microseconds, so the designated timestamp
+    // is a `TIMESTAMP`, while the payload source test pins `TIMESTAMP_NS`.
+    assert_eq!(
+        columns.get("timestamp").map(String::as_str),
+        Some("TIMESTAMP"),
+        "{columns:?}"
     );
     // Metadata columns requested by this fixture.
     assert_eq!(
@@ -565,8 +572,14 @@ async fn given_payload_timestamp_source_when_consumed_should_use_the_field(
 
     let columns = fixture.column_types().await.expect("no columns");
     // An auto-created designated timestamp is always named `timestamp`, and
-    // the source field must not also appear as a data column.
-    assert!(columns.contains_key("timestamp"), "{columns:?}");
+    // the source field must not also appear as a data column. The payload
+    // source converts through `timestamp_unit` to nanoseconds, so the column
+    // type follows; the README documents the per-source resolution.
+    assert_eq!(
+        columns.get("timestamp").map(String::as_str),
+        Some("TIMESTAMP_NS"),
+        "{columns:?}"
+    );
     assert!(
         !columns.contains_key("event_time"),
         "timestamp field must not double as a column: {columns:?}"
@@ -799,6 +812,46 @@ async fn given_many_rejections_across_chunks_when_consumed_should_write_every_va
     assert_eq!(
         reported, rejected,
         "every rejected record must be reported once: {logs}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_origin_timestamp_source_when_consumed_should_stamp_from_the_producer(
+    harness: &TestHarness,
+    fixture: QuestDbSinkOriginTimestampFixture,
+) {
+    // The producer stamps `origin_timestamp` when it builds the message, and
+    // the builder offers no way to set it by hand, so the assertion is a window
+    // around the send rather than an exact value. It cannot tell the producer's
+    // clock from the server's, since both are "about now" here; what it does
+    // pin is that the source runs end to end, stamps nothing at the epoch, and
+    // creates a microsecond column. The exact-value behaviour has unit tests.
+    let fixture = &fixture.0;
+    let before = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(1, json!({"price": 1.5}))],
+    )
+    .await;
+
+    fixture.wait_for_rows(1).await.expect("no rows");
+    let after = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(
+        columns.get("timestamp").map(String::as_str),
+        Some("TIMESTAMP"),
+        "the origin source carries microseconds: {columns:?}"
+    );
+    let values = fixture.column_values("timestamp").await.expect("no values");
+    let stored = values[0].as_str().expect("timestamp is not a string");
+    let stored_seconds: String = stored.chars().take(before.len()).collect();
+    assert!(
+        stored_seconds.as_str() >= before.as_str() && stored_seconds.as_str() <= after.as_str(),
+        "stored {stored} is outside the send window {before}..{after}"
     );
 }
 

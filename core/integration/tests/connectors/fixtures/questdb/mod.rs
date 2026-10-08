@@ -21,8 +21,8 @@ pub mod sink;
 pub use container::QuestDbOps;
 pub use sink::{
     QuestDbSinkCoercionFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
-    QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture,
-    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
-    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
-    QuestDbSinkTypedNumbersFixture,
+    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture,
+    QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerTimestampFixture,
+    QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
+    QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
 };

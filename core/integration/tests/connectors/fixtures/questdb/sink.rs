@@ -46,7 +46,6 @@ pub const SINK_TABLE: &str = "iggy_events";
 /// connector's own defaults, so a default fixture also exercises those.
 #[derive(Debug, Clone, Default)]
 pub struct QuestDbSinkOptions {
-    pub table: Option<String>,
     pub timestamp_source: Option<String>,
     pub timestamp_field: Option<String>,
     pub timestamp_unit: Option<String>,
@@ -93,29 +92,40 @@ impl QuestDbOps for QuestDbSinkFixture {
 
 impl QuestDbSinkFixture {
     pub fn table(&self) -> String {
-        self.options
-            .table
-            .clone()
-            .unwrap_or_else(|| SINK_TABLE.to_string())
+        SINK_TABLE.to_string()
     }
 
-    /// Poll until `table` holds at least `expected` rows. The table does not
+    /// Poll until `table` holds exactly `expected` rows. The table does not
     /// exist until the sink's first successful flush, which is why a missing
     /// table is treated as "not yet" rather than an error.
+    ///
+    /// A count past `expected` is an error, not a success: the connector is
+    /// at-least-once, so a duplicate row is the documented failure mode, and a
+    /// helper that returned on "at least" would let every caller's
+    /// `assert_eq!(count, expected)` pass with one in the table.
     pub async fn wait_for_rows(&self, expected: usize) -> Result<usize, TestBinaryError> {
         let table = self.table();
+        let mut last = None;
         for _ in 0..POLL_ATTEMPTS {
-            if let Ok(Some(count)) = self.count_rows(&table).await
-                && count >= expected
-            {
-                info!("Found {count} rows in QuestDB table {table} (expected {expected})");
-                return Ok(count);
+            if let Ok(Some(count)) = self.count_rows(&table).await {
+                last = Some(count);
+                if count == expected {
+                    info!("Found {count} rows in QuestDB table {table} (expected {expected})");
+                    return Ok(count);
+                }
+                if count > expected {
+                    return Err(TestBinaryError::InvalidState {
+                        message: format!(
+                            "Expected exactly {expected} rows in {table} but observed {count}, so a duplicate landed"
+                        ),
+                    });
+                }
             }
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
         Err(TestBinaryError::InvalidState {
             message: format!(
-                "Expected at least {expected} rows in {table} after {POLL_ATTEMPTS} attempts"
+                "Expected {expected} rows in {table} but observed {last:?} after {POLL_ATTEMPTS} attempts"
             ),
         })
     }
@@ -474,6 +484,15 @@ delegate_fixture!(
     QuestDbSinkOptions {
         batch_size: Some(7),
         include_offset_column: Some(true),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// Stamps rows from the producer's clock rather than the server's.
+    QuestDbSinkOriginTimestampFixture,
+    QuestDbSinkOptions {
+        timestamp_source: Some("origin".to_string()),
         ..Default::default()
     }
 );

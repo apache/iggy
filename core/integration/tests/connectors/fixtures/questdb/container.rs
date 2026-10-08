@@ -56,9 +56,11 @@ pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PATH";
 /// directory. Cargo runs the test with the same working directory, so the same
 /// relative path resolves here.
 pub const SINK_PLUGIN_PATH: &str = "../../target/debug/libiggy_connector_questdb_sink";
-/// Everything that changes what the plugin does, for the staleness check in
-/// [`ensure_plugin_built`]. `config.toml` is in the list because the runtime
-/// reads it from the source tree rather than from the built library.
+/// Everything that changes what gets built into the plugin, for the staleness
+/// check in [`ensure_plugin_built`]. `Cargo.toml` is in the list because a
+/// dependency or feature change rebuilds the library without touching a source
+/// file. `config.toml` is not, because the runtime reads it from the source
+/// tree at start and no build is involved.
 const SINK_SOURCE_PATHS: &[&str] = &[
     "../connectors/sinks/questdb_sink/src/lib.rs",
     "../connectors/sinks/questdb_sink/src/mapping.rs",
@@ -179,8 +181,6 @@ impl QuestDbContainer {
             .with_exposed_port(QUESTDB_HTTP_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(QUESTDB_READY_LOG))
             .with_mapped_port(0, QUESTDB_HTTP_PORT.tcp())
-            // Keep the footprint small; these suites write a few thousand rows.
-            .with_env_var("QDB_CAIRO_COMMIT_LAG", "100")
             .with_container_name(fixtures::unique_container_name("questdb"))
             .start()
             .await
