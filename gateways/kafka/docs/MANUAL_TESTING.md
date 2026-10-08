@@ -216,6 +216,8 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
 | 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
+| 8 | OffsetCommit | 2 | 9 | 1, 2, 9, 10 |
+| 9 | OffsetFetch | 1 | 9 | 0, 1, 9, 10 |
 | 10 | FindCoordinator | 0 | 4 | −1, 0, 4, 5 |
 | 11 | JoinGroup | 0 | 9 | −1, 0, 9, 10 |
 | 12 | Heartbeat | 0 | 4 | −1, 0, 4, 5 |
@@ -229,8 +231,8 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | ---- | ------ | ---------------------- | --------------------------- |
 | B1 | ApiVersions negotiation | `error_code=0`; body lists 14 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
-| B3 | Produce/Fetch/ListOffsets/CreateTopics/InitProducerId out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these five messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,10,11,12,13,14,15,16,18,19,22 only. No OffsetCommit/OffsetFetch, and no transaction keys (24, 25, 26, 28) |
+| B3 | Produce/Fetch/ListOffsets/CreateTopics/InitProducerIdOffsetCommit/OffsetFetch  out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these five messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,22 only, and no transaction keys (24, 25, 26, 28) |
 
 An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
 key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
@@ -251,7 +253,7 @@ decoded `ec`.
 
 | ID | API key | Name | Steps | Expected |
 | ---- | --------- | ------ | ------- | ---------- |
-| C1 | 8 | OffsetCommit | `send --host 127.0.0.1:9093 --api-key 8 --version 2` | Connection closes, no response bytes |
+| C1 | 15 | DescribeGroups | `send --host 127.0.0.1:9093 --api-key 15` | Connection closes, no response bytes |
 | C2 | 10 | FindCoordinator | `send --host 127.0.0.1:9093 --api-key 10` | Connection closes |
 | C3 | 17 | SaslHandshake | `send --host 127.0.0.1:9093 --api-key 17` | Connection closes |
 | C4 | 20 | DeleteTopics | `send --host 127.0.0.1:9093 --api-key 20` | Connection closes |
@@ -315,9 +317,12 @@ success. This category predates the bridge landing: G2/G3's "fails at metadata" 
 | G6 | Graceful kcat exit | G3's two kcats, then Ctrl-C one (kcat closes its consumer, which sends LeaveGroup v0/v1) | The survivor rebalances within one heartbeat interval, not `session.timeout.ms`. Join, leave and sync are real, but the assignment is empty: the Metadata stub reports the topic unknown, so the assignor has no partitions to hand out |
 | G7 | Graceful Java exit | G5 in two terminals, then Ctrl-C one | Same as G6 |
 | G8 | Static member exit | G7 with `--consumer-property group.instance.id=x` on the one stopped | No LeaveGroup is sent; the survivor waits out the session timeout before rebalancing |
-| G9 | List groups | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list` after G5 has joined | Prints the group. `--list --state Empty` matches a group that was issued a member id and has not joined yet. A group whose members have all expired is absent |
-| G10 | Describe members | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --members --group g2` | Prints member ids. Assignment and protocol are filled only while the group is Stable |
-| G11 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch and fails, because that API is not implemented |
+| G9 | Group resumes from its commit | Bridge on and topic `orders` made as in Category I. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g9 --topic orders --from-beginning`, stop it, produce one record, run it again | The second run prints only the new record. `--from-beginning` applies only to a group with no committed offset |
+| G10 | Resume after a gateway restart | G9 with a gateway restart before the second run | Same as G9, because the offsets live in Iggy ([#3542](https://github.com/apache/iggy/issues/3542)) |
+| G11 | Two members share a topic | Bridge on and a topic with 2 partitions. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g11 --topic <topic> --property print.partition=true --property print.offset=true` in two terminals, produce to both partitions, stop one, produce again | Each prints one partition. After the stop, the other prints the new records of both partitions, and none twice |
+| G12 | List groups | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list` after G5 has joined | Prints the group. `--list --state Empty` matches a group that was issued a member id and has not joined yet. A group whose members have all expired is absent |
+| G13 | Describe members | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --members --group g2` | Prints member ids. Assignment and protocol are filled only while the group is Stable |
+| G14 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch and fails, because that API is not implemented |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 
@@ -442,7 +447,7 @@ Gateway commit: ___________
 kcat version (if used): ___________
 
 [ ] A1–A10 Smoke tests
-[ ] B1–B4  Version firewall (all 7 keys × 4 boundary versions)
+[ ] B1–B4  Version firewall (every listed key × 4 boundary versions)
 [ ] C1–C4  Unsupported API keys
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
@@ -485,3 +490,4 @@ These are documented as TODO in [SCOPE.md](SCOPE.md) — do not fail #3421 valid
 - Transactional produce
 - Real offset commit semantics
 - Consumer group offset commit/fetch, including `kafka-consumer-groups.sh --describe` without `--members` or `--state` (list, `--describe --members` and `--describe --state` are G9-G11; join/sync/heartbeat/leave are G3-G8)
+- Admin group views (join/sync/heartbeat/leave are covered by G3-G8, offset commit and fetch by G9-G10)

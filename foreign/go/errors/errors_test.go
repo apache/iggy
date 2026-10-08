@@ -71,6 +71,12 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			message:  "request is below the deduplication window; outcome unknown, resending may duplicate the write",
 		},
 		{
+			err:      PartitionHistoryChanged{},
+			sentinel: ErrPartitionHistoryChanged,
+			code:     Code(3014),
+			message:  "partition history changed after the request was resolved",
+		},
+		{
 			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
 			sentinel: ErrConsumerGroupPartitionNotOwned,
 			code:     ConsumerGroupPartitionNotOwnedCode,

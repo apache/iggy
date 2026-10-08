@@ -19,7 +19,7 @@
 //!
 //! [`GroupCoordinator`] owns every group this gateway instance coordinates and is the only
 //! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup`/
-//! `DescribeGroups`/`ListGroups` handlers translate wire messages into the request types here,
+//! `DescribeGroups`/`ListGroups`/`OffsetCommit` handlers translate wire messages into the request types here,
 //! and `state` holds the synchronous state machine those requests drive.
 //!
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
@@ -27,11 +27,15 @@
 
 mod state;
 
+pub use state::{MAX_GROUP_ID_BYTES, is_valid_group_id};
+
 use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
-use kafka_protocol::messages::{JoinGroupRequest, LeaveGroupRequest, SyncGroupRequest};
+use kafka_protocol::messages::{
+    HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest, SyncGroupRequest,
+};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
@@ -388,6 +392,43 @@ impl From<(&LeavingMember, i16)> for LeftMember {
     }
 }
 
+/// Who an `OffsetCommit` says it is.
+#[derive(Debug, Clone)]
+pub struct CommitRequest {
+    pub group_id: StrBytes,
+    /// Negative for a commit made outside the group protocol, as admin tools send.
+    pub generation_id: i32,
+    pub member_id: StrBytes,
+    pub group_instance_id: Option<StrBytes>,
+}
+
+impl From<&OffsetCommitRequest> for CommitRequest {
+    fn from(request: &OffsetCommitRequest) -> Self {
+        Self {
+            group_id: request.group_id.0.clone(),
+            generation_id: request.generation_id_or_member_epoch,
+            member_id: request.member_id.clone(),
+            group_instance_id: request.group_instance_id.clone(),
+        }
+    }
+}
+
+/// One member of one group. Holds copies, so it pins no frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    pub group_id: StrBytes,
+    pub member_id: StrBytes,
+}
+
+impl From<&HeartbeatRequest> for GroupMember {
+    fn from(request: &HeartbeatRequest) -> Self {
+        Self {
+            group_id: owned_str(&request.group_id.0),
+            member_id: owned_str(&request.member_id),
+        }
+    }
+}
+
 /// Every consumer group this gateway instance coordinates.
 ///
 /// There is no timer task. A request that touches a group first expires whatever is overdue in
@@ -523,6 +564,24 @@ impl GroupCoordinator {
         )
     }
 
+    /// Whether `request` may commit offsets for its group. A member's commit also refreshes its
+    /// session. Never parks.
+    pub async fn validate_commit(&self, request: &CommitRequest) -> i16 {
+        let mut groups = self.groups.lock().await;
+        state::commit_step(&mut groups, request, Instant::now())
+    }
+
+    /// How long an `OffsetCommit` or `OffsetFetch` may hold its connection. A heartbeat there
+    /// waits behind it. So it takes half the shortest session, and at most half of what is left
+    /// of the session of `member`, the member that heartbeats on that connection. Never parks.
+    pub async fn offset_hold(&self, member: Option<&GroupMember>) -> Duration {
+        let hold = self.config.min_session_timeout / 2;
+        let Some(member) = member else {
+            return hold;
+        };
+        let groups = self.groups.lock().await;
+        state::offset_hold(&groups, member, hold, Instant::now())
+  }
     /// Every group currently in the map, ordered by group id.
     ///
     /// Does not tick. A list names no group, and sweeping here would open rebalances as a side

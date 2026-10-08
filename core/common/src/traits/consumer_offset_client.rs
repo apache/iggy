@@ -43,6 +43,7 @@ pub trait ConsumerOffsetClient {
     ///
     /// Authentication is required, and the permission to poll the messages.
     /// An absent offset key returns `Ok(None)` when its stream, topic, and consumer group resolve.
+    /// A replica unable to admit the request returns [`IggyError::TransientNotAccepted`].
     /// A local auto-commit cursor can be visible before its durable store commits.
     /// In a cluster the node the client is connected to answers from its own replica of the partition.
     /// That replica can be a backup that lags the partition's primary, so a read right after a store can return the previous offset.

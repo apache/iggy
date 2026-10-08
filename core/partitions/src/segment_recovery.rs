@@ -30,16 +30,18 @@
 
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::segment_anchor::ANCHOR_EXTENSION;
-use crate::state_transfer::STAGING_SUFFIX;
+use crate::state_transfer::{STAGING_SUFFIX, segment_dir_entries};
 use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
+use compio::buf::{IntoInner, IoBuf};
+use compio::fs;
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
 use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::fs_utils::truncate_file;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
-use std::fs;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
@@ -613,7 +615,7 @@ pub async fn load_persisted_segments_with_checkpoint(
     // collects ARE the post-sweep start-offset set. Note the error policy is
     // the collect side's (NotFound => empty, anything else => refuse boot); the
     // sweep's silent return would swallow an EACCES that must not be ignored.
-    let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
+    let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path).await?;
     start_offsets.sort_unstable();
     if let Some(checkpoint) = checkpoint {
         start_offsets.retain(|offset| {
@@ -636,7 +638,7 @@ pub async fn load_persisted_segments_with_checkpoint(
             config.get_messages_path(stream_id, topic_id, partition_id, start_offset);
         let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
 
-        let raw_messages_size = file_len(&messages_path)?;
+        let raw_messages_size = file_len(&messages_path).await?;
         let checkpoint_segment =
             checkpoint.is_some_and(|checkpoint| checkpoint.start_offset == start_offset);
         let messages_size = checkpoint
@@ -652,7 +654,7 @@ pub async fn load_persisted_segments_with_checkpoint(
             );
         }
         let bounds = if checkpoint_segment {
-            let messages = open_messages_file(identity, &messages_path)?;
+            let messages = open_messages_file(identity, &messages_path).await?;
             let mut scanner = FileScanner::new(&messages, messages_size, &mut scratch);
             recover_by_walking_log(
                 identity,
@@ -723,8 +725,8 @@ pub async fn load_persisted_segments_with_checkpoint(
 
         // Staged now so pass C can install it with one atomic rename, and so
         // a long chain never holds more than one rebuilt index in memory.
-        let rebuilt_index_staging = match &bounds.rebuilt_index {
-            Some(entries) => Some(stage_rebuilt_index(&index_path, entries)?),
+        let rebuilt_index_staging = match bounds.rebuilt_index {
+            Some(entries) => Some(stage_rebuilt_index(&index_path, entries).await?),
             None => None,
         };
 
@@ -769,7 +771,8 @@ pub async fn load_persisted_segments_with_checkpoint(
                 &plan.messages_path,
                 &plan.index_path,
                 plan.segment.start_offset,
-            )?;
+            )
+            .await?;
         }
         // Log first, index second: an index is kept only when a whole batch
         // verifies at its LAST entry's position, so the walked log length
@@ -785,12 +788,12 @@ pub async fn load_persisted_segments_with_checkpoint(
         // pair converges.
         if checkpoint.is_none_or(|checkpoint| checkpoint.start_offset != plan.segment.start_offset)
         {
-            truncate_to(&plan.messages_path, messages_size)?;
+            truncate_to(&plan.messages_path, messages_size).await?;
         }
         if let Some(staging_path) = &plan.rebuilt_index_staging {
-            install_rebuilt_index(staging_path, &plan.index_path, identity.partition_path)?;
+            install_rebuilt_index(staging_path, &plan.index_path, identity.partition_path).await?;
         } else {
-            truncate_to(&plan.index_path, plan.index_size)?;
+            truncate_to(&plan.index_path, plan.index_size).await?;
         }
 
         let mut storage = if checkpoint.is_some() {
@@ -1135,12 +1138,13 @@ async fn ensure_contiguous_chain(
 /// Sweeps boot-time scratch (`.staging` spill, orphan `.index`) and returns the
 /// start offset parsed out of every remaining zero-padded `.log` file name. A
 /// missing directory means a never-persisted partition.
-fn sweep_scratch_files_and_collect_offsets(
+async fn sweep_scratch_files_and_collect_offsets(
     partition_path: &str,
 ) -> Result<Vec<u64>, PartitionRecoveryError> {
     // The recovery opens are read-only, but a failed one fails the partition
     // load, which stops the server at boot, so they count like write opens.
-    let entries = match fs::read_dir(partition_path)
+    let entries = match segment_dir_entries(partition_path)
+        .await
         .note_descriptor_exhaustion(|| format!("listing directory {partition_path}"))
     {
         Ok(entries) => entries,
@@ -1158,8 +1162,7 @@ fn sweep_scratch_files_and_collect_offsets(
     let mut orphan_candidates = Vec::new();
     let mut log_stems = std::collections::HashSet::new();
     let mut start_offsets = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         let Some(as_str) = path.to_str() else {
             continue;
         };
@@ -1191,7 +1194,7 @@ fn sweep_scratch_files_and_collect_offsets(
             .is_some_and(|stem| log_stems.contains(stem))
     }));
     for path in swept {
-        if let Err(error) = fs::remove_file(&path) {
+        if let Err(error) = fs::remove_file(&path).await {
             warn!(
                 partition_path,
                 path = %path.display(),
@@ -1211,8 +1214,8 @@ fn sweep_scratch_files_and_collect_offsets(
 /// `EIO` into 0 would route a healthy segment into recover-as-empty, fencing
 /// it out of service (worst route: an index stat error floors a healthy
 /// sealed index to a 0-byte target while its entries still load).
-fn file_len(path: &str) -> Result<u64, PartitionRecoveryError> {
-    match fs::metadata(path) {
+async fn file_len(path: &str) -> Result<u64, PartitionRecoveryError> {
+    match fs::metadata(path).await {
         Ok(metadata) => Ok(metadata.len()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(source) => {
@@ -1242,12 +1245,11 @@ fn file_len(path: &str) -> Result<u64, PartitionRecoveryError> {
 ///
 /// Stats the file fresh instead of trusting a length carried from pass A: the
 /// whole chain was walked in between, and the mutation must key on what is on
-/// disk now. Synchronous `std::fs` on purpose (see [`FileScanner`]). The
-/// fsync bounds the crash window: a power cut right after `set_len` may
+/// disk now. The fsync bounds the crash window: a power cut right after `set_len` may
 /// re-present the torn tail on the next boot, which only walks and truncates
 /// again (idempotent), but the sync keeps the common case deterministic.
-fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryError> {
-    let current_size = file_len(path)?;
+async fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryError> {
+    let current_size = file_len(path).await?;
     if current_size == target_size {
         return Ok(());
     }
@@ -1275,6 +1277,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
+        .await
         .note_descriptor_exhaustion(|| format!("opening {path}"))
         .map_err(|source| {
             error!(
@@ -1284,7 +1287,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
             );
             PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })?;
-    file.set_len(target_size).map_err(|source| {
+    truncate_file(&file, target_size).await.map_err(|source| {
         error!(
             path,
             target_size,
@@ -1293,7 +1296,7 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
         );
         PartitionRecoveryError::from(IggyError::CannotWriteToFile)
     })?;
-    file.sync_all().map_err(|source| {
+    file.sync_all().await.map_err(|source| {
         error!(
             path,
             error = %source,
@@ -1316,13 +1319,17 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), PartitionRecoveryErro
 /// The staging file is pure scratch until pass C renames it into place: the
 /// boot sweep unlinks orphaned `*.staging` files, so a crash anywhere before
 /// the rename costs nothing.
-fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, PartitionRecoveryError> {
+async fn stage_rebuilt_index(
+    index_path: &str,
+    entries: Vec<u8>,
+) -> Result<String, PartitionRecoveryError> {
     let staging_path = format!("{index_path}{STAGING_SUFFIX}");
-    let file = fs::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(&staging_path)
+        .await
         .note_descriptor_exhaustion(|| format!("opening {staging_path}"))
         .map_err(|source| {
             error!(
@@ -1332,7 +1339,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Parti
             );
             PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })?;
-    file.write_all_at(entries, 0).map_err(|source| {
+    file.write_all_at(entries, 0).await.0.map_err(|source| {
         error!(
             path = %staging_path,
             error = %source,
@@ -1340,7 +1347,7 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Parti
         );
         PartitionRecoveryError::from(IggyError::CannotWriteToFile)
     })?;
-    file.sync_all().map_err(|source| {
+    file.sync_all().await.map_err(|source| {
         error!(
             path = %staging_path,
             error = %source,
@@ -1355,37 +1362,41 @@ fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, Parti
 /// atomic commit point: the on-disk index is either the old one holding no
 /// whole entry (whose walk re-runs the rebuild) or the complete rebuilt one,
 /// never a mix of pages from both.
-fn install_rebuilt_index(
+async fn install_rebuilt_index(
     staging_path: &str,
     index_path: &str,
     partition_path: &str,
 ) -> Result<(), PartitionRecoveryError> {
-    fs::rename(staging_path, index_path).map_err(|source| {
-        error!(
-            from = %staging_path,
-            to = %index_path,
-            error = %source,
-            "failed to rename a rebuilt sparse index into place during recovery"
-        );
-        PartitionRecoveryError::from(IggyError::CannotWriteToFile)
-    })?;
-    fsync_dir(partition_path)
-}
-
-/// Makes renames and new files in `dir` durable. Synchronous like every
-/// other mutation in this module (see [`FileScanner`]).
-fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
-    fs::File::open(dir)
-        .note_descriptor_exhaustion(|| format!("opening directory {dir}"))
-        .and_then(|handle| handle.sync_all())
+    fs::rename(staging_path, index_path)
+        .await
         .map_err(|source| {
             error!(
-                dir,
+                from = %staging_path,
+                to = %index_path,
                 error = %source,
-                "failed to fsync a directory during recovery"
+                "failed to rename a rebuilt sparse index into place during recovery"
             );
-            PartitionRecoveryError::from(IggyError::CannotSyncFile)
-        })
+            PartitionRecoveryError::from(IggyError::CannotWriteToFile)
+        })?;
+    fsync_dir(partition_path).await
+}
+
+/// Makes renames and new files in `dir` durable.
+async fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
+    let synced = async {
+        let handle = fs::File::open(dir)
+            .await
+            .note_descriptor_exhaustion(|| format!("opening directory {dir}"))?;
+        handle.sync_all().await
+    };
+    synced.await.map_err(|source| {
+        error!(
+            dir,
+            error = %source,
+            "failed to fsync a directory during recovery"
+        );
+        PartitionRecoveryError::from(IggyError::CannotSyncFile)
+    })
 }
 
 /// Moves a segment pair that recovery proved unreadable into a fresh
@@ -1399,14 +1410,14 @@ fn fsync_dir(dir: &str) -> Result<(), PartitionRecoveryError> {
 /// sweeps orphaned indexes, so a crash between the two creates leaves only
 /// states a later boot already understands (segment absent, or one orphan
 /// index).
-fn fence_unrecoverable_segment_files(
+async fn fence_unrecoverable_segment_files(
     identity: PartitionIdentity<'_>,
     messages_path: &str,
     index_path: &str,
     start_offset: u64,
 ) -> Result<(), PartitionRecoveryError> {
-    let log_bytes = file_len(messages_path)?;
-    let index_bytes = file_len(index_path)?;
+    let log_bytes = file_len(messages_path).await?;
+    let index_bytes = file_len(index_path).await?;
     if log_bytes == 0 && index_bytes == 0 {
         return Ok(());
     }
@@ -1416,7 +1427,7 @@ fn fence_unrecoverable_segment_files(
         // `create_dir`, not `create_dir_all`: success is the claim on this
         // suffix, and merging into an existing fence would mix evidence from
         // two incidents.
-        match fs::create_dir(&candidate) {
+        match fs::create_dir(&candidate).await {
             Ok(()) => {
                 fenced_dir = Some(candidate);
                 break;
@@ -1441,19 +1452,19 @@ fn fence_unrecoverable_segment_files(
     };
     let fenced_log = fenced_target(&fenced_dir, messages_path)?;
     let fenced_index = fenced_target(&fenced_dir, index_path)?;
-    rename_into_fence(messages_path, &fenced_log)?;
-    rename_into_fence(index_path, &fenced_index)?;
-    seed_empty_file(index_path)?;
-    seed_empty_file(messages_path)?;
+    rename_into_fence(messages_path, &fenced_log).await?;
+    rename_into_fence(index_path, &fenced_index).await?;
+    seed_empty_file(index_path).await?;
+    seed_empty_file(messages_path).await?;
     // The fence directory's new dirents, the partition directory's renames
     // plus fresh files, and the parent's new fence-directory dirent.
-    fsync_dir(&fenced_dir)?;
-    fsync_dir(identity.partition_path)?;
+    fsync_dir(&fenced_dir).await?;
+    fsync_dir(identity.partition_path).await?;
     if let Some(parent) = Path::new(identity.partition_path)
         .parent()
         .and_then(Path::to_str)
     {
-        fsync_dir(parent)?;
+        fsync_dir(parent).await?;
     }
     warn!(
         stream_id = identity.stream_id,
@@ -1486,8 +1497,8 @@ fn fenced_target(fenced_dir: &str, source_path: &str) -> Result<PathBuf, Partiti
     )
 }
 
-fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRecoveryError> {
-    match fs::rename(source_path, target) {
+async fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRecoveryError> {
+    match fs::rename(source_path, target).await {
         Ok(()) => Ok(()),
         // A missing index beside a present log has nothing to move.
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1503,18 +1514,21 @@ fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), PartitionRe
     }
 }
 
-fn seed_empty_file(path: &str) -> Result<(), PartitionRecoveryError> {
-    fs::File::create(path)
-        .note_descriptor_exhaustion(|| format!("creating {path}"))
-        .and_then(|file| file.sync_all())
-        .map_err(|source| {
-            error!(
-                path,
-                error = %source,
-                "failed to seed a fresh empty segment file after fencing"
-            );
-            PartitionRecoveryError::from(IggyError::CannotWriteToFile)
-        })
+async fn seed_empty_file(path: &str) -> Result<(), PartitionRecoveryError> {
+    let seeded = async {
+        let file = fs::File::create(path)
+            .await
+            .note_descriptor_exhaustion(|| format!("creating {path}"))?;
+        file.sync_all().await
+    };
+    seeded.await.map_err(|source| {
+        error!(
+            path,
+            error = %source,
+            "failed to seed a fresh empty segment file after fencing"
+        );
+        PartitionRecoveryError::from(IggyError::CannotWriteToFile)
+    })
 }
 
 /// Index anchors for one segment: `(entry_count, first, last)`.
@@ -1533,7 +1547,7 @@ async fn load_index_anchors(
     identity: PartitionIdentity<'_>,
     index_path: &str,
 ) -> Result<(u64, Option<IggyIndex>, Option<IggyIndex>), PartitionRecoveryError> {
-    if file_len(index_path)? == 0 {
+    if file_len(index_path).await? == 0 {
         return Ok((0, None, None));
     }
     // Opened here, not by `IggyIndexReader::new`, which drops the `io::Error`.
@@ -1639,7 +1653,7 @@ async fn recover_segment_bounds(
             )
             .await?;
 
-            let messages = open_messages_file(identity, messages_path)?;
+            let messages = open_messages_file(identity, messages_path).await?;
             let mut scanner = FileScanner::new(&messages, messages_size, scratch);
             if !validation.structurally_consistent {
                 return recover_by_walking_log(
@@ -1845,7 +1859,7 @@ async fn recover_segment_bounds(
         // path performs, and rebuilds the index from the batches it proves so
         // a sealed segment does not pay a full-scan poll penalty forever.
         _ if messages_size > 0 => {
-            let messages = open_messages_file(identity, messages_path)?;
+            let messages = open_messages_file(identity, messages_path).await?;
             let mut scanner = FileScanner::new(&messages, messages_size, scratch);
             recover_by_walking_log(
                 identity,
@@ -1893,6 +1907,7 @@ fn ensure_fsynced_rebuild_reaches(
 /// entries the log cannot back. Every batch is checksum-verified, as in the
 /// anchored walk; here the FILENAME is the only anchor at all, and the
 /// header decode checks a length, not a checksum.
+#[allow(clippy::too_many_lines)]
 async fn recover_by_walking_log(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
@@ -1908,7 +1923,7 @@ async fn recover_by_walking_log(
     let mut rebuilt_index = Vec::new();
     let mut last_indexed_position: Option<u64> = None;
     while position < messages_size {
-        let Some(header) = header_at(identity, scanner, messages_path, position)? else {
+        let Some(header) = header_at(identity, scanner, messages_path, position).await? else {
             break;
         };
         let extent = position.saturating_add(header.total_size() as u64);
@@ -1921,7 +1936,8 @@ async fn recover_by_walking_log(
             messages_path,
             position,
             header.total_size(),
-        )?;
+        )
+        .await?;
         if !verifies {
             break;
         }
@@ -2042,7 +2058,7 @@ async fn walk_chain_from_anchor(
     // already proved makes the expectation the LOG's own.
     let mut expectation_from_log = false;
     while position < messages_size {
-        let Some(header) = header_at(identity, scanner, messages_path, position)? else {
+        let Some(header) = header_at(identity, scanner, messages_path, position).await? else {
             break;
         };
         let extent = position.saturating_add(header.total_size() as u64);
@@ -2063,7 +2079,9 @@ async fn walk_chain_from_anchor(
             messages_path,
             position,
             header.total_size(),
-        )? {
+        )
+        .await?
+        {
             break;
         }
         if header.partition_id != identity.partition_id as u64 {
@@ -2184,7 +2202,7 @@ impl<'scan> IndexLogScanner<'scan> {
         }
     }
 
-    fn entry_matches(
+    async fn entry_matches(
         &mut self,
         offset: u64,
         timestamp: u64,
@@ -2201,8 +2219,8 @@ impl<'scan> IndexLogScanner<'scan> {
             let fill = usize::try_from((self.file_len - position).min(SCAN_WINDOW_CAPACITY as u64))
                 .unwrap_or(SCAN_WINDOW_CAPACITY);
             self.window.resize(fill, 0);
-            self.file
-                .read_exact_at(&mut self.window[..], position)
+            read_scan_window(self.file, self.window, position)
+                .await
                 .map_err(|source| {
                     error!(
                         stream_id = self.identity.stream_id,
@@ -2265,6 +2283,7 @@ impl<'scan> IndexLogScanner<'scan> {
 /// every [`INDEX_SCAN_YIELD_STRIDE`] entries: an entry that overshoots the
 /// log reads nothing from it, so there is no refill to key the yield on, and
 /// an index that outran a truncated log is full of exactly those.
+#[allow(clippy::too_many_lines)]
 async fn find_provable_index_anchor(
     identity: PartitionIdentity<'_>,
     index_path: &str,
@@ -2283,6 +2302,7 @@ async fn find_provable_index_anchor(
         });
     };
     let file = fs::File::open(index_path)
+        .await
         .note_descriptor_exhaustion(|| format!("opening {index_path}"))
         .map_err(|source| {
             error!(
@@ -2301,18 +2321,22 @@ async fn find_provable_index_anchor(
     let mut budgeted_down_to = messages_size;
     let mut searched_entries = 0u64;
     loop {
-        file.read_exact_at(&mut raw, entry_index * IGGY_INDEX_SIZE as u64)
-            .map_err(|source| {
-                error!(
-                    stream_id = identity.stream_id,
-                    topic_id = identity.topic_id,
-                    partition_id = identity.partition_id,
-                    path = %index_path,
-                    error = %source,
-                    "failed to read a sparse index entry for anchor search during recovery"
-                );
-                PartitionRecoveryError::from(IggyError::CannotReadFile)
-            })?;
+        let (read, bytes) = file
+            .read_exact_at(raw, entry_index * IGGY_INDEX_SIZE as u64)
+            .await
+            .into();
+        raw = bytes;
+        read.map_err(|source| {
+            error!(
+                stream_id = identity.stream_id,
+                topic_id = identity.topic_id,
+                partition_id = identity.partition_id,
+                path = %index_path,
+                error = %source,
+                "failed to read a sparse index entry for anchor search during recovery"
+            );
+            PartitionRecoveryError::from(IggyError::CannotReadFile)
+        })?;
         let entry = IggyIndex::new(
             read_u64_le(&raw, 0),
             read_u64_le(&raw, 8),
@@ -2324,7 +2348,8 @@ async fn find_provable_index_anchor(
                 .budget
                 .grow_for_residue(budgeted_down_to.saturating_sub(entry.position));
             budgeted_down_to = entry.position;
-            if let Some(header) = header_at(identity, scanner, messages_path, entry.position)?
+            if let Some(header) =
+                header_at(identity, scanner, messages_path, entry.position).await?
                 && header.partition_id == identity.partition_id as u64
                 && header.base_offset == entry.offset
                 && header.message_count > 0
@@ -2345,7 +2370,9 @@ async fn find_provable_index_anchor(
                     messages_path,
                     entry.position,
                     header.total_size(),
-                )? {
+                )
+                .await?
+                {
                     return Ok(IndexAnchorSearch {
                         provable_entries: entry_index + 1,
                         provable_position: entry.position,
@@ -2410,6 +2437,7 @@ async fn index_is_consistent(
     scratch: &mut ScanScratch,
 ) -> Result<IndexValidation, PartitionRecoveryError> {
     let index_file = fs::File::open(index_path)
+        .await
         .note_descriptor_exhaustion(|| format!("opening {index_path}"))
         .map_err(|source| {
             error!(
@@ -2423,6 +2451,7 @@ async fn index_is_consistent(
             PartitionRecoveryError::from(IggyError::CannotReadFile)
         })?;
     let messages_file = fs::File::open(messages_path)
+        .await
         .note_descriptor_exhaustion(|| format!("opening {messages_path}"))
         .map_err(|source| {
             error!(
@@ -2458,8 +2487,8 @@ async fn index_is_consistent(
         let chunk_bytes =
             usize::try_from(chunk_entries).unwrap_or(per_chunk_entries) * IGGY_INDEX_SIZE;
         index_window.resize(chunk_bytes, 0);
-        index_file
-            .read_exact_at(&mut index_window[..], byte_position)
+        read_scan_window(&index_file, index_window, byte_position)
+            .await
             .map_err(|source| {
                 error!(
                     stream_id = identity.stream_id,
@@ -2510,7 +2539,9 @@ async fn index_is_consistent(
             }
 
             if mappings_match
-                && !log_scanner.entry_matches(entry_offset, entry_timestamp, entry_position)?
+                && !log_scanner
+                    .entry_matches(entry_offset, entry_timestamp, entry_position)
+                    .await?
             {
                 warn!(
                     stream_id = identity.stream_id,
@@ -2545,11 +2576,12 @@ async fn index_is_consistent(
 /// produces, so folding an open failure into "walked nothing" would discard
 /// a healthy indexed segment's index -- or route an index-less one into
 /// recover-as-empty, fencing the whole log out of service.
-fn open_messages_file(
+async fn open_messages_file(
     identity: PartitionIdentity<'_>,
     messages_path: &str,
 ) -> Result<fs::File, PartitionRecoveryError> {
     fs::File::open(messages_path)
+        .await
         .note_descriptor_exhaustion(|| format!("opening {messages_path}"))
         .map_err(|source| {
             error!(
@@ -2566,7 +2598,7 @@ fn open_messages_file(
 
 /// The batch header at `position`, or `None` when the walk must stop there
 /// (nothing decodes, or the header runs past the end of the walked file).
-fn header_at(
+async fn header_at(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
     messages_path: &str,
@@ -2574,13 +2606,14 @@ fn header_at(
 ) -> Result<Option<BatchHeader>, PartitionRecoveryError> {
     scanner
         .peek_header(position)
+        .await
         .map_err(|source| scan_read_failure(identity, messages_path, &source))
 }
 
 /// Whether the whole batch at `position` passes its batch checksum. `false`
 /// when the claimed extent runs past the end of the walked file, which is
 /// the torn-tail shape and not a read failure.
-fn batch_verifies(
+async fn batch_verifies(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
     messages_path: &str,
@@ -2589,6 +2622,7 @@ fn batch_verifies(
 ) -> Result<bool, PartitionRecoveryError> {
     Ok(scanner
         .slice_at(position, total_size)
+        .await
         .map_err(|source| scan_read_failure(identity, messages_path, &source))?
         .is_some_and(|batch| decode_batch_slice(batch).is_ok()))
 }
@@ -2718,10 +2752,8 @@ enum ProbeOutcome {
 /// candidate one byte at a time, and per-candidate preads would turn one
 /// damaged multi-GiB segment into a boot-length stall.
 ///
-/// Synchronous `std::fs` on purpose, like every mutation in this module: the
-/// boot path's runtime sizes its blocking pool at zero and recovery must not
-/// depend on `io_uring` opcode coverage. Only the sparse-index bound reads go
-/// through the async `IggyIndexReader`.
+/// Window refills use async reads so online partition recovery can share a
+/// shard with request handling, including when the runtime has no blocking pool.
 struct FileScanner<'scan> {
     file: &'scan fs::File,
     file_len: u64,
@@ -2752,17 +2784,15 @@ impl<'scan> FileScanner<'scan> {
     }
 
     /// True when the scanner hit disk since the last call. The async scan
-    /// loops yield to the reactor once per window of work on it: recovery
-    /// runs in front of the bootstrap barrier with the blocking pool sized
-    /// at zero, so an unyielding walk over a damaged multi-GiB chain would
-    /// pin the shard core -- signal handling included -- until it finishes.
+    /// loops yield once per window of CPU work, including when reads complete
+    /// immediately, so recovery cannot monopolize the shard.
     fn take_refilled(&mut self) -> bool {
         std::mem::take(&mut self.refilled)
     }
 
     /// Bytes `[position, position + len)`, or `None` when they run past the
     /// end of the file.
-    fn slice_at(&mut self, position: u64, len: usize) -> io::Result<Option<&[u8]>> {
+    async fn slice_at(&mut self, position: u64, len: usize) -> io::Result<Option<&[u8]>> {
         let Some(end) = position.checked_add(len as u64) else {
             return Ok(None);
         };
@@ -2774,7 +2804,7 @@ impl<'scan> FileScanner<'scan> {
             // Callers only pass lengths from headers that already passed the
             // plausibility cap, which is what bounds this resize.
             self.spill.resize(len, 0);
-            self.file.read_exact_at(&mut self.spill[..], position)?;
+            read_scan_window(self.file, self.spill, position).await?;
             self.refilled = true;
             return Ok(Some(&self.spill[..]));
         }
@@ -2795,8 +2825,7 @@ impl<'scan> FileScanner<'scan> {
                 usize::try_from((self.file_len - window_start).min(SCAN_WINDOW_CAPACITY as u64))
                     .unwrap_or(SCAN_WINDOW_CAPACITY);
             self.window.resize(fill, 0);
-            self.file
-                .read_exact_at(&mut self.window[..], window_start)?;
+            read_scan_window(self.file, self.window, window_start).await?;
             self.window_start = window_start;
             self.refilled = true;
         }
@@ -2813,8 +2842,8 @@ impl<'scan> FileScanner<'scan> {
     /// so treating the header as undecodable is verdict-identical to reading
     /// the claimed bytes and failing the verify, and it keeps one bit-flipped
     /// length field from driving a claimed-size allocation and read.
-    fn peek_header(&mut self, position: u64) -> io::Result<Option<BatchHeader>> {
-        let Some(bytes) = self.slice_at(position, COMMAND_HEADER_SIZE)? else {
+    async fn peek_header(&mut self, position: u64) -> io::Result<Option<BatchHeader>> {
+        let Some(bytes) = self.slice_at(position, COMMAND_HEADER_SIZE).await? else {
             return Ok(None);
         };
         Ok(BatchHeader::decode(bytes)
@@ -2860,7 +2889,7 @@ impl<'scan> FileScanner<'scan> {
         // first candidate starts one past them.
         let mut candidate = damage_position.saturating_add(1);
         while candidate.saturating_add(header_len) <= self.file_len {
-            self.fill_window_at(candidate)?;
+            self.fill_window_at(candidate).await?;
             let window_end = self.window_start + self.window.len() as u64;
             while candidate.saturating_add(header_len) <= window_end {
                 if !self.budget.charge_candidate() {
@@ -2886,7 +2915,7 @@ impl<'scan> FileScanner<'scan> {
                         if !self.budget.charge_verify(total_size as u64) {
                             return Ok(ProbeOutcome::BudgetExhausted);
                         }
-                        let batch = self.verify_slice(candidate, total_size)?;
+                        let batch = self.verify_slice(candidate, total_size).await?;
                         if decode_batch_slice(batch).is_ok() {
                             return Ok(ProbeOutcome::Survivor {
                                 position: candidate,
@@ -2914,7 +2943,7 @@ impl<'scan> FileScanner<'scan> {
     /// Anchors the window at `position` unless the header there already sits
     /// inside it. The probe's outer loop refills through this, so its
     /// windows advance strictly forward.
-    fn fill_window_at(&mut self, position: u64) -> io::Result<()> {
+    async fn fill_window_at(&mut self, position: u64) -> io::Result<()> {
         let window_end = self.window_start + self.window.len() as u64;
         if position >= self.window_start
             && position.saturating_add(COMMAND_HEADER_SIZE as u64) <= window_end
@@ -2924,7 +2953,7 @@ impl<'scan> FileScanner<'scan> {
         let fill = usize::try_from((self.file_len - position).min(SCAN_WINDOW_CAPACITY as u64))
             .unwrap_or(SCAN_WINDOW_CAPACITY);
         self.window.resize(fill, 0);
-        self.file.read_exact_at(&mut self.window[..], position)?;
+        read_scan_window(self.file, self.window, position).await?;
         self.window_start = position;
         self.refilled = true;
         Ok(())
@@ -2935,7 +2964,7 @@ impl<'scan> FileScanner<'scan> {
     /// else is one direct read into the spill buffer. The caller bounds
     /// `len` against the file and the plausibility cap before calling, which
     /// is what bounds the spill's growth.
-    fn verify_slice(&mut self, position: u64, len: usize) -> io::Result<&[u8]> {
+    async fn verify_slice(&mut self, position: u64, len: usize) -> io::Result<&[u8]> {
         let window_end = self.window_start + self.window.len() as u64;
         let end = position.saturating_add(len as u64);
         if position >= self.window_start && end <= window_end {
@@ -2945,7 +2974,7 @@ impl<'scan> FileScanner<'scan> {
             return Ok(&self.window[at..at + len]);
         }
         self.spill.resize(len, 0);
-        self.file.read_exact_at(&mut self.spill[..], position)?;
+        read_scan_window(self.file, self.spill, position).await?;
         self.refilled = true;
         Ok(&self.spill[..])
     }
@@ -2955,6 +2984,16 @@ fn push_index_entry(rebuilt_index: &mut Vec<u8>, offset: u64, timestamp: u64, po
     rebuilt_index.extend_from_slice(&offset.to_le_bytes());
     rebuilt_index.extend_from_slice(&timestamp.to_le_bytes());
     rebuilt_index.extend_from_slice(&position.to_le_bytes());
+}
+
+async fn read_scan_window(file: &fs::File, window: &mut Vec<u8>, position: u64) -> io::Result<()> {
+    let length = window.len();
+    let (result, bytes) = file
+        .read_exact_at(std::mem::take(window).slice(..length), position)
+        .await
+        .into();
+    *window = bytes.into_inner();
+    result
 }
 
 fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
@@ -2973,6 +3012,7 @@ mod tests {
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, calculate_batch_checksum,
     };
     use server_common::sharding::IggyNamespace;
+    use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::{TempDir, tempdir};
 
@@ -3205,29 +3245,32 @@ mod tests {
         .await
     }
 
-    #[compio::test]
-    async fn given_torn_log_tail_when_recovering_should_truncate_files_to_walked_bounds() {
-        let tmp = tempdir().expect("tempdir");
-        let config = test_config(&tmp);
-        prepare_partition_dir(&config);
-        let mut log = encoded_batch(0, 3);
-        let valid_len = log.len() as u64;
-        log.extend_from_slice(&GARBAGE);
-        let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
+    #[test]
+    fn given_torn_log_tail_when_recovering_should_truncate_files_to_walked_bounds() {
+        let runtime = server_common::executor::create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let tmp = tempdir().expect("tempdir");
+            let config = test_config(&tmp);
+            prepare_partition_dir(&config);
+            let mut log = encoded_batch(0, 3);
+            let valid_len = log.len() as u64;
+            log.extend_from_slice(&GARBAGE);
+            let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
 
-        let recovered = recover(&config).await.expect("recover torn-tail segment");
+            let recovered = recover(&config).await.expect("recover torn-tail segment");
 
-        assert_eq!(recovered.len(), 1);
-        let segment = &recovered[0].segment;
-        assert_eq!(segment.end_offset, 2);
-        assert_eq!(segment.size, IggyByteSize::from(valid_len));
-        assert_eq!(segment.current_position, valid_len);
-        assert_eq!(
-            len_of(&messages_path),
-            valid_len,
-            "torn tail bytes must be gone from disk"
-        );
-        assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
+            assert_eq!(recovered.len(), 1);
+            let segment = &recovered[0].segment;
+            assert_eq!(segment.end_offset, 2);
+            assert_eq!(segment.size, IggyByteSize::from(valid_len));
+            assert_eq!(segment.current_position, valid_len);
+            assert_eq!(
+                len_of(&messages_path),
+                valid_len,
+                "torn tail bytes must be gone from disk"
+            );
+            assert_eq!(len_of(&index_path), IGGY_INDEX_SIZE as u64);
+        });
     }
 
     #[compio::test]
@@ -4419,7 +4462,9 @@ mod tests {
         log.extend_from_slice(&GARBAGE);
         let messages_path = tmp.path().join("00000000000000000000.log");
         fs::write(&messages_path, &log).expect("write log fixture");
-        let file = fs::File::open(&messages_path).expect("open log fixture");
+        let file = compio::fs::File::open(&messages_path)
+            .await
+            .expect("open log fixture");
         let partition_path = tmp.path().to_string_lossy().into_owned();
         let identity = PartitionIdentity {
             partition_path: &partition_path,
@@ -4478,7 +4523,9 @@ mod tests {
         let log = GARBAGE.to_vec();
         let messages_path = tmp.path().join("00000000000000000000.log");
         fs::write(&messages_path, &log).expect("write log fixture");
-        let file = fs::File::open(&messages_path).expect("open log fixture");
+        let file = compio::fs::File::open(&messages_path)
+            .await
+            .expect("open log fixture");
         let partition_path = tmp.path().to_string_lossy().into_owned();
         let identity = PartitionIdentity {
             partition_path: &partition_path,

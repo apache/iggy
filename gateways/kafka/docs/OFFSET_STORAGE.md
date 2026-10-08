@@ -1,202 +1,153 @@
 # Consumer offset storage
 
-Status: accepted. Answers [#3540](https://github.com/apache/iggy/issues/3540) and unblocks
-[#3542](https://github.com/apache/iggy/issues/3542), OffsetCommit and OffsetFetch.
+Status: accepted. Replaces the first design ([#4205](https://github.com/apache/iggy/pull/4205),
+[#4289](https://github.com/apache/iggy/pull/4289)). Answers
+[#3540](https://github.com/apache/iggy/issues/3540). Used by OffsetCommit and OffsetFetch
+([#3542](https://github.com/apache/iggy/issues/3542)).
 
 ## Decision
 
-Store Kafka group offsets as Iggy consumer offsets, one key per partition, under a consumer
-group whose name is derived from the Kafka group id.
+Kafka group offsets go in a third Iggy consumer kind, `ConsumerKind::ExternalGroup` (wire kind 3),
+next to `Consumer` and `ConsumerGroup`.
 
-The issue lists three options. None of them is this one.
+| Property | Value |
+| --- | --- |
+| Key | The partition, plus Iggy consumer group `kafka.cg.<group>` on the mapped topic, resolved by name |
+| Value | The Kafka offset as sent. Iggy does not read it |
+| Membership | Not needed. The gateway never joins the group |
+| Range check | None. 0 on an empty partition and the high watermark are both stored |
+| Polling | Refused for this kind |
+| Retention | Not held back by these offsets, as in Kafka |
+| Group deleted | Its offsets go with it |
 
-| Option | Why not |
-| -------- | --------- |
-| A, an Iggy-backed `__consumer_offsets` topic | Rebuilds what Iggy already has. A compacted offset topic needs compaction, which Iggy does not have, so the gateway replays the whole topic at every startup |
-| B, a SQLite file on the gateway host | A second durability story, a second backup story, and offsets that do not survive moving the gateway |
-| C, in memory only | Fails the acceptance criterion in #3542, which is that offsets survive a restart |
+## Why not the first design
 
-Iggy already stores a durable offset per consumer and per partition, replicated with the
-partition itself. Using it costs one call per partition on commit and one on fetch.
+It stored offsets as `ConsumerGroup` offsets. Two server rules block that:
 
-## The key
+- Only a member that owns the partition can store or delete a group offset (`fence_group_offset`,
+  `core/server/src/namespace.rs:239`). The fence stays. It holds for an empty group too
+  (`partition_primary_routing.rs:888`).
+- A stored offset must be at most the last message, and an empty partition takes none
+  (`store_offset_range_error`, `core/partitions/src/iggy_partition.rs:3625`). A caught-up Kafka
+  consumer commits last + 1. A Java consumer on defaults commits 0 on an empty partition.
 
-One Iggy consumer offset per Kafka `(group, topic, partition)`.
+A plain `Consumer` key passes both checks, but its name is hashed to 32 bits and deleting a group
+leaves it behind.
 
-- consumer kind: `ConsumerKind::ConsumerGroup`
-- consumer id: `Identifier::named("kafka.cg.<group>")`
-- stream and topic: whatever `TopicMapping` resolves the Kafka topic to
-- partition: the Kafka partition index, unchanged, because both sides number from 0
+## Gateway rules
 
-The gateway calls `create_consumer_group(stream, topic, "kafka.cg.<group>")` before the first
-commit for a group on a topic. If the group does not resolve in metadata, the server rejects the
-offset write. The group has to exist first. The gateway never joins the group. Offsets are
-readable by any client, member or not.
+- A commit stores the offset. If group `kafka.cg.<group>` is not on the topic, the gateway creates it
+  and stores again. A group that already exists counts as created. An operator can delete the group,
+  and the next commit creates it again.
+- The prefix keeps a Kafka group apart from a native Iggy group with the same name.
+- Group id: 1 to 246 bytes, else `INVALID_GROUP_ID` (24). Iggy names stop at 255. Unlike Kafka,
+  an empty id is refused in OffsetCommit and OffsetFetch too.
+- Negative offset: delete the key. A missing key or group counts as success. Kafka consumers read any
+  negative offset as none.
+- Metadata string and leader epoch: dropped. OffsetFetch returns `""` and -1.
+- No key, unknown group or unknown topic: OffsetFetch returns -1 and no error.
+- Any other failed read fails the whole group in OffsetFetch. A lost read never goes back as -1,
+  because the consumer then resets its position. A read that its owning shard does not answer in
+  time, or that finds the partition not loaded there, comes back from the server as
+  `TransientNotAccepted`, not as "no offset".
+- Null topic list (OffsetFetch v2+): read every Kafka topic that has group `kafka.cg.<group>`. Only
+  the partitions with an offset come back. A topic deleted during the read is skipped.
+- A failure that a retry can fix goes back as `COORDINATOR_LOAD_IN_PROGRESS` (14). The Java client
+  fails an offset call on 6, and fails OffsetFetch on 7. `RequestTooOld` goes back as 14 too: the
+  retry is a new request, and storing an offset twice does no harm.
+- A replayed write that Iggy already applied (`RequestAlreadyApplied`) counts as done.
+- A failure sent as `UNKNOWN_SERVER_ERROR` (-1) is logged at `error!`: once per OffsetCommit
+  request, and once per group in OffsetFetch.
+- Committed offset below the oldest kept message: Fetch reads from the first kept message.
 
-### Why the group kind and not a named consumer
+## Calls
 
-`ConsumerKind::Consumer` with a name looks simpler, because it needs no registration call. It is
-not. The server hashes a named consumer id to a `u32` with `XxHash32`
-(`core/server/src/dispatch/partition.rs:916`), and that hash is the offset key. Two different
-group names can collide and silently share one offset.
-
-A consumer group name resolves through metadata to a monotonic id instead. No hash, no
-collision, and `get_consumer_groups(stream, topic)` lists what exists.
-
-### Why the prefix
-
-`kafka.cg.` keeps a Kafka group called `orders` off the key that a native Iggy consumer group
-called `orders` uses. Without it the two share an offset and each one moves the other.
-
-The prefix does not make the offsets safe to poll with. That is the next section.
-
-## What is stored
-
-The Kafka committed offset, verbatim, with no conversion.
-
-The two systems mean different things by the number. Kafka commits the next offset to read.
-Iggy stores the last offset processed, and `PollingKind::Next` resumes at the stored value plus
-one (`core/partitions/src/iggy_partition.rs:3835`). A Kafka offset stored in an Iggy key is
-therefore one greater than Iggy's own convention for that key.
-
-This is inert because the gateway never polls that way. Fetch always polls with an explicit
-offset, `PollingKind::Offset`, taken from the Kafka request. Nothing in the gateway reads the
-stored value to decide where to resume. It is returned to the client on OffsetFetch and
-otherwise untouched.
-
-The rule this creates: no code path polls a `kafka.cg.*` key with `PollingKind::Next`. Doing so
-skips one record per partition. The prefix is what keeps a native Iggy consumer from doing it by
-accident.
-
-Converting on write instead, and storing the Kafka offset minus one, breaks at offset 0. It also
-makes an empty commit look the same as a commit of the first record. Storing verbatim is the
-smaller problem.
-
-### A commit of -1
-
-Kafka does not validate the sign of a committed offset. `OffsetMetadataManager` checks the
-metadata length and nothing else, so a real broker stores `-1` and hands it back on the next
-OffsetFetch, where a consumer reads it as no committed offset.
-
-Iggy cannot store that value, because `store_consumer_offset` takes a `u64`. A commit of `-1`
-therefore calls `delete_consumer_offset` on the key. What a client can observe is the same: the
-next OffsetFetch finds nothing and the gateway answers `-1`.
-
-Deleting a key that is not there returns `ConsumerOffsetNotFound` (3021). On this path that
-counts as success, because the client asked for the offset to be absent and it is absent. Any
-other negative offset is rejected with `OFFSET_OUT_OF_RANGE` (1).
-
-## OffsetFetch with no topics named
-
-OffsetFetch v2 and later let a client pass a null topic list, which asks for every offset the
-group holds. `kafka-consumer-groups.sh --describe` does this.
-
-Iggy has no lookup by consumer. Offsets are read one partition at a time
-(`core/common/src/traits/consumer_offset_client.rs:41`). The gateway answers by enumerating the
-topics in the mapped stream and querying each partition of each one.
-
-Answering also means naming each topic the way the client named it, and `TopicMapping::resolve`
-runs the wrong way. Its own doc says it is not injective, so it cannot be inverted in general.
-Two cases divide it. A topic with no override resolves to `(default_stream, kafka_topic)`, so the
-Iggy topic name is the Kafka name and reverses for free. A topic with an override needs a reverse
-index, built once at config load, which `TopicMapping::new` already makes safe by rejecting two
-overrides that share a target.
-
-What neither case covers is an unlisted Kafka topic whose name collides with an override's target
-inside the default stream. `new` rejects the shapes it can check, but the space of unlisted names
-is unbounded, so the collision is disclosed rather than prevented. An offset under a colliding
-name is reported against whichever Kafka name the reverse index holds.
-
-That is one round trip per partition on an admin call. The cost is bounded by the topic and
-partition count of one stream. This is an admin path and not a data path, so the cost is
-acceptable. It is written here so nobody discovers it in a test.
-
-## What is dropped
-
-Kafka lets a client attach a metadata string to a commit. Iggy stores a number and nothing else.
-The string is dropped on commit, and OffsetFetch returns an empty string.
-
-`committed_leader_epoch` is dropped the same way. The gateway reports `-1`.
+- Offset calls run on 4 offset slots. Each slot has an Iggy client for commits and one for reads,
+  so a read never waits behind a commit, and no offset call waits behind Produce. The topic listing
+  for a null topic list runs on a slot too.
+- A request queues at most one call per slot, so a large request cannot hold up the others. Within
+  that, its partitions, the groups of a v8 OffsetFetch and the topics of a null topic list run at
+  once.
+- A partition always takes the same slot. The partitions of a topic take the slots in turn.
+- A commit keeps its slot until it ends, or for at most 45 s. The commits of a slot share one
+  client, which sends one call at a time, so the commits of a partition reach Iggy in order, even
+  after a caller gives up.
+- A read frees its slot at the deadline. A read cut off there drops its client, so the next read
+  does not wait behind it.
+- A request gives up at half of the minimum session timeout: 3 s at the default 6 s. A heartbeat
+  on the same connection waits behind it, so a request also gives up at half of what is left of
+  the session of the member that heartbeats there. A partition that the deadline leaves out
+  answers 14 and makes no call.
+- Cost: one Iggy call per partition. A null topic list costs one topic listing, one call per Kafka
+  topic, and one call per partition of each topic that holds the group.
 
 ## Limits
 
-A partition admits a bounded number of distinct offset keys per consumer kind. The default is
-4096, set by `partition.consumer_offsets_max`
-(`core/configs/src/server_config/partition.rs:151`). The configurable ceiling is 262144. Passing
-the limit returns `TooManyConsumerOffsets` (3024). Kafka has no error code for this condition, so
-it maps to `UNKNOWN_SERVER_ERROR`, which is what `bridge/error.rs` already does where no honest
-code exists.
+| Limit | Value |
+| --- | --- |
+| Keys per partition, per kind | 4096, at most 262144: `partition.consumer_offsets_max` |
+| Past the limit | `TooManyConsumerOffsets` (3024). Sent as `UNKNOWN_SERVER_ERROR`, logged at `error!` |
 
-Consumer groups and plain consumers count against separate limits, so Kafka groups do not
-compete with native Iggy consumers for the same 4096.
+The gateway never deletes a `kafka.cg.<group>` group, and does not serve DeleteGroups (42). A group
+nobody uses keeps its keys until an operator deletes its Iggy group on each topic:
 
-A client cannot act on that error, so the operator has to. `partition.consumer_offsets_max` is
-named in the gateway README for that reason, and a handler that hits the limit logs the Iggy
-error at `error!` level, which is what `bridge/error.rs` already asks handlers to do wherever the
-Kafka code it sends is less specific than the Iggy error it received.
+```bash
+iggy consumer-group list <stream> <topic>
+iggy consumer-group delete <stream> <topic> kafka.cg.<group>
+```
 
-An Iggy name is capped at 255 bytes (`core/common/src/lib.rs:168`), which leaves 246 for a Kafka
-group id after the prefix. A longer group id is rejected with `INVALID_GROUP_ID` (24).
+The gateway does not expire groups. No gateway knows whether another gateway or a standalone
+consumer still uses a group, and Iggy keeps no commit time.
 
-### Committed offsets hold back retention
+## More than one gateway
 
-Iggy deletes a partition's segments, by retention or by `DeleteSegments`, only up to the lowest
-offset any consumer or consumer group has committed there
-(`core/partitions/src/iggy_partition.rs`, `min_committed_offset`). Every `kafka.cg.*` offset is
-one of those, so a Kafka group that stops consuming stops retention on every partition it
-committed on, for as long as the offset exists. Kafka itself never lets committed offsets block
-retention, and it expires them after `offsets.retention.minutes`. Iggy has no offset expiry, so an
-abandoned group's offsets stay, keep that barrier in place, and keep counting against the
-4096-key limit above until an operator deletes the Iggy consumer group `kafka.cg.<group>` on every
-topic the group committed on, since [the key](#the-key) creates one per topic. The gateway never
-does, since it does not implement `DeleteGroups` (42).
+Offsets are shared, since the key depends only on the Kafka group id. Membership is not
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)).
 
-The barrier reads the stored value as Iggy's last consumed offset and keeps a segment only while
-its end offset is above it, but a `kafka.cg.*` key holds the Kafka commit, the next offset to
-read (see [What is stored](#what-is-stored)). A sealed segment that ends exactly at that offset
-is therefore deletable while its last record is still unread. OffsetCommit and OffsetFetch
-([#3542](https://github.com/apache/iggy/issues/3542)) have to close this before any `kafka.cg.*`
-offset is written, for example by having the barrier subtract one for those keys.
+- A gateway with no members in a group accepts a commit with no generation, as admin tools and
+  `assign()` consumers send, even when another gateway has live members in it. That commit
+  overwrites their offsets. Point admin tools at the gateway that the group's consumers use.
+- A commit that a gateway gave up on can still land after a newer commit made through another
+  gateway. It then puts back the older offset, or deletes the key. Iggy cannot refuse the older
+  write yet.
 
-A blocked trim stays pending rather than failing. The reconciler restages a `DeleteSegments`
-trim the barrier blocks on every pass (`reconcile_segment_truncations`), and each blocked
-attempt, by that trim or by retention, logs `segment retained: blocked by committed consumer
-offset` at `warn!`, for as long as an abandoned group's offsets exist.
+## Server side
 
-`PurgeTopic` resets each partition to offset 0 and clears its consumer offsets, Kafka groups'
-included, so a purge leaves every group with nothing committed.
+[#4392](https://github.com/apache/iggy/pull/4392) adds the kind:
 
-## More than one gateway instance
+- Wire: `KIND_EXTERNAL_GROUP = 3`, next to kinds 1 and 2 in `core/binary_protocol/src/primitives/consumer.rs`.
+- SDK: `ConsumerKind::ExternalGroup`. The enum is not `#[non_exhaustive]`, so this breaks the API.
+- `core/partitions`: a third offset table, with recovery, state transfer and its own key count.
+- Server: no fence and no range check for the kind, refuse polls, leave it out of
+  `min_committed_offset`, delete its keys with the group (`partition_reconciler.rs`).
 
-Two gateway instances that share an Iggy cluster read and write the same offset keys. The key
-comes from the Kafka group id and nothing else. Two instances that serve one group therefore
-agree on committed offsets without talking to each other.
+## Upgrade
 
-They do not agree on group membership. That belongs to the coordinator
-([#3541](https://github.com/apache/iggy/issues/3541)) and is not settled here.
+Every Iggy server must run a build with kind 3 before the first external group store. Nothing
+enforces this yet ([#4416](https://github.com/apache/iggy/issues/4416)).
 
-## Partition assignment
+- A server with an older build refuses kind 3 with `InvalidCommand`. The gateway sends that as
+  `UNKNOWN_SERVER_ERROR` and logs it at `error!`.
+- A primary with the new build accepts the store. If most replicas of that partition run an older
+  build, they cannot decode it, and the partition stops committing (`core/server/README.md`).
 
-The gateway runs no assignor: the group leader assigns on the client, whatever its configured
-strategy ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#assignment-is-the-clients-job)). Offset
-storage does not depend on the choice, since a commit names the partition it is for, whichever
-member owns it.
-Iggy's balanced consumer-group assignment is not used for Kafka groups, and KIP-848's server-side
-assignment (`ConsumerGroupHeartbeat`, key 68) is out of scope.
+The Iggy HTTP API cannot carry kind 3. The gateway uses TCP, so this does not limit it.
 
-## Decision record
+## Reads in a cluster
 
-The open question was whether to store offsets as Iggy consumer offsets keyed by group, as above,
-or take one of A, B and C from the issue. This document proposed a default: the design above
-unless an answer landed by 2026-09-22. It was merged in
-[#4205](https://github.com/apache/iggy/pull/4205) as a proposal, approved by @hubcio and
-@numinnex. No alternative was raised by that date, so it was decided by default and the design
-above is the one taken.
+An offset read goes to the Iggy node that the gateway is connected to. That is not always the
+partition primary (the node that orders the partition writes). So an OffsetFetch right after an
+OffsetCommit can return the older value until that node applies the commit.
+
+- After a later commit, the consumer reads some records again.
+- After the first commit of a group, the node has no offset and answers -1. The consumer then
+  applies `auto.offset.reset`. With `latest`, it skips records.
+
+Reads from the primary are [#4409](https://github.com/apache/iggy/issues/4409). Until then, use
+`auto.offset.reset=earliest` for a group that a cluster serves.
 
 ## References
 
 - Record mapping: [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md)
-- Scope and phases: [`SCOPE.md`](SCOPE.md)
+- Scope: [`SCOPE.md`](SCOPE.md)
 - Offset API: `core/common/src/traits/consumer_offset_client.rs`
-- Group API: `core/common/src/traits/consumer_group_client.rs`
-- Offset key resolution: `core/server/src/dispatch/partition.rs`

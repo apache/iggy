@@ -120,9 +120,8 @@ An empty result is `error_code` 0 with no resources, not an error. Kafka draws a
 rendering a Kafka topic name means resolving every id through a lookup, one call per resource, on
 what should be a cheap read. Worse, the resolution can be ambiguous in the direction we need it:
 the topic mapping is one-way, from Kafka name to Iggy stream and topic, and an override means an
-Iggy topic name does not identify the Kafka name it came from. The same limitation is already
-recorded against `OffsetFetch` with a null topic list. Closing it needs a reverse index, which
-belongs with whichever change first needs one.
+Iggy topic name does not identify the Kafka name it came from. Closing it needs a reverse index,
+which belongs with whichever change first needs one.
 
 The consequence is honest but worth stating: a principal whose access is granted per topic rather
 than globally is described as having no topic bindings. That under-reports rather than

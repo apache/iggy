@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::rc::Rc;
@@ -24,13 +25,15 @@ use std::task::{Context, Poll, Wake};
 
 use consensus::{
     ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle,
-    STATE_TRANSFER_MAX_DECODE_RETRIES, Sequencer, StateArtifact, StateTransferStage, VsrConsensus,
-    artifact_kind, build_reply_message_with, encode_state_manifest,
+    STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StateArtifact,
+    StateTransferStage, VsrConsensus, artifact_kind, build_reply_message_with,
+    encode_state_manifest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, PurgeTopicRequest};
 use iggy_binary_protocol::{
-    AckLevel, ReplyHeader, RoutedRequestHeader, StateTransferTargetHeader, WireConsumer,
+    AckLevel, ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier,
@@ -46,6 +49,7 @@ use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
 use metadata::stm::user::Users;
 use partitions::{IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
 use server_common::Message;
+use server_common::iobuf::Owned;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
@@ -540,12 +544,15 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                 partition.commit_journal(&config).await;
             }
         }
-        let reply = owner
-            .await_partition_submit(ticket)
-            .await
-            .unwrap()
-            .try_into_typed::<ReplyHeader>()
-            .unwrap();
+        let futures::future::Either::Left((reply, _)) = futures::future::select(
+            Box::pin(owner.await_partition_submit(ticket)),
+            pump.as_mut(),
+        )
+        .await
+        else {
+            panic!("pump stopped before the admitted offset write completed");
+        };
+        let reply = reply.unwrap().try_into_typed::<ReplyHeader>().unwrap();
         let header = reply.header();
         let status = if admitted {
             0
@@ -925,6 +932,205 @@ async fn given_owner_processed_completion_when_shutdown_sender_drops_should_wake
 }
 
 #[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_metadata_transfer_when_target_is_unavailable_should_retry_only_unaccepted_transient()
+{
+    const GENERATION: u64 = 37;
+    const PEER: u8 = 0;
+    const RETRY_TICKS: u32 = 2;
+    const SNAPSHOT_BYTES: &[u8] = b"snapshot contents";
+    for (target_accepted, transient) in [(false, true), (false, false), (true, true)] {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+            captured.borrow_mut().push((peer, frame));
+            Ok(())
+        }));
+        assert!(bus.owner_table().try_claim(PEER, 1));
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        consensus.advance_commit_max(GENERATION);
+        let metadata = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            PollTestMetadata::default(),
+            None,
+        );
+        let (owner, _sender) = owner_with_metadata_plane(
+            &bus,
+            partitions_config(),
+            IggyNamespace::new(0, 0, 0),
+            metadata,
+        );
+        owner.set_repair_retry_ticks(RETRY_TICKS);
+        let consensus = owner.plane.metadata().consensus.as_ref().unwrap();
+        consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+        owner.arm_metadata_transfer(consensus, PEER).await;
+        let nonce = owner.metadata_transfer.borrow().as_ref().unwrap().nonce;
+        assert_eq!(sent.borrow().len(), 1);
+        sent.borrow_mut().clear();
+        let descriptor = metadata_descriptor(
+            nonce,
+            GENERATION,
+            &[
+                StateArtifact::for_bytes(
+                    artifact_kind::METADATA_SNAPSHOT,
+                    GENERATION,
+                    SNAPSHOT_BYTES,
+                ),
+                StateArtifact::for_bytes(artifact_kind::CLIENT_TABLE, GENERATION, b"client table"),
+            ],
+        );
+        if target_accepted {
+            owner.on_state_transfer_target(&descriptor).await;
+            assert_eq!(
+                consensus.state_transfer_stage(),
+                StateTransferStage::Fetching
+            );
+            assert!(
+                owner
+                    .metadata_transfer
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .target_accepted
+            );
+            assert_eq!(sent.borrow().len(), 1);
+            sent.borrow_mut().clear();
+        }
+        let unavailable =
+            Message::<StateTransferTargetHeader>::new(size_of::<StateTransferTargetHeader>())
+                .transmute_header(|_, header: &mut StateTransferTargetHeader| {
+                    header.command = Command::StateTransferTarget;
+                    header.cluster = 1;
+                    header.replica = PEER;
+                    header.group = server_common::sharding::METADATA_GROUP;
+                    header.nonce = nonce;
+                    header.size = u32::try_from(size_of::<StateTransferTargetHeader>()).unwrap();
+                    header.unavailable_transient = u8::from(transient);
+                    header.seal();
+                });
+
+        if transient && !target_accepted {
+            for _ in 0..=STATE_TRANSFER_MAX_STALL_RETRIES {
+                owner
+                    .metadata_transfer
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .idle_ticks = RETRY_TICKS - 1;
+                owner
+                    .metadata_transfer_attempts
+                    .set(STATE_TRANSFER_MAX_STALL_RETRIES);
+
+                owner.on_state_transfer_target(&unavailable).await;
+
+                let transfer = owner.metadata_transfer.borrow();
+                let session = transfer
+                    .as_ref()
+                    .expect("checkpoint contention preserves the session");
+                assert_eq!(session.nonce, nonce);
+                assert_eq!(session.peer, PEER);
+                assert_eq!(session.idle_ticks, 0);
+                assert!(!session.target_accepted);
+                assert!(session.artifacts.is_empty());
+                assert_eq!(owner.metadata_transfer_attempts.get(), 0);
+                assert_eq!(
+                    consensus.state_transfer_stage(),
+                    StateTransferStage::AwaitingTarget
+                );
+                assert!(owner.metadata_repair.borrow().is_none());
+                assert!(
+                    sent.borrow().is_empty(),
+                    "a busy reply must not trigger another request"
+                );
+            }
+            owner.tick_metadata().await;
+            assert!(
+                sent.borrow().is_empty(),
+                "descriptor retry waits for the configured interval"
+            );
+            owner.tick_metadata().await;
+            assert_eq!(sent.borrow().len(), 1);
+            let (peer, frame) = sent.borrow_mut().pop().unwrap();
+            let request = Message::<RequestStateTransferHeader>::try_from(Owned::copy_from_slice(
+                frame.as_slice(),
+            ))
+            .unwrap();
+            assert_eq!(peer, PEER);
+            assert_eq!(request.header().command, Command::RequestStateTransfer);
+            assert_eq!(request.header().nonce, nonce);
+
+            owner.on_state_transfer_target(&descriptor).await;
+
+            assert_eq!(
+                consensus.state_transfer_stage(),
+                StateTransferStage::Fetching
+            );
+            let transfer = owner.metadata_transfer.borrow();
+            let session = transfer.as_ref().unwrap();
+            assert_eq!(session.nonce, nonce);
+            assert!(session.target_accepted);
+            assert_eq!(session.generation, GENERATION);
+            assert_eq!(session.artifacts.len(), 2);
+            assert_eq!(sent.borrow().len(), 1);
+            let (peer, frame) = sent.borrow_mut().pop().unwrap();
+            let request = Message::<RequestStateChunkHeader>::try_from(Owned::copy_from_slice(
+                frame.as_slice(),
+            ))
+            .unwrap();
+            assert_eq!(peer, PEER);
+            assert_eq!(request.header().command, Command::RequestStateChunk);
+            assert_eq!(request.header().nonce, nonce);
+            assert_eq!(request.header().artifact, 0);
+            assert_eq!(request.header().offset, 0);
+            assert_eq!(request.header().len as usize, SNAPSHOT_BYTES.len());
+        } else {
+            owner.on_state_transfer_target(&unavailable).await;
+
+            assert!(
+                owner.metadata_transfer.borrow().is_none(),
+                "accepted={target_accepted}, transient={transient}"
+            );
+            assert_eq!(consensus.state_transfer_stage(), StateTransferStage::Idle);
+            let repair = owner.metadata_repair.borrow();
+            let repair = repair
+                .as_ref()
+                .expect("unavailable history falls back to journal repair");
+            assert_eq!(repair.peer, PEER);
+            assert_eq!((repair.from_op, repair.to_op), (1, GENERATION));
+            assert_eq!(sent.borrow().len(), 1);
+            let (peer, frame) = sent.borrow_mut().pop().unwrap();
+            let request = Message::<RequestPreparesHeader>::try_from(Owned::copy_from_slice(
+                frame.as_slice(),
+            ))
+            .unwrap();
+            assert_eq!(peer, PEER);
+            assert_eq!(request.header().command, Command::RequestPrepares);
+            assert_eq!(request.header().nonce, repair.nonce);
+            assert_eq!(
+                (request.header().from_op, request.header().to_op),
+                (1, GENERATION)
+            );
+        }
+    }
+}
+
+#[compio::test]
 async fn given_accepted_descriptor_when_install_fails_should_exhaust_its_generation() {
     const GENERATION: u64 = 37;
     const UNKNOWN_ARTIFACT_KIND: u8 = u8::MAX;
@@ -1014,11 +1220,23 @@ fn invalid_metadata_descriptor(
     generation: u64,
     unknown_kind: u8,
 ) -> Message<StateTransferTargetHeader> {
-    let manifest = encode_state_manifest(&[
-        StateArtifact::for_bytes(unknown_kind, generation, &[]),
-        StateArtifact::for_bytes(artifact_kind::METADATA_SNAPSHOT, generation, &[]),
-        StateArtifact::for_bytes(artifact_kind::CLIENT_TABLE, generation, &[]),
-    ]);
+    metadata_descriptor(
+        nonce,
+        generation,
+        &[
+            StateArtifact::for_bytes(unknown_kind, generation, &[]),
+            StateArtifact::for_bytes(artifact_kind::METADATA_SNAPSHOT, generation, &[]),
+            StateArtifact::for_bytes(artifact_kind::CLIENT_TABLE, generation, &[]),
+        ],
+    )
+}
+
+fn metadata_descriptor(
+    nonce: u128,
+    generation: u64,
+    artifacts: &[StateArtifact],
+) -> Message<StateTransferTargetHeader> {
+    let manifest = encode_state_manifest(artifacts);
     let size = size_of::<StateTransferTargetHeader>() + manifest.len();
     let mut message = Message::<StateTransferTargetHeader>::new(size);
     message.as_mut_slice()[size_of::<StateTransferTargetHeader>()..].copy_from_slice(&manifest);
@@ -1086,6 +1304,7 @@ fn owner_with_metadata_plane(
         inbox,
         replies,
         2,
+        None,
         routes,
         PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
         None,
