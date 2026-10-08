@@ -2924,7 +2924,7 @@ TEST_F(E2E_Client, ConsumerOffsetKeepsDistinctConsumersApart) {
     EXPECT_EQ(offset_b.StoredOffset(), 3u);
 }
 
-TEST_F(E2E_Client, StoreConsumerOffsetRejectsAnyPartitionId) {
+TEST_F(E2E_Client, StoreConsumerOffsetRejectsMissingPartitionId) {
     RecordProperty("description", "Storing an offset needs an explicit partition, unlike polling.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
@@ -2938,6 +2938,6 @@ TEST_F(E2E_Client, StoreConsumerOffsetRejectsAnyPartitionId) {
 
     const auto consumer = iggy::Consumer::Single(iggy::Identifier::String("offset-consumer"));
     ASSERT_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::Numeric(stream.Id()),
-                                            iggy::Identifier::Numeric(0), iggy::kAnyPartitionId, 1),
+                                            iggy::Identifier::Numeric(0), std::nullopt, 1),
                  iggy::IggyException);
 }

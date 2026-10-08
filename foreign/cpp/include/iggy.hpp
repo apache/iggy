@@ -3256,18 +3256,6 @@ class PollingStrategy final {
 };
 
 /**
- * @brief Partition value that names no partition.
- *
- * Low-level polling of a consumer group with it reads one of the partitions
- * assigned to the polling member, taking the next one on every call. A regular
- * consumer reads partition 0, and so does `get_consumer_offset(...)`.
- * `store_consumer_offset(...)` and `delete_consumer_offset(...)` reject it and
- * need an explicit partition. High-level calls express the same omission with
- * `std::nullopt`.
- */
-inline constexpr std::uint32_t kAnyPartitionId{std::numeric_limits<std::uint32_t>::max()};
-
-/**
  * @brief Selects the destination partition for a batch of messages.
  *
  * Balanced() distributes batches across the topic's partitions. PartitionId()
