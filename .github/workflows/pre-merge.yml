@@ -36,6 +36,11 @@ permissions:
   security-events: write
   pull-requests: write
 
+# ASF Infra caps a workflow at 20 concurrent jobs and asks for 15 or fewer
+# (https://infra.apache.org/github-actions-policy.html). GitHub can only cap
+# jobs per matrix, so the test matrices wait for the common checks (15 short
+# jobs) and their max-parallel values add up to 18. The larger caps go to the
+# matrices with the most runner minutes: Rust, BDD and Examples.
 jobs:
   # Common checks - always run
   common:
@@ -56,10 +61,11 @@ jobs:
   # Rust components
   test-rust:
     name: Rust • ${{ matrix.component }}/${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.rust_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 4
       matrix: ${{ fromJson(needs.detect.outputs.rust_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -71,10 +77,11 @@ jobs:
   # Python SDK
   test-python:
     name: Python • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.python_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -86,10 +93,11 @@ jobs:
   # PHP SDK
   test-php:
     name: PHP • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.php_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -101,10 +109,11 @@ jobs:
   # Node SDK
   test-node:
     name: Node • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.node_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -116,10 +125,11 @@ jobs:
   # Go SDK
   test-go:
     name: Go • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.go_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -131,10 +141,11 @@ jobs:
   # Java SDK
   test-java:
     name: Java • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.java_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -146,10 +157,11 @@ jobs:
   # C# SDK
   test-csharp:
     name: C# • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.csharp_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -161,10 +173,11 @@ jobs:
   # C++ SDK
   test-cpp:
     name: C++ • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.cpp_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -176,10 +189,11 @@ jobs:
   # Swift SDK
   test-swift:
     name: Swift • ${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.swift_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.swift_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -189,10 +203,11 @@ jobs:
   # Other components
   test-other:
     name: Other • ${{ matrix.component }}/${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 1
       matrix: ${{ fromJson(needs.detect.outputs.other_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -202,10 +217,11 @@ jobs:
   # BDD Tests
   test-bdd:
     name: BDD • ${{ matrix.component }}/${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 3
       matrix: ${{ fromJson(needs.detect.outputs.bdd_matrix) }}
     uses: ./.github/workflows/_test_bdd.yml
     with:
@@ -215,10 +231,11 @@ jobs:
   # Examples Tests
   test-examples:
     name: Examples • ${{ matrix.component }}/${{ matrix.task }}
-    needs: detect
+    needs: [detect, common]
     if: ${{ fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
     strategy:
       fail-fast: true
+      max-parallel: 2
       matrix: ${{ fromJson(needs.detect.outputs.examples_matrix) }}
     uses: ./.github/workflows/_test_examples.yml
     with:
