@@ -85,6 +85,7 @@ export const translateErrorCode = (code: number): string => {
     case '82': return "Invalid number encoding";
     case '83': return "Invalid boolean value";
     case '84': return "Invalid number value";
+    case '85': return "Request is below the deduplication window; outcome unknown, resending may duplicate the write";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
@@ -168,6 +169,7 @@ export const translateErrorCode = (code: number): string => {
     case '3023': return "Cannot open consumer offsets file for path: {0}";
     case '3024': return "Consumer offset limit reached for partition, raise [partition] consumer_offsets_max";
     case '3013': return "Partition id space exhausted for this topic";
+    case '3014': return "Partition history changed after the request was resolved";
 
     // MESSAGE
     case '4000': return "Segment not found";
@@ -269,6 +271,8 @@ export const translateErrorCode = (code: number): string => {
     case '14000': return "VSR session already bound; reset before re-binding";
     case '14001': return "VSR session value {0} is invalid (must be non-zero)";
     case '14003': return "Incompatible binary protocol version: client {}, server accepts [{}, {}]";
+    case '14004': return "VSR session mismatch: requested {0}, server bound {1}";
+    case '14005': return "VSR request id exhausted";
 
     default: return 'error';
   }

@@ -665,7 +665,7 @@ func (c *IggyTcpClient) sendFrame(
 	}
 	if code == uint32(command.PollMessagesOnPrimaryCode) ||
 		code == uint32(command.GetPollRoutingCode) ||
-		code == uint32(command.AttachConsumerSessionCode) {
+		code == uint32(command.BindSessionCode) {
 		response, generation, _, err := c.sendPollFrame(ctx, code, frame)
 		return response, generation, err
 	}
@@ -858,6 +858,7 @@ func (c *IggyTcpClient) exchangeLocked(
 	transientDeadline, readDeadline time.Time,
 ) ([]byte, error) {
 	pollState, _ := ctx.Value(singlePollExchange{}).(*pollExchangeState)
+	uncertain := false
 	for {
 		if pollState != nil {
 			if err := ctx.Err(); err != nil {
@@ -905,6 +906,18 @@ func (c *IggyTcpClient) exchangeLocked(
 			pollState.reusable = c.conn != nil && vsr.PeekCommand(&c.respHeader) == vsr.FrameReply &&
 				(err == nil || !isReconnectable(err))
 			return response, err
+		}
+		if errors.Is(err, ierror.ErrTransientNotCommitted) {
+			uncertain = true
+		}
+		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) ||
+			errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) ||
+			errors.Is(err, ierror.ErrUnauthorized)) {
+			c.handleReplyFailureLocked(err)
+			if c.conn == nil {
+				return nil, ierror.ErrTransientNotCommitted
+			}
+			err = ierror.ErrTransientNotCommitted
 		}
 		switch {
 		case errors.Is(err, ierror.ErrTransientNotCommitted) && time.Now().Before(readDeadline):
@@ -1008,7 +1021,6 @@ func (c *IggyTcpClient) invalidateConnLocked() {
 	_ = c.closeConnLocked()
 	c.transportState = iggcon.TransportStateDisconnected
 	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
 	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()
@@ -1210,9 +1222,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 	c.connGeneration++
 	c.transportState = iggcon.TransportStateConnected
 	c.connectedAt = time.Now()
-	// The server fence does not survive the old socket, so the new connection
-	// starts from a fresh client identity.
-	c.session.Reset()
+	// The logical identity survives the socket and is authenticated by BindSession.
 	c.clearPollSession()
 	clientAddress := c.clientAddress
 	serverAddress := c.currentServerAddress
@@ -1372,6 +1382,15 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool
 		c.logger.Info("Skipping the automatic sign-in for a replayed login.")
 		return nil
 	}
+	c.registerMtx.Lock()
+	identity, resumeErr := c.resumeSession(ctx)
+	if resumeErr == nil && identity != nil {
+		_, resumeErr = c.settleOnLeader(ctx, uint32(command.BindSessionCode), nil, [vsr.BindSecretBytes]byte{})
+	}
+	c.registerMtx.Unlock()
+	if resumeErr != nil || identity != nil {
+		return resumeErr
+	}
 
 	if credentials.personalAccessToken != "" {
 		_, err := c.LoginWithPersonalAccessToken(ctx, credentials.personalAccessToken)
@@ -1507,7 +1526,6 @@ func (c *IggyTcpClient) disconnectLocked() error {
 	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
 	c.transportState = iggcon.TransportStateDisconnected
 	c.sessionState = iggcon.SessionStateUnauthenticated
-	c.session.Reset()
 	c.clearPollSession()
 	c.groups.clear()
 	c.topics.clearCounts()

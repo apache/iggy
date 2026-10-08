@@ -69,7 +69,7 @@ impl ConnectionCap {
     pub fn try_acquire(&self) -> Option<ConnectionPermit> {
         if let Some(max) = self.max.map(NonZeroUsize::get) {
             let admitted =
-                LIVE_CONNECTIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                LIVE_CONNECTIONS.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
                     (live < max).then_some(live + 1)
                 });
             if let Err(live) = admitted {

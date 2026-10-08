@@ -75,6 +75,7 @@ impl IntoResponse for CustomError {
                     | IggyError::InvalidAccessToken
                     | IggyError::InvalidPersonalAccessToken => StatusCode::UNAUTHORIZED,
                     IggyError::Unauthorized => StatusCode::FORBIDDEN,
+                    IggyError::PartitionHistoryChanged => StatusCode::CONFLICT,
                     // The pre-consensus retry frame: reaching this render
                     // means the write path's replay budget is exhausted and
                     // the op never committed - a transient server condition,
@@ -809,6 +810,28 @@ mod tests {
         let response = CustomError::from(IggyError::UserAlreadyExists).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn partition_history_changed_renders_409_without_retry_after() {
+        const ERROR_BODY_LIMIT: usize = 1024;
+        let response = WriteError::Rejected(IggyError::PartitionHistoryChanged).into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), ERROR_BODY_LIMIT)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "id": 3014,
+                "code": "partition_history_changed",
+                "reason": "Partition history changed after the request was resolved",
+                "field": null,
+            })
+        );
     }
 
     // The ownership refusal is permanent and deterministic. Rendering it as

@@ -188,6 +188,7 @@ class IggyErrorCodeTest {
         "82, INVALID_NUMBER_ENCODING",
         "83, INVALID_BOOLEAN_VALUE",
         "84, INVALID_NUMBER_VALUE",
+        "85, REQUEST_TOO_OLD",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",
@@ -216,6 +217,7 @@ class IggyErrorCodeTest {
         // Partition errors
         "3007, PARTITION_NOT_FOUND",
         "3013, PARTITION_ID_SPACE_EXHAUSTED",
+        "3014, PARTITION_HISTORY_CHANGED",
         "3024, TOO_MANY_CONSUMER_OFFSETS",
 
         // Segment errors
@@ -240,6 +242,7 @@ class IggyErrorCodeTest {
 
         // VSR protocol errors
         "14003, INCOMPATIBLE_PROTOCOL_VERSION",
+        "14004, SESSION_MISMATCH",
     })
     void fromCodeReturnsExpectedIggyErrorCodeWhenCodeIsValid(int code, IggyErrorCode expected) {
         var iggyErrorCode = IggyErrorCode.fromCode(code);

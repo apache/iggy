@@ -92,6 +92,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case invalidNumberEncoding = 82
     case invalidBooleanValue = 83
     case invalidNumberValue = 84
+    case requestTooOld = 85
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -162,6 +163,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case cannotDeleteConsumerOffsetFile = 3011
     case cannotCreateConsumerOffsetsDirectory = 3012
     case partitionIdSpaceExhausted = 3013
+    case partitionHistoryChanged = 3014
     case cannotReadConsumerOffsets = 3020
     case consumerOffsetNotFound = 3021
     case notResolvedConsumer = 3022
@@ -265,6 +267,8 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case alreadyAuthenticated = 14000
     case invalidSession = 14001
     case incompatibleProtocolVersion = 14003
+    case sessionMismatch = 14004
+    case requestIdExhausted = 14005
 }
 
 extension IggyErrorCode {
@@ -339,6 +343,7 @@ extension IggyErrorCode {
         case .invalidNumberEncoding: "invalid_number_encoding"
         case .invalidBooleanValue: "invalid_boolean_value"
         case .invalidNumberValue: "invalid_number_value"
+        case .requestTooOld: "request_too_old"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -409,6 +414,7 @@ extension IggyErrorCode {
         case .cannotDeleteConsumerOffsetFile: "cannot_delete_consumer_offset_file"
         case .cannotCreateConsumerOffsetsDirectory: "cannot_create_consumer_offsets_directory"
         case .partitionIdSpaceExhausted: "partition_id_space_exhausted"
+        case .partitionHistoryChanged: "partition_history_changed"
         case .cannotReadConsumerOffsets: "cannot_read_consumer_offsets"
         case .consumerOffsetNotFound: "consumer_offset_not_found"
         case .notResolvedConsumer: "not_resolved_consumer"
@@ -512,6 +518,8 @@ extension IggyErrorCode {
         case .alreadyAuthenticated: "already_authenticated"
         case .invalidSession: "invalid_session"
         case .incompatibleProtocolVersion: "incompatible_protocol_version"
+        case .sessionMismatch: "session_mismatch"
+        case .requestIdExhausted: "request_id_exhausted"
         }
     }
 }

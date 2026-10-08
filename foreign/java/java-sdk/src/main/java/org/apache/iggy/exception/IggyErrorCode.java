@@ -67,6 +67,12 @@ public enum IggyErrorCode {
     INVALID_BOOLEAN_VALUE(83),
     INVALID_NUMBER_VALUE(84),
 
+    /**
+     * The request is below the server's deduplication window. Its outcome is unknown;
+     * resending can duplicate the write.
+     */
+    REQUEST_TOO_OLD(85),
+
     // Client errors
     CLIENT_NOT_FOUND(100),
 
@@ -94,6 +100,7 @@ public enum IggyErrorCode {
     // Partition errors
     PARTITION_NOT_FOUND(3007),
     PARTITION_ID_SPACE_EXHAUSTED(3013),
+    PARTITION_HISTORY_CHANGED(3014),
 
     // Consumer offset errors
     TOO_MANY_CONSUMER_OFFSETS(3024),
@@ -120,6 +127,8 @@ public enum IggyErrorCode {
 
     // VSR protocol errors
     INCOMPATIBLE_PROTOCOL_VERSION(14003),
+    SESSION_MISMATCH(14004),
+    REQUEST_ID_EXHAUSTED(14005),
 
     // Unknown error code
     UNKNOWN(-1);

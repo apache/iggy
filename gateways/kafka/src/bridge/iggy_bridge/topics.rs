@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
-    Identifier, IggyError, StreamClient, TopicClient, TopicCreateOptions, TopicDetails,
+    Identifier, IggyClient, IggyError, StreamClient, TopicClient, TopicCreateOptions, TopicDetails,
 };
 use kafka_protocol::protocol::StrBytes;
 use tracing::{debug, info};
@@ -273,6 +273,15 @@ impl IggyBridge {
         &self,
         kafka_topic: &str,
     ) -> Result<Option<TopicDetails>, BridgeError> {
+        self.get_kafka_topic_on(&self.client, kafka_topic).await
+    }
+
+    /// [`Self::get_kafka_topic`] on `client`.
+    async fn get_kafka_topic_on(
+        &self,
+        client: &IggyClient,
+        kafka_topic: &str,
+    ) -> Result<Option<TopicDetails>, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
@@ -280,7 +289,7 @@ impl IggyBridge {
         // No separate get_stream probe: get_topic already answers Ok(None) when the stream
         // itself is missing (see high_watermarks' own doc on this same fact), so a probe first
         // would just pay a second round trip to learn something this one call already tells us.
-        with_request_timeout(self.client.get_topic(&stream_id, &topic_id)).await
+        with_request_timeout(client.get_topic(&stream_id, &topic_id)).await
     }
 
     /// Resolves many Kafka-visible names at once, one entry per input in the same order.
@@ -428,6 +437,14 @@ impl IggyBridge {
     /// Returns [`BridgeError::Timeout`] if a call takes longer than `REQUEST_TIMEOUT`. Returns
     /// [`BridgeError::Iggy`] for connectivity/auth failures.
     pub async fn list_kafka_topics(&self) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
+        self.list_kafka_topics_on(&self.client).await
+    }
+
+    /// [`Self::list_kafka_topics`] on `client`.
+    pub(super) async fn list_kafka_topics_on(
+        &self,
+        client: &IggyClient,
+    ) -> Result<Vec<KafkaTopicMetadata>, BridgeError> {
         let default_stream = self.config.topic_mapping.default_stream();
         let mut default_stream_override_targets: HashSet<&str> = HashSet::new();
         let mut override_keys: HashSet<&str> = HashSet::new();
@@ -438,7 +455,7 @@ impl IggyBridge {
             if over.stream == default_stream {
                 default_stream_override_targets.insert(over.topic.as_str());
             }
-            match self.get_kafka_topic(kafka_topic).await {
+            match self.get_kafka_topic_on(client, kafka_topic).await {
                 Ok(Some(details)) => results.push(KafkaTopicMetadata {
                     kafka_topic: kafka_topic.to_string(),
                     partitions_count: details.partitions_count,
@@ -467,7 +484,7 @@ impl IggyBridge {
         // this one call already tells us - and it costs an extra ACL check this caller might not
         // even have, when a user with only read_topics on the default stream (no read_streams)
         // should still see its topics listed.
-        let topics = with_request_timeout(self.client.get_topics(&default_stream_id)).await?;
+        let topics = with_request_timeout(client.get_topics(&default_stream_id)).await?;
         for topic in topics {
             if default_stream_override_targets.contains(topic.name.as_str())
                 || override_keys.contains(topic.name.as_str())

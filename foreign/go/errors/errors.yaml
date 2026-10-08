@@ -335,6 +335,10 @@
   code: 84
   format: "invalid number value"
   fields: []
+- name: RequestTooOld
+  code: 85
+  format: "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -786,6 +790,10 @@
 - name: PartitionIdSpaceExhausted
   code: 3013
   format: "partition id space exhausted for this topic"
+  fields: []
+- name: PartitionHistoryChanged
+  code: 3014
+  format: "partition history changed after the request was resolved"
   fields: []
 - name: SegmentNotFound
   code: 4000
@@ -1299,3 +1307,14 @@
       type: uint32
     - name: ServerVersionMax
       type: uint32
+- name: SessionMismatch
+  code: 14004
+  format: "vsr session mismatch: requested %d, server bound %d"
+  fields:
+    - name: Requested
+      type: uint64
+    - name: Bound
+      type: uint64
+- name: RequestIdExhausted
+  code: 14005
+  format: "vsr request id exhausted"

@@ -124,6 +124,7 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     );
 
     // 6. Disconnect the consumer and client (simulating runtime restart)
+    consumer.shutdown().await.unwrap();
     drop(consumer);
     runtime_client.disconnect().await.unwrap();
     drop(runtime_client);

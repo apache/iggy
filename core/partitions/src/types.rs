@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///
-/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// The replica is divergent from here on: the commit walk popped
 /// the op, its `commit_min` never advanced, and the next
 /// `advance_commit_min` would assert on the gap. Continuing would either
 /// serve a prefix the cluster has moved past or panic somewhere less
@@ -36,7 +36,8 @@ use std::sync::Arc;
 pub struct FatalCommit {
     pub namespace_raw: u64,
     pub op: u64,
-    pub operation: Operation,
+    /// None for a checkpoint failure covering multiple operation kinds.
+    pub operation: Option<Operation>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +394,7 @@ pub struct PartitionsConfig {
 const OFFSETS_DIR: &str = "offsets";
 const CONSUMER_OFFSETS_DIR: &str = "consumers";
 const CONSUMER_GROUP_OFFSETS_DIR: &str = "groups";
+const EXTERNAL_GROUP_OFFSETS_DIR: &str = "external_groups";
 
 impl PartitionsConfig {
     #[must_use]
@@ -476,6 +478,20 @@ impl PartitionsConfig {
     ) -> String {
         format!(
             "{}/{CONSUMER_GROUP_OFFSETS_DIR}",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Directory holding one offset file per external group.
+    #[must_use]
+    pub fn get_external_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{EXTERNAL_GROUP_OFFSETS_DIR}",
             self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }

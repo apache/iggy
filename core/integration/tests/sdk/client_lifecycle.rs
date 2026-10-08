@@ -17,8 +17,8 @@
 
 //! A client that is shut down stays shut down, and an explicit disconnect
 //! stays in effect until the caller connects again. These tests pin that
-//! contract and fail on the current SDK (#4287), so they stay ignored until the
-//! fixes land.
+//! contract. The ignored ones still fail on the current SDK (#4287) and stay
+//! ignored until their fixes land.
 
 use iggy::prelude::*;
 use integration::harness::TestHarness;
@@ -46,16 +46,7 @@ const SDK_SIDE_FAILURE: Duration = Duration::from_millis(500);
 const DISCONNECT_BOUND: Duration = Duration::from_secs(5);
 
 #[iggy_harness]
-#[ignore = "fails until #4287 is fixed (WebSocket connects after shutdown); run this test explicitly with --ignored"]
 async fn given_a_shut_down_websocket_client_when_connecting_should_fail(harness: &TestHarness) {
-    // TODO: in `WebSocketClient::connect_inner`, return `ClientShutdown` in the
-    // `Shutdown` state before any dial, as `TcpClient` and `QuicClient` already
-    // do. The `set_state` guard of the next test only stops the state change,
-    // not the dial. The fix turns the strict `xfail` of
-    // `test_shutdown_client_cannot_connect_again` in
-    // `foreign/python/tests/test_connectivity.py` into an XPASS, so remove that
-    // mark with it, and update the known-issue note of `shutdown()` in
-    // `foreign/python/src/client.rs`.
     let client = harness.websocket_new_client().await.unwrap();
     client.shutdown().await.unwrap();
 
@@ -68,15 +59,7 @@ async fn given_a_shut_down_websocket_client_when_connecting_should_fail(harness:
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
-#[ignore = "fails until #4287 is fixed (disconnect after shutdown makes the client reusable); run this test explicitly with --ignored"]
 async fn given_a_shut_down_client_when_disconnected_should_stay_shut_down(harness: &TestHarness) {
-    // TODO: add one guard in `set_state` of each transport, so that no write
-    // moves a client out of `Shutdown`. A guard in each `disconnect()` is not
-    // enough: other paths also write `Disconnected`, for example a timeout.
-    // With the guard, `connect_inner` returns `ClientShutdown` on TCP and QUIC.
-    // WebSocket also needs the `connect_inner` fix of the test above, because it
-    // dials in any state. Drop the known-issue note of `shutdown()` in
-    // `foreign/python/src/client.rs` with this fix.
     let client = harness.new_client().await.unwrap();
     client.shutdown().await.unwrap();
     client.disconnect().await.unwrap();

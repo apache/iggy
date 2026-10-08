@@ -401,6 +401,8 @@ pub struct PartitionDiagEvent<'a> {
     pub replica: ReplicaLogContext,
     pub message: &'static str,
     pub operation: Option<Operation>,
+    pub client: Option<u128>,
+    pub request: Option<u64>,
     pub op: Option<u64>,
     /// This replica's sequencer position when the event fired. Set where `op`
     /// alone cannot say which side of the frontier the frame landed on: a
@@ -419,6 +421,8 @@ impl<'a> PartitionDiagEvent<'a> {
             replica,
             message,
             operation: None,
+            client: None,
+            request: None,
             op: None,
             sequence: None,
             prepare_checksum: None,
@@ -430,6 +434,18 @@ impl<'a> PartitionDiagEvent<'a> {
     #[must_use]
     pub const fn with_operation(mut self, operation: Operation) -> Self {
         self.operation = Some(operation);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_client(mut self, client: u128) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_request(mut self, request: u64) -> Self {
+        self.request = Some(request);
         self
     }
 
@@ -480,6 +496,8 @@ pub fn emit_partition_diag(level: tracing::Level, event: &PartitionDiagEvent<'_>
 fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
+    let client = event.client.unwrap_or_default();
+    let request = event.request.unwrap_or_default();
     let op = event.op.unwrap_or_default();
     let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
@@ -502,6 +520,8 @@ fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
         operation,
+        client,
+        request,
         op,
         sequence,
         prepare_checksum,
@@ -514,6 +534,8 @@ fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
 fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
+    let client = event.client.unwrap_or_default();
+    let request = event.request.unwrap_or_default();
     let op = event.op.unwrap_or_default();
     let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
@@ -536,6 +558,8 @@ fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
         operation,
+        client,
+        request,
         op,
         sequence,
         prepare_checksum,
@@ -548,6 +572,8 @@ fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
 fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
+    let client = event.client.unwrap_or_default();
+    let request = event.request.unwrap_or_default();
     let op = event.op.unwrap_or_default();
     let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
@@ -570,6 +596,8 @@ fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
         operation,
+        client,
+        request,
         op,
         sequence,
         prepare_checksum,
@@ -582,6 +610,8 @@ fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
 fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
+    let client = event.client.unwrap_or_default();
+    let request = event.request.unwrap_or_default();
     let op = event.op.unwrap_or_default();
     let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
@@ -604,6 +634,8 @@ fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
         operation,
+        client,
+        request,
         op,
         sequence,
         prepare_checksum,
@@ -616,6 +648,8 @@ fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
 fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
     let ctx = event.replica;
     let operation = event.operation.map_or("", operation_as_str);
+    let client = event.client.unwrap_or_default();
+    let request = event.request.unwrap_or_default();
     let op = event.op.unwrap_or_default();
     let sequence = event.sequence.unwrap_or_default();
     let prepare_checksum = event.prepare_checksum.unwrap_or_default();
@@ -638,6 +672,8 @@ fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
         operation,
+        client,
+        request,
         op,
         sequence,
         prepare_checksum,
@@ -665,6 +701,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::RemoveConsumerGroupMember => "remove_consumer_group_member",
         Operation::CompleteConsumerGroupRevocation => "complete_consumer_group_revocation",
         Operation::TruncatePartition => "truncate_partition",
+        Operation::FinalizeSession => "finalize_session",
+        Operation::RetireSession => "retire_session",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",

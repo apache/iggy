@@ -30,6 +30,7 @@ pub trait MessageClient {
     ///
     /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
+    /// A [`ConsumerKind::ExternalGroup`] consumer only holds offsets, so polling with it returns [`IggyError::FeatureUnavailable`].
     ///
     /// With automatic commits enabled, a new consumer offset key can be
     /// rejected with `TooManyConsumerOffsets` at the partition's configured

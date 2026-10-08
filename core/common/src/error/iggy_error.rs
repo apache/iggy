@@ -35,6 +35,7 @@ use thiserror::Error;
     derive(FromRepr, IntoStaticStr),
     strum(serialize_all = "snake_case")
 )]
+#[non_exhaustive]
 pub enum IggyError {
     #[default]
     #[error("Error")]
@@ -173,6 +174,10 @@ pub enum IggyError {
     InvalidBooleanValue = 83,
     #[error("Invalid number value")]
     InvalidNumberValue = 84,
+    #[error(
+        "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
+    )]
+    RequestTooOld = 85,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -327,6 +332,10 @@ pub enum IggyError {
     /// range frees again.
     #[error("Partition id space exhausted for this topic")]
     PartitionIdSpaceExhausted = 3013,
+    /// Clients must resolve the current partition state and submit a new request,
+    /// rather than replay the rejected request against its previous history.
+    #[error("Partition history changed after the request was resolved")]
+    PartitionHistoryChanged = 3014,
     #[error("Failed to read consumers offsets from path: {0}")]
     CannotReadConsumerOffsets(String) = 3020,
     #[error("Consumer offset for consumer with ID: {0} was not found.")]
@@ -568,6 +577,10 @@ pub enum IggyError {
         iggy_binary_protocol::ProtocolVersion(*.2)
     )]
     IncompatibleProtocolVersion(u32, u32, u32) = 14003,
+    #[error("VSR session mismatch: requested {0}, server bound {1}")]
+    SessionMismatch(u64, u64) = 14004,
+    #[error("VSR request IDs exhausted; start a new logical session")]
+    RequestIdExhausted = 14005,
 }
 
 impl IggyError {
@@ -646,5 +659,13 @@ mod tests {
         assert_eq!(error.as_code(), 3024);
         assert_eq!(IggyError::from_code(3024), error);
         assert_eq!(IggyError::from_code_as_string(3024), error.as_string());
+    }
+
+    #[test]
+    fn request_too_old_round_trips_by_code() {
+        let error = IggyError::RequestTooOld;
+        assert_eq!(error.as_code(), 85);
+        assert_eq!(IggyError::from_code(85), error);
+        assert_eq!(IggyError::from_code_as_string(85), error.as_string());
     }
 }

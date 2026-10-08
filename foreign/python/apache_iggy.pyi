@@ -1367,10 +1367,6 @@ class IggyClient:
         connection to close, but the heartbeat that `connect` started keeps
         sending pings until the client is dropped.
 
-        Known issue: `disconnect` then `connect` makes the client usable again
-        on TCP, QUIC and WebSocket, and WebSocket also accepts `connect` alone.
-        See https://github.com/apache/iggy/issues/4287.
-
         Raises:
             RuntimeError: If the client cannot be shut down.
         """
@@ -1852,6 +1848,7 @@ class IggyClient:
         topic_max_size: MaxTopicSize | None = None,
         send_retries: builtins.int | None = 3,
         send_retry_interval: datetime.timedelta | None = ...,
+        topic_durability: Durability | None = None,
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
         Creates and initializes a high-level producer bound to a stream and topic.
@@ -1860,7 +1857,9 @@ class IggyClient:
         producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
         `None` selects direct mode. `BackgroundProducerConfig` starts background
         workers and makes successful sends mean queue acceptance rather than a
-        server commit. The returned producer is ready to send.
+        server commit. Replicated topics accept producer writes. Set
+        `topic_durability=Durability.PERSISTED` for an automatically created topic
+        when sends require crash-safe retry receipts.
 
         Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
         when stream/topic initialization fails.
@@ -2601,9 +2600,8 @@ class SendMessagesConfirmation:
         r"""
         Gets the offset assigned to the first message of the batch in this partition.
 
-        The offset locates the batch, it does not identify it. Delivery is
-        at-least-once, so an earlier retry may already have committed these
-        messages at a lower offset.
+        The offset locates the batch, it does not identify it. An application
+        resend creates another request and can duplicate the messages.
 
         Confirmation follows VSR quorum commit. A topic with persisted message
         durability also waits for recoverable stable-storage copies on the quorum.
@@ -2622,10 +2620,10 @@ class SendMessagesResponse:
         The list is empty when the server reports no offsets, so check whether
         it is empty before indexing into it.
 
-        A reported `base_offset` never implies uniqueness, because delivery is
-        at-least-once and an earlier retry may already have committed the same
-        messages at a lower offset. Confirmation follows the topic's message
-        durability policy: quorum commit, plus stable storage for persisted topics.
+        A reported `base_offset` never implies uniqueness: an application resend
+        can commit the same messages at another offset. Confirmation follows the
+        topic's policy: quorum commit, plus stable storage and crash-safe retry
+        receipts for persisted topics.
         """
 
 @typing.final

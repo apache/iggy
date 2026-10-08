@@ -722,6 +722,17 @@ func (e InvalidNumberValue) Is(target error) bool {
 	return ok
 }
 
+type RequestTooOld struct{}
+
+func (e RequestTooOld) Error() string {
+	return "request is below the deduplication window; outcome unknown, resending may duplicate the write"
+}
+func (e RequestTooOld) Code() Code { return 85 }
+func (e RequestTooOld) Is(target error) bool {
+	_, ok := target.(RequestTooOld)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -1614,6 +1625,17 @@ func (e PartitionIdSpaceExhausted) Error() string {
 func (e PartitionIdSpaceExhausted) Code() Code { return 3013 }
 func (e PartitionIdSpaceExhausted) Is(target error) bool {
 	_, ok := target.(PartitionIdSpaceExhausted)
+	return ok
+}
+
+type PartitionHistoryChanged struct{}
+
+func (e PartitionHistoryChanged) Error() string {
+	return "partition history changed after the request was resolved"
+}
+func (e PartitionHistoryChanged) Code() Code { return 3014 }
+func (e PartitionHistoryChanged) Is(target error) bool {
+	_, ok := target.(PartitionHistoryChanged)
 	return ok
 }
 
@@ -2665,6 +2687,29 @@ func (e IncompatibleProtocolVersion) Is(target error) bool {
 	return ok
 }
 
+type SessionMismatch struct {
+	Requested uint64
+	Bound     uint64
+}
+
+func (e SessionMismatch) Error() string {
+	return fmt.Sprintf("vsr session mismatch: requested %d, server bound %d", e.Requested, e.Bound)
+}
+func (e SessionMismatch) Code() Code { return 14004 }
+func (e SessionMismatch) Is(target error) bool {
+	_, ok := target.(SessionMismatch)
+	return ok
+}
+
+type RequestIdExhausted struct{}
+
+func (e RequestIdExhausted) Error() string { return "vsr request id exhausted" }
+func (e RequestIdExhausted) Code() Code    { return 14005 }
+func (e RequestIdExhausted) Is(target error) bool {
+	_, ok := target.(RequestIdExhausted)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2734,6 +2779,7 @@ var (
 	ErrInvalidNumberEncoding                      = InvalidNumberEncoding{}
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
+	ErrRequestTooOld                              = RequestTooOld{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2809,6 +2855,7 @@ var (
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
 	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
+	ErrPartitionHistoryChanged                    = PartitionHistoryChanged{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
 	ErrInvalidSegmentSize                         = InvalidSegmentSize{}
@@ -2906,6 +2953,8 @@ var (
 	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
+	ErrSessionMismatch                            = SessionMismatch{}
+	ErrRequestIdExhausted                         = RequestIdExhausted{}
 )
 
 type Code uint32
@@ -2979,6 +3028,7 @@ const (
 	InvalidNumberEncodingCode                      Code = 82
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
+	RequestTooOldCode                              Code = 85
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3054,6 +3104,7 @@ const (
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
 	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
+	PartitionHistoryChangedCode                    Code = 3014
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
 	InvalidSegmentSizeCode                         Code = 4002
@@ -3151,6 +3202,8 @@ const (
 	AlreadyAuthenticatedCode                       Code = 14000
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
+	SessionMismatchCode                            Code = 14004
+	RequestIdExhaustedCode                         Code = 14005
 )
 
 func (c Code) String() string {
@@ -3291,6 +3344,8 @@ func (c Code) String() string {
 		return "InvalidBooleanValue"
 	case InvalidNumberValueCode:
 		return "InvalidNumberValue"
+	case RequestTooOldCode:
+		return "RequestTooOld"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3441,6 +3496,8 @@ func (c Code) String() string {
 		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
+	case PartitionHistoryChangedCode:
+		return "PartitionHistoryChanged"
 	case SegmentNotFoundCode:
 		return "SegmentNotFound"
 	case SegmentClosedCode:
@@ -3635,6 +3692,10 @@ func (c Code) String() string {
 		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
+	case SessionMismatchCode:
+		return "SessionMismatch"
+	case RequestIdExhaustedCode:
+		return "RequestIdExhausted"
 	default:
 		return "Unknown error code"
 	}
@@ -3778,6 +3839,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidBooleanValue
 	case InvalidNumberValueCode:
 		return ErrInvalidNumberValue
+	case RequestTooOldCode:
+		return ErrRequestTooOld
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -3928,6 +3991,8 @@ func FromCode(code Code) IggyError {
 		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
+	case PartitionHistoryChangedCode:
+		return ErrPartitionHistoryChanged
 	case SegmentNotFoundCode:
 		return ErrSegmentNotFound
 	case SegmentClosedCode:
@@ -4122,6 +4187,10 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
+	case SessionMismatchCode:
+		return ErrSessionMismatch
+	case RequestIdExhaustedCode:
+		return ErrRequestIdExhausted
 	default:
 		return ErrError
 	}

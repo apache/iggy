@@ -22,16 +22,18 @@
 //! delete a partition from disk.
 
 use crate::offset_recovery::{
-    RecoveredOffsets, load_consumer_group_offsets_with_storage, load_consumer_offsets_with_storage,
+    RecoveredOffsets, load_consumer_offsets_with_storage, load_group_offsets_with_storage,
 };
 use crate::segment_recovery::{PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment};
 use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
 use compio::fs::create_dir_all;
-use iggy_common::{ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, IggyError};
+use compio::io::AsyncWriteAtExt;
+use iggy_common::{ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
-use server_common::fs_utils::remove_dir_all;
+use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::fs_utils::walk_dir;
 use server_common::sharding::IggyNamespace;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -41,9 +43,11 @@ use tracing::{error, warn};
 /// Create the on-disk directory hierarchy for a partition.
 ///
 /// Builds the partition root, offsets, consumer offsets, and consumer
-/// group offsets directories. Idempotent: every step short-circuits when
-/// the directory already exists, so a reconciler retry after a partial
-/// failure is safe.
+/// group offsets directories. Idempotent: an existing directory is
+/// accepted, so a reconciler retry after a partial failure is safe. The
+/// external group offsets directory comes from
+/// [`configure_consumer_offsets_with_storage`], which a partition made
+/// before that kind existed reaches too.
 ///
 /// # Errors
 ///
@@ -64,53 +68,110 @@ pub async fn create_partition_file_hierarchy(
         ));
     }
 
-    let offset_path = config.get_offsets_path(stream_id, topic_id, partition_id);
-    if !Path::new(&offset_path).exists() && create_dir_all(&offset_path).await.is_err() {
-        error!(
-            stream_id,
-            topic_id, partition_id, "Failed to create offsets directory for partition"
-        );
-        return Err(IggyError::CannotCreatePartition(
-            partition_id,
-            stream_id,
-            topic_id,
-        ));
-    }
-
-    let consumer_offset_path = config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
-    if !Path::new(&consumer_offset_path).exists()
-        && create_dir_all(&consumer_offset_path).await.is_err()
-    {
-        error!(
-            stream_id,
-            topic_id, partition_id, "Failed to create consumer offsets directory for partition"
-        );
-        return Err(IggyError::CannotCreatePartition(
-            partition_id,
-            stream_id,
-            topic_id,
-        ));
-    }
-
-    let consumer_group_offsets_path =
-        config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-    if !Path::new(&consumer_group_offsets_path).exists()
-        && create_dir_all(&consumer_group_offsets_path).await.is_err()
-    {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            "Failed to create consumer group offsets directory for partition"
-        );
-        return Err(IggyError::CannotCreatePartition(
-            partition_id,
-            stream_id,
-            topic_id,
-        ));
+    // `create_dir_all` also creates the shared `offsets/` parent.
+    for path in [
+        config.get_consumer_offsets_path(stream_id, topic_id, partition_id),
+        config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id),
+    ] {
+        if create_dir_all(&path).await.is_err() {
+            error!(
+                stream_id,
+                topic_id, partition_id, path, "Failed to create offsets directory for partition"
+            );
+            return Err(IggyError::CannotCreatePartition(
+                partition_id,
+                stream_id,
+                topic_id,
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// File in a partition directory that names the incarnation the directory
+/// belongs to: the partition's `created_revision`, as 8 little-endian bytes.
+///
+/// Ids are reused after a delete, and a delete that did not finish before a
+/// restart leaves the directory behind, so the path alone does not say whose
+/// segments it holds. The file is written before any other content and removed
+/// after all of it ([`delete_partitions_from_disk`]).
+pub const CREATED_REVISION_FILE: &str = "created.revision";
+
+/// Durably record that `partition_dir` belongs to the incarnation created at
+/// `created_revision`. The directory must exist.
+///
+/// # Errors
+///
+/// The underlying I/O error.
+pub async fn write_created_revision(
+    partition_dir: &str,
+    created_revision: u64,
+) -> std::io::Result<()> {
+    write_revision_record(partition_dir, CREATED_REVISION_FILE, created_revision).await
+}
+
+/// The incarnation `partition_dir` belongs to, or `None` when nothing recorded
+/// one: a missing directory, or one an older server made.
+///
+/// # Errors
+///
+/// The underlying I/O error, and `InvalidData` for a record that is not 8 bytes.
+pub async fn read_created_revision(partition_dir: &str) -> std::io::Result<Option<u64>> {
+    read_revision_record(partition_dir, CREATED_REVISION_FILE).await
+}
+
+/// Durably replace the 8-byte little-endian record `name` in `directory`: write
+/// a temporary sibling, sync it, rename it over the record, sync the directory.
+///
+/// # Errors
+/// Returns the underlying open, write, rename, or synchronization error.
+pub async fn write_revision_record(
+    directory: &str,
+    name: &str,
+    revision: u64,
+) -> std::io::Result<()> {
+    let path = Path::new(directory).join(name);
+    let temporary = Path::new(directory).join(format!("{name}.tmp"));
+    let mut file = compio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
+    file.write_all_at(revision.to_le_bytes(), 0).await.0?;
+    file.sync_all().await?;
+    if let Err(error) = compio::fs::rename(&temporary, path).await {
+        let _ = compio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    DiskStorage.sync_directory(Path::new(directory)).await
+}
+
+/// Read the 8-byte little-endian record `name` in `directory`, `None` when it
+/// is absent.
+///
+/// # Errors
+/// Returns an I/O error or `InvalidData` if the record is not exactly eight bytes.
+pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Result<Option<u64>> {
+    let path = Path::new(directory).join(name);
+    match compio::fs::read(&path)
+        .await
+        .note_descriptor_exhaustion(|| format!("reading {}", path.display()))
+    {
+        Ok(bytes) => {
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name} in {directory} is not an 8-byte record"),
+                )
+            })?;
+            Ok(Some(u64::from_le_bytes(bytes)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Populate `partition` with consumer and consumer group offset storage from disk.
@@ -124,8 +185,11 @@ pub async fn create_partition_file_hierarchy(
 /// # Errors
 ///
 /// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] when an existing offset
-/// directory cannot be enumerated. A stored offset past the offset space is clamped
-/// to `current_offset` (with a warning), not an error.
+/// directory cannot be enumerated, and
+/// [`PartitionRecoveryError::CreateOffsetsDirectory`] when the external group one
+/// cannot be created. A stored offset past the offset space is clamped to
+/// `current_offset` (with a warning), not an error. External group offsets are
+/// never clamped.
 pub async fn configure_consumer_offsets<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     config: &PartitionsConfig,
@@ -154,12 +218,13 @@ pub async fn configure_consumer_offsets<B: MessageBus>(
 /// Offsets beyond the space reserved by the partition are clamped to
 /// `current_offset`, as during server boot. Clamping changes the visible position
 /// without rewriting its file; persistence tracking retains the original value
-/// read from storage.
+/// read from storage. External group offsets are never clamped.
 ///
 /// # Errors
 /// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] if an existing offset directory
-/// cannot be enumerated. Consumer recovery may already have seeded the partition
-/// when group recovery fails, so callers must discard a failed recovery.
+/// cannot be enumerated, and [`PartitionRecoveryError::CreateOffsetsDirectory`] if the
+/// external group one cannot be created. Consumer recovery may already have seeded the
+/// partition when group recovery fails, so callers must discard a failed recovery.
 #[allow(clippy::too_many_lines)]
 pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
     storage: &S,
@@ -174,6 +239,8 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     let consumer_offsets_path = config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
     let consumer_group_offsets_path =
         config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+    let external_group_offsets_path =
+        config.get_external_group_offsets_path(stream_id, topic_id, partition_id);
     // The bound is the offset space this replica could have MINTED, not the data
     // it can still serve. A boot re-anchor leaves the append point a lease block
     // above the recovered chain, so on the restart after a crash that took
@@ -189,7 +256,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     let recovered_consumers = load_partition_consumer_offsets(
         storage,
         &consumer_offsets_path,
-        "consumer",
+        ConsumerKind::Consumer.as_str(),
         stream_id,
         topic_id,
         partition_id,
@@ -199,39 +266,22 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     {
         let guard = consumer_offsets.pin();
         for offset in recovered_consumers.entries {
-            let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > offset_space_ceiling {
-                // A crash can persist an offset ahead of the flushed data
-                // (offsets are stored eagerly, messages flush later). Clamp to
-                // the recovered head so the consumer resumes instead of being
-                // stuck polling past the log; mirrors the legacy contract.
-                warn!(
-                    consumer_id = offset.consumer_id,
-                    recovered_offset,
-                    current_offset,
-                    offset_space_ceiling,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    "recovered consumer offset ahead of partition data; clamping"
-                );
-                offset.offset.store(current_offset, Ordering::Relaxed);
-            }
-            let consumer_id = offset.consumer_id;
-            let committed_offset = offset.offset.load(Ordering::Relaxed);
-            partition.seed_recovered_consumer_offset(
+            seed_recovered_offset(
+                partition,
+                namespace,
                 ConsumerKind::Consumer,
-                consumer_id,
-                committed_offset,
-                recovered_offset,
+                &offset,
+                Some(offset_space_ceiling),
+                current_offset,
             );
-            guard.insert(consumer_id as usize, offset);
+            guard.insert(offset.consumer_id as usize, offset);
         }
     }
 
-    let recovered_groups = load_partition_consumer_group_offsets(
+    let recovered_groups = load_partition_group_offsets(
         storage,
         &consumer_group_offsets_path,
+        ConsumerKind::ConsumerGroup,
         stream_id,
         topic_id,
         partition_id,
@@ -242,53 +292,89 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     {
         let guard = consumer_group_offsets.pin();
         for (group_id, offset) in recovered_groups.entries {
-            let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > offset_space_ceiling {
-                warn!(
-                    consumer_group_id = group_id.0,
-                    recovered_offset,
-                    current_offset,
-                    offset_space_ceiling,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    "recovered consumer group offset ahead of partition data; clamping"
-                );
-                offset.offset.store(current_offset, Ordering::Relaxed);
-            }
-            let committed_offset = offset.offset.load(Ordering::Relaxed);
-            partition.seed_recovered_consumer_offset(
+            seed_recovered_offset(
+                partition,
+                namespace,
                 ConsumerKind::ConsumerGroup,
-                offset.consumer_id,
-                committed_offset,
-                recovered_offset,
+                &offset,
+                Some(offset_space_ceiling),
+                current_offset,
             );
             guard.insert(group_id, offset);
         }
+    }
+
+    // A partition made before this kind existed has no directory for it. The checkpoint syncs
+    // every offset directory, so it has to exist before the first one.
+    storage
+        .create_directories(Path::new(&external_group_offsets_path))
+        .await
+        .map_err(|source| PartitionRecoveryError::CreateOffsetsDirectory {
+            stream_id,
+            topic_id,
+            partition_id,
+            path: external_group_offsets_path.clone(),
+            source,
+        })?;
+    let recovered_external = load_partition_group_offsets(
+        storage,
+        &external_group_offsets_path,
+        ConsumerKind::ExternalGroup,
+        stream_id,
+        topic_id,
+        partition_id,
+    )
+    .await?;
+    // Never clamped: the value belongs to the external system, and a Kafka commit sits one past
+    // the last message. The durable table is the only store of an external offset.
+    for (_, offset) in &recovered_external.entries {
+        seed_recovered_offset(
+            partition,
+            namespace,
+            ConsumerKind::ExternalGroup,
+            offset,
+            None,
+            current_offset,
+        );
     }
 
     // Offset files have their own knob, not the topic's `persisted`: that
     // one gates message and index writes, and syncing a 16-byte cursor on every
     // commit costs milliseconds per commit for a file whose loss is a redelivery.
     partition.configure_consumer_offset_storage(
-        consumer_offsets_path.clone(),
-        consumer_group_offsets_path.clone(),
+        [
+            consumer_offsets_path.clone(),
+            consumer_group_offsets_path.clone(),
+            external_group_offsets_path.clone(),
+        ],
         consumer_offsets,
         consumer_group_offsets,
     );
-    for consumer_id in recovered_consumers.stranded_ids {
-        if partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id) {
-            warn!(stream_id, topic_id, partition_id, consumer_id, path = %consumer_offsets_path,
-                "unloaded consumer offset file retains its capacity slot until updated or deleted");
+    for (kind, path, stranded_ids) in [
+        (
+            ConsumerKind::Consumer,
+            &consumer_offsets_path,
+            recovered_consumers.stranded_ids,
+        ),
+        (
+            ConsumerKind::ConsumerGroup,
+            &consumer_group_offsets_path,
+            recovered_groups.stranded_ids,
+        ),
+        (
+            ConsumerKind::ExternalGroup,
+            &external_group_offsets_path,
+            recovered_external.stranded_ids,
+        ),
+    ] {
+        for consumer_id in stranded_ids {
+            if partition.seed_stranded_consumer_offset(kind, consumer_id) {
+                warn!(stream_id, topic_id, partition_id, %kind, consumer_id, path = %path,
+                    "unloaded offset file retains its capacity slot until it is updated, deleted, or reclaimed");
+            }
         }
     }
-    for group_id in recovered_groups.stranded_ids {
-        if partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, group_id) {
-            warn!(stream_id, topic_id, partition_id, group_id, path = %consumer_group_offsets_path,
-                "unloaded group offset file retains its capacity slot until repaired or reclaimed");
-        }
-    }
-    for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+    for kind in ConsumerKind::ALL {
         let count = partition.occupied_consumer_offset_count(kind);
         let limit = partition.consumer_offset_capacity_for(kind).limit();
         if count > limit {
@@ -306,11 +392,50 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
     Ok(())
 }
 
+/// Seed the durable state of one recovered offset record. A record past
+/// `ceiling` is clamped to `current_offset` first, and `None` skips the clamp.
+/// The file high-water keeps the value read from storage.
+fn seed_recovered_offset<B: MessageBus>(
+    partition: &IggyPartition<B>,
+    namespace: IggyNamespace,
+    kind: ConsumerKind,
+    offset: &ConsumerOffset,
+    ceiling: Option<u64>,
+    current_offset: u64,
+) {
+    let recovered_offset = offset.offset.load(Ordering::Relaxed);
+    if let Some(ceiling) = ceiling
+        && recovered_offset > ceiling
+    {
+        // A crash can persist an offset ahead of the flushed data (offsets are
+        // stored eagerly, messages flush later). Clamp to the recovered head so
+        // the consumer resumes instead of being stuck polling past the log;
+        // mirrors the legacy contract.
+        warn!(
+            stream_id = namespace.stream_id(),
+            topic_id = namespace.topic_id(),
+            partition_id = namespace.partition_id(),
+            %kind,
+            consumer_id = offset.consumer_id,
+            recovered_offset,
+            current_offset,
+            offset_space_ceiling = ceiling,
+            "recovered offset ahead of partition data; clamping"
+        );
+        offset.offset.store(current_offset, Ordering::Relaxed);
+    }
+    partition.seed_recovered_consumer_offset(
+        kind,
+        offset.consumer_id,
+        offset.offset.load(Ordering::Relaxed),
+        recovered_offset,
+    );
+}
+
 /// Provision an initial segment + writers for a partition that has none.
 ///
-/// No-op when `partition.log.has_segments()` already returns `true`
-/// (recovery hydrated existing segments), so callers can invoke this
-/// unconditionally.
+/// With WAL-owned messages, restore the deterministic empty tail when the
+/// recovered last segment already reached its size limit.
 ///
 /// # Errors
 ///
@@ -323,6 +448,11 @@ pub async fn ensure_initial_segment<B: MessageBus>(
     wal_owned_messages: bool,
 ) -> Result<(), PartitionRecoveryError> {
     if partition.log.has_segments() {
+        if wal_owned_messages
+            && partition.log.active_segment().size >= partition.log.active_segment().max_size
+        {
+            partition.rotate_segment(config).await?;
+        }
         return Ok(());
     }
     let stream_id = namespace.stream_id();
@@ -425,6 +555,10 @@ pub async fn ensure_initial_segment<B: MessageBus>(
 /// Recursive delete of partition root. Idempotent: `NotFound` is treated
 /// as success so a prior crashed pass cannot arm perpetual backoff.
 ///
+/// The [`CREATED_REVISION_FILE`] goes last, so a delete cut short by a crash
+/// leaves a directory the loader still knows as a dead incarnation, never
+/// unmarked segments that the next incarnation with the same ids would adopt.
+///
 /// # Errors
 ///
 /// [`IggyError::CannotDeletePartitionDirectory`] on any non-`NotFound`
@@ -436,7 +570,7 @@ pub async fn delete_partitions_from_disk(
     config: &PartitionsConfig,
 ) -> Result<(), IggyError> {
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
-    match remove_dir_all(&partition_path).await {
+    match remove_partition_dir(&partition_path).await {
         Ok(()) => {
             tracing::info!(
                 stream_id,
@@ -472,6 +606,54 @@ pub async fn delete_partitions_from_disk(
                 stream_id,
                 topic_id,
             ))
+        }
+    }
+}
+
+async fn remove_partition_dir(partition_path: &str) -> std::io::Result<()> {
+    let directory = Path::new(partition_path);
+    let result = async {
+        let marker = directory.join(CREATED_REVISION_FILE);
+        for entry in walk_dir(directory).await? {
+            if entry.path == marker || entry.path == directory {
+                continue;
+            }
+            if entry.is_dir {
+                compio::fs::remove_dir(&entry.path).await?;
+            } else {
+                compio::fs::remove_file(&entry.path).await?;
+            }
+        }
+        // The removals above must be durable before the marker's own is.
+        DiskStorage.sync_directory(directory).await?;
+        DiskStorage.remove_tree(directory).await
+    }
+    .await;
+    if let Err(error) = &result
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return result;
+    }
+
+    // Retrying an interrupted delete can find the root or its parent already gone.
+    // Sync the nearest surviving ancestor before acknowledging that absence.
+    let current_directory = Path::new(".");
+    let mut parent = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(current_directory);
+    loop {
+        match DiskStorage.sync_directory(parent).await {
+            Ok(()) => return result,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && parent != current_directory =>
+            {
+                parent = parent
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(current_directory);
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -636,9 +818,10 @@ async fn load_partition_consumer_offsets<S: DurableStorage>(
     }
 }
 
-async fn load_partition_consumer_group_offsets<S: DurableStorage>(
+async fn load_partition_group_offsets<S: DurableStorage>(
     storage: &S,
     path: &str,
+    kind: ConsumerKind,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -654,7 +837,7 @@ async fn load_partition_consumer_group_offsets<S: DurableStorage>(
         return Ok(RecoveredOffsets::default());
     }
 
-    match load_consumer_group_offsets_with_storage(storage, path).await {
+    match load_group_offsets_with_storage(storage, path, kind).await {
         Ok(offsets) => Ok(offsets),
         Err(IggyError::CannotReadConsumerOffsets(_))
             if !storage
@@ -665,7 +848,7 @@ async fn load_partition_consumer_group_offsets<S: DurableStorage>(
             Ok(RecoveredOffsets::default())
         }
         Err(source) => Err(PartitionRecoveryError::ConsumerOffsetsLoad {
-            consumer_kind: "consumer group",
+            consumer_kind: kind.as_str(),
             stream_id,
             topic_id,
             partition_id,
@@ -708,5 +891,152 @@ fn hydrate_reopen_error(
             }
         }
         transient => transient.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[compio::test]
+    async fn revision_record_rename_failure_removes_the_temporary_file() {
+        const CREATED_REVISION: u64 = 7;
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join(CREATED_REVISION_FILE);
+        let temporary = root.path().join(format!("{CREATED_REVISION_FILE}.tmp"));
+        std::fs::create_dir(&record).unwrap();
+
+        let error = write_created_revision(root.path().to_str().unwrap(), CREATED_REVISION)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(
+            record.is_dir(),
+            "the failed rename must preserve its destination"
+        );
+        assert!(
+            !temporary.exists(),
+            "the failed rename must clean up its temporary file"
+        );
+    }
+
+    #[compio::test]
+    async fn removing_a_partition_dir_requires_syncing_its_parent() {
+        const CREATED_REVISION: u64 = 7;
+        const NO_PARENT_READ: u32 = 0o300;
+        let root = tempfile::tempdir().unwrap();
+        let partition_dir = root.path().join("0");
+        std::fs::create_dir(&partition_dir).unwrap();
+        write_created_revision(partition_dir.to_str().unwrap(), CREATED_REVISION)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(root.path()).unwrap().permissions().mode();
+        std::fs::set_permissions(root.path(), Permissions::from_mode(NO_PARENT_READ)).unwrap();
+        let parent_read_denied = std::fs::File::open(root.path()).is_err();
+
+        let result = remove_partition_dir(partition_dir.to_str().unwrap()).await;
+        let retry = remove_partition_dir(partition_dir.to_str().unwrap()).await;
+        std::fs::set_permissions(root.path(), Permissions::from_mode(mode)).unwrap();
+        // Root ignores the mode, so the parent sync cannot be made to fail.
+        if !parent_read_denied {
+            return;
+        }
+
+        assert!(!partition_dir.exists());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "a removed partition cannot be acknowledged before its parent sync succeeds"
+        );
+        assert_eq!(
+            retry.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "a retry must repeat the failed parent sync even when the partition is already absent"
+        );
+    }
+
+    #[compio::test]
+    async fn removing_a_partition_dir_takes_the_marker_with_every_other_entry() {
+        const CREATED_REVISION: u64 = 7;
+        let root = tempfile::tempdir().unwrap();
+        let partition_dir = root.path().join("0");
+        std::fs::create_dir_all(partition_dir.join("offsets")).unwrap();
+        std::fs::write(partition_dir.join("offsets/1"), b"offset").unwrap();
+        std::fs::write(partition_dir.join("00000000000000000000.log"), b"segment").unwrap();
+        let moved_segment = root.path().join("moved.log");
+        std::fs::write(&moved_segment, b"segment").unwrap();
+        std::os::unix::fs::symlink(
+            &moved_segment,
+            partition_dir.join("00000000000000000001.log"),
+        )
+        .unwrap();
+        let partition_dir = partition_dir.to_str().unwrap();
+        write_created_revision(partition_dir, CREATED_REVISION)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_created_revision(partition_dir).await.unwrap(),
+            Some(CREATED_REVISION)
+        );
+
+        remove_partition_dir(partition_dir).await.unwrap();
+        assert!(!Path::new(partition_dir).exists());
+        assert!(
+            moved_segment.exists(),
+            "a symlink is unlinked, never followed"
+        );
+        assert_eq!(read_created_revision(partition_dir).await.unwrap(), None);
+        assert_eq!(
+            remove_partition_dir(partition_dir)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "the caller maps a missing directory to an already finished delete"
+        );
+    }
+
+    #[compio::test]
+    async fn a_removal_cut_short_leaves_the_marker_in_place() {
+        const CREATED_REVISION: u64 = 7;
+        const NO_REMOVALS: u32 = 0o500;
+        let root = tempfile::tempdir().unwrap();
+        let partition_dir = root.path().join("0");
+        let offsets = partition_dir.join("offsets");
+        std::fs::create_dir_all(&offsets).unwrap();
+        std::fs::write(offsets.join("1"), b"offset").unwrap();
+        let segment = partition_dir.join("00000000000000000000.log");
+        std::fs::write(&segment, b"segment").unwrap();
+        let partition_dir = partition_dir.to_str().unwrap();
+        write_created_revision(partition_dir, CREATED_REVISION)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&offsets).unwrap().permissions().mode();
+        std::fs::set_permissions(&offsets, Permissions::from_mode(NO_REMOVALS)).unwrap();
+        // Root ignores the mode, so nothing would cut the removal short.
+        let blocked = std::fs::remove_file(offsets.join("1")).is_err();
+
+        let result = remove_partition_dir(partition_dir).await;
+        std::fs::set_permissions(&offsets, Permissions::from_mode(mode)).unwrap();
+        if !blocked {
+            return;
+        }
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            !segment.exists(),
+            "the walk reached the inner entry after the top-level files"
+        );
+        assert_eq!(
+            read_created_revision(partition_dir).await.unwrap(),
+            Some(CREATED_REVISION),
+            "a delete cut short must leave a directory the loader still knows as dead"
+        );
     }
 }

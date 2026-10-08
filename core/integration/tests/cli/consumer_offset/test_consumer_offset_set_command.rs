@@ -335,11 +335,12 @@ Arguments:
 
 Options:
   -k, --kind <KIND>
-          Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group
+          Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy
 
           Possible values:
           - consumer:       `Consumer` represents a regular consumer
           - consumer-group: `ConsumerGroup` represents a consumer group
+          - external-group: `ExternalGroup` holds the offsets of a group managed outside Iggy, such as a Kafka group
 {CLAP_INDENT}
           [default: consumer]
 
@@ -372,7 +373,8 @@ Arguments:
   <OFFSET>        Offset to set
 
 Options:
-  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group [default: consumer] [possible values: consumer, consumer-group]
+  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer-group" for consumer group, "external-group" for a group managed outside Iggy [default: consumer] [possible values:
+                     consumer, consumer-group, external-group]
   -h, --help         Print help (see more with '--help')
 "#,
             ),
