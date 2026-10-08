@@ -21,13 +21,13 @@ name: PR Triage Apply
 # rust-lang/triagebot UX.
 #
 # Two-stage design to defeat the fork-PR token restriction:
-#   pr-triage-collect.yml runs on issue_comment / pull_request_review with
-#   a read-only GITHUB_TOKEN (forced for cross-fork events) and uploads
-#   the raw event payload as artifact `triage-event`. This workflow then
-#   fires via workflow_run on the base ref, where the GITHUB_TOKEN has
-#   write perms, downloads the artifact, and applies the labels.
-#   pull_request_target lifecycle is handled directly here without going
-#   through the collector — it already gets a write token by design.
+#   pr-triage-collect.yml runs on issue_comment / pull_request_review /
+#   pull_request with a read-only GITHUB_TOKEN (forced for cross-fork
+#   events) and uploads the raw event payload as artifact `triage-event`.
+#   This workflow then fires via workflow_run on the base ref, where the
+#   GITHUB_TOKEN has write perms, downloads the artifact, and applies the
+#   labels. This is the pattern ASF Infra requires in place of
+#   pull_request_target (https://infra.apache.org/github-actions-policy.html).
 #
 # Comment commands (parsed line-by-line in PR comments and review bodies):
 #   /request-review @u [@u2 ...]   — request review from one or more
@@ -61,7 +61,8 @@ name: PR Triage Apply
 #   one-line reply naming the rejected handles. Review-triggered actions
 #   have no comment to react to and stay log-only.
 #
-# Lifecycle (pull_request_target):
+# Lifecycle (pull_request, via the collector). The action only selects
+# which of these runs; the outcome follows the PR's live state from the API:
 #   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present);
 #                             unless the author has repo write access, post
 #                             a one-time welcome comment listing the triage
@@ -71,15 +72,14 @@ name: PR Triage Apply
 #   closed (merged or not) -> remove both S-* labels
 #
 # SECURITY:
-# - workflow_run, pull_request_target are the ONLY triggers here.
+# - workflow_run is the ONLY trigger here.
 # - No actions/checkout of any ref. PR-controlled code is never executed.
 # - The default GITHUB_TOKEN is never written to outputs, env files, or
 #   passed to user-supplied programs. The workflow only calls the GitHub
 #   REST API via actions/github-script.
-# - pull_request_target runs the base-repo workflow with a write token so
-#   fork-PR lifecycle labels can be applied. workflow_run also runs against
-#   base ref. Both are safe because we never run fork code: no checkout,
-#   no exec of PR contents, no token export.
+# - workflow_run runs against the base ref with a write token. It is safe
+#   because we never run fork code: no checkout, no exec of PR contents, no
+#   token export.
 # - The artifact from pr-triage-collect.yml is NOT trusted for identity. On
 #   the pull_request_review path collect runs the PR head's own copy of
 #   itself, so a fork can upload any payload. The resolve step reads only a
@@ -89,8 +89,6 @@ name: PR Triage Apply
 #   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 
 on:
-  pull_request_target:
-    types: [opened, ready_for_review, converted_to_draft, closed]
   workflow_run:
     workflows: ["PR Triage Collect"]
     types: [completed]
@@ -125,15 +123,14 @@ concurrency:
   # state. Per-PR serialization on this leg is a noise/cost
   # optimization, blocked on GH adding job-level concurrency so the
   # parsed PR number can re-key.
-  group: pr-triage-apply-${{ github.event.pull_request.number || github.event.workflow_run.id }}
+  group: pr-triage-apply-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
 jobs:
   apply:
     if: |
-      github.event_name == 'pull_request_target'
-      || (github.event_name == 'workflow_run'
-          && github.event.workflow_run.conclusion == 'success')
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
@@ -217,7 +214,7 @@ jobs:
             return 1
           }
 
-          author=""; assoc=""; state=""; pr=""; cid=""
+          author=""; assoc=""; state=""; pr=""; cid=""; lifecycle=""
           : > payload/body.txt
 
           case "$UPSTREAM_EVENT" in
@@ -281,6 +278,35 @@ jobs:
               # Reviews carry no issue-comment id, so reactions stay skipped
               # for them, as before.
               ;;
+            pull_request)
+              # PR lifecycle. The action comes from the artifact, which a fork
+              # can forge, so it is checked against a fixed list and used only
+              # to pick the lifecycle branch; the Dispatch step acts on the
+              # PR's live state from the API, not on the action.
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              lifecycle="$(jq -r '.action // ""' "$f")"
+              require_num "$cpr" pr_number
+              case "$lifecycle" in
+                opened|ready_for_review|converted_to_draft|closed) ;;
+                *)
+                  echo "pull_request action '${lifecycle}' has no lifecycle step, skipping"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+              # As on the review path: the collect run's commit must belong to
+              # the claimed PR, so a forged payload is confined to the fork's
+              # own PR.
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
+                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
+                exit 1
+              fi
+              p="$(gh_api "repos/${REPO}/pulls/${cpr}")"
+              author="$(jq -r '.user.login // ""' <<<"$p")"
+              assoc="$(jq -r '.author_association' <<<"$p")"
+              pr="$cpr"
+              ;;
             *)
               echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
               exit 1
@@ -316,6 +342,7 @@ jobs:
             echo "comment_author=${author}"
             echo "comment_assoc=${assoc}"
             echo "comment_id=${cid}"
+            echo "lifecycle_action=${lifecycle}"
             echo "pr_number=${pr}"
             echo "review_state=${state}"
             echo "triage_event_name=${UPSTREAM_EVENT}"
@@ -328,9 +355,10 @@ jobs:
           COMMENT_AUTHOR: ${{ steps.resolve.outputs.comment_author }}
           COMMENT_ASSOC: ${{ steps.resolve.outputs.comment_assoc }}
           COMMENT_ID: ${{ steps.resolve.outputs.comment_id }}
-          PR_NUMBER: ${{ steps.resolve.outputs.pr_number || github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+          LIFECYCLE_ACTION: ${{ steps.resolve.outputs.lifecycle_action }}
           REVIEW_STATE: ${{ steps.resolve.outputs.review_state }}
-          TRIAGE_EVENT_NAME: ${{ steps.resolve.outputs.triage_event_name || github.event_name }}
+          TRIAGE_EVENT_NAME: ${{ steps.resolve.outputs.triage_event_name }}
         with:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
@@ -358,12 +386,10 @@ jobs:
               return;
             }
 
-            // Effective event name. On the workflow_run leg the trigger was
-            // issue_comment / pull_request_review, and the upstream event name
-            // was preserved into the env by the resolve step. On the
-            // pull_request_target leg we read the GH-provided context.eventName
-            // directly.
-            const eventName = process.env.TRIAGE_EVENT_NAME || context.eventName;
+            // Effective event name: the upstream trigger (issue_comment,
+            // pull_request_review or pull_request), preserved into the env by
+            // the resolve step.
+            const eventName = process.env.TRIAGE_EVENT_NAME;
 
             // Welcome comment posted once when a non-draft PR is opened.
             // The leading HTML marker is invisible in rendered Markdown
@@ -607,14 +633,22 @@ jobs:
               }
             };
 
-            // ----- pull_request_target lifecycle -----
-            if (eventName === 'pull_request_target') {
-              const action = context.payload.action;
-              const pr = context.payload.pull_request;
+            // ----- pull_request lifecycle -----
+            if (eventName === 'pull_request') {
+              const action = process.env.LIFECYCLE_ACTION;
+              // The action came from a forgeable artifact (checked against a
+              // fixed list in the resolve step), so act on the PR's live
+              // state. That also covers a PR that changed between the event
+              // and this run, which arrives after the collect handoff.
+              const { data: pr } = await withRetry(() => github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              }), 'lifecycle pulls.get');
 
-              core.info(`lifecycle event=${action} draft=${pr.draft}`);
+              core.info(`lifecycle event=${action} state=${pr.state} draft=${pr.draft}`);
 
-              if (action === 'closed' || action === 'converted_to_draft') {
+              if (pr.state === 'closed' || pr.draft) {
                 // Atomic clear via replaceStateLabel(null): a single
                 // setLabels PUT that drops both S-* in one call. Using
                 // the same primitive as the command leg closes the
@@ -628,10 +662,6 @@ jobs:
               }
 
               if (action === 'opened' || action === 'ready_for_review') {
-                if (pr.draft) {
-                  core.info('lifecycle: draft PR, no label');
-                  return;
-                }
                 // Welcome comment only on the initial non-draft open,
                 // and only for authors without repo write access -- the
                 // core team already knows the triage commands, the
@@ -698,8 +728,8 @@ jobs:
             // artifact. body stays in a file (payload/body.txt) rather than a
             // step output: it is multi-line text its author controls, and a
             // multi-line output needs a delimiter the body could forge. The file
-            // is absent on the pull_request_target leg (no resolve step), and
-            // lifecycle returned above, so falling back to '' is safe.
+            // is always written by the resolve step on the command paths, and
+            // the lifecycle path returned above, so falling back to '' is safe.
             const fs = require('fs');
             const body = fs.existsSync('payload/body.txt')
               ? fs.readFileSync('payload/body.txt', 'utf8')
@@ -770,7 +800,7 @@ jobs:
               return;
             }
             // Reject command runs against a PR that turned draft after
-            // the comment was posted. The pull_request_target lifecycle
+            // the comment was posted. The pull_request lifecycle
             // clears S-* on converted_to_draft; without this gate the
             // ~30-90s artifact-handoff window lets a stale command
             // re-add S-waiting-on-review onto a now-draft PR.
