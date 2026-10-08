@@ -1909,9 +1909,7 @@ TEST_F(E2E_Client, ConnectWithoutLoginThenDelete) {
 
 TEST_F(E2E_Client, DeleteWithoutDisconnect) {
     RecordProperty("description", "Allows deleting a connected and authenticated client without disconnecting first.");
-    {
-        auto client = GetLoggedInHighLevelClient();
-    }
+    { auto client = GetLoggedInHighLevelClient(); }
 }
 
 TEST_F(E2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
@@ -2855,91 +2853,91 @@ TEST_F(E2E_Client, SendBinaryRequestUnknownCommandCodeThrows) {
     ASSERT_THROW(client.SendBinaryRequest(unknown_command_code, empty_payload), std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, ConsumerOffsetStoreGetDeleteRoundTrip) {
+TEST_F(E2E_Client, ConsumerOffsetStoreGetDeleteRoundTrip) {
     RecordProperty("description", "Stores a consumer offset, reads it back, and deletes it.");
     const std::string stream_name = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    client->create_stream(stream_name);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
+    client.CreateStream(stream_name);
+    const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    TrackStream(stream.Id());
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
-                         {});
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), topic_name,
+                       iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg =
-            iggy::ffi::make_message(to_payload("offset-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
-        messages.push_back(std::move(msg));
+        messages.push_back(
+            iggy::IggyMessageToSend::Create("offset-" + std::to_string(i), std::vector<iggy::HeaderEntry>()));
     }
-    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+    client.SendMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
+                        iggy::Partitioning::PartitionId(0), messages);
 
-    ASSERT_NO_THROW(client->store_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                                  iggy::Consumer::Single("offset-consumer"), 2));
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::String("offset-consumer"));
+    ASSERT_NO_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::Numeric(stream.Id()),
+                                               iggy::Identifier::Numeric(0), 0, 2));
 
-    auto stored = client->get_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                              iggy::Consumer::Single("offset-consumer"));
-    EXPECT_EQ(stored.partition_id, 0u);
-    EXPECT_EQ(stored.stored_offset, 2u);
+    auto stored =
+        client.GetConsumerOffset(consumer, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0);
+    EXPECT_EQ(stored.PartitionId(), 0u);
+    EXPECT_EQ(stored.StoredOffset(), 2u);
 
-    ASSERT_NO_THROW(client->delete_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                                   iggy::Consumer::Single("offset-consumer")));
+    ASSERT_NO_THROW(
+        client.DeleteConsumerOffset(consumer, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0));
 
-    ASSERT_THROW(client->get_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                             iggy::Consumer::Single("offset-consumer")),
-                 std::exception);
+    ASSERT_THROW(
+        client.GetConsumerOffset(consumer, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0),
+        iggy::IggyException);
 }
 
-TEST_F(LowLevelE2E_Client, ConsumerOffsetKeepsDistinctConsumersApart) {
+TEST_F(E2E_Client, ConsumerOffsetKeepsDistinctConsumersApart) {
     RecordProperty("description", "Each consumer owns its stored offset on the same partition.");
     const std::string stream_name = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    client->create_stream(stream_name);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
+    client.CreateStream(stream_name);
+    const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    TrackStream(stream.Id());
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
-                         {});
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), topic_name,
+                       iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg =
-            iggy::ffi::make_message(to_payload("offset-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
-        messages.push_back(std::move(msg));
+        messages.push_back(
+            iggy::IggyMessageToSend::Create("offset-" + std::to_string(i), std::vector<iggy::HeaderEntry>()));
     }
-    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
+    client.SendMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
+                        iggy::Partitioning::PartitionId(0), messages);
 
-    client->store_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                  iggy::Consumer::Single("consumer-a"), 1);
-    client->store_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                  iggy::Consumer::Single("consumer-b"), 3);
+    const auto consumer_a = iggy::Consumer::Single(iggy::Identifier::String("consumer-a"));
+    const auto consumer_b = iggy::Consumer::Single(iggy::Identifier::String("consumer-b"));
+    client.StoreConsumerOffset(consumer_a, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0, 1);
+    client.StoreConsumerOffset(consumer_b, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0, 3);
 
-    auto offset_a = client->get_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                                iggy::Consumer::Single("consumer-a"));
-    auto offset_b = client->get_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
-                                                iggy::Consumer::Single("consumer-b"));
+    auto offset_a =
+        client.GetConsumerOffset(consumer_a, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0);
+    auto offset_b =
+        client.GetConsumerOffset(consumer_b, iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0), 0);
 
-    EXPECT_EQ(offset_a.stored_offset, 1u);
-    EXPECT_EQ(offset_b.stored_offset, 3u);
+    EXPECT_EQ(offset_a.StoredOffset(), 1u);
+    EXPECT_EQ(offset_b.StoredOffset(), 3u);
 }
 
-TEST_F(LowLevelE2E_Client, StoreConsumerOffsetRejectsAnyPartitionId) {
+TEST_F(E2E_Client, StoreConsumerOffsetRejectsAnyPartitionId) {
     RecordProperty("description", "Storing an offset needs an explicit partition, unlike polling.");
     const std::string stream_name = GetRandomName();
-    iggy::ffi::Client *client     = GetLoggedInClient();
+    auto client                   = GetLoggedInHighLevelClient();
 
-    client->create_stream(stream_name);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    TrackStream(stream.id);
+    client.CreateStream(stream_name);
+    const auto stream = client.GetStream(iggy::Identifier::String(stream_name));
+    TrackStream(stream.Id());
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
-                         {});
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), topic_name,
+                       iggy::TopicCreateOptions().SetPartitionsCount(1));
 
-    ASSERT_THROW(client->store_consumer_offset(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                               iggy::kAnyPartitionId, iggy::Consumer::Single("offset-consumer"), 1),
-                 std::exception);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::String("offset-consumer"));
+    ASSERT_THROW(client.StoreConsumerOffset(consumer, iggy::Identifier::Numeric(stream.Id()),
+                                            iggy::Identifier::Numeric(0), iggy::kAnyPartitionId, 1),
+                 iggy::IggyException);
 }

@@ -743,9 +743,7 @@ class Consumer final {
      * @return Consumer accepted by the low-level client.
      * @throws IggyException if @p id is empty or longer than 255 bytes.
      */
-    static ffi::Consumer Single(std::string id) {
-        return ToFfi(Kind::Single, Identifier::String(std::move(id)));
-    }
+    static ffi::Consumer Single(std::string id) { return ToFfi(Kind::Single, Identifier::String(std::move(id))); }
 
     /**
      * @brief Creates a numbered consumer for the low-level client.
@@ -767,9 +765,7 @@ class Consumer final {
      * @return Consumer group accepted by the low-level client.
      * @throws IggyException if @p id is empty or longer than 255 bytes.
      */
-    static ffi::Consumer Group(std::string id) {
-        return ToFfi(Kind::Group, Identifier::String(std::move(id)));
-    }
+    static ffi::Consumer Group(std::string id) { return ToFfi(Kind::Group, Identifier::String(std::move(id))); }
 
     /**
      * @brief Creates a numbered consumer group for the low-level client.

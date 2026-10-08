@@ -390,8 +390,8 @@ ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consume
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        return ConsumerOffsetInfo::FromFfi(Handle()->get_consumer_offset(
-            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi()));
+        return ConsumerOffsetInfo::FromFfi(
+            Handle()->get_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi()));
     });
 }
 
@@ -468,9 +468,9 @@ PolledMessages IggyBlockingClient::PollMessages(const Identifier &stream,
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        return PolledMessages::FromFfi(Handle()->poll_messages(
-            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), std::string(strategy.Kind()),
-            strategy.Value(), count, auto_commit));
+        return PolledMessages::FromFfi(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
+                                                               consumer.ToFfi(), std::string(strategy.Kind()),
+                                                               strategy.Value(), count, auto_commit));
     });
 }
 
