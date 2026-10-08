@@ -6850,7 +6850,7 @@ mod partition_repair_driver_tests {
         /// Primary -> 2: withhold this group's commit heartbeats, so the
         /// `Advanced` backstop can never run, and withhold retransmits of the
         /// dropped op. The retransmit half stands in for production behaviour
-        /// rather than adding a fault: `consensus::retransmit_targets` skips an
+        /// rather than adding a fault: `consensus::prepare_timeout_targets` skips an
         /// op that already reached quorum, and this op reaches quorum on 0 and 1
         /// alone. Without it the retry timer could heal the gap and the test
         /// would pass with no repair driver at all.
@@ -7033,7 +7033,7 @@ mod partition_repair_driver_tests {
 
         // TWO replicas, so quorum spans both: no op can commit without the
         // backup's ack, every reordering-induced gap therefore blocks quorum, and
-        // `consensus::retransmit_targets` refills it. At three, the network's
+        // `consensus::prepare_timeout_targets` refills it. At three, the network's
         // per-tick delivery shuffle lets an op commit on the primary and its
         // first chain hop while the last replica loses it for good, which is the
         // very fault the sibling tests inject -- it would then be repaired here,
@@ -7578,7 +7578,7 @@ mod metadata_repair_driver_tests {
     /// retransmits of the op `$withheld_op` names.
     ///
     /// The retransmit half stands in for production behaviour rather than
-    /// adding a fault: `consensus::retransmit_targets` skips an op that already
+    /// adding a fault: `consensus::prepare_timeout_targets` skips an op that already
     /// reached quorum, and this op reaches quorum on 0 and 1 alone.
     macro_rules! starve_commit_edge {
         ($withheld_op:ident) => {

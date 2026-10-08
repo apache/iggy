@@ -1392,8 +1392,8 @@ where
         // overflowed under a client burst). Re-forward the tail down the chain
         // so a downstream replica that missed it recovers, then re-ack ONLY
         // the retransmitted op. The primary's retransmit cycle walks every
-        // un-acked op in the window (`retransmit_targets`), so a lost ack for
-        // a lower op gets its own retransmit and its own re-ack; re-acking the
+        // un-acked op in the window (`prepare_timeout_targets`), so a lost ack
+        // for a lower op gets its own retransmit and its own re-ack; re-acking the
         // whole suffix here is O(window^2) PrepareOks per cycle across the
         // backups, which can overflow the primary's inbox -- the very failure
         // this path recovers from. Both downstream and primary are idempotent
@@ -3035,12 +3035,10 @@ where
     /// The primary's `PrepareOk` for its own prepare is produced exactly once,
     /// as a loopback right after the WAL append (see `on_replicate`). If that
     /// one-shot is lost or suppressed (e.g. the `send_prepare_ok` persistence
-    /// gate races the sequencer pre-advance under a client burst), no
-    /// retransmit path regenerates it: `retransmit_targets` lists the primary
-    /// itself among the missing replicas, but `RetransmitPrepares` to self is a
-    /// no-op. The op then sits one vote short of quorum forever and pins the
-    /// contiguous commit prefix, so `commit_min` never catches up to
-    /// `commit_max` and the cluster wedges.
+    /// gate races the sequencer pre-advance under a client burst), only this
+    /// sweep regenerates it. Without it the op sits one vote short of quorum
+    /// forever and pins the contiguous commit prefix, so `commit_min` never
+    /// catches up to `commit_max` and the cluster wedges.
     ///
     /// This is a re-ack-only repair: for each pending op the primary holds
     /// DURABLY but has not self-acked, re-emit the self `PrepareOk` and drain
