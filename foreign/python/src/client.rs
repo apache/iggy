@@ -1097,7 +1097,9 @@ impl IggyClient {
     /// Delete the oldest sealed segments of a partition, including all messages
     /// stored in them. The active segment is never deleted, and deletion stops at
     /// the lowest offset any consumer or consumer group has committed on the
-    /// partition, so fewer than `segments_count` segments may be removed.
+    /// partition, so fewer than `segments_count` segments may be removed at first.
+    /// The server keeps the request and removes the remaining segments later, up
+    /// to the requested count, as consumers commit past them.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -1112,6 +1114,7 @@ impl IggyClient {
     ///
     /// Raises:
     ///     ValueError: If an identifier is invalid.
+    ///     TypeError: If an integer identifier is outside the unsigned 32-bit range.
     ///     OverflowError: If `partition_id` or `segments_count` is outside the
     ///         unsigned 32-bit range.
     ///     RuntimeError: If the client is not authenticated, lacks global
