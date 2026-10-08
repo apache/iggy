@@ -7024,6 +7024,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "flate2",
+ "futures",
  "iggy",
  "kafka-protocol",
  "libc",

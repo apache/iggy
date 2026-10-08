@@ -105,9 +105,9 @@ async fn e2e_unsupported_api_key_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // Unknown api key (8, OffsetCommit) has no response schema this gateway can encode, so the
+    // Unknown api key (16, ListGroups) has no response schema this gateway can encode, so the
     // server closes the connection without a (misparseable) response body.
-    let frame1 = build_request_frame(8, 2, 99, Some("e2e-test"), &[]);
+    let frame1 = build_request_frame(16, 2, 99, Some("e2e-test"), &[]);
     stream.write_all(&frame1).await.unwrap();
 
     assert_eq!(
@@ -422,7 +422,7 @@ async fn metadata_empty_body_e2e_closes_connection() {
 async fn out_of_scope_api_keys_e2e_close() {
     let (addr, _shutdown) = spawn_test_server().await;
 
-    for &(api_key, name) in &OUT_OF_SCOPE_API_KEYS[..4] {
+    for &(api_key, name) in OUT_OF_SCOPE_API_KEYS {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let frame = build_request_frame(api_key, 0, i32::from(api_key), Some("scope-test"), &[]);
         stream.write_all(&frame).await.expect("write oos key");

@@ -674,7 +674,8 @@ fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
 /// an unresolved consumer group included, since a deleted group has no offset
 /// to report. A malformed request or an unresolved stream, topic, or partition
 /// denies with a nonzero status instead, so an addressing typo cannot read
-/// back as a fresh consumer.
+/// back as a fresh consumer. A read that its owner does not answer in time, or
+/// whose owner does not hold the partition, denies with `TransientNotAccepted`.
 // TODO(hubcio): plain local partition_read with no primary gate, so a
 // follower answers from its own (possibly lagging) offset state. Needs the
 // same is-caught-up-primary gate the auto-commit path has, or an explicit
@@ -725,12 +726,41 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                     stored: Some(stored_offset),
                     current_offset,
                 }) => build_consumer_offset_body(partition_id, current_offset, stored_offset),
+                Some(PartitionReadReply::ConsumerOffset { stored: None, .. }) => Bytes::new(),
                 Some(PartitionReadReply::Rejected(error)) => {
                     send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
                         .await;
                     return;
                 }
-                _ => Bytes::new(),
+                // No reply, or an owner that does not hold the partition yet,
+                // says nothing about the offset, so it must not read as "no
+                // stored offset". A read moves no progress, so the client may
+                // retry it. The SDK retries every 50 ms, so the not-yet-held
+                // case logs at debug.
+                reply => {
+                    if matches!(reply, Some(PartitionReadReply::NotFound)) {
+                        debug!(
+                            transport_client_id,
+                            namespace = namespace.inner(),
+                            "consumer offset partition not held by owner; replying not accepted"
+                        );
+                    } else {
+                        warn!(
+                            transport_client_id,
+                            namespace = namespace.inner(),
+                            ?reply,
+                            "consumer offset read unanswered; replying not accepted"
+                        );
+                    }
+                    send_non_replicated_deny(
+                        shard,
+                        request,
+                        transport_client_id,
+                        IggyError::TransientNotAccepted.as_code(),
+                    )
+                    .await;
+                    return;
+                }
             }
         }
         // An unresolved group has no offset to report, the one thing the
@@ -2113,55 +2143,7 @@ mod tests {
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
         let shard = Rc::new(shard);
-
-        // Create metadata and a route so authorization and resolution let the
-        // poll reach its owner inbox.
-        let metadata = shard.plane.metadata();
-        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
-        metadata
-            .mux_stm
-            .update(prepare_message(
-                Operation::CreateStream,
-                VSR_CLIENT_ID,
-                1,
-                &CreateStreamRequest {
-                    name: WireName::new("stream").unwrap(),
-                    options: WireOptions::empty(),
-                }
-                .to_bytes(),
-            ))
-            .unwrap();
-        metadata
-            .mux_stm
-            .update(prepare_message(
-                Operation::CreateTopicWithAssignments,
-                VSR_CLIENT_ID,
-                2,
-                &CreateTopicWithAssignmentsRequest {
-                    request: CreateTopicRequest {
-                        stream_id: WireIdentifier::numeric(0),
-                        partitions_count: 1,
-                        name: WireName::new("topic").unwrap(),
-                        options: WireOptions::empty(),
-                    },
-                    derived_options: WireOptions::empty(),
-                    partitions: vec![CreatedPartitionAssignment {
-                        partition_id: 0,
-                        consensus_group_id: 1,
-                    }],
-                    created_view: 0,
-                }
-                .to_bytes(),
-            ))
-            .unwrap();
-        let namespace = metadata
-            .mux_stm
-            .streams()
-            .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
-            .unwrap();
-        shard
-            .shards_table()
-            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        route_one_partition(&shard);
         let poll_body = PollMessagesRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(0),
@@ -2213,6 +2195,163 @@ mod tests {
             "the timeout must have dropped the caller's reply receiver"
         );
         assert_eq!(bus.client_replies.borrow().len(), 1);
+    }
+
+    /// An empty body reads as "no stored offset", and a consumer that reads it
+    /// resets its position. A read with no reply must deny instead.
+    #[compio::test]
+    async fn given_pending_offset_read_when_owner_reply_times_out_should_deny_not_accepted() {
+        const TRANSPORT_CLIENT_ID: u128 = 91;
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        route_one_partition(&shard);
+        let offset_body = GetConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+        }
+        .to_bytes();
+        let request = request_message(Operation::NonReplicated, 1, 1, 1, &offset_body);
+
+        handle_get_consumer_offset(
+            &shard,
+            TRANSPORT_CLIENT_ID,
+            &request,
+            Some(DEFAULT_ROOT_USER_ID),
+        )
+        .await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1);
+        let (client_id, frame) = &replies[0];
+        assert_eq!(*client_id, TRANSPORT_CLIENT_ID);
+        assert_eq!(frame.len(), std::mem::size_of::<ReplyHeader>());
+        let status_start = std::mem::offset_of!(ReplyHeader, status);
+        let status = u32::from_le_bytes(frame[status_start..status_start + 4].try_into().unwrap());
+        assert_eq!(status, IggyError::TransientNotAccepted.as_code());
+        assert!(
+            owner_inbox.try_recv().is_ok(),
+            "the read must have reached its owner before the timeout"
+        );
+    }
+
+    /// Only the owner's own "no stored offset" may go back as the empty body.
+    /// An owner that does not hold the partition says nothing about the offset.
+    #[compio::test]
+    async fn given_owner_reply_when_reading_offset_should_send_empty_body_only_for_no_offset() {
+        const TRANSPORT_CLIENT_ID: u128 = 91;
+        for (owner_reply, expected_status) in [
+            (
+                PartitionReadReply::NotFound,
+                IggyError::TransientNotAccepted.as_code(),
+            ),
+            (
+                PartitionReadReply::ConsumerOffset {
+                    stored: None,
+                    current_offset: 0,
+                },
+                0,
+            ),
+        ] {
+            let bus = SpyBus::default();
+            let mut shard = test_shard(&bus, 0, 1, 1);
+            let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+            shard.attach_senders(vec![sender]);
+            let shard = Rc::new(shard);
+            route_one_partition(&shard);
+            let owner_task = compio::runtime::spawn(async move {
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
+                    owner_inbox.recv().await.unwrap()
+                else {
+                    panic!("the read must have reached the owner");
+                };
+                reply.try_send(owner_reply).unwrap();
+            });
+            let offset_body = GetConsumerOffsetRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+            }
+            .to_bytes();
+            let request = request_message(Operation::NonReplicated, 1, 1, 1, &offset_body);
+
+            handle_get_consumer_offset(
+                &shard,
+                TRANSPORT_CLIENT_ID,
+                &request,
+                Some(DEFAULT_ROOT_USER_ID),
+            )
+            .await;
+            owner_task.await.expect("the owner task must finish");
+
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1);
+            let (_, frame) = &replies[0];
+            assert_eq!(frame.len(), std::mem::size_of::<ReplyHeader>());
+            let status_start = std::mem::offset_of!(ReplyHeader, status);
+            let status =
+                u32::from_le_bytes(frame[status_start..status_start + 4].try_into().unwrap());
+            assert_eq!(status, expected_status);
+        }
+    }
+
+    /// Creates one stream with one single-partition topic and routes the
+    /// partition to shard 0, so authorization and resolution let a read reach
+    /// the owner inbox.
+    fn route_one_partition(shard: &TestShard) {
+        const VSR_CLIENT_ID: u128 = 1;
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                VSR_CLIENT_ID,
+                1,
+                &CreateStreamRequest {
+                    name: WireName::new("stream").unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                VSR_CLIENT_ID,
+                2,
+                &CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 1,
+                        name: WireName::new("topic").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: vec![CreatedPartitionAssignment {
+                        partition_id: 0,
+                        consensus_group_id: 1,
+                    }],
+                    created_view: 0,
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        let namespace = metadata
+            .mux_stm
+            .streams()
+            .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
+            .unwrap();
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
     }
 
     /// A partition write whose routable wait exhausts (namespace committed,
