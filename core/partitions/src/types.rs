@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///
-/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// The replica is divergent from here on: the commit walk popped
 /// the op, its `commit_min` never advanced, and the next
 /// `advance_commit_min` would assert on the gap. Continuing would either
 /// serve a prefix the cluster has moved past or panic somewhere less

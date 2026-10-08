@@ -77,15 +77,9 @@ impl FetchPool {
         })
     }
 
-    /// Shuts down each client that connected, and returns the first error. A client that fails to
-    /// shut down stops none of the others.
+    /// Shuts down each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
-        let mut closed = Ok(());
-        for client in &self.all {
-            let shutdown = client.close().await;
-            closed = closed.and(shutdown);
-        }
-        closed
+        LazyClient::close_all(&self.all).await
     }
 }
 
@@ -99,6 +93,12 @@ impl FetchPool {
 pub(super) struct LazyClient(Arc<AsyncMutex<Option<Arc<IggyClient>>>>);
 
 impl LazyClient {
+    /// A client already in hand, so a test needs no server.
+    #[cfg(test)]
+    pub(super) fn holding(client: Arc<IggyClient>) -> Self {
+        Self(Arc::new(AsyncMutex::new(Some(client))))
+    }
+
     /// The client, connected at the first call. Callers that come during a connect wait for it.
     pub(super) async fn connected(
         &self,
@@ -135,6 +135,19 @@ impl LazyClient {
             return Ok(());
         };
         with_request_timeout(client.shutdown()).await
+    }
+
+    /// Shuts down each client that connected, and returns the first error. A client that fails to
+    /// shut down stops none of the others.
+    pub(super) async fn close_all(
+        clients: impl IntoIterator<Item = &Self>,
+    ) -> Result<(), BridgeError> {
+        let mut closed = Ok(());
+        for client in clients {
+            let shutdown = client.close().await;
+            closed = closed.and(shutdown);
+        }
+        closed
     }
 }
 
@@ -283,8 +296,8 @@ impl IggyBridge {
     /// Reads up to `count` messages of `partition`, from `offset` on, with the client of `slot`.
     /// Hands the slot back with the result. `None` if no result comes by `deadline`.
     ///
-    /// A plain consumer without auto commit, so Iggy stores no offset. Always an explicit
-    /// offset, never `Next` (see `docs/OFFSET_STORAGE.md`).
+    /// A plain consumer without auto commit, so Iggy stores no offset. Always the request's
+    /// offset, never `Next`.
     ///
     /// The errors are those of [`Self::probe`]. A partition the topic lacks is
     /// [`BridgeError::Iggy`] here. The poll stops at `deadline` too, so a result that comes then

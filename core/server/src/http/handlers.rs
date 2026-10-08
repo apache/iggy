@@ -1328,10 +1328,9 @@ pub(in crate::http) async fn poll_messages(
 /// the legacy server accepts (`consumer_id`, optional `partition_id`).
 ///
 /// A non-replicated read served in band, mirroring [`poll_messages`]. A
-/// missing offset (never stored, or the partition unknown to its owner) is
-/// the legacy 404: the TCP path replies an empty body the SDK decodes as
-/// `None`, and the legacy HTTP server renders that `None` as
-/// `CustomError::ResourceNotFound`.
+/// missing offset is the legacy 404, which the SDK reads as `None`. An owner
+/// that does not hold the partition yet answers 503 `TransientNotAccepted`,
+/// as TCP does, so it never reads as `None`.
 pub(in crate::http) async fn get_consumer_offset(
     State(state): State<HttpState>,
     identity: Identity,
@@ -1360,6 +1359,14 @@ pub(in crate::http) async fn get_consumer_offset(
         .map_err(|_| ReadError::NotFound)?
         .ok_or(ReadError::NotFound)?;
     let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
+    consumer_offset_reply(partition_id, reply)
+}
+
+/// The HTTP answer to the owner's reply to a consumer offset read.
+fn consumer_offset_reply(
+    partition_id: u32,
+    reply: Option<PartitionReadReply>,
+) -> Result<Json<ConsumerOffsetInfo>, ReadError> {
     match reply {
         Some(PartitionReadReply::ConsumerOffset {
             stored: Some(stored_offset),
@@ -1369,9 +1376,10 @@ pub(in crate::http) async fn get_consumer_offset(
             current_offset,
             stored_offset,
         })),
-        Some(
-            PartitionReadReply::ConsumerOffset { stored: None, .. } | PartitionReadReply::NotFound,
-        ) => Err(ReadError::NotFound),
+        Some(PartitionReadReply::ConsumerOffset { stored: None, .. }) => Err(ReadError::NotFound),
+        Some(PartitionReadReply::NotFound) => {
+            Err(ReadError::Rejected(IggyError::TransientNotAccepted))
+        }
         Some(PartitionReadReply::Rejected(error)) => Err(ReadError::Rejected(error)),
         Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
         None => Err(ReadError::Timeout),
@@ -1905,5 +1913,25 @@ mod tests {
         let json = serde_json::to_string(&SendMessagesConfirmations::from(response))
             .expect("confirmations serialize");
         assert_eq!(json, r#"{"confirmations":[]}"#);
+    }
+
+    /// The HTTP SDK reads a 404 as "no stored offset", and a consumer that
+    /// reads it resets its position. Only the owner's own "none" may send it.
+    #[test]
+    fn given_owner_without_the_partition_when_reading_offset_should_answer_not_accepted() {
+        assert!(matches!(
+            consumer_offset_reply(0, Some(PartitionReadReply::NotFound)),
+            Err(ReadError::Rejected(IggyError::TransientNotAccepted))
+        ));
+        assert!(matches!(
+            consumer_offset_reply(
+                0,
+                Some(PartitionReadReply::ConsumerOffset {
+                    stored: None,
+                    current_offset: 0,
+                })
+            ),
+            Err(ReadError::NotFound)
+        ));
     }
 }

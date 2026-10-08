@@ -214,6 +214,16 @@ fn reason_index(s: &str) -> Option<usize> {
 /// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
+    partition_io_capacity: Gauge,
+    partition_io_bytes_max: Gauge,
+    partition_io_active_jobs: Gauge,
+    partition_io_queued_results: Gauge,
+    partition_io_charged_bytes: Gauge,
+    partition_io_wait_depth: Gauge,
+    partition_io_quarantined_jobs: Gauge,
+    partition_io_fenced: Counter,
+    partition_io_timeouts: Counter,
+
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
@@ -279,6 +289,15 @@ impl ShardMetrics {
                 .clone()
         });
         Self {
+            partition_io_capacity: Gauge::default(),
+            partition_io_bytes_max: Gauge::default(),
+            partition_io_active_jobs: Gauge::default(),
+            partition_io_queued_results: Gauge::default(),
+            partition_io_charged_bytes: Gauge::default(),
+            partition_io_wait_depth: Gauge::default(),
+            partition_io_quarantined_jobs: Gauge::default(),
+            partition_io_fenced: Counter::default(),
+            partition_io_timeouts: Counter::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
@@ -410,6 +429,41 @@ impl ShardMetrics {
             "partition WAL writer failures",
             self.partition_wal_errors.clone(),
         );
+    }
+
+    pub(crate) fn set_partition_io_limits(&self, capacity: usize, bytes_max: usize) {
+        self.partition_io_capacity
+            .set(i64::try_from(capacity).unwrap_or(i64::MAX));
+        self.partition_io_bytes_max
+            .set(i64::try_from(bytes_max).unwrap_or(i64::MAX));
+    }
+
+    pub(crate) fn partition_io_fenced_counter(&self) -> Counter {
+        self.partition_io_fenced.clone()
+    }
+
+    pub(crate) fn partition_io_timeouts_counter(&self) -> Counter {
+        self.partition_io_timeouts.clone()
+    }
+
+    pub(crate) fn set_partition_io(
+        &self,
+        active: usize,
+        queued: usize,
+        bytes: usize,
+        waiting: usize,
+        quarantined: usize,
+    ) {
+        self.partition_io_active_jobs
+            .set(i64::try_from(active).unwrap_or(i64::MAX));
+        self.partition_io_queued_results
+            .set(i64::try_from(queued).unwrap_or(i64::MAX));
+        self.partition_io_charged_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.partition_io_wait_depth
+            .set(i64::try_from(waiting).unwrap_or(i64::MAX));
+        self.partition_io_quarantined_jobs
+            .set(i64::try_from(quarantined).unwrap_or(i64::MAX));
     }
 
     /// Republished by every partition sweep: what the repair rings on this
@@ -768,8 +822,55 @@ impl ShardMetrics {
     /// `[http.metrics]` scrape encodes it. Names are registered without the
     /// `_total` suffix; the prometheus text exposition appends it for
     /// counters.
+    #[allow(clippy::too_many_lines)]
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        registry.register(
+            "partition_io_capacity",
+            "configured partition file-job slots per shard",
+            self.partition_io_capacity.clone(),
+        );
+        registry.register(
+            "partition_io_bytes_max",
+            "configured allocation ceiling for partition file jobs per shard",
+            self.partition_io_bytes_max.clone(),
+        );
+        registry.register(
+            "partition_io_active_jobs",
+            "partition file jobs whose physical work has not completed",
+            self.partition_io_active_jobs.clone(),
+        );
+        registry.register(
+            "partition_io_queued_results",
+            "completed partition file jobs awaiting acceptance by their owner",
+            self.partition_io_queued_results.clone(),
+        );
+        registry.register(
+            "partition_io_charged_bytes",
+            "bytes reserved for partition file jobs and retained continuations",
+            self.partition_io_charged_bytes.clone(),
+        );
+        registry.register(
+            "partition_io_wait_depth",
+            "partition continuations ready to run or waiting for file-job capacity",
+            self.partition_io_wait_depth.clone(),
+        );
+        registry.register(
+            "partition_io_quarantined_jobs",
+            "interrupted partition file jobs retaining their reservation and resource fence",
+            self.partition_io_quarantined_jobs.clone(),
+        );
+        registry.register(
+            "partition_io_fenced",
+            "partition file jobs fenced after interruption or timeout",
+            self.partition_io_fenced.clone(),
+        );
+        registry.register(
+            "partition_io_timeouts",
+            "partition file jobs that exceeded their completion deadline",
+            self.partition_io_timeouts.clone(),
+        );
+
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",
