@@ -42,6 +42,7 @@ pub mod segment_anchor;
 mod segment_recovery;
 pub mod state_transfer;
 mod types;
+mod view_fence;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
 use iggy_binary_protocol::PrepareHeader;
@@ -52,6 +53,7 @@ pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
+pub use view_fence::ViewWindowVerdict;
 
 /// Offsets a partition claims in its superblock ahead of the mint counter
 /// before it will append, so a crash-restarted replica resumes above every

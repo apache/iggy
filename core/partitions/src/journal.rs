@@ -426,6 +426,22 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// width of `ops`. Resident entries take precedence over retained repairs.
     #[must_use]
     pub fn repair_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
+        self.headers_in(ops, false)
+    }
+
+    /// Like [`Self::repair_headers_in`], but the FIRST resident header wins on a
+    /// duplicated op, as in [`Self::committed_headers_from`]: the entry proven is
+    /// the entry the commit walk would apply.
+    #[must_use]
+    pub fn walked_headers_in(&self, ops: RangeInclusive<u64>) -> BTreeMap<u64, PrepareHeader> {
+        self.headers_in(ops, true)
+    }
+
+    fn headers_in(
+        &self,
+        ops: RangeInclusive<u64>,
+        first_wins: bool,
+    ) -> BTreeMap<u64, PrepareHeader> {
         let mut found = BTreeMap::new();
         if ops.is_empty() {
             return found;
@@ -433,7 +449,11 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         {
             let headers = unsafe { &*self.headers.get() };
             for header in headers.iter().filter(|header| ops.contains(&header.op)) {
-                found.insert(header.op, *header);
+                if first_wins {
+                    found.entry(header.op).or_insert(*header);
+                } else {
+                    found.insert(header.op, *header);
+                }
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
@@ -846,6 +866,22 @@ where
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.contains_key(&op)
+    }
+
+    /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
+    pub fn held_through(&self, floor: u64) -> u64 {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let mut through = floor;
+        for op in op_to_storage_offset
+            .range(floor.saturating_add(1)..)
+            .map(|(op, _)| *op)
+        {
+            if op != through + 1 {
+                break;
+            }
+            through = op;
+        }
+        through
     }
 
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`

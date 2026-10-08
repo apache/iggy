@@ -3442,8 +3442,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Falls back to the announced `op` on an empty body (probe answer, stale-view
     /// correction).
     fn adopt_start_view_suffix(&self, header: &StartViewHeader, suffix_body: &[u8]) -> u64 {
-        let suffix = match dvc_suffix_decode(suffix_body, header.op, 0, 0) {
-            Ok(suffix) => suffix,
+        match MergedLog::from_start_view(header, suffix_body) {
+            Ok(Some(log)) => *self.pending_view_log.borrow_mut() = Some(log),
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
                     replica = self.replica,
@@ -3452,20 +3453,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     op = header.op,
                     "start_view suffix did not decode, falling back to the announced op: {error}"
                 );
-                return header.op;
             }
-        };
-        let headers = suffix.headers();
-        if headers.is_empty() {
-            return header.op;
         }
-
-        *self.pending_view_log.borrow_mut() = Some(MergedLog {
-            op_head: header.op,
-            commit_max: header.commit,
-            headers: headers.to_vec(),
-            committed_elsewhere: Vec::new(),
-        });
         header.op
     }
 

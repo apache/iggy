@@ -538,7 +538,7 @@ repair_retry_interval = "1s"
 # per node, so its detector is not rate-capped.
 repair_gap_debounce_interval = "1s"
 
-# Prepares a peer serves per repair round before the requester walks to the next
+# Prepares a peer serves per repair round before the requester asks for the next
 # chunk (integer). Each frame rides the per-peer message-bus queue, so this must
 # stay strictly below message_bus.peer_queue_capacity or a full round overruns
 # the queue and drops frames. Must be > 0 and <= 1024.
