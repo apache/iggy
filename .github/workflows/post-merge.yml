@@ -40,6 +40,7 @@ jobs:
   check-auto-publish:
     name: Check auto-publish
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: ${{ !github.event.repository.fork }}
     outputs:
       docker_components: ${{ steps.check.outputs.docker_components }}

@@ -30,6 +30,7 @@ jobs:
     name: PR Title
     if: github.event.action != 'edited' || github.event.changes.title
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
     steps:
       - name: Validate PR Title
         uses: amannn/action-semantic-pull-request@v6
