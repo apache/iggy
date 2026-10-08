@@ -472,8 +472,8 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
-                                        std::string(consumer.KindName()), consumer.Id().ToFfi(), offset, error_info);
+        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), offset,
+                                        error_info);
     });
 }
 
@@ -482,8 +482,8 @@ void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
                                                const Identifier &topic,
                                                const Checkpoint &checkpoint) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
-        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
-                                          consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
+        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), consumer.ToFfi(), *checkpoint.inner_,
+                                          error_info);
     });
 }
 
@@ -492,8 +492,8 @@ void IggyBlockingClient::DeleteConsumerPosition(const Consumer &consumer,
                                                 const Identifier &topic,
                                                 const Checkpoint &checkpoint) {
     RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
-        Handle()->delete_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
-                                           consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
+        Handle()->delete_consumer_position(stream.ToFfi(), topic.ToFfi(), consumer.ToFfi(), *checkpoint.inner_,
+                                           error_info);
     });
 }
 
@@ -507,8 +507,8 @@ ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consume
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        return ConsumerOffsetInfo::FromFfi(Handle()->get_consumer_offset(
-            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi()));
+        return ConsumerOffsetInfo::FromFfi(
+            Handle()->get_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi()));
     });
 }
 
@@ -522,8 +522,7 @@ void IggyBlockingClient::DeleteConsumerOffset(const Consumer &consumer,
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
-                                         std::string(consumer.KindName()), consumer.Id().ToFfi(), error_info);
+        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), error_info);
     });
 }
 
@@ -575,7 +574,7 @@ SendMessagesResponse IggyBlockingClient::SendMessages(const Identifier &stream,
                                                       const Identifier &topic,
                                                       const Partitioning &partitioning,
                                                       const std::vector<IggyMessageToSend> &messages) {
-    return RethrowAsIggyException([this, &stream, &topic, &partitioning, &messages] {
+    return RethrowAsIggyException([this, &stream, &topic, &partitioning, &messages](ffi::ErrorInfo &error_info) {
         rust::Vec<ffi::IggyMessageToSend> ffi_messages;
         ffi_messages.reserve(messages.size());
         for (const auto &message : messages) {
@@ -588,7 +587,7 @@ SendMessagesResponse IggyBlockingClient::SendMessages(const Identifier &stream,
         }
         return SendMessagesResponse::FromFfi(
             Handle()->send_messages(stream.ToFfi(), topic.ToFfi(), std::string(partitioning.Kind()),
-                                    std::move(ffi_partitioning_value), std::move(ffi_messages)));
+                                    std::move(ffi_partitioning_value), std::move(ffi_messages), error_info));
     });
 }
 
@@ -599,16 +598,17 @@ PolledMessages IggyBlockingClient::PollMessages(const Identifier &stream,
                                                 const PollingStrategy &strategy,
                                                 const std::uint32_t count,
                                                 const bool auto_commit) {
-    return RethrowAsIggyException([this, &stream, &topic, partition_id, &consumer, &strategy, count, auto_commit] {
-        constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
-        if (partition_id == unspecified_partition_id) {
-            throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
-        }
-        const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        return PolledMessages::FromFfi(Handle()->poll_messages(
-            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi(),
-            std::string(strategy.Kind()), strategy.Value(), count, auto_commit));
-    });
+    return RethrowAsIggyException(
+        [this, &stream, &topic, partition_id, &consumer, &strategy, count, auto_commit](ffi::ErrorInfo &error_info) {
+            constexpr auto unspecified_partition_id = std::numeric_limits<std::uint32_t>::max();
+            if (partition_id == unspecified_partition_id) {
+                throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
+            }
+            const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
+            return PolledMessages::FromFfi(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
+                                                                   consumer.ToFfi(), std::string(strategy.Kind()),
+                                                                   strategy.Value(), count, auto_commit, error_info));
+        });
 }
 
 std::vector<OptionSpec> IggyBlockingClient::DescribeOptions(std::string scope) {
@@ -646,29 +646,29 @@ std::vector<std::uint8_t> IggyBlockingClient::Snapshot(const SnapshotCompression
 
 std::vector<std::uint8_t> IggyBlockingClient::SendBinaryRequest(std::uint32_t code,
                                                                 const std::vector<std::uint8_t> &payload) {
-    return RethrowAsIggyException([this, code, &payload] {
+    return RethrowAsIggyException([this, code, &payload](ffi::ErrorInfo &error_info) {
         rust::Vec<std::uint8_t> ffi_payload;
         ffi_payload.reserve(payload.size());
         for (const auto byte : payload) {
             ffi_payload.push_back(byte);
         }
-        auto ffi_response = Handle()->send_binary_request(code, std::move(ffi_payload));
+        auto ffi_response = Handle()->send_binary_request(code, std::move(ffi_payload), error_info);
         return std::vector<std::uint8_t>(ffi_response.begin(), ffi_response.end());
     });
 }
 
 void IggyBlockingClient::UpdatePermissions(const Identifier &user, const std::optional<Permissions> &permissions) {
-    RethrowAsIggyException([this, &user, &permissions] {
+    RethrowAsIggyException([this, &user, &permissions](ffi::ErrorInfo &error_info) {
         auto ffi_permissions = permissions ? permissions->ToFfi() : ffi::Permissions{};
-        Handle()->update_permissions(user.ToFfi(), permissions.has_value(), std::move(ffi_permissions));
+        Handle()->update_permissions(user.ToFfi(), permissions.has_value(), std::move(ffi_permissions), error_info);
     });
 }
 
 void IggyBlockingClient::ChangePassword(const Identifier &user,
                                         std::string current_password,
                                         std::string new_password) {
-    RethrowAsIggyException([this, &user, &current_password, &new_password] {
-        Handle()->change_password(user.ToFfi(), current_password, new_password);
+    RethrowAsIggyException([this, &user, &current_password, &new_password](ffi::ErrorInfo &error_info) {
+        Handle()->change_password(user.ToFfi(), current_password, new_password, error_info);
     });
 }
 
