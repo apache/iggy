@@ -35,7 +35,7 @@ use iggy_binary_protocol::{
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier,
 };
-use iggy_common::{IggyError, IggyTimestamp, PollingStrategy};
+use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
 use metadata::IggyMetadata;
@@ -44,7 +44,8 @@ use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
 use metadata::stm::user::Users;
-use partitions::{IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
+use partitions::state_transfer::PartitionTransferSession;
+use partitions::{IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
 use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
@@ -1006,6 +1007,100 @@ async fn given_accepted_descriptor_when_install_fails_should_exhaust_its_generat
         owner.metadata_transfer_decode_failures.get(),
         Some((GENERATION + 1, 1)),
         "a new checkpoint generation starts a fresh decode budget"
+    );
+}
+
+/// A replica that needs partition state transfer cannot finish a view change.
+/// With `persisted` durability it cannot vote in one either: its WAL cannot
+/// certify a holed log, so every view-scoped send is withheld. Its elections
+/// time out with nobody hearing them and keep raising its `view` far past the
+/// group's. The numbers are from a reproduction: this replica's log was last
+/// adopted in view 11, solo elections pushed its view to 58, and the group's
+/// primary at view 20 offers more committed state than this replica knows.
+/// Refusing that offer as "from a replica behind this one" keeps the replica
+/// behind for good, serving reads from its stale prefix.
+///
+/// TODO(#4438): `on_partition_state_transfer_target` compares the serving
+/// view with the local `view()`. Comparing it with `log_view()`, the last view
+/// whose log this replica adopted, accepts this offer and still refuses a
+/// phantom view-0 primary, an offer from before the adopted view, and any offer
+/// below the local `commit_max`.
+#[compio::test]
+#[ignore = "#4438: a partition transfer offer from the group's primary is refused once this replica ratcheted its view alone"]
+async fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_should_accept_it() {
+    const NONCE: u128 = 0x5eed;
+    const LOCAL_LOG_VIEW: u32 = 11;
+    const LOCAL_VIEW: u32 = 58;
+    const LOCAL_COMMIT_MAX: u64 = 53_052;
+    const PRIMARY_VIEW: u32 = 20;
+    const PRIMARY_COMMIT: u64 = 55_013;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let config = partitions_config();
+    let (owner, _sender) = owner_with_inbox(&bus, config.clone(), namespace);
+    let mut consensus = VsrConsensus::new(
+        1,
+        0,
+        3,
+        namespace.inner(),
+        bus.clone(),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    consensus.set_view(LOCAL_VIEW);
+    consensus.set_log_view(LOCAL_LOG_VIEW);
+    consensus.advance_commit_max(LOCAL_COMMIT_MAX);
+    consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        config.segment_size,
+    );
+    let primary = u8::try_from(PRIMARY_VIEW % 3).unwrap();
+    partition.transfer = Some(PartitionTransferSession {
+        nonce: NONCE,
+        peer: primary,
+        commit_op: 0,
+        artifacts: Vec::new(),
+        target_accepted: false,
+        idle_ticks: 0,
+    });
+    owner.plane.partitions().insert(namespace, partition);
+
+    let manifest = encode_state_manifest(&[StateArtifact::for_bytes(
+        artifact_kind::SEGMENT_LOG,
+        PRIMARY_COMMIT,
+        b"segment",
+    )]);
+    let size = size_of::<StateTransferTargetHeader>() + manifest.len();
+    let mut offer = Message::<StateTransferTargetHeader>::new(size);
+    offer.as_mut_slice()[size_of::<StateTransferTargetHeader>()..].copy_from_slice(&manifest);
+    let offer = offer.transmute_header(|_, header: &mut StateTransferTargetHeader| {
+        header.command = Command::StateTransferTarget;
+        header.cluster = 1;
+        header.replica = primary;
+        header.view = PRIMARY_VIEW;
+        header.group = namespace.inner();
+        header.nonce = NONCE;
+        header.size = u32::try_from(size).unwrap();
+        header.available = 1;
+        header.commit_op = PRIMARY_COMMIT;
+        header.commit_max = PRIMARY_COMMIT;
+        header.seal();
+    });
+
+    owner.on_partition_state_transfer_target(&offer).await;
+
+    let partitions = owner.plane.partitions();
+    let session = partitions
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered")
+        .transfer
+        .as_ref();
+    assert!(
+        session.is_some_and(|session| session.target_accepted),
+        "the group primary's offer holds more committed state than this replica \
+         knows, so it must be accepted"
     );
 }
 
