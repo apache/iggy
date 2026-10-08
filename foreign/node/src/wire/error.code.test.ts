@@ -34,6 +34,10 @@ it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
 });
 
+it('translates a partition history change', () => {
+  assert.equal(translateErrorCode(3014), 'Partition history changed after the request was resolved');
+});
+
 it('translates the consumer-group error range', () => {
   assert.equal(
     translateErrorCode(5000),

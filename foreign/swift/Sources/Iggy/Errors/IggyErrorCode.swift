@@ -163,6 +163,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case cannotDeleteConsumerOffsetFile = 3011
     case cannotCreateConsumerOffsetsDirectory = 3012
     case partitionIdSpaceExhausted = 3013
+    case partitionHistoryChanged = 3014
     case cannotReadConsumerOffsets = 3020
     case consumerOffsetNotFound = 3021
     case notResolvedConsumer = 3022
@@ -413,6 +414,7 @@ extension IggyErrorCode {
         case .cannotDeleteConsumerOffsetFile: "cannot_delete_consumer_offset_file"
         case .cannotCreateConsumerOffsetsDirectory: "cannot_create_consumer_offsets_directory"
         case .partitionIdSpaceExhausted: "partition_id_space_exhausted"
+        case .partitionHistoryChanged: "partition_history_changed"
         case .cannotReadConsumerOffsets: "cannot_read_consumer_offsets"
         case .consumerOffsetNotFound: "consumer_offset_not_found"
         case .notResolvedConsumer: "not_resolved_consumer"

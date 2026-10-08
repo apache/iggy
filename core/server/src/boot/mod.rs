@@ -303,9 +303,8 @@ pub fn bootstrap(
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
     // Before the shards, so the first count is there when a client connects.
     let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
-    if let Err(error) = crate::sysinfo_probe::start_open_files_scan(sysinfo_print_interval) {
-        warn!(error = %error, "cannot start the open-files scan thread, so open_files_count stays 0");
-    }
+    crate::sysinfo_probe::start_system_stats_sampler(sysinfo_print_interval)
+        .map_err(|source| ServerError::SystemStatsSamplerSpawnFailed { source })?;
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 

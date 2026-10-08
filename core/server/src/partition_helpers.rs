@@ -53,6 +53,7 @@ use partitions::{
     load_persisted_segments, load_persisted_segments_with_checkpoint,
 };
 use server_common::fatal::is_descriptor_exhaustion;
+use server_common::fs_utils::run_blocking;
 use server_common::sharding::IggyNamespace;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -278,8 +279,15 @@ pub async fn load_partition_or_fence(
         }
         Ok(Some(_)) => false,
         Ok(None) => {
-            match std::fs::read_dir(&directory).and_then(|mut entries| entries.next().transpose()) {
-                Ok(Some(_)) => warn!(
+            let path = directory.clone();
+            let nonempty = run_blocking("iggy-partition-scan", move || {
+                std::fs::read_dir(path)
+                    .and_then(|mut entries| entries.next().transpose())
+                    .map(|entry| entry.is_some())
+            })
+            .await;
+            match nonempty {
+                Ok(true) => warn!(
                     stream_id,
                     topic_id,
                     partition_id = partition_metadata.id,
@@ -289,7 +297,7 @@ pub async fn load_partition_or_fence(
                      if this namespace was deleted and recreated, delete and recreate it again \
                      only if its messages can be discarded; see core/server/README.md"
                 ),
-                Ok(None) => {}
+                Ok(false) => {}
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => return Err(revision_io(source)),
             }
@@ -1515,7 +1523,7 @@ mod tests {
             }
 
             let recovered = if use_loader {
-                load_partition(
+                Box::pin(load_partition(
                     &config,
                     &partitions_config,
                     namespace,
@@ -1526,7 +1534,7 @@ mod tests {
                     REPLICA,
                     REPLICAS,
                     Rc::new(IggyMessageBus::new(0)),
-                )
+                ))
                 .await
             } else {
                 build_partition_fresh(
@@ -1650,7 +1658,7 @@ mod tests {
             preallocate_segments: Some(false),
             ..Default::default()
         };
-        let result = load_partition(
+        let result = Box::pin(load_partition(
             &config,
             partitions.config(),
             namespace,
@@ -1661,7 +1669,7 @@ mod tests {
             REPLICA,
             REPLICAS,
             Rc::new(IggyMessageBus::new(0)),
-        )
+        ))
         .await;
         assert!(matches!(
             result,
@@ -2015,7 +2023,7 @@ mod tests {
                 };
                 store.write(&state.to_bytes()).await.unwrap();
             }
-            let recovered = load_partition(
+            let recovered = Box::pin(load_partition(
                 &config,
                 &partitions_config,
                 namespace,
@@ -2026,7 +2034,7 @@ mod tests {
                 REPLICA,
                 REPLICAS,
                 Rc::new(IggyMessageBus::new(0)),
-            )
+            ))
             .await
             .unwrap();
             assert_eq!(
@@ -2267,7 +2275,7 @@ mod tests {
         std::fs::remove_file(partitions_config.get_messages_path(1, 1, 0, 0)).unwrap();
         std::fs::remove_file(partitions_config.get_index_path(1, 1, 0, 0)).unwrap();
         let partitions = solo_partitions(&config);
-        let partition = load_partition(
+        let partition = Box::pin(load_partition(
             &config,
             partitions.config(),
             namespace,
@@ -2278,7 +2286,7 @@ mod tests {
             REPLICA,
             REPLICAS,
             Rc::new(IggyMessageBus::new(0)),
-        )
+        ))
         .await
         .unwrap();
         assert_eq!(partition.log.active_segment().start_offset, 1);
@@ -2655,11 +2663,6 @@ mod tests {
             std::fs::File::create(partitions_config.get_messages_path(1, 1, 0, start_offset))
                 .expect("empty segment log");
         }
-        // The rebuild's claim is this group's first superblock write, so it
-        // targets slot A. A directory where its temp file goes fails the atomic
-        // replace and nothing else: the slot reads still find the store empty,
-        // and the quarantine moves segment files only.
-        std::fs::create_dir(Path::new(&dir).join("superblock.a.tmp")).expect("block slot A");
         drop(
             journal::PartitionPrepareJournal::open(
                 &Path::new(&dir).join("prepares-0"),
@@ -2672,24 +2675,40 @@ mod tests {
 
         let stats = Arc::new(PartitionStats::default());
         let partitions = solo_partitions(&config);
-        let loaded = load_partition_or_fence(
+        let partition_metadata = Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0);
+        let mut loaded = Box::pin(load_partition_or_fence(
             &config,
             namespace,
             Arc::clone(&stats),
-            &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+            &partition_metadata,
             TopicRuntimeOptions::default(),
             CLUSTER,
             0,
             1,
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
-        )
-        .await;
+        ));
+        // Segment provisioning finishes before the claim's detached file-open
+        // task can run. Removing its directory here fails only that claim.
+        loop {
+            assert!(
+                futures::poll!(&mut loaded).is_pending(),
+                "the loader must reach the claim before completing"
+            );
+            if stats.segments_count_inconsistent() == 1 {
+                break;
+            }
+            server_common::yield_to_reactor().await;
+        }
+        let unavailable = root.path().join("unavailable-partition");
+        std::fs::rename(&dir, &unavailable).expect("make the claim's directory unavailable");
+        let loaded = loaded.await;
+        std::fs::rename(&unavailable, &dir).expect("restore the partition directory");
 
         match loaded {
             Err(ServerError::PartitionOffsetReservationClaim { .. }) => {}
             Err(other) => panic!("expected the claim's own refusal, got {other}"),
-            Ok(Some(_)) => panic!("the planted directory must fail the rebuild's claim"),
+            Ok(Some(_)) => panic!("the missing directory must fail the rebuild's claim"),
             Ok(None) => panic!("a refused claim must reach the caller, not be absorbed here"),
         }
         assert!(

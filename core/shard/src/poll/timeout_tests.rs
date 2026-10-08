@@ -226,7 +226,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
         .expect("fixture has messages before eviction");
     assert!(!resident_plan.needs_off_pump_io());
     let delayed_result = resident_plan.execute_resident();
-    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace);
     assert!(
         partitions
             .build_poll_snapshot(&namespace, consumer, &args)
@@ -338,7 +338,7 @@ async fn given_missing_owner_route_when_disk_poll_arrives_should_reject_before_d
     let namespace = IggyNamespace::new(1, 1, 0);
     let bus = PollTestBus::default();
     let owner = owner_with_messages(&bus, namespace).await;
-    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace);
     let consumer = PollingConsumer::ConsumerGroup(7, 0);
     let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
     assert!(
@@ -382,7 +382,7 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     owner.attach_senders(vec![owner_sender]);
     drop(owner_inbox);
     drop(owner_replies);
-    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace);
     let consumer = PollingConsumer::ConsumerGroup(7, 0);
     let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
     assert!(
@@ -420,13 +420,12 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
 /// Remove the fixture's only resident batch to select disk dispatch without
 /// creating files. Captured tasks must stay unpolled: these tests establish
 /// admission behavior, while real disk reads are covered in partition tests.
-#[allow(clippy::future_not_send)]
-async fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
+fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
     let partitions = owner.plane.partitions();
     let partition = partitions
         .remove(&namespace)
         .expect("fixture partition exists");
-    let retained = partition.log.journal().inner.evict_prefix(1).await;
+    let retained = partition.log.journal().inner.evict_prefix(1);
     assert!(retained.is_empty(), "fixture has exactly one batch");
     assert!(
         partition
@@ -477,15 +476,15 @@ async fn owner_with_messages(bus: &PollTestBus, namespace: IggyNamespace) -> Pol
     )
 }
 
-type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
+pub type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
 
 /// The first configured timer expires on demand; other timers stay pending.
 /// Detached tasks are captured so dispatch tests can observe admission without
 /// executing their synthetic disk plans.
 #[derive(Clone, Default)]
-struct PollTestBus {
+pub struct PollTestBus {
     next_timeout: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
-    spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
+    pub(crate) spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
 }
 
 #[allow(clippy::future_not_send)]

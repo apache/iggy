@@ -61,6 +61,11 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to spawn the system stats sampler: {source}")]
+    SystemStatsSamplerSpawnFailed {
+        #[source]
+        source: std::io::Error,
+    },
     // `{source}` is deliberately part of the Display text: the shard-join
     // failure report and `%error` log fields print Display only, and the
     // source carries the io_uring remediation folded in by
@@ -117,6 +122,8 @@ pub enum ServerError {
     InvalidReplyInboxCapacity { value: usize, max: usize },
     #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
     InvalidPollCompletionCapacity { value: usize, max: usize },
+    #[error(transparent)]
+    InvalidPartitionIoLimits(#[from] shard::PartitionIoLimitsError),
     #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,

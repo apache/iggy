@@ -12704,6 +12704,7 @@ name = "server"
 version = "0.9.1-edge.1"
 dependencies = [
  "ahash",
+ "arc-swap",
  "argon2",
  "assert_cmd",
  "async-channel",
