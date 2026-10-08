@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::TransportProtocol;
 use crate::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// The arguments used by the `ClientProviderConfig` to create a client.
 /// We are not using default values here because we want to be able to
@@ -353,19 +355,13 @@ pub struct Args {
     pub websocket_tls_validate_certificate: bool,
 }
 
-const QUIC_TRANSPORT: &str = "quic";
-const HTTP_TRANSPORT: &str = "http";
-const TCP_TRANSPORT: &str = "tcp";
-const WEBSOCKET_TRANSPORT: &str = "websocket";
-
 impl Args {
     pub fn get_server_address(&self) -> Option<String> {
-        match self.transport.as_str() {
-            QUIC_TRANSPORT => Some(self.quic_server_address.clone()),
-            HTTP_TRANSPORT => Some(self.http_api_url.clone().replace("http://", "")),
-            TCP_TRANSPORT => Some(self.tcp_server_address.clone()),
-            WEBSOCKET_TRANSPORT => Some(self.websocket_server_address.clone()),
-            _ => None,
+        match TransportProtocol::from_str(&self.transport).ok()? {
+            TransportProtocol::Quic => Some(self.quic_server_address.clone()),
+            TransportProtocol::Http => Some(self.http_api_url.replace("http://", "")),
+            TransportProtocol::Tcp => Some(self.tcp_server_address.clone()),
+            TransportProtocol::WebSocket => Some(self.websocket_server_address.clone()),
         }
     }
 }
@@ -520,5 +516,43 @@ impl From<Vec<ArgsOptional>> for Args {
         }
 
         args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_with_transport(transport: &str) -> Args {
+        Args {
+            transport: transport.to_string(),
+            ..Args::default()
+        }
+    }
+
+    #[test]
+    fn should_return_server_address_for_each_transport() {
+        assert_eq!(
+            args_with_transport("tcp").get_server_address().as_deref(),
+            Some("127.0.0.1:8090")
+        );
+        assert_eq!(
+            args_with_transport("quic").get_server_address().as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(
+            args_with_transport("http").get_server_address().as_deref(),
+            Some("localhost:3000")
+        );
+        assert_eq!(
+            args_with_transport("ws").get_server_address().as_deref(),
+            Some("127.0.0.1:8092")
+        );
+    }
+
+    #[test]
+    fn should_return_none_for_unknown_transport() {
+        assert_eq!(args_with_transport("websocket").get_server_address(), None);
+        assert_eq!(args_with_transport("foo").get_server_address(), None);
     }
 }

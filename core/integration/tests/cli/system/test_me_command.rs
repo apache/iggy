@@ -43,7 +43,7 @@ impl TransportProtocolExt for TransportProtocol {
         match self {
             TransportProtocol::Tcp => vec!["--transport", "tcp"],
             TransportProtocol::Quic => vec!["--transport", "quic"],
-            TransportProtocol::WebSocket => vec!["--transport", "websocket"],
+            TransportProtocol::WebSocket => vec!["--transport", "ws"],
             // Note: HTTP is not supported for the 'me' command
             TransportProtocol::Http => {
                 panic!("HTTP transport is not supported for the 'me' command")
@@ -61,8 +61,8 @@ pub(super) struct TestMeCmd {
 impl TestMeCmd {
     pub(super) fn new(protocol: TransportProtocol, scenario: Scenario) -> Self {
         assert!(
-            protocol == TransportProtocol::Tcp || protocol == TransportProtocol::Quic,
-            "Only TCP and QUIC protocols are supported for the 'me' command"
+            protocol != TransportProtocol::Http,
+            "HTTP transport is not supported for the 'me' command"
         );
         Self { protocol, scenario }
     }
@@ -86,13 +86,14 @@ impl IggyCmdTestCase for TestMeCmd {
     fn verify_command(&self, command_state: Assert) {
         match &self.scenario {
             Scenario::SuccessWithCredentials | Scenario::SuccessWithoutCredentials => {
+                let transport = match self.protocol {
+                    TransportProtocol::WebSocket => "WebSocket".to_string(),
+                    _ => self.protocol.as_str().to_uppercase(),
+                };
                 command_state
                     .success()
                     .stdout(starts_with("Executing me command\n"))
-                    .stdout(contains(format!(
-                        "Transport | {}",
-                        self.protocol.as_str().to_uppercase()
-                    )));
+                    .stdout(contains(format!("Transport | {transport}")));
             }
             Scenario::FailureWithoutCredentials => {
                 command_state
