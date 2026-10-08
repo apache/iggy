@@ -4027,18 +4027,6 @@ class IggyBlockingClient final {
     void DeleteStream(const Identifier &stream);
 
     /**
-     * @brief Removes all messages from every topic in a stream.
-     *
-     * The stream, its topics, and topic configuration remain available. A
-     * transport failure after submission can still leave the purge committed.
-     * @param stream Stream to purge, addressed by numeric ID or name.
-     * @throws IggyException if the client is unavailable, the caller lacks
-     *         stream-management permission, the stream does not exist, or the
-     *         request fails.
-     */
-    void PurgeStream(const Identifier &stream);
-
-    /**
      * @brief Creates a topic and its initial partitions in a stream.
      *
      * The server creates the topic's initial partitions and applies the
@@ -4123,22 +4111,6 @@ class IggyBlockingClient final {
      *         commit the write.
      */
     void DeleteTopic(const Identifier &stream, const Identifier &topic);
-
-    /**
-     * @brief Removes retained messages from every partition of a topic.
-     *
-     * The topic, its partitions, names, and configuration remain. New messages
-     * can be sent after a purge. A failed or unknown transport outcome can
-     * still leave the purge committed.
-     *
-     * @param stream Parent stream, addressed by numeric ID or name.
-     * @param topic Topic to purge, addressed by numeric ID or name.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the stream or topic does not exist; the caller lacks
-     *         topic-management permission; or the server rejects or cannot
-     *         commit the write.
-     */
-    void PurgeTopic(const Identifier &stream, const Identifier &topic);
 
     /**
      * @brief Adds partitions to a topic.

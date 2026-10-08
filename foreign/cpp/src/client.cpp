@@ -179,10 +179,6 @@ void IggyBlockingClient::DeleteStream(const Identifier &stream) {
     RethrowAsIggyException([this, &stream] { Handle()->delete_stream(stream.ToFfi()); });
 }
 
-void IggyBlockingClient::PurgeStream(const Identifier &stream) {
-    RethrowAsIggyException([this, &stream] { Handle()->purge_stream(stream.ToFfi()); });
-}
-
 TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
                                              std::string name,
                                              const TopicCreateOptions &options) {
@@ -291,10 +287,6 @@ TopicDetails IggyBlockingClient::GetTopic(const Identifier &stream, const Identi
 
 void IggyBlockingClient::DeleteTopic(const Identifier &stream, const Identifier &topic) {
     RethrowAsIggyException([this, &stream, &topic] { Handle()->delete_topic(stream.ToFfi(), topic.ToFfi()); });
-}
-
-void IggyBlockingClient::PurgeTopic(const Identifier &stream, const Identifier &topic) {
-    RethrowAsIggyException([this, &stream, &topic] { Handle()->purge_topic(stream.ToFfi(), topic.ToFfi()); });
 }
 
 void IggyBlockingClient::CreatePartitions(const Identifier &stream,
