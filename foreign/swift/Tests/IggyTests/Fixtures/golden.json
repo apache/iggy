@@ -783,6 +783,7 @@
     "3011": "cannot_delete_consumer_offset_file",
     "3012": "cannot_create_consumer_offsets_directory",
     "3013": "partition_id_space_exhausted",
+    "3014": "partition_history_changed",
     "3020": "cannot_read_consumer_offsets",
     "3021": "consumer_offset_not_found",
     "3022": "not_resolved_consumer",

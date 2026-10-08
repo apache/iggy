@@ -17,6 +17,7 @@
 
 use aligned_vec::{AVec, ConstAlign};
 use compio_buf::{IoBuf, IoBufMut, ReserveError, ReserveExactError, SetLen};
+use std::alloc::Layout;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::ptr::NonNull;
@@ -295,6 +296,22 @@ impl<const ALIGN: usize> Frozen<ALIGN> {
     /// allocation alive, not just the window.
     pub fn shares_allocation(&self, other: &Self) -> bool {
         self.inner.ctrlb == other.inner.ctrlb
+    }
+
+    /// Capacity of the retained backing buffer, unaffected by slices or truncation.
+    pub fn backing_capacity(&self) -> usize {
+        // This extent holds a reference to the control block; capacity is immutable.
+        unsafe { self.inner.ctrlb.as_ref().capacity }
+    }
+
+    /// Aligned backing storage and its control block, including empty extents.
+    /// Returns `None` when the requested allocation cannot be represented.
+    pub fn allocation_size(capacity: usize) -> Option<usize> {
+        Layout::from_size_align(capacity, ALIGN)
+            .ok()?
+            .pad_to_align()
+            .size()
+            .checked_add(size_of::<ControlBlock>())
     }
 
     pub fn split_at(self, split_at: usize) -> (Prefix<ALIGN>, Frozen<ALIGN>) {
@@ -746,6 +763,24 @@ mod tests {
         let s = fslice(&f, 2..6);
         drop(f);
         assert_eq!(s.as_slice(), b"cdef");
+    }
+
+    #[test]
+    fn frozen_slices_retain_the_full_backing_capacity() {
+        const CAPACITY: usize = 8192;
+        let mut backing = Owned::<A>::with_capacity(CAPACITY);
+        backing.extend_from_slice(b"payload");
+        let capacity = backing.inner.capacity();
+        let frozen = Frozen::from(backing);
+        let slice = Frozen::slice(&frozen, 1..2);
+        let empty = Frozen::slice(&frozen, ..0);
+        assert!(capacity >= CAPACITY);
+        assert_eq!(frozen.backing_capacity(), capacity);
+        assert_eq!(slice.backing_capacity(), capacity);
+        assert_eq!(empty.backing_capacity(), capacity);
+        drop(frozen);
+        assert_eq!(slice.backing_capacity(), capacity);
+        assert_eq!(slice.as_slice(), b"a");
     }
 
     #[test]

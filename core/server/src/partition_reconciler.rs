@@ -738,7 +738,7 @@ async fn reconcile_additions(
         let partition_dir =
             ctx.config
                 .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
-        let prior_life_on_disk = std::fs::metadata(&partition_dir).is_ok();
+        let prior_life_on_disk = compio::fs::metadata(&partition_dir).await.is_ok();
 
         // The target was snapshotted before this read, so a delete plus a
         // recreate of the same slab keys can commit in between. Everything
@@ -1014,17 +1014,27 @@ async fn tear_down_owned_partition(
         return;
     }
 
-    // Fence writes BEFORE awaiting disk delete. Tombstone is RefCell
-    // (cross-task callable) and shards_table is papaya, both safe to mutate
-    // directly from the reconciler. Routing through the pump's ReconcileOp
+    // Fence through detached handles before awaiting disk delete. The pump
+    // may hold a mutable partition borrow, so this must not access its vec.
+    // Routing through the pump's ReconcileOp
     // queue here would race the unlink against in-flight on_request /
     // on_replicate / on_ack frames that haven't observed the queued
     // tombstone yet. Idempotent on retry: already-tombstoned namespace
     // stays tombstoned; already-removed shards_table row is a no-op.
+    let teardown = partitions.capture_teardown(&ns);
     if !partitions.is_tombstoned(&ns) {
         partitions.tombstone(ns);
     }
     shards_table.remove(&ns);
+
+    if let Some(teardown) = teardown
+        && let Err(error) = teardown.drain().await
+    {
+        ctx.record_failure(ns, FailureCause::Delete, now);
+        ctx.shard.metrics().record_partition_reconcile_failure();
+        error!(shard = shard_id, ns_raw = ns.inner(), %error, "partition writers did not settle; retaining tombstone and files");
+        return;
+    }
 
     if let Err(err) = delete_partitions_from_disk(
         ns.stream_id(),
@@ -3228,22 +3238,25 @@ mod tests {
             repair.first_batch_offset = Some(20);
         }
 
-        compio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                shard
-                    .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
-                    .await;
-                if shard
-                    .plane
-                    .partitions()
-                    .get_by_ns(&ns)
-                    .is_some_and(|partition| partition.repair.is_none())
-                {
-                    break;
+        Box::pin(compio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                loop {
+                    shard
+                        .on_message(build_repair_range_reply(ns, Command::RepairDone, NONCE, 8))
+                        .await;
+                    if shard
+                        .plane
+                        .partitions()
+                        .get_by_ns(&ns)
+                        .is_some_and(|partition| partition.repair.is_none())
+                    {
+                        break;
+                    }
+                    compio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
-                compio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        })
+            },
+        ))
         .await
         .expect("repair finishes after its WAL becomes durable");
 

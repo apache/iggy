@@ -799,6 +799,7 @@ mod tests {
                 inbox,
                 replies,
                 POLL_COMPLETION_CAPACITY,
+                None,
                 PapayaShardsTable::new(),
                 PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus),
                 None,
