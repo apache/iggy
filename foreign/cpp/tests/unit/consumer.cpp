@@ -20,61 +20,54 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <variant>
 
 #include <gtest/gtest.h>
 
 #include "iggy.hpp"
 
-namespace {
-
-std::string identifier_text(const iggy::ffi::Identifier &identifier) {
-    return std::string(identifier.value.begin(), identifier.value.end());
-}
-
-}  // namespace
-
 TEST(ConsumerTest, SingleFromNameCarriesConsumerKind) {
-    const auto consumer = iggy::Consumer::Single("order-processor");
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::String("order-processor"));
 
-    EXPECT_EQ(consumer.kind, iggy::ffi::ConsumerKind::Consumer);
-    EXPECT_EQ(consumer.id.kind, "string");
-    EXPECT_EQ(identifier_text(consumer.id), "order-processor");
+    EXPECT_EQ(consumer.Type(), iggy::Consumer::Kind::Single);
+    EXPECT_EQ(consumer.Id().Type(), iggy::Identifier::Kind::String);
+    EXPECT_EQ(std::get<std::string>(consumer.Id().Value()), "order-processor");
 }
 
 TEST(ConsumerTest, SingleFromNumberCarriesConsumerKind) {
-    const auto consumer = iggy::Consumer::Single(7);
+    const auto consumer = iggy::Consumer::Single(iggy::Identifier::Numeric(7));
 
-    EXPECT_EQ(consumer.kind, iggy::ffi::ConsumerKind::Consumer);
-    EXPECT_EQ(consumer.id.kind, "numeric");
-    EXPECT_EQ(consumer.id.length, 4u);
+    EXPECT_EQ(consumer.Type(), iggy::Consumer::Kind::Single);
+    EXPECT_EQ(consumer.Id().Type(), iggy::Identifier::Kind::Numeric);
+    EXPECT_EQ(std::get<std::uint32_t>(consumer.Id().Value()), 7u);
 }
 
 TEST(ConsumerTest, GroupFromNameCarriesConsumerGroupKind) {
-    const auto consumer = iggy::Consumer::Group("order-processors");
+    const auto consumer = iggy::Consumer::Group(iggy::Identifier::String("order-processors"));
 
-    EXPECT_EQ(consumer.kind, iggy::ffi::ConsumerKind::ConsumerGroup);
-    EXPECT_EQ(consumer.id.kind, "string");
-    EXPECT_EQ(identifier_text(consumer.id), "order-processors");
+    EXPECT_EQ(consumer.Type(), iggy::Consumer::Kind::Group);
+    EXPECT_EQ(consumer.Id().Type(), iggy::Identifier::Kind::String);
+    EXPECT_EQ(std::get<std::string>(consumer.Id().Value()), "order-processors");
 }
 
 TEST(ConsumerTest, GroupFromNumberCarriesConsumerGroupKind) {
-    const auto consumer = iggy::Consumer::Group(7);
+    const auto consumer = iggy::Consumer::Group(iggy::Identifier::Numeric(7));
 
-    EXPECT_EQ(consumer.kind, iggy::ffi::ConsumerKind::ConsumerGroup);
-    EXPECT_EQ(consumer.id.kind, "numeric");
-    EXPECT_EQ(consumer.id.length, 4u);
+    EXPECT_EQ(consumer.Type(), iggy::Consumer::Kind::Group);
+    EXPECT_EQ(consumer.Id().Type(), iggy::Identifier::Kind::Numeric);
+    EXPECT_EQ(std::get<std::uint32_t>(consumer.Id().Value()), 7u);
 }
 
 TEST(ConsumerTest, RejectsEmptyName) {
-    EXPECT_THROW(iggy::Consumer::Single(""), iggy::IggyException);
-    EXPECT_THROW(iggy::Consumer::Group(""), iggy::IggyException);
+    EXPECT_THROW((void)iggy::Consumer::Single(iggy::Identifier::String("")), iggy::IggyException);
+    EXPECT_THROW((void)iggy::Consumer::Group(iggy::Identifier::String("")), iggy::IggyException);
 }
 
 TEST(ConsumerTest, RejectsNameLongerThan255Bytes) {
     const std::string too_long_name(256, 'a');
 
-    EXPECT_THROW(iggy::Consumer::Single(too_long_name), iggy::IggyException);
-    EXPECT_THROW(iggy::Consumer::Group(too_long_name), iggy::IggyException);
+    EXPECT_THROW((void)iggy::Consumer::Single(iggy::Identifier::String(too_long_name)), iggy::IggyException);
+    EXPECT_THROW((void)iggy::Consumer::Group(iggy::Identifier::String(too_long_name)), iggy::IggyException);
 }
 
 TEST(AnyPartitionIdTest, LeavesThePartitionToTheServer) {
