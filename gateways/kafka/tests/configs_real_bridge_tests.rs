@@ -27,7 +27,7 @@ use kafka_protocol::messages::describe_configs_request::{
     DescribeConfigsRequest, DescribeConfigsResource,
 };
 use kafka_protocol::messages::describe_configs_response::{
-    DescribeConfigsResourceResult, DescribeConfigsResponse,
+    DescribeConfigsResourceResult, DescribeConfigsResponse, DescribeConfigsSynonym,
 };
 use kafka_protocol::protocol::StrBytes;
 use serial_test::serial;
@@ -174,13 +174,13 @@ async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_reten
     assert!(!retention.read_only);
     assert!(!retention.is_sensitive);
     assert_eq!(retention.config_source, SOURCE_DEFAULT);
-    assert!(retention.synonyms.is_empty());
+    assert_eq!(retention.synonyms, [] as [DescribeConfigsSynonym; 0]);
     assert!(retention.documentation.is_some());
     let cleanup = entry(&result.configs, "cleanup.policy");
     assert_eq!(cleanup.value.as_ref().map(StrBytes::as_str), Some("delete"));
     assert!(cleanup.read_only);
     assert_eq!(cleanup.config_source, SOURCE_DEFAULT);
-    assert!(cleanup.synonyms.is_empty());
+    assert_eq!(cleanup.synonyms, [] as [DescribeConfigsSynonym; 0]);
     assert!(cleanup.documentation.is_some());
 
     let without_docs = describe(
@@ -193,7 +193,10 @@ async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_reten
     .await;
     let bare = &without_docs.results[0].configs;
     assert!(entry(bare, "retention.ms").documentation.is_none());
-    assert!(entry(bare, "retention.ms").synonyms.is_empty());
+    assert_eq!(
+        entry(bare, "retention.ms").synonyms,
+        [] as [DescribeConfigsSynonym; 0]
+    );
 
     let filtered = describe(
         &state,
@@ -324,7 +327,10 @@ async fn describe_and_alter_configs_reject_unknown_nontopic_missing_and_invalid_
     )
     .await;
     assert_eq!(broker.results[0].error_code, ERROR_INVALID_REQUEST);
-    assert!(broker.results[0].configs.is_empty());
+    assert_eq!(
+        broker.results[0].configs,
+        [] as [DescribeConfigsResourceResult; 0]
+    );
     assert_eq!(
         broker.results[0]
             .error_message
@@ -346,7 +352,10 @@ async fn describe_and_alter_configs_reject_unknown_nontopic_missing_and_invalid_
         missing.results[0].error_code,
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     );
-    assert!(missing.results[0].configs.is_empty());
+    assert_eq!(
+        missing.results[0].configs,
+        [] as [DescribeConfigsResourceResult; 0]
+    );
 
     let invalid = describe(
         &state,
