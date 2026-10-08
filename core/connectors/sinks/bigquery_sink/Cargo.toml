@@ -36,6 +36,7 @@ crate-type = ["cdylib", "lib"]
 arrow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bigdecimal = { workspace = true }
 gcloud-bigquery = { workspace = true }
 gcloud-gax = { workspace = true }
 gcloud-googleapis = { workspace = true }

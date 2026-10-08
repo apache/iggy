@@ -48,6 +48,7 @@ use arrow::ipc::writer::{
 use arrow::json::ReaderBuilder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use bigdecimal::{BigDecimal, Zero};
 use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, TopicMetadata};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use simd_json::{OwnedValue, StaticNode};
@@ -497,6 +498,12 @@ fn normalize_scalar(value: &mut OwnedValue, column: &Column) -> Result<(), Strin
         BqType::Int64 | BqType::Timestamp | BqType::Date | BqType::Time => {
             validate_integral_number(value, column)?;
         }
+        BqType::Numeric { precision, scale } => {
+            normalize_decimal(value, column, "NUMERIC", *precision, *scale)?;
+        }
+        BqType::BigNumeric { precision, scale } => {
+            normalize_decimal(value, column, "BIGNUMERIC", *precision, *scale)?;
+        }
         _ => {}
     }
     Ok(())
@@ -520,6 +527,92 @@ fn validate_integral_number(value: &OwnedValue, column: &Column) -> Result<(), S
         )),
         _ => Ok(()),
     }
+}
+
+fn normalize_decimal(
+    value: &mut OwnedValue,
+    column: &Column,
+    type_name: &str,
+    precision: u8,
+    scale: i8,
+) -> Result<(), String> {
+    let result = match &*value {
+        OwnedValue::String(value) => normalize_decimal_text(value, precision, scale),
+        OwnedValue::Static(StaticNode::I64(value)) => {
+            normalize_decimal_text(&value.to_string(), precision, scale)
+        }
+        OwnedValue::Static(StaticNode::U64(value)) => {
+            normalize_decimal_text(&value.to_string(), precision, scale)
+        }
+        OwnedValue::Static(StaticNode::F64(value)) if value.is_finite() => {
+            normalize_decimal_text(&value.to_string(), precision, scale)
+        }
+        _ => {
+            return Err(format!(
+                "column '{}' expects a decimal number or string",
+                column.name
+            ));
+        }
+    };
+
+    let normalized = result.map_err(|reason| {
+        format!(
+            "column '{}' cannot represent value as {type_name}({precision}, {scale}): {reason}",
+            column.name
+        )
+    })?;
+    *value = OwnedValue::String(normalized);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecimalFitError {
+    InvalidSyntax,
+    ExponentOutOfRange,
+    ExcessScale,
+    ExcessPrecision,
+}
+
+impl std::fmt::Display for DecimalFitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidSyntax => "invalid decimal syntax",
+            Self::ExponentOutOfRange => "exponent is outside the supported range",
+            Self::ExcessScale => "fractional digits would require rounding",
+            Self::ExcessPrecision => "value exceeds the declared precision",
+        };
+        formatter.write_str(message)
+    }
+}
+
+// Arrow truncates excess fractional digits while parsing decimals. Normalize
+// exact values first so its JSON decoder only receives fixed-point strings.
+fn normalize_decimal_text(text: &str, precision: u8, scale: i8) -> Result<String, DecimalFitError> {
+    let normalized = text
+        .parse::<BigDecimal>()
+        .map_err(|_| DecimalFitError::InvalidSyntax)?
+        .normalized();
+    if normalized.is_zero() {
+        return Ok("0".to_owned());
+    }
+
+    let target_scale = i64::from(scale);
+    let value_scale = normalized.fractional_digit_count();
+    if value_scale > target_scale {
+        return Err(DecimalFitError::ExcessScale);
+    }
+    let zero_padding = target_scale
+        .checked_sub(value_scale)
+        .and_then(|padding| u64::try_from(padding).ok())
+        .ok_or(DecimalFitError::ExponentOutOfRange)?;
+    let unscaled_digits = normalized
+        .digits()
+        .checked_add(zero_padding)
+        .ok_or(DecimalFitError::ExponentOutOfRange)?;
+    if unscaled_digits > u64::from(precision) {
+        return Err(DecimalFitError::ExcessPrecision);
+    }
+    Ok(normalized.with_scale(target_scale).to_string())
 }
 
 /// Serialize a row for `arrow-json` while substituting empty strings for BYTES.
@@ -1745,6 +1838,40 @@ mod tests {
             .column(0)
             .as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
         assert_eq!(at.value(0), 1_704_164_645_123_456);
+    }
+
+    #[test]
+    fn given_decimal_values_exceeding_declared_bounds_should_reject_rows() {
+        let layout = layout(
+            r#"{"name":"amount","type":"NUMERIC","precision":"5","scale":"2"},
+               {"name":"large_amount","type":"BIGNUMERIC","precision":"10","scale":"4"}"#,
+            WriteMode::Mapped,
+            false,
+        );
+        let encoded = run(
+            &layout,
+            vec![
+                json(1, r#"{"amount":"12.34","large_amount":"12345.6789"}"#),
+                json(2, r#"{"amount":"12.345","large_amount":"1.0000"}"#),
+                json(3, r#"{"amount":"1.00","large_amount":"1.23456"}"#),
+                json(4, r#"{"amount":"12.3400","large_amount":"1.23000"}"#),
+                json(5, r#"{"amount":"1000","large_amount":"1.0000"}"#),
+                json(6, r#"{"amount":12.345,"large_amount":"1.0000"}"#),
+                json(7, r#"{"amount":"123e-2","large_amount":"1.0000"}"#),
+                json(8, r#"{"amount":"123e-3","large_amount":"1.0000"}"#),
+                json(9, r#"{"amount":"1230e-3","large_amount":"1.0000"}"#),
+            ],
+        );
+
+        assert_eq!(
+            encoded
+                .rejected
+                .iter()
+                .map(|rejected| rejected.offset)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 5, 6, 8]
+        );
+        assert_eq!(encoded.chunks[0].offsets, vec![1, 4, 7, 9]);
     }
 
     #[test]

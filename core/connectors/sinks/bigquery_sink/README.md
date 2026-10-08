@@ -126,7 +126,7 @@ With `include_metadata = true` the table must contain these columns. A missing c
 | `INT64` | integer, or a string holding one |
 | `FLOAT64` | number, or a string holding one |
 | `BOOL` | `true` / `false` |
-| `NUMERIC`, `BIGNUMERIC` | number or string, using the table column's declared precision and scale. Prefer strings to avoid float rounding |
+| `NUMERIC`, `BIGNUMERIC` | number or string, using the table column's declared precision and scale. Values that require rounding or exceed the precision are rejected per row. Prefer strings to avoid float rounding |
 | `TIMESTAMP` | RFC 3339 string, or an integer in microseconds since the epoch |
 | `DATETIME` | `YYYY-MM-DDTHH:MM:SS[.ffffff]` string |
 | `DATE` | `YYYY-MM-DD` string |

@@ -113,6 +113,7 @@ bench-dashboard-server = { path = "core/bench/dashboard/server" }
 bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
 bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
+bigdecimal = "0.4.10"
 bit-set = "0.11.1"
 blake3 = "1.8.7"
 bon = "3.10.1"

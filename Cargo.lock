@@ -7227,6 +7227,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bigdecimal",
  "gcloud-bigquery",
  "gcloud-gax",
  "gcloud-googleapis",
