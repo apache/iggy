@@ -105,16 +105,16 @@ verbose_logging      = false
 timeout                   = "10s"   # per-request timeout
 max_retries               = 3       # total query attempts, including the first (network errors, 429/5xx)
 retry_delay               = "1s"    # initial backoff
-retry_max_delay           = "5s"    # cap for backoff and Retry-After
+retry_max_delay           = "5s"    # backoff cap
 max_open_retries          = 10      # total open() health-check attempts, including the first
 open_retry_max_delay      = "60s"   # backoff cap for open() retries
 circuit_breaker_threshold = 5       # consecutive failures before circuit trips
 circuit_breaker_cool_down = "30s"   # cooldown before queries resume
 ```
 
-Attempt counts are clamped to at least one. Query retries use exponential backoff with jitter. Integer-seconds `Retry-After` on HTTP 429 or any 5xx replaces the calculated delay, bounded by `retry_max_delay`. Raise `retry_max_delay` for a rate-limited backend that asks for longer waits.
+Attempt counts are clamped to at least one. Query retries use exponential backoff with jitter. Integer-seconds `Retry-After` on HTTP 429 or any 5xx can lengthen the calculated delay past `retry_max_delay`, up to one hour.
 
-HTTP errors other than 429 and 5xx, and malformed successful response bodies fail the poll. Startup retries failed authenticated `GET /health` requests. Invalid duration strings warn and fall back to `1s`, while zero durations are accepted. `batch_size = 0` is clamped to `1`. Without `initial_offset`, the cursor starts at `1970-01-01T00:00:00Z`.
+HTTP 429 and 5xx fail the poll once the last attempt fails. Other HTTP errors and malformed successful response bodies fail it right away. Startup retries failed authenticated `GET /health` requests. Invalid duration strings warn and fall back to `1s`, while zero durations are accepted. `batch_size = 0` is clamped to `1`. Without `initial_offset`, the cursor starts at `1970-01-01T00:00:00Z`.
 
 ## Query Template Placeholders
 
