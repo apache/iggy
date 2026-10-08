@@ -346,7 +346,9 @@ mod tests {
         CompressionAlgorithm, HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp,
         MaxTopicSize, OptionValue, ResourceOptions, TopicDetails, topic_option_keys,
     };
-    use kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
+    use kafka_protocol::messages::describe_configs_response::{
+        DescribeConfigsResourceResult, DescribeConfigsSynonym,
+    };
     use kafka_protocol::protocol::StrBytes;
 
     use super::described_entries;
@@ -416,7 +418,7 @@ mod tests {
             .iter()
             .find(|config| config.name.as_str() == CLEANUP_POLICY)
             .expect("cleanup");
-        assert!(cleanup.synonyms.is_empty());
+        assert_eq!(cleanup.synonyms, [] as [DescribeConfigsSynonym; 0]);
     }
 
     #[test]
