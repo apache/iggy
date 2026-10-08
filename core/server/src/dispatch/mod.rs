@@ -1145,6 +1145,7 @@ mod tests {
             inbox_rx,
             reply_inbox_rx,
             POLL_COMPLETION_CAPACITY,
+            None,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,

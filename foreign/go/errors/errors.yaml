@@ -791,6 +791,10 @@
   code: 3013
   format: "partition id space exhausted for this topic"
   fields: []
+- name: PartitionHistoryChanged
+  code: 3014
+  format: "partition history changed after the request was resolved"
+  fields: []
 - name: SegmentNotFound
   code: 4000
   format: "segment not found"

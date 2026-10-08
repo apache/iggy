@@ -7024,12 +7024,14 @@ dependencies = [
  "bytes",
  "crc32c",
  "flate2",
+ "futures",
  "iggy",
  "kafka-protocol",
  "libc",
  "lz4",
  "secrecy",
  "serde",
+ "serde_json",
  "serial_test",
  "snap",
  "socket2 0.6.5",
@@ -12705,6 +12707,7 @@ name = "server"
 version = "0.9.1-edge.1"
 dependencies = [
  "ahash",
+ "arc-swap",
  "argon2",
  "assert_cmd",
  "async-channel",

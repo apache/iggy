@@ -41,6 +41,8 @@
 //! replays a durable journal into a new partition. No partition memory survives
 //! recovery. The two controls inject no sync failures. A retry within one
 //! process runs through `IggyPartition::purge`, so the partition crate tests it.
+//! A failed unlink leaves the generation unrecorded, including for bookmarks not
+//! loaded into memory. Restart must complete that purge before fresh history.
 
 use super::tests::owned_prepare;
 use super::{Crash, FaultMode, SimStorage, StorageOperation};
@@ -48,7 +50,8 @@ use configs::server::ServerConfig;
 use consensus::{LocalPipeline, Sequencer, VsrConsensus};
 use futures::executor::block_on;
 use iggy_common::{
-    ConsumerKind, Durability, IggyByteSize, PartitionStats, PollingStrategy, TopicRuntimeOptions,
+    ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize, PartitionStats,
+    PollingStrategy, TopicRuntimeOptions,
 };
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
 use journal::{DurableAppend, PartitionPrepareJournal};
@@ -445,7 +448,7 @@ fn given_completed_purge_when_power_is_lost_should_read_all_fresh_messages() {
 
             // Check the purge's effects on the live partition before discarding it.
             partition
-                .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
                 .await
                 .expect("complete purge cleanup");
             assert_eq!(
@@ -526,7 +529,7 @@ fn given_missing_offset_directory_when_purge_completes_should_record_the_generat
                 .await;
 
             partition
-                .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
                 .await
                 .unwrap_or_else(|error| {
                     panic!("{kind:?}: purge must record its generation: {error}")
@@ -570,7 +573,7 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
         traced.recover_progress(&mut partition, STORED_OFFSET).await;
         traced.storage.clear_trace();
         partition
-            .complete_purge_with_storage(&traced.storage, NEW_GENERATION)
+            .complete_purge_with_storage(&partition_config(), &traced.storage, NEW_GENERATION)
             .await
             .expect("the traced purge completes");
         let external_dir_sync = traced
@@ -593,7 +596,7 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
             .fail_at(external_dir_sync, FaultMode::Before);
         assert!(matches!(
             partition
-                .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+                .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
                 .await,
             Err(PurgeError::OffsetsNotDurable(_))
         ));
@@ -619,7 +622,7 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
 
         // The purge that boot runs again removes it for good.
         recovered
-            .complete_purge_with_storage(&harness.storage, NEW_GENERATION)
+            .complete_purge_with_storage(&partition_config(), &harness.storage, NEW_GENERATION)
             .await
             .expect("the purge at boot completes");
         drop(recovered);
@@ -628,5 +631,128 @@ fn given_failed_offsets_dir_sync_when_power_is_lost_should_purge_again_at_boot()
         harness.recover_progress(&mut purged, 0).await;
         assert_eq!(purged.applied_purge_generation(), NEW_GENERATION);
         assert_bookmarks(&purged, None, "the purge at boot must clear every bookmark");
+    });
+}
+
+#[test]
+fn given_unremovable_bookmark_when_power_is_lost_should_require_purge_before_fresh_history() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            for loaded in [false, true] {
+                let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+                let mut partition = harness.empty_partition();
+                if loaded {
+                    harness
+                        .recover_progress(&mut partition, STORED_OFFSET)
+                        .await;
+                } else {
+                    partition.configure_consumer_offset_storage(
+                        ConsumerKind::ALL.map(|kind| {
+                            harness
+                                .offset_directory(kind)
+                                .to_string_lossy()
+                                .into_owned()
+                        }),
+                        ConsumerOffsets::with_capacity(1),
+                        ConsumerGroupOffsets::with_capacity(1),
+                    );
+                }
+                // The consumer directory scan precedes its only bookmark unlink.
+                harness.storage.fail_at(1, FaultMode::Before);
+                let result = partition
+                    .complete_purge_with_storage(
+                        &partition_config(),
+                        &harness.storage,
+                        NEW_GENERATION,
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(PurgeError::OffsetsNotDurable(_))),
+                    "{policy:?}, loaded={loaded}: a surviving bookmark must prevent purge completion: {result:?}"
+                );
+                assert_ne!(partition.applied_purge_generation(), NEW_GENERATION);
+                assert_eq!(
+                    partition.stranded_consumer_offset_count(ConsumerKind::Consumer),
+                    1
+                );
+                drop(partition);
+
+                harness.storage.crash(Crash::PowerLoss);
+                let mut recovered = harness.empty_partition();
+                harness
+                    .recover_progress(&mut recovered, STORED_OFFSET)
+                    .await;
+                assert_eq!(recovered.applied_purge_generation(), OLD_GENERATION);
+                recovered
+                    .complete_purge_with_storage(
+                        &partition_config(),
+                        &harness.storage,
+                        NEW_GENERATION,
+                    )
+                    .await
+                    .expect("restart must finish the same purge before accepting fresh history");
+                assert_eq!(
+                    recovered.stranded_consumer_offset_count(ConsumerKind::Consumer),
+                    0
+                );
+                assert_bookmarks(
+                    &recovered,
+                    None,
+                    "completed retry removes every old bookmark",
+                );
+                drop(recovered);
+
+                harness.persist_fresh_history().await;
+                harness.storage.crash(Crash::PowerLoss);
+                let recovered = harness.recover_partition().await;
+                assert_eq!(recovered.applied_purge_generation(), NEW_GENERATION);
+                harness
+                    .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
+                    .await;
+            }
+        }
+    });
+}
+
+#[test]
+fn given_offset_scan_failure_when_purging_should_remove_live_paths_without_recording_generation() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+            let mut partition = harness.empty_partition();
+            harness
+                .recover_progress(&mut partition, STORED_OFFSET)
+                .await;
+            let directory = harness.offset_directory(ConsumerKind::Consumer);
+            harness.storage.fail_at(0, FaultMode::Before);
+            assert!(matches!(
+                partition
+                    .complete_purge_with_storage(
+                        &partition_config(),
+                        &harness.storage,
+                        NEW_GENERATION,
+                    )
+                    .await,
+                Err(partitions::PurgeError::Unserviceable(_))
+            ));
+            assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
+            assert!(
+                harness
+                    .storage
+                    .entries(&directory)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut recovered = harness.empty_partition();
+            harness
+                .recover_progress(&mut recovered, STORED_OFFSET)
+                .await;
+            assert_eq!(recovered.applied_purge_generation(), OLD_GENERATION);
+            assert_eq!(
+                recovered.durable_consumer_offset_count(ConsumerKind::Consumer),
+                0
+            );
+        }
     });
 }

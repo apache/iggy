@@ -1058,6 +1058,7 @@ mod tests {
         let snapshot = protected_snapshot(42);
         snapshot
             .persist(&metadata_dir.join("snapshot.bin"))
+            .await
             .unwrap();
 
         let recovered = recover::<TestStm>(
@@ -1290,6 +1291,7 @@ mod tests {
         let snapshot = protected_snapshot(5);
         snapshot
             .persist(&metadata_dir.join("snapshot.bin"))
+            .await
             .unwrap();
 
         // WAL has ops 1-10
@@ -1353,6 +1355,7 @@ mod tests {
         for snapshot in [IggySnapshot::new(2), malformed] {
             snapshot
                 .persist(&metadata_dir.join("snapshot.bin"))
+                .await
                 .unwrap();
             let result = recover::<TestStm>(
                 dir.path(),
@@ -1417,6 +1420,7 @@ mod tests {
         snapshot.snapshot_mut().client_table = Some(at_checkpoint.to_snapshot());
         snapshot
             .persist(&metadata_dir.join("snapshot.bin"))
+            .await
             .unwrap();
 
         {
@@ -1713,13 +1717,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn snapshot_persist_load_roundtrip() {
+    #[compio::test]
+    async fn snapshot_persist_load_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("snapshot.bin");
 
         let snapshot = protected_snapshot(99);
-        snapshot.persist(&path).unwrap();
+        snapshot.persist(&path).await.unwrap();
 
         let (loaded, checksum) = IggySnapshot::load(&path).unwrap();
         assert_eq!(loaded.sequence_number(), 99);
@@ -1742,13 +1746,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn snapshot_refuses_absent_truncated_and_damaged_integrity_framing() {
+    #[compio::test]
+    async fn snapshot_refuses_absent_truncated_and_damaged_integrity_framing() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("snapshot.bin");
         let snapshot = protected_snapshot(99);
         let payload = snapshot.encode().unwrap();
-        snapshot.persist(&path).unwrap();
+        snapshot.persist(&path).await.unwrap();
         let sealed = std::fs::read(&path).unwrap();
         assert_eq!(
             IggySnapshot::decode(&payload).unwrap().sequence_number(),
@@ -1940,8 +1944,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-        IggySnapshot::write_durably(&metadata_dir.join("snapshot.bin"), &foreign).unwrap();
         let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&foreign));
+        IggySnapshot::write_durably(&metadata_dir.join("snapshot.bin"), foreign)
+            .await
+            .unwrap();
         {
             let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
             superblock.write(&state.to_bytes()).await.unwrap();
@@ -2005,8 +2011,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-        IggySnapshot::write_durably(&metadata_dir.join("snapshot.bin"), &on_disk).unwrap();
-        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&on_disk));
+        let checksum = checkpoint_checksum(&on_disk);
+        IggySnapshot::write_durably(&metadata_dir.join("snapshot.bin"), on_disk)
+            .await
+            .unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checksum);
         {
             let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
             superblock.write(&state.to_bytes()).await.unwrap();
@@ -2024,8 +2033,7 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.snapshot_checkpoint.0, CHECKPOINT_OP);
         assert_eq!(
-            recovered.snapshot_checkpoint.1,
-            checkpoint_checksum(&on_disk),
+            recovered.snapshot_checkpoint.1, checksum,
             "the verified pairing must be the checksum of the bytes on disk"
         );
     }
