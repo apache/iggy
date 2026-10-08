@@ -51,6 +51,11 @@ timestamp_unit = "auto"
 symbol_columns = []
 # Payload fields holding canonical RFC-4122 strings to store as UUID.
 uuid_columns = []
+# Payload fields to keep as LONG while numbers_as_double is on. Use it for
+# values past 2^53, such as nanosecond epochs, snowflake ids and hashes, which a
+# DOUBLE cannot hold exactly. A whole value written as 20.0 is accepted here; a
+# genuinely fractional one is rejected per record.
+integer_columns = []
 
 include_stream_column = true
 include_topic_column = true
@@ -65,7 +70,9 @@ ack_level = "ok"
 # How long one flush waits without progress, not a budget for the whole batch,
 # so a batch that flushes several times can wait this long more than once. At
 # ack_level = "ok" a value of "0s" means fire and forget. It is refused at
-# ack_level = "durable", because a zero timeout never expires.
+# ack_level = "durable", because a zero timeout never expires. It also sets the
+# worst-case shutdown delay: the runtime allows a sink five seconds to stop and
+# does not interrupt a flush already in progress.
 flush_timeout = "30s"
 batch_size = 1000
 
@@ -76,11 +83,21 @@ batch_size = 1000
 # measured against is a local estimate, not the encoded frame size.
 max_flush_bytes = 1000000
 
-# JSON has one number type, so the same field can arrive as 2 and as 2.5 and
-# claim two different QuestDB column types. Set this to write every number as a
-# DOUBLE, which makes the type follow the column name. Integers then lose
-# exactness above 2^53.
-numbers_as_double = false
+# JSON has one number type, and a serializer writes 2.0 as 2, so one field can
+# arrive as 2 and as 2.5. On (the default), every number is written as a DOUBLE,
+# so a column holding a measurement is always a DOUBLE whatever its values look
+# like and however the batches fall.
+#
+# A DOUBLE is exact for integers only up to 2^53. For a nanosecond epoch, a
+# snowflake id or a hash, name the column in integer_columns above rather than
+# turning this off.
+#
+# Turn it off only when every numeric field is a genuine integer AND the table
+# is pre-created with explicit column types. Otherwise a column holding a
+# measurement can be created as a LONG, because the first flush window to define
+# it happened to carry only whole values, and records disagreeing with that type
+# are refused inside the window.
+numbers_as_double = true
 
 # A rejected record cannot be replayed or dead-lettered, so its log line is the
 # only trace. Enable this to include a truncated payload in that line, at the

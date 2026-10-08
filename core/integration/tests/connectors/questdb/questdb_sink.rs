@@ -26,10 +26,11 @@ use tokio::time::sleep;
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
-    QuestDbOps, QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
-    QuestDbSinkNumbersAsDoubleFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture,
+    QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
+    QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture,
     QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
     QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
+    QuestDbSinkTypedNumbersFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -111,6 +112,8 @@ async fn given_typed_payload_when_consumed_should_map_questdb_column_types(
     let columns = fixture.column_types().await.expect("no columns");
     assert_eq!(columns.get("side").map(String::as_str), Some("SYMBOL"));
     assert_eq!(columns.get("price").map(String::as_str), Some("DOUBLE"));
+    // `amount` is in integer_columns, so it stays LONG while every other number
+    // takes the default DOUBLE.
     assert_eq!(columns.get("amount").map(String::as_str), Some("LONG"));
     assert_eq!(columns.get("active").map(String::as_str), Some("BOOLEAN"));
     assert_eq!(columns.get("note").map(String::as_str), Some("VARCHAR"));
@@ -283,14 +286,13 @@ async fn given_invalid_record_in_batch_when_consumed_should_write_the_rest(
     server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_numbers_as_double_when_consumed_should_write_both_mixed_records(
+async fn given_the_default_when_consumed_should_write_both_mixed_records(
     harness: &TestHarness,
-    fixture: QuestDbSinkNumbersAsDoubleFixture,
+    fixture: QuestDbSinkFixture,
 ) {
-    // The README offers this switch as the cure for the type conflict, so the
-    // cure is driven against a real server here rather than only in a unit test.
-    // Both records must land, and the column must be a DOUBLE.
-    let fixture = &fixture.0;
+    // JSON writes 20.0 as 20, so a field arriving whole and fractional is
+    // ordinary data. The default has to take both against a real server, not
+    // only in a unit test, and the column has to end up a DOUBLE.
     send(
         &harness.root_client().await.unwrap(),
         vec![
@@ -315,10 +317,111 @@ async fn given_numbers_as_double_when_consumed_should_write_both_mixed_records(
     server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
     seed = seeds::connector_stream
 )]
+async fn given_a_declared_table_when_consumed_should_coerce_both_number_directions(
+    harness: &TestHarness,
+    fixture: QuestDbSinkCoercionFixture,
+) {
+    // The README's claim that `numbers_as_double` is safe below 2^53 rests on
+    // QuestDB coercing an incoming value to the column's declared type in both
+    // directions. The fixture declares the columns opposite to what the
+    // connector sends, so one record tests both, and `big` pins the loss above
+    // 2^53 that the README documents as the reason `integer_columns` exists.
+    let fixture = &fixture.0;
+    let past_precision = 9_007_199_254_740_993i64;
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(
+            1,
+            json!({"measured": 7, "counted": 42, "big": past_precision}),
+        )],
+    )
+    .await;
+
+    let count = fixture.wait_for_rows(1).await.expect("no rows");
+    assert_eq!(count, 1, "a declared table must accept the record");
+
+    // `measured` is in integer_columns, so the connector sent a LONG into a
+    // DOUBLE column: widening.
+    let measured = fixture.column_values("measured").await.expect("no values");
+    assert_eq!(
+        measured
+            .iter()
+            .filter_map(serde_json::Value::as_f64)
+            .collect::<Vec<_>>(),
+        vec![7.0],
+        "a LONG into a DOUBLE column must widen"
+    );
+
+    // `counted` took the default, so the connector sent a DOUBLE into a LONG
+    // column: narrowing. This is the direction the README depends on and the
+    // one that was never verified.
+    let counted = fixture.column_values("counted").await.expect("no values");
+    assert_eq!(
+        counted
+            .iter()
+            .filter_map(serde_json::Value::as_i64)
+            .collect::<Vec<_>>(),
+        vec![42],
+        "a whole DOUBLE into a LONG column must coerce back to the integer"
+    );
+
+    // `big` also took the default, so it was rounded in the connector before the
+    // frame existed. The declared LONG column cannot recover the lost bit, which
+    // is exactly why a column past 2^53 has to be declared in integer_columns.
+    let big = fixture.column_values("big").await.expect("no values");
+    let stored = big
+        .iter()
+        .filter_map(serde_json::Value::as_i64)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored,
+        vec![past_precision - 1],
+        "a value past 2^53 is rounded by the f64 cast, and the column type cannot undo it"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_integer_columns_when_consumed_should_keep_the_declared_column_exact(
+    harness: &TestHarness,
+    fixture: QuestDbSinkTypedFixture,
+) {
+    // A DOUBLE holds integers exactly only below 2^53, which is the cost of the
+    // default, so a value past it has to come back byte for byte from the
+    // declared column.
+    let fixture = &fixture.0;
+    let exact = 9_007_199_254_740_993i64;
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(1, json!({"amount": exact, "price": 1.5}))],
+    )
+    .await;
+
+    let count = fixture.wait_for_rows(1).await.expect("no rows");
+    assert_eq!(count, 1);
+
+    let amounts = fixture.column_values("amount").await.expect("no values");
+    assert_eq!(
+        amounts
+            .iter()
+            .filter_map(serde_json::Value::as_i64)
+            .collect::<Vec<_>>(),
+        vec![exact],
+        "the declared column must survive the round trip exactly"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
 async fn given_many_conflicting_records_when_consumed_should_write_every_other_one(
     harness: &TestHarness,
-    fixture: QuestDbSinkFixture,
+    fixture: QuestDbSinkTypedNumbersFixture,
 ) {
+    let fixture = &fixture.0;
     // JSON has one number type, so a producer alternating whole and fractional
     // values for one field makes every second record disagree with the column
     // type the first one pinned. The client refuses those records and rolls each
@@ -362,12 +465,14 @@ async fn given_many_conflicting_records_when_consumed_should_write_every_other_o
 )]
 async fn given_rejected_record_before_a_conflicting_one_when_consumed_should_write_the_rest(
     harness: &TestHarness,
-    fixture: QuestDbSinkFixture,
+    fixture: QuestDbSinkTypedNumbersFixture,
 ) {
     // Two records in one batch are refused for different reasons: one by this
     // mapping before anything is written, one by the client after it rolled the
     // row back. Both must cost one record, and the records around them must
-    // still be written, which is what this pins.
+    // still be written, which is what this pins. `numbers_as_double` is off, so
+    // the mixed numbers still conflict.
+    let fixture = &fixture.0;
     send(
         &harness.root_client().await.unwrap(),
         vec![
@@ -402,15 +507,16 @@ async fn given_rejected_record_before_a_conflicting_one_when_consumed_should_wri
 )]
 async fn given_record_whose_column_type_conflicts_when_consumed_should_write_the_rest(
     harness: &TestHarness,
-    fixture: QuestDbSinkFixture,
+    fixture: QuestDbSinkTypedNumbersFixture,
 ) {
     // QuestDB pins one type per column for the lifetime of a buffer, so a
     // record disagreeing with a column an earlier record defined is refused by
     // the client rather than by validation: nothing about the record alone says
-    // it conflicts. JSON has a single number type, so a producer emitting whole
-    // values as integers and fractional ones as decimals reaches this on
-    // ordinary data. The client rolls the half-written row back itself, so the
-    // buffer stays usable and only the offending record is lost.
+    // it conflicts. The client rolls the half-written row back itself, so the
+    // buffer stays usable and only the offending record is lost. This is the
+    // `numbers_as_double = false` path, which is what makes mixed numbers reach
+    // it.
+    let fixture = &fixture.0;
     send(
         &harness.root_client().await.unwrap(),
         vec![
@@ -625,6 +731,75 @@ async fn given_batch_size_below_message_count_when_consumed_should_write_every_c
     offsets.sort_unstable();
     offsets.dedup();
     assert_eq!(offsets.len(), total, "offsets are not unique: {offsets:?}");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_many_rejections_across_chunks_when_consumed_should_write_every_valid_record(
+    harness: &TestHarness,
+    fixture: QuestDbSinkSmallBatchFixture,
+) {
+    // batch_size is 7, so the rejections are spread over several chunks. Every
+    // odd record claims one column twice, which QuestDB resolves as one name, so
+    // validation refuses it. The log cap is covered by a unit test, because how
+    // many rejections share one runtime batch depends on poll timing.
+    let fixture = &fixture.0;
+    let total = 60usize;
+    let rejected = total / 2;
+    send(
+        &harness.root_client().await.unwrap(),
+        (0..total)
+            .map(|i| {
+                let payload = if i % 2 == 0 {
+                    json!({"seq": i})
+                } else {
+                    json!({"seq": i, "SEQ": i})
+                };
+                message((i + 1) as u128, payload)
+            })
+            .collect(),
+    )
+    .await;
+
+    let expected = total - rejected;
+    let count = fixture.wait_for_rows(expected).await.expect("no rows");
+    assert_eq!(count, expected, "every valid record must survive");
+
+    // The surviving rows must be exactly the valid ones, so a rejection cannot
+    // be quietly taking a neighbour with it. `seq` is a DOUBLE under the
+    // default, so it comes back as a float.
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        (0..total)
+            .filter(|i| i % 2 == 0)
+            .map(|i| i as f64)
+            .collect::<Vec<_>>()
+    );
+
+    let runtime = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available");
+    let (stdout, stderr) = runtime.collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    // However the batches fell, no rejection may go unreported, and the count
+    // the connector reports has to match what actually went missing.
+    let reported: usize = logs
+        .lines()
+        .filter_map(|line| {
+            line.split_once("rejected ")
+                .and_then(|(_, rest)| rest.split_once(" of "))
+                .and_then(|(count, _)| count.parse::<usize>().ok())
+        })
+        .sum();
+    assert_eq!(
+        reported, rejected,
+        "every rejected record must be reported once: {logs}"
+    );
 }
 
 #[iggy_harness(

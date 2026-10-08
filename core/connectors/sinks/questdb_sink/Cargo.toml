@@ -38,8 +38,17 @@ ignored = ["questdb-rs"]
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+default = []
+# Lets a connect string carry `tls_verify=unsafe_off`, which accepts any server
+# certificate. Off by default, so a released plugin cannot be pointed at a
+# man-in-the-middle by configuration alone. Build with it only for a test
+# server that has a self-signed certificate.
+insecure-skip-verify = ["questdb-rs/insecure-skip-verify"]
+
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 questdb-rs = { workspace = true }
