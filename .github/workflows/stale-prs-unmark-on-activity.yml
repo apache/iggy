@@ -15,8 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Removes the S-stale label on PR comments and review submissions, via
-# the workflow_run handoff from pr-triage-collect.yml.
+# Removes the S-stale label on PR comments, review submissions, and
+# contributor push / reopen / ready_for_review, via the workflow_run handoff
+# from pr-triage-collect.yml. Companion to stale-prs.yml, which runs with
+# remove-stale-when-updated:false so the stale bot does not unmark its own
+# label on the next cron run.
 #
 # Why workflow_run instead of issue_comment / pull_request_review here:
 # those events deliver a read-only GITHUB_TOKEN on cross-fork PRs
@@ -26,8 +29,11 @@
 # token; this workflow runs against base ref via workflow_run, where the
 # GITHUB_TOKEN has write perms, and removes the label.
 #
-# Push-driven unmark stays in stale-prs-unmark.yml because
-# pull_request_target.synchronize gets a write token directly.
+# Push-driven unmark used to live in stale-prs-unmark.yml on
+# pull_request_target, which ASF Infra bars on workflows that hold a token
+# and disables for ASF repositories from November 2026
+# (https://infra.apache.org/github-actions-policy.html). It now arrives here
+# as a pull_request event through the same collector.
 #
 # SECURITY: no actions/checkout, no exec of PR contents. The artifact is
 # not trusted for identity: on the pull_request_review path collect runs the
@@ -154,6 +160,29 @@ jobs:
               fi
               pr="$cpr"
               ;;
+            pull_request)
+              # The action comes from the artifact, which a fork can forge. It
+              # only decides whether to look further, and the worst a forged
+              # one can do is clear S-stale on the fork's own PR, which a push
+              # does anyway.
+              action="$(jq -r '.action // ""' "$f")"
+              case "$action" in
+                synchronize|reopened|ready_for_review) ;;
+                *)
+                  echo "pull_request action '${action}' does not unmark, skipping"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              require_num "$cpr" pr_number
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
+                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
+                exit 1
+              fi
+              pr="$cpr"
+              ;;
             *)
               echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
               exit 1
@@ -166,6 +195,7 @@ jobs:
           echo "pr_number=$pr" >> "$GITHUB_OUTPUT"
 
       - name: Remove stale label if present
+        if: steps.resolve.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
