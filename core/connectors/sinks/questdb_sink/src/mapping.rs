@@ -29,6 +29,8 @@ use simd_json::value::StaticNode;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::CONNECTOR_NAME;
+
 /// Where the designated timestamp comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TimestampSource {
@@ -111,6 +113,15 @@ impl TimestampUnit {
 /// from as an ordinary rejection.
 pub(crate) const MAX_NAME_LEN: usize = 127;
 
+/// What the rounding warning tells the operator to do, per source of the
+/// rounded value. An array element and a value past `i64::MAX` have no exact
+/// QuestDB form, so pointing them at `integer_columns` would be wrong: that
+/// list refuses both.
+const REMEDY_INTEGER_COLUMN: &str = "list the column in integer_columns to keep it exact";
+const REMEDY_PAST_LONG: &str = "a value above i64::MAX has no exact QuestDB column";
+const REMEDY_ARRAY: &str =
+    "QuestDB stores only DOUBLE arrays, so an array element has no exact form";
+
 /// A message that could not be turned into a row. The batch continues; the
 /// caller counts and logs these.
 #[derive(Debug)]
@@ -181,6 +192,8 @@ impl FromIterator<String> for ColumnNames {
 /// per batch.
 #[derive(Debug)]
 pub struct Mapping {
+    /// The connector ID, for the one log line this module writes.
+    pub id: u32,
     pub table: String,
     pub symbol_columns: ColumnNames,
     pub uuid_columns: ColumnNames,
@@ -274,10 +287,8 @@ impl Mapping {
         // less than hashing a lowercased copy of every name, and it allocates
         // nothing on a path that runs for every field of every row.
         let mut seen: Vec<&str> = Vec::new();
-        let mut columns = 0usize;
         for reserved in self.reserved_columns() {
             seen.push(reserved);
-            columns += 1;
         }
 
         let mut row = PreparedRow {
@@ -319,7 +330,7 @@ impl Mapping {
                                 "column {name} is listed in symbol_columns but its value is not a scalar"
                             )));
                         };
-                        self.claim_column(name.as_str(), &mut seen, &mut columns)?;
+                        self.claim_column(name.as_str(), &mut seen)?;
                         row.symbols.push((name.as_str(), text));
                         continue;
                     }
@@ -327,14 +338,13 @@ impl Mapping {
                         // Encoded by omitting the column, so it claims nothing.
                         continue;
                     }
-                    self.claim_column(name.as_str(), &mut seen, &mut columns)?;
+                    self.claim_column(name.as_str(), &mut seen)?;
                     row.columns
                         .push((name.as_str(), self.prepare_value(name.as_str(), value)?));
                 }
             }
             None => {
                 row.payload = Some(self.payload_text(message)?);
-                columns += 1;
             }
         }
 
@@ -357,13 +367,15 @@ impl Mapping {
             // The prefixed names are owned, so they are claimed from the vector
             // that already holds them rather than being built a second time.
             for (column, _) in &row.headers {
-                self.claim_column(column, &mut seen, &mut columns)?;
+                self.claim_column(column, &mut seen)?;
             }
         }
 
         // Every QuestDB row needs at least one symbol or column before its
-        // designated timestamp; `at` is refused otherwise.
-        if columns == 0 {
+        // designated timestamp; `at` is refused otherwise. `seen` holds every
+        // claimed name, reserved columns and headers included, and the payload
+        // column is the one write that claims no name.
+        if seen.is_empty() && row.payload.is_none() {
             return Err(RowError::Invalid(
                 "row would have no columns, so QuestDB cannot accept it".to_owned(),
             ));
@@ -375,24 +387,41 @@ impl Mapping {
 
     /// Column names this connector emits itself for every row.
     pub(crate) fn reserved_columns(&self) -> impl Iterator<Item = &'static str> {
+        self.reserved_columns_with_flags().map(|(name, _)| name)
+    }
+
+    /// The enabled reserved columns, each with the configuration flag that
+    /// enables it, so an error message can name the flag an operator has to
+    /// turn off. The flag names are not derivable from the column names:
+    /// `partition_id` is enabled by `include_partition_column`.
+    pub(crate) fn reserved_columns_with_flags(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, &'static str)> {
         [
-            ("stream", self.include_stream_column),
-            ("topic", self.include_topic_column),
-            ("partition_id", self.include_partition_column),
-            ("offset", self.include_offset_column),
+            (
+                "stream",
+                "include_stream_column",
+                self.include_stream_column,
+            ),
+            ("topic", "include_topic_column", self.include_topic_column),
+            (
+                "partition_id",
+                "include_partition_column",
+                self.include_partition_column,
+            ),
+            (
+                "offset",
+                "include_offset_column",
+                self.include_offset_column,
+            ),
         ]
         .into_iter()
-        .filter_map(|(name, included)| included.then_some(name))
+        .filter_map(|(name, flag, included)| included.then_some((name, flag)))
     }
 
     /// Records that `name` will occupy a column, rejecting a case-insensitive
     /// collision with one already claimed.
-    fn claim_column<'n>(
-        &self,
-        name: &'n str,
-        seen: &mut Vec<&'n str>,
-        columns: &mut usize,
-    ) -> Result<(), RowError> {
+    fn claim_column<'n>(&self, name: &'n str, seen: &mut Vec<&'n str>) -> Result<(), RowError> {
         validate_name(name)?;
         if seen
             .iter()
@@ -403,7 +432,6 @@ impl Mapping {
             )));
         }
         seen.push(name);
-        *columns += 1;
         Ok(())
     }
 
@@ -449,32 +477,39 @@ impl Mapping {
         match value {
             OwnedValue::Static(StaticNode::Bool(flag)) => Ok(PreparedValue::Bool(*flag)),
             OwnedValue::Static(StaticNode::I64(number)) if as_double => Ok(PreparedValue::F64(
-                self.widen(name, *number as f64, *number as f64 as i64 == *number),
+                self.widen(name, i128::from(*number), REMEDY_INTEGER_COLUMN),
             )),
             OwnedValue::Static(StaticNode::U64(number)) if as_double => Ok(PreparedValue::F64(
-                self.widen(name, *number as f64, *number as f64 as u64 == *number),
+                self.widen(name, i128::from(*number), REMEDY_INTEGER_COLUMN),
             )),
             OwnedValue::Static(StaticNode::I64(number)) => Ok(PreparedValue::I64(*number)),
             // QuestDB has no unsigned 64-bit column, so anything past `i64::MAX`
             // would wrap. A column the operator declared an integer is refused
             // rather than silently sent as a `DOUBLE`, which would change the
             // type the declaration pinned. Otherwise it degrades to `DOUBLE`,
-            // which is what `numbers_as_double` would have done anyway.
+            // which is what `numbers_as_double` would have done anyway, and
+            // the remedy differs: no QuestDB column holds such a value exactly.
             OwnedValue::Static(StaticNode::U64(number)) => match i64::try_from(*number) {
                 Ok(number) => Ok(PreparedValue::I64(number)),
                 Err(_) if declared_integer => Err(RowError::Invalid(format!(
                     "column {name} is listed in integer_columns but its value is larger than a QuestDB LONG"
                 ))),
-                Err(_) => Ok(PreparedValue::F64(self.widen(name, *number as f64, false))),
+                Err(_) => Ok(PreparedValue::F64(self.widen(
+                    name,
+                    i128::from(*number),
+                    REMEDY_PAST_LONG,
+                ))),
             },
             // A declared integer column takes a float whose value is whole,
             // because JSON gives no way to tell `20` from `20.0`. A genuinely
             // fractional value is refused: rounding it would store something the
             // producer did not send, and sending it as a `DOUBLE` would break
-            // the type the declaration pinned.
+            // the type the declaration pinned. The upper bound is strict:
+            // `i64::MAX as f64` rounds up to 2^63, which `as i64` would
+            // saturate one short of the value sent.
             OwnedValue::Static(StaticNode::F64(number)) if declared_integer => {
                 let number = *number;
-                if number.fract() == 0.0 && number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+                if number.fract() == 0.0 && number >= i64::MIN as f64 && number < i64::MAX as f64 {
                     Ok(PreparedValue::I64(number as i64))
                 } else {
                     Err(RowError::Invalid(format!(
@@ -484,7 +519,13 @@ impl Mapping {
             }
             OwnedValue::Static(StaticNode::F64(number)) => Ok(PreparedValue::F64(*number)),
             OwnedValue::String(text) => Ok(PreparedValue::Str(text.as_str())),
-            OwnedValue::Array(items) => parse_array(name, items).map(PreparedValue::Array),
+            OwnedValue::Array(items) => {
+                let (values, rounded) = parse_array(name, items)?;
+                if rounded {
+                    self.warn_rounding(name, REMEDY_ARRAY);
+                }
+                Ok(PreparedValue::Array(values))
+            }
             // Nested objects have no QuestDB column type; store the JSON text so
             // the data is preserved rather than dropped.
             OwnedValue::Object(_) => simd_json::to_string(value)
@@ -503,14 +544,25 @@ impl Mapping {
     /// A `DOUBLE` carries integers exactly only up to 2^53. The README states
     /// the limit, but an operator who missed it would otherwise get rounded
     /// identifiers with no signal at all, so the first lossy conversion is
-    /// logged, once per connector, naming the column and the remedy.
-    fn widen(&self, name: &str, widened: f64, exact: bool) -> f64 {
-        if !exact && !self.precision_warned.swap(true, Ordering::Relaxed) {
-            warn!(
-                "column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; list the column in integer_columns to keep it exact. This is reported once per connector."
-            );
+    /// logged, once per connector, naming the column and the remedy. The
+    /// exactness test goes through `i128`, because casting the double back to
+    /// the source width saturates at the extremes and would call `i64::MAX`
+    /// exact after rounding it to 2^63.
+    fn widen(&self, name: &str, number: i128, remedy: &str) -> f64 {
+        let widened = number as f64;
+        if widened as i128 != number {
+            self.warn_rounding(name, remedy);
         }
         widened
+    }
+
+    fn warn_rounding(&self, name: &str, remedy: &str) {
+        if !self.precision_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {remedy}. This is reported once per connector.",
+                self.id
+            );
+        }
     }
 
     /// Resolves the designated timestamp, rejecting a value `Buffer::at` would
@@ -737,7 +789,9 @@ fn timestamp_number(value: &OwnedValue) -> Option<i64> {
         OwnedValue::Static(StaticNode::U64(number)) => i64::try_from(*number).ok(),
         OwnedValue::Static(StaticNode::F64(number)) => {
             let number = *number;
-            (number.is_finite() && number >= i64::MIN as f64 && number <= i64::MAX as f64)
+            // Strict on the upper side: `i64::MAX as f64` is 2^63, which `as
+            // i64` would saturate to a timestamp one short of the one sent.
+            (number.is_finite() && number >= i64::MIN as f64 && number < i64::MAX as f64)
                 .then_some(number as i64)
         }
         _ => None,
@@ -788,7 +842,7 @@ enum ArrayValues {
 ///
 /// Building it is what checks its shape, so the rules cannot be held in two
 /// places that have to agree by hand.
-fn parse_array(name: &str, items: &[OwnedValue]) -> Result<ArrayValues, RowError> {
+fn parse_array(name: &str, items: &[OwnedValue]) -> Result<(ArrayValues, bool), RowError> {
     let not_numeric = || RowError::Invalid(format!("column {name} is not a numeric array"));
     // QuestDB arrays are rectangular: every sibling must have the same length,
     // or the client refuses the whole frame.
@@ -800,22 +854,28 @@ fn parse_array(name: &str, items: &[OwnedValue]) -> Result<ArrayValues, RowError
             "column {name} is an empty array"
         )));
     }
+    // Whether any element lost precision on its way to a `DOUBLE`, so the
+    // caller can say so once.
+    let mut rounded = false;
     match array_depth(items) {
-        1 => Ok(ArrayValues::One(flat_array(items).ok_or_else(not_numeric)?)),
+        1 => Ok((
+            ArrayValues::One(flat_array(items, &mut rounded).ok_or_else(not_numeric)?),
+            rounded,
+        )),
         2 => {
             let mut rows = Vec::with_capacity(items.len());
             let mut width = None;
             for item in items {
                 let values = item
                     .as_array()
-                    .and_then(|values| flat_array(values))
+                    .and_then(|values| flat_array(values, &mut rounded))
                     .ok_or_else(not_numeric)?;
                 if *width.get_or_insert(values.len()) != values.len() {
                     return Err(ragged());
                 }
                 rows.push(values);
             }
-            Ok(ArrayValues::Two(rows))
+            Ok((ArrayValues::Two(rows), rounded))
         }
         3 => {
             let mut cubes = Vec::with_capacity(items.len());
@@ -830,7 +890,7 @@ fn parse_array(name: &str, items: &[OwnedValue]) -> Result<ArrayValues, RowError
                 for nested in outer {
                     let values = nested
                         .as_array()
-                        .and_then(|values| flat_array(values))
+                        .and_then(|values| flat_array(values, &mut rounded))
                         .ok_or_else(not_numeric)?;
                     if *width.get_or_insert(values.len()) != values.len() {
                         return Err(ragged());
@@ -839,7 +899,7 @@ fn parse_array(name: &str, items: &[OwnedValue]) -> Result<ArrayValues, RowError
                 }
                 cubes.push(rows);
             }
-            Ok(ArrayValues::Three(cubes))
+            Ok((ArrayValues::Three(cubes), rounded))
         }
         _ => Err(RowError::Invalid(format!(
             "column {name} exceeds the supported array nesting depth of 3"
@@ -863,15 +923,25 @@ fn array_depth(items: &[OwnedValue]) -> usize {
     }
 }
 
-fn flat_array(items: &[OwnedValue]) -> Option<Vec<f64>> {
+/// Widens one level of a numeric array, setting `rounded` when an integer
+/// element lost precision.
+fn flat_array(items: &[OwnedValue], rounded: &mut bool) -> Option<Vec<f64>> {
     let mut values = Vec::with_capacity(items.len());
     for item in items {
-        values.push(match item {
-            OwnedValue::Static(StaticNode::I64(number)) => *number as f64,
-            OwnedValue::Static(StaticNode::U64(number)) => *number as f64,
-            OwnedValue::Static(StaticNode::F64(number)) => *number,
+        let number = match item {
+            OwnedValue::Static(StaticNode::I64(number)) => i128::from(*number),
+            OwnedValue::Static(StaticNode::U64(number)) => i128::from(*number),
+            OwnedValue::Static(StaticNode::F64(number)) => {
+                values.push(*number);
+                continue;
+            }
             _ => return None,
-        });
+        };
+        let widened = number as f64;
+        if widened as i128 != number {
+            *rounded = true;
+        }
+        values.push(widened);
     }
     Some(values)
 }
@@ -920,6 +990,7 @@ mod tests {
 
     fn mapping() -> Mapping {
         Mapping {
+            id: 1,
             table: "events".to_owned(),
             symbol_columns: ColumnNames::default(),
             uuid_columns: ColumnNames::default(),
@@ -1772,9 +1843,12 @@ mod tests {
     }
 
     #[test]
-    fn given_a_number_past_2_to_53_when_widened_should_warn_once_per_connector() {
+    fn given_a_number_past_2_to_53_when_widened_should_set_the_warned_flag() {
         // The README states the limit; this is the runtime signal for an
-        // operator who missed it. The flag is what the test can observe.
+        // operator who missed it. The crate has no `tracing` subscriber in its
+        // dev-dependencies, so the flag is what the test can observe: it
+        // proves the lossy conversion was detected, not that the line was
+        // written exactly once.
         let mapping = mapping();
         mapping
             .append_row(
@@ -1811,6 +1885,82 @@ mod tests {
             )
             .unwrap();
         assert!(!declared.precision_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn given_the_extreme_integers_when_widened_should_still_count_as_rounded() {
+        // `i64::MAX as f64` is 2^63 and `as i64` saturates back to `i64::MAX`,
+        // so a check through the source width would call that exact. The
+        // check goes through `i128`, where nothing saturates.
+        for payload in [
+            r#"{"big":9223372036854775807}"#,
+            r#"{"big":18446744073709551615}"#,
+        ] {
+            let mapping = mapping();
+            mapping
+                .append_row(&mut qwp_buffer(), &json_message(payload), context())
+                .unwrap();
+            assert!(
+                mapping.precision_warned.load(Ordering::Relaxed),
+                "{payload} must count as rounded"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_array_element_past_2_to_53_when_appending_should_set_the_warned_flag() {
+        // The array path widens too, so it has to report the loss as well.
+        let lossy = mapping();
+        lossy
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"ids":[1,9007199254740993]}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(lossy.precision_warned.load(Ordering::Relaxed));
+
+        let exact = mapping();
+        exact
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"ids":[1,2,3]}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(!exact.precision_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn given_an_integer_column_holding_2_to_63_as_a_float_when_appending_should_reject_the_row() {
+        // `i64::MAX as f64` rounds up to 2^63, so an inclusive bound would admit
+        // it and `as i64` would store one less than the producer sent. The
+        // same value as an integer literal is refused, and the two must agree.
+        let mut mapping = mapping();
+        mapping.integer_columns.insert("count".to_owned());
+        let mut buffer = qwp_buffer();
+        let error = mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"count":9223372036854775808.0}"#),
+                context(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RowError::Invalid(_)), "{error:?}");
+        assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_a_float_timestamp_of_2_to_63_when_resolved_should_be_out_of_range() {
+        // The same strict bound as the integer column, for the same reason.
+        assert_eq!(
+            timestamp_number(&OwnedValue::Static(StaticNode::F64(9223372036854775808.0))),
+            None
+        );
+        assert_eq!(
+            timestamp_number(&OwnedValue::Static(StaticNode::F64(1.0))),
+            Some(1)
+        );
     }
 
     #[test]

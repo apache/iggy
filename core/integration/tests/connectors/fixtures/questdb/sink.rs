@@ -101,24 +101,38 @@ impl QuestDbSinkFixture {
     ///
     /// A count past `expected` is an error, not a success: the connector is
     /// at-least-once, so a duplicate row is the documented failure mode, and a
-    /// helper that returned on "at least" would let every caller's
-    /// `assert_eq!(count, expected)` pass with one in the table.
+    /// helper that returned on "at least" could not catch one. The helper is
+    /// therefore the assertion, and a caller has nothing to compare its return
+    /// value against. Once the count matches, one more poll interval passes
+    /// before it returns, so a duplicate that lands just after the matching
+    /// poll, as a store-and-forward replay can, is caught as well.
     pub async fn wait_for_rows(&self, expected: usize) -> Result<usize, TestBinaryError> {
         let table = self.table();
         let mut last = None;
+        let duplicate = |count: usize| TestBinaryError::InvalidState {
+            message: format!(
+                "Expected exactly {expected} rows in {table} but observed {count}, so a duplicate landed"
+            ),
+        };
         for _ in 0..POLL_ATTEMPTS {
             if let Ok(Some(count)) = self.count_rows(&table).await {
                 last = Some(count);
+                if count > expected {
+                    return Err(duplicate(count));
+                }
                 if count == expected {
+                    sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                    let settled = self
+                        .count_rows(&table)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or(count);
+                    if settled > expected {
+                        return Err(duplicate(settled));
+                    }
                     info!("Found {count} rows in QuestDB table {table} (expected {expected})");
                     return Ok(count);
-                }
-                if count > expected {
-                    return Err(TestBinaryError::InvalidState {
-                        message: format!(
-                            "Expected exactly {expected} rows in {table} but observed {count}, so a duplicate landed"
-                        ),
-                    });
                 }
             }
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
