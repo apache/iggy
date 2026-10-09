@@ -230,6 +230,14 @@ impl IggyClient {
     }
 
     /// Polls messages from the specified topic and partition.
+    ///
+    /// Each message keeps the partition context of this poll. To continue at an offset under
+    /// that context, pass PollingStrategy::offset($offset)->withContext($message->context()).
+    /// A stale context fails with HistoryUnavailable (87).
+    ///
+    /// Without a context, the poll uses the context of its route. It can fail once with
+    /// HistoryUnavailable (87) after another client deleted and recreated the partition. The
+    /// failed route is dropped, and the next call routes again.
     pub fn poll_messages(
         &self,
         stream: PhpIdentifier,
@@ -265,6 +273,7 @@ impl IggyClient {
                 .map(|message| ReceiveMessage {
                     inner: message,
                     partition_id,
+                    context: polled_messages.context,
                 })
                 .collect())
         })
