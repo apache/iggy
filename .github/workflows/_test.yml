@@ -45,7 +45,7 @@ jobs:
       (inputs.task == 'build-macos-aarch64' || inputs.task == 'clippy-macos-aarch64') && 'macos-14' ||
       inputs.task == 'build-macos' && 'macos-15' ||
       inputs.task == 'build-windows-sdk' && 'windows-latest' ||
-      'ubuntu-latest'
+      'ubuntu-26.04'
       }}
     timeout-minutes: 60
     steps:

@@ -69,10 +69,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             libc: gnu
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             libc: musl
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
@@ -189,7 +189,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     steps:
@@ -264,7 +264,7 @@ jobs:
     name: Collect artifacts
     needs: [build-binaries, build-connector-plugins]
     if: inputs.upload_artifacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:

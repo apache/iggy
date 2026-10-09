@@ -35,15 +35,15 @@ runs:
           libclang-dev \
           libhwloc-dev \
           libssl-dev \
-          php8.3-cli \
-          php8.3-dev \
-          php8.3-mbstring \
-          php8.3-xml \
+          php8.5-cli \
+          php8.5-dev \
+          php8.5-mbstring \
+          php8.5-xml \
           pkg-config \
           unzip
 
-        php_bin="$(command -v php8.3)"
-        php_config="$(command -v php-config8.3)"
+        php_bin="$(command -v php8.5)"
+        php_config="$(command -v php-config8.5)"
         composer_bin="$(command -v composer)"
         {
           echo "PHP=${php_bin}"

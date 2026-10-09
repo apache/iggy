@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -74,12 +74,12 @@ jobs:
             libclang-dev \
             libhwloc-dev \
             libssl-dev \
-            php8.3-cli \
-            php8.3-dev \
+            php8.5-cli \
+            php8.5-dev \
             pkg-config
 
-          php_bin="$(command -v php8.3)"
-          php_config="$(command -v php-config8.3)"
+          php_bin="$(command -v php8.5)"
+          php_config="$(command -v php-config8.5)"
           {
             echo "PHP=${php_bin}"
             echo "PHP_CONFIG=${php_config}"
