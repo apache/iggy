@@ -270,7 +270,7 @@ pub struct Mapping {
     /// numeric field is a genuine integer and the table was pre-created, since
     /// otherwise a whole-valued first window creates the column as a `LONG`.
     pub numbers_as_double: bool,
-    pub rounding_warned: RoundingWarned,
+    pub(crate) rounding_warned: RoundingWarned,
 }
 
 /// Per-batch context that is constant across every row.
@@ -521,9 +521,18 @@ impl Mapping {
             OwnedValue::Static(StaticNode::I64(number)) if as_double => Ok(PreparedValue::F64(
                 self.widen(name, i128::from(*number), Rounding::Scalar),
             )),
-            OwnedValue::Static(StaticNode::U64(number)) if as_double => Ok(PreparedValue::F64(
-                self.widen(name, i128::from(*number), Rounding::Scalar),
-            )),
+            OwnedValue::Static(StaticNode::U64(number)) if as_double => {
+                let source = if i64::try_from(*number).is_ok() {
+                    Rounding::Scalar
+                } else {
+                    Rounding::PastLong
+                };
+                Ok(PreparedValue::F64(self.widen(
+                    name,
+                    i128::from(*number),
+                    source,
+                )))
+            }
             OwnedValue::Static(StaticNode::I64(number)) => Ok(PreparedValue::I64(*number)),
             // QuestDB has no unsigned 64-bit column, so anything past `i64::MAX`
             // would wrap. A column the operator declared an integer is refused
@@ -1669,7 +1678,8 @@ mod tests {
         // QuestDB has no unsigned 64-bit column, so a value past `i64::MAX`
         // degrades to a double rather than wrapping into a negative.
         let mut buffer = buffer();
-        mapping()
+        let mapping = mapping();
+        mapping
             .append_row(
                 &mut buffer,
                 &json_message(r#"{"fingerprint":18446744073709551615}"#),
@@ -1681,6 +1691,10 @@ mod tests {
             line.contains("fingerprint=1.8446744073709552e19"),
             "expected a double rendering, got {line}"
         );
+        let flags = &mapping.rounding_warned;
+        assert!(flags.flag(Rounding::PastLong).load(Ordering::Relaxed));
+        assert!(!flags.flag(Rounding::Scalar).load(Ordering::Relaxed));
+        assert!(!flags.flag(Rounding::ArrayElement).load(Ordering::Relaxed));
     }
 
     #[test]
