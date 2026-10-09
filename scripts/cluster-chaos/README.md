@@ -177,7 +177,8 @@ Two of three nodes crashing within the flush window loses data the same way
 196,460 and 66,120 of 143,520 acknowledged events. In both runs a restarted replica then stopped with
 `partition N could not commit op M, which the cluster had already committed. The replica is divergent and was fenced`
 and stayed down. Sends to some partitions were refused on the two remaining nodes until the producers gave up after
-180 s. With `persisted` the same scenario passes.
+180 s. With `persisted` the same scenario passes. Tracked in #4476: the fence follows
+`partition WAL append does not extend its history`, holds across restarts, and stops the whole node.
 
 ## Environment
 
