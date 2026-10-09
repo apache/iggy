@@ -22,12 +22,11 @@ use crate::{
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
-    CREATE_STREAM_CODE, DELETE_STREAM_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, PURGE_STREAM_CODE,
-    UPDATE_STREAM_CODE,
+    CREATE_STREAM_CODE, DELETE_STREAM_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, UPDATE_STREAM_CODE,
 };
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
-    PurgeStreamRequest, UpdateStreamRequest,
+    UpdateStreamRequest,
 };
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
@@ -108,17 +107,6 @@ impl<B: BinaryClient> StreamClient for B {
         self.send_raw_with_response(
             DELETE_STREAM_CODE,
             DeleteStreamRequest { stream_id: wire_id }.to_bytes(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        fail_if_not_authenticated(self).await?;
-        let wire_id = identifier_to_wire(stream_id)?;
-        self.send_raw_with_response(
-            PURGE_STREAM_CODE,
-            PurgeStreamRequest { stream_id: wire_id }.to_bytes(),
         )
         .await?;
         Ok(())

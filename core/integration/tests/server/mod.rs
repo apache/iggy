@@ -26,8 +26,8 @@ pub(crate) mod raw_tcp;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 mod legacy_login_vsr;
 // A non-replicated code no read serves (unknown, or table-listed without an
-// arm) must deny typed (InvalidCommand) at the read gate, not stall or reply
-// empty-ok.
+// arm) must deny typed (InvalidCommand) at the read gate, and an undeclared
+// operation byte at the funnel, not stall or reply empty-ok.
 mod unknown_code_vsr;
 // A failed credential login must report the credential failure, not the
 // payload shape it fell through to.
@@ -39,9 +39,8 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
-// Purge durability: applied generation survives restart; journal-resident
-// purged batches stay fenced behind the purge floor.
-mod purge_vsr;
+// /metrics carries per-topic size and message count (#4473).
+mod topic_metrics_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
 pub(crate) mod http_client;
@@ -92,7 +91,7 @@ mod message_retrieval;
 // Server restarts, consumer-group barriers, and DeleteSegments maintenance.
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
-mod purge_delete;
+mod delete_segments;
 mod scenarios;
 mod specific;
 mod telemetry;

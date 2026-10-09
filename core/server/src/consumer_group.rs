@@ -971,7 +971,7 @@ mod tests {
             .await
             .unwrap();
         recovering
-            .install_state_transfer(config, offer.commit_op, vec![staged], &offer.offsets.1, 0)
+            .install_state_transfer(config, offer.commit_op, vec![staged], &offer.offsets.1)
             .await
             .unwrap();
         assert!(!recovering.requires_state_transfer());
