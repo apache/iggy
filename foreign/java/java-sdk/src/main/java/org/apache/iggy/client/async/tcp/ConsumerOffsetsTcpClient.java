@@ -44,17 +44,34 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerOffsetsTcpClient.class);
 
     private static final byte ACK_QUORUM = 1;
+    private static final int STORE = CommandCode.ConsumerOffset.STORE.getValue();
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
     private final PartitionContexts storeContexts;
+    private final PollRouter pollRouter;
+    private final Supplier<CompletableFuture<Boolean>> clustered;
 
+    /**
+     * Creates a low-level client on the supplied connection without primary routing.
+     * Use {@code Iggy.tcpClientBuilder()} for a cluster, so offset writes reach the
+     * partition primary while the coordinator retains group membership.
+     */
     public ConsumerOffsetsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, null, () -> CompletableFuture.completedFuture(false));
+    }
+
+    ConsumerOffsetsTcpClient(
+            Supplier<AsyncTcpConnection> connectionSupplier,
+            PollRouter pollRouter,
+            Supplier<CompletableFuture<Boolean>> clustered) {
         this.connectionSupplier = connectionSupplier;
         this.storeContexts = new PartitionContexts(
                 connectionSupplier,
                 CommandCode.ConsumerOffset.GET_ROUTING.getValue(),
                 PollRouter.ATTACHMENT_BYTES,
                 false);
+        this.pollRouter = pollRouter;
+        this.clustered = clustered;
     }
 
     private AsyncTcpConnection connection() {
@@ -64,9 +81,6 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     @Override
     public CompletableFuture<Void> storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
-        var target = offsetTarget(consumer, streamId, topicId, partitionId);
-        var payload = storePayload(target.copy(), offset);
-
         log.debug(
                 "Storing consumer offset - Stream: {}, Topic: {}, Partition: {}, Consumer: {}, Offset: {}",
                 streamId,
@@ -75,9 +89,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 consumer,
                 offset);
 
-        return storeContexts
-                .send(CommandCode.ConsumerOffset.STORE.getValue(), payload, target, target.readableBytes())
-                .thenAccept(ByteBuf::release);
+        return store(streamId, topicId, partitionId, consumer, offset, Optional.empty());
     }
 
     @Override
@@ -88,14 +100,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
             Consumer consumer,
             BigInteger offset,
             PartitionContext context) {
-        var payload = storePayload(offsetTarget(consumer, streamId, topicId, Optional.of(partitionId)), offset);
-        return connection()
-                .send(
-                        CommandCode.ConsumerOffset.STORE.getValue(),
-                        payload,
-                        0,
-                        new AsyncTcpConnection.TransientFailoverState(context))
-                .thenAccept(ByteBuf::release);
+        return store(streamId, topicId, Optional.of(partitionId), consumer, offset, Optional.of(context));
     }
 
     @Override
@@ -125,18 +130,57 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 });
     }
 
+    private CompletableFuture<Void> store(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            Optional<PartitionContext> context) {
+        var payload = offsetTarget(consumer, streamId, topicId, partitionId);
+        int targetLength = payload.readableBytes();
+        payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
+        payload.writeByte(ACK_QUORUM);
+        return write(STORE, payload, targetLength, context).thenAccept(ByteBuf::release);
+    }
+
+    /**
+     * Routes an offset write as Rust's {@code send_offset_write_with_response} does:
+     * a cluster takes it to the partition primary, a single node serves it here.
+     * Takes ownership of {@code payload}, whose first {@code targetLength} bytes
+     * name the consumer and the partition.
+     */
+    CompletableFuture<ByteBuf> write(
+            int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
+        if (pollRouter == null) {
+            return writeOnCoordinator(command, payload, targetLength, context);
+        }
+        return clustered
+                .get()
+                .handle((isClustered, error) -> {
+                    if (error != null) {
+                        payload.release();
+                        return CompletableFuture.<ByteBuf>failedFuture(error);
+                    }
+                    return isClustered
+                            ? pollRouter.writeOffset(command, payload, targetLength, context)
+                            : writeOnCoordinator(command, payload, targetLength, context);
+                })
+                .thenCompose(written -> written);
+    }
+
+    private CompletableFuture<ByteBuf> writeOnCoordinator(
+            int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
+        return storeContexts.send(
+                command, payload, payload.retainedSlice(payload.readerIndex(), targetLength), targetLength, context);
+    }
+
     private static ByteBuf offsetTarget(
             Consumer consumer, StreamId streamId, TopicId topicId, Optional<Long> partitionId) {
         var target = BytesSerializer.toBytes(consumer);
         target.writeBytes(BytesSerializer.toBytes(streamId));
         target.writeBytes(BytesSerializer.toBytes(topicId));
         target.writeBytes(BytesSerializer.toBytes(partitionId));
-        return target;
-    }
-
-    private static ByteBuf storePayload(ByteBuf target, BigInteger offset) {
-        target.writeBytes(BytesSerializer.toBytesAsU64(offset));
-        target.writeByte(ACK_QUORUM);
         return target;
     }
 }

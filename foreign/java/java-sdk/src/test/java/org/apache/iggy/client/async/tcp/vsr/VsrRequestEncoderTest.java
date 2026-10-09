@@ -218,7 +218,7 @@ class VsrRequestEncoderTest {
     @Test
     void shouldKeepUnsignedSharedEpochInEncodedRequest() {
         byte[] secret = session.bindSecret();
-        session.bindShared(1, 2, Long.MIN_VALUE, secret);
+        session.bindShared(new ConsensusSession(), 1, 2, Long.MIN_VALUE, secret);
         ByteBuf frame = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(Long.MIN_VALUE);

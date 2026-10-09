@@ -30,9 +30,11 @@ class PartitionsHttpClient implements PartitionsClient {
     private static final String TOPICS = "/topics";
     private static final String PARTITIONS = "/partitions";
     private final InternalHttpClient httpClient;
+    private final SendContexts sendContexts;
 
-    public PartitionsHttpClient(InternalHttpClient httpClient) {
+    public PartitionsHttpClient(InternalHttpClient httpClient, SendContexts sendContexts) {
         this.httpClient = httpClient;
+        this.sendContexts = sendContexts;
     }
 
     @Override
@@ -40,6 +42,7 @@ class PartitionsHttpClient implements PartitionsClient {
         var request = httpClient.preparePostRequest(
                 STREAMS + "/" + streamId + TOPICS + "/" + topicId + PARTITIONS, new CreatePartitions(partitionsCount));
         httpClient.execute(request);
+        sendContexts.clear();
     }
 
     @Override
@@ -48,6 +51,7 @@ class PartitionsHttpClient implements PartitionsClient {
                 STREAMS + "/" + streamId + TOPICS + "/" + topicId + PARTITIONS,
                 new BasicNameValuePair("partitions_count", partitionsCount.toString()));
         httpClient.execute(request);
+        sendContexts.clear();
     }
 
     private record CreatePartitions(Long partitionsCount) {}

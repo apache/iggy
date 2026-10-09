@@ -68,6 +68,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
     static final int TRANSIENT_NOT_ACCEPTED = 58;
     static final int POLL_CODE = 100;
     static final int GET_POLL_ROUTING_CODE = 103;
+    static final int POLL_ON_PRIMARY_CODE = 104;
+    static final int BIND_SESSION_CODE = 15;
+    static final int GROUP_SYNC_CODE = 606;
 
     private static final int HEADER_SIZE = 256;
     private static final int SIZE_OFFSET = 48;
@@ -76,6 +79,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int REQUEST_OPERATION_OFFSET = 176;
     private static final int REQUEST_CODE_OFFSET = 196;
     private static final int REQUEST_INCARNATION_OFFSET = 200;
+    private static final int REQUEST_OWNER_GENERATION_OFFSET = 208;
+    private static final int REQUEST_METADATA_OP_OFFSET = 216;
     private static final int REPLY_REQUEST_ID_OFFSET = 200;
     private static final int REPLY_OPERATION_OFFSET = 208;
     private static final int REPLY_STATUS_OFFSET = 216;
@@ -89,9 +94,6 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int OPERATION_CREATE_STREAM = 128;
     private static final int CREATE_STREAM_CODE = 202;
     private static final int EVICTION_STALE_CLIENT = 13;
-    private static final int POLL_ON_PRIMARY_CODE = 104;
-    private static final int BIND_SESSION_CODE = 15;
-    private static final int GROUP_SYNC_CODE = 606;
     private static final int GROUP_JOIN_OPERATION = 148;
     private static final int UPDATE_USER_OPERATION = 142;
     private static final int CHANGE_PASSWORD_OPERATION = 144;
@@ -1674,7 +1676,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
      * runners, so three blocking nodes can starve the client continuations the
      * test is waiting for when the full suite runs concurrently.
      */
-    private static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
+    static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
         CompletableFuture<Void> serving = new CompletableFuture<>();
         Thread serverThread = new Thread(
                 () -> {
@@ -1730,6 +1732,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 fields.getLong(REQUEST_CLIENT_OFFSET),
                 fields.getLong(REQUEST_CLIENT_OFFSET + Long.BYTES),
                 fields.getLong(REQUEST_INCARNATION_OFFSET),
+                fields.getLong(REQUEST_OWNER_GENERATION_OFFSET),
+                fields.getLong(REQUEST_METADATA_OP_OFFSET),
                 body,
                 connection);
     }
@@ -1768,7 +1772,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return body;
     }
 
-    private static ByteBuf transientResult(int errorCode) {
+    static ByteBuf transientResult(int errorCode) {
         ByteBuf body = Unpooled.buffer(3 * Integer.BYTES);
         body.writeIntLE(1);
         body.writeIntLE(0);
@@ -1827,6 +1831,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
             long clientLow,
             long clientHigh,
             long incarnation,
+            long ownerGeneration,
+            long metadataOp,
             byte[] body,
             int connection) {
         boolean is(int expectedCode, int expectedOperation) {

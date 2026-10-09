@@ -25,7 +25,8 @@ public interface IggyBaseClient {
      * Sends a command code and payload and returns the raw response payload.
      *
      * <p>Session-control codes are rejected with an invalid-command error. HTTP clients report
-     * that this operation is unsupported.
+     * that this operation is unsupported. Over TCP, partition commands carry a partition context
+     * the client captures first, so a SendMessages payload must name an explicit partition id.
      *
      * @param code the command code
      * @param payload the command payload
