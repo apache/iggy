@@ -42,6 +42,7 @@ const (
 	//  - Maximum headers size: 100 KB
 	//  - Each individual header key is limited to 255 bytes
 	//  - Each individual header value is limited to 255 bytes
+	//  - Keys and values must not be empty, and a fixed-size kind must have its exact width
 	MaxUserHeadersSize = 100 * 1000
 )
 
@@ -84,6 +85,9 @@ type IggyMessage struct {
 type IggyMessageOpt func(message *IggyMessage)
 
 // NewIggyMessage Creates a new message with customizable parameters.
+//
+// It returns ierror.ErrInvalidHeaderKey or ierror.ErrInvalidHeaderValue for a user header that readers would refuse
+// to decode, since readers drop or fail on every header of a message that carries one.
 func NewIggyMessage(payload []byte, opts ...IggyMessageOpt) (IggyMessage, error) {
 	if len(payload) == 0 {
 		return IggyMessage{}, ierror.ErrInvalidMessagePayloadLength
@@ -107,6 +111,9 @@ func NewIggyMessage(payload []byte, opts ...IggyMessageOpt) (IggyMessage, error)
 	userHeaderLength := len(message.UserHeaders)
 	if userHeaderLength > MaxUserHeadersSize {
 		return IggyMessage{}, ierror.ErrTooBigUserHeaders
+	}
+	if err := validateUserHeaders(message.UserHeaders); err != nil {
+		return IggyMessage{}, err
 	}
 	message.Header.UserHeaderLength = uint32(userHeaderLength)
 	return message, nil
