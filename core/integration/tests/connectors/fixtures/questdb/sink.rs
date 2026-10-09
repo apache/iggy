@@ -106,7 +106,7 @@ impl QuestDbSinkFixture {
     /// value against. Once the count matches, one more poll interval passes
     /// before it returns, so a duplicate that lands just after the matching
     /// poll, as a store-and-forward replay can, is caught as well.
-    pub async fn wait_for_rows(&self, expected: usize) -> Result<usize, TestBinaryError> {
+    pub async fn wait_for_rows(&self, expected: usize) -> Result<(), TestBinaryError> {
         let table = self.table();
         let mut last = None;
         let duplicate = |count: usize| TestBinaryError::InvalidState {
@@ -122,17 +122,20 @@ impl QuestDbSinkFixture {
                 }
                 if count == expected {
                     sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-                    let settled = self
-                        .count_rows(&table)
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or(count);
+                    // A recount that fails proves nothing, so it is an error
+                    // rather than a pass on the earlier count.
+                    let settled = self.count_rows(&table).await?.ok_or_else(|| {
+                        TestBinaryError::InvalidState {
+                            message: format!(
+                                "table {table} disappeared after holding {count} rows"
+                            ),
+                        }
+                    })?;
                     if settled > expected {
                         return Err(duplicate(settled));
                     }
                     info!("Found {count} rows in QuestDB table {table} (expected {expected})");
-                    return Ok(count);
+                    return Ok(());
                 }
             }
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;

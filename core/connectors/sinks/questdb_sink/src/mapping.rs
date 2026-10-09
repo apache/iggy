@@ -113,14 +113,40 @@ impl TimestampUnit {
 /// from as an ordinary rejection.
 pub(crate) const MAX_NAME_LEN: usize = 127;
 
-/// What the rounding warning tells the operator to do, per source of the
-/// rounded value. An array element and a value past `i64::MAX` have no exact
+/// Where a rounded integer came from, which decides what the warning tells the
+/// operator to do. An array element and a value past `i64::MAX` have no exact
 /// QuestDB form, so pointing them at `integer_columns` would be wrong: that
-/// list refuses both.
-const REMEDY_INTEGER_COLUMN: &str = "list the column in integer_columns to keep it exact";
-const REMEDY_PAST_LONG: &str = "a value above i64::MAX has no exact QuestDB column";
-const REMEDY_ARRAY: &str =
-    "QuestDB stores only DOUBLE arrays, so an array element has no exact form";
+/// list refuses both. Each source warns once on its own, so an early array
+/// rounding cannot hide the `integer_columns` remedy for a scalar column.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Rounding {
+    Scalar,
+    PastLong,
+    ArrayElement,
+}
+
+impl Rounding {
+    const COUNT: usize = 3;
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Scalar => "list the column in integer_columns to keep it exact",
+            Self::PastLong => "a value above i64::MAX has no exact QuestDB column",
+            Self::ArrayElement => {
+                "QuestDB stores only DOUBLE arrays, so an array element has no exact form"
+            }
+        }
+    }
+}
+
+/// Widens an integer to the `DOUBLE` QuestDB stores, and says whether that
+/// lost precision. The test goes through `i128`, because casting the double
+/// back to the source width saturates at the extremes and would call
+/// `i64::MAX` exact after rounding it to 2^63.
+fn widen_exact(number: i128) -> (f64, bool) {
+    let widened = number as f64;
+    (widened, widened as i128 == number)
+}
 
 /// A message that could not be turned into a row. The batch continues; the
 /// caller counts and logs these.
@@ -226,9 +252,10 @@ pub struct Mapping {
     /// numeric field is a genuine integer and the table was pre-created, since
     /// otherwise a whole-valued first window creates the column as a `LONG`.
     pub numbers_as_double: bool,
-    /// Set once the first integer was rounded on its way to a `DOUBLE`, so the
-    /// warning about it is logged once per connector rather than per row.
-    pub precision_warned: AtomicBool,
+    /// One flag per [`Rounding`] source, set when that source first rounded an
+    /// integer on its way to a `DOUBLE`, so each warning is logged once per
+    /// connector rather than per row.
+    pub rounding_warned: [AtomicBool; Rounding::COUNT],
 }
 
 /// Per-batch context that is constant across every row.
@@ -477,10 +504,10 @@ impl Mapping {
         match value {
             OwnedValue::Static(StaticNode::Bool(flag)) => Ok(PreparedValue::Bool(*flag)),
             OwnedValue::Static(StaticNode::I64(number)) if as_double => Ok(PreparedValue::F64(
-                self.widen(name, i128::from(*number), REMEDY_INTEGER_COLUMN),
+                self.widen(name, i128::from(*number), Rounding::Scalar),
             )),
             OwnedValue::Static(StaticNode::U64(number)) if as_double => Ok(PreparedValue::F64(
-                self.widen(name, i128::from(*number), REMEDY_INTEGER_COLUMN),
+                self.widen(name, i128::from(*number), Rounding::Scalar),
             )),
             OwnedValue::Static(StaticNode::I64(number)) => Ok(PreparedValue::I64(*number)),
             // QuestDB has no unsigned 64-bit column, so anything past `i64::MAX`
@@ -497,7 +524,7 @@ impl Mapping {
                 Err(_) => Ok(PreparedValue::F64(self.widen(
                     name,
                     i128::from(*number),
-                    REMEDY_PAST_LONG,
+                    Rounding::PastLong,
                 ))),
             },
             // A declared integer column takes a float whose value is whole,
@@ -522,7 +549,7 @@ impl Mapping {
             OwnedValue::Array(items) => {
                 let (values, rounded) = parse_array(name, items)?;
                 if rounded {
-                    self.warn_rounding(name, REMEDY_ARRAY);
+                    self.warn_rounding(name, Rounding::ArrayElement);
                 }
                 Ok(PreparedValue::Array(values))
             }
@@ -544,23 +571,21 @@ impl Mapping {
     /// A `DOUBLE` carries integers exactly only up to 2^53. The README states
     /// the limit, but an operator who missed it would otherwise get rounded
     /// identifiers with no signal at all, so the first lossy conversion is
-    /// logged, once per connector, naming the column and the remedy. The
-    /// exactness test goes through `i128`, because casting the double back to
-    /// the source width saturates at the extremes and would call `i64::MAX`
-    /// exact after rounding it to 2^63.
-    fn widen(&self, name: &str, number: i128, remedy: &str) -> f64 {
-        let widened = number as f64;
-        if widened as i128 != number {
-            self.warn_rounding(name, remedy);
+    /// logged, once per connector and source, naming the column and the remedy.
+    fn widen(&self, name: &str, number: i128, source: Rounding) -> f64 {
+        let (widened, exact) = widen_exact(number);
+        if !exact {
+            self.warn_rounding(name, source);
         }
         widened
     }
 
-    fn warn_rounding(&self, name: &str, remedy: &str) {
-        if !self.precision_warned.swap(true, Ordering::Relaxed) {
+    fn warn_rounding(&self, name: &str, source: Rounding) {
+        if !self.rounding_warned[source as usize].swap(true, Ordering::Relaxed) {
             warn!(
-                "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {remedy}. This is reported once per connector.",
-                self.id
+                "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {}. This is reported once per connector.",
+                self.id,
+                source.remedy()
             );
         }
     }
@@ -937,10 +962,8 @@ fn flat_array(items: &[OwnedValue], rounded: &mut bool) -> Option<Vec<f64>> {
             }
             _ => return None,
         };
-        let widened = number as f64;
-        if widened as i128 != number {
-            *rounded = true;
-        }
+        let (widened, exact) = widen_exact(number);
+        *rounded |= !exact;
         values.push(widened);
     }
     Some(values)
@@ -1006,8 +1029,16 @@ mod tests {
             // The production default, so the common path is what the tests
             // exercise. The tests that pin integer typing set it back.
             numbers_as_double: true,
-            precision_warned: AtomicBool::new(false),
+            rounding_warned: Default::default(),
         }
+    }
+
+    /// Whether any rounding warning fired.
+    fn warned(mapping: &Mapping) -> bool {
+        mapping
+            .rounding_warned
+            .iter()
+            .any(|flag| flag.load(Ordering::Relaxed))
     }
 
     fn context() -> RowContext<'static> {
@@ -1857,10 +1888,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(
-            !mapping.precision_warned.load(Ordering::Relaxed),
-            "an exact widening must not warn"
-        );
+        assert!(!warned(&mapping), "an exact widening must not warn");
 
         mapping
             .append_row(
@@ -1869,11 +1897,11 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(mapping.precision_warned.load(Ordering::Relaxed));
+        assert!(warned(&mapping));
 
         // A declared integer column is never widened, so it never trips it.
         let mut declared = Mapping {
-            precision_warned: AtomicBool::new(false),
+            rounding_warned: Default::default(),
             ..mapping
         };
         declared.integer_columns.insert("big".to_owned());
@@ -1884,7 +1912,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(!declared.precision_warned.load(Ordering::Relaxed));
+        assert!(!warned(&declared));
     }
 
     #[test]
@@ -1900,10 +1928,7 @@ mod tests {
             mapping
                 .append_row(&mut qwp_buffer(), &json_message(payload), context())
                 .unwrap();
-            assert!(
-                mapping.precision_warned.load(Ordering::Relaxed),
-                "{payload} must count as rounded"
-            );
+            assert!(warned(&mapping), "{payload} must count as rounded");
         }
     }
 
@@ -1918,7 +1943,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(lossy.precision_warned.load(Ordering::Relaxed));
+        assert!(warned(&lossy));
 
         let exact = mapping();
         exact
@@ -1928,7 +1953,32 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(!exact.precision_warned.load(Ordering::Relaxed));
+        assert!(!warned(&exact));
+    }
+
+    #[test]
+    fn given_an_array_rounding_first_when_a_scalar_rounds_later_should_still_warn_for_the_scalar() {
+        // Each source has its own flag, so the array warning cannot use up the
+        // one that points a scalar column at integer_columns.
+        let mapping = mapping();
+        mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"ids":[9007199254740993]}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(mapping.rounding_warned[Rounding::ArrayElement as usize].load(Ordering::Relaxed));
+        assert!(!mapping.rounding_warned[Rounding::Scalar as usize].load(Ordering::Relaxed));
+
+        mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(r#"{"big":9007199254740993}"#),
+                context(),
+            )
+            .unwrap();
+        assert!(mapping.rounding_warned[Rounding::Scalar as usize].load(Ordering::Relaxed));
     }
 
     #[test]

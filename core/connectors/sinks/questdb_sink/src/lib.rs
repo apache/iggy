@@ -20,7 +20,7 @@ mod mapping;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
@@ -154,9 +154,6 @@ pub struct QuestDbSink {
     /// The `sink_connector!` macro requires `new` to be infallible, so a bad
     /// config is recorded here and surfaced from `open` instead.
     init_error: Option<Error>,
-    /// Terminal rejections the handler has reported and no batch has accounted
-    /// for yet. The handler is the only report of a rejection the sink never
-    /// asks `wait` about, so each batch spends one and fails.
     /// Terminal rejections the client reported minus the chunks that failed
     /// on one. Signed on purpose: the client reports on its own thread, after
     /// the chunk has already seen the latched error, so the chunk's retire can
@@ -272,7 +269,7 @@ impl QuestDbSink {
             include_offset_column: config.include_offset_column.unwrap_or(false),
             include_headers: config.include_headers.unwrap_or(false),
             numbers_as_double: config.numbers_as_double.unwrap_or(true),
-            precision_warned: AtomicBool::new(false),
+            rounding_warned: Default::default(),
         };
         if let Err(error) = validate_column_overlap(&mapping) {
             reject(error);
@@ -372,7 +369,6 @@ impl QuestDbSink {
                     // would otherwise be rejected whole and lose every row in it.
                     if buffer.row_count() > 0 && buffer.len() >= max_flush_bytes {
                         match flush_window(
-                            db,
                             &mut sender,
                             &mut buffer,
                             ack_level,
@@ -466,7 +462,6 @@ impl QuestDbSink {
 
                 if buffer.row_count() > 0
                     && let Err(failure) = flush_window(
-                        db,
                         &mut sender,
                         &mut buffer,
                         ack_level,
@@ -518,7 +513,10 @@ impl QuestDbSink {
     /// code, would recur on the next chunk and cost it a timeout, so the loop
     /// ends. A full symbol dictionary is the one transient fault that does not
     /// recur, because returning the sender retires that connection and the
-    /// next borrow dials a fresh one, so it does not stop the loop. A failure
+    /// next borrow dials a fresh one, so it does not stop the loop. Under
+    /// `sf_dir` the next connection re-seeds the dictionary from the slot until
+    /// the slot drains, so each chunk can fail once more; it still does not
+    /// stop the loop, because each later chunk can succeed. A failure
     /// that belongs to the frame, such as a server rejection, does not stop the
     /// chunks behind it either. Whether a token has to be retired is the third:
     /// the handler counts a terminal rejection on its own thread, so a chunk
@@ -546,6 +544,11 @@ impl QuestDbSink {
 
     /// A rejection the handler reported that no failed chunk accounted for,
     /// or a sign that one went unreported, for the batch-level check.
+    ///
+    /// This reports `PermanentHttpError` even for a schema rejection, where
+    /// `map_client_error` reports `SchemaMismatch`, because the balance is a
+    /// count with no category attached. The runtime branches on neither
+    /// variant, and the handler's own log line carries the category.
     fn unclaimed_rejection(&self, db: &QuestDb) -> Option<Error> {
         match settle_rejections(
             &self.server_rejections,
@@ -1205,6 +1208,12 @@ enum Unclaimed {
 /// debit, and left alone that debt would absorb the next rejection the
 /// handler alone reports. Forgiving on every check instead would reopen the
 /// race, because a debit whose credit is merely late would be erased too.
+///
+/// One case stays open, because the counters cannot tell a dropped credit from
+/// a late one. If a drop and a still-pending credit coincide, the forgive step
+/// erases debt that the late credit was going to repay, and that credit then
+/// fails one later batch. The drop itself is reported, so the operator already
+/// has a reason to distrust the next failure.
 fn settle_rejections(
     balance: &AtomicI64,
     drops_seen: &AtomicU64,
@@ -1246,13 +1255,14 @@ fn should_escalate_stall(consecutive_batches: u64) -> bool {
 
 /// Publishes the buffer and waits for the configured acknowledgement.
 ///
-/// A publish can fail for a fault that is not this frame's own. A terminal
-/// rejection of an earlier frame latches the connection, so the next publish
-/// on it is refused with that earlier error, and a full symbol dictionary
-/// belongs to the connection too. The buffer is intact in both cases, because
-/// `flush_buffer` clears it only after local acceptance, and returning the
-/// sender retires that connection. One fresh borrow and one re-flush therefore
-/// save the window, where failing it would lose rows that nothing refused.
+/// A publish refused by the connection itself, a latch left by an earlier
+/// frame's terminal rejection or a full symbol dictionary, fails the window
+/// rather than being re-sent on a fresh borrow. Re-sending looks cheap but
+/// needs a second pool slot while the first is still held, splits the chunk's
+/// acknowledgement across two senders, and drops the first mid-loop. Failing
+/// keeps one sender per chunk, so the caller names the lost window by offset
+/// and retires the rejection token against the batch that saw it. The sender
+/// is retired when the chunk returns it, so the next chunk borrows a fresh one.
 ///
 /// A pending acknowledgement is lag rather than loss, so it is counted and
 /// warned about instead of failing the batch: the frames are queued and the
@@ -1260,10 +1270,8 @@ fn should_escalate_stall(consecutive_batches: u64) -> bool {
 /// exhausted, so there is nothing to retry there; a stall that outlasts
 /// several batches is escalated by the caller instead, where the run of them
 /// is visible.
-#[allow(clippy::too_many_arguments)]
-fn flush_window<'a>(
-    db: &'a QuestDb,
-    sender: &mut questdb::BorrowedSender<'a>,
+fn flush_window(
+    sender: &mut questdb::BorrowedSender<'_>,
     buffer: &mut questdb::ingress::Buffer,
     ack_level: AckLevel,
     flush_timeout: Duration,
@@ -1271,23 +1279,9 @@ fn flush_window<'a>(
     id: u32,
     context: RowContext<'_>,
 ) -> Result<WindowAck, FlushError> {
-    let RowContext {
-        stream,
-        topic,
-        partition_id,
-    } = context;
-    if let Err(error) = sender.flush_buffer(buffer) {
-        if !belongs_to_the_connection(&error) {
-            return Err(FlushError::publishing(error));
-        }
-        warn!(
-            "{CONNECTOR_NAME} ID: {id} re-flushing a window on a fresh connection, stream: {stream}, topic: {topic}, partition_id: {partition_id}, because the previous one refused it for a fault of its own: {error}"
-        );
-        *sender = db.borrow_sender().map_err(FlushError::borrowing)?;
-        sender
-            .flush_buffer(buffer)
-            .map_err(FlushError::publishing)?;
-    }
+    sender
+        .flush_buffer(buffer)
+        .map_err(FlushError::publishing)?;
 
     // `Duration::ZERO` means "no deadline" to the client, not "do not wait", so
     // with the default ack level it is treated as fire and forget here instead
@@ -1300,6 +1294,11 @@ fn flush_window<'a>(
         Ok(()) => Ok(WindowAck::Confirmed),
         Err(error) if is_pending_ack(&error) => {
             outcome.pending_acks += 1;
+            let RowContext {
+                stream,
+                topic,
+                partition_id,
+            } = context;
             warn!(
                 "{CONNECTOR_NAME} ID: {id} flushed rows whose acknowledgement has not arrived yet, stream: {stream}, topic: {topic}, partition_id: {partition_id}. The frames are queued and delivery continues in the background, so this is lag rather than a failed write, but it is only durable across a restart when the connect string sets `sf_dir`: {error}"
             );
@@ -1307,18 +1306,6 @@ fn flush_window<'a>(
         }
         Err(error) => Err(FlushError::awaiting(error)),
     }
-}
-
-/// A publish refusal the connection caused rather than the frame.
-///
-/// `ServerRejection` at publish time is always an earlier frame's: the server
-/// never sees a frame before it is published, so the code can only come from
-/// the latch that frame left. `SymbolDictFull` is the connection's dictionary.
-fn belongs_to_the_connection(error: &questdb::Error) -> bool {
-    matches!(
-        error.code(),
-        ErrorCode::ServerRejection | ErrorCode::SymbolDictFull
-    )
 }
 
 /// Re-emits a QuestDB server rejection through `tracing`.
@@ -1871,18 +1858,6 @@ mod tests {
         assert!(!full.stops_batch);
         assert!(!full.server_rejection);
         assert!(matches!(full.error, Error::CannotStoreData(_)));
-        assert!(belongs_to_the_connection(&questdb::Error::new(
-            ErrorCode::SymbolDictFull,
-            "full"
-        )));
-        assert!(belongs_to_the_connection(&questdb::Error::new(
-            ErrorCode::ServerRejection,
-            "latched"
-        )));
-        assert!(!belongs_to_the_connection(&questdb::Error::new(
-            ErrorCode::SocketError,
-            "reset"
-        )));
     }
 
     #[test]
@@ -1895,7 +1870,17 @@ mod tests {
             let drops = AtomicU64::new(0);
             if credit_first {
                 balance.fetch_add(1, Ordering::Relaxed);
+                // Between the two, the credit is a rejection nobody retired
+                // yet, which a batch running now has to report.
+                assert_eq!(
+                    settle_rejections(&balance, &drops, 0),
+                    Some(Unclaimed::Rejection),
+                    "an unretired credit must be reported"
+                );
+                // That batch took the token, so the chunk's debit lands on an
+                // empty balance and dips below zero.
                 balance.fetch_sub(1, Ordering::Relaxed);
+                balance.fetch_add(1, Ordering::Relaxed);
             } else {
                 balance.fetch_sub(1, Ordering::Relaxed);
                 assert_eq!(
@@ -1971,8 +1956,19 @@ mod tests {
     #[test]
     fn given_a_stopped_chunk_when_classified_should_keep_only_the_acknowledged_rows() {
         // `rows_written` grows at append time, so the rows of an unconfirmed
-        // window come out again when the chunk stops.
-        let messages: Vec<ConsumedMessage> = Vec::new();
+        // window come out again when the chunk stops, and those messages are
+        // the ones named as undelivered.
+        let messages: Vec<ConsumedMessage> = (0..6u64)
+            .map(|offset| ConsumedMessage {
+                id: u128::from(offset) + 1,
+                offset,
+                checksum: 0,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Text("x".to_owned()),
+            })
+            .collect();
         let outcome = BatchOutcome {
             rows_written: 7,
             rejected_rows: 2,
@@ -1981,15 +1977,20 @@ mod tests {
         let stop = chunk_stop(
             FlushError::publishing(questdb::Error::new(ErrorCode::SocketError, "reset")),
             outcome,
-            0,
             4,
-            0,
+            4,
+            6,
             &messages,
         );
         assert_eq!(stop.outcome.rows_written, 4);
         assert_eq!(stop.outcome.rejected_rows, 2);
-        assert!(stop.undelivered.is_none());
+        let range = stop.undelivered.expect("two messages are unconfirmed");
+        assert_eq!(
+            (range.count, range.first_offset, range.last_offset),
+            (2, 4, 5)
+        );
     }
+
     #[test]
     fn given_a_column_in_two_type_lists_when_constructed_should_record_init_error() {
         // A column has one type, so overlapping declarations are a config error

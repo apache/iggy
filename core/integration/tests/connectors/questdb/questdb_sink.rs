@@ -609,7 +609,7 @@ async fn given_bulk_messages_when_consumed_should_write_every_row(
     fixture
         .wait_for_rows(bulk_count)
         .await
-        .expect("expected exactly {bulk_count}, got {count}");
+        .expect("bulk messages did not land exactly once");
 }
 
 #[iggy_harness(
@@ -697,7 +697,7 @@ async fn given_questdb_outage_when_consumed_should_buffer_and_replay_on_recovery
     fixture
         .wait_for_rows(15)
         .await
-        .expect("expected exactly 15 rows after replay, got {count}");
+        .expect("rows sent during the outage did not land exactly once after replay");
 }
 
 #[iggy_harness(
