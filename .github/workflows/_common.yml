@@ -32,6 +32,7 @@ jobs:
   rust-versions:
     name: Check Rust versions sync
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -41,6 +42,7 @@ jobs:
   python-versions:
     name: Check Python SDK versions sync
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -50,6 +52,7 @@ jobs:
   python-interpreter-versions:
     name: Check Python interpreter versions sync
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -59,6 +62,7 @@ jobs:
   python-lockfiles:
     name: Check Python lockfiles
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -71,6 +75,7 @@ jobs:
   version-consistency:
     name: Check version consistency
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -90,6 +95,7 @@ jobs:
   edge-image-catalog:
     name: Check edge image catalog
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -109,6 +115,7 @@ jobs:
   license-headers:
     name: Check license headers
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -128,6 +135,7 @@ jobs:
     name: Validate third-party licenses
     if: inputs.validate-third-party-licenses
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/utils/validate-third-party-licenses
@@ -135,6 +143,7 @@ jobs:
   markdown:
     name: Markdown lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -155,6 +164,7 @@ jobs:
   shellcheck:
     name: Shell scripts lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -171,6 +181,7 @@ jobs:
   trailing-whitespace:
     name: Check trailing whitespace
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -183,6 +194,7 @@ jobs:
   trailing-newline:
     name: Check trailing newline
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -195,6 +207,7 @@ jobs:
   toml-format:
     name: Check TOML formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -218,6 +231,7 @@ jobs:
   binary-artifacts:
     name: Check binary artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -263,6 +277,7 @@ jobs:
       ]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Summary
         run: |
