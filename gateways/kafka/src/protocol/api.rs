@@ -40,8 +40,8 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
     api_versions, create_topics, decode_guarded, delete_topics, dispatch, fetch, find_coordinator,
-    heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit, offset_fetch,produce,
-    respond_or_close, sync_group,
+    heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit,
+    offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{

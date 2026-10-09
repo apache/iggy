@@ -31,10 +31,7 @@ use bytes::Bytes;
 use super::codec::Encoder;
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
-    (15, "DescribeGroups"),
-    (16, "ListGroups"),
-];
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(15, "DescribeGroups"), (16, "ListGroups")];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
