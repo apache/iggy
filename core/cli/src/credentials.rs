@@ -37,6 +37,7 @@ use credentials_login_session::*;
 
 static ENV_IGGY_USERNAME: &str = "IGGY_USERNAME";
 static ENV_IGGY_PASSWORD: &str = "IGGY_PASSWORD";
+static ENV_IGGY_TOKEN: &str = "IGGY_TOKEN";
 
 struct IggyUserClient {
     username: String,
@@ -142,6 +143,18 @@ impl<'a> IggyCredentials<'a> {
                     username: username.clone(),
                     password,
                 })),
+                iggy_client: None,
+                login_required,
+            })
+        } else if let Some(token) = var(ENV_IGGY_TOKEN).ok().filter(|token| !token.is_empty()) {
+            // An environment token outranks the username and password pair
+            // below it, so a CI job can authenticate with IGGY_TOKEN alone.
+            // An empty value counts as unset. This is read here rather than
+            // as a clap `env` attribute: clap would treat the value like the
+            // --token flag and fail on the credentials group conflict rules
+            // whenever -u/-p are also present.
+            Ok(Self {
+                credentials: Some(Credentials::PersonalAccessToken(SecretString::from(token))),
                 iggy_client: None,
                 login_required,
             })

@@ -19,6 +19,7 @@ use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::PersonalAccessTokenExpiry;
 use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -83,5 +84,135 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestLoginOptions::new(UseCredentials::StdinInput))
+        .await;
+}
+
+#[derive(Debug)]
+enum EnvTokenScenario {
+    // Only IGGY_TOKEN is set, holding a valid personal access token.
+    TokenOnly,
+    // IGGY_TOKEN holds an invalid token and --token a valid one: the flag wins.
+    FlagTokenOverridesEnvToken,
+    // IGGY_TOKEN holds a valid token and the IGGY_USERNAME/IGGY_PASSWORD pair
+    // a wrong password: the token wins.
+    EnvTokenOverridesEnvCredentials,
+    // IGGY_TOKEN holds an invalid token and the pair is valid: the token
+    // still wins, so the login fails.
+    InvalidEnvTokenOverridesEnvCredentials,
+}
+
+#[derive(Debug)]
+struct TestLoginOptionsWithEnvToken {
+    scenario: EnvTokenScenario,
+    token_name: String,
+    token_value: Option<String>,
+}
+
+impl TestLoginOptionsWithEnvToken {
+    fn new(scenario: EnvTokenScenario, token_name: &str) -> Self {
+        Self {
+            scenario,
+            token_name: token_name.to_string(),
+            token_value: None,
+        }
+    }
+
+    fn needs_valid_token(&self) -> bool {
+        !matches!(
+            self.scenario,
+            EnvTokenScenario::InvalidEnvTokenOverridesEnvCredentials
+        )
+    }
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestLoginOptionsWithEnvToken {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        if self.needs_valid_token() {
+            let token = client
+                .create_personal_access_token(
+                    &self.token_name,
+                    PersonalAccessTokenExpiry::NeverExpire,
+                )
+                .await;
+            assert!(token.is_ok());
+            self.token_value = Some(token.unwrap().token);
+        }
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        let valid_token = self.token_value.clone().unwrap_or_default();
+        match self.scenario {
+            EnvTokenScenario::TokenOnly => IggyCmdCommand::new()
+                .env("IGGY_TOKEN", valid_token)
+                .arg("me"),
+            EnvTokenScenario::FlagTokenOverridesEnvToken => IggyCmdCommand::new()
+                .env("IGGY_TOKEN", "invalid-token")
+                .opts(vec!["--token".to_string(), valid_token])
+                .arg("me"),
+            EnvTokenScenario::EnvTokenOverridesEnvCredentials => IggyCmdCommand::new()
+                .env("IGGY_TOKEN", valid_token)
+                .env("IGGY_USERNAME", DEFAULT_ROOT_USERNAME)
+                .env("IGGY_PASSWORD", "wrong-password")
+                .arg("me"),
+            EnvTokenScenario::InvalidEnvTokenOverridesEnvCredentials => IggyCmdCommand::new()
+                .env("IGGY_TOKEN", "invalid-token")
+                .env("IGGY_USERNAME", DEFAULT_ROOT_USERNAME)
+                .env("IGGY_PASSWORD", DEFAULT_ROOT_PASSWORD)
+                .arg("me"),
+        }
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        match self.scenario {
+            EnvTokenScenario::InvalidEnvTokenOverridesEnvCredentials => {
+                command_state.failure();
+            }
+            _ => {
+                command_state
+                    .success()
+                    .stdout(starts_with("Executing me command\n"))
+                    .stdout(contains(String::from("Transport | TCP")));
+            }
+        }
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        if self.needs_valid_token() {
+            let token = client.delete_personal_access_token(&self.token_name).await;
+            assert!(token.is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_resolve_iggy_token_with_documented_precedence() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptionsWithEnvToken::new(
+            EnvTokenScenario::TokenOnly,
+            "env-token-only",
+        ))
+        .await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptionsWithEnvToken::new(
+            EnvTokenScenario::FlagTokenOverridesEnvToken,
+            "env-token-flag-override",
+        ))
+        .await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptionsWithEnvToken::new(
+            EnvTokenScenario::EnvTokenOverridesEnvCredentials,
+            "env-token-pair-override",
+        ))
+        .await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptionsWithEnvToken::new(
+            EnvTokenScenario::InvalidEnvTokenOverridesEnvCredentials,
+            "env-token-invalid",
+        ))
         .await;
 }

@@ -199,6 +199,8 @@ Options:
 
   -u, --username <USERNAME>
           Iggy server username
+{CLAP_INDENT}
+          Can also be provided with the IGGY_USERNAME environment variable.
 
   -p, --password <PASSWORD>
           Iggy server password
@@ -206,9 +208,16 @@ Options:
           An optional parameter to specify the password for authentication.
           If not provided, user will be prompted interactively to enter the
           password securely.
+{CLAP_INDENT}
+          Can also be provided with the IGGY_PASSWORD environment variable.
 
   -t, --token <TOKEN>
           Iggy server personal access token
+{CLAP_INDENT}
+          Can also be provided with the IGGY_TOKEN environment variable.
+          Command line credentials take precedence over the environment
+          variables, and IGGY_TOKEN takes precedence over IGGY_USERNAME and
+          IGGY_PASSWORD.
 
   -n, --token-name <TOKEN_NAME>
           Iggy server personal access token name
