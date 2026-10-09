@@ -374,8 +374,10 @@ Three further conditions fail a batch:
 
   A publish can also fail for a fault that is not the frame's own: a terminal
   rejection of an earlier frame latches the connection, and a full dictionary
-  belongs to it. The buffer is intact in both cases, so the connector borrows
-  a fresh connection and re-flushes that window once before giving it up.
+  belongs to it. The connector does not re-send that window on a fresh
+  connection. It fails the chunk, names the window's messages in the `error`
+  line above, and returns the connection, which the client then retires, so
+  the next chunk starts on a fresh one.
 
 `flush_timeout` also sets the worst-case shutdown delay. The runtime allows a
 sink five seconds to stop, and does not interrupt a flush that is already in
