@@ -457,6 +457,9 @@ runs:
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
         PKG_CONFIG_ALL_STATIC: "1"
+        # liblzma-sys links the system liblzma when pkg-config reports 5.8 or
+        # newer, and the glibc library dir it adds shadows the musl libc.
+        LZMA_API_STATIC: "1"
 
     # macOS builds
     - name: Build macOS aarch64

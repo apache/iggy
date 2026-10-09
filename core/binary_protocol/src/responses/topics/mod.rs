@@ -19,7 +19,6 @@ mod create_topic;
 mod delete_topic;
 pub mod get_topic;
 pub mod get_topics;
-mod purge_topic;
 mod update_topic;
 
 pub use super::EmptyResponse;
@@ -27,5 +26,4 @@ pub use create_topic::CreateTopicResponse;
 pub use delete_topic::DeleteTopicResponse;
 pub use get_topic::{GetTopicResponse, PartitionResponse};
 pub use get_topics::GetTopicsResponse;
-pub use purge_topic::PurgeTopicResponse;
 pub use update_topic::UpdateTopicResponse;

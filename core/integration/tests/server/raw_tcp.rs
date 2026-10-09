@@ -98,7 +98,11 @@ pub(crate) fn non_replicated_header(
 }
 
 pub(crate) async fn write_frame(stream: &mut TcpStream, header: &RequestHeader, body: &[u8]) {
-    stream.write_all(bytemuck::bytes_of(header)).await.unwrap();
+    write_raw_frame(stream, bytemuck::bytes_of(header), body).await;
+}
+
+async fn write_raw_frame(stream: &mut TcpStream, header: &[u8], body: &[u8]) {
+    stream.write_all(header).await.unwrap();
     if !body.is_empty() {
         stream.write_all(body).await.unwrap();
     }
@@ -121,7 +125,17 @@ pub(crate) async fn exchange(
     header: &RequestHeader,
     body: &[u8],
 ) -> ([u8; HEADER_SIZE], Vec<u8>) {
-    write_frame(stream, header, body).await;
+    exchange_raw(stream, bytemuck::bytes_of(header), body).await
+}
+
+/// [`exchange`] for a header that [`RequestHeader`] cannot hold, such as one
+/// whose operation byte this build does not declare.
+pub(crate) async fn exchange_raw(
+    stream: &mut TcpStream,
+    header: &[u8],
+    body: &[u8],
+) -> ([u8; HEADER_SIZE], Vec<u8>) {
+    write_raw_frame(stream, header, body).await;
     let reply_header = read_frame_header(stream).await;
     let command = frame_command(&reply_header);
     assert_eq!(
