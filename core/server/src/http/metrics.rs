@@ -21,10 +21,12 @@
 //! other route handlers so this leaf never imports the state hub.
 
 use std::fmt::Write;
+use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use configs::http::HttpMetricsConfig;
-use iggy_common::{DEFAULT_MAX_TOPIC_SIZE, IggyError, MaxTopicSize, stats_rollup_underflows};
+use iggy_common::{IggyError, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::{
@@ -35,8 +37,6 @@ use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 use tracing::error;
-
-use crate::segment_cleaner::resolve_max_topic_size;
 
 /// Exports the process-wide clamped-rollup count as a counter series, read at
 /// encode time rather than mirrored into one.
@@ -82,7 +82,7 @@ impl Collector for StatsRollupUnderflows {
 }
 
 /// One topic's usage as the scrape handler sampled it from the streams STM.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(in crate::http) struct TopicUsageSample {
     pub(in crate::http) stream: Arc<str>,
     pub(in crate::http) topic: Arc<str>,
@@ -91,15 +91,6 @@ pub(in crate::http) struct TopicUsageSample {
     /// `None` for an uncapped topic, so its series is absent rather than 0 and
     /// `topic_size_bytes / topic_max_size_bytes` never yields `+Inf`.
     pub(in crate::http) max_size_bytes: Option<u64>,
-}
-
-impl TopicUsageSample {
-    /// `ServerDefault` resolves against the node default the way the segment
-    /// cleaner does. The cleaner enforces a per-partition share on sealed
-    /// segments only, so `topic_size_bytes` can sit at or above this cap.
-    pub(in crate::http) fn max_size_bytes(max_topic_size: MaxTopicSize) -> Option<u64> {
-        resolve_max_topic_size(max_topic_size, DEFAULT_MAX_TOPIC_SIZE)
-    }
 }
 
 /// Per-topic `{stream, topic}` series, replaced wholesale on every scrape so a
@@ -116,6 +107,10 @@ pub(in crate::http) struct TopicUsage {
 impl TopicUsage {
     pub(in crate::http) fn replace(&self, samples: Vec<TopicUsageSample>) {
         *self.samples.lock().unwrap_or_else(PoisonError::into_inner) = samples;
+    }
+
+    fn take(&self) -> Vec<TopicUsageSample> {
+        mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -139,7 +134,10 @@ impl Collector for TopicUsage {
         encode_topic_gauge(
             &mut encoder,
             "topic_max_size_bytes",
-            "configured size cap of the topic in bytes, absent when unlimited; enforced per partition on sealed segments",
+            concat!(
+                "configured size cap of the topic in bytes, absent when unlimited; ",
+                "retention may keep more",
+            ),
             &samples,
             |sample| sample.max_size_bytes,
         )
@@ -173,6 +171,9 @@ struct EscapedLabelValue<'a>(&'a str);
 
 impl EncodeLabelValue for EscapedLabelValue<'_> {
     fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        if !self.0.contains(['\\', '"', '\n']) {
+            return encoder.write_str(self.0);
+        }
         for character in self.0.chars() {
             match character {
                 '\\' => encoder.write_str("\\\\")?,
@@ -203,6 +204,7 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
     pub(in crate::http) topic_usage: TopicUsage,
+    last_output_len: AtomicUsize,
 }
 
 impl HttpMetrics {
@@ -261,6 +263,7 @@ impl HttpMetrics {
             users,
             clients,
             topic_usage,
+            last_output_len: AtomicUsize::new(0),
         }
     }
 
@@ -271,10 +274,16 @@ impl HttpMetrics {
     }
 
     pub(in crate::http) fn formatted_output(&self) -> String {
-        let mut buffer = String::new();
+        let last = self.last_output_len.load(Ordering::Relaxed);
+        let mut buffer = String::with_capacity(last + last / 8);
         if let Err(error) = encode(&mut buffer, &self.registry) {
             error!(%error, "failed to encode metrics");
         }
+        // The scrape handler refills the snapshot before every encode, so
+        // holding it past this point only pins every topic name until the
+        // next scrape.
+        drop(self.topic_usage.take());
+        self.last_output_len.store(buffer.len(), Ordering::Relaxed);
         buffer
     }
 }
@@ -489,6 +498,24 @@ mod tests {
     }
 
     #[test]
+    fn given_encoded_snapshot_when_scraping_again_without_refill_should_not_retain_it() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("orders", "eu", None)]);
+        let first = metrics.formatted_output();
+        assert!(
+            first.contains(r#"topic="eu""#),
+            "the snapshot must be encoded before it is released:\n{first}"
+        );
+        let second = metrics.formatted_output();
+        assert!(
+            !second.contains(r#"topic="eu""#),
+            "the snapshot must not outlive the scrape that encoded it:\n{second}"
+        );
+    }
+
+    #[test]
     fn given_name_with_exposition_syntax_when_encoding_should_escape_it() {
         let metrics = HttpMetrics::init(&[]);
         metrics
@@ -498,23 +525,6 @@ mod tests {
         assert!(
             output.contains(r#"topic_messages{stream="a\"b",topic="c\\d\ne"} 20"#),
             "label values must be escaped:\n{output}"
-        );
-    }
-
-    #[test]
-    fn given_max_topic_size_variants_when_resolving_should_export_only_a_finite_cap() {
-        assert_eq!(
-            TopicUsageSample::max_size_bytes(MaxTopicSize::from(1024)),
-            Some(1024)
-        );
-        assert_eq!(
-            TopicUsageSample::max_size_bytes(MaxTopicSize::Unlimited),
-            None
-        );
-        // The shipped node default is unlimited.
-        assert_eq!(
-            TopicUsageSample::max_size_bytes(MaxTopicSize::ServerDefault),
-            None
         );
     }
 

@@ -191,7 +191,9 @@ enabled = true
 
 # Specifies the endpoint for accessing metrics, e.g., "/metrics".
 # This route requires authentication like every other read: scrapers must
-# present a bearer credential (JWT or personal access token).
+# present a bearer credential (JWT or personal access token). Any
+# authenticated user gets the aggregate gauges; the per-topic series are
+# exported only to users with the read_servers or manage_servers permission.
 endpoint = "/metrics"
 
 # TLS (Transport Layer Security) configuration for HTTP.
