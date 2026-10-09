@@ -629,6 +629,47 @@ async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harn
     );
 }
 
+#[iggy_harness]
+async fn given_purge_paths_when_deleting_should_answer_404_and_keep_messages(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-purge-paths", "kept", 1)
+        .await;
+    let messages = vec![text_message(1, "kept".to_string())];
+    let response = http
+        .produce("http-purge-paths", "kept", PARTITION_ID, messages)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+
+    for path in [
+        "/streams/http-purge-paths/purge",
+        "/streams/http-purge-paths/topics/kept/purge",
+    ] {
+        let response = http
+            .client
+            .delete(http.url(path))
+            .bearer_auth(&http.token)
+            .send()
+            .await
+            .expect("delete purge path request");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must match no route"
+        );
+    }
+
+    let polled = http
+        .poll("http-purge-paths", "kept", PARTITION_ID, 0, 10)
+        .await;
+    assert_eq!(polled.messages.len(), 1, "the topic must keep its message");
+}
+
 /// A store of an out-of-range consumer offset is denied by the partition
 /// primary at admission and must answer a typed 400, NOT a silent 204.
 /// Regression guard: the deny once rode the result-body result section with

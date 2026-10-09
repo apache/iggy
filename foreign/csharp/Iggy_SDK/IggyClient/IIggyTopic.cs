@@ -109,17 +109,4 @@ public interface IIggyTopic
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
     Task DeleteTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default);
-
-    /// <summary>
-    ///     Purges all messages from a topic while keeping the topic and its partitions intact.
-    /// </summary>
-    /// <remarks>
-    ///     This operation removes all messages from all partitions within the topic.
-    ///     The topic structure remains intact, allowing new messages to be published afterwards.
-    /// </remarks>
-    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
-    /// <param name="topicId">The identifier of the topic to purge (numeric ID or name).</param>
-    /// <param name="token">The cancellation token to cancel the operation.</param>
-    /// <returns>A task that represents the asynchronous operation.</returns>
-    Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default);
 }

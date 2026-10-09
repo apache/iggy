@@ -245,7 +245,6 @@ pub struct ShardMetrics {
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
-    partition_repair_serves_deferred_purge_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
@@ -322,7 +321,6 @@ impl ShardMetrics {
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
-            partition_repair_serves_deferred_purge_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
@@ -705,23 +703,6 @@ impl ShardMetrics {
         self.partition_requests_denied_transient_total.get()
     }
 
-    /// Bumped every time this replica declines to serve or complete a partition
-    /// repair because a committed purge has not applied locally yet. One or two
-    /// per rejoin is the normal convergence window; a sustained climb means the
-    /// purge never landed, and the requester is spinning its stall retry with
-    /// nothing but a `debug!` to show for it.
-    pub fn record_partition_repair_serve_deferred(&self) {
-        self.partition_repair_serves_deferred_purge_total.inc();
-    }
-
-    /// Snapshot of `partition_repair_serves_deferred_purge_total`.
-    /// Test/simulator accessor.
-    #[cfg(any(test, feature = "simulator"))]
-    #[must_use]
-    pub fn partition_repair_serves_deferred_purge_value(&self) -> u64 {
-        self.partition_repair_serves_deferred_purge_total.get()
-    }
-
     /// Add the prepares a partition's backup gap check destroyed since the last
     /// sweep. Drained per tick from `IggyPartition::take_prepare_gap_drops`,
     /// and once more when `ConfirmRemove` drops the partition: a tombstoned
@@ -915,11 +896,6 @@ impl ShardMetrics {
             "partition_requests_denied_transient",
             "partition requests answered with a retriable transient denial",
             self.partition_requests_denied_transient_total.clone(),
-        );
-        registry.register(
-            "partition_repair_serves_deferred_purge",
-            "partition repair serves or completions deferred until a committed purge applies",
-            self.partition_repair_serves_deferred_purge_total.clone(),
         );
         registry.register(
             "partition_prepare_gap_drops",

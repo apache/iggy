@@ -1023,7 +1023,7 @@ mod tests {
         assert_eq!(router.poll(&coordinator, &request).await.unwrap(), "first");
         let metadata_reply = ReplyHeader {
             command: Command::Reply,
-            operation: Operation::PurgeTopic,
+            operation: Operation::DeleteTopic,
             size: u32::try_from(HEADER_SIZE).unwrap(),
             commit: 11,
             ..Default::default()

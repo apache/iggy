@@ -28,9 +28,7 @@
 //! partition-specific payload handling on either end.
 
 use crate::IggyPartition;
-use crate::offset_storage::{
-    PURGE_GENERATION_FILE, discard_offset_replacement, stage_offset_replacement,
-};
+use crate::offset_storage::{discard_offset_replacement, stage_offset_replacement};
 use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::types::PartitionsConfig;
@@ -64,7 +62,8 @@ use std::sync::atomic::Ordering;
 
 /// Current state-transfer offsets format, including the prepare-chain anchor.
 pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 4;
+/// Version 6 dropped the purge generation that followed the version byte.
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 6;
 pub(crate) const SEGMENT_SWEEP_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const RETRY_CHECKPOINT_MAGIC: [u8; 4] = *b"IRP2";
@@ -238,9 +237,9 @@ pub struct StagedSegmentMeta {
 /// Keyed per segment rather than per `(base offset, size)` pair so the ACTIVE
 /// segment extends its own hasher as it grows, instead of missing the memo on
 /// every byte it gained and re-reading from byte zero. Every path that plants a
-/// new file at an existing base offset (purge, install, converge) clears the
-/// whole map, which is what makes "same base offset, longer file, same leading
-/// bytes" hold.
+/// new file at an existing base offset (install, converge) clears the whole
+/// map, which is what makes "same base offset, longer file, same leading bytes"
+/// hold.
 pub(crate) struct SegmentChecksumMemo {
     hashed_len: u64,
     /// The stamp is NOT cached alongside: `StateArtifactHasher::finish` takes
@@ -297,18 +296,12 @@ impl StagedSegmentMeta {
     }
 }
 
-/// The consumer-offset artifact: the offsets of every kind plus the applied
-/// purge generation, at the offer's `commit_op`.
-///
-/// The purge generation rides here because a receiver that missed a
-/// `PurgeTopic` would otherwise install post-purge data at a stale local
-/// generation and the reconciler would immediately re-wipe it, costing a
-/// full extra transfer.
+/// The consumer-offset artifact: the offsets of every kind at the offer's
+/// `commit_op`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ConsumerOffsetsWire {
     pub dedup_capacity: usize,
     pub required_metadata_frontier: u64,
-    pub purge_generation: u64,
     /// Checksum of the prepare at the offer's committed operation.
     pub prepare_checksum: Option<u128>,
     pub checkpoint_prepare: Vec<u8>,
@@ -332,7 +325,7 @@ pub(crate) struct ConsumerOffsetsWire {
 }
 
 impl ConsumerOffsetsWire {
-    /// Encode: `magic | version u8 | purge_generation u64 | next_offset u64 |
+    /// Encode: `magic | version u8 | next_offset u64 |
     /// required_metadata_frontier u64 | dedup_capacity u32 |
     /// consumer_count u32 | group_count u32 | external_group_count u32 |
     /// dedup_count u32 | {id u32, offset u64}xN | {id u32, offset u64}xM |
@@ -348,7 +341,7 @@ impl ConsumerOffsetsWire {
         // arithmetic honest as fields are added.
         let reserved = CONSUMER_OFFSETS_MAGIC.len()
             + size_of::<u8>()
-            + 3 * size_of::<u64>()
+            + 2 * size_of::<u64>()
             + (sections.len() + 2) * size_of::<u32>()
             + sections.iter().map(|entries| entries.len()).sum::<usize>()
                 * (size_of::<u32>() + size_of::<u64>())
@@ -366,7 +359,6 @@ impl ConsumerOffsetsWire {
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
         out.push(CONSUMER_OFFSETS_VERSION);
-        out.extend_from_slice(&self.purge_generation.to_le_bytes());
         out.extend_from_slice(&self.next_offset.to_le_bytes());
         out.extend_from_slice(&self.required_metadata_frontier.to_le_bytes());
         out.extend_from_slice(
@@ -440,7 +432,6 @@ impl ConsumerOffsetsWire {
         if version != CONSUMER_OFFSETS_VERSION {
             return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
         }
-        let purge_generation = cursor.u64()?;
         let next_offset = cursor.u64()?;
         let required_metadata_frontier = cursor.u64()?;
         let dedup_capacity = cursor.u32()? as usize;
@@ -486,7 +477,6 @@ impl ConsumerOffsetsWire {
         Ok(Self {
             dedup_capacity,
             required_metadata_frontier,
-            purge_generation,
             prepare_checksum,
             checkpoint_prepare,
             next_offset,
@@ -796,7 +786,6 @@ mod tests {
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 3,
             next_offset: 43,
             consumers: vec![(1, 10), (7, 42)],
             groups: vec![(2, 5)],
@@ -887,7 +876,6 @@ mod tests {
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
@@ -944,15 +932,14 @@ mod tests {
         // of place. One entry per section makes each length cover the header,
         // every count field and every entry stride. Changing a length is the
         // reminder to change its version.
-        const WITHOUT_EXTERNAL_LEN: usize = 422;
-        const WITH_EXTERNAL_LEN: usize = 434;
+        const WITHOUT_EXTERNAL_LEN: usize = 414;
+        const WITH_EXTERNAL_LEN: usize = 426;
 
         let with_external = ConsumerOffsetsWire {
             dedup_capacity: consensus::CLIENTS_TABLE_MAX,
             required_metadata_frontier: 0,
             prepare_checksum: Some(1),
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
             consumers: vec![(1, 0)],
             groups: vec![(1, 0)],
@@ -976,7 +963,7 @@ mod tests {
             );
         }
         assert_eq!(
-            CONSUMER_OFFSETS_VERSION, 4,
+            CONSUMER_OFFSETS_VERSION, 6,
             "a consumer-offsets version moved; confirm its layout moved with it"
         );
     }
@@ -992,7 +979,8 @@ mod tests {
         let mut released = Vec::new();
         released.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
         released.push(1);
-        released.extend_from_slice(&wire.purge_generation.to_le_bytes());
+        // 0.9.0 wrote its purge generation here.
+        released.extend_from_slice(&0u64.to_le_bytes());
         released.extend_from_slice(&wire.next_offset.to_le_bytes());
         for count in [wire.consumers.len(), wire.groups.len(), wire.dedup.len()] {
             released.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
@@ -1056,7 +1044,6 @@ mod tests {
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
@@ -1076,7 +1063,6 @@ mod tests {
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
@@ -1111,7 +1097,6 @@ mod tests {
         bytes.push(CONSUMER_OFFSETS_VERSION);
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -1138,7 +1123,6 @@ mod tests {
         bytes.push(CONSUMER_OFFSETS_VERSION);
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -1157,7 +1141,6 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
         bytes.push(CONSUMER_OFFSETS_VERSION);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
@@ -1184,7 +1167,6 @@ mod tests {
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
             consumers: vec![(5, 1), (5, 2)],
             groups: Vec::new(),
@@ -1203,7 +1185,6 @@ mod tests {
             required_metadata_frontier: 0,
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
-            purge_generation: 0,
             next_offset: 0,
             consumers: Vec::new(),
             groups: vec![(9, 1), (4, 2)],
@@ -1516,10 +1497,6 @@ impl PartitionStateTransferOffer {
 /// these lengths, so hash rounds that span them still describe `commit_op`.
 pub(crate) struct TransferPlan {
     commit_op: u64,
-    /// A purge truncates every file and restarts the offset space, so a size
-    /// that grew back past its planned length would pass the size re-check
-    /// while the stamps describe post-purge bytes at pre-purge offsets.
-    purge_generation: u64,
     /// `(start_offset, len, log_path)` of each non-empty segment.
     segments: Vec<(u64, u64, String)>,
     offsets: ConsumerOffsetsWire,
@@ -1672,7 +1649,7 @@ impl fmt::Display for PartitionTransferUnavailable {
 impl std::error::Error for PartitionTransferUnavailable {}
 
 /// Outcome of a completed install. Offset files must land before the installed
-/// commit floor advances. A failed purge-generation record remains retryable.
+/// commit floor advances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionInstallOutcome {
     /// The consensus op the install applied. Named for what it holds: every
@@ -1681,9 +1658,6 @@ pub struct PartitionInstallOutcome {
     /// `installed_frontier`), and op-vs-offset confusion is what produced this
     /// PR's durability defects.
     pub applied_commit_op: u64,
-    /// The offered purge generation was already recorded or persisted during
-    /// this install. False means a restart may repeat the purge and transfer.
-    pub purge_generation_recorded: bool,
 }
 
 /// Failure installing a transferred partition state.
@@ -1769,10 +1743,8 @@ pub enum PartitionInstallError {
         source: iggy_common::IggyError,
         /// The offer's frontier, carried because the LIVE counter is not it on
         /// this path: a mutate failure can leave the counter at its pre-install
-        /// value, and under an advancing purge generation that value is above
-        /// the group's. The fence records this instead, or it would stamp the
-        /// stale counter over the reset the install already made and then
-        /// quarantine the segments that would have contradicted it.
+        /// value, which can lag the group's. The fence records this instead of
+        /// the stale counter.
         frontier: u64,
     },
 }
@@ -1881,7 +1853,7 @@ pub(crate) async fn segment_dir_entries(partition_dir: &str) -> std::io::Result<
 }
 
 /// Remove physical tails outside the logical segment list after draining the WAL.
-/// The owner has settled its writers and published a purge or install backup.
+/// The owner has settled its writers and published an install backup.
 pub(crate) async fn remove_public_segment_files(partition_dir: &str) -> std::io::Result<()> {
     let directory = PathBuf::from(partition_dir);
     run_blocking("iggy-segment-sweep", move || {
@@ -2038,10 +2010,10 @@ pub async fn quarantine_partition_files(
 /// function -- it deletes the live chain as well and must propagate its
 /// errors.
 /// Do NOT widen this predicate to the quarantine's four-suffix list if the two
-/// are ever unified: the keep-lists callers pass hold staging paths only (purge
-/// passes none), so a wider filter would unlink every live `.log` and `.index`
-/// on the partition -- worst at the reuse scan, which runs at descriptor-accept
-/// on a serving partition.
+/// are ever unified: the keep-lists callers pass hold staging paths only, so a
+/// wider filter would unlink every live `.log` and `.index` on the partition --
+/// worst at the reuse scan, which runs at descriptor-accept on a serving
+/// partition.
 pub(crate) async fn sweep_staging_except(partition_dir: &str, keep: HashSet<PathBuf>) {
     let partition_dir = partition_dir.to_owned();
     let _ = run_blocking("iggy-staging-sweep", move || {
@@ -2119,7 +2091,6 @@ pub(crate) struct PendingInstall {
     offsets_wire: ConsumerOffsetsWire,
     planned_offsets: Vec<PlannedOffsetWrite>,
     next_offset: u64,
-    purge_advances: bool,
     phase: InstallPhase,
     drain: Option<crate::PersistenceDrain>,
     directory_handle: Option<compio::fs::File>,
@@ -2130,7 +2101,6 @@ pub(crate) struct PendingInstall {
     retry_checkpoint: Vec<u8>,
     failure: Option<PartitionInstallError>,
     disposition: InstallDisposition,
-    purge_generation_recorded: bool,
 }
 
 enum InstallDisposition {
@@ -2155,7 +2125,6 @@ enum InstallPhase {
     CommitOffsets(usize),
     OffsetDirectories,
     Publish,
-    PurgeGeneration,
     RetryCheckpoint,
     WalReset,
     ResetDraining,
@@ -2184,7 +2153,6 @@ enum InstallFilePhase {
     OldOffsets(ConsumerKind),
     CommitOffsets { start: usize, end: usize },
     OffsetDirectories,
-    PurgeGeneration,
     RetryCheckpoint,
     ReclaimRetry,
     FinishBackup,
@@ -2420,10 +2388,10 @@ where
         }
 
         // Re-validate the chain under the lock: the plan outlives the rounds
-        // that hash it, so GC could have unlinked a sealed segment or a purge
-        // could have planted a fresh file at a planned path. Every stamp would
-        // then describe bytes the offer no longer addresses, so refuse and let
-        // the requester ask again against the chain that exists now.
+        // that hash it, so GC could have unlinked a sealed segment or a
+        // replaced file could stand at a planned path. Every stamp would then
+        // describe bytes the offer no longer addresses, so refuse and let the
+        // requester ask again against the chain that exists now.
         {
             let write_lock = self.write_lock.clone();
             let _guard = write_lock.lock().await;
@@ -2435,11 +2403,10 @@ where
                 .collect();
             // Append-only within a segment instance, so a live size BELOW the
             // planned one means the file was replaced rather than extended.
-            let changed = plan.purge_generation != self.applied_purge_generation
-                || planned.iter().any(|(start_offset, size, _)| {
-                    live.get(start_offset)
-                        .is_none_or(|live_size| live_size < size)
-                });
+            let changed = planned.iter().any(|(start_offset, size, _)| {
+                live.get(start_offset)
+                    .is_none_or(|live_size| live_size < size)
+            });
             if changed {
                 return Err(PartitionTransferUnavailable::SegmentSetChanged);
             }
@@ -2466,17 +2433,12 @@ where
         }
 
         // An empty chain at frontier 0 tells the receiver to unlink its own, so
-        // serve it only when a recorded purge says the emptiness is the truth.
-        // Offset-only ops, such as external group commits, move the commit
-        // floor without a message, so a replica holding zero bytes passes the
-        // `NothingCommitted` gate above. Its empty chain would let a receiver at
-        // frontier 0 claim a history that neither replica holds.
-        // `install_state_transfer`'s `purge_advances` check re-decides the purge
-        // against the metadata plane and refuses the rest.
-        if segments.is_empty()
-            && plan.offsets.next_offset == 0
-            && plan.offsets.purge_generation == 0
-        {
+        // never serve one. Offset-only ops, such as external group commits,
+        // move the commit floor without a message, so a replica holding zero
+        // bytes passes the `NothingCommitted` gate above. Its empty chain would
+        // let a receiver at frontier 0 claim a history that neither replica
+        // holds.
+        if segments.is_empty() && plan.offsets.next_offset == 0 {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
         let offsets_bytes = Rc::new(plan.offsets.encode());
@@ -2516,7 +2478,6 @@ where
         }
         Ok(TransferPlan {
             commit_op: self.consensus().commit_min(),
-            purge_generation: self.applied_purge_generation,
             segments,
             offsets: self.offsets_wire_snapshot()?,
         })
@@ -2718,7 +2679,6 @@ where
             },
             checkpoint_prepare,
             prepare_checksum,
-            purge_generation: self.applied_purge_generation,
             next_offset,
             consumers,
             groups,
@@ -2971,19 +2931,13 @@ where
         commit_op: u64,
         staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
-        committed_purge_generation: u64,
         peer: u8,
     ) -> Result<(), PartitionInstallError> {
         if self.is_shutting_down() {
             return Err(PartitionInstallError::ShuttingDown);
         }
-        let pending = self.prepare_state_transfer_install(
-            commit_op,
-            staged,
-            offsets_bytes,
-            committed_purge_generation,
-            peer,
-        )?;
+        let pending =
+            self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -3079,12 +3033,12 @@ where
             }
             InstallPhase::Frontier => {
                 let frontier = install.offsets_wire.next_offset;
-                let intent = if install.purge_advances {
-                    crate::iggy_partition::SuperblockIntent::Reset(frontier)
-                } else {
-                    crate::iggy_partition::SuperblockIntent::Install(frontier)
-                };
-                match self.transition_superblock(intent).await {
+                match self
+                    .transition_superblock(crate::iggy_partition::SuperblockIntent::Install(
+                        frontier,
+                    ))
+                    .await
+                {
                     crate::PartitionIoVerdict::Pending => step = crate::PartitionIoStep::Pending,
                     crate::PartitionIoVerdict::Failed => self.fail_install(
                         &mut install,
@@ -3134,24 +3088,12 @@ where
             }
             InstallPhase::Publish => {
                 self.publish_installed_state(&mut install);
-                install.phase = InstallPhase::PurgeGeneration;
-            }
-            InstallPhase::PurgeGeneration
-                if install.offsets_wire.purge_generation <= self.applied_purge_generation =>
-            {
                 install.phase = InstallPhase::RetryCheckpoint;
             }
             InstallPhase::RetryCheckpoint if self.persistence.is_none() => {
                 install.phase = InstallPhase::WalReset;
             }
             InstallPhase::WalReset => {
-                self.applied_purge_generation = self
-                    .applied_purge_generation
-                    .max(install.offsets_wire.purge_generation);
-                self.purge_deferred = false;
-                // The chain an unrecorded purge reset is gone, so a purge still
-                // owed here has to run whole.
-                self.unrecorded_purge_generation = None;
                 if let Some(persistence) = &self.persistence {
                     let prepare =
                         (!install.offsets_wire.checkpoint_prepare.is_empty()).then(|| {
@@ -3253,7 +3195,6 @@ where
                     || {
                         Ok(PartitionInstallOutcome {
                             applied_commit_op: install.commit_op,
-                            purge_generation_recorded: install.purge_generation_recorded,
                         })
                     },
                     Err,
@@ -3495,14 +3436,6 @@ where
                     InstallFilePhase::OffsetDirectories,
                 )
             }
-            InstallPhase::PurgeGeneration => (
-                crate::PartitionIoJob::PurgeGeneration {
-                    path: format!("{}/{PURGE_GENERATION_FILE}", install.partition_dir),
-                    generation: install.offsets_wire.purge_generation,
-                    revision: self.created_revision,
-                },
-                InstallFilePhase::PurgeGeneration,
-            ),
             InstallPhase::FinishBackup => (
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
@@ -3653,7 +3586,7 @@ where
                 }),
             (
                 InstallPhase::Submitted(InstallFilePhase::OldOffsets(consumer_kind)),
-                crate::PartitionIoResult::PurgeOffsets(outcome),
+                crate::PartitionIoResult::OffsetCleanup(outcome),
             ) => {
                 let kind = consumer_kind.index();
                 let capacity = self.consumer_offset_capacity_for(consumer_kind);
@@ -3700,16 +3633,6 @@ where
                         source: std::io::Error::other("consumer offset directory sync failed"),
                     })
                 }),
-            (
-                InstallPhase::Submitted(InstallFilePhase::PurgeGeneration),
-                crate::PartitionIoResult::PurgeGeneration(outcome),
-            ) => {
-                if let Err(error) = outcome {
-                    tracing::warn!(%error, "installed purge generation could not be recorded");
-                    install.purge_generation_recorded = false;
-                }
-                Ok(InstallPhase::RetryCheckpoint)
-            }
             (
                 InstallPhase::Submitted(InstallFilePhase::RetryCheckpoint),
                 crate::PartitionIoResult::RetryCheckpoint(outcome),
@@ -3872,9 +3795,6 @@ where
         self.invalidate_poll_history();
         self.log.invalidate_sealed_read_state();
         while self.log.retire_front().is_some() {}
-        // Same as a completed install: no chain an unrecorded purge reset
-        // survives this, so a purge still owed here has to run whole.
-        self.unrecorded_purge_generation = None;
         self.clear_install_journal();
         self.clear_install_offsets();
         self.segment_checksum_cache.borrow_mut().clear();
@@ -3900,7 +3820,6 @@ where
         commit_op: u64,
         mut staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
-        committed_purge_generation: u64,
         peer: u8,
     ) -> Result<PendingInstall, PartitionInstallError> {
         // ---- check phase: nothing below may mutate live state. Staging
@@ -3980,27 +3899,8 @@ where
         // `stamp_prepare_for_persistence` overwrites `base_offset` from this
         // counter and recomputes `batch_checksum` over it, so a rewound
         // counter persists different bytes and a different checksum on this
-        // replica than on the rest of the group. A purge is the one
-        // legitimate rewind, and the artifact carries the generation that
-        // proves one happened.
-        // Against the METADATA plane's committed generation, which the caller
-        // reads off durable state, NOT against `self.applied_purge_generation`:
-        // that one hydrates from `purge.gen`, which a kill before the purge's
-        // record step leaves absent or stale, so a post-restart rejoin of an
-        // ever-purged topic could see `offered > applied` and call it an
-        // advancing purge. That is the canonical rejoin, and treating it as a
-        // purge disables the `OfferRewindsDurableData` refusal below -- the
-        // one guard standing between an offer that rewinds this replica's
-        // offset space and its durable data.
-        // Second disjunct: this replica has NOT applied the committed purge, so
-        // its frontier still measures the pre-purge offset space and cannot be
-        // compared against a post-purge offer. Restricted to `next_offset == 0`
-        // -- the state a purge leaves before anything is appended -- so an
-        // origin that merely lags within the same purge era still fails the
-        // fence rather than rewinding this replica's durable post-purge data.
-        let purge_advances = offsets_wire.purge_generation > committed_purge_generation
-            || (self.applied_purge_generation < committed_purge_generation
-                && offsets_wire.next_offset == 0);
+        // replica than on the rest of the group.
+        //
         // The COMMITTED frontier, which is what an offer is comparable against:
         // `held_offset_frontier` reads 0 for a chain installed empty at frontier
         // N (its disk arm filters empty segments and the install clears the
@@ -4009,8 +3909,7 @@ where
         // point is not usable either -- it can stand a lease block high -- but
         // only on a solo group, which never receives an offer.
         let local_next_offset = self.offset_frontier();
-        if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
-        {
+        if local_next_offset > 0 && offsets_wire.next_offset < local_next_offset {
             return Err(PartitionInstallError::OfferRewindsDurableData {
                 offer_next_offset: offsets_wire.next_offset,
                 local_next_offset,
@@ -4030,7 +3929,7 @@ where
             .into_iter()
             .map(|kind| self.durable_consumer_offsets.count(kind))
             .sum();
-        if !purge_advances && offer_holds_nothing && local_offsets > 0 {
+        if offer_holds_nothing && local_offsets > 0 {
             return Err(PartitionInstallError::OfferErasesDurableOffsets { local_offsets });
         }
         staged.sort_unstable_by_key(|meta| meta.start_offset);
@@ -4071,7 +3970,6 @@ where
             offsets_wire,
             planned_offsets,
             next_offset,
-            purge_advances,
             phase: InstallPhase::StageOffsets(0),
             drain: None,
             directory_handle: None,
@@ -4080,7 +3978,6 @@ where
             retry_checkpoint,
             failure: None,
             disposition: InstallDisposition::Prepared,
-            purge_generation_recorded: true,
         })
     }
 
@@ -4094,16 +3991,10 @@ where
         commit_op: u64,
         staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
-        committed_purge_generation: u64,
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         let peer = self.consensus().primary_index(self.consensus().view());
-        let pending = self.prepare_state_transfer_install(
-            commit_op,
-            staged,
-            offsets_bytes,
-            committed_purge_generation,
-            peer,
-        )?;
+        let pending =
+            self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4374,21 +4265,6 @@ async fn verify_state_artifact_yielding(entry: &consensus::StateArtifact, bytes:
         yield_to_reactor().await;
     }
     hasher.finish() == entry.checksum
-}
-
-/// The purge generation an encoded consumer-offsets artifact carries, or `0`
-/// when it cannot be decoded.
-///
-/// Lets the shard refuse an offer built BEFORE a committed purge without
-/// duplicating the wire codec: the install's own generation handling only ever
-/// widens permission, so a stale offer would resurrect purged data with the
-/// local applied generation left at the newer value, which the reconciler's
-/// re-wipe gate then reads as "already applied".
-#[must_use]
-pub fn offered_purge_generation(offsets_bytes: &[u8]) -> u64 {
-    ConsumerOffsetsWire::decode(offsets_bytes)
-        .map(|wire| wire.purge_generation)
-        .unwrap_or_default()
 }
 
 pub(crate) fn numeric_offset_id(path: &str) -> Option<u32> {

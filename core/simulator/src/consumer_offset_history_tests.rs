@@ -16,8 +16,8 @@
 // under the License.
 
 //! Queue-history coverage under seeded scheduling and delayed replica replies.
-//! The partition integration test covers actual purge. Here the existing log
-//! reload seam changes history while real shard queues and replication run.
+//! The existing log reload seam changes history while real shard queues and
+//! replication run.
 
 use crate::Simulator;
 use crate::client::SimClient;
@@ -142,8 +142,9 @@ fn history_reload_trace(seed: u64) -> u64 {
     simulator.run_pumps();
 
     // Reinstall the retained log only while every pump is quiescent. This
-    // production helper invalidates the same history identity as purge, while
-    // retaining bytes avoids real filesystem timing in the seeded executor.
+    // production helper invalidates the same history identity as a state
+    // transfer install, while retaining bytes avoids real filesystem timing in
+    // the seeded executor.
     let owner = simulator.replicas[0].partition_shard(namespace);
     let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
     let retained = partition.take_retained_state();

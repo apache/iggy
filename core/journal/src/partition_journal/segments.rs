@@ -357,11 +357,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
 
     pub(super) async fn migrate_segment_prepares(&mut self) -> io::Result<()> {
         if let Some(segments) = self.state.segment_storage
-            && (self
-                .entries
-                .range(..=self.state.purge_floor)
-                .any(|(_, entry)| entry.reference.is_some())
-                || self.segment_migration_needed(segments).await?)
+            && self.segment_migration_needed(segments).await?
         {
             self.rewrite(
                 self.state.checkpoint,
@@ -376,10 +372,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
 
     async fn segment_migration_needed(&self, mut segments: SegmentState) -> io::Result<bool> {
         let mut convertible = false;
-        for (_, entry) in self
-            .entries
-            .range(self.state.purge_floor.saturating_add(1)..)
-        {
+        for entry in self.entries.values() {
             if entry.reference.is_some() {
                 continue;
             }
@@ -534,8 +527,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .find_map(|(&op, entry)| {
                 let reference = entry.reference?;
                 let next_offset = entry.next_offset?;
-                (op > self.state.purge_floor
-                    && op > self.state.checkpoint
+                (op > self.state.checkpoint
                     && next_offset >= segments.checkpoint.position.next_offset)
                     .then_some(SegmentCursor {
                         generation: reference.generation,

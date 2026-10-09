@@ -277,12 +277,12 @@ where
     /// cleared, handle untracked) and reset the sealed LRU. In-flight polls
     /// hold `Rc` clones of these handles, so clearing the slots (not just
     /// dropping the pump's references) is what a suspended walk observes: its
-    /// next segment resolve re-opens by path and sees the current files. Purge
-    /// needs this because it recreates segment files at the paths it just
-    /// unlinked; a stale cached fd would keep serving the purged inodes as
-    /// live data. Retention retirement deliberately skips this: retired paths
-    /// are never recreated, so a cached fd reading the unlinked inode stays
-    /// consistent (see [`Self::retire_front`]).
+    /// next segment resolve re-opens by path and sees the current files.
+    /// Install and converge need this because they recreate segment files at
+    /// the paths they just unlinked; a stale cached fd would keep serving the
+    /// replaced inodes as live data. Retention retirement deliberately skips
+    /// this: retired paths are never recreated, so a cached fd reading the
+    /// unlinked inode stays consistent (see [`Self::retire_front`]).
     pub fn invalidate_sealed_read_state(&mut self) {
         for handle in &self.sealed_read_state {
             handle.tracked.set(false);
@@ -616,8 +616,8 @@ mod tests {
         assert!(log.sealed_lru.is_empty());
         assert!(!log.sealed_read_state()[0].tracked.get());
 
-        // Out-of-range slot (the purge drain window empties the vec across
-        // awaits): must be a no-op, not a panic.
+        // Out-of-range slot (segment removal shrinks the vec across awaits):
+        // must be a no-op, not a panic.
         log.touch_sealed_read_state(1);
         assert!(log.sealed_lru.is_empty());
     }
@@ -643,8 +643,8 @@ mod tests {
         assert!(log.sealed_lru.contains(&5), "other slots are untouched");
         assert!(log.sealed_read_state()[0].index.borrow().is_none());
 
-        // Out-of-range slot (the purge drain window empties the vec across
-        // awaits): a no-op, not a panic.
+        // Out-of-range slot (segment removal shrinks the vec across awaits):
+        // a no-op, not a panic.
         log.reset_read_state(2);
     }
 

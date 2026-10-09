@@ -690,26 +690,6 @@ where
                     }
                 }
             }
-            partitions::PartitionIoStep::PurgeFinished {
-                generation,
-                outcome,
-            } => {
-                self.partition_io.pop_ready(namespace, incarnation);
-                self.drop_partition_transfer_state(namespace, partition);
-                match outcome {
-                    Ok(()) => self.partition_io.reschedule(namespace, incarnation),
-                    Err(
-                        partitions::PurgeError::Unserviceable(error)
-                        | partitions::PurgeError::OffsetsNotDurable(error),
-                    ) => {
-                        tracing::error!(namespace_raw = namespace.inner(), generation, %error, "partition purge failed after mutation");
-                        self.fence_partition_for_rebuild(namespace, partition, Some(0));
-                    }
-                    Err(error) => {
-                        tracing::warn!(namespace_raw = namespace.inner(), generation, %error, "partition purge remains incomplete; reconciler will retry");
-                    }
-                }
-            }
             partitions::PartitionIoStep::ViewApplied { actions, peer } => {
                 if let Some(peer) = peer {
                     self.finish_partition_view_adoption(namespace, peer, actions)
@@ -743,7 +723,6 @@ where
                         if matches!(
                             plan.continuation,
                             partitions::PartitionIoContinuation::Retention
-                                | partitions::PartitionIoContinuation::Purge
                                 | partitions::PartitionIoContinuation::Install
                         ) {
                             self.drop_partition_transfer_state(namespace, partition);
@@ -782,6 +761,7 @@ impl<SB> Drop for InterruptionMarker<SB> {
 mod tests {
     use std::cell::RefCell;
     use std::io;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -802,7 +782,7 @@ mod tests {
         StartViewChangeHeader, StartViewHeader, WireEncode, WireIdentifier,
     };
     use iggy_common::{
-        ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize, IggyError,
+        ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
         IggyTimestamp, PartitionStats, TopicRuntimeOptions, variadic,
     };
     use journal::prepare_journal::PrepareJournal;
@@ -838,118 +818,6 @@ mod tests {
     const TEST_PARTITIONS: usize = 3;
     const REPLY_DEADLINE: Duration = Duration::from_secs(1);
     const TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-    #[compio::test]
-    async fn failed_purge_file_phases_fence_before_readmission() {
-        const STEPS_MAX: usize = 64;
-        #[derive(Clone, Copy, Debug)]
-        enum Failure {
-            Segments,
-            Cleanup,
-            Plant,
-            OffsetDirectory,
-        }
-        for failure_phase in [
-            Failure::Segments,
-            Failure::Cleanup,
-            Failure::Plant,
-            Failure::OffsetDirectory,
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let bus = Rc::new(IggyMessageBus::new(0));
-            let (owner, _sender) = test_owner(&bus, None);
-            let namespace = IggyNamespace::new(0, 0, 0);
-            let partitions = owner.plane.partitions();
-            partitions.set_io_notifier(
-                owner.partition_io.notifier(),
-                owner.partition_io.limits.bytes_max(),
-            );
-            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-            partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
-            partition.open_persistence().await.unwrap();
-            let directories = ["consumers", "groups", "external"]
-                .map(|name| directory.path().join(name).to_str().unwrap().to_owned());
-            for path in &directories {
-                std::fs::create_dir(path).unwrap();
-            }
-            let failed_directory = directories[0].clone();
-            partition.configure_consumer_offset_storage(
-                directories,
-                ConsumerOffsets::with_capacity(1),
-                ConsumerGroupOffsets::with_capacity(1),
-            );
-            assert!(matches!(
-                partition.purge(partitions.config(), 1).await,
-                Err(partitions::PurgeError::Pending)
-            ));
-            let mut failed = false;
-            for _ in 0..STEPS_MAX {
-                let step = partition.resume_io(partitions.config()).await;
-                if let partitions::PartitionIoStep::Ready(plan) = step {
-                    let captured = partition
-                        .capture_io(plan, partitions.config())
-                        .unwrap()
-                        .unwrap();
-                    let injected = match (&captured.job, failure_phase) {
-                        (partitions::PartitionIoJob::RemoveSegment { .. }, Failure::Segments) => {
-                            Some(partitions::PartitionIoResult::SegmentRemoved(Err(
-                                IggyError::CannotDeleteFile,
-                            )))
-                        }
-                        (partitions::PartitionIoJob::PurgeCleanup { .. }, Failure::Cleanup) => {
-                            Some(partitions::PartitionIoResult::PurgeCleanup(Err(
-                                io::Error::other("cleanup failed"),
-                            )))
-                        }
-                        (partitions::PartitionIoJob::EmptySegment(_), Failure::Plant) => {
-                            Some(partitions::PartitionIoResult::EmptySegment(Err(
-                                IggyError::CannotWriteToFile,
-                            )))
-                        }
-                        (
-                            partitions::PartitionIoJob::SegmentDirectory(path),
-                            Failure::OffsetDirectory,
-                        ) if *path == failed_directory => {
-                            Some(partitions::PartitionIoResult::SegmentDirectory(Err(
-                                io::Error::other("offset directory writeback failed"),
-                            )))
-                        }
-                        _ => None,
-                    };
-                    let failure = injected.is_some();
-                    let result = match injected {
-                        Some(result) => result,
-                        None => captured.job.execute().await,
-                    };
-                    partition.accept_io(captured.identity, result).unwrap();
-                    if let Some(gate) = captured.gate {
-                        gate.release();
-                    }
-                    captured.quiescence.settle(captured.identity);
-                    if failure {
-                        failed = true;
-                        break;
-                    }
-                } else if matches!(step, partitions::PartitionIoStep::Pending) {
-                    compio::time::sleep(Duration::from_millis(1)).await;
-                }
-            }
-            assert!(failed, "purge reached {failure_phase:?}");
-            owner.service_partition_io().await;
-            assert!(
-                partitions.get_by_ns(&namespace).is_none(),
-                "failed purge must stop admission before the next frame"
-            );
-            assert!(owner.shards_table.shard_for(namespace).is_none());
-            assert_eq!(
-                partitions
-                    .get_io_owner(&namespace)
-                    .unwrap()
-                    .applied_purge_generation(),
-                0
-            );
-        }
-    }
 
     #[test]
     fn idle_partitions_do_not_enter_the_io_ready_queue_on_retry() {
@@ -1212,19 +1080,13 @@ mod tests {
     async fn held_materialization_and_offset_jobs_allow_other_partition_progress_and_shutdown() {
         for durability in [Durability::Replicated, Durability::Persisted] {
             for operation in [Operation::SendMessages, Operation::StoreConsumerOffset] {
-                for purge in [false, true] {
-                    Box::pin(held_file_job_allows_progress(operation, durability, purge)).await;
-                }
+                Box::pin(held_file_job_allows_progress(operation, durability)).await;
             }
         }
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    async fn held_file_job_allows_progress(
-        operation: Operation,
-        durability: Durability,
-        purge: bool,
-    ) {
+    async fn held_file_job_allows_progress(operation: Operation, durability: Durability) {
         let directory = tempfile::tempdir().unwrap();
         let bus = Rc::new(IggyMessageBus::new(0));
         let (owner, sender) = test_owner(&bus, None);
@@ -1246,42 +1108,8 @@ mod tests {
             consumer_offset_durability: durability,
             ..Default::default()
         });
-        partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
-        let log_path = directory.path().join("00000000000000000000.log");
-        let index_path = directory.path().join("00000000000000000000.index");
-        let messages = MessagesWriter::new(
-            log_path.to_str().unwrap(),
-            Rc::new(AtomicU64::new(0)),
-            durability.is_persisted(),
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        let indexes = IggyIndexWriter::new(
-            index_path.to_str().unwrap(),
-            Rc::new(AtomicU64::new(0)),
-            durability.is_persisted(),
-            false,
-        )
-        .await
-        .unwrap();
-        let storage = SegmentStorage::new(
-            log_path.to_str().unwrap(),
-            index_path.to_str().unwrap(),
-            0,
-            0,
-            true,
-        )
-        .await
-        .unwrap();
-        partition.log.retire_back();
-        partition.log.add_persisted_segment(
-            Segment::new(0, IggyByteSize::from(SEGMENT_BYTES)),
-            storage,
-            Some(Rc::new(messages)),
-            Some(Rc::new(indexes)),
-        );
+        let (log_path, index_path) =
+            attach_segment_files(partition, directory.path(), durability.is_persisted()).await;
         let request = if operation == Operation::StoreConsumerOffset {
             let dirs = [
                 "consumer_offsets",
@@ -1328,14 +1156,6 @@ mod tests {
             let reply: Message<ReplyHeader> = second_reply.unwrap().try_into_typed().unwrap();
             assert_eq!(reply.header().status, 0, "{operation:?}, {durability:?}");
             assert_eq!(owner.partition_io.counters.active.get(), 1);
-            if purge {
-                let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-                assert!(matches!(
-                    partition.purge(partitions.config(), 1).await,
-                    Err(partitions::PurgeError::Pending)
-                ));
-                assert_eq!(partition.applied_purge_generation(), 0);
-            }
             stop.try_send(()).unwrap();
             compio::time::sleep(TASK_POLL_INTERVAL).await;
             assert_eq!(owner.partition_io.outstanding(), 1);
@@ -1374,17 +1194,7 @@ mod tests {
             () = deadline => panic!("held {operation:?} in {durability:?} blocked healthy progress or shutdown"),
         }
         assert_eq!(owner.partition_io.charged.get(), 0);
-        if purge {
-            assert_eq!(
-                partitions
-                    .get_by_ns(&namespace)
-                    .unwrap()
-                    .applied_purge_generation(),
-                1
-            );
-            assert_eq!(std::fs::metadata(log_path).unwrap().len(), 0);
-            assert!(!directory.path().join("consumer_offsets/1").exists());
-        } else if operation == Operation::SendMessages {
+        if operation == Operation::SendMessages {
             assert!(std::fs::metadata(log_path).unwrap().len() > 0);
             assert!(std::fs::metadata(index_path).unwrap().len() > 0);
         } else {
@@ -1935,10 +1745,12 @@ mod tests {
         let source_directory = tempfile::tempdir().unwrap();
         let namespace = IggyNamespace::new(0, 0, 0);
         let sources = source_owner.plane.partitions();
-        sources
-            .get_mut_by_ns(&namespace)
-            .unwrap()
-            .set_partition_dir(source_directory.path().to_str().unwrap().to_owned());
+        attach_segment_files(
+            sources.get_mut_by_ns(&namespace).unwrap(),
+            source_directory.path(),
+            false,
+        )
+        .await;
         let (reply, replied) = consensus::oneshot_channel();
         sources
             .on_request_with_reply(send_request(namespace, 1), Some(reply))
@@ -1948,7 +1760,6 @@ mod tests {
             .await;
         replied.await.unwrap();
         let source = sources.get_mut_by_ns(&namespace).unwrap();
-        source.purge(sources.config(), 1).await.unwrap();
         let offer = source.state_transfer_offer(sources.config()).await.unwrap();
         let offsets_index = offer.artifact_count() - 1;
         let PartitionArtifactSource::Offsets(offsets) = offer.artifact_at(offsets_index).unwrap()
@@ -2773,6 +2584,53 @@ mod tests {
         )
         .expect("valid shard wiring");
         (owner, sender)
+    }
+
+    /// Backs the first segment with files, so flushes and transfer plans read
+    /// the bytes they name.
+    #[allow(clippy::future_not_send)]
+    async fn attach_segment_files(
+        partition: &mut IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        directory: &Path,
+        fsync: bool,
+    ) -> (PathBuf, PathBuf) {
+        partition.set_partition_dir(directory.to_str().unwrap().to_owned());
+        let log_path = directory.join("00000000000000000000.log");
+        let index_path = directory.join("00000000000000000000.index");
+        let messages = MessagesWriter::new(
+            log_path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            fsync,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let indexes = IggyIndexWriter::new(
+            index_path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            fsync,
+            false,
+        )
+        .await
+        .unwrap();
+        let storage = SegmentStorage::new(
+            log_path.to_str().unwrap(),
+            index_path.to_str().unwrap(),
+            0,
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+        partition.log.retire_back();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(SEGMENT_BYTES)),
+            storage,
+            Some(Rc::new(messages)),
+            Some(Rc::new(indexes)),
+        );
+        (log_path, index_path)
     }
 
     fn submit(

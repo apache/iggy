@@ -22,16 +22,15 @@
 //! the build under test, and everything must read back unchanged:
 //!
 //! - A checkpointed metadata snapshot holding topics with every option key,
-//!   partitions with a deletion watermark and a purge generation, consumer
-//!   groups, users with permissions and personal access tokens, all created
-//!   BEFORE the checkpoint fires, plus an uncheckpointed WAL tail holding one
-//!   more of each, created after it. The snapshot and the WAL encode the same
-//!   types differently, and either can break on its own.
+//!   partitions with a deletion watermark, consumer groups, users with
+//!   permissions and personal access tokens, all created BEFORE the
+//!   checkpoint fires, plus an uncheckpointed WAL tail holding one more of
+//!   each, created after it. The snapshot and the WAL encode the same types
+//!   differently, and either can break on its own.
 //! - Sealed and active segments in a non-zero partition, holding messages
 //!   with explicit ids, typed user headers and payload lengths that vary
 //!   inside every batch, and a partial segment deletion.
-//! - Individual and group consumer offsets, and a purge generation with
-//!   messages appended past it.
+//! - Individual and group consumer offsets.
 //!
 //! The swap works because `ServerHandle::start` re-reads
 //! `config.executable_path` on every call while the data directory, the
@@ -133,8 +132,8 @@ const DATA_STREAM: &str = "compat-data";
 const DATA_TOPIC: &str = "data";
 /// Created after the checkpoint, so its options only exist as a WAL record.
 const WAL_TAIL_TOPIC: &str = "tail";
-const PURGE_STREAM: &str = "compat-purge";
-const PURGE_TOPIC: &str = "purged";
+const COMPRESSION_STREAM: &str = "compat-compression";
+const COMPRESSION_TOPIC: &str = "compression";
 const OFFSET_CONSUMER: &str = "compat-offset-consumer";
 const READBACK_CONSUMER: &str = "compat-readback";
 const OFFSET_GROUP: &str = "compat-offset-group";
@@ -149,7 +148,7 @@ const WAL_TAIL_PAT: &str = "compat-tail-pat";
 /// can be non-zero.
 const PARTITIONS_COUNT: u32 = 2;
 
-/// The partition every message, offset and purge check targets. Non-zero on
+/// The partition every message and offset check targets. Non-zero on
 /// purpose: the segment batch header carries the partition id, and a field
 /// that decoded as 0 is indistinguishable from a correct one when the only
 /// seeded partition is 0. Partition 0 stays empty.
@@ -210,18 +209,6 @@ const SEND_BATCH: u64 = 16;
 /// before deleting one, so a sealed segment is still left behind.
 const MIN_SEGMENTS_BEFORE_DELETE: usize = 4;
 
-/// Messages produced into the topic that is purged afterwards.
-const PURGED_MESSAGES: u64 = 8;
-
-/// Messages appended to the purged topic AFTER the purge, at generation 1.
-///
-/// Without them the purge check is vacuous. An unreadable `purge.gen` reads
-/// as 0 on purpose (the absent-or-torn sentinel), the reconciler then
-/// re-purges the partition, and an empty topic passes a `messages_count == 0`
-/// assertion whether or not the generation decoded. Only messages that must
-/// SURVIVE the swap can tell the two apart.
-const POST_PURGE_MESSAGES: u64 = 8;
-
 /// Seeded personal access token expiry. Non-default (the default is
 /// `NeverExpire`, which reads back as `None`) so a dropped or misread field
 /// cannot pass as the default.
@@ -236,7 +223,7 @@ const READBACK_COUNT: u32 = 16;
 /// Kept small because the whole test has to finish inside nextest's 300s hard
 /// kill (`slow-timeout` x `terminate-after` in `.config/nextest.toml`, and the
 /// driving script deliberately runs without `--profile ci`). Two boots at 60s
-/// plus two stops at 5s plus seven of these waits is 200s. A SIGKILL past
+/// plus two stops at 5s plus five of these waits is 180s. A SIGKILL past
 /// that budget would take the named `wait_until` message with it, losing the
 /// diagnostic in exactly the run that needed it. At a 200ms
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
@@ -353,9 +340,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     let mut produced = 0u64;
     while produced < PRODUCED_MESSAGES {
         let batch_end = (produced + SEND_BATCH).min(PRODUCED_MESSAGES);
-        let mut batch: Vec<IggyMessage> = (produced..batch_end)
-            .map(|offset| seeded_message(offset, payload_for(offset)))
-            .collect();
+        let mut batch: Vec<IggyMessage> = (produced..batch_end).map(seeded_message).collect();
         client
             .send_messages(
                 &data_stream,
@@ -477,62 +462,18 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .await;
     }
 
-    // 5. A purge on a SEPARATE topic: it resets the partition and empties its
-    //    segment chain, so it must not touch the one above.
-    let purge_stream_details = client.create_stream(PURGE_STREAM).await.unwrap();
-    let purge_stream = Identifier::numeric(purge_stream_details.id).unwrap();
-    let purge_topic_details =
-        create_baseline_topic(&client, &purge_stream, PURGE_TOPIC, &purge_topic_options())
-            .await
-            .unwrap();
-    let purge_topic = Identifier::numeric(purge_topic_details.id).unwrap();
-    let mut purged_batch: Vec<IggyMessage> = (0..PURGED_MESSAGES)
-        .map(|index| seeded_message(index, Bytes::from(format!("compat-purged-{index}"))))
-        .collect();
-    client
-        .send_messages(
-            &purge_stream,
-            &purge_topic,
-            &Partitioning::partition_id(SEEDED_PARTITION),
-            &mut purged_batch,
-        )
-        .await
-        .unwrap();
-    client
-        .purge_topic(&purge_stream, &purge_topic)
-        .await
-        .unwrap();
-
-    let purge_generation = partition_dir(
-        &data_path,
-        purge_stream_details.id,
-        purge_topic_details.id,
-        SEEDED_PARTITION,
+    // 5. A second topic, in its own stream: the only snapshot topic that sends
+    //    `compression_algorithm`.
+    let compression_stream_details = client.create_stream(COMPRESSION_STREAM).await.unwrap();
+    let compression_stream = Identifier::numeric(compression_stream_details.id).unwrap();
+    create_baseline_topic(
+        &client,
+        &compression_stream,
+        COMPRESSION_TOPIC,
+        &compression_topic_options(),
     )
-    .join("purge.gen");
-    wait_until("the purge generation to reach disk", async || {
-        if purge_generation.is_file() {
-            Ok(())
-        } else {
-            Err(format!("{} does not exist", purge_generation.display()))
-        }
-    })
-    .await;
-
-    // Appended once the generation is durable, so they sit at offset 0 of the
-    // reset chain and only survive a boot that decodes `purge.gen`.
-    let mut post_purge_batch: Vec<IggyMessage> = (0..POST_PURGE_MESSAGES)
-        .map(|index| seeded_message(index, post_purge_payload(index)))
-        .collect();
-    client
-        .send_messages(
-            &purge_stream,
-            &purge_topic,
-            &Partitioning::partition_id(SEEDED_PARTITION),
-            &mut post_purge_batch,
-        )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     // 6. A user with permissions at every level, and a personal access token.
     let permissions = seeded_permissions(data_stream_details.id, data_topic_details.id);
@@ -651,7 +592,6 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         &retained_before,
         first_retained_offset,
         READBACK_COUNT as usize,
-        payload_for,
     );
     let tail_before = poll_window(
         &client,
@@ -662,29 +602,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         1,
     )
     .await;
-    assert_seeded_messages(
-        "the last produced message",
-        &tail_before,
-        last_offset,
-        1,
-        payload_for,
-    );
-    let post_purge_before = poll_window(
-        &client,
-        &purge_stream,
-        &purge_topic,
-        &readback,
-        0,
-        READBACK_COUNT,
-    )
-    .await;
-    assert_seeded_messages(
-        "the post-purge messages",
-        &post_purge_before,
-        0,
-        POST_PURGE_MESSAGES as usize,
-        post_purge_payload,
-    );
+    assert_seeded_messages("the last produced message", &tail_before, last_offset, 1);
 
     drop(client);
     harness.stop().await.unwrap();
@@ -761,7 +679,13 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         &wal_tail_topic_options(),
     )
     .await;
-    assert_topic_recovered(&client, &purge_stream, PURGE_TOPIC, &purge_topic_options()).await;
+    assert_topic_recovered(
+        &client,
+        &compression_stream,
+        COMPRESSION_TOPIC,
+        &compression_topic_options(),
+    )
+    .await;
 
     assert_eq!(
         segment_logs(&partition),
@@ -830,72 +754,6 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         "the on-disk offset record must decode to the offset the baseline stored"
     );
 
-    let purged = client
-        .get_topic(&purge_stream, &purge_topic)
-        .await
-        .unwrap()
-        .expect("the purged topic survives the swap");
-    assert_eq!(
-        purged.messages_count, POST_PURGE_MESSAGES,
-        "the purged topic must hold exactly the messages appended after the purge: fewer means \
-         `purge.gen` read back as 0 and the partition was purged again, more means the purge \
-         itself was lost"
-    );
-    assert_messages_identical(
-        "the post-purge messages",
-        &post_purge_before,
-        &poll_window(
-            &client,
-            &purge_stream,
-            &purge_topic,
-            &readback,
-            0,
-            READBACK_COUNT,
-        )
-        .await,
-    );
-
-    // A generation that decoded ABOVE the committed one passes both checks
-    // above, nothing was re-purged, while parking the partition past every
-    // purge the topic will ever commit: the reconciler stages a reset only
-    // for `committed > applied`. So a purge issued under the build under test
-    // must still take effect.
-    client
-        .purge_topic(&purge_stream, &purge_topic)
-        .await
-        .unwrap();
-    wait_until("the post-swap purge to empty the topic", async || {
-        let topic = client
-            .get_topic(&purge_stream, &purge_topic)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "the purged topic is gone".to_string())?;
-        if topic.messages_count == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "messages_count is still {}: the reconciler staged no reset, so the recovered \
-                 generation must sit at or above the newly committed one",
-                topic.messages_count
-            ))
-        }
-    })
-    .await;
-    let after_purge = poll_window(
-        &client,
-        &purge_stream,
-        &purge_topic,
-        &readback,
-        0,
-        READBACK_COUNT,
-    )
-    .await;
-    assert!(
-        after_purge.is_empty(),
-        "offset 0 of the purged topic must be empty after the post-swap purge, got {} message(s)",
-        after_purge.len()
-    );
-
     assert_user_recovered(&harness, &client, COMPAT_USER, &permissions).await;
     assert_user_recovered(&harness, &client, WAL_TAIL_USER, &tail_permissions).await;
     assert_token_recovered(&harness, &client, COMPAT_PAT, &pat).await;
@@ -929,12 +787,9 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
 
-    // The purged topic was rewritten by the post-swap purge on purpose, so
-    // only the rest of the tree is held to byte identity.
     assert_segments_identical(
         &baseline_files,
         &disk::collect_comparable_files(&data_path, false),
-        &topic_prefix(purge_stream_details.id, purge_topic_details.id),
     );
 }
 
@@ -1140,10 +995,11 @@ fn wal_tail_topic_options() -> TopicCreateOptions {
     }
 }
 
-/// Options of the topic that is purged. `compression_algorithm` is stored
-/// topic metadata only (the server compresses nothing), so Gzip is just a
-/// non-default value that must round-trip.
-fn purge_topic_options() -> TopicCreateOptions {
+/// Options of the second topic in the snapshot, the only one there that sends
+/// `compression_algorithm`. It is stored topic metadata only (the server
+/// compresses nothing), so Gzip is just a non-default value that must
+/// round-trip.
+fn compression_topic_options() -> TopicCreateOptions {
     TopicCreateOptions {
         partitions_count: Some(PARTITIONS_COUNT),
         compression_algorithm: Some(CompressionAlgorithm::Gzip),
@@ -1153,11 +1009,12 @@ fn purge_topic_options() -> TopicCreateOptions {
 }
 
 /// Deterministic message for `offset`: an explicit id, typed user headers and
-/// the given payload, so a readback can name exactly which message diverged.
-fn seeded_message(offset: u64, payload: Bytes) -> IggyMessage {
+/// the [`payload_for`] payload, so a readback can name exactly which message
+/// diverged.
+fn seeded_message(offset: u64) -> IggyMessage {
     IggyMessage::builder()
         .id(message_id_for(offset))
-        .payload(payload)
+        .payload(payload_for(offset))
         .user_headers(user_headers_for(offset))
         .build()
         .unwrap()
@@ -1203,10 +1060,6 @@ fn payload_for(offset: u64) -> Bytes {
         b'.',
     );
     Bytes::from(bytes)
-}
-
-fn post_purge_payload(index: u64) -> Bytes {
-    Bytes::from(format!("compat-post-purge-{index}"))
 }
 
 /// Alternating bits at every level. All-true (the harness default) reads back
@@ -1320,13 +1173,7 @@ async fn poll_window(
 /// The baseline's own readback of what it was asked to store. Verified before
 /// the swap, so the captured messages are a trustworthy oracle for the
 /// field-by-field comparison after it.
-fn assert_seeded_messages(
-    what: &str,
-    messages: &[IggyMessage],
-    first_offset: u64,
-    count: usize,
-    payload: fn(u64) -> Bytes,
-) {
+fn assert_seeded_messages(what: &str, messages: &[IggyMessage], first_offset: u64, count: usize) {
     assert_eq!(
         messages.len(),
         count,
@@ -1346,7 +1193,7 @@ fn assert_seeded_messages(
             "{what}: user headers of the message at offset {offset}"
         );
         assert!(
-            message.payload == payload(offset),
+            message.payload == payload_for(offset),
             "{what}: the payload of the message at offset {offset} ({} bytes) is not the seeded one",
             message.payload.len()
         );
@@ -1588,8 +1435,7 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
     );
 }
 
-/// Byte-compare the segment files across the binary swap, except under
-/// `rewritten`, the one directory the build under test was told to change.
+/// Byte-compare the segment files across the binary swap.
 ///
 /// Segment batch headers carry no magic and no version, and recovery is
 /// allowed to truncate a torn tail, so a misparse can shorten a `.log` while
@@ -1597,18 +1443,9 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
 fn assert_segments_identical(
     baseline: &BTreeMap<String, Vec<u8>>,
     current: &BTreeMap<String, Vec<u8>>,
-    rewritten: &str,
 ) {
-    assert!(
-        baseline.keys().any(|rel| rel.starts_with(rewritten)),
-        "`{rewritten}` matches nothing the baseline wrote, so the exclusion would hide a typo \
-         rather than the post-swap purge"
-    );
     let mut problems = Vec::new();
-    for (rel, baseline_bytes) in baseline
-        .iter()
-        .filter(|(rel, _)| !rel.starts_with(rewritten))
-    {
+    for (rel, baseline_bytes) in baseline {
         match current.get(rel) {
             None => problems.push(format!(
                 "`{rel}` was written by the baseline but is GONE after the swap"
@@ -1619,7 +1456,7 @@ fn assert_segments_identical(
             Some(_) => {}
         }
     }
-    for rel in current.keys().filter(|rel| !rel.starts_with(rewritten)) {
+    for rel in current.keys() {
         if !baseline.contains_key(rel) {
             problems.push(format!("`{rel}` appeared only after the swap"));
         }

@@ -193,23 +193,6 @@ public sealed class HttpTopicOptionsTests
     }
 
     [Fact]
-    public async Task PurgeTopic_Should_SurfaceFailedResponse()
-    {
-        var handler = new StubHandler("""{"id":5,"code":"feature_unavailable","reason":"Purge disabled."}""")
-        {
-            StatusCode = HttpStatusCode.NotImplemented
-        };
-        using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
-
-        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-            client.PurgeTopicAsync(StreamId, Identifier.Numeric(2), TestContext.Current.CancellationToken));
-
-        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
-        Assert.True(error.FromServer);
-        Assert.Equal("/streams/1/topics/2/purge", handler.RequestPath);
-    }
-
-    [Fact]
     public async Task SendMessages_Should_ReportAnAgedOutRequestAsOutcomeUnknown()
     {
         var handler = new StubHandler("""{"id":85,"code":"request_too_old","reason":"Request too old."}""")

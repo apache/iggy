@@ -23,7 +23,7 @@
 //!
 //! | channel | carrier | when |
 //! |---|---|---|
-//! | [`FrameChannel::TypedDeny`] | Reply, nonzero status + empty body, or a result-framed rejection body | rejections that must unblock the SDK's lockstep request slot: checksum, authz, pre-consensus rewrite, unknown or unsupported non-replicated code, unbound non-PING read, transient replay hints |
+//! | [`FrameChannel::TypedDeny`] | Reply, nonzero status + empty body, or a result-framed rejection body | rejections that must unblock the SDK's lockstep request slot: checksum, undeclared operation byte, authz, pre-consensus rewrite, unknown or unsupported non-replicated code, unbound non-PING read, transient replay hints |
 //! | [`FrameChannel::Eviction`] | session-terminal Eviction frame with a typed reason | the client must register again: `NoSession`, `MalformedLogin`, heartbeat and login evictions. The reason rides the channel label, since one `context` covers four of them |
 //! | [`FrameChannel::ResyncSentinel`] | status-0 poll reply, body carries `RESYNC_REQUIRED_PARTITION_SENTINEL` | a fenced consumer-group poll: the consumer must re-sync its assignment; HTTP mirrors it as `resync_required_polled_messages` in `crate::http::wire` |
 //! | [`FrameChannel::EmptyFrame`] | status 0 with the 16-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
@@ -49,12 +49,16 @@ use consensus::{
     EvictionContext, MetadataHandle, build_eviction_message,
     build_incompatible_protocol_eviction_message, build_result_rejection_reply,
 };
-use iggy_binary_protocol::{EvictionReason, PrepareHeader, RoutedRequestHeader};
+use iggy_binary_protocol::{
+    EvictionReason, HEADER_SIZE, Operation, PrepareHeader, ReplyHeader, RequestHeader,
+    RoutedRequestHeader,
+};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::BusMessage;
 use server_common::Message;
+use std::mem::offset_of;
 use std::rc::Rc;
 use tracing::warn;
 
@@ -163,6 +167,71 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "unbound_request_denial",
+    )
+    .await;
+}
+
+/// Deny a request whose operation byte this build does not declare with
+/// `InvalidCommand`. Silence would stall the client's lockstep connection.
+///
+/// `request_header` was copied before the typed cast refused the byte.
+/// `Operation::Reserved` stands in for it while the echo is built, and the
+/// reply gets the original byte back, because clients match a reply by
+/// operation and request id. No checksum covers the byte, since `ReplyHeader`
+/// is not frame-sealed. `validate` is skipped: it refuses `Reserved` and a
+/// zero `client`, and the reply echoes neither. Session and commit stay 0 as
+/// in [`send_unbound_deny_reply`], because the transport may be unbound.
+#[allow(clippy::future_not_send)]
+pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    mut request_header: [u8; HEADER_SIZE],
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let operation_offset = offset_of!(RequestHeader, operation);
+    let operation = request_header[operation_offset];
+    request_header[operation_offset] = Operation::Reserved as u8;
+    // Routing fields unset, as `Message::into_routed` leaves them, so the
+    // client's reserved tail never reads as a group.
+    request_header[offset_of!(RoutedRequestHeader, metadata_watermark)..].fill(0);
+    let request_header =
+        match bytemuck::checked::try_pod_read_unaligned::<RoutedRequestHeader>(&request_header) {
+            Ok(request_header) => request_header,
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    operation,
+                    error = %error,
+                    "dropping client request with invalid header"
+                );
+                return;
+            }
+        };
+    warn!(
+        transport_client_id,
+        operation, "denying client request whose operation this build does not declare"
+    );
+    let reply = build_deny_reply(
+        &request_header,
+        transport_client_id,
+        0,
+        0,
+        IggyError::InvalidCommand.as_code(),
+    );
+    // Generic before the write: the typed view panics on an undeclared byte.
+    let mut reply = reply.into_generic();
+    reply.as_mut_slice()[offset_of!(ReplyHeader, operation)] = operation;
+    send_host_frame(
+        &shard.bus,
+        transport_client_id,
+        reply.into_frozen(),
+        FrameChannel::TypedDeny,
+        "undeclared_operation_denial",
     )
     .await;
 }
@@ -366,7 +435,7 @@ mod tests {
     use super::*;
     use crate::dispatch::handle_client_request;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestShard, request_message, test_shard,
+        FIRST_BOOT, SpyBus, TestShard, UNDECLARED_OPERATION, request_message, test_shard,
     };
     use crate::session_manager::SessionManager;
     use configs::server::ServerConfig;
@@ -388,6 +457,8 @@ mod tests {
     const REQUEST: u64 = 5;
     /// Nonzero, so a stamped frontier is distinguishable from a withheld one.
     const COMMIT: u64 = 11;
+    /// Nonzero, so an echoed stamp is distinguishable from a zeroed field.
+    const REQUEST_CHECKSUM: u128 = 0x0123_4567_89AB_CDEF;
     const MAX_TOKENS_PER_USER: u32 = 1;
     /// `[partition_id:4][current_offset:8][count:4]`.
     const EMPTY_POLL_BODY_LEN: usize = 16;
@@ -550,6 +621,69 @@ mod tests {
         assert_eq!(
             header.commit, 0,
             "an unbound transport must not learn the commit frontier"
+        );
+    }
+
+    #[compio::test]
+    async fn undeclared_operation_must_be_denied_invalid_command_with_its_own_byte_echoed() {
+        assert!(
+            !Operation::is_known_code(UNDECLARED_OPERATION),
+            "test needs an operation byte this build does not declare"
+        );
+        let (bus, shard) = shard_at_commit();
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let server_config = Arc::new(ServerConfig::default());
+        let request = request_message(Operation::CreateStream, VSR_CLIENT, SESSION, REQUEST, &[])
+            .transmute_header(|header, stamped: &mut RoutedRequestHeader| {
+                *stamped = header;
+                stamped.request_checksum = REQUEST_CHECKSUM;
+            });
+        let request_header = *request.header();
+        let mut frame = request.into_generic();
+        frame.as_mut_slice()[offset_of!(RequestHeader, operation)] = UNDECLARED_OPERATION;
+
+        handle_client_request(
+            &shard,
+            &sessions,
+            &server_config,
+            MAX_TOKENS_PER_USER,
+            TRANSPORT,
+            frame,
+        )
+        .await;
+
+        {
+            let mut replies = bus.client_replies.borrow_mut();
+            let (_, reply) = replies
+                .first_mut()
+                .expect("the request must be answered, not dropped");
+            let operation_offset = offset_of!(ReplyHeader, operation);
+            assert_eq!(
+                reply[operation_offset], UNDECLARED_OPERATION,
+                "the deny must echo the request's own operation byte"
+            );
+            // A declared byte in its place lets the typed view check the rest.
+            reply[operation_offset] = request_header.operation as u8;
+        }
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_typed_deny(
+            &header,
+            &body,
+            &request_header,
+            IggyError::InvalidCommand.as_code(),
+        );
+        assert_eq!(
+            header.request_checksum, REQUEST_CHECKSUM,
+            "the deny must echo the request checksum"
+        );
+        assert_eq!(
+            header.client, TRANSPORT,
+            "a deny ahead of the session lookup answers under the transport id"
+        );
+        assert_eq!(header.op, 0, "the deny has no session to stamp");
+        assert_eq!(
+            header.commit, 0,
+            "a transport that may be unbound must not learn the commit frontier"
         );
     }
 
