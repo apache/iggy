@@ -43,6 +43,7 @@ members = [
     "core/connectors/sinks/influxdb_sink",
     "core/connectors/sinks/meilisearch_sink",
     "core/connectors/sinks/mongodb_sink",
+    "core/connectors/sinks/mqtt_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/rabbitmq_sink",
