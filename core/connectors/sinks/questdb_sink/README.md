@@ -256,7 +256,8 @@ A string, boolean, array or object in a listed field is rejected for the same
 reason. Both rejections apply whatever `numbers_as_double` is set to.
 
 When a number past 2^53 is widened to a `DOUBLE`, the connector logs a warning
-naming the column, once per connector, so the rounding is not silent.
+naming the column, once per connector for each kind of rounded value (a scalar,
+a value past `i64::MAX`, an array element), so the rounding is not silent.
 
 #### Turning it off
 
