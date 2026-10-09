@@ -154,7 +154,9 @@
 //! the client.
 //!
 
-use crate::partition_helpers::{build_partition_fresh, load_partition_or_fence};
+use crate::partition_helpers::{
+    build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
+};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -172,7 +174,7 @@ use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleFence};
+use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleFence, RETIRED_PARTITION_OP};
 use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::{delete_partitions_from_disk, read_created_revision};
 use server_common::Message;
@@ -185,7 +187,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
@@ -524,6 +526,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_consumer_group_offsets(ctx, &mut counters);
     reconcile_segment_truncations(ctx, &mut counters);
     counters.lifecycle_fences_pending += reconcile_partition_lifecycles(&ctx.shard);
+    counters.lifecycle_fences_pending += reconcile_retired_lifecycles(ctx).await;
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -1590,6 +1593,66 @@ where
             } else {
                 submit_partition_fence(shard, namespace, target.fence);
             }
+        }
+    }
+    pending
+}
+
+/// On a single-replica node, recovery fences a partition it cannot load, and
+/// then no log can install a lifecycle fence. Without this, a delete of the
+/// topic, the operator's exit from that fence, would wait forever. The durable
+/// retirement fence keeps the incarnation offline, which is what the lifecycle
+/// fence would have proven.
+async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) -> usize {
+    if ctx.replica_count != 1 {
+        return 0;
+    }
+    let partitions = ctx.shard.plane.partitions();
+    let system_path = ctx.config.get_system_path();
+    let mut pending = 0;
+    for intent in ctx
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .pending_lifecycles()
+    {
+        for target in intent
+            .partitions
+            .iter()
+            .filter(|target| target.partition_op.is_none())
+        {
+            let namespace = IggyNamespace::new(
+                intent.stream_id as usize,
+                target.topic_id as usize,
+                target.partition_id as usize,
+            );
+            let incarnation = match target.fence {
+                LifecycleFence::History(transition) => transition.incarnation,
+                LifecycleFence::Owner(installation) => installation.incarnation,
+            };
+            if partitions.failed_revision(&namespace) != Some(incarnation) {
+                continue;
+            }
+            pending += 1;
+            if let Err(error) =
+                record_partition_retirement_fence(&system_path, namespace, incarnation).await
+            {
+                warn!(%error, namespace_raw = namespace.inner(),
+                    "lifecycle waits for a durable partition fence");
+                continue;
+            }
+            ctx.shard
+                .forward_metadata_submit(MetadataSubmit::CompleteLifecycle(
+                    CompleteLifecycleRequest {
+                        metadata_op: intent.context.metadata_op,
+                        stream_id: intent.stream_id,
+                        topic_id: target.topic_id,
+                        partition_id: target.partition_id,
+                        partition_op: RETIRED_PARTITION_OP,
+                    },
+                ));
         }
     }
     pending
@@ -3526,15 +3589,12 @@ mod tests {
         );
     }
 
-    /// Boot-fence exit: once an operator DELETES the fenced namespace it
-    /// leaves the committed target, but it sits in neither `partitions` nor
-    /// `shards_table`, so neither ghost sweep used to reach it -- the fence
-    /// had no exit, and slab-key recycling made a recreate of the same ids
-    /// inherit it for bytes it never had. The removals pass must route it
-    /// through teardown: the refused files are deleted first (metadata says
-    /// the partition is gone, so nothing an operator kept is destroyed) and
-    /// only the delete's success enqueues the `ConfirmRemove` that lifts
-    /// the tombstone.
+    /// Boot-fence exit: an operator deletes the fenced topic. The delete waits
+    /// for a lifecycle fence on every partition, and the fenced partition has
+    /// no log to install one, so its durable retirement fence completes it.
+    /// Teardown may remove the refused files and lift the tombstone only after
+    /// metadata finishes the delete, and a recreate of the recycled ids must
+    /// not inherit the fence.
     #[compio::test]
     async fn reconcile_lifts_boot_fence_once_namespace_leaves_target() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -3543,18 +3603,65 @@ mod tests {
         seed_stream(&mux, 1, "stream-fence-exit");
         seed_topic(&mux, 2, 0, "topic-fence-exit", vec![assignment(0, 1)]);
 
-        let shard = build_test_shard(0, &config, mux);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
+        let mux = &shard.plane.metadata().mux_stm;
+        let revision = mux
+            .streams()
+            .created_revision_for_namespace(ns)
+            .expect("committed partition records its revision");
         // Boot-fence shape with the refused files still at their real paths.
-        partitions.tombstone(ns);
+        partitions.fence(ns, revision);
         let partition_root = ctx.config.get_partition_path(0, 0, 0);
         std::fs::create_dir_all(&partition_root).expect("plant partition dir");
         let refused_log = format!("{partition_root}/00000000000000000000.log");
         std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");
 
-        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        mux.update(build_prepare(3, Operation::DeleteTopic, &delete))
+            .expect("DeleteTopic apply succeeds");
+        reconcile_pass(&ctx).await;
+
+        let completions: Vec<_> = std::iter::from_fn(|| lanes.main.try_recv().ok())
+            .filter_map(|frame| match frame {
+                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
+                    shard::MetadataSubmit::CompleteLifecycle(request),
+                )) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions.len(),
+            1,
+            "the fenced partition must complete the delete"
+        );
+        assert_eq!(
+            completions[0].partition_op,
+            metadata::stm::lifecycle::RETIRED_PARTITION_OP
+        );
+        assert_eq!(
+            crate::partition_helpers::partition_retirement_fence(&ctx.config.get_system_path(), ns)
+                .await
+                .unwrap(),
+            Some(revision),
+            "the incarnation must be retired durably before the delete completes"
+        );
+        assert!(
+            std::path::Path::new(&refused_log).exists(),
+            "the refused files stay until metadata finishes the delete"
+        );
+
+        mux.update(build_prepare(
+            4,
+            Operation::CompleteLifecycle,
+            &completions[0],
+        ))
+        .expect("CompleteLifecycle apply succeeds");
         reconcile_pass(&ctx).await;
 
         assert!(
@@ -3569,13 +3676,7 @@ mod tests {
 
         // Recreate the same ids: slab keys recycle, so the fresh topic gets
         // an identical namespace and must materialise cleanly.
-        seed_topic(
-            &shard.plane.metadata().mux_stm,
-            4,
-            0,
-            "topic-fence-reborn",
-            vec![assignment(0, 1)],
-        );
+        seed_topic(mux, 5, 0, "topic-fence-reborn", vec![assignment(0, 1)]);
         reconcile_pass(&ctx).await;
         assert!(
             partitions.contains(&ns),

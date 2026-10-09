@@ -58,8 +58,11 @@ pub struct LifecyclePartition {
     pub partition_op: Option<u64>,
 }
 
-/// Retained until every affected partition has durably installed its exact fence.
-/// The original request identity stays stable through retry, failover and restore.
+/// Retained until every affected partition durably installs its exact fence.
+///
+/// A partition whose only replica failed recovery retires its incarnation instead
+/// (see [`RETIRED_PARTITION_OP`]). The original request identity stays stable
+/// through retry, failover and restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LifecycleIntent {
     pub context: ApplyContext,
@@ -88,6 +91,11 @@ impl LifecycleIntent {
             .count();
     }
 }
+
+/// The `partition_op` of a target whose only replica failed recovery. No log
+/// can install its fence, so a durable retirement fence that keeps the
+/// incarnation offline completes it instead.
+pub const RETIRED_PARTITION_OP: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompleteLifecycleRequest {
