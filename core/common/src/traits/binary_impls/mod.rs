@@ -28,6 +28,7 @@ mod topics;
 mod users;
 
 pub use messages::decode_send_confirmations;
+pub(crate) use messages::send_raw_messages;
 
 use crate::IggyError;
 use crate::http::users::defaults::{
