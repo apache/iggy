@@ -17,28 +17,32 @@
 
 name: PR Triage Collect
 
-# Read-only collector for fork-restricted events. issue_comment and
-# pull_request_review on cross-fork PRs deliver a read-only GITHUB_TOKEN
-# regardless of the workflow's permissions: block, so the label mutations
-# cannot run here. This workflow uploads the raw event payload as an
-# artifact; pr-triage-apply.yml picks it up via workflow_run and applies
-# the labels with a write token from the base ref.
+# Read-only collector for fork-restricted events. issue_comment,
+# pull_request_review and pull_request on cross-fork PRs deliver a read-only
+# GITHUB_TOKEN regardless of the workflow's permissions: block, so the label
+# mutations cannot run here. This workflow uploads the raw event payload as an
+# artifact; pr-triage-apply.yml and stale-prs-unmark-on-activity.yml pick it
+# up via workflow_run and apply the labels with a write token from the base
+# ref.
 #
-# pull_request_target is NOT routed through this collector — it already
-# runs against base ref with a write token and is handled directly in
-# pr-triage-apply.yml.
+# The pull_request lifecycle events replace pull_request_target, which ASF
+# Infra bars on workflows that hold a token and disables for ASF repositories
+# from November 2026 (https://infra.apache.org/github-actions-policy.html).
 #
 # SECURITY: no actions/checkout, no exec of PR contents, no token export.
 # The token here is read-only. The artifact is NOT trustworthy: on the
-# pull_request_review path GitHub runs the PR head's copy of this file, so a
-# fork can change it and upload any payload. The consumers take only a
-# numeric id from the artifact and re-fetch everything else from the API.
+# pull_request_review and pull_request paths GitHub runs the PR head's copy of
+# this file, so a fork can change it and upload any payload. The consumers
+# take only numeric ids and the event action from the artifact, check the
+# action against a fixed list, and re-fetch everything else from the API.
 
 on:
   issue_comment:
     types: [created]
   pull_request_review:
     types: [submitted]
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed]
 
 permissions:
   contents: read
@@ -47,6 +51,7 @@ jobs:
   collect:
     if: |
       github.event_name == 'pull_request_review'
+      || github.event_name == 'pull_request'
       || (github.event_name == 'issue_comment'
           && github.event.issue.pull_request != null)
     runs-on: ubuntu-24.04-arm
