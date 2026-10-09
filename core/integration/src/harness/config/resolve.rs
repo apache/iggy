@@ -25,7 +25,9 @@ use std::collections::HashMap;
 /// `ServerConfig::all_env_var_names` cannot know them. `IGGY_CONFIG_PATH`
 /// selects the config file itself and the root credentials are consumed by
 /// `args.rs` before the config loads; `IGGY_TEST_VERBOSE` is harness-only.
-pub const NON_CONFIG_ENV_VARS: &[&str] = configs::server::SERVER_PROCESS_ENV_VARS;
+fn non_config_env_vars() -> impl Iterator<Item = &'static str> {
+    configs::server::server_process_env_vars()
+}
 
 /// Resolve config paths to environment variable names.
 ///
@@ -111,8 +113,8 @@ fn find_mapping(path: &str) -> Option<&'static EnvVarMapping> {
 ///
 /// Names outside the `IGGY_` prefix are left alone: those address the process
 /// environment (`RUST_LOG`, test scaffolding), not the config schema.
-/// `NON_CONFIG_ENV_VARS` carries the `IGGY_`-prefixed names the server reads
-/// outside the config struct.
+/// `server_process_env_vars()` supplies the `IGGY_`-prefixed names the server
+/// reads outside the config struct.
 ///
 /// # Errors
 ///
@@ -125,7 +127,7 @@ pub fn validate_env_var_names(envs: &HashMap<String, String>) -> Result<(), Stri
         .filter(|name| {
             name.starts_with("IGGY_")
                 && !known.contains(&name.as_str())
-                && !NON_CONFIG_ENV_VARS.contains(&name.as_str())
+                && !non_config_env_vars().any(|known| known == name.as_str())
         })
         .collect();
     if unknown.is_empty() {
@@ -283,9 +285,8 @@ mod tests {
 
     #[test]
     fn validate_env_var_names_accepts_the_non_config_variables() {
-        let envs: HashMap<String, String> = NON_CONFIG_ENV_VARS
-            .iter()
-            .map(|name| ((*name).to_string(), "value".to_string()))
+        let envs: HashMap<String, String> = non_config_env_vars()
+            .map(|name| (name.to_string(), "value".to_string()))
             .collect();
         assert!(
             validate_env_var_names(&envs).is_ok(),

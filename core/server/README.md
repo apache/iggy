@@ -37,7 +37,7 @@ To run one node of a cluster, pass its replica ID from the `cluster.nodes` roste
 cargo run --bin iggy-server --release -- --replica-id 0
 ```
 
-`--replica-id` selects the configured replica. Other settings come from configuration.
+Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
 ## Configuration
 

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::PLUGIN_CONFIG_ENV_SEGMENT;
 use super::env_mapping::ConfigEnvMappings;
 use super::error::ConfigurationError;
 use super::parsing::parse_env_value;
@@ -37,25 +38,20 @@ enum EnvNameResolution<'a> {
 
 /// Controls filtering and messaging for unknown env var warnings.
 enum WarningContext<'a> {
-    /// Main config: filter IGNORED_ENV_VARS and DELEGATED prefixes
+    /// Main config: filter runtime env vars and delegated prefixes.
     MainConfig,
     /// Connector config: filter PLUGIN_CONFIG_ prefix
     ConnectorConfig(&'a str),
 }
 
-/// `IGGY_` variables that are NOT config values: the config file and dotenv
-/// paths the connectors runtime and the MCP server read before their config
-/// loads.
-const IGNORED_ENV_VARS: &[&str] = &[
-    "IGGY_CONNECTORS_CONFIG_PATH",
-    "IGGY_CONNECTORS_ENV_PATH",
-    "IGGY_MCP_CONFIG_PATH",
-    "IGGY_MCP_ENV_PATH",
-];
-
 /// Prefixes for env vars handled by separate providers with runtime prefixes.
 /// The main config provider skips these; each sub-provider validates its own vars.
 const DELEGATED_ENV_VAR_PREFIXES: &[&str] = &["IGGY_CONNECTORS_SINK_", "IGGY_CONNECTORS_SOURCE_"];
+
+fn is_runtime_env_var(name: &str) -> bool {
+    super::CONNECTORS_RUNTIME_ENV_VARS.contains(&name)
+        || super::MCP_RUNTIME_ENV_VARS.contains(&name)
+}
 
 type ProfileMap = FigmentMap<Profile, Dict>;
 
@@ -291,13 +287,13 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
 
             let should_skip = match &context {
                 WarningContext::MainConfig => {
-                    IGNORED_ENV_VARS.contains(&key.as_str())
+                    is_runtime_env_var(&key)
                         || DELEGATED_ENV_VAR_PREFIXES
                             .iter()
                             .any(|p| key.starts_with(p))
                 }
                 WarningContext::ConnectorConfig(prefix) => {
-                    let plugin_config_prefix = format!("{}PLUGIN_CONFIG_", prefix);
+                    let plugin_config_prefix = format!("{}{PLUGIN_CONFIG_ENV_SEGMENT}", prefix);
                     key.starts_with(&plugin_config_prefix)
                 }
             };
@@ -314,8 +310,9 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
 
             let debug_msg = match &context {
                 WarningContext::MainConfig => format!(
-                    "Unknown IGGY_ env var: '{}'.{}. Add to IGNORED_ENV_VARS if intentional, \
-                     or add #[derive(ConfigEnv)] to the config struct.",
+                    "Unknown IGGY_ env var: '{}'.{}. Add advertised process variables to \
+                     MCP_RUNTIME_ENV_VARS or CONNECTORS_RUNTIME_ENV_VARS, add a dedicated scan-only \
+                     list for internal variables, or add #[derive(ConfigEnv)] to the config struct.",
                     key, suggestion_hint
                 ),
                 WarningContext::ConnectorConfig(_) => format!(
@@ -625,19 +622,21 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn ignored_env_vars_are_skipped_by_the_unknown_variable_scan() {
-        for name in [
+        let runtime_env_vars = [
             "IGGY_CONNECTORS_CONFIG_PATH",
             "IGGY_CONNECTORS_ENV_PATH",
             "IGGY_MCP_CONFIG_PATH",
             "IGGY_MCP_ENV_PATH",
-        ] {
+        ];
+
+        for name in runtime_env_vars {
             assert!(
-                IGNORED_ENV_VARS.contains(&name),
-                "{name} is read by a sibling binary before its config loads, so the scan must skip it"
+                is_runtime_env_var(name),
+                "{name} is read before config loading and must be skipped by the scan"
             );
         }
 
-        for name in IGNORED_ENV_VARS {
+        for name in runtime_env_vars {
             // SAFETY: the race is process-wide, not per key: `set_var` is unsound
             // against any concurrent environment access. `serial_test::serial` on
             // this test is what prevents that.
@@ -649,7 +648,7 @@ mod tests {
                 .warn_unknown_env_vars_inner(WarningContext::MainConfig);
         }
 
-        for name in IGNORED_ENV_VARS {
+        for name in runtime_env_vars {
             // SAFETY: paired with the set above.
             unsafe { env::remove_var(name) };
         }
