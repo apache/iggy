@@ -31,7 +31,6 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
-import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -137,7 +136,12 @@ class IggySourceRecoveryTest {
         private int nextOffset;
 
         private PolledMessages poll(PollingStrategy strategy, long count, boolean autoCommit) {
-            int start = strategy.kind() == PollingKind.Offset ? strategy.value().intValueExact() : nextOffset;
+            int start =
+                    switch (strategy.kind()) {
+                        case Next -> nextOffset;
+                        case Offset -> strategy.value().intValueExact();
+                        default -> throw new AssertionError("Unexpected polling strategy: " + strategy.kind());
+                    };
             List<Message> messages = new ArrayList<>();
             int end = Math.min(INPUT.size(), start + Math.toIntExact(count));
             for (int offset = start; offset < end; offset++) {
