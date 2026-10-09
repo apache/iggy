@@ -1676,25 +1676,29 @@ mod tests {
     #[test]
     fn given_u64_above_i64_max_when_appending_should_widen_to_double() {
         // QuestDB has no unsigned 64-bit column, so a value past `i64::MAX`
-        // degrades to a double rather than wrapping into a negative.
-        let mut buffer = buffer();
-        let mapping = mapping();
-        mapping
-            .append_row(
-                &mut buffer,
-                &json_message(r#"{"fingerprint":18446744073709551615}"#),
-                context(),
-            )
-            .unwrap();
-        let line = rendered(&buffer);
-        assert!(
-            line.contains("fingerprint=1.8446744073709552e19"),
-            "expected a double rendering, got {line}"
-        );
-        let flags = &mapping.rounding_warned;
-        assert!(flags.flag(Rounding::PastLong).load(Ordering::Relaxed));
-        assert!(!flags.flag(Rounding::Scalar).load(Ordering::Relaxed));
-        assert!(!flags.flag(Rounding::ArrayElement).load(Ordering::Relaxed));
+        // is written as a double whatever `numbers_as_double` says, and its
+        // warning names that no column holds it exactly.
+        for numbers_as_double in [true, false] {
+            let mut buffer = buffer();
+            let mut mapping = mapping();
+            mapping.numbers_as_double = numbers_as_double;
+            mapping
+                .append_row(
+                    &mut buffer,
+                    &json_message(r#"{"fingerprint":18446744073709551615}"#),
+                    context(),
+                )
+                .unwrap();
+            let line = rendered(&buffer);
+            assert!(
+                line.contains("fingerprint=1.8446744073709552e19"),
+                "numbers_as_double={numbers_as_double}: expected a double, got {line}"
+            );
+            let flags = &mapping.rounding_warned;
+            assert!(flags.flag(Rounding::PastLong).load(Ordering::Relaxed));
+            assert!(!flags.flag(Rounding::Scalar).load(Ordering::Relaxed));
+            assert!(!flags.flag(Rounding::ArrayElement).load(Ordering::Relaxed));
+        }
     }
 
     #[test]
