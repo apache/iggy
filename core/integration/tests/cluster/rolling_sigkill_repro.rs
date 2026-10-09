@@ -190,8 +190,8 @@ async fn produce(
     let mut client = None;
     let mut sequence = 0u64;
     while start.elapsed() < LOAD {
-        let partition = (producer + u32::try_from(sequence % u64::from(PARTITIONS)).unwrap())
-            % PARTITIONS;
+        let partition =
+            (producer + u32::try_from(sequence % u64::from(PARTITIONS)).unwrap()) % PARTITIONS;
         let payloads: Vec<String> = (0..BATCH)
             .map(|index| {
                 let mut payload = format!("p{producer}-s{sequence}-m{index}-");
@@ -235,7 +235,9 @@ async fn produce(
             match attempt {
                 Ok(Ok(_)) => {
                     let latency = u64::try_from(sent_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    counters.max_latency_ms.fetch_max(latency, Ordering::Relaxed);
+                    counters
+                        .max_latency_ms
+                        .fetch_max(latency, Ordering::Relaxed);
                     counters.acked_batches.fetch_add(1, Ordering::Relaxed);
                     acked
                         .lock()
