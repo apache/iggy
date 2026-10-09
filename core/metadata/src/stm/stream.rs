@@ -53,7 +53,7 @@ use iggy_binary_protocol::requests::streams::{
 // Only the slab-seeding helpers build a bare `CreateTopicRequest`; without
 // their cfg the import is dead and `-p <crate>` clippy (which skips the
 // simulator feature) rejects it.
-use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
@@ -1038,6 +1038,15 @@ impl PollMetadata {
     #[must_use]
     pub fn matches_partition(&self, created_revision: Option<u64>) -> bool {
         created_revision == Some(self.created_revision)
+    }
+
+    /// Whether `owner`, installed on the partition for `group_id`, is the
+    /// owner this metadata activated for the caller.
+    #[must_use]
+    pub fn is_installed_owner(&self, group_id: u64, owner: ConsumerGroupOwner) -> bool {
+        !owner.is_unassigned()
+            && owner.client_id == self.client_id
+            && self.group == Some((group_id, owner.generation))
     }
 
     #[must_use]

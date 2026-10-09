@@ -351,11 +351,15 @@ pub enum PartitionRead {
     SessionRetired {
         identity: iggy_binary_protocol::requests::system::SessionIdentity,
     },
+    /// A bound poll. A group read is served only to the partition's installed
+    /// owner.
     PollOnPrimary {
         consumer: PollingConsumer,
         args: PollingArgs,
         attachment: poll::ConsumerAttachment,
     },
+    /// A read with no owner check. In production only plain consumers use it.
+    /// Tests and the simulator also read groups through it.
     Poll {
         consumer: PollingConsumer,
         args: PollingArgs,

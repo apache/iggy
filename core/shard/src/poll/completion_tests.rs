@@ -63,6 +63,7 @@ use crate::{
     PartitionRead, PartitionReadReply, Receiver, ReplicaTopology, ShardFrame, ShardIdentity,
     TaggedSender, channel, shard_channel,
 };
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
 
 #[compio::test]
@@ -271,6 +272,333 @@ fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: 
         owner.plane.metadata().mux_stm.update(message).unwrap().code,
         0
     );
+}
+
+const BOUND_CLIENT: u128 = 41;
+const OTHER_CLIENT: u128 = 42;
+const BOUND_USER: u32 = 7;
+const BOUND_GROUP: u64 = 7;
+
+/// Another node's rebalance moved the partition to a newer owner, and this
+/// node's metadata has not applied it. The stale owner's auto-commit would
+/// otherwise be stamped with the new owner's generation.
+#[compio::test]
+async fn given_newer_installed_owner_when_stale_owner_polls_on_primary_should_refuse_without_progress()
+ {
+    let (mut fixture, activated) = BoundPoll::activated().await;
+    fixture
+        .install(InstallConsumerGroupOwnerRequest {
+            owner: ConsumerGroupOwner {
+                client_id: OTHER_CLIENT,
+                session: 1,
+                generation: activated.owner.generation + 1,
+            },
+            metadata_op: activated.metadata_op + 1,
+            ..activated
+        })
+        .await;
+
+    let reply = fixture.poll().await;
+    fixture.commit().await;
+    assert_eq!(
+        fixture.group_offsets(),
+        (None, None),
+        "the stale owner's read must not move the new owner's progress"
+    );
+    assert_not_owned(&reply);
+}
+
+/// The last member left, so the partition installed an unassigned owner. An
+/// automatic commit under it fails at apply on every replica.
+#[compio::test]
+async fn given_unassigned_installed_owner_when_stale_owner_polls_on_primary_should_refuse_without_fatal_commit()
+ {
+    let (mut fixture, activated) = BoundPoll::activated().await;
+    fixture
+        .install(InstallConsumerGroupOwnerRequest {
+            owner: ConsumerGroupOwner {
+                client_id: 0,
+                session: 0,
+                generation: activated.owner.generation + 1,
+            },
+            metadata_op: activated.metadata_op + 1,
+            ..activated
+        })
+        .await;
+
+    let reply = fixture.poll().await;
+    fixture.commit().await;
+    assert_eq!(fixture.group_offsets(), (None, None));
+    assert_not_owned(&reply);
+}
+
+/// Metadata activates an owner only after its install committed, but this
+/// replica can apply the install later. The owner retries until it does.
+#[compio::test]
+async fn given_unapplied_install_when_new_owner_polls_on_primary_should_retry_until_it_applies() {
+    let (mut fixture, _) = BoundPoll::activated().await;
+    let successor = fixture.reconnect_owner();
+
+    let reply = fixture.poll().await;
+    assert!(
+        matches!(
+            reply,
+            PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+        ),
+        "the partition has not applied generation {}, got {reply:?}",
+        successor.owner.generation
+    );
+    assert_eq!(fixture.group_offsets(), (None, None));
+
+    fixture.install(successor).await;
+    let reply = fixture.poll().await;
+    fixture.commit().await;
+    assert_served(&reply, successor.owner.generation);
+    assert_eq!(fixture.group_offsets(), (Some(0), Some(0)));
+}
+
+#[compio::test]
+async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generation() {
+    let (mut fixture, activated) = BoundPoll::activated().await;
+
+    let reply = fixture.poll().await;
+    fixture.commit().await;
+    assert_served(&reply, activated.owner.generation);
+    assert_eq!(fixture.group_offsets(), (Some(0), Some(0)));
+}
+
+/// Equal generations alone must not bind the poller: the partition's owner
+/// at that generation is another client.
+#[compio::test]
+async fn given_other_client_installed_at_same_generation_when_owner_polls_on_primary_should_refuse()
+{
+    let (mut fixture, activated) = BoundPoll::activated_without_install().await;
+    fixture
+        .install(InstallConsumerGroupOwnerRequest {
+            owner: ConsumerGroupOwner {
+                client_id: OTHER_CLIENT,
+                ..activated.owner
+            },
+            ..activated
+        })
+        .await;
+
+    let reply = fixture.poll().await;
+    fixture.commit().await;
+    assert_eq!(fixture.group_offsets(), (None, None));
+    assert_not_owned(&reply);
+}
+
+fn assert_not_owned(reply: &PartitionReadReply) {
+    assert!(
+        matches!(
+            reply,
+            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(group, 0))
+                if u64::from(*group) == BOUND_GROUP
+        ),
+        "the poller is not the installed owner, got {reply:?}"
+    );
+}
+
+fn assert_served(reply: &PartitionReadReply, generation: u64) {
+    let PartitionReadReply::Poll {
+        context,
+        current_offset: 0,
+        ..
+    } = reply
+    else {
+        panic!("the installed owner must be served, got {reply:?}");
+    };
+    assert_eq!(context.owner_generation, generation);
+}
+
+/// Bound group polls of `BOUND_CLIENT`, driven through the owner's read gate
+/// as a binary poll on the partition primary arrives. Metadata and the
+/// partition apply owners independently, so either one can lag the other.
+struct BoundPoll {
+    namespace: IggyNamespace,
+    bus: Rc<IggyMessageBus>,
+    config: PartitionsConfig,
+    group: ConsumerGroup,
+    topic: Topic,
+    partition: Option<Box<partitions::IggyPartition<Rc<IggyMessageBus>>>>,
+    served: Option<(CompletionTestShard, TaggedSender, ClientTable)>,
+}
+
+#[allow(clippy::future_not_send)]
+impl BoundPoll {
+    /// Metadata and the partition both name `BOUND_CLIENT`.
+    async fn activated() -> (Self, InstallConsumerGroupOwnerRequest) {
+        let (mut fixture, installation) = Self::pending().await;
+        let op = fixture.install(installation).await;
+        assert!(fixture.group.complete_revocation(0, &installation, op));
+        (fixture, installation)
+    }
+
+    /// Metadata names `BOUND_CLIENT`, and the partition installed no owner.
+    async fn activated_without_install() -> (Self, InstallConsumerGroupOwnerRequest) {
+        let (mut fixture, installation) = Self::pending().await;
+        assert!(fixture.group.complete_revocation(0, &installation, 2));
+        (fixture, installation)
+    }
+
+    async fn pending() -> (Self, InstallConsumerGroupOwnerRequest) {
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+        let mut topic = Topic::default();
+        topic.partitions.push(Partition::new(
+            0,
+            namespace.inner(),
+            IggyTimestamp::default(),
+            partition.created_revision(),
+            0,
+        ));
+        let mut group = ConsumerGroup::new(BOUND_GROUP, Arc::from("bound-group"));
+        let mut member = ConsumerGroupMember::new(0, BOUND_CLIENT);
+        member.session = Some(1);
+        group.members.insert(member);
+        group.rebalance_members(&topic.partitions, 1, 1);
+        let pending = group.assignments[&0].pending.unwrap();
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: group.assignments[&0].incarnation,
+            group_id: BOUND_GROUP,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        let fixture = Self {
+            namespace,
+            bus,
+            config,
+            group,
+            topic,
+            partition: Some(Box::new(partition)),
+            served: None,
+        };
+        (fixture, installation)
+    }
+
+    /// The owner reconnected with a new session. Metadata activates the new
+    /// session's owner as if its install committed on another replica.
+    fn reconnect_owner(&mut self) -> InstallConsumerGroupOwnerRequest {
+        for (_, member) in &mut self.group.members {
+            member.session = Some(2);
+        }
+        self.group.rebalance_members(&self.topic.partitions, 3, 2);
+        let pending = self.group.assignments[&0].pending.unwrap();
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: self.group.assignments[&0].incarnation,
+            group_id: BOUND_GROUP,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        assert!(self.group.complete_revocation(0, &installation, 99));
+        installation
+    }
+
+    async fn install(&mut self, installation: InstallConsumerGroupOwnerRequest) -> u64 {
+        let config = self.config.clone();
+        if let Some(partition) = self.partition.as_mut() {
+            return install_group_owner(partition, &config, installation).await;
+        }
+        let (owner, ..) = self.served.as_ref().unwrap();
+        let partition = owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&self.namespace)
+            .unwrap();
+        install_group_owner(partition, &config, installation).await
+    }
+
+    /// Freeze metadata on the first poll, then serve every poll from it.
+    async fn poll(&mut self) -> PartitionReadReply {
+        if let Some(partition) = self.partition.take() {
+            let mut stream = Stream::default();
+            let mut topic = self.topic.clone();
+            topic
+                .consumer_groups
+                .insert(BOUND_GROUP, self.group.clone());
+            stream.topics.insert(topic);
+            let mut inner = StreamsInner::default();
+            inner.items.insert(stream);
+            let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+            let (owner, inbox) =
+                owner_with_metadata(&self.bus, self.config.clone(), self.namespace, metadata);
+            owner.shards_table.insert(
+                self.namespace,
+                PartitionLocation::new(ShardId::new(0), partition.created_revision()),
+            );
+            owner.plane.partitions().insert(self.namespace, *partition);
+            let mut table = ClientTable::new(1);
+            let registration = PrepareHeader {
+                client: BOUND_CLIENT,
+                user_id: BOUND_USER,
+                operation: Operation::Register,
+                op: 1,
+                ..Default::default()
+            };
+            table
+                .commit_register(
+                    BOUND_CLIENT,
+                    BOUND_USER,
+                    [0x5a; 32],
+                    build_reply_message_with(&registration, 0, |_| {}),
+                )
+                .unwrap();
+            self.served = Some((owner, inbox, table));
+        }
+        let (owner, _, table) = self.served.as_mut().unwrap();
+        let attachment = ConsumerAttachment {
+            session: table.attach_session(BOUND_CLIENT, 1, BOUND_USER).unwrap(),
+            metadata: owner
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .poll_metadata(self.namespace, Some(BOUND_GROUP), BOUND_CLIENT)
+                .expect("metadata names the poller as the group's owner"),
+        };
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(
+                self.namespace,
+                PartitionRead::PollOnPrimary {
+                    consumer: PollingConsumer::ConsumerGroup(
+                        usize::try_from(BOUND_GROUP).unwrap(),
+                        0,
+                    ),
+                    args: PollingArgs::new(PollingStrategy::first(), 1, true),
+                    attachment,
+                },
+                reply,
+            )
+            .await;
+        replies.try_recv().expect("the owner answers the read")
+    }
+
+    /// Commit what the poll prepared. A store that apply refuses would make
+    /// every replica fatal, since each applies the same op to the same owner.
+    async fn commit(&self) {
+        let (owner, ..) = self.served.as_ref().unwrap();
+        let partition = owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&self.namespace)
+            .unwrap();
+        let op = partition.consensus().sequencer().current_sequence();
+        partition.consensus().advance_commit_max(op);
+        partition.commit_journal(&self.config).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+    }
+
+    fn group_offsets(&self) -> (Option<u64>, Option<u64>) {
+        let (owner, ..) = self.served.as_ref().unwrap();
+        owner
+            .plane
+            .partitions()
+            .group_offset_state(&self.namespace, BOUND_GROUP)
+            .unwrap()
+    }
 }
 
 #[compio::test]

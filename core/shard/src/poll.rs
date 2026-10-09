@@ -33,13 +33,14 @@ use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::PollMetadata;
-use partitions::{PollCompletion, PollPlan, PollReadResult};
+use partitions::{PollCompletion, PollPlan, PollReadResult, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
@@ -157,35 +158,57 @@ where
                 return;
             }
         }
-        let rejected = partitions
+        let rejection = partitions
             .with_partition(&namespace, |partition| {
                 if partition.requires_state_transfer() || partition.read_history_is_changing() {
-                    return true;
+                    return Some(IggyError::TransientNotAccepted);
                 }
-                if let PartitionRead::PollOnPrimary { attachment, .. } = &read {
+                if let PartitionRead::PollOnPrimary {
+                    consumer,
+                    attachment,
+                    ..
+                } = &read
+                {
                     let consensus = partition.consensus();
-                    return !consensus.is_primary()
+                    if !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
                         || !attachment
                             .metadata
-                            .matches_partition(self.shards_table.epoch_for(namespace));
+                            .matches_partition(self.shards_table.epoch_for(namespace))
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                    // The plan captures this owner in the same turn, and
+                    // completion refuses an owner that changed since.
+                    return match *consumer {
+                        PollingConsumer::ConsumerGroup(group_id, _) => group_owner_rejection(
+                            namespace,
+                            group_id as u64,
+                            partition.consumer_group_owner(group_id as u64),
+                            &attachment.metadata,
+                        ),
+                        PollingConsumer::Consumer(..) => None,
+                    };
                 }
                 if let PartitionRead::Poll {
                     metadata: Some(metadata),
                     ..
                 } = &read
                 {
-                    return !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
-                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace));
+                    return (!metadata
+                        .is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace)))
+                    .then_some(IggyError::TransientNotAccepted);
                 }
-                false
+                None
             })
-            .unwrap_or(matches!(read, PartitionRead::PollOnPrimary { .. }));
-        if rejected {
-            let _ = reply.try_send(PartitionReadReply::Rejected(
-                IggyError::TransientNotAccepted,
-            ));
+            .unwrap_or_else(|| {
+                matches!(read, PartitionRead::PollOnPrimary { .. })
+                    .then_some(IggyError::TransientNotAccepted)
+            });
+        if let Some(error) = rejection {
+            let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
         }
         let (read, attachment) = match read {
@@ -390,6 +413,31 @@ where
             }
         }
     }
+}
+
+/// Serve a group read only to the partition's installed owner. The serving
+/// node's metadata can lag an install the partition already applied, for
+/// example on a new primary after a view change, and the partition commits a
+/// read's progress under the installed owner.
+fn group_owner_rejection(
+    namespace: IggyNamespace,
+    group_id: u64,
+    installed: Option<ConsumerGroupOwner>,
+    metadata: &PollMetadata,
+) -> Option<IggyError> {
+    if installed.is_some_and(|owner| metadata.is_installed_owner(group_id, owner)) {
+        return None;
+    }
+    // Metadata activates an owner only after its install committed, so an
+    // older or missing install means this replica has not applied it yet.
+    let attached_generation = metadata.context(0).owner_generation;
+    if installed.is_none_or(|owner| owner.generation < attached_generation) {
+        return Some(IggyError::TransientNotAccepted);
+    }
+    Some(IggyError::ConsumerGroupPartitionNotOwned(
+        u32::try_from(group_id).unwrap_or(u32::MAX),
+        u32::try_from(namespace.partition_id()).unwrap_or(u32::MAX),
+    ))
 }
 
 /// Read an owned snapshot without borrowing the partition or changing progress.

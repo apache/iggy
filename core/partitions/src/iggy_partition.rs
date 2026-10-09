@@ -151,6 +151,10 @@ where
     pub(crate) consumer_group_polls: BTreeMap<u64, Arc<AtomicBool>>,
     pub(crate) owner_retirement: Option<RetireConsumerGroupOwnersRequest>,
     pub(crate) pending_owner_install: Cell<Option<InstallConsumerGroupOwnerRequest>>,
+    /// Op of the last unapplied install the latest log scan found. A view
+    /// change can leave several, and the latch holds only the last one, so
+    /// group reads and offset writes wait until every one of them has applied.
+    owner_install_barrier: u64,
     pending_history_transition: Cell<Option<TransitionPartitionHistoryRequest>>,
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
     pub stats: Arc<PartitionStats>,
@@ -825,6 +829,7 @@ where
             consumer_group_polls: BTreeMap::new(),
             owner_retirement: None,
             pending_owner_install: Cell::new(None),
+            owner_install_barrier: 0,
             pending_history_transition: Cell::new(None),
             history_transition: None,
             stats,
@@ -3797,17 +3802,32 @@ where
         {
             return Err(IggyError::TransientNotAccepted);
         }
-        if let PollingConsumer::ConsumerGroup(group_id, _) = result.context.consumer
-            && (result.context.owner.is_none()
+        // A view change rebuilds the install latch and barrier from the log,
+        // so the owner checks below must run after it.
+        self.resynchronize_consumer_offset_reservations();
+        if let PollingConsumer::ConsumerGroup(group_id, _) = result.context.consumer {
+            // A store by an unassigned owner fails at apply on every replica.
+            if result
+                .context
+                .owner
+                .is_some_and(ConsumerGroupOwner::is_unassigned)
+            {
+                return Err(IggyError::ConsumerGroupPartitionNotOwned(
+                    u32::try_from(group_id).unwrap_or(u32::MAX),
+                    u32::try_from(self.namespace().partition_id()).unwrap_or(u32::MAX),
+                ));
+            }
+            if result.context.owner.is_none()
                 || result.context.owner != self.consumer_group_owner(group_id as u64)
                 || self
                     .pending_owner_install
                     .get()
-                    .is_some_and(|pending| pending.group_id == group_id as u64))
-        {
-            return Err(IggyError::TransientNotAccepted);
+                    .is_some_and(|pending| pending.group_id == group_id as u64)
+                || self.consensus.commit_min() < self.owner_install_barrier
+            {
+                return Err(IggyError::TransientNotAccepted);
+            }
         }
-        self.resynchronize_consumer_offset_reservations();
         let mut replication = None;
         if let Some(offset) = result
             .last_matching_offset
@@ -4843,6 +4863,11 @@ where
             .map(|(op, pending)| (*op, *pending))
             .collect();
         let headers = self.log.journal().inner.repair_headers_in(from_op..=to_op);
+        self.owner_install_barrier = headers
+            .iter()
+            .rev()
+            .find(|(_, header)| header.operation == Operation::InstallConsumerGroupOwner)
+            .map_or(0, |(op, _)| *op);
         let uncommitted_from = from_op.max(commit_max.saturating_add(1));
         let expected = to_op
             .checked_sub(uncommitted_from)
@@ -6951,13 +6976,16 @@ where
                 }
             }
 
-            // Only this group's offsets wait for its installation. They would
-            // otherwise land behind the install under the old owner token.
+            // A group's offsets wait for its installation, or they would land
+            // behind the install under the old owner token. The latch names only
+            // the last install, so after a view change every group waits for the
+            // barrier.
             if let Some((ConsumerKind::ConsumerGroup, consumer_id, _, _)) = consumer_offset
-                && self
+                && (self
                     .pending_owner_install
                     .get()
                     .is_some_and(|pending| pending.group_id == u64::from(consumer_id))
+                    || consensus.commit_min() < self.owner_install_barrier)
             {
                 Self::send_partition_deny_or_log(
                     consensus,
@@ -16267,6 +16295,230 @@ mod tests {
             Some(installation.owner)
         );
         assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+    }
+
+    /// Complete `read`, replicate any automatic commit it admits, then commit
+    /// the whole log. Returns the refusal, if any.
+    async fn complete_poll_and_commit(
+        partition: &mut IggyPartition<IggyMessageBus>,
+        read: PollReadResult,
+    ) -> Option<IggyError> {
+        let refusal = match partition.complete_poll(read) {
+            Ok(completion) => {
+                if let Some(replication) = completion.replication {
+                    partition.replicate_poll_completion(replication).await;
+                }
+                None
+            }
+            Err(error) => Some(error),
+        };
+        commit_log(partition).await;
+        refusal
+    }
+
+    /// An applied install ends a commit walk, so walk until the head applies.
+    async fn commit_log(partition: &mut IggyPartition<IggyMessageBus>) {
+        let head = partition.consensus.sequencer().current_sequence();
+        partition.consensus.advance_commit_max(head);
+        for _ in 0..head {
+            if partition.consensus.commit_min() == head || partition.fatal().is_some() {
+                break;
+            }
+            partition.commit_journal(&repair_config()).await;
+        }
+    }
+
+    /// Journal installs that replace one client in two groups, apply neither
+    /// and change the view. A view change can leave this state, and the rebuilt
+    /// latch then names only the second install. Returns the first install.
+    async fn unapplied_installs_after_view_change(
+        partition: &mut IggyPartition<IggyMessageBus>,
+    ) -> InstallConsumerGroupOwnerRequest {
+        const GROUPS: [u64; 2] = [7, 8];
+        const REPLACED_CLIENT: u128 = 42;
+        for group_id in GROUPS {
+            install_test_owner(partition, group_id, REPLACED_CLIENT).await;
+        }
+        let first = next_test_installation(partition, GROUPS[0], REPLACED_CLIENT + 1);
+        let second = InstallConsumerGroupOwnerRequest {
+            metadata_op: first.metadata_op + 1,
+            ..next_test_installation(partition, GROUPS[1], REPLACED_CLIENT + 1)
+        };
+        for installation in [first, second] {
+            let prepare = partition.pipeline_local_request(
+                owner_install_request(partition, &installation),
+                None,
+                None,
+            );
+            partition.on_replicate(prepare).await;
+        }
+        partition.consensus.set_view(1);
+        first
+    }
+
+    /// A store under an unassigned owner fails at apply on every replica, so
+    /// the read that would prepare it must not complete.
+    #[compio::test]
+    async fn given_unassigned_captured_owner_when_group_read_completes_should_refuse_before_auto_commit()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        let mut partition = test_partition();
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let mut unassigned = next_test_installation(&partition, GROUP_ID, 0);
+        unassigned.owner.session = 0;
+        partition
+            .on_request(owner_install_request(&partition, &unassigned), None)
+            .await;
+        commit_log(&mut partition).await;
+        let op = partition.consensus.sequencer().current_sequence();
+        assert_eq!(
+            partition.consumer_group_owner(GROUP_ID),
+            Some(unassigned.owner)
+        );
+        partition.stats.increment_messages_count(1);
+        let read = poll_read_result(
+            &partition,
+            PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0),
+            true,
+            Some(0),
+        );
+
+        let refusal = complete_poll_and_commit(&mut partition, read).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus.sequencer().current_sequence(), op);
+        assert!(
+            matches!(
+                refusal,
+                Some(IggyError::ConsumerGroupPartitionNotOwned(group, 0))
+                    if u64::from(group) == GROUP_ID
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(partition.group_offset_state(GROUP_ID), (None, None));
+    }
+
+    /// A view change can leave an install that this replica has not applied.
+    /// The replaced owner's read must wait for it even without a commit, and
+    /// the successor is served once it applies.
+    #[compio::test]
+    async fn given_unapplied_install_after_view_change_when_replaced_owner_read_completes_should_refuse()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        let consumer = PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0);
+        let mut partition = test_partition();
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let successor = next_test_installation(&partition, GROUP_ID, CLIENT_ID + 1);
+        let prepare = partition.pipeline_local_request(
+            owner_install_request(&partition, &successor),
+            None,
+            None,
+        );
+        partition.on_replicate(prepare).await;
+        partition.consensus.set_view(1);
+        let read = poll_read_result(&partition, consumer, false, Some(0));
+
+        assert!(matches!(
+            partition.complete_poll(read),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(partition.group_offset_state(GROUP_ID), (None, None));
+
+        commit_log(&mut partition).await;
+        assert_eq!(
+            partition.consumer_group_owner(GROUP_ID),
+            Some(successor.owner)
+        );
+        let read = poll_read_result(&partition, consumer, false, Some(0));
+        partition.complete_poll(read).unwrap();
+        assert_eq!(partition.group_offset_state(GROUP_ID).0, Some(0));
+    }
+
+    /// A view change can leave unapplied installs for several groups, and the
+    /// rebuilt latch holds only the last one. A store prepared under an earlier
+    /// group's replaced owner would fail at apply on every replica.
+    #[compio::test]
+    async fn given_unapplied_installs_for_two_groups_after_view_change_when_first_group_auto_commits_should_refuse_without_fatal_commit()
+     {
+        let mut partition = test_partition();
+        let first = unapplied_installs_after_view_change(&mut partition).await;
+        partition.stats.increment_messages_count(1);
+        let head = partition.consensus.sequencer().current_sequence();
+        let read = poll_read_result(
+            &partition,
+            PollingConsumer::ConsumerGroup(usize::try_from(first.group_id).unwrap(), 0),
+            true,
+            Some(0),
+        );
+
+        let refusal = complete_poll_and_commit(&mut partition, read).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+        assert!(
+            matches!(refusal, Some(IggyError::TransientNotAccepted)),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            partition.consumer_group_owner(first.group_id),
+            Some(first.owner)
+        );
+        assert_eq!(partition.group_offset_state(first.group_id), (None, None));
+    }
+
+    /// The same state as above, but the replaced owner stores explicitly. Its
+    /// store would land behind the first install and fail at apply on every
+    /// replica, so admission waits until every unapplied install has applied.
+    #[compio::test]
+    async fn given_unapplied_installs_for_two_groups_after_view_change_when_replaced_owner_stores_should_refuse_without_fatal_commit()
+     {
+        let mut partition = test_partition();
+        let first = unapplied_installs_after_view_change(&mut partition).await;
+        partition.stats.increment_messages_count(1);
+        let replaced = partition.consumer_group_owner(first.group_id).unwrap();
+        let head = partition.consensus.sequencer().current_sequence();
+        let group = u32::try_from(first.group_id).unwrap();
+        let store = |owner: ConsumerGroupOwner, metadata_watermark: u64| {
+            store_offset_request(
+                owner.client_id,
+                1,
+                ConsumerKind::ConsumerGroup,
+                group,
+                0,
+                AckLevel::Quorum,
+            )
+            .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+                header.metadata_watermark = metadata_watermark;
+                header.owner_generation = owner.generation;
+                *next = header;
+            })
+        };
+        let (sender, receiver) = consensus::oneshot_channel();
+
+        let frontier = partition.required_metadata_frontier;
+        partition
+            .on_request(store(replaced, frontier), Some(sender))
+            .await;
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+        assert_eq!(
+            partition.consumer_group_owner(first.group_id),
+            Some(first.owner)
+        );
+        assert_eq!(partition.group_offset_state(first.group_id), (None, None));
+
+        let frontier = partition.required_metadata_frontier;
+        partition
+            .on_request(store(first.owner, frontier), None)
+            .await;
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.group_offset_state(first.group_id).1, Some(0));
     }
 
     #[compio::test]
