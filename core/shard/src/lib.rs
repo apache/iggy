@@ -431,7 +431,6 @@ pub enum PartitionReadReply {
         up_to_offset: Option<u64>,
         lagging: bool,
         created_revision: u64,
-        purge_generation: u64,
     },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
@@ -858,15 +857,6 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         up_to_offset: u64,
     },
-    /// Reconciler-staged enforcement of a committed `PurgeTopic`: reset the
-    /// partition to a single empty segment at offset 0 and clear consumer
-    /// offsets on the pump, serialized with reads. `generation` is the
-    /// committed purge generation; the pump no-ops if the partition already
-    /// applied it, so a redundant reconcile pass never re-wipes live data.
-    PurgePartition {
-        namespace: IggyNamespace,
-        generation: u64,
-    },
 }
 
 /// Reconciler-staged partition mutation.
@@ -1239,11 +1229,11 @@ impl ServedSegmentCache {
 
     /// Drop every payload cached for `namespace`, crediting their bytes back.
     ///
-    /// A purge unlinks the segments these payloads copy, and the cache key is
-    /// the manifest checksum over the PRE-purge bytes, so nothing about a hit
-    /// can notice: the serve path answers from the resident copy without
-    /// touching disk, and every served chunk resets the expiry clock, so an
-    /// active puller keeps purged data alive indefinitely.
+    /// Retention, a truncate or an install unlinks the segments these payloads
+    /// copy, and the cache key is the manifest checksum over the removed bytes,
+    /// so nothing about a hit can notice: the serve path answers from the
+    /// resident copy without touching disk, and every served chunk resets the
+    /// expiry clock, so an active puller keeps deleted data alive indefinitely.
     fn evict_namespace(&mut self, namespace: u64) {
         let stale: Vec<(u64, u64)> = self
             .entries
@@ -2586,20 +2576,6 @@ where
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::TruncatePartition {
             namespace,
             up_to_offset,
-        }));
-    }
-
-    /// Stage a `PurgePartition` enforcement for `namespace` on this shard's
-    /// pump: reset the partition to empty at offset 0 and clear consumer
-    /// offsets. The reconciler calls this after observing a committed purge
-    /// generation newer than the partition's locally applied one.
-    pub fn request_purge_partition(&self, namespace: IggyNamespace, generation: u64) {
-        let Some(sender) = self.senders.get(self.id as usize) else {
-            return;
-        };
-        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::PurgePartition {
-            namespace,
-            generation,
         }));
     }
 
@@ -5246,34 +5222,6 @@ where
         }
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
-        // Purge convergence gate: while a committed purge is not yet locally
-        // applied, this journal still holds pre-purge entries with NO floor
-        // to fence them (the floor is installed by the purge itself), so
-        // serving now would hand a rejoiner batches the cluster purged.
-        // Defer instead: no RepairDone is sent, the rejoiner's stall retry
-        // re-asks, and the local purge (one reconciler wake away) installs
-        // the floor the fence below serves behind.
-        let committed_purge = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_purge_generation(
-                namespace.stream_id(),
-                namespace.topic_id(),
-                namespace.partition_id(),
-            );
-        if committed_purge > partition.applied_purge_generation() {
-            self.metrics.record_partition_repair_serve_deferred();
-            tracing::debug!(
-                shard = self.id,
-                namespace_raw = header.group,
-                committed_purge,
-                applied_purge = partition.applied_purge_generation(),
-                "deferring repair serve until the committed purge applies locally"
-            );
-            return;
-        }
         // The frontier bounds the serve, not `commit_max` alone, mirroring the
         // metadata twin: a rejoining backup needs the BODIES of the adopted
         // suffix above the commit point. Its ack for those ops is withheld
@@ -5296,22 +5244,12 @@ where
         // journal instead reports eviction from the commit frontier, which
         // refuses the floor into a transfer (the empty window passes the
         // completeness check) and heals in one round.
-        //
-        // Purge fence on top: never serve entries at or below this replica's
-        // purge floor. The journal keeps them (own commit walk), but a
-        // rejoiner's floor died with its process, so served pre-purge batches
-        // would flush right back into its freshly reset segments. Reporting
-        // the floor as the retention start rides the normal `RangeEvicted`
-        // path: the rejoiner moves its commit floor to the purge point
-        // instead.
-        let purge_floor = partition.purge_floor_op();
         let retained_from = partition
             .log
             .journal()
             .inner
             .repair_retained_from()
-            .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1))
-            .max(purge_floor.saturating_add(1));
+            .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1));
         let mut from_op = header.from_op;
         if retained_from > from_op {
             self.send_repair_range_reply(
@@ -5783,40 +5721,6 @@ where
             || partition.consensus().view() != session.view
         {
             partition.repair = None;
-            return;
-        }
-        // Receiver half of the serve-side purge gate: while a committed purge
-        // is not yet locally applied, this replica's `recovered_durable_offset`
-        // still describes the PRE-purge segments, so a floor from a peer that
-        // did purge reads as connected against state the purge is about to
-        // delete -- and the post-purge batches (offsets restarting at 0) then
-        // flush-skip below that stale durable line and are silently lost.
-        // Defer the whole reply: the purge is one reconciler wake away and
-        // resets the line to `None`, and the stall retry re-asks, so the peer
-        // re-emits both `RangeEvicted` and `RepairDone` for the same window.
-        // Pinned by `repair_completion_defers_until_committed_purge_applies`
-        // (server crate, partition_reconciler tests), driven through the pub
-        // `on_message` entry; the serve-side twin has its own pin there.
-        let committed_purge = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_purge_generation(
-                namespace.stream_id(),
-                namespace.topic_id(),
-                namespace.partition_id(),
-            );
-        if committed_purge > partition.applied_purge_generation() {
-            self.metrics.record_partition_repair_serve_deferred();
-            tracing::debug!(
-                shard = self.id,
-                namespace_raw = header.group,
-                committed_purge,
-                applied_purge = partition.applied_purge_generation(),
-                command = ?header.command,
-                "deferring repair completion until the committed purge applies locally"
-            );
             return;
         }
         match header.command {
@@ -8903,7 +8807,7 @@ where
     /// resident payloads behind them.
     ///
     /// Called wherever a partition's segments stop being the bytes an offer
-    /// describes -- retention cleaning, a committed truncate, a purge. None of
+    /// describes -- retention cleaning, a committed truncate, an install. None of
     /// the caches can detect that themselves: the builder cache is keyed on
     /// `commit_op` (which a metadata-plane truncate never moves), the shard's
     /// offers on the requester, and the payloads on a checksum over the bytes
@@ -8962,9 +8866,8 @@ where
     /// from committed metadata.
     ///
     /// Used wherever a partition is left without a serviceable segment chain (a
-    /// failed state-transfer install whose convergence also failed, a purge that
-    /// could not plant its replacement segment): the next append or poll would
-    /// panic on `active_segment()`'s expect.
+    /// failed state-transfer install whose convergence also failed): the next
+    /// append or poll would panic on `active_segment()`'s expect.
     ///
     /// `IggyPartitions` mandates external removals go through `ConfirmRemove` --
     /// a direct `remove()` would invalidate the `&mut` the caller still holds --
@@ -8972,18 +8875,14 @@ where
     /// the tombstone is the only gate in `get_mut_by_ns` and the queue does not
     /// drain until the end of the pump iteration.
     ///
-    /// `intended_frontier` is the offset frontier the caller knows the group is
-    /// at, for the paths where the LIVE counter is not it. A failed install
-    /// under an advancing purge generation leaves the counter at the pre-purge
-    /// value while the group restarted its offset space lower, and the
-    /// advancing write would stamp that stale counter over the reset the
-    /// install just made, then quarantine the segments that would have
-    /// contradicted it. `None` where the counter is authoritative.
+    /// `intended_frontier` is the offset frontier the group committed, not the
+    /// LIVE counter: a failed install can leave the counter at its pre-install
+    /// value, below that frontier.
     fn fence_partition_for_rebuild(
         &self,
         namespace: IggyNamespace,
         partition: &mut IggyPartition<B, SB>,
-        intended_frontier: Option<u64>,
+        intended_frontier: u64,
     ) where
         B: MessageBus + 'static,
         T: ShardsTable,
@@ -9660,8 +9559,6 @@ where
         let Some(session) = partition.transfer.take() else {
             return;
         };
-        // `commit_op`, NOT a "generation": in this file that word means the
-        // committed PURGE generation, and the callee's parameter is `commit_op`.
         let commit_op = session.commit_op;
         let peer = session.peer;
         let mut offsets_bytes: Option<Vec<u8>> = None;
@@ -9707,7 +9604,8 @@ where
                 namespace_raw = namespace,
                 commit_op,
                 offsets_frontier = frontier,
-                "descriptor commit_op disagrees with its offsets artifact frontier;                  refusing the install"
+                "descriptor commit_op disagrees with its offsets artifact frontier; \
+                 refusing the install"
             );
             damaged = true;
         }
@@ -9721,64 +9619,17 @@ where
                 .await;
             return;
         };
-        // A peer that has NOT yet applied a committed purge offers pre-purge
-        // segments under the stale generation. The install's own generation
-        // handling only widens permission (`max`), so it would resurrect the
-        // purged data durably: the local applied value stays at the newer
-        // generation, and the reconciler's `committed > applied` gate never
-        // re-fires. Compared against the METADATA plane's committed value, not
-        // this partition's applied one -- the latter hydrates from `purge.gen`,
-        // which a kill before the purge's record step leaves absent or stale.
-        // Routed through the ordinary failure arm, which rotates the peer;
-        // worst case is one wasted pull.
-        let committed_purge_generation = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_purge_generation(
-                target_namespace.stream_id(),
-                target_namespace.topic_id(),
-                target_namespace.partition_id(),
-            );
-        let offered_purge_generation =
-            partitions::state_transfer::offered_purge_generation(&offsets_bytes);
-        if offered_purge_generation < committed_purge_generation {
-            tracing::warn!(
-                shard = self.id,
-                namespace_raw = namespace,
-                peer,
-                offered_purge_generation,
-                committed_purge_generation,
-                "refusing a partition transfer offer built before a committed purge;                  installing it would resurrect purged data"
-            );
-            self.abandon_or_rearm_partition_transfer(partition, peer)
-                .await;
-            return;
-        }
         partition
             .consensus()
             .set_state_transfer_stage(consensus::StateTransferStage::Installing);
         let outcome = if partition.has_io_dispatcher() {
-            match partition.queue_state_transfer_install(
-                commit_op,
-                staged,
-                &offsets_bytes,
-                committed_purge_generation,
-                peer,
-            ) {
+            match partition.queue_state_transfer_install(commit_op, staged, &offsets_bytes, peer) {
                 Ok(()) => return,
                 Err(error) => Err(error),
             }
         } else {
             partition
-                .install_state_transfer(
-                    &config,
-                    commit_op,
-                    staged,
-                    &offsets_bytes,
-                    committed_purge_generation,
-                )
+                .install_state_transfer(&config, commit_op, staged, &offsets_bytes)
                 .await
         };
         self.finish_partition_install(namespace, peer, outcome)
@@ -9811,25 +9662,12 @@ where
                 partition.note_transfer_progress();
                 partition.note_transfer_installed();
                 partition.transfer_rearm = None;
-                if outcome.purge_generation_recorded {
-                    tracing::info!(
-                        shard = self.id,
-                        namespace_raw = namespace,
-                        applied_commit_op = outcome.applied_commit_op,
-                        "partition state transfer installed; handing tail to journal repair"
-                    );
-                } else {
-                    // Deliberately NOT prefixed with the success line's text:
-                    // specs match log substrings, and a shared prefix would
-                    // let them pass on the degraded path.
-                    tracing::warn!(
-                        shard = self.id,
-                        namespace_raw = namespace,
-                        applied_commit_op = outcome.applied_commit_op,
-                        "partition state transfer landed without a durable purge generation. \
-                         A restart may repeat the purge and transfer"
-                    );
-                }
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace,
+                    applied_commit_op = outcome.applied_commit_op,
+                    "partition state transfer installed; handing tail to journal repair"
+                );
                 partition.commit_journal(&config).await;
                 self.maybe_request_partition_repair(partition, peer).await;
             }
@@ -9853,15 +9691,15 @@ where
                     %error,
                     "partition unserviceable after failed install; fencing it for rebuild"
                 );
-                // Served state first, as the purge fence does: the quarantine
-                // below moves the chain those offers and cached payloads
-                // describe into `.fenced.N`, and a requester holding one would
-                // otherwise pull bytes that no longer exist.
+                // Served state first: the quarantine below moves the chain
+                // those offers and cached payloads describe into `.fenced.N`,
+                // and a requester holding one would otherwise pull bytes that
+                // no longer exist.
                 self.drop_partition_transfer_state(IggyNamespace::from_raw(namespace), partition);
                 self.fence_partition_for_rebuild(
                     IggyNamespace::from_raw(namespace),
                     partition,
-                    Some(frontier),
+                    frontier,
                 );
             }
             Err(error) => {
@@ -12405,7 +12243,8 @@ mod view_coverage_tests {
         assert_eq!(
             missing,
             Some(15),
-            "the scan must walk the held run below the merged commit point, not stop at its              first covered probe"
+            "the scan must walk the held run below the merged commit point, not stop at its \
+             first covered probe"
         );
     }
 

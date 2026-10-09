@@ -30,7 +30,7 @@ use consensus::{
     encode_state_manifest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
-use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, PurgeTopicRequest};
+use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::{
     AckLevel, CommitHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
     RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
@@ -82,7 +82,6 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         OtherLeave,
         MissingLeave,
         Rejoin,
-        Purge,
         Delete,
     }
     for change in [
@@ -91,7 +90,6 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         Change::OtherLeave,
         Change::MissingLeave,
         Change::Rejoin,
-        Change::Purge,
         Change::Delete,
     ] {
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -144,28 +142,6 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
 
         let session = table.attach_session(CLIENT, header.op, USER).unwrap();
         let streams = owner.plane.metadata().mux_stm.streams();
-        if matches!(change, Change::Purge) {
-            let (reply, replies) = channel(1);
-            owner
-                .on_partition_read(
-                    namespace,
-                    PartitionRead::PollOnPrimary {
-                        consumer: PollingConsumer::Consumer(USER as usize, 0),
-                        args: PollingArgs {
-                            strategy: PollingStrategy::first(),
-                            count: 1,
-                            auto_commit: false,
-                        },
-                        attachment: ConsumerAttachment {
-                            session: session.clone(),
-                            metadata: streams.poll_metadata(namespace, None, CLIENT).unwrap(),
-                        },
-                    },
-                    reply,
-                )
-                .await;
-            assert_single_message_reply(&replies);
-        }
         let mut completions = Vec::new();
         for group in [None, Some(GROUP)] {
             let attachment = ConsumerAttachment {
@@ -217,15 +193,6 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 }
                 .to_bytes(),
             ),
-            Change::Purge => apply_poll_metadata(
-                &owner,
-                Operation::PurgeTopic,
-                PurgeTopicRequest {
-                    stream_id: WireIdentifier::numeric(0),
-                    topic_id: WireIdentifier::numeric(0),
-                }
-                .to_bytes(),
-            ),
             Change::Delete => apply_poll_metadata(
                 &owner,
                 Operation::DeleteTopic,
@@ -237,7 +204,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             ),
         }
         for (group, completion, replies, result) in completions {
-            let stale = matches!(change, Change::Logout | Change::Purge | Change::Delete)
+            let stale = matches!(change, Change::Logout | Change::Delete)
                 || (matches!(change, Change::Leave) && group.is_some());
             completion.complete(result);
             assert!(futures::poll!(pump.as_mut()).is_pending());
@@ -277,34 +244,6 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 );
             }
         }
-        if matches!(change, Change::Purge) {
-            let (reply, replies) = channel(1);
-            owner
-                .on_partition_read(
-                    namespace,
-                    PartitionRead::PollOnPrimary {
-                        consumer: PollingConsumer::Consumer(USER as usize, 0),
-                        args: PollingArgs {
-                            strategy: PollingStrategy::first(),
-                            count: 1,
-                            auto_commit: true,
-                        },
-                        attachment: ConsumerAttachment {
-                            session: session.clone(),
-                            metadata: streams.poll_metadata(namespace, None, CLIENT).unwrap(),
-                        },
-                    },
-                    reply,
-                )
-                .await;
-            assert!(
-                matches!(
-                    replies.try_recv().unwrap(),
-                    PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
-                ),
-                "new polls must wait until the committed purge is materialized"
-            );
-        }
     }
 }
 
@@ -340,7 +279,6 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
         Logout,
         SessionReplacement,
         Leave,
-        Purge,
         Delete,
         Replaced,
         Unmaterialized,
@@ -353,7 +291,6 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
         Change::Logout,
         Change::SessionReplacement,
         Change::Leave,
-        Change::Purge,
         Change::Delete,
         Change::Replaced,
         Change::Unmaterialized,
@@ -486,15 +423,6 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                     .unwrap();
             }
             Change::Leave => streams.remove_consumer_group_member(PARENT, IggyTimestamp::default()),
-            Change::Purge => apply_poll_metadata(
-                &owner,
-                Operation::PurgeTopic,
-                PurgeTopicRequest {
-                    stream_id: WireIdentifier::numeric(0),
-                    topic_id: WireIdentifier::numeric(0),
-                }
-                .to_bytes(),
-            ),
             Change::Delete => apply_poll_metadata(
                 &owner,
                 Operation::DeleteTopic,

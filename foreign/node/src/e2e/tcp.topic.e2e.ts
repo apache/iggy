@@ -67,10 +67,6 @@ describe('e2e -> topic', async () => {
     assert.ok(dp);
   });
 
-  it('e2e -> topic::purge', async () => {
-    assert.ok(await c.topic.purge({ streamId: streamName, topicId: topicName }));
-  });
-
   it('e2e -> topic::delete', async () => {
     assert.ok(await c.topic.delete({
       streamId: streamName, topicId: topicName, partitionsCount: 0

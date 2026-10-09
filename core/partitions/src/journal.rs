@@ -192,13 +192,6 @@ where
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
-    /// Poll-index seal installed by a partition purge: ops at or below this
-    /// floor never enter `offset_to_op` / `timestamp_to_op`. Without it,
-    /// `evict_prefix` re-appending the retained tail would re-insert
-    /// pre-purge entries the purge just sealed off, and resident polls would
-    /// serve purged bytes. Survives only as long as the journal (in-memory),
-    /// same lifetime argument as the partition's `purge_floor_op`.
-    poll_floor: Cell<u64>,
     /// Resident entries that are not `SendMessages` (consumer offset stores
     /// and deletes). They carry no segment bytes, so the message-count and
     /// byte flush thresholds never see them, yet the flush is the only
@@ -237,7 +230,6 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
-            poll_floor: Cell::new(0),
             resident_control_ops: Cell::new(0),
         }
     }
@@ -756,13 +748,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 .set(self.resident_control_ops.get() + 1);
         }
 
-        // Poll-index only ops above the purge floor: `op_to_storage_offset`
-        // above stays unconditional (consensus history for the repair and
-        // commit walks), but a fenced pre-purge entry re-appended by
-        // `evict_prefix` must not become poll-resolvable again.
-        if op > self.poll_floor.get()
-            && let Some((offset, timestamp)) = index_offset_timestamp
-        {
+        if let Some((offset, timestamp)) = index_offset_timestamp {
             let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
             offset_to_op.insert(offset, op);
 
@@ -787,9 +773,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// only ever matches message batches, and control ops (one per auto-commit
     /// poll) outnumber them by orders of magnitude between flushes, so cloning
     /// every entry made each disk-tier poll pay for every poll since the last
-    /// flush. The index also carries the purge fence: it holds indexed batches
-    /// above the poll floor only, and [`Self::clear_poll_index`] empties it, so
-    /// a fenced entry never reaches the snapshot.
+    /// flush.
     pub fn resident_message_entries(&self) -> Vec<JournalBuffer> {
         let offset_to_op = unsafe { &*self.offset_to_op.get() };
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
@@ -805,33 +789,13 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         entries
     }
 
-    /// Owned, append-ordered clones of every resident entry above the purge
-    /// floor, control ops included; one `Frozen` refcount bump each. Linear in
-    /// the resident journal, so not for the poll path, which takes
+    /// Owned, append-ordered clones of every resident entry, control ops
+    /// included; one `Frozen` refcount bump each. Linear in the resident
+    /// journal, so not for the poll path, which takes
     /// [`Self::resident_message_entries`].
-    ///
-    /// Entries at or below the purge floor are filtered out. They stay resident
-    /// (consensus history for backups, repair and retransmission) but are
-    /// poll-fenced exactly like the offset/timestamp indexes
-    /// [`Self::clear_poll_index`] sealed: a walk over these matches on the batch
-    /// contents alone, so an unfiltered list re-exposes purged bytes as soon as
-    /// one post-purge append puts an entry back into the index.
     pub fn resident_entries(&self) -> Vec<JournalBuffer> {
         let inner = unsafe { &*self.inner.get() };
-        let entries = inner.storage.entries();
-        let floor = self.poll_floor.get();
-        if floor == 0 {
-            return entries;
-        }
-        // `headers[i]` pairs with storage index `i` (see the length-lock
-        // invariant on `append_with_meta_sync`), so the op comes from the header
-        // vector rather than a per-entry decode.
-        let headers = unsafe { &*self.headers.get() };
-        headers
-            .iter()
-            .zip(entries)
-            .filter_map(|(header, entry)| (header.op > floor).then_some(entry))
-            .collect()
+        inner.storage.entries()
     }
 }
 
@@ -853,7 +817,6 @@ where
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
-            poll_floor: Cell::new(0),
             resident_control_ops: Cell::new(0),
         }
     }
@@ -1046,25 +1009,6 @@ where
     pub fn oldest_resident_offset(&self) -> Option<u64> {
         let offset_to_op = unsafe { &*self.offset_to_op.get() };
         offset_to_op.keys().next().copied()
-    }
-
-    /// Seal the resident poll tier: clear the offset and timestamp poll
-    /// indexes ONLY, so `oldest_resident_offset` reads `None` and every poll
-    /// falls back to the on-disk segments. Called by a partition purge, which
-    /// wipes the segments but must KEEP the journal entries themselves:
-    /// headers, storage, `op_to_storage_offset` and the evicted ring are
-    /// consensus history that backups, repair and retransmission still walk.
-    /// Clearing those would wedge `commit_min` until a view change.
-    ///
-    /// `floor` (the purge's fence op) makes the seal survive eviction:
-    /// `evict_prefix` re-appends the retained tail, and without the floor
-    /// that re-append would re-index the pre-purge entries just cleared.
-    pub fn clear_poll_index(&self, floor: u64) {
-        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
-        offset_to_op.clear();
-        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-        timestamp_to_op.clear();
-        self.poll_floor.set(floor);
     }
 
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
@@ -2005,7 +1949,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn resident_message_entries_skip_control_ops_and_fenced_batches() {
+    async fn resident_message_entries_skip_control_ops() {
         // Batches at ops 1, 3, 5 (three offsets each) interleaved with the
         // offset ops a polling group journals between them.
         let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
@@ -2023,20 +1967,9 @@ mod tests {
         );
         assert_eq!(journal.resident_control_ops(), 3);
 
-        // The purge seal empties the poll view, and the first post-purge
-        // append re-arms it with that batch alone.
-        journal.clear_poll_index(3);
-        assert!(journal.resident_message_entries().is_empty());
-        journal
-            .append(build_message_prepare(7, 9, 3, 8))
-            .await
-            .expect("append");
-        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![7]);
-
-        // Eviction re-appends the retained tail: op 5 is above the floor and
-        // comes back into the poll view, op 3 stays fenced.
+        // Eviction rebuilds the poll view from the retained tail.
         journal.evict_prefix(2);
-        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![5, 7]);
+        assert_eq!(entry_ops(&journal.resident_message_entries()), vec![3, 5]);
         assert_eq!(journal.resident_control_ops(), 2);
     }
 
