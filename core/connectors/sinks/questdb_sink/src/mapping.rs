@@ -126,10 +126,11 @@ pub(crate) enum Rounding {
 }
 
 impl Rounding {
-    /// Follows the last variant rather than a literal, so a variant added
-    /// before it is counted automatically. A new variant must go before
-    /// `ArrayElement`, or this must name the new last one.
-    const COUNT: usize = Self::ArrayElement as usize + 1;
+    /// The match is exhaustive, so a new variant fails to compile here until
+    /// it is counted.
+    const COUNT: usize = match Self::Scalar {
+        Self::Scalar | Self::PastLong | Self::ArrayElement => 3,
+    };
 
     fn remedy(self) -> &'static str {
         match self {

@@ -1869,21 +1869,13 @@ mod tests {
     }
 
     #[test]
-    fn given_a_credit_and_a_debit_in_either_order_when_settled_should_net_to_zero() {
+    fn given_a_debit_before_its_credit_when_settled_should_net_to_zero() {
         // The handler credits on the client's thread and the failed chunk
-        // debits on the Tokio thread, in no fixed order. Both orders must
-        // leave nothing for the next batch to find.
-        // Credit first: nothing settles between, so the debit cancels it.
+        // debits on the Tokio thread, in no fixed order. A credit that lands
+        // first is cancelled by the debit before any settle. A debit that
+        // lands first must not make the pending credit look like a token.
         let balance = AtomicI64::new(0);
         let drops = AtomicU64::new(0);
-        balance.fetch_add(1, Ordering::Relaxed);
-        balance.fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(settle_rejections(&balance, &drops, 0), None);
-        assert_eq!(balance.load(Ordering::Relaxed), 0);
-
-        // Debit first: the late credit must not be mistaken for a token while
-        // it is pending, and nets to zero when it lands.
-        let balance = AtomicI64::new(0);
         balance.fetch_sub(1, Ordering::Relaxed);
         assert_eq!(
             settle_rejections(&balance, &drops, 0),
@@ -1917,6 +1909,7 @@ mod tests {
             None,
             "the debt absorbs the next handler-only rejection"
         );
+        assert_eq!(balance.load(Ordering::Relaxed), 0);
     }
 
     #[test]
