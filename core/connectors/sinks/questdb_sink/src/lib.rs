@@ -1220,8 +1220,8 @@ enum Unclaimed {
 /// rejection is reported twice, once per batch, and the debit leaves the
 /// balance at -1, where it absorbs the next rejection only the handler
 /// reports. Nothing ties a credit to a batch, so the sink cannot tell the two
-/// orders apart. The rejection itself is never lost: the handler logs it, and
-/// the batch that saw it fails.
+/// orders apart. The handler still logs every rejection, but the absorbed one
+/// fails no batch.
 fn settle_rejections(
     balance: &AtomicI64,
     drops_seen: &AtomicU64,
@@ -1892,8 +1892,8 @@ mod tests {
         // credit as an unclaimed rejection before the failed chunk debits it,
         // so the rejection is reported twice and the balance stays at -1,
         // where it absorbs the next handler-only rejection. That rejection
-        // then fails no batch and is never reported. Pinned so that a change
-        // to this behaviour is a deliberate one.
+        // then fails no batch, though the handler still logs it. Pinned so
+        // that a change to this behaviour is a deliberate one.
         let balance = AtomicI64::new(0);
         let drops = AtomicU64::new(0);
         balance.fetch_add(1, Ordering::Relaxed);
