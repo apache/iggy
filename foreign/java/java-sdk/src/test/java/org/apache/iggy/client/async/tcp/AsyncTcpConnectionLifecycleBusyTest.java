@@ -74,6 +74,8 @@ class AsyncTcpConnectionLifecycleBusyTest {
     private static final Duration FIRST_PAUSE = Duration.ofMillis(50);
     private static final Duration SECOND_PAUSE = Duration.ofMillis(100);
     private static final Duration DEADLINE_MARGIN = Duration.ofMillis(500);
+    // Long enough for the first two retries, which start 50 and 150 ms after a refusal.
+    private static final Duration TWO_RETRIES = Duration.ofMillis(300);
     // The fifth refusal starts an 800 ms pause; closing 300 ms after it lands inside.
     private static final int LONG_PAUSE_ATTEMPT = 5;
     private static final Duration INTO_LONG_PAUSE = Duration.ofMillis(300);
@@ -211,6 +213,41 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 client.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
             server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldStopRetryingLifecycleBusyOnceTheCallerGivesUp() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            AtomicInteger attempts = new AtomicInteger();
+            CompletableFuture<Void> received = new CompletableFuture<>();
+            CompletableFuture<Void> gaveUp = new CompletableFuture<>();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.operation() == OPERATION_JOIN_GROUP) {
+                    attempts.incrementAndGet();
+                    received.complete(null);
+                    // Refusing only after the caller gave up keeps a retry from starting before.
+                    gaveUp.join();
+                    return lifecycleBusy();
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncTcpConnection connection = connection(socket, Duration.ofSeconds(TEST_TIMEOUT_SECONDS));
+            try {
+                login(connection);
+                CompletableFuture<ByteBuf> join = connection.send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY));
+                received.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                join.cancel(false);
+                gaveUp.complete(null);
+                Thread.sleep(TWO_RETRIES.toMillis());
+            } finally {
+                connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(attempts).hasValue(1);
         }
     }
 

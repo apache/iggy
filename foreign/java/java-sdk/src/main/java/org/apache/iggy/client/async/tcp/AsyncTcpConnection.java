@@ -569,6 +569,7 @@ public class AsyncTcpConnection {
                         commandCode,
                         payload,
                         responseFuture,
+                        callerFuture,
                         requestDeadlineNanos,
                         holdLeaseUntilResponse,
                         requiredSessionGeneration,
@@ -601,6 +602,7 @@ public class AsyncTcpConnection {
             int commandCode,
             ByteBuf payload,
             CompletableFuture<ByteBuf> responseFuture,
+            CompletableFuture<ByteBuf> callerFuture,
             long requestDeadlineNanos,
             boolean holdLeaseUntilResponse,
             long requiredSessionGeneration,
@@ -619,7 +621,7 @@ public class AsyncTcpConnection {
                         IggyServerException.fromTcpResponse(TRANSIENT_NOT_ACCEPTED, new byte[0]));
                 return;
             }
-            sendFrame(channel, payload, commandCode, responseFuture, requestDeadlineNanos, failoverState);
+            sendFrame(channel, payload, commandCode, responseFuture, callerFuture, requestDeadlineNanos, failoverState);
         } finally {
             if (!holdLeaseUntilResponse) {
                 releaseChannel(channel);
@@ -740,6 +742,7 @@ public class AsyncTcpConnection {
                     binding,
                     CommandCode.System.BIND_SESSION.getValue(),
                     bindingFuture,
+                    bindingFuture,
                     requestDeadlineNanos,
                     new TransientFailoverState());
             return bindingFuture
@@ -767,7 +770,14 @@ public class AsyncTcpConnection {
                     .thenCompose(Function.identity());
         }
         CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
-        sendFrame(channel, payload, commandCode, loginFuture, requestDeadlineNanos, new TransientFailoverState());
+        sendFrame(
+                channel,
+                payload,
+                commandCode,
+                loginFuture,
+                loginFuture,
+                requestDeadlineNanos,
+                new TransientFailoverState());
         return loginFuture;
     }
 
@@ -860,11 +870,16 @@ public class AsyncTcpConnection {
                 || commandCode == CommandCode.ConsumerOffset.DELETE.getValue();
     }
 
+    /**
+     * Writes the first attempt of a request. {@code callerFuture} is the future its caller holds,
+     * and an authentication step holds the response future itself.
+     */
     private void sendFrame(
             Channel channel,
             ByteBuf payload,
             int commandCode,
             CompletableFuture<ByteBuf> responseFuture,
+            CompletableFuture<ByteBuf> callerFuture,
             long requestDeadlineNanos,
             TransientFailoverState failoverState) {
         try {
@@ -883,6 +898,7 @@ public class AsyncTcpConnection {
                             channel,
                             handler,
                             responseFuture,
+                            callerFuture,
                             commandCode,
                             failoverState,
                             requestDeadlineNanos,
@@ -1039,8 +1055,11 @@ public class AsyncTcpConnection {
         ByteBuf frame;
         try {
             // A late timer or a lost channel keeps the refusal, rather than a
-            // timeout that would close the channel under other requests.
-            if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0 || !channel.isActive()) {
+            // timeout that would close the channel under other requests. A
+            // caller that gave up must not see the request applied later.
+            if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0
+                    || !channel.isActive()
+                    || exchange.callerFuture().isDone()) {
                 exchange.responseFuture().completeExceptionally(refusal);
                 return;
             }
@@ -1363,6 +1382,7 @@ public class AsyncTcpConnection {
             Channel channel,
             VsrResponseHandler handler,
             CompletableFuture<ByteBuf> responseFuture,
+            CompletableFuture<ByteBuf> callerFuture,
             int commandCode,
             TransientFailoverState failoverState,
             long requestDeadlineNanos,
