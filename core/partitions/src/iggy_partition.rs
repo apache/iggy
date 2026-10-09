@@ -6556,12 +6556,7 @@ where
             }
 
             let frame_bytes = Self::prepared_request_size(&message);
-            let operation = message.header().operation;
-            if operation != Operation::RetireSession
-                && !operation.is_partition_lifecycle()
-                && (self.history_deleted()
-                    || message.header().partition_incarnation != self.created_revision)
-            {
+            if !self.request_history_available(message.header()) {
                 Self::send_partition_deny_or_log(
                     consensus,
                     message.header(),
@@ -7271,7 +7266,7 @@ where
             // Taken before the preflight so a refusal answers the parked waiter
             // instead of waking it with `Canceled`.
             let mut reply_sender = request.take_reply_sender();
-            if header.partition_incarnation != self.created_revision {
+            if !self.request_history_available(&header) {
                 if self
                     .deny_queued_request(
                         &header,
@@ -11596,6 +11591,15 @@ where
         Ok(base_offset)
     }
 
+    /// Admission and queue promotion share this rule. Session retirement
+    /// carries no incarnation, and a lifecycle fence names its incarnation in
+    /// its body, which admission checks.
+    fn request_history_available(&self, header: &RoutedRequestHeader) -> bool {
+        header.operation == Operation::RetireSession
+            || header.operation.is_partition_lifecycle()
+            || (header.partition_incarnation == self.created_revision && !self.history_deleted())
+    }
+
     fn prepare_history_available(&self, header: &PrepareHeader) -> bool {
         header.operation == Operation::RetireSession
             || (header.partition_incarnation == self.created_revision && !self.history_deleted())
@@ -14821,6 +14825,90 @@ mod tests {
             &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
         );
         assert_eq!(rejected.status, IggyError::TransientNotAccepted.as_code());
+    }
+
+    #[compio::test]
+    async fn given_queued_session_retirement_when_promoted_at_a_live_incarnation_should_prepare_it()
+    {
+        const INCARNATION: u64 = 7;
+        let (mut partition, replies) =
+            recording_partition_with_pipeline(0, 1, LocalPipeline::with_capacities(1, 1));
+        partition.set_created_revision(INCARNATION);
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+        // The send holds the only prepare slot, so the retirement has to queue.
+        let mut send = checksumless_send_request(partition.namespace(), 1).transmute_header(
+            |header, next: &mut RoutedRequestHeader| {
+                *next = header;
+                next.client = 2;
+                next.partition_incarnation = INCARNATION;
+            },
+        );
+        send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+        partition.on_request(send, None).await;
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 1,
+        };
+        partition
+            .on_request(
+                retire_session_request(partition.namespace(), identity),
+                None,
+            )
+            .await;
+        assert_eq!(partition.consensus().request_queue_len(), 1);
+
+        commit_recorded_loopback(&mut partition).await;
+
+        assert_eq!(partition.consensus().request_queue_len(), 0);
+        let promoted = partition.consensus.pipeline_head_header().unwrap();
+        assert_eq!(promoted.operation, Operation::RetireSession);
+        for (_, reply) in replies.borrow().iter() {
+            let header = bytemuck::checked::from_bytes::<ReplyHeader>(
+                &reply.as_slice()[..size_of::<ReplyHeader>()],
+            );
+            assert_ne!(header.status, IggyError::HistoryUnavailable.as_code());
+        }
+    }
+
+    /// The history is live, so the incarnation stamp is the only thing that
+    /// tells admission this send was aimed at an older partition with this id.
+    #[compio::test]
+    async fn given_live_history_when_send_names_an_older_incarnation_should_refuse_it() {
+        const INCARNATION: u64 = 7;
+        const OLDER_INCARNATION: u64 = 5;
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.set_created_revision(INCARNATION);
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        let namespace = partition.namespace();
+        let send_at = |incarnation: u64| {
+            let mut send = checksumless_send_request(namespace, 1).transmute_header(
+                |header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.partition_incarnation = incarnation;
+                },
+            );
+            send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(namespace, 0));
+            send
+        };
+        assert!(!partition.history_deleted());
+
+        let (sender, refusal) = consensus::oneshot_channel();
+        partition
+            .on_request(send_at(OLDER_INCARNATION), Some(sender))
+            .await;
+        // Checked before the await: a wrongly admitted send never gets a reply.
+        assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
+        assert_eq!(
+            refusal.await.unwrap().header().status,
+            IggyError::HistoryUnavailable.as_code()
+        );
+
+        partition.on_request(send_at(INCARNATION), None).await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
     }
 
     #[compio::test]
