@@ -615,13 +615,17 @@ pub(in crate::http) async fn get_stats(
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
 /// increments are relaxed, so scraped values are approximate while writes are
 /// in flight. The per-topic series come from the same walk and the same
-/// rollups `GetTopic` reads. The clients count scatter-gathers the per-shard session managers
-/// exactly like `GET /clients` and turns partial when a shard misses the reply
-/// deadline.
+/// rollups `GetTopic` reads, and encode synchronously on shard 0 in time linear
+/// in the topic count. The clients count scatter-gathers the per-shard session
+/// managers exactly like `GET /clients` and turns partial when a shard misses
+/// the reply deadline.
 pub(in crate::http) async fn get_metrics(
     State(state): State<HttpState>,
     _identity: Identity,
 ) -> String {
+    // Awaited before the walk so walk, replace and encode run without a yield,
+    // and a scrape that finishes later never publishes an older walk.
+    let clients_count = SendWrapper::new(state.shard.count_all_clients()).await as u64;
     let (
         (streams_count, topics_count, partitions_count, segments_count, messages_count),
         topic_usage,
@@ -636,7 +640,7 @@ pub(in crate::http) async fn get_metrics(
             let mut partitions_count = 0u64;
             let mut segments_count = 0u64;
             let mut messages_count = 0u64;
-            let mut topic_usage = Vec::new();
+            let mut topic_usage = Vec::with_capacity(streams.items.len());
             for (_, stream) in &streams.items {
                 topics_count = topics_count.saturating_add(stream.topics.len() as u64);
                 segments_count = segments_count
@@ -673,7 +677,6 @@ pub(in crate::http) async fn get_metrics(
         .mux_stm
         .users()
         .read(|users| users.items.len() as u64);
-    let clients_count = SendWrapper::new(state.shard.count_all_clients()).await as u64;
 
     let metrics = &state.metrics;
     metrics.streams.set(gauge_value(streams_count));

@@ -36,6 +36,8 @@ use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 use tracing::error;
 
+use crate::segment_cleaner::resolve_max_topic_size;
+
 /// Exports the process-wide clamped-rollup count as a counter series, read at
 /// encode time rather than mirrored into one.
 ///
@@ -92,26 +94,20 @@ pub(in crate::http) struct TopicUsageSample {
 }
 
 impl TopicUsageSample {
-    /// `ServerDefault` resolves the way the segment cleaner enforces it, so
-    /// the exported cap is the one retention actually trims against.
+    /// `ServerDefault` resolves against the node default the way the segment
+    /// cleaner does. The cleaner enforces a per-partition share on sealed
+    /// segments only, so `topic_size_bytes` can sit at or above this cap.
     pub(in crate::http) fn max_size_bytes(max_topic_size: MaxTopicSize) -> Option<u64> {
-        let resolved = match max_topic_size {
-            MaxTopicSize::ServerDefault => MaxTopicSize::from(DEFAULT_MAX_TOPIC_SIZE),
-            sized => sized,
-        };
-        match resolved {
-            MaxTopicSize::Custom(size) => Some(size.as_bytes_u64()),
-            MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
-        }
+        resolve_max_topic_size(max_topic_size, DEFAULT_MAX_TOPIC_SIZE)
     }
 }
 
-/// Per-topic `{stream, topic}` series, replaced wholesale on every scrape.
+/// Per-topic `{stream, topic}` series, replaced wholesale on every scrape so a
+/// deleted or renamed topic drops out on the next one.
 ///
-/// A `Family` would keep reporting a deleted or renamed topic under its old
-/// labels until restart. The collector cannot read the streams STM itself: it
-/// lives on shard 0 and is `!Sync`, while a registered collector must be
-/// `Send + Sync`, so the scrape handler hands it a snapshot instead.
+/// The collector cannot read the streams STM itself: it lives on shard 0 and
+/// is `!Sync`, while a registered collector must be `Send + Sync`, so the
+/// scrape handler hands it a snapshot instead.
 #[derive(Debug, Clone, Default)]
 pub(in crate::http) struct TopicUsage {
     samples: Arc<Mutex<Vec<TopicUsageSample>>>,
@@ -143,7 +139,7 @@ impl Collector for TopicUsage {
         encode_topic_gauge(
             &mut encoder,
             "topic_max_size_bytes",
-            "size cap of the topic in bytes, absent when unlimited",
+            "configured size cap of the topic in bytes, absent when unlimited; enforced per partition on sealed segments",
             &samples,
             |sample| sample.max_size_bytes,
         )

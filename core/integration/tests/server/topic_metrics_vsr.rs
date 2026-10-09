@@ -28,6 +28,7 @@ use super::http_client::HttpClient;
 
 const STREAM: &str = "metrics-stream";
 const TOPIC: &str = "metrics-topic";
+const TOPIC_SERIES: [&str; 3] = ["topic_size_bytes", "topic_messages", "topic_max_size_bytes"];
 
 /// The value of the `name` series labelled with this test's stream and topic.
 fn topic_series(exposition: &str, name: &str) -> Option<u64> {
@@ -135,19 +136,15 @@ async fn given_scraped_topic_when_deleted_should_drop_its_series_on_next_scrape(
     harness: &TestHarness,
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
-    create_topic(&client, MaxTopicSize::Unlimited).await;
+    create_topic(&client, MaxTopicSize::from(2 * 1024 * 1024 * 1024u64)).await;
 
     let before = scrape(harness).await;
-    assert_eq!(
-        topic_series(&before, "topic_messages"),
-        Some(0),
-        "the empty topic must be exported before the delete:\n{before}"
-    );
-    assert_eq!(
-        topic_series(&before, "topic_max_size_bytes"),
-        None,
-        "an unlimited topic must not export a cap:\n{before}"
-    );
+    for name in TOPIC_SERIES {
+        assert!(
+            topic_series(&before, name).is_some(),
+            "the capped topic must export its {name} series before the delete:\n{before}"
+        );
+    }
 
     let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
     let topic_id = Identifier::from_str_value(TOPIC).expect("topic identifier");
@@ -157,7 +154,7 @@ async fn given_scraped_topic_when_deleted_should_drop_its_series_on_next_scrape(
         .expect("delete topic");
 
     let after = scrape(harness).await;
-    for name in ["topic_size_bytes", "topic_messages"] {
+    for name in TOPIC_SERIES {
         assert_eq!(
             topic_series(&after, name),
             None,
