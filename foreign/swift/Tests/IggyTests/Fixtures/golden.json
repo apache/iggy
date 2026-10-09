@@ -856,6 +856,7 @@
     "5007": "cannot_create_consumer_group_info",
     "5008": "cannot_delete_consumer_group_info",
     "5009": "consumer_group_partition_not_owned",
+    "5010": "too_many_consumer_groups",
     "6000": "missing_base_offset_retained_message_batch",
     "6001": "missing_last_offset_delta_retained_message_batch",
     "6002": "missing_max_timestamp_retained_message_batch",

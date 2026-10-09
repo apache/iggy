@@ -236,6 +236,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case cannotCreateConsumerGroupInfo = 5007
     case cannotDeleteConsumerGroupInfo = 5008
     case consumerGroupPartitionNotOwned = 5009
+    case tooManyConsumerGroups = 5010
     case missingBaseOffsetRetainedMessageBatch = 6000
     case missingLastOffsetDeltaRetainedMessageBatch = 6001
     case missingMaxTimestampRetainedMessageBatch = 6002
@@ -490,6 +491,7 @@ extension IggyErrorCode {
         case .cannotCreateConsumerGroupInfo: "cannot_create_consumer_group_info"
         case .cannotDeleteConsumerGroupInfo: "cannot_delete_consumer_group_info"
         case .consumerGroupPartitionNotOwned: "consumer_group_partition_not_owned"
+        case .tooManyConsumerGroups: "too_many_consumer_groups"
         case .missingBaseOffsetRetainedMessageBatch: "missing_base_offset_retained_message_batch"
         case .missingLastOffsetDeltaRetainedMessageBatch: "missing_last_offset_delta_retained_message_batch"
         case .missingMaxTimestampRetainedMessageBatch: "missing_max_timestamp_retained_message_batch"
