@@ -155,6 +155,20 @@ impl RoundingWarned {
             Rounding::ArrayElement => &self.array_element,
         }
     }
+
+    /// Whether any warning fired. The destructure fails to compile when a
+    /// flag is added and not read here.
+    #[cfg(test)]
+    fn any(&self) -> bool {
+        let Self {
+            scalar,
+            past_long,
+            array_element,
+        } = self;
+        [scalar, past_long, array_element]
+            .iter()
+            .any(|flag| flag.load(Ordering::Relaxed))
+    }
 }
 
 /// Widens an integer to the `DOUBLE` QuestDB stores, and says whether that
@@ -1061,13 +1075,6 @@ mod tests {
         }
     }
 
-    /// Whether any rounding warning fired.
-    fn warned(mapping: &Mapping) -> bool {
-        [Rounding::Scalar, Rounding::PastLong, Rounding::ArrayElement]
-            .into_iter()
-            .any(|source| mapping.rounding_warned.flag(source).load(Ordering::Relaxed))
-    }
-
     fn context() -> RowContext<'static> {
         RowContext {
             stream: "user_events",
@@ -1924,7 +1931,10 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(!warned(&mapping), "an exact widening must not warn");
+        assert!(
+            !mapping.rounding_warned.any(),
+            "an exact widening must not warn"
+        );
 
         mapping
             .append_row(
@@ -1933,7 +1943,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(warned(&mapping));
+        assert!(mapping.rounding_warned.any());
 
         // A declared integer column is never widened, so it never trips it.
         let mut declared = Mapping {
@@ -1948,7 +1958,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(!warned(&declared));
+        assert!(!declared.rounding_warned.any());
     }
 
     #[test]
@@ -1956,16 +1966,31 @@ mod tests {
         // `i64::MAX as f64` is 2^63 and `as i64` saturates back to `i64::MAX`,
         // so a check through the source width would call that exact. The
         // check goes through `i128`, where nothing saturates.
-        for payload in [
-            r#"{"big":9223372036854775807}"#,
-            r#"{"big":18446744073709551615}"#,
+        for (payload, source) in [
+            (r#"{"big":9223372036854775807}"#, Rounding::Scalar),
+            (r#"{"big":18446744073709551615}"#, Rounding::PastLong),
         ] {
             let mapping = mapping();
             mapping
                 .append_row(&mut qwp_buffer(), &json_message(payload), context())
                 .unwrap();
-            assert!(warned(&mapping), "{payload} must count as rounded");
+            assert!(
+                mapping.rounding_warned.flag(source).load(Ordering::Relaxed),
+                "{payload} must count as a {source:?} rounding"
+            );
         }
+    }
+
+    #[test]
+    fn given_an_unsigned_value_within_i64_when_widened_should_tag_a_scalar_rounding() {
+        // The JSON parser only yields an unsigned node past `i64::MAX`, so
+        // this side of the unsigned arm is reachable only with a built value.
+        let mapping = mapping();
+        let value = OwnedValue::Static(StaticNode::U64((1 << 53) + 1));
+        mapping.prepare_value("big", &value).unwrap();
+        let flags = &mapping.rounding_warned;
+        assert!(flags.flag(Rounding::Scalar).load(Ordering::Relaxed));
+        assert!(!flags.flag(Rounding::PastLong).load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1979,7 +2004,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(warned(&lossy));
+        assert!(lossy.rounding_warned.any());
 
         let exact = mapping();
         exact
@@ -1989,7 +2014,7 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(!warned(&exact));
+        assert!(!exact.rounding_warned.any());
     }
 
     #[test]
