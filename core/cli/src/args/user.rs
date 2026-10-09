@@ -94,6 +94,10 @@ pub(crate) enum UserAction {
     /// options are set, the default behavior is to remove permissions for the
     /// specified user.
     ///
+    /// The command replaces the full permission set of the user. If only
+    /// --global-permissions is set, stream permissions are removed. If only
+    /// --stream-permissions is set, all global permissions are set to false.
+    ///
     /// Examples:
     ///  iggy user permissions 2
     ///  iggy user permissions client
@@ -251,10 +255,6 @@ pub(crate) struct UserPermissionsArgs {
     pub(crate) user_id: Identifier,
     /// Set global permissions for the user
     ///
-    /// This command replaces the full permission set of the user. Global permissions
-    /// that are not listed are set to false, and stream permissions are removed
-    /// unless they are also given with --stream-permissions.
-    ///
     /// All global permissions by default are set to false and this command line option
     /// allows to set each permission individually. Permissions are separated
     /// by comma and each permission is identified by the same name as in the iggy
@@ -273,10 +273,6 @@ pub(crate) struct UserPermissionsArgs {
     #[arg(value_parser = clap::value_parser!(GlobalPermissionsArg))]
     pub(crate) global_permissions: Option<GlobalPermissionsArg>,
     /// Set stream permissions for the user
-    ///
-    /// This command replaces the full permission set of the user. Streams that are
-    /// not listed lose their permissions, and global permissions are set to false
-    /// unless they are also given with --global-permissions.
     ///
     /// Stream permissions are defined by each stream separately. Setting permission for stream
     /// allows to set each permission individually, by default, if no permission is provided

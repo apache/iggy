@@ -249,6 +249,10 @@ are configured based on the options provided with this command. If no
 options are set, the default behavior is to remove permissions for the
 specified user.
 
+The command replaces the full permission set of the user. If only
+--global-permissions is set, stream permissions are removed. If only
+--stream-permissions is set, all global permissions are set to false.
+
 Examples:
  iggy user permissions 2
  iggy user permissions client
@@ -264,10 +268,6 @@ Arguments:
 Options:
   -g, --global-permissions <GLOBAL_PERMISSIONS>
           Set global permissions for the user
-{CLAP_INDENT}
-          This command replaces the full permission set of the user. Global permissions
-          that are not listed are set to false, and stream permissions are removed
-          unless they are also given with --stream-permissions.
 {CLAP_INDENT}
           All global permissions by default are set to false and this command line option
           allows to set each permission individually. Permissions are separated
@@ -286,10 +286,6 @@ Options:
 
   -s, --stream-permissions <STREAM_PERMISSIONS>
           Set stream permissions for the user
-{CLAP_INDENT}
-          This command replaces the full permission set of the user. Streams that are
-          not listed lose their permissions, and global permissions are set to false
-          unless they are also given with --global-permissions.
 {CLAP_INDENT}
           Stream permissions are defined by each stream separately. Setting permission for stream
           allows to set each permission individually, by default, if no permission is provided
