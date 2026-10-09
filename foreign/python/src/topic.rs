@@ -27,6 +27,7 @@ use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
+use crate::receive_message::PartitionContext;
 use crate::user_headers::{UserHeaders, rust_user_headers_to_py};
 
 /// The entries of one provenance, as the dictionary message user headers come
@@ -435,5 +436,12 @@ impl Partition {
     #[getter]
     pub fn messages_count(&self) -> u64 {
         self.inner.messages_count
+    }
+
+    /// The partition incarnation and the metadata operation the details were read at.
+    /// The owner generation is `0` because the details belong to no consumer group.
+    #[getter]
+    pub fn context(&self) -> PartitionContext {
+        self.inner.context.into()
     }
 }
