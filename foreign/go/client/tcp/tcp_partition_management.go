@@ -33,7 +33,7 @@ func (c *IggyTcpClient) CreatePartitions(ctx context.Context, streamId iggcon.Id
 	if err != nil {
 		return err
 	}
-	c.invalidateTopicCache(streamId, topicId)
+	c.topics.invalidateAll()
 	return nil
 }
 
@@ -46,12 +46,8 @@ func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Id
 	if err != nil {
 		return err
 	}
-	c.invalidateTopicCache(streamId, topicId)
+	c.topics.invalidateAll()
 	return nil
-}
-
-func (c *IggyTcpClient) invalidateTopicCache(streamId, topicId iggcon.Identifier) {
-	c.topics.invalidate(newTopicKey(streamId, topicId))
 }
 
 func (c *IggyTcpClient) dropTopicCache(streamId, topicId iggcon.Identifier) {

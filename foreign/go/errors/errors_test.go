@@ -83,6 +83,12 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			message:  "consumer group member with client id: 4 does not own partition: 9 at the current generation (rebalance in progress).",
 		},
 		{
+			err:      TooManyConsumerGroups{},
+			sentinel: ErrTooManyConsumerGroups,
+			code:     Code(5010),
+			message:  "too many consumer groups",
+		},
+		{
 			err:      IncompatibleProtocolVersion{ClientVersion: 1, ServerVersionMin: 2, ServerVersionMax: 3},
 			sentinel: ErrIncompatibleProtocolVersion,
 			code:     IncompatibleProtocolVersionCode,

@@ -2382,6 +2382,15 @@ func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
 	return ok
 }
 
+type TooManyConsumerGroups struct{}
+
+func (e TooManyConsumerGroups) Error() string { return "too many consumer groups" }
+func (e TooManyConsumerGroups) Code() Code    { return 5010 }
+func (e TooManyConsumerGroups) Is(target error) bool {
+	_, ok := target.(TooManyConsumerGroups)
+	return ok
+}
+
 type MissingBaseOffsetRetainedMessageBatch struct{}
 
 func (e MissingBaseOffsetRetainedMessageBatch) Error() string { return "base offset is missing" }
@@ -2955,6 +2964,7 @@ var (
 	ErrCannotCreateConsumerGroupInfo              = CannotCreateConsumerGroupInfo{}
 	ErrCannotDeleteConsumerGroupInfo              = CannotDeleteConsumerGroupInfo{}
 	ErrConsumerGroupPartitionNotOwned             = ConsumerGroupPartitionNotOwned{}
+	ErrTooManyConsumerGroups                      = TooManyConsumerGroups{}
 	ErrMissingBaseOffsetRetainedMessageBatch      = MissingBaseOffsetRetainedMessageBatch{}
 	ErrMissingLastOffsetDeltaRetainedMessageBatch = MissingLastOffsetDeltaRetainedMessageBatch{}
 	ErrMissingMaxTimestampRetainedMessageBatch    = MissingMaxTimestampRetainedMessageBatch{}
@@ -3207,6 +3217,7 @@ const (
 	CannotCreateConsumerGroupInfoCode              Code = 5007
 	CannotDeleteConsumerGroupInfoCode              Code = 5008
 	ConsumerGroupPartitionNotOwnedCode             Code = 5009
+	TooManyConsumerGroupsCode                      Code = 5010
 	MissingBaseOffsetRetainedMessageBatchCode      Code = 6000
 	MissingLastOffsetDeltaRetainedMessageBatchCode Code = 6001
 	MissingMaxTimestampRetainedMessageBatchCode    Code = 6002
@@ -3669,6 +3680,8 @@ func (c Code) String() string {
 		return "CannotDeleteConsumerGroupInfo"
 	case ConsumerGroupPartitionNotOwnedCode:
 		return "ConsumerGroupPartitionNotOwned"
+	case TooManyConsumerGroupsCode:
+		return "TooManyConsumerGroups"
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return "MissingBaseOffsetRetainedMessageBatch"
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:
@@ -4170,6 +4183,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotDeleteConsumerGroupInfo
 	case ConsumerGroupPartitionNotOwnedCode:
 		return ErrConsumerGroupPartitionNotOwned
+	case TooManyConsumerGroupsCode:
+		return ErrTooManyConsumerGroups
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return ErrMissingBaseOffsetRetainedMessageBatch
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:

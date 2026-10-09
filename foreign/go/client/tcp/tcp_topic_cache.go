@@ -97,34 +97,45 @@ func (c *topicCache) invalidate(key topicKey) {
 	delete(c.contexts, key)
 }
 
-func (c *topicCache) drop(key topicKey) {
+// forgetCount forgets the partition count of a topic and keeps its contexts.
+func (c *topicCache) forgetCount(key topicKey) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	delete(c.partitionsCounts, key)
-	delete(c.balancedCursors, key)
-	delete(c.contexts, key)
 }
 
-// dropStream forgets every topic cached under the encoded stream identifier,
-// because deleting a stream invalidates each topic under it.
-func (c *topicCache) dropStream(stream string) {
+// invalidateAll forgets every partition count and context after the client
+// changed the topology itself. A name and a numeric id cache one topic under
+// two keys, so the change cannot tell which entries it made stale. The
+// balanced cursors survive.
+func (c *topicCache) invalidateAll() {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	for key := range c.partitionsCounts {
-		if key.stream == stream {
-			delete(c.partitionsCounts, key)
-		}
-	}
+	clear(c.partitionsCounts)
+	clear(c.contexts)
+}
+
+// drop restarts the balanced cursor of a deleted topic, then invalidates every
+// count and context.
+func (c *topicCache) drop(key topicKey) {
+	c.mtx.Lock()
+	delete(c.balancedCursors, key)
+	c.mtx.Unlock()
+	c.invalidateAll()
+}
+
+// dropStream restarts the balanced cursor of every topic cached under the
+// encoded stream identifier of a deleted stream, then invalidates every count
+// and context.
+func (c *topicCache) dropStream(stream string) {
+	c.mtx.Lock()
 	for key := range c.balancedCursors {
 		if key.stream == stream {
 			delete(c.balancedCursors, key)
 		}
 	}
-	for key := range c.contexts {
-		if key.stream == stream {
-			delete(c.contexts, key)
-		}
-	}
+	c.mtx.Unlock()
+	c.invalidateAll()
 }
 
 // nextBalanced returns the partition a balanced send targets and advances the

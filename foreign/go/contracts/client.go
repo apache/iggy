@@ -130,6 +130,13 @@ type Client interface {
 	// These polls are never replayed automatically after an unknown outcome.
 	// Servers must support primary routing and consumer-session attachment.
 	//
+	// Without a caller-supplied partition context, a poll stamps the context
+	// of a cached route. After another client deleted and recreated the
+	// partition, one such poll can fail with ErrHistoryUnavailable, or with
+	// ErrConsumerGroupPartitionNotOwned for a consumer group that names the
+	// partition. The SDK drops the failed route and does not retry the poll.
+	// The next call routes again.
+	//
 	// A group poll that names no partition is orchestrated client-side and
 	// has three outcomes:
 	//   - err == nil with PartitionId == NoAssignedPartition and an empty
@@ -157,6 +164,11 @@ type Client interface {
 	// StoreConsumerOffset store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
 	// The partition context is read at store time, so a polled offset belongs in StoreConsumerPosition.
+	//
+	// The context comes from a cached route. After another client deleted and
+	// recreated the partition, one call can fail with ErrHistoryUnavailable, or
+	// with ErrConsumerGroupPartitionNotOwned for a consumer group. The SDK drops
+	// the failed route and does not retry the call. The next call routes again.
 	StoreConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -194,6 +206,12 @@ type Client interface {
 
 	// DeleteConsumerOffset delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// The partition context comes from a cached route. After another client
+	// deleted and recreated the partition, one call can fail with
+	// ErrHistoryUnavailable, or with ErrConsumerGroupPartitionNotOwned for a
+	// consumer group. The SDK drops the failed route and does not retry the
+	// call. The next call routes again.
 	DeleteConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -373,7 +391,9 @@ type Client interface {
 
 	// SendBinaryRequest sends a command code and payload and returns the raw response body.
 	// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
-	// It stamps no partition context, so the server refuses message sends, polls and
-	// consumer offset writes with ierror.ErrHistoryUnavailable. Use the typed methods for those.
+	// Message sends, polls and consumer offset writes are stamped with the partition context
+	// their typed methods would capture, and keep it across retries. A send must name an
+	// explicit partition id: a balanced or key-partitioned send returns
+	// ierror.ErrFeatureUnavailable without writing, so use SendMessages for those.
 	SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error)
 }

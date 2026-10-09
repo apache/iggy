@@ -275,6 +275,112 @@ func TestExchange_PreservesUncertaintyAfterALaterRefusal(t *testing.T) {
 	}
 }
 
+func lifecycleBusyJoin(t *testing.T) *command.JoinConsumerGroup {
+	t.Helper()
+	return &command.JoinConsumerGroup{
+		TopicPath: command.TopicPath{StreamId: numericIdentifier(t, 1), TopicId: numericIdentifier(t, 2)},
+		GroupId:   numericIdentifier(t, 3),
+	}
+}
+
+func TestExchange_RetriesALifecycleRefusalAsANewRequest(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(index int, _ request) []byte {
+		if index == 0 {
+			return replyFrame(vsr.OperationJoinConsumerGroup,
+				resultSection(uint32(ierror.LifecycleBusyCode)))
+		}
+		return replyFrame(vsr.OperationJoinConsumerGroup, append(resultSection(), "joined"...))
+	})
+	captured := iggcon.PartitionContext{Incarnation: 17, OwnerGeneration: 3, MetadataOp: 4}
+	ctx := context.WithValue(context.Background(), capturedPartitionContext{}, captured)
+
+	response, err := client.do(ctx, lifecycleBusyJoin(t))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("joined"), response)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, 2)
+	refused, retried := recorded[0], recorded[1]
+	assert.NotEqual(t, refused.requestID(), retried.requestID(),
+		"the refusal committed under the first request id, so the retry needs a new one")
+	assert.Equal(t, refused.clientID(), retried.clientID())
+	assert.Equal(t, refused.sessionID(), retried.sessionID())
+	stampedContext := func(read request) []byte {
+		return read.header[frameOffsetContext : frameOffsetContext+iggcon.PartitionContextSize]
+	}
+	assert.Equal(t, stampedContext(refused), stampedContext(retried))
+	assert.Equal(t, captured.Incarnation, retried.incarnation())
+	assert.Equal(t, refused.payload, retried.payload)
+}
+
+func TestExchange_BacksOffALastingLifecycleRefusalUntilTheDeadline(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return statusReplyFrame(vsr.OperationJoinConsumerGroup, uint32(ierror.LifecycleBusyCode), nil)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := client.do(ctx, lifecycleBusyJoin(t))
+	assert.ErrorIs(t, err, ierror.ErrLifecycleBusy,
+		"the request stops before the deadline and reports the refusal")
+
+	recorded := server.recorded()
+	// A pause doubling from 50 ms fits five attempts into the second, a fixed one twenty.
+	assert.GreaterOrEqual(t, len(recorded), 2)
+	assert.LessOrEqual(t, len(recorded), 5)
+	requestIDs := make(map[uint64]struct{}, len(recorded))
+	for _, read := range recorded {
+		requestIDs[read.requestID()] = struct{}{}
+	}
+	assert.Len(t, requestIDs, len(recorded), "every retry is a new request")
+}
+
+func TestExchange_LifecycleRetryPauseDoesNotBlockTheClient(t *testing.T) {
+	// The pause after the third refusal lasts 200 ms. The ping starts once the
+	// refused request is inside it, and must finish well before it ends: a ping
+	// queued earlier would take a released lock ahead of the pause.
+	const refusals = 3
+	const pauseEntry = 20 * time.Millisecond
+	const pingBudget = 100 * time.Millisecond
+	client, serverConn := newPipeClient(t)
+	lastRefusal := make(chan struct{})
+	joins := 0
+	server := serve(serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.PingCode) {
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+		joins++
+		if joins == refusals {
+			close(lastRefusal)
+		}
+		if joins <= refusals {
+			return replyFrame(vsr.OperationJoinConsumerGroup,
+				resultSection(uint32(ierror.LifecycleBusyCode)))
+		}
+		return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+	})
+
+	join := lifecycleBusyJoin(t)
+	joined := make(chan error, 1)
+	go func() {
+		_, err := client.do(context.Background(), join)
+		joined <- err
+	}()
+	<-lastRefusal
+	time.Sleep(pauseEntry)
+	ctx, cancel := context.WithTimeout(context.Background(), pingBudget)
+	defer cancel()
+	require.NoError(t, client.Ping(ctx))
+	require.NoError(t, <-joined)
+
+	recorded := server.recorded()
+	require.Len(t, recorded, refusals+2)
+	assert.Equal(t, uint32(command.PingCode), recorded[refusals].code(),
+		"the ping went through between the refusal and the retry")
+}
+
 func TestExchange_EscalatesNotAcceptedToALeaderRecheck(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	// A single-node roster short-circuits the redirect, so the request keeps

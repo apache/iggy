@@ -20,6 +20,17 @@ package iggcon
 type PollingStrategy struct {
 	Kind  MessagePolling
 	Value uint64
+	// Context is the partition incarnation and owner a continuation offset was
+	// polled under. A stale context refuses the poll instead of reading that
+	// offset in another incarnation. Nil takes the context the route reports.
+	Context *PartitionContext
+}
+
+// WithContext continues at an offset under the incarnation and owner that
+// produced it, as PolledMessage.Context reports them.
+func (s PollingStrategy) WithContext(context PartitionContext) PollingStrategy {
+	s.Context = &context
+	return s
 }
 
 type MessagePolling byte

@@ -1163,6 +1163,10 @@
       type: uint32
     - name: PartitionId
       type: uint32
+- name: TooManyConsumerGroups
+  code: 5010
+  format: "too many consumer groups"
+  fields: []
 - name: MissingBaseOffsetRetainedMessageBatch
   code: 6000
   format: "base offset is missing"

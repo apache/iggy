@@ -212,6 +212,11 @@ func (c *IggyTcpClient) pollGroup(
 				return nil, err
 			}
 			c.groups.drop(key)
+			if strategy.Context != nil {
+				// The caller's context names the owner its offset was polled
+				// under, so a retry with it would only be refused again.
+				return nil, err
+			}
 			continue
 		}
 

@@ -39,6 +39,10 @@ const (
 	consumerSessionSize   = 32
 	pollParametersSize    = 1 + 8 + 4 + 1
 	pollHeartbeatInterval = 5 * time.Second
+	// Offset writes end with the offset and the ack level, a delete with the
+	// ack level only.
+	storeOffsetSuffixSize  = 8 + 1
+	deleteOffsetSuffixSize = 1
 )
 
 // Primary polls have no deduplication key, including within one VSR session.
@@ -155,7 +159,23 @@ func (p *pollRouter) dropConnection(endpoint string, connection *pollConnection)
 	connection.retire()
 }
 
-func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.PollMessages) (response []byte, err error) {
+func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.PollMessages) ([]byte, error) {
+	payload, err := request.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	key := string(payload[:len(payload)-pollParametersSize])
+	return c.sendRouted(caller, command.PollMessagesOnPrimaryCode, key, command.GetPollRoutingCode,
+		payload, payload, request.Strategy.Context)
+}
+
+// sendRouted sends a partition request to the partition primary, keeping the
+// coordinator connection and its group membership in place. A captured
+// context is stamped on every attempt; without one, every attempt keeps the
+// context the first route reported.
+func (c *IggyTcpClient) sendRouted(caller context.Context, code command.Code, key string,
+	routeCode command.Code, routePayload, payload []byte, captured *iggcon.PartitionContext,
+) (response []byte, err error) {
 	if caller == nil {
 		return nil, ierror.ErrNilContext
 	}
@@ -170,11 +190,6 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 		}
 		cancel()
 	}()
-	payload, err := request.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	key := string(payload[:len(payload)-pollParametersSize])
 
 	c.polls.mu.Lock()
 	now := time.Now()
@@ -194,12 +209,11 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 		}
 	}
 
-	var captured *iggcon.PartitionContext
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		route, err := c.consumerRoute(ctx, key, payload, command.GetPollRoutingCode)
+		route, err := c.consumerRoute(ctx, key, routePayload, routeCode)
 		var response []byte
 		if err == nil {
 			if captured == nil {
@@ -207,7 +221,7 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 				captured = &value
 			}
 			route.context = *captured
-			response, err = c.pollOnRoute(ctx, key, payload, route)
+			response, err = c.pollOnRoute(ctx, code, key, payload, route)
 		}
 		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
 			return response, err
@@ -226,7 +240,7 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 	}
 }
 
-func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []byte, route pollRoute) ([]byte, error) {
+func (c *IggyTcpClient) pollOnRoute(ctx context.Context, code command.Code, key string, payload []byte, route pollRoute) ([]byte, error) {
 	c.polls.mu.Lock()
 	if !c.matchesPollParent(route.parent) {
 		c.polls.mu.Unlock()
@@ -331,7 +345,14 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	if !c.pollParentCurrent(route.parent) {
 		return nil, ierror.ErrTransientNotAccepted
 	}
-	response, state, err := slot.client.sendPollRequest(context.WithValue(exchangeCtx, capturedPartitionContext{}, route.context), uint32(command.PollMessagesOnPrimaryCode), payload)
+	var response []byte
+	var state pollExchangeState
+	var err error
+	if _, replicated := vsr.ReplicatedOperation(uint32(code)); replicated {
+		response, state, err = c.sendPrimaryWrite(exchangeCtx, slot.client, code, payload, route)
+	} else {
+		response, state, err = slot.client.sendPollRequest(context.WithValue(exchangeCtx, capturedPartitionContext{}, route.context), uint32(code), payload)
+	}
 	err = slot.exchangeError(ctx, state, err)
 	if errors.Is(err, ierror.ErrTransientNotAccepted) {
 		slot.attached = false
@@ -447,6 +468,41 @@ func (c *IggyTcpClient) sendPollRequest(ctx context.Context, code uint32, payloa
 	frame := append(reserveHeader(*bp), payload...)
 	*bp = frame
 	response, _, state, err := c.sendPollFrame(ctx, code, frame)
+	return response, state, err
+}
+
+// sendPrimaryWrite sends a replicated write over a data connection. That
+// connection shares this client's session identity, which the partition
+// deduplicates by, so the request id comes from this client's counter, as
+// the Rust SDK shares one consensus session between both connections.
+func (c *IggyTcpClient) sendPrimaryWrite(ctx context.Context, data *IggyTcpClient, code command.Code, payload []byte, route pollRoute) ([]byte, pollExchangeState, error) {
+	state := pollExchangeState{}
+	bp := acquireRequestBuf()
+	defer releaseRequestBuf(bp)
+	frame := append(reserveHeader(*bp), payload...)
+	*bp = frame
+	// The gate is taken first, as attempt does, so a coordinator exchange
+	// holding the session cannot outlast the caller's deadline here.
+	select {
+	case c.exchangeGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, state, ctx.Err()
+	case <-c.closed:
+		return nil, state, ierror.ErrClientShutdown
+	}
+	c.mtx.Lock()
+	var err error = ierror.ErrTransientNotAccepted
+	if c.session.ClientID() == route.parent.client && c.session.SessionID() == route.parent.session {
+		err = vsr.StampRequestHeader(c.session, uint32(code), frame)
+	}
+	c.mtx.Unlock()
+	<-c.exchangeGate
+	if err != nil {
+		return nil, state, err
+	}
+	vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), route.context)
+	response, _, _, err := data.attempt(context.WithValue(ctx, singlePollExchange{}, &state),
+		uint32(code), frame, true, time.Now(), time.Now().Add(responseReadTimeout))
 	return response, state, err
 }
 
