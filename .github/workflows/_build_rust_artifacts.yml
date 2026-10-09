@@ -75,10 +75,10 @@ jobs:
             runner: ubuntu-26.04
             libc: musl
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             libc: gnu
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             libc: musl
     steps:
       - name: Download latest copy script from master
@@ -191,7 +191,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-26.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
