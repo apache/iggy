@@ -944,8 +944,9 @@ impl IggyConsumer {
     ///   [`auto_commit()`](crate::prelude::IggyConsumerBuilder::auto_commit) is
     ///   [`AutoCommitWhen::PollingMessages`], checked before anything is sent. See
     ///   [Encryption](IggyConsumer#encryption).
-    /// - [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`] when the
-    ///   stream or the topic still does not exist once the retries are exhausted.
+    /// - [`IggyError::StreamNameNotFound`], [`IggyError::StreamIdNotFound`] or [`IggyError::TopicNameNotFound`],
+    ///   [`IggyError::TopicIdNotFound`] when the stream or the topic still does not exist once the retries are
+    ///   exhausted.
     /// - [`IggyError::ConsumerGroupNameNotFound`] when the consumer group does not exist
     ///   and its auto creation is disabled.
     /// - Any error returned by the server while looking up the stream or the topic, or

@@ -904,8 +904,9 @@ impl IggyProducer {
     ///
     /// # Errors
     ///
-    /// - [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`] when the stream or
-    ///   the topic does not exist and its auto creation is disabled.
+    /// - [`IggyError::StreamNameNotFound`], [`IggyError::StreamIdNotFound`] or [`IggyError::TopicNameNotFound`],
+    ///   [`IggyError::TopicIdNotFound`] when the stream or the topic still does not exist once the retries are
+    ///   exhausted.
     /// - Any other error the server raised while looking up or creating the stream or the topic.
     pub async fn init(&self) -> Result<(), IggyError> {
         self.core.init().await
