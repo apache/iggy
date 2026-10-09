@@ -105,11 +105,9 @@ where
                 | Operation::CreateStream
                 | Operation::UpdateStream
                 | Operation::DeleteStream
-                | Operation::PurgeStream
                 | Operation::CreateTopic
                 | Operation::UpdateTopic
                 | Operation::DeleteTopic
-                | Operation::PurgeTopic
                 | Operation::CreatePartitions
                 | Operation::DeletePartitions
                 | Operation::DeleteSegments

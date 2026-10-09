@@ -51,7 +51,7 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
+pub use iggy_partition::{IggyPartition, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{

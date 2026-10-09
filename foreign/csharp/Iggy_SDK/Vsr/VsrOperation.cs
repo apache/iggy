@@ -40,11 +40,9 @@ internal enum VsrOperation : byte
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
-    PurgeStream = 131,
     CreateTopic = 132,
     UpdateTopic = 133,
     DeleteTopic = 134,
-    PurgeTopic = 135,
     CreatePartitions = 136,
     DeletePartitions = 137,
     DeleteSegments = 138,
@@ -129,11 +127,9 @@ internal static class VsrOperations
             CommandCodes.CREATE_STREAM_CODE => VsrOperation.CreateStream,
             CommandCodes.DELETE_STREAM_CODE => VsrOperation.DeleteStream,
             CommandCodes.UPDATE_STREAM_CODE => VsrOperation.UpdateStream,
-            CommandCodes.PURGE_STREAM_CODE => VsrOperation.PurgeStream,
             CommandCodes.CREATE_TOPIC_CODE => VsrOperation.CreateTopic,
             CommandCodes.DELETE_TOPIC_CODE => VsrOperation.DeleteTopic,
             CommandCodes.UPDATE_TOPIC_CODE => VsrOperation.UpdateTopic,
-            CommandCodes.PURGE_TOPIC_CODE => VsrOperation.PurgeTopic,
             CommandCodes.CREATE_PARTITIONS_CODE => VsrOperation.CreatePartitions,
             CommandCodes.DELETE_PARTITIONS_CODE => VsrOperation.DeletePartitions,
             CommandCodes.DELETE_SEGMENTS_CODE => VsrOperation.DeleteSegments,
@@ -192,7 +188,9 @@ internal static class VsrOperations
                 true,
             >= VsrOperation.CreateTopicWithAssignments and <= VsrOperation.TruncatePartition => true,
             VsrOperation.FinalizeSession or VsrOperation.RetireSession => true,
-            >= VsrOperation.CreateStream and <= VsrOperation.LeaveConsumerGroup => true,
+            >= VsrOperation.CreateStream and <= VsrOperation.DeleteStream => true,
+            >= VsrOperation.CreateTopic and <= VsrOperation.DeleteTopic => true,
+            >= VsrOperation.CreatePartitions and <= VsrOperation.LeaveConsumerGroup => true,
             VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset =>
                 true,
             _ => false
@@ -219,11 +217,9 @@ internal static class VsrOperations
             || operation is VsrOperation.CreateStream
             or VsrOperation.UpdateStream
             or VsrOperation.DeleteStream
-            or VsrOperation.PurgeStream
             or VsrOperation.CreateTopic
             or VsrOperation.UpdateTopic
             or VsrOperation.DeleteTopic
-            or VsrOperation.PurgeTopic
             or VsrOperation.CreatePartitions
             or VsrOperation.DeletePartitions
             or VsrOperation.CreateConsumerGroup
