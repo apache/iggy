@@ -20,13 +20,19 @@
 //! whether the route is mounted. The scrape handler itself lives with the
 //! other route handlers so this leaf never imports the state hub.
 
+use std::fmt::Write;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use configs::http::HttpMetricsConfig;
-use iggy_common::{IggyError, stats_rollup_underflows};
+use iggy_common::{DEFAULT_MAX_TOPIC_SIZE, IggyError, MaxTopicSize, stats_rollup_underflows};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::encoding::{
+    DescriptorEncoder, EncodeLabelValue, EncodeMetric, LabelValueEncoder,
+};
+use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
-use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 use tracing::error;
 
@@ -73,6 +79,116 @@ impl Collector for StatsRollupUnderflows {
     }
 }
 
+/// One topic's usage as the scrape handler sampled it from the streams STM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::http) struct TopicUsageSample {
+    pub(in crate::http) stream: Arc<str>,
+    pub(in crate::http) topic: Arc<str>,
+    pub(in crate::http) size_bytes: u64,
+    pub(in crate::http) messages: u64,
+    /// `None` for an uncapped topic, so its series is absent rather than 0 and
+    /// `topic_size_bytes / topic_max_size_bytes` never yields `+Inf`.
+    pub(in crate::http) max_size_bytes: Option<u64>,
+}
+
+impl TopicUsageSample {
+    /// `ServerDefault` resolves the way the segment cleaner enforces it, so
+    /// the exported cap is the one retention actually trims against.
+    pub(in crate::http) fn max_size_bytes(max_topic_size: MaxTopicSize) -> Option<u64> {
+        let resolved = match max_topic_size {
+            MaxTopicSize::ServerDefault => MaxTopicSize::from(DEFAULT_MAX_TOPIC_SIZE),
+            sized => sized,
+        };
+        match resolved {
+            MaxTopicSize::Custom(size) => Some(size.as_bytes_u64()),
+            MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
+        }
+    }
+}
+
+/// Per-topic `{stream, topic}` series, replaced wholesale on every scrape.
+///
+/// A `Family` would keep reporting a deleted or renamed topic under its old
+/// labels until restart. The collector cannot read the streams STM itself: it
+/// lives on shard 0 and is `!Sync`, while a registered collector must be
+/// `Send + Sync`, so the scrape handler hands it a snapshot instead.
+#[derive(Debug, Clone, Default)]
+pub(in crate::http) struct TopicUsage {
+    samples: Arc<Mutex<Vec<TopicUsageSample>>>,
+}
+
+impl TopicUsage {
+    pub(in crate::http) fn replace(&self, samples: Vec<TopicUsageSample>) {
+        *self.samples.lock().unwrap_or_else(PoisonError::into_inner) = samples;
+    }
+}
+
+impl Collector for TopicUsage {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+        encode_topic_gauge(
+            &mut encoder,
+            "topic_size_bytes",
+            "size of the topic's stored messages in bytes",
+            &samples,
+            |sample| Some(sample.size_bytes),
+        )?;
+        encode_topic_gauge(
+            &mut encoder,
+            "topic_messages",
+            "count of the topic's stored messages",
+            &samples,
+            |sample| Some(sample.messages),
+        )?;
+        encode_topic_gauge(
+            &mut encoder,
+            "topic_max_size_bytes",
+            "size cap of the topic in bytes, absent when unlimited",
+            &samples,
+            |sample| sample.max_size_bytes,
+        )
+    }
+}
+
+fn encode_topic_gauge(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    samples: &[TopicUsageSample],
+    value: impl Fn(&TopicUsageSample) -> Option<u64>,
+) -> Result<(), std::fmt::Error> {
+    let mut metric_encoder = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
+    for sample in samples {
+        let Some(value) = value(sample) else {
+            continue;
+        };
+        let labels = [
+            ("stream", EscapedLabelValue(&sample.stream)),
+            ("topic", EscapedLabelValue(&sample.topic)),
+        ];
+        ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
+    }
+    Ok(())
+}
+
+/// prometheus-client writes label values verbatim, and stream and topic names
+/// may contain any character the exposition format treats as syntax.
+struct EscapedLabelValue<'a>(&'a str);
+
+impl EncodeLabelValue for EscapedLabelValue<'_> {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        for character in self.0.chars() {
+            match character {
+                '\\' => encoder.write_str("\\\\")?,
+                '"' => encoder.write_str("\\\"")?,
+                '\n' => encoder.write_str("\\n")?,
+                other => encoder.write_char(other)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
@@ -90,6 +206,7 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) messages: Gauge,
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
+    pub(in crate::http) topic_usage: TopicUsage,
 }
 
 impl HttpMetrics {
@@ -122,6 +239,8 @@ impl HttpMetrics {
         // Not a legacy-parity metric, and not a mirrored one: the source is a
         // process-wide static the scrape reads directly.
         registry.register_collector(Box::new(StatsRollupUnderflows));
+        let topic_usage = TopicUsage::default();
+        registry.register_collector(Box::new(topic_usage.clone()));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -145,6 +264,7 @@ impl HttpMetrics {
             messages,
             users,
             clients,
+            topic_usage,
         }
     }
 
@@ -317,6 +437,89 @@ mod tests {
     fn validated_endpoint_returns_enabled_path() {
         let endpoint = validated_endpoint(&metrics_config(true, "/metrics")).unwrap();
         assert_eq!(endpoint.as_deref(), Some("/metrics"));
+    }
+
+    fn topic_sample(stream: &str, topic: &str, max_size_bytes: Option<u64>) -> TopicUsageSample {
+        TopicUsageSample {
+            stream: Arc::from(stream),
+            topic: Arc::from(topic),
+            size_bytes: 4096,
+            messages: 20,
+            max_size_bytes,
+        }
+    }
+
+    #[test]
+    fn given_topic_samples_when_encoding_should_label_each_series_by_stream_and_topic() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics.topic_usage.replace(vec![
+            topic_sample("orders", "eu", Some(1_000_000)),
+            topic_sample("orders", "us", None),
+        ]);
+        let output = metrics.formatted_output();
+        for line in [
+            "# TYPE topic_size_bytes gauge",
+            "# TYPE topic_messages gauge",
+            "# TYPE topic_max_size_bytes gauge",
+            r#"topic_size_bytes{stream="orders",topic="eu"} 4096"#,
+            r#"topic_size_bytes{stream="orders",topic="us"} 4096"#,
+            r#"topic_messages{stream="orders",topic="eu"} 20"#,
+            r#"topic_messages{stream="orders",topic="us"} 20"#,
+            r#"topic_max_size_bytes{stream="orders",topic="eu"} 1000000"#,
+        ] {
+            assert!(
+                output.contains(&format!("\n{line}\n")),
+                "expected `{line}` in exposition:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains(r#"topic_max_size_bytes{stream="orders",topic="us"}"#),
+            "an uncapped topic must not export a max size:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_replaced_snapshot_when_encoding_should_drop_topics_no_longer_present() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("orders", "eu", None)]);
+        metrics.topic_usage.replace(Vec::new());
+        let output = metrics.formatted_output();
+        assert!(
+            !output.contains(r#"topic="eu""#),
+            "a deleted topic must not outlive the next scrape:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_name_with_exposition_syntax_when_encoding_should_escape_it() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics
+            .topic_usage
+            .replace(vec![topic_sample("a\"b", "c\\d\ne", None)]);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains(r#"topic_messages{stream="a\"b",topic="c\\d\ne"} 20"#),
+            "label values must be escaped:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_max_topic_size_variants_when_resolving_should_export_only_a_finite_cap() {
+        assert_eq!(
+            TopicUsageSample::max_size_bytes(MaxTopicSize::from(1024)),
+            Some(1024)
+        );
+        assert_eq!(
+            TopicUsageSample::max_size_bytes(MaxTopicSize::Unlimited),
+            None
+        );
+        // The shipped node default is unlimited.
+        assert_eq!(
+            TopicUsageSample::max_size_bytes(MaxTopicSize::ServerDefault),
+            None
+        );
     }
 
     #[test]

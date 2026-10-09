@@ -126,7 +126,7 @@ use crate::http::error::{
     ReadError, WriteError,
 };
 use crate::http::extractor::{Authenticated, Identity};
-use crate::http::metrics::gauge_value;
+use crate::http::metrics::{TopicUsageSample, gauge_value};
 use crate::http::reads::{
     authorize_data_plane, gate_local_read, read_local, resolve_gate_stream, resolve_gate_topic,
     resolve_gate_topic_ids, resolve_gate_user, topic_durability,
@@ -614,14 +614,18 @@ pub(in crate::http) async fn get_stats(
 /// The entity gauges sample the same reads `/stats` serves: the metadata STM
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
 /// increments are relaxed, so scraped values are approximate while writes are
-/// in flight. The clients count scatter-gathers the per-shard session managers
+/// in flight. The per-topic series come from the same walk and the same
+/// rollups `GetTopic` reads. The clients count scatter-gathers the per-shard session managers
 /// exactly like `GET /clients` and turns partial when a shard misses the reply
 /// deadline.
 pub(in crate::http) async fn get_metrics(
     State(state): State<HttpState>,
     _identity: Identity,
 ) -> String {
-    let (streams_count, topics_count, partitions_count, segments_count, messages_count) = state
+    let (
+        (streams_count, topics_count, partitions_count, segments_count, messages_count),
+        topic_usage,
+    ) = state
         .shard
         .plane
         .metadata()
@@ -632,6 +636,7 @@ pub(in crate::http) async fn get_metrics(
             let mut partitions_count = 0u64;
             let mut segments_count = 0u64;
             let mut messages_count = 0u64;
+            let mut topic_usage = Vec::new();
             for (_, stream) in &streams.items {
                 topics_count = topics_count.saturating_add(stream.topics.len() as u64);
                 segments_count = segments_count
@@ -641,14 +646,24 @@ pub(in crate::http) async fn get_metrics(
                 for (_, topic) in &stream.topics {
                     partitions_count =
                         partitions_count.saturating_add(topic.partitions.len() as u64);
+                    topic_usage.push(TopicUsageSample {
+                        stream: Arc::clone(&stream.name),
+                        topic: Arc::clone(&topic.name),
+                        size_bytes: topic.stats.size_bytes_inconsistent(),
+                        messages: topic.stats.messages_count_inconsistent(),
+                        max_size_bytes: TopicUsageSample::max_size_bytes(topic.max_topic_size),
+                    });
                 }
             }
             (
-                streams.items.len() as u64,
-                topics_count,
-                partitions_count,
-                segments_count,
-                messages_count,
+                (
+                    streams.items.len() as u64,
+                    topics_count,
+                    partitions_count,
+                    segments_count,
+                    messages_count,
+                ),
+                topic_usage,
             )
         });
     let users_count = state
@@ -668,6 +683,7 @@ pub(in crate::http) async fn get_metrics(
     metrics.messages.set(gauge_value(messages_count));
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
+    metrics.topic_usage.replace(topic_usage);
     metrics.formatted_output()
 }
 
