@@ -23,6 +23,14 @@ use async_trait::async_trait;
 /// The HTTP transport cannot name a consumer kind, so every method refuses a
 /// [`ConsumerKind::ExternalGroup`](crate::ConsumerKind::ExternalGroup) consumer with
 /// [`IggyError::FeatureUnavailable`] there.
+///
+/// Binary clients cache the route of an offset write with the partition context it reported.
+/// After another client deletes and recreates the partition, a write without a caller context
+/// ([`Self::store_consumer_offset`], [`Self::delete_consumer_offset`]) can fail once with
+/// [`IggyError::HistoryUnavailable`] (87), or with [`IggyError::ConsumerGroupPartitionNotOwned`]
+/// (5009) for a consumer group. The failed route is dropped, so the next call routes again and
+/// takes the new context. [`Self::store_consumer_position`] carries the caller's context, so it
+/// keeps getting the refusal for that context.
 #[async_trait]
 pub trait ConsumerOffsetClient {
     /// Commit a captured position without substituting a newer incarnation or owner.

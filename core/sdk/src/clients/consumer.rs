@@ -173,6 +173,9 @@ impl IggyConsumerState {
     }
 
     /// Stores the consumer offset on the server either for the current partition or the provided partition ID.
+    ///
+    /// It commits under the context of the latest message consumed from that partition, see
+    /// [`IggyConsumer::store_offset`].
     pub async fn store_offset(
         &self,
         offset: u64,
@@ -257,6 +260,21 @@ impl IggyConsumerState {
         self.last_stored_offsets
             .insert(position.partition_id, position);
         Ok(())
+    }
+
+    /// The commit tasks have no caller to hand a failure to, so it is logged here. Replay governs
+    /// reading only, so they never move a stored offset back.
+    async fn store_in_background(&self, position: ConsumerPosition) {
+        if let Err(error) = self.store_consumer_position(position, false).await {
+            error!(
+                "Failed to store offset: {} for consumer: {}, partition ID: {}, topic: {}, stream: {}. {error}",
+                position.offset,
+                self.consumer,
+                position.partition_id,
+                self.topic_id,
+                self.stream_id
+            );
+        }
     }
 
     fn last_consumed_positions(&self) -> Vec<ConsumerPosition> {
@@ -484,6 +502,12 @@ unsafe impl Sync for IggyConsumer {}
 /// automatically; the next call parks for [`polling_retry_interval()`] while polling is paused. Hence,
 /// deciding when to give up on repeated errors is up to you.
 ///
+/// After another client deletes and recreates a partition, one poll of it can fail with
+/// [`IggyError::HistoryUnavailable`], or [`IggyError::ConsumerGroupPartitionNotOwned`] for a group
+/// member, because the request still carries the context of the deleted partition. That context is
+/// dropped with the failed request, so the next poll reads the new partition. Commits of positions
+/// read before the change keep their context and are refused the same way.
+///
 /// With [`AutoCommitWhen::PollingMessages`], a missing response can leave the server's
 /// cursor ahead of messages this consumer received. Continuing with
 /// [`PollingStrategy::next()`] can skip those messages. See the
@@ -668,10 +692,10 @@ pub struct IggyConsumer {
     auto_join_consumer_group: bool,
     create_consumer_group_if_not_exists: bool,
     state: IggyConsumerState,
-    current_offsets: Arc<DashMap<u32, AtomicU64>>,
     poll_future: Option<PollMessagesFuture>,
     buffered_messages: VecDeque<IggyMessage>,
     buffered_context: PartitionContext,
+    buffered_current_offset: u64,
     encryptor: Option<Arc<EncryptorKind>>,
     /// The latest offset each message trigger asked to commit, per partition. The store task
     /// drains it, so a burst of triggers costs one round trip per partition instead of one each.
@@ -750,7 +774,6 @@ impl IggyConsumer {
             next_offsets: Arc::new(DashMap::new()),
             poll_interval_micros: polling_interval.map_or(0, |interval| interval.as_micros()),
             state,
-            current_offsets: Arc::new(DashMap::new()),
             poll_future: None,
             batch_length,
             auto_commit,
@@ -763,6 +786,7 @@ impl IggyConsumer {
             create_consumer_group_if_not_exists,
             buffered_messages: VecDeque::new(),
             buffered_context: PartitionContext::default(),
+            buffered_current_offset: 0,
             encryptor,
             pending_commits: Arc::new(DashMap::new()),
             store_offset_notify: Arc::new(Notify::new()),
@@ -844,8 +868,16 @@ impl IggyConsumer {
     /// An offset that is not ahead of the last one stored in the same captured context is
     /// skipped and `Ok(())` is returned without a request, unless the consumer was built with
     /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay).
-    /// This method uses the latest consumed context. Use [`Self::store_position`]
-    /// for a message held across an ownership change. To start over from the first message, delete the stored offset with
+    ///
+    /// The offset is committed under the context of the latest message consumed from that
+    /// partition, or without a captured context when nothing was consumed from it. An offset taken
+    /// from a message of an older incarnation or owner is therefore committed under the newer
+    /// context. To commit under the exact context of a message, pass [`ReceivedMessage::position`]
+    /// to [`store_position()`](Self::store_position). A refusal of the captured context, such as
+    /// [`IggyError::HistoryUnavailable`] after the partition was recreated, repeats until a message
+    /// is consumed under the new context.
+    ///
+    /// To start over from the first message, delete the stored offset with
     /// [`delete_offset()`](Self::delete_offset) after [`shutdown()`](Self::shutdown) and build a new
     /// consumer. A new consumer built with [`PollingStrategy::offset()`] re-reads from any point.
     ///
@@ -1115,7 +1147,7 @@ impl IggyConsumer {
                     break;
                 }
                 for position in state.last_consumed_positions() {
-                    _ = state.store_consumer_position(position, false).await;
+                    state.store_in_background(position).await;
                 }
             }
         })
@@ -1139,7 +1171,7 @@ impl IggyConsumer {
                     let Some((_, position)) = pending_commits.remove(&partition_id) else {
                         continue;
                     };
-                    _ = state.store_consumer_position(position, false).await;
+                    state.store_in_background(position).await;
                 }
                 if shutdown.load(ORDERING) && pending_commits.is_empty() {
                     break;
@@ -1611,16 +1643,9 @@ impl Stream for IggyConsumer {
 
             // Not the position of this message but the newest offset the partition had when the
             // batch was polled. So every message of a batch reports the same value.
-            let current_offset;
-            if let Some(current_offset_entry) = self.current_offsets.get(&partition_id) {
-                current_offset = current_offset_entry.load(ORDERING);
-            } else {
-                current_offset = 0;
-            }
-
             return Poll::Ready(Some(Ok(ReceivedMessage::new(
                 message,
-                current_offset,
+                self.buffered_current_offset,
                 partition_id,
                 self.buffered_context,
             ))));
@@ -1686,16 +1711,10 @@ impl Stream for IggyConsumer {
                         }
                     }
 
-                    if let Some(current_offset_entry) = self.current_offsets.get(&partition_id) {
-                        current_offset_entry.store(current_offset, ORDERING);
-                    } else {
-                        self.current_offsets
-                            .insert(partition_id, AtomicU64::new(current_offset));
-                    }
-
                     // A poll is only sent once the buffer has run empty, so nothing is overwritten.
                     self.buffered_messages = messages;
                     self.buffered_context = context;
+                    self.buffered_current_offset = current_offset;
 
                     if self.polling_strategy.kind != PollingKind::Next {
                         self.next_offsets.insert(
@@ -1914,6 +1933,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::timeout;
+    use tracing::field::Field;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
 
     const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
     const POLL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2270,6 +2292,104 @@ mod tests {
 
         assert_eq!(served.lock().unwrap().stored_offsets, [OFFSET]);
         assert_eq!(consumer.get_last_stored_offset(1), Some(OFFSET));
+    }
+
+    /// Records the error events emitted on the test thread. The current-thread runtime of
+    /// `#[tokio::test]` polls the tasks it spawns on that thread, so their events count too.
+    #[derive(Clone, Default)]
+    struct ErrorReports(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Subscriber for ErrorReports {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::ERROR
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Vec::new();
+            event.record(&mut |field: &Field, value: &dyn Debug| {
+                fields.push(format!("{field}: {value:?}"));
+            });
+            self.0.lock().unwrap().push(fields.join(", "));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    impl ErrorReports {
+        /// Waits for the first report, or returns none after [`POLL_TIMEOUT`].
+        async fn wait(&self) -> Vec<String> {
+            let first = async {
+                loop {
+                    let reports = self.0.lock().unwrap().clone();
+                    if !reports.is_empty() {
+                        return reports;
+                    }
+                    sleep(POLL_RETRY_INTERVAL).await;
+                }
+            };
+            timeout(POLL_TIMEOUT, first).await.unwrap_or_default()
+        }
+    }
+
+    #[tokio::test]
+    async fn interval_commit_should_report_a_failed_store() {
+        let recorder = ErrorReports::default();
+        let _subscriber = tracing::subscriber::set_default(recorder.clone());
+        let consumer = builder().partition(Some(1)).build();
+        consumer
+            .state
+            .last_consumed_offsets
+            .insert(1, position_at(9, 1));
+
+        // The client is not connected, so every store fails.
+        let task = consumer
+            .store_offsets_in_background(NonZeroIggyDuration::new(POLL_RETRY_INTERVAL).unwrap());
+        let reports = recorder.wait().await;
+        task.abort();
+
+        assert!(
+            !reports.is_empty(),
+            "a failed interval commit must be reported"
+        );
+        let failure = IggyError::Disconnected.to_string();
+        assert!(
+            reports.iter().all(|report| report.contains(&failure)),
+            "{reports:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_commit_should_report_a_failed_store() {
+        let recorder = ErrorReports::default();
+        let _subscriber = tracing::subscriber::set_default(recorder.clone());
+        let mut consumer = builder().partition(Some(1)).build();
+        consumer.initialized = true;
+        let task = consumer.store_pending_commits_in_background();
+
+        // The client is not connected, so the store fails.
+        consumer.send_store_offset(position_at(9, 1));
+        let reports = recorder.wait().await;
+        task.abort();
+
+        assert_eq!(
+            reports.len(),
+            1,
+            "a failed queued commit must be reported once"
+        );
+        assert!(
+            reports[0].contains(&IggyError::Disconnected.to_string()),
+            "{reports:?}"
+        );
     }
 
     /// Polls once as a group member on a client that is not connected. The outcome must be an
