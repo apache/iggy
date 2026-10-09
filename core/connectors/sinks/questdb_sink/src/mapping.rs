@@ -126,12 +126,6 @@ pub(crate) enum Rounding {
 }
 
 impl Rounding {
-    /// The match is exhaustive, so a new variant fails to compile here until
-    /// it is counted.
-    const COUNT: usize = match Self::Scalar {
-        Self::Scalar | Self::PastLong | Self::ArrayElement => 3,
-    };
-
     fn remedy(self) -> &'static str {
         match self {
             Self::Scalar => "list the column in integer_columns to keep it exact",
@@ -139,6 +133,26 @@ impl Rounding {
             Self::ArrayElement => {
                 "QuestDB stores only DOUBLE arrays, so an array element has no exact form"
             }
+        }
+    }
+}
+
+/// One flag per [`Rounding`] source, set when that source first rounded an
+/// integer on its way to a `DOUBLE`, so each warning is logged once per
+/// connector rather than per row.
+#[derive(Debug, Default)]
+pub(crate) struct RoundingWarned {
+    scalar: AtomicBool,
+    past_long: AtomicBool,
+    array_element: AtomicBool,
+}
+
+impl RoundingWarned {
+    fn flag(&self, source: Rounding) -> &AtomicBool {
+        match source {
+            Rounding::Scalar => &self.scalar,
+            Rounding::PastLong => &self.past_long,
+            Rounding::ArrayElement => &self.array_element,
         }
     }
 }
@@ -256,10 +270,7 @@ pub struct Mapping {
     /// numeric field is a genuine integer and the table was pre-created, since
     /// otherwise a whole-valued first window creates the column as a `LONG`.
     pub numbers_as_double: bool,
-    /// One flag per [`Rounding`] source, set when that source first rounded an
-    /// integer on its way to a `DOUBLE`, so each warning is logged once per
-    /// connector rather than per row.
-    pub rounding_warned: [AtomicBool; Rounding::COUNT],
+    pub rounding_warned: RoundingWarned,
 }
 
 /// Per-batch context that is constant across every row.
@@ -585,7 +596,11 @@ impl Mapping {
     }
 
     fn warn_rounding(&self, name: &str, source: Rounding) {
-        if !self.rounding_warned[source as usize].swap(true, Ordering::Relaxed) {
+        if !self
+            .rounding_warned
+            .flag(source)
+            .swap(true, Ordering::Relaxed)
+        {
             warn!(
                 "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {}. This is reported once per connector for this kind of value.",
                 self.id,
@@ -1039,8 +1054,12 @@ mod tests {
 
     /// Whether any rounding warning fired.
     fn warned(mapping: &Mapping) -> bool {
-        mapping
-            .rounding_warned
+        let RoundingWarned {
+            scalar,
+            past_long,
+            array_element,
+        } = &mapping.rounding_warned;
+        [scalar, past_long, array_element]
             .iter()
             .any(|flag| flag.load(Ordering::Relaxed))
     }
@@ -1972,8 +1991,18 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(mapping.rounding_warned[Rounding::ArrayElement as usize].load(Ordering::Relaxed));
-        assert!(!mapping.rounding_warned[Rounding::Scalar as usize].load(Ordering::Relaxed));
+        assert!(
+            mapping
+                .rounding_warned
+                .flag(Rounding::ArrayElement)
+                .load(Ordering::Relaxed)
+        );
+        assert!(
+            !mapping
+                .rounding_warned
+                .flag(Rounding::Scalar)
+                .load(Ordering::Relaxed)
+        );
 
         mapping
             .append_row(
@@ -1982,7 +2011,12 @@ mod tests {
                 context(),
             )
             .unwrap();
-        assert!(mapping.rounding_warned[Rounding::Scalar as usize].load(Ordering::Relaxed));
+        assert!(
+            mapping
+                .rounding_warned
+                .flag(Rounding::Scalar)
+                .load(Ordering::Relaxed)
+        );
     }
 
     #[test]

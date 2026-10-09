@@ -1871,9 +1871,8 @@ mod tests {
     #[test]
     fn given_a_debit_before_its_credit_when_settled_should_net_to_zero() {
         // The handler credits on the client's thread and the failed chunk
-        // debits on the Tokio thread, in no fixed order. A credit that lands
-        // first is cancelled by the debit before any settle. A debit that
-        // lands first must not make the pending credit look like a token.
+        // debits on the Tokio thread, in no fixed order. A debit that lands
+        // first must not make the pending credit look like a token.
         let balance = AtomicI64::new(0);
         let drops = AtomicU64::new(0);
         balance.fetch_sub(1, Ordering::Relaxed);
@@ -1892,8 +1891,9 @@ mod tests {
         // The documented residual case: another topic's batch settles the
         // credit as an unclaimed rejection before the failed chunk debits it,
         // so the rejection is reported twice and the balance stays at -1,
-        // where it absorbs the next handler-only rejection. Pinned so that a
-        // change to this behaviour is a deliberate one.
+        // where it absorbs the next handler-only rejection. That rejection
+        // then fails no batch and is never reported. Pinned so that a change
+        // to this behaviour is a deliberate one.
         let balance = AtomicI64::new(0);
         let drops = AtomicU64::new(0);
         balance.fetch_add(1, Ordering::Relaxed);
