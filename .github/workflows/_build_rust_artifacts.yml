@@ -133,6 +133,9 @@ jobs:
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             export PKG_CONFIG_ALLOW_CROSS=1
             export PKG_CONFIG_ALL_STATIC=1
+            # liblzma-sys links the system liblzma when pkg-config reports 5.8
+            # or newer, and the glibc library dir it adds shadows the musl libc.
+            export LZMA_API_STATIC=1
           fi
 
           # musl builds: use musl-gcc as linker to ensure proper linking against musl libc
