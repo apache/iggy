@@ -249,6 +249,7 @@ result_enum!(CreateConsumerGroupResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     NameAlreadyExists = 5004,
+    TooManyConsumerGroups = 5010,
 });
 // Delete/Join/Leave resolve stream -> topic -> group inside the apply (the
 // authz gate passes a resolution miss through), so their codes mirror the

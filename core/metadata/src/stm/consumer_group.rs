@@ -44,6 +44,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX;
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_common::IggyTimestamp;
@@ -485,6 +486,12 @@ impl WireDecode for LeaveConsumerGroupRequest {
     }
 }
 
+/// Owner retirement sends every live group id of a topic in one catalog, and
+/// decode refuses a catalog above `CONSUMER_GROUP_OWNERS_MAX`.
+const fn admits_consumer_group(live_groups: usize) -> bool {
+    live_groups < CONSUMER_GROUP_OWNERS_MAX as usize
+}
+
 impl StateHandler for CreateConsumerGroupRequest {
     type State = StreamsInner;
     #[allow(clippy::cast_possible_truncation)]
@@ -521,6 +528,9 @@ impl StateHandler for CreateConsumerGroupRequest {
         // `CreateStream`/`CreateTopic` on a duplicate name.
         if topic.consumer_group_index.contains_key(&name) {
             return ApplyReply::err(CreateConsumerGroupResult::NameAlreadyExists);
+        }
+        if !admits_consumer_group(topic.consumer_groups.len()) {
+            return ApplyReply::err(CreateConsumerGroupResult::TooManyConsumerGroups);
         }
         let id = topic.next_consumer_group_id;
         topic.next_consumer_group_id += 1;
@@ -1014,6 +1024,7 @@ mod tests {
     use crate::stm::snapshot::Snapshotable;
     use crate::stm::stream::Streams;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest;
     use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
@@ -1504,6 +1515,26 @@ mod tests {
             u32::from(CreateConsumerGroupResult::NameAlreadyExists)
         );
         assert!(apply.body.is_empty());
+    }
+
+    /// A full topic costs hundreds of megabytes to materialise, so this pins
+    /// the guard to the catalog bound instead: the largest admitted topic must
+    /// still fit one retirement catalog.
+    #[test]
+    fn given_the_owner_catalog_bound_when_creating_one_more_group_should_reject() {
+        let largest = CONSUMER_GROUP_OWNERS_MAX as usize;
+        assert!(admits_consumer_group(largest - 1));
+        assert!(!admits_consumer_group(largest));
+
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: 1,
+            metadata_op: 1,
+            next_group_id: largest as u64,
+            live_group_ids: (0..largest as u64).collect(),
+        };
+        let decoded = RetireConsumerGroupOwnersRequest::decode_from(&catalog.to_bytes())
+            .expect("a topic at the group cap fits one retirement catalog");
+        assert_eq!(decoded.live_group_ids.len(), largest);
     }
 
     #[test]

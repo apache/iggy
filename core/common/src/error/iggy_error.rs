@@ -503,6 +503,8 @@ pub enum IggyError {
         "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress)."
     )]
     ConsumerGroupPartitionNotOwned(u32, u32) = 5009,
+    #[error("Too many consumer groups")]
+    TooManyConsumerGroups = 5010,
     #[error("Base offset is missing")]
     MissingBaseOffsetRetainedMessageBatch = 6000,
     #[error("Last offset delta is missing")]

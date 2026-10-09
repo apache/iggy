@@ -83,6 +83,9 @@ pub fn sample(
                 name,
             })
         }
+        // Not targeted (absent from `OUTCOMES`): the per-topic cap needs 2^20
+        // surviving creates on one topic, far past any workload length.
+        Outcome::TooManyConsumerGroups => None,
     }
 }
 
@@ -108,10 +111,11 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
             topic: input.topic.clone(),
             name: input.name.clone(),
         },
-        // A committed rejection is a no-op: an absent parent stream or topic, or
-        // a duplicate group name, leaves the shadow unchanged.
-        Outcome::StreamNotFound | Outcome::TopicNotFound | Outcome::NameAlreadyExists => {
-            Effect::None
-        }
+        // A committed rejection is a no-op: an absent parent stream or topic, a
+        // duplicate group name or a full topic leaves the shadow unchanged.
+        Outcome::StreamNotFound
+        | Outcome::TopicNotFound
+        | Outcome::NameAlreadyExists
+        | Outcome::TooManyConsumerGroups => Effect::None,
     }
 }
