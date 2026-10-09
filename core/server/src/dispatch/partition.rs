@@ -45,9 +45,10 @@ use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::responses::messages::poll_messages::PollMessagesResponseHeader;
 use iggy_binary_protocol::{
     KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, RoutedRequestHeader,
-    WireDecode, WireIdentifier,
+    WireDecode, WireEncode, WireIdentifier,
 };
 use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use journal::superblock::SuperblockStore;
@@ -869,22 +870,17 @@ where
     true
 }
 
-/// The 16-byte `PolledMessages` body with zero messages
-/// (`[partition_id:4][current_offset:8][count:4]`). The SDK decoder
-/// requires at least this header, so failure paths must never reply a
-/// zero-byte body.
+/// A `PolledMessages` body with zero messages and a zero context: only the
+/// 40-byte [`PollMessagesResponseHeader`]. The SDK decoder requires at least
+/// this header, so failure paths must never reply a zero-byte body.
 fn empty_polled_messages_body(partition_id: u32) -> Bytes {
-    let mut body = Vec::with_capacity(
-        16 + iggy_binary_protocol::primitives::partition_history::PartitionContext::ENCODED_SIZE,
-    );
-    body.extend_from_slice(&partition_id.to_le_bytes());
-    body.extend_from_slice(&0u64.to_le_bytes());
-    body.extend_from_slice(&0u32.to_le_bytes());
-    body.extend_from_slice(
-        &iggy_binary_protocol::primitives::partition_history::PartitionContext::default()
-            .to_le_bytes(),
-    );
-    Bytes::from(body)
+    PollMessagesResponseHeader {
+        partition_id,
+        current_offset: 0,
+        messages_count: 0,
+        context: iggy_binary_protocol::primitives::partition_history::PartitionContext::default(),
+    }
+    .to_bytes()
 }
 
 type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);

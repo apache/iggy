@@ -29,7 +29,9 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
-use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
+use iggy_binary_protocol::responses::messages::poll_messages::{
+    POLL_RESPONSE_HEADER_SIZE, PollMessagesResponseHeader,
+};
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
@@ -368,14 +370,18 @@ pub fn build_polled_messages_reply(
         .map_err(|_| IggyError::InvalidCommand)?;
     let mut header = reply_header(request_header, client_id, session, commit, size);
     header.partition_incarnation = context.incarnation;
-    header.owner_generation = context.owner_generation;
     let mut head = Owned::<MESSAGE_ALIGN>::zeroed(header_len + POLL_RESPONSE_HEADER_SIZE);
     let (header_bytes, body_head) = head.as_mut_slice().split_at_mut(header_len);
     header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
-    body_head[..4].copy_from_slice(&partition_id.to_le_bytes());
-    body_head[4..12].copy_from_slice(&current_offset.to_le_bytes());
-    body_head[12..16].copy_from_slice(&count.to_le_bytes());
-    body_head[16..].copy_from_slice(&context.to_le_bytes());
+    body_head.copy_from_slice(
+        &PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        }
+        .to_le_bytes(),
+    );
     frames.insert(0, head.into());
 
     // Re-checks the header and that the fragments cover `size`.
@@ -488,7 +494,8 @@ impl<'a> FragmentCursor<'a> {
 /// ships the fragments without gathering them; this builder serves the
 /// decrypt path and the HTTP handler, which decodes the body into JSON.
 ///
-/// Body layout: `[partition_id:4][current_offset:8][count:4][batch records...]`.
+/// Body layout: the 40-byte [`PollMessagesResponseHeader`], then the batch
+/// records.
 pub fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
@@ -496,10 +503,6 @@ pub fn build_polled_messages_body(
     fragments: PollFragments,
     encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
-    // Body head: [partition_id:4][current_offset:8][count:4][context:24]. `count` sits at
-    // COUNT_OFFSET and is backpatched once the walk below knows it.
-    const HEAD_LEN: usize = POLL_RESPONSE_HEADER_SIZE;
-    const COUNT_OFFSET: usize = 12;
     // Batches may arrive split across fragments (rewritten batch header +
     // sliced blob); concatenate into one stream before walking records.
     let mut stream: Vec<u8> = Vec::new();
@@ -508,11 +511,9 @@ pub fn build_polled_messages_body(
         stream.extend_from_slice(frozen.as_slice());
     }
 
-    let mut body: Vec<u8> = Vec::with_capacity(HEAD_LEN + stream.len());
-    body.extend_from_slice(&partition_id.to_le_bytes());
-    body.extend_from_slice(&current_offset.to_le_bytes());
-    body.extend_from_slice(&[0u8; 4]); // count placeholder, backpatched below
-    body.extend_from_slice(&context.to_le_bytes());
+    // The head is written after the walk, which is what counts the messages.
+    let mut body: Vec<u8> = Vec::with_capacity(POLL_RESPONSE_HEADER_SIZE + stream.len());
+    body.resize(POLL_RESPONSE_HEADER_SIZE, 0);
     let mut count: u32 = 0;
     let mut position = 0usize;
     while position < stream.len() {
@@ -537,7 +538,15 @@ pub fn build_polled_messages_body(
         position = batch_end;
     }
 
-    body[COUNT_OFFSET..COUNT_OFFSET + size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
+    body[..POLL_RESPONSE_HEADER_SIZE].copy_from_slice(
+        &PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        }
+        .to_le_bytes(),
+    );
     Ok(Bytes::from(body))
 }
 

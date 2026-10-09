@@ -44,16 +44,27 @@ pub struct PollMessagesResponseHeader {
     pub context: PartitionContext,
 }
 
+impl PollMessagesResponseHeader {
+    /// The header bytes, for reply frames that place them without allocating.
+    #[must_use]
+    pub fn to_le_bytes(&self) -> [u8; POLL_RESPONSE_HEADER_SIZE] {
+        let mut bytes = [0; POLL_RESPONSE_HEADER_SIZE];
+        let mut head = &mut bytes[..];
+        head.put_u32_le(self.partition_id);
+        head.put_u64_le(self.current_offset);
+        head.put_u32_le(self.messages_count);
+        head.put_slice(&self.context.to_le_bytes());
+        bytes
+    }
+}
+
 impl WireEncode for PollMessagesResponseHeader {
     fn encoded_size(&self) -> usize {
         POLL_RESPONSE_HEADER_SIZE
     }
 
     fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u32_le(self.partition_id);
-        buf.put_u64_le(self.current_offset);
-        buf.put_u32_le(self.messages_count);
-        self.context.encode(buf);
+        buf.extend_from_slice(&self.to_le_bytes());
     }
 }
 

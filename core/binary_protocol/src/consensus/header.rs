@@ -641,8 +641,7 @@ pub struct ReplyHeader {
     pub status: u32,
     pub reserved: [u8; 4],
     pub partition_incarnation: u64,
-    pub owner_generation: u64,
-    pub reserved_tail: [u8; 16],
+    pub reserved_tail: [u8; 24],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -655,8 +654,8 @@ const _: () = {
             == offset_of!(ReplyHeader, partition_incarnation)
     );
     assert!(offset_of!(ReplyHeader, partition_incarnation) == 224);
-    assert!(offset_of!(ReplyHeader, owner_generation) == 232);
-    assert!(offset_of!(ReplyHeader, reserved_tail) + size_of::<[u8; 16]>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved_tail) == 232);
+    assert!(offset_of!(ReplyHeader, reserved_tail) + size_of::<[u8; 24]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -683,8 +682,7 @@ impl Default for ReplyHeader {
             status: 0,
             reserved: [0; 4],
             partition_incarnation: 0,
-            owner_generation: 0,
-            reserved_tail: [0; 16],
+            reserved_tail: [0; 24],
         }
     }
 }
@@ -722,7 +720,7 @@ impl ReplyHeader {
     /// The base of a reply that answers `request_header` without a prepare
     /// (rejections, denials, non-replicated reads): `cluster`, `view`,
     /// `release`, `replica`, `request_checksum`, `timestamp`, `request`,
-    /// `operation`, `partition_incarnation` and `owner_generation` echo the
+    /// `operation` and `partition_incarnation` echo the
     /// request, `command` is `Reply`, `size` is the
     /// caller's frame length, and every other field is zero.
     ///
@@ -745,7 +743,6 @@ impl ReplyHeader {
             request: request_header.request,
             operation: request_header.operation,
             partition_incarnation: request_header.partition_incarnation,
-            owner_generation: request_header.owner_generation,
             ..Self::default()
         }
     }
@@ -3318,7 +3315,7 @@ mod tests {
         assert_eq!(reply.operation_padding, [0; 7]);
         assert_eq!(reply.status, 0);
         assert_eq!(reply.reserved, [0; 4]);
-        assert_eq!(reply.reserved_tail, [0; 16]);
+        assert_eq!(reply.reserved_tail, [0; 24]);
         assert_eq!(reply.partition_incarnation, 19);
     }
 
@@ -3372,9 +3369,8 @@ mod tests {
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
         assert_eq!(reply.reserved, [0; 4]);
-        assert_eq!(reply.reserved_tail, [0; 16]);
+        assert_eq!(reply.reserved_tail, [0; 24]);
         assert_eq!(reply.partition_incarnation, 19);
-        assert_eq!(reply.owner_generation, 29);
     }
 
     // Wire-discriminant pin: any change breaks SDK decoders.

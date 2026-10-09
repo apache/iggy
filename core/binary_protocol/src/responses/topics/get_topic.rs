@@ -41,6 +41,8 @@ pub struct PartitionResponse {
 impl PartitionResponse {
     const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 8 + 8 + PartitionContext::ENCODED_SIZE;
 }
+// Wire pin: SDK decoders read fixed 64-byte partition records.
+const _: () = assert!(PartitionResponse::FIXED_SIZE == 64);
 
 impl WireEncode for PartitionResponse {
     fn encoded_size(&self) -> usize {
