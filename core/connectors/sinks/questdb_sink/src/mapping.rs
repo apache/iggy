@@ -1063,14 +1063,9 @@ mod tests {
 
     /// Whether any rounding warning fired.
     fn warned(mapping: &Mapping) -> bool {
-        let RoundingWarned {
-            scalar,
-            past_long,
-            array_element,
-        } = &mapping.rounding_warned;
-        [scalar, past_long, array_element]
-            .iter()
-            .any(|flag| flag.load(Ordering::Relaxed))
+        [Rounding::Scalar, Rounding::PastLong, Rounding::ArrayElement]
+            .into_iter()
+            .any(|source| mapping.rounding_warned.flag(source).load(Ordering::Relaxed))
     }
 
     fn context() -> RowContext<'static> {
