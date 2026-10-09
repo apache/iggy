@@ -17,6 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
@@ -57,7 +58,6 @@ impl ConsumerOffsetClient for HttpClient {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
-        refuse_external_group(consumer)?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
@@ -78,7 +78,6 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        refuse_external_group(consumer)?;
         let response = self
             .get_with_query(
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -110,15 +109,10 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        refuse_external_group(consumer)?;
-        let partition_id = partition_id
-            .map(|id| format!("?partition_id={id}"))
-            .unwrap_or_default();
-
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            utf8_percent_encode(&consumer.id.as_cow_str(), PATH_SEGMENT)
+            encode_segment(&consumer.id.as_cow_str())
         );
         self.delete_with_query(
             &path,
@@ -133,16 +127,9 @@ impl ConsumerOffsetClient for HttpClient {
 }
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/consumer-offsets")
-}
-
-/// The REST API cannot name a consumer kind, so an external group would land on a plain
-/// consumer's offset.
-pub(crate) fn refuse_external_group(consumer: &Consumer) -> Result<(), IggyError> {
-    if consumer.kind == ConsumerKind::ExternalGroup {
-        return Err(IggyError::FeatureUnavailable);
-    }
-    Ok(())
+    let encoded_stream = encode_segment(stream_id);
+    let encoded_topic = encode_segment(topic_id);
+    format!("streams/{encoded_stream}/topics/{encoded_topic}/consumer-offsets")
 }
 
 #[cfg(test)]
@@ -155,7 +142,7 @@ mod tests {
     const UNREACHABLE_API: &str = "http://127.0.0.1:1";
 
     #[tokio::test]
-    async fn given_external_group_when_calling_over_http_should_refuse_before_sending() {
+    async fn given_external_group_when_polling_over_http_should_refuse_before_sending() {
         let client = HttpClient::new(UNREACHABLE_API).unwrap();
         let group = Consumer::external_group(Identifier::numeric(1).unwrap());
         let stream = Identifier::numeric(1).unwrap();
@@ -211,9 +198,19 @@ mod tests {
     }
 
     #[test]
-    fn given_plain_consumer_when_guarded_should_pass() {
-        let consumer = Consumer::new(Identifier::numeric(1).unwrap());
+    fn given_plain_ids_when_building_path_should_join_segments() {
+        let path = get_path("1", "orders");
 
-        assert!(refuse_external_group(&consumer).is_ok());
+        assert_eq!(path, "streams/1/topics/orders/consumer-offsets");
+    }
+
+    #[test]
+    fn given_reserved_characters_when_building_path_should_percent_encode() {
+        let path = get_path("my stream", "my/topic");
+
+        assert_eq!(
+            path,
+            "streams/my%20stream/topics/my%2Ftopic/consumer-offsets"
+        );
     }
 }
