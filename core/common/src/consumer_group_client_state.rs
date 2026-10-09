@@ -43,6 +43,9 @@ struct TopicPartitions {
     count: Option<u32>,
     contexts: HashMap<u32, PartitionContext>,
     cursor: usize,
+    /// HTTP only: the client may send to the topic but not read its details, the only HTTP
+    /// source of send contexts, so its sends there carry none.
+    send_contexts_refused: bool,
 }
 
 /// Per-transport cache of group assignments, producer cursors, partition counts
@@ -181,6 +184,7 @@ impl ConsumerGroupClientState {
             .iter()
             .map(|partition| (partition.id, partition.context))
             .collect();
+        topic.send_contexts_refused = false;
     }
 
     #[must_use]
@@ -218,6 +222,29 @@ impl ConsumerGroupClientState {
             .insert(partition_id, context);
     }
 
+    /// Remember that the topic details were refused to this client, so its sends to the topic go
+    /// without a context instead of asking for the details again.
+    pub fn refuse_send_contexts(&self, stream_id: &Identifier, topic_id: &Identifier) {
+        self.topic_partitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(stream_id.clone())
+            .or_default()
+            .entry(topic_id.clone())
+            .or_default()
+            .send_contexts_refused = true;
+    }
+
+    #[must_use]
+    pub fn send_contexts_refused(&self, stream_id: &Identifier, topic_id: &Identifier) -> bool {
+        self.topic_partitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(stream_id)
+            .and_then(|topics| topics.get(topic_id))
+            .is_some_and(|topic| topic.send_contexts_refused)
+    }
+
     pub fn invalidate_topic(&self, stream_id: &Identifier, topic_id: &Identifier) {
         if let Some(topic) = self
             .topic_partitions
@@ -228,6 +255,7 @@ impl ConsumerGroupClientState {
         {
             topic.count = None;
             topic.contexts.clear();
+            topic.send_contexts_refused = false;
         }
     }
 
@@ -241,6 +269,7 @@ impl ConsumerGroupClientState {
         for topic in map.values_mut().flat_map(HashMap::values_mut) {
             topic.count = None;
             topic.contexts.clear();
+            topic.send_contexts_refused = false;
         }
     }
 
@@ -393,6 +422,27 @@ mod tests {
         state.invalidate_topic(&stream, &topic);
         assert_eq!(state.partition_context(&stream, &topic, 2), None);
         assert_eq!(state.partition_count(&stream, &topic), None);
+    }
+
+    #[test]
+    fn refused_send_contexts_are_forgotten_with_the_topic_state() {
+        let stream = Identifier::named("s").unwrap();
+        let topic = Identifier::named("t").unwrap();
+        let state = ConsumerGroupClientState::new();
+        assert!(!state.send_contexts_refused(&stream, &topic));
+
+        state.refuse_send_contexts(&stream, &topic);
+        assert!(state.send_contexts_refused(&stream, &topic));
+        state.invalidate_topic(&stream, &topic);
+        assert!(!state.send_contexts_refused(&stream, &topic));
+
+        state.refuse_send_contexts(&stream, &topic);
+        state.invalidate_topic_discovery();
+        assert!(!state.send_contexts_refused(&stream, &topic));
+
+        state.refuse_send_contexts(&stream, &topic);
+        state.set_topic_partitions(&stream, &topic, &partitions(1));
+        assert!(!state.send_contexts_refused(&stream, &topic));
     }
 
     #[test]

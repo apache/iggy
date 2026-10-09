@@ -474,6 +474,7 @@ pub(in crate::http) async fn produce_unacked(
     state: &Rc<HttpInner>,
     session: &Rc<HttpSession>,
     body: Bytes,
+    context: Option<PartitionContext>,
 ) -> Result<(), PartitionWriteError> {
     let state = Rc::clone(state);
     let session = Rc::clone(session);
@@ -485,7 +486,7 @@ pub(in crate::http) async fn produce_unacked(
             &session,
             Operation::SendMessages,
             &body,
-            None,
+            context,
             &mut sent,
         )
         .await;

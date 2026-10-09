@@ -172,6 +172,7 @@ impl HttpSessionExt for HttpClient {
             topic_id: Identifier::default(),
             partitioning: Partitioning::partition_id(partition_id),
             batch: IggyMessagesBatch::from(&messages),
+            context: None,
         };
         self.client
             .post(self.url(&format!("/streams/{stream}/topics/{topic}/messages{query}")))

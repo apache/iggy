@@ -425,6 +425,7 @@ async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_fo
         topic_id: Identifier::default(),
         partitioning: Partitioning::partition_id(PARTITION_ID),
         batch: IggyMessagesBatch::from(&messages),
+        context: None,
     };
     let response = http
         .client
