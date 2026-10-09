@@ -95,7 +95,7 @@ jobs:
     env:
       CLAUDE_CODE_VERSION: 2.1.284
       DEEPSEEK_MODEL: deepseek-flash[1m]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Parse the command
