@@ -32,13 +32,15 @@ use consensus::{
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, PurgeTopicRequest};
 use iggy_binary_protocol::{
-    AckLevel, ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StateTransferTargetHeader, WireConsumer,
+    AckLevel, CommitHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
+    StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier,
 };
-use iggy_common::{IggyError, IggyTimestamp, PollingStrategy};
+use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy};
+use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
 use metadata::IggyMetadata;
@@ -47,9 +49,13 @@ use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
 use metadata::stm::user::Users;
-use partitions::{IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer};
+use partitions::state_transfer::PartitionTransferSession;
+use partitions::{
+    IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer, RepairSession,
+};
+use server_common::MESSAGE_ALIGN;
 use server_common::Message;
-use server_common::iobuf::Owned;
+use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
@@ -58,8 +64,8 @@ use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
     ConsumerAttachment, IggyShard, LifecycleFrame, NoopHost, PartitionConsensusConfig,
-    PartitionRead, PartitionReadReply, Receiver, ReplicaTopology, ShardFrame, ShardIdentity,
-    TaggedSender, channel, shard_channel,
+    PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver, ReplicaTopology, ShardFrame,
+    ShardIdentity, TaggedSender, channel, shard_channel,
 };
 
 #[compio::test]
@@ -1215,6 +1221,798 @@ async fn given_accepted_descriptor_when_install_fails_should_exhaust_its_generat
     );
 }
 
+const LAGGING_NONCE: u128 = 0x5eed;
+const LAGGING_LOG_VIEW: u32 = 11;
+const LAGGING_VIEW: u32 = 58;
+const LAGGING_COMMIT_MAX: u64 = 53_052;
+const GROUP_VIEW: u32 = 20;
+const GROUP_COMMIT: u64 = 55_013;
+const GROUP_PRIMARY: u8 = 2;
+
+/// What a partition transfer descriptor answers.
+#[derive(Clone, Copy)]
+enum DescriptorReply {
+    Offer,
+    TransientRefusal,
+    HardRefusal,
+}
+
+/// Replica 0 of three, awaiting a transfer descriptor from `GROUP_PRIMARY`. Its
+/// log was last adopted in `LAGGING_LOG_VIEW` while elections nobody heard
+/// raised its own view to `LAGGING_VIEW`, so `primary_index(view())` names a
+/// different replica than the group's real primary.
+fn lagging_replica_awaiting_target(namespace: IggyNamespace) -> CompletionTestShard {
+    let owner = lagging_replica_in_cluster(namespace, 3);
+    {
+        let partitions = owner.plane.partitions();
+        let consensus = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus();
+        assert_ne!(consensus.primary_index(LAGGING_VIEW), GROUP_PRIMARY);
+        assert_eq!(consensus.primary_index(GROUP_VIEW), GROUP_PRIMARY);
+    }
+    owner
+}
+
+/// Replica 0 of `replica_count` in the lagging state above, with a transfer
+/// session awaiting a descriptor from `GROUP_PRIMARY`.
+fn lagging_replica_in_cluster(namespace: IggyNamespace, replica_count: u8) -> CompletionTestShard {
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let config = partitions_config();
+    let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
+    let (owner, _sender) =
+        owner_in_cluster(&bus, config.clone(), namespace, metadata, replica_count);
+    let mut consensus = VsrConsensus::new(
+        1,
+        0,
+        replica_count,
+        namespace.inner(),
+        bus,
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    consensus.set_view(LAGGING_VIEW);
+    consensus.set_log_view(LAGGING_LOG_VIEW);
+    consensus.advance_commit_max(LAGGING_COMMIT_MAX);
+    consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        config.segment_size,
+    );
+    arm_lagging_transfer(&mut partition, GROUP_PRIMARY);
+    owner.plane.partitions().insert(namespace, partition);
+    owner
+}
+
+fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8)
+where
+    B: message_bus::MessageBus,
+{
+    partition.transfer = Some(PartitionTransferSession {
+        nonce: LAGGING_NONCE,
+        peer,
+        commit_op: 0,
+        artifacts: Vec::new(),
+        target_accepted: false,
+        idle_ticks: 0,
+    });
+}
+
+/// A descriptor from `GROUP_PRIMARY` at `GROUP_VIEW`: an offer at
+/// `GROUP_COMMIT` when `offer` is set, a transient refusal otherwise.
+fn group_primary_descriptor(
+    namespace: IggyNamespace,
+    offer: bool,
+) -> Message<StateTransferTargetHeader> {
+    let reply = if offer {
+        DescriptorReply::Offer
+    } else {
+        DescriptorReply::TransientRefusal
+    };
+    lagging_descriptor(namespace, GROUP_PRIMARY, GROUP_VIEW, reply)
+}
+
+/// A descriptor answering the lagging replica's transfer session, sent by
+/// `replica` at `view`.
+fn lagging_descriptor(
+    namespace: IggyNamespace,
+    replica: u8,
+    view: u32,
+    reply: DescriptorReply,
+) -> Message<StateTransferTargetHeader> {
+    let manifest = if matches!(reply, DescriptorReply::Offer) {
+        encode_state_manifest(&[StateArtifact::for_bytes(
+            artifact_kind::SEGMENT_LOG,
+            GROUP_COMMIT,
+            b"segment",
+        )])
+    } else {
+        Vec::new()
+    };
+    let size = size_of::<StateTransferTargetHeader>() + manifest.len();
+    let mut message = Message::<StateTransferTargetHeader>::new(size);
+    message.as_mut_slice()[size_of::<StateTransferTargetHeader>()..].copy_from_slice(&manifest);
+    message.transmute_header(|_, header: &mut StateTransferTargetHeader| {
+        header.command = Command::StateTransferTarget;
+        header.cluster = 1;
+        header.replica = replica;
+        header.view = view;
+        header.group = namespace.inner();
+        header.nonce = LAGGING_NONCE;
+        header.size = u32::try_from(size).unwrap();
+        header.commit_max = GROUP_COMMIT;
+        match reply {
+            DescriptorReply::Offer => {
+                header.available = 1;
+                header.commit_op = GROUP_COMMIT;
+            }
+            DescriptorReply::TransientRefusal => header.unavailable_transient = 1,
+            DescriptorReply::HardRefusal => {}
+        }
+        header.seal();
+    })
+}
+
+/// A partition `Commit` heartbeat from `replica` as the primary of `view`.
+fn primary_commit(
+    namespace: IggyNamespace,
+    replica: u8,
+    view: u32,
+    commit: u64,
+) -> Message<CommitHeader> {
+    Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+        |_, header: &mut CommitHeader| {
+            header.command = Command::Commit;
+            header.cluster = 1;
+            header.replica = replica;
+            header.view = view;
+            header.commit = commit;
+            header.group = namespace.inner();
+            header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
+            header.seal();
+        },
+    )
+}
+
+/// Restart the lagging replica's transfer against `peer` after a re-arm.
+fn rearm_lagging_transfer_to(owner: &CompletionTestShard, namespace: IggyNamespace, peer: u8) {
+    let partitions = owner.plane.partitions();
+    let partition = partitions
+        .get_mut_by_ns(&namespace)
+        .expect("the partition stays registered");
+    partition.transfer_rearm = None;
+    arm_lagging_transfer(partition, peer);
+}
+
+/// The peer the lagging replica's next transfer attempt is scheduled against.
+fn scheduled_rearm_peer(owner: &CompletionTestShard, namespace: IggyNamespace) -> u8 {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered")
+        .transfer_rearm
+        .expect("a refusal schedules a re-arm")
+        .peer
+}
+
+/// A replica that needs partition state transfer cannot finish a view change,
+/// and with `persisted` durability it cannot vote in one either, so its own
+/// `view` climbs past the group's. Refusing the group primary's offer as "from
+/// a replica behind this one" keeps it behind for good.
+#[compio::test]
+async fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_should_accept_it() {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_awaiting_target(namespace);
+
+    owner
+        .on_partition_state_transfer_target(&group_primary_descriptor(namespace, true))
+        .await;
+
+    let partitions = owner.plane.partitions();
+    let session = partitions
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered")
+        .transfer
+        .as_ref();
+    assert!(
+        session.is_some_and(|session| session.target_accepted),
+        "the group primary's offer holds more committed state than this replica \
+         knows, so it must be accepted"
+    );
+}
+
+/// Only the primary serves a partition transfer, so a transient refusal from
+/// it must be retried against it, not against the replica this node's
+/// inflated view would name. Its heartbeats carry a view below this replica's,
+/// which the partition view filter drops, yet they still name the primary.
+#[compio::test]
+async fn given_a_transient_refusal_from_the_primary_when_this_replica_ratcheted_its_view_alone_should_retry_the_primary()
+ {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_awaiting_target(namespace);
+    owner
+        .on_commit(&primary_commit(
+            namespace,
+            GROUP_PRIMARY,
+            GROUP_VIEW,
+            GROUP_COMMIT,
+        ))
+        .await;
+
+    owner
+        .on_partition_state_transfer_target(&group_primary_descriptor(namespace, false))
+        .await;
+
+    assert_eq!(
+        scheduled_rearm_peer(&owner, namespace),
+        GROUP_PRIMARY,
+        "the next request must go to the primary this replica heard from"
+    );
+}
+
+/// A refusal names no primary: without a heartbeat from the refusing peer,
+/// staying on it may spend every round on a backup.
+#[compio::test]
+async fn given_a_transient_refusal_from_an_unheard_peer_when_lagging_should_rotate_away() {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_awaiting_target(namespace);
+
+    owner
+        .on_partition_state_transfer_target(&group_primary_descriptor(namespace, false))
+        .await;
+
+    assert_ne!(scheduled_rearm_peer(&owner, namespace), GROUP_PRIMARY);
+}
+
+/// A backup can only refuse, so staying on it spends every round on nothing.
+#[compio::test]
+async fn given_a_transient_refusal_from_a_backup_of_the_group_view_when_lagging_should_rotate_away()
+{
+    const BACKUP: u8 = 1;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_awaiting_target(namespace);
+    assert_ne!(BACKUP, GROUP_PRIMARY);
+
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            BACKUP,
+            GROUP_VIEW,
+            DescriptorReply::TransientRefusal,
+        ))
+        .await;
+
+    assert_ne!(scheduled_rearm_peer(&owner, namespace), BACKUP);
+}
+
+/// The sender was primary of a view older than the one this replica's log was
+/// adopted in, so the group has provably moved past it.
+#[compio::test]
+async fn given_a_transient_refusal_from_the_primary_of_a_view_below_log_view_when_lagging_should_rotate_away()
+ {
+    const STALE_VIEW: u32 = 8;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_awaiting_target(namespace);
+    let stale_primary = {
+        let partitions = owner.plane.partitions();
+        let consensus = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus();
+        assert!(STALE_VIEW < consensus.log_view());
+        consensus.primary_index(STALE_VIEW)
+    };
+
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            stale_primary,
+            STALE_VIEW,
+            DescriptorReply::TransientRefusal,
+        ))
+        .await;
+
+    assert_ne!(scheduled_rearm_peer(&owner, namespace), stale_primary);
+}
+
+/// Five replicas, so the primary this replica's inflated view names (3), the
+/// group's primary (1) and the failed backup (2) are all distinct. A rotation
+/// steered by the inflated view asks replica 3, which can only refuse.
+#[compio::test]
+async fn given_a_hard_refusal_from_a_backup_when_this_replica_ratcheted_its_view_alone_should_rotate_to_the_group_primary()
+ {
+    const GROUP_VIEW_OF_FIVE: u32 = 21;
+    const FAILED_BACKUP: u8 = 2;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_in_cluster(namespace, 5);
+    let group_primary = {
+        let partitions = owner.plane.partitions();
+        let consensus = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus();
+        let group_primary = consensus.primary_index(GROUP_VIEW_OF_FIVE);
+        let inflated_primary = consensus.primary_index(LAGGING_VIEW);
+        assert_eq!(
+            HashSet::from([0, group_primary, inflated_primary, FAILED_BACKUP]).len(),
+            4
+        );
+        group_primary
+    };
+    owner
+        .on_commit(&primary_commit(
+            namespace,
+            group_primary,
+            GROUP_VIEW_OF_FIVE,
+            GROUP_COMMIT,
+        ))
+        .await;
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            group_primary,
+            GROUP_VIEW_OF_FIVE,
+            DescriptorReply::TransientRefusal,
+        ))
+        .await;
+    assert_eq!(scheduled_rearm_peer(&owner, namespace), group_primary);
+    {
+        let partitions = owner.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&namespace)
+            .expect("the partition stays registered");
+        partition.transfer_rearm = None;
+        arm_lagging_transfer(partition, FAILED_BACKUP);
+    }
+
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            FAILED_BACKUP,
+            GROUP_VIEW_OF_FIVE,
+            DescriptorReply::HardRefusal,
+        ))
+        .await;
+
+    assert_eq!(
+        scheduled_rearm_peer(&owner, namespace),
+        group_primary,
+        "the rotation must follow the primary the group was last heard from"
+    );
+}
+
+/// A second lagging replica whose view climbed alone to a view it is primary
+/// of refuses transiently, stamping that view. Taken as the primary, it would
+/// pin every later re-arm to itself.
+#[compio::test]
+async fn given_a_lagging_peer_refusing_at_its_inflated_view_when_the_group_primary_was_heard_should_rearm_to_the_group_primary()
+ {
+    const GROUP_VIEW_OF_FIVE: u32 = 21;
+    const INFLATED_PEER: u8 = 4;
+    const INFLATED_VIEW: u32 = 59;
+    const FAILED_BACKUP: u8 = 2;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_in_cluster(namespace, 5);
+    let group_primary = {
+        let partitions = owner.plane.partitions();
+        let consensus = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus();
+        assert_eq!(consensus.primary_index(INFLATED_VIEW), INFLATED_PEER);
+        consensus.primary_index(GROUP_VIEW_OF_FIVE)
+    };
+    owner
+        .on_commit(&primary_commit(
+            namespace,
+            group_primary,
+            GROUP_VIEW_OF_FIVE,
+            GROUP_COMMIT,
+        ))
+        .await;
+    rearm_lagging_transfer_to(&owner, namespace, INFLATED_PEER);
+
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            INFLATED_PEER,
+            INFLATED_VIEW,
+            DescriptorReply::TransientRefusal,
+        ))
+        .await;
+    assert_eq!(scheduled_rearm_peer(&owner, namespace), group_primary);
+
+    rearm_lagging_transfer_to(&owner, namespace, group_primary);
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            group_primary,
+            GROUP_VIEW_OF_FIVE,
+            DescriptorReply::TransientRefusal,
+        ))
+        .await;
+    assert_eq!(scheduled_rearm_peer(&owner, namespace), group_primary);
+
+    rearm_lagging_transfer_to(&owner, namespace, FAILED_BACKUP);
+    owner
+        .on_partition_state_transfer_target(&lagging_descriptor(
+            namespace,
+            FAILED_BACKUP,
+            GROUP_VIEW_OF_FIVE,
+            DescriptorReply::HardRefusal,
+        ))
+        .await;
+    assert_eq!(scheduled_rearm_peer(&owner, namespace), group_primary);
+    assert_eq!(
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the partition stays registered")
+            .consensus()
+            .primary_hint(),
+        Some(group_primary)
+    );
+}
+
+/// The primary this replica heard from goes silent. Kept as the hint, it
+/// would draw every rotation back to itself, so the ring walk would only ever
+/// reach the next replica and never the new primary beyond it.
+#[compio::test]
+async fn given_the_heard_primary_failing_when_rotating_should_walk_the_ring_to_the_new_primary() {
+    const DEAD_PRIMARY_VIEW: u32 = 21;
+    const NEW_PRIMARY_VIEW: u32 = 23;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let owner = lagging_replica_in_cluster(namespace, 5);
+    let (dead_primary, new_primary) = {
+        let partitions = owner.plane.partitions();
+        let consensus = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus();
+        (
+            consensus.primary_index(DEAD_PRIMARY_VIEW),
+            consensus.primary_index(NEW_PRIMARY_VIEW),
+        )
+    };
+    assert_eq!((dead_primary, new_primary), (1, 3));
+    owner
+        .on_commit(&primary_commit(
+            namespace,
+            dead_primary,
+            DEAD_PRIMARY_VIEW,
+            GROUP_COMMIT,
+        ))
+        .await;
+
+    let mut tried = Vec::new();
+    let mut peer = dead_primary;
+    for _ in 0..2 {
+        rearm_lagging_transfer_to(&owner, namespace, peer);
+        {
+            let partitions = owner.plane.partitions();
+            let partition = partitions
+                .get_mut_by_ns(&namespace)
+                .expect("the partition stays registered");
+            owner
+                .abandon_or_rearm_partition_transfer(partition, peer)
+                .await;
+        }
+        peer = scheduled_rearm_peer(&owner, namespace);
+        tried.push(peer);
+    }
+
+    assert_eq!(tried, vec![2, new_primary]);
+}
+
+/// Frames the bus forwarded, by destination replica.
+type SentFrames = Rc<RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>>;
+
+/// A backup at view 1 of five, behind its own `commit_max`.
+fn gap_stopped_backup(
+    namespace: IggyNamespace,
+    commit_max: u64,
+) -> (CompletionTestShard, SentFrames) {
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let captured = Rc::clone(&sent);
+    bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+        captured.borrow_mut().push((peer, frame));
+        Ok(())
+    }));
+    for peer in 1..5 {
+        assert!(bus.owner_table().try_claim(peer, 1));
+    }
+    let config = partitions_config();
+    let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
+    let (owner, _sender) = owner_in_cluster(&bus, config.clone(), namespace, metadata, 5);
+    let mut consensus = VsrConsensus::new(1, 0, 5, namespace.inner(), bus, LocalPipeline::new());
+    consensus.init();
+    consensus.set_view(1);
+    consensus.set_log_view(1);
+    consensus.advance_commit_max(commit_max);
+    let partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        config.segment_size,
+    );
+    owner.plane.partitions().insert(namespace, partition);
+    owner.set_repair_gap_debounce_ticks(1);
+    owner.set_repair_retry_ticks(1);
+    (owner, sent)
+}
+
+/// Tick until the partition's repair session targets a peer other than
+/// `previous`, and return it.
+#[allow(clippy::future_not_send)]
+async fn tick_until_repair_peer_changes(
+    owner: &CompletionTestShard,
+    namespace: IggyNamespace,
+    previous: Option<u8>,
+) -> u8 {
+    let mut scratch = Vec::new();
+    for _ in 0..64 {
+        assert!(owner.tick_partitions(&mut scratch).await.is_none());
+        scratch.clear();
+        let peer = owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the partition stays registered")
+            .repair
+            .map(|session| session.peer);
+        if let Some(peer) = peer
+            && Some(peer) != previous
+        {
+            return peer;
+        }
+    }
+    panic!("the repair session never moved off {previous:?}");
+}
+
+/// The gap-repair arm and the stall rotation both aim at the primary this
+/// replica last heard from, which is not the primary of its own view.
+#[compio::test]
+async fn given_a_primary_heard_at_a_newer_view_when_the_partition_gap_stops_should_repair_from_it()
+{
+    const HEARD_VIEW: u32 = 3;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, _sent) = gap_stopped_backup(namespace, 5);
+    let (own_view_primary, heard_primary) = {
+        let partitions = owner.plane.partitions();
+        let consensus = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus();
+        (
+            consensus.primary_index(consensus.view()),
+            consensus.primary_index(HEARD_VIEW),
+        )
+    };
+    assert_eq!((own_view_primary, heard_primary), (1, 3));
+    let heartbeat = primary_commit(namespace, heard_primary, HEARD_VIEW, 5);
+    owner.on_commit(&heartbeat).await;
+
+    let armed = tick_until_repair_peer_changes(&owner, namespace, None).await;
+    assert_eq!(armed, heard_primary, "the gap arm asks the heard primary");
+
+    let rotated = tick_until_repair_peer_changes(&owner, namespace, Some(armed)).await;
+    assert_eq!(
+        rotated, own_view_primary,
+        "a stalled heard primary is forgotten, leaving the primary of this view"
+    );
+
+    owner.on_commit(&heartbeat).await;
+    let back = tick_until_repair_peer_changes(&owner, namespace, Some(rotated)).await;
+    assert_eq!(
+        back, heard_primary,
+        "the stall rotation goes to the primary heard again"
+    );
+}
+
+/// A floor holds the walk and the served chunk above it carries no message, so
+/// nothing anchors the window. Pulling again from `commit_min + 1` would
+/// re-serve that same chunk forever.
+#[compio::test]
+async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_should_pull_the_next_chunk()
+ {
+    const PEER: u8 = 1;
+    const NONCE: u128 = 0xf100;
+    const FLOOR: u64 = 5;
+    const FIRST_CHUNK_LAST: u64 = FLOOR + REPAIR_CHUNK_MAX;
+    const TO_OP: u64 = FIRST_CHUNK_LAST + 10;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, sent) = gap_stopped_backup(namespace, TO_OP);
+    {
+        let partitions = owner.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&namespace)
+            .expect("the fixture registers the partition");
+        partition.repair = Some(RepairSession {
+            nonce: NONCE,
+            view: partition.consensus().view(),
+            commit_to_op: TO_OP,
+            fetch_to_op: TO_OP,
+            floor: Some(FLOOR),
+            peer: PEER,
+            idle_ticks: 0,
+            floor_pulled_from: 0,
+        });
+        for op in FLOOR + 1..=FIRST_CHUNK_LAST {
+            partition
+                .log
+                .journal()
+                .inner
+                .append(control_prepare(namespace, op).into_frozen())
+                .await
+                .expect("journal append");
+        }
+    }
+    let repair_done = |served_through: u64| {
+        Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
+            .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
+                header.command = Command::RepairDone;
+                header.size = u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
+                header.group = namespace.inner();
+                header.cluster = 1;
+                header.replica = PEER;
+                header.nonce = NONCE;
+                header.op = served_through;
+                header.seal();
+            })
+    };
+
+    owner
+        .on_repair_range_reply(&repair_done(FIRST_CHUNK_LAST))
+        .await;
+
+    assert_eq!(
+        drain_prepare_requests(&sent),
+        vec![(PEER, FIRST_CHUNK_LAST + 1, TO_OP)]
+    );
+
+    owner
+        .on_repair_range_reply(&repair_done(FIRST_CHUNK_LAST))
+        .await;
+    assert!(
+        sent.borrow().is_empty(),
+        "a reply that delivered nothing new leaves the rest to the stall retry"
+    );
+
+    let mut scratch = Vec::new();
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    assert_eq!(
+        drain_prepare_requests(&sent),
+        vec![(PEER, FIRST_CHUNK_LAST + 1, TO_OP)],
+        "the stall retry starts past the resident chunk too"
+    );
+}
+
+/// A floor holds the walk and every op up to `fetch_to_op` is resident, so the
+/// pull start lies past the window. Only a `RepairDone` completes the session.
+#[allow(clippy::future_not_send)]
+async fn resident_window_backup(
+    namespace: IggyNamespace,
+    peer: u8,
+    nonce: u128,
+    floor: u64,
+    to_op: u64,
+) -> (CompletionTestShard, SentFrames) {
+    let (owner, sent) = gap_stopped_backup(namespace, to_op);
+    {
+        let partitions = owner.plane.partitions();
+        let partition = partitions
+            .get_mut_by_ns(&namespace)
+            .expect("the fixture registers the partition");
+        partition.repair = Some(RepairSession {
+            nonce,
+            view: partition.consensus().view(),
+            commit_to_op: to_op,
+            fetch_to_op: to_op,
+            floor: Some(floor),
+            peer,
+            idle_ticks: 0,
+            floor_pulled_from: 0,
+        });
+        for op in floor + 1..=to_op {
+            partition
+                .log
+                .journal()
+                .inner
+                .append(control_prepare(namespace, op).into_frozen())
+                .await
+                .expect("journal append");
+        }
+    }
+    (owner, sent)
+}
+
+#[compio::test]
+async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_request_and_complete()
+{
+    const PEER: u8 = 1;
+    const NONCE: u128 = 0xf100;
+    const FLOOR: u64 = 5;
+    const TO_OP: u64 = FLOOR + 10;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, sent) = resident_window_backup(namespace, PEER, NONCE, FLOOR, TO_OP).await;
+
+    let mut scratch = Vec::new();
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    assert_eq!(
+        drain_prepare_requests(&sent),
+        vec![(PEER, TO_OP, TO_OP)],
+        "the stall retry asks again for the last op to draw a fresh RepairDone"
+    );
+
+    let repair_done = Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
+        .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
+            header.command = Command::RepairDone;
+            header.size = u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
+            header.group = namespace.inner();
+            header.cluster = 1;
+            header.replica = PEER;
+            header.nonce = NONCE;
+            header.op = TO_OP;
+            header.seal();
+        });
+    owner.on_repair_range_reply(&repair_done).await;
+
+    let partitions = owner.plane.partitions();
+    let partition = partitions
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered");
+    assert!(
+        partition.repair.is_none(),
+        "the re-served RepairDone completes the session"
+    );
+    assert_eq!(partition.consensus().commit_min(), TO_OP);
+}
+
+#[compio::test]
+async fn given_a_resident_window_when_the_serving_peer_is_dead_should_rotate_to_another_peer() {
+    const PEER: u8 = 1;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, _sent) = resident_window_backup(namespace, PEER, 0xf100, 5, 15).await;
+
+    let rotated = tick_until_repair_peer_changes(&owner, namespace, Some(PEER)).await;
+    assert_ne!(rotated, PEER);
+}
+
+/// The `RequestPrepares` frames the bus forwarded, as `(peer, from_op, to_op)`.
+fn drain_prepare_requests(sent: &SentFrames) -> Vec<(u8, u64, u64)> {
+    sent.borrow_mut()
+        .drain(..)
+        .filter_map(|(peer, frame)| {
+            let request = Message::<RequestPreparesHeader>::try_from(Owned::copy_from_slice(
+                frame.as_slice(),
+            ))
+            .ok()?;
+            (request.header().command == Command::RequestPrepares)
+                .then(|| (peer, request.header().from_op, request.header().to_op))
+        })
+        .collect()
+}
+
+/// A bare non-`SendMessages` prepare at `op`, as the commit walk skips it.
+fn control_prepare(namespace: IggyNamespace, op: u64) -> Message<PrepareHeader> {
+    let size = size_of::<PrepareHeader>();
+    Message::<PrepareHeader>::new(size).transmute_header(|_, header: &mut PrepareHeader| {
+        header.command = Command::Prepare;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
+        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+        header.session = 1;
+        header.request = op;
+        header.op = op;
+        header.operation = Operation::CreateStream;
+        header.group = namespace.inner();
+        header.size = u32::try_from(size).unwrap();
+    })
+}
+
 fn invalid_metadata_descriptor(
     nonce: u128,
     generation: u64,
@@ -1289,6 +2087,21 @@ fn owner_with_metadata_plane(
         PollTestMetadata,
     >,
 ) -> (CompletionTestShard, TaggedSender) {
+    owner_in_cluster(bus, config, namespace, metadata, 3)
+}
+
+fn owner_in_cluster(
+    bus: &Rc<IggyMessageBus>,
+    config: PartitionsConfig,
+    namespace: IggyNamespace,
+    metadata: IggyMetadata<
+        consensus::VsrConsensus<Rc<IggyMessageBus>>,
+        PrepareJournal,
+        IggySnapshot,
+        PollTestMetadata,
+    >,
+    replica_count: u8,
+) -> (CompletionTestShard, TaggedSender) {
     let shard_id = ShardId::new(0);
     let partitions = IggyPartitions::new(shard_id, config);
     let (sender, inbox, replies) = shard_channel(0, 2, 1);
@@ -1306,7 +2119,7 @@ fn owner_with_metadata_plane(
         2,
         None,
         routes,
-        PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
+        PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus.clone()),
         None,
         ShardMetrics::for_shard(),
     )

@@ -3083,8 +3083,8 @@ mod tests {
             fetch_to_op: 5,
             floor: None,
             peer: 1,
-            first_batch_offset: None,
             idle_ticks: 0,
+            floor_pulled_from: 0,
         });
 
         // Committed purge: generation 1 > applied 0.
@@ -3206,8 +3206,8 @@ mod tests {
                 fetch_to_op: 8,
                 floor: None,
                 peer: 1,
-                first_batch_offset: None,
                 idle_ticks: 0,
+                floor_pulled_from: 0,
             });
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();
@@ -3235,7 +3235,6 @@ mod tests {
             partition.recovered_durable_offset = Some(10);
             let repair = partition.repair.as_mut().expect("repair remains armed");
             repair.floor = Some(5);
-            repair.first_batch_offset = Some(20);
         }
 
         Box::pin(compio::time::timeout(

@@ -1264,6 +1264,13 @@ where
     /// strict `>`.
     observed_newer_view: Cell<u32>,
 
+    /// `(view, replica)` of the highest-view sender heard acting as that view's
+    /// primary: a partition `Commit` heartbeat, which only a `Normal` primary
+    /// sends, or a state-transfer offer, which only a primary serves. A replica
+    /// that cannot rejoin keeps electing alone, so its own `view` names a
+    /// primary nobody follows.
+    observed_primary: Cell<Option<(u32, u8)>>,
+
     /// Highest op number that has been locally executed (state machine applied,
     /// client table updated). Advances one-by-one in `commit_journal` (backup)
     /// and `on_ack` (primary). On a normal primary, `commit_min == commit_max`.
@@ -1677,6 +1684,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             status: Cell::new(Status::Recovering),
             state_transfer_stage: Cell::new(StateTransferStage::Idle),
             observed_newer_view: Cell::new(0),
+            observed_primary: Cell::new(None),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
             commit_max: Cell::new(0),
@@ -3397,6 +3405,53 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if view > self.observed_newer_view.get() {
             self.observed_newer_view.set(view);
         }
+    }
+
+    /// Record a frame from `replica` stamped with `view`, if `replica` is that
+    /// view's primary. Monotone in `view`.
+    pub fn observe_primary(&self, view: u32, replica: u8) {
+        if replica != self.primary_index(view) {
+            return;
+        }
+        if self
+            .observed_primary
+            .get()
+            .is_none_or(|(observed_view, _)| view > observed_view)
+        {
+            self.observed_primary.set(Some((view, replica)));
+        }
+    }
+
+    /// Drop the observed primary if it is `replica`, after a request to it
+    /// failed. A dead primary sends nothing newer, so a kept hint would steer
+    /// every later rotation back to it.
+    pub fn forget_primary(&self, replica: u8) {
+        if self
+            .observed_primary
+            .get()
+            .is_some_and(|(_, observed)| observed == replica)
+        {
+            self.observed_primary.set(None);
+        }
+    }
+
+    /// The replica most likely to be the group's primary, or `None` when this
+    /// replica cannot tell.
+    ///
+    /// `primary_index(view)` only while `view` is the view the log was adopted
+    /// in: past it, `view` may have climbed through elections nobody joined.
+    /// An observed primary counts only from `log_view` on, because below it the
+    /// group has provably moved on.
+    #[must_use]
+    pub fn primary_hint(&self) -> Option<u8> {
+        let log_view = self.log_view.get();
+        if let Some((view, replica)) = self.observed_primary.get()
+            && view >= log_view
+        {
+            return Some(replica);
+        }
+        let view = self.view.get();
+        (view == log_view).then(|| self.primary_index(view))
     }
 
     #[must_use]
@@ -6551,5 +6606,94 @@ mod probe_answer_tests {
             "announced commit {commit} exceeds head {op}, which StartViewHeader::validate \
              rejects and the dispatcher panics on"
         );
+    }
+}
+
+#[cfg(test)]
+mod primary_hint_tests {
+    //! Which replica a partition peer choice treats as the group's primary.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::test_bus::NoopBus;
+
+    /// Replica 0 of five whose log was adopted in `log_view` and whose own
+    /// view has since moved to `view`.
+    fn replica(view: u32, log_view: u32) -> VsrConsensus<NoopBus> {
+        let mut consensus = VsrConsensus::new(1, 0, 5, 7, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.set_view(view);
+        consensus.set_log_view(log_view);
+        consensus
+    }
+
+    #[test]
+    fn given_a_view_matching_log_view_when_nothing_was_observed_should_name_its_primary() {
+        assert_eq!(replica(12, 12).primary_hint(), Some(2));
+    }
+
+    #[test]
+    fn given_a_view_ratcheted_past_log_view_when_nothing_was_observed_should_have_no_hint() {
+        assert_eq!(replica(58, 11).primary_hint(), None);
+    }
+
+    #[test]
+    fn given_a_view_ratcheted_past_log_view_when_the_group_primary_was_heard_should_name_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        assert_eq!(consensus.primary_hint(), Some(1));
+    }
+
+    #[test]
+    fn given_a_view_ratcheted_past_log_view_when_the_primary_of_log_view_was_heard_should_name_it()
+    {
+        let consensus = replica(58, 11);
+        let primary = consensus.primary_index(11);
+        consensus.observe_primary(11, primary);
+        assert_eq!(consensus.primary_hint(), Some(primary));
+    }
+
+    #[test]
+    fn given_an_observed_primary_when_it_is_forgotten_should_fall_back_to_no_hint() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        consensus.forget_primary(1);
+        assert_eq!(consensus.primary_hint(), None);
+        consensus.observe_primary(21, 1);
+        assert_eq!(
+            consensus.primary_hint(),
+            Some(1),
+            "a forgotten primary that speaks again is heard again"
+        );
+    }
+
+    #[test]
+    fn given_an_observed_primary_when_another_replica_is_forgotten_should_keep_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        consensus.forget_primary(2);
+        assert_eq!(consensus.primary_hint(), Some(1));
+    }
+
+    #[test]
+    fn given_a_sender_that_is_not_its_view_primary_when_observed_should_ignore_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 2);
+        assert_eq!(consensus.primary_hint(), None);
+    }
+
+    #[test]
+    fn given_a_primary_below_log_view_when_observed_should_ignore_it() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(8, 3);
+        assert_eq!(consensus.primary_hint(), None);
+    }
+
+    #[test]
+    fn given_an_older_view_primary_when_observed_after_a_newer_one_should_keep_the_newer() {
+        let consensus = replica(58, 11);
+        consensus.observe_primary(21, 1);
+        consensus.observe_primary(12, 2);
+        assert_eq!(consensus.primary_hint(), Some(1));
     }
 }

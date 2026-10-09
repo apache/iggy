@@ -303,16 +303,13 @@ pub struct RepairSession {
     pub floor: Option<u64>,
     /// The peer serving this stream (re-request target on stall).
     pub peer: u8,
-    /// Lowest `base_offset` among the repaired `SendMessages` batches:
-    /// where the served window begins in offset space. Compared against the
-    /// boot-recovered durable end when a commit floor arrives -- a window
-    /// starting above `recovered_durable_offset + 1` means ops below the
-    /// floor are neither locally durable nor repaired (state-transfer
-    /// territory), and the floor must be refused.
-    pub first_batch_offset: Option<u64>,
     /// Ticks since the stream last made progress; at
     /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
     pub idle_ticks: u32,
+    /// Start of the last chunk pulled above a pending [`Self::floor`]. A
+    /// `RepairDone` pulls again only past it, so a peer that serves nothing
+    /// is left to the stall retry instead of answering an unthrottled loop.
+    pub floor_pulled_from: u64,
 }
 
 /// How a repair-window commit walk concluded, decided by
