@@ -121,6 +121,14 @@ Give each connector instance its own `sender_id`, or its own `sf_dir`. Two pools
 that share a directory under one `sender_id` adopt each other's slots, so one
 instance can replay frames the other queued.
 
+**A full symbol dictionary persists in the slot too.** The dictionary belongs to
+one connection, and a connection whose dictionary filled is retired when the
+connector returns it, so the next flush borrows a fresh one. With `sf_dir` set,
+the slot re-seeds the next connection's dictionary at the same size until the
+slot drains, so each flush window fails once more until it does. A
+`symbol_columns` field with unbounded cardinality is the usual cause; store it
+as a `VARCHAR` instead.
+
 **A terminal rejection persists in the store-and-forward log.** If QuestDB
 rejects a frame with a terminal error such as a schema mismatch, restarting the
 runtime replays that same frame from disk and latches the sender again before
@@ -199,6 +207,12 @@ since none of those can be inferred from a JSON payload.
 
 QuestDB stores only `DOUBLE` arrays, so integer arrays are widened. `BOOLEAN`
 has no null representation: an omitted boolean reads back as `false`.
+
+Payloads with no field structure land in a single `payload` `VARCHAR` column:
+`Raw`, `Text`, `FlatBuffer` and `Avro`, proto text that does not parse as JSON,
+and a JSON document that is an array or a scalar rather than an object. Proto
+text that holds a JSON object takes the field path instead, so its fields become
+columns.
 
 ### Numbers
 
@@ -282,6 +296,8 @@ Both coercion directions and the rounding above 2^53 are pinned by
 `core/integration/tests/connectors/questdb/questdb_sink.rs`, against a table
 whose declared types are the opposite of what the connector sends.
 
+### Timestamps
+
 Every QuestDB table has a designated timestamp and the client cannot name it, so
 an auto-created table calls it `timestamp`. A payload field named `timestamp` is
 therefore written as an ordinary column beside it, which the server can refuse.
@@ -295,15 +311,11 @@ data column.
 The designated timestamp's resolution follows `timestamp_source`. `message`
 and `origin` carry microseconds, so an auto-created table gets a `TIMESTAMP`
 column. `payload` converts the field to nanoseconds through `timestamp_unit`,
-so the column is `TIMESTAMP_NS`. Pre-create the table with the matching type
-when it has to be one or the other, and keep one source per table: a table
-created by one source does not take the other's resolution.
-
-Payloads with no field structure land in a single `payload` `VARCHAR` column:
-`Raw`, `Text`, `FlatBuffer` and `Avro`, proto text that does not parse as JSON,
-and a JSON document that is an array or a scalar rather than an object. Proto
-text that holds a JSON object takes the field path instead, so its fields become
-columns.
+so the column is `TIMESTAMP_NS`. `server` sends no timestamp at all: QuestDB
+stamps the row on arrival and creates its default `TIMESTAMP` column.
+Pre-create the table with the matching type when it has to be one or the
+other, and keep one source per table: a table created by one source does not
+take the other's resolution.
 
 ## Delivery semantics
 
@@ -335,7 +347,13 @@ Three further conditions fail a batch:
   where it cannot know which batch caused it, so the connector counts the
   rejection and fails one batch for each. When a chunk's own flush failed on
   that rejection, that chunk is the one, and the count is retired for it rather
-  than failing a later healthy batch. A transport failure retires nothing.
+  than failing a later healthy batch. The retire can run before the client's
+  report lands, so the count is allowed to go negative and nets to zero when
+  the report arrives. A transport failure retires nothing. The client's report
+  inbox is bounded and drops its oldest entry when full; the connector reads
+  the client's dropped-event count each batch, and when it grew it forgives any
+  negative balance and fails that batch, because a terminal rejection may have
+  gone unreported.
 - **A run of unacknowledged flushes.** One flush whose acknowledgement does not
   arrive within `flush_timeout` is delivery lag, and the frames stay queued, so
   it is a warning. After 10 consecutive such batches on one topic the connector
@@ -346,10 +364,18 @@ Three further conditions fail a batch:
   the chunks behind it. A failure that belongs to the connection does: a
   transport error, or a borrow the pool could not satisfy, which includes an
   exhausted `sender_pool_max` and a refused dial. Each remaining chunk would
-  otherwise spend its own timeout finding that out. Two `error` lines name
-  what was lost, by offset and message ID, since the runtime committed them
-  already: the failed chunk's own messages that QuestDB did not confirm, and
-  the chunks behind it that were never attempted.
+  otherwise spend its own timeout finding that out. A full symbol dictionary
+  is the exception: it belongs to the connection, but the next borrow replaces
+  that connection, so the chunks behind it go on. Two `error` lines name what
+  was lost, by offset and message ID, since the runtime committed them
+  already: the failed chunk's messages from its last acknowledged window
+  onward, which is the whole chunk under fire-and-forget or after a pending
+  acknowledgement, and the chunks behind it that were never attempted.
+
+  A publish can also fail for a fault that is not the frame's own: a terminal
+  rejection of an earlier frame latches the connection, and a full dictionary
+  belongs to it. The buffer is intact in both cases, so the connector borrows
+  a fresh connection and re-flushes that window once before giving it up.
 
 `flush_timeout` also sets the worst-case shutdown delay. The runtime allows a
 sink five seconds to stop, and does not interrupt a flush that is already in
@@ -422,8 +448,8 @@ Two names are deliberately not reserved. `payload` is written only for a record
 with no field structure, which by definition carries no field that could collide
 with it, so a JSON field named `payload` is stored as an ordinary column.
 `timestamp` is not reserved either, because it is a valid data column on a table
-whose designated timestamp was pre-created under another name; see Timestamps
-for the auto-created case.
+whose designated timestamp was pre-created under another name; see
+[Timestamps](#timestamps) for the auto-created case.
 
 Rejections come in three kinds, and only the first two name a record:
 

@@ -249,11 +249,10 @@ async fn given_invalid_record_in_batch_when_consumed_should_write_the_rest(
     )
     .await;
 
-    let count = fixture.wait_for_rows(2).await.expect("no rows");
-    assert_eq!(
-        count, 2,
-        "the malformed record must be the only one dropped"
-    );
+    fixture
+        .wait_for_rows(2)
+        .await
+        .expect("the malformed record must be the only one dropped");
 
     let prices = fixture.column_values("price").await.expect("no values");
     let mut prices: Vec<f64> = prices
@@ -309,8 +308,10 @@ async fn given_the_default_when_consumed_should_write_both_mixed_records(
     )
     .await;
 
-    let count = fixture.wait_for_rows(2).await.expect("no rows");
-    assert_eq!(count, 2, "both records must survive the mixed number types");
+    fixture
+        .wait_for_rows(2)
+        .await
+        .expect("both records must survive the mixed number types");
 
     let columns = fixture.column_types().await.expect("no columns");
     assert_eq!(
@@ -344,8 +345,10 @@ async fn given_a_declared_table_when_consumed_should_coerce_both_number_directio
     )
     .await;
 
-    let count = fixture.wait_for_rows(1).await.expect("no rows");
-    assert_eq!(count, 1, "a declared table must accept the record");
+    fixture
+        .wait_for_rows(1)
+        .await
+        .expect("a declared table must accept the record");
 
     // `measured` is in integer_columns, so the connector sent a LONG into a
     // DOUBLE column: widening.
@@ -406,8 +409,7 @@ async fn given_integer_columns_when_consumed_should_keep_the_declared_column_exa
     )
     .await;
 
-    let count = fixture.wait_for_rows(1).await.expect("no rows");
-    assert_eq!(count, 1);
+    fixture.wait_for_rows(1).await.expect("no rows");
 
     let amounts = fixture.column_values("amount").await.expect("no values");
     assert_eq!(
@@ -450,11 +452,10 @@ async fn given_many_conflicting_records_when_consumed_should_write_every_other_o
     // count is an equality rather than a floor, and every one of the twelve has
     // to arrive. A cap that failed the batch would leave far fewer.
     let expected = (total / 2) as usize;
-    let count = fixture.wait_for_rows(expected).await.expect("no rows");
-    assert_eq!(
-        count, expected,
-        "every record matching the pinned column type must survive"
-    );
+    fixture
+        .wait_for_rows(expected)
+        .await
+        .expect("every record matching the pinned column type must survive");
 
     let ids = fixture.column_values("sensor_id").await.expect("no values");
     let mut ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
@@ -492,11 +493,10 @@ async fn given_rejected_record_before_a_conflicting_one_when_consumed_should_wri
     )
     .await;
 
-    let count = fixture.wait_for_rows(3).await.expect("no rows");
-    assert_eq!(
-        count, 3,
-        "only the rejected and the conflicting record should be dropped"
-    );
+    fixture
+        .wait_for_rows(3)
+        .await
+        .expect("only the rejected and the conflicting record should be dropped");
 
     let ids = fixture.column_values("sensor_id").await.expect("no values");
     let mut ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
@@ -535,11 +535,10 @@ async fn given_record_whose_column_type_conflicts_when_consumed_should_write_the
     )
     .await;
 
-    let count = fixture.wait_for_rows(3).await.expect("no rows");
-    assert_eq!(
-        count, 3,
-        "only the conflicting record should be dropped, not the batch"
-    );
+    fixture
+        .wait_for_rows(3)
+        .await
+        .expect("only the conflicting record should be dropped, not the batch");
 
     let ids = fixture.column_values("sensor_id").await.expect("no values");
     let mut ids: Vec<i64> = ids.iter().filter_map(serde_json::Value::as_i64).collect();
@@ -607,14 +606,10 @@ async fn given_bulk_messages_when_consumed_should_write_every_row(
         .collect();
     send(&harness.root_client().await.unwrap(), messages).await;
 
-    let count = fixture
+    fixture
         .wait_for_rows(bulk_count)
         .await
-        .expect("Failed to wait for QuestDB rows");
-    assert_eq!(
-        count, bulk_count,
-        "expected exactly {bulk_count}, got {count}"
-    );
+        .expect("expected exactly {bulk_count}, got {count}");
 }
 
 #[iggy_harness(
@@ -699,16 +694,10 @@ async fn given_questdb_outage_when_consumed_should_buffer_and_replay_on_recovery
     fixture.resume().await.expect("failed to unpause");
 
     // Everything sent during the outage must arrive once the server is back.
-    // `wait_for_rows` only returns once the count is reached, so the assertion
-    // below is about the exact total rather than the wait succeeding.
-    let count = fixture
+    fixture
         .wait_for_rows(15)
         .await
-        .expect("rows buffered during the outage were not replayed");
-    assert_eq!(
-        count, 15,
-        "expected exactly 15 rows after replay, got {count}"
-    );
+        .expect("expected exactly 15 rows after replay, got {count}");
 }
 
 #[iggy_harness(
@@ -731,8 +720,10 @@ async fn given_batch_size_below_message_count_when_consumed_should_write_every_c
     )
     .await;
 
-    let count = fixture.wait_for_rows(total).await.expect("no rows");
-    assert_eq!(count, total, "chunking lost or duplicated rows");
+    fixture
+        .wait_for_rows(total)
+        .await
+        .expect("chunking lost or duplicated rows");
 
     // Offsets must be contiguous: an off-by-one in the drain loop would show
     // up as a gap rather than a count mismatch.
@@ -777,8 +768,10 @@ async fn given_many_rejections_across_chunks_when_consumed_should_write_every_va
     .await;
 
     let expected = total - rejected;
-    let count = fixture.wait_for_rows(expected).await.expect("no rows");
-    assert_eq!(count, expected, "every valid record must survive");
+    fixture
+        .wait_for_rows(expected)
+        .await
+        .expect("every valid record must survive");
 
     // The surviving rows must be exactly the valid ones, so a rejection cannot
     // be quietly taking a neighbour with it. `seq` is a DOUBLE under the
@@ -823,22 +816,19 @@ async fn given_origin_timestamp_source_when_consumed_should_stamp_from_the_produ
     harness: &TestHarness,
     fixture: QuestDbSinkOriginTimestampFixture,
 ) {
-    // The producer stamps `origin_timestamp` when it builds the message, and
-    // the builder offers no way to set it by hand, so the assertion is a window
-    // around the send rather than an exact value. It cannot tell the producer's
-    // clock from the server's, since both are "about now" here; what it does
-    // pin is that the source runs end to end, stamps nothing at the epoch, and
-    // creates a microsecond column. The exact-value behaviour has unit tests.
+    // The builder stamps `origin_timestamp` with the producer's clock, but the
+    // header field is public, so the test overwrites it with a fixed past
+    // instant. The wire carries a single message's value exactly, so the
+    // stored timestamp has to be that instant: a sink that fell back to the
+    // message or server clock would store "now" and fail here.
     let fixture = &fixture.0;
-    let before = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
-    send(
-        &harness.root_client().await.unwrap(),
-        vec![message(1, json!({"price": 1.5}))],
-    )
-    .await;
+    // 2026-09-04T12:00:00Z in microseconds, the instant the payload test uses.
+    let origin = 1_788_523_200_000_000u64;
+    let mut sent = message(1, json!({"price": 1.5}));
+    sent.header.origin_timestamp = origin;
+    send(&harness.root_client().await.unwrap(), vec![sent]).await;
 
     fixture.wait_for_rows(1).await.expect("no rows");
-    let after = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
 
     let columns = fixture.column_types().await.expect("no columns");
     assert_eq!(
@@ -848,10 +838,9 @@ async fn given_origin_timestamp_source_when_consumed_should_stamp_from_the_produ
     );
     let values = fixture.column_values("timestamp").await.expect("no values");
     let stored = values[0].as_str().expect("timestamp is not a string");
-    let stored_seconds: String = stored.chars().take(before.len()).collect();
     assert!(
-        stored_seconds.as_str() >= before.as_str() && stored_seconds.as_str() <= after.as_str(),
-        "stored {stored} is outside the send window {before}..{after}"
+        stored.starts_with("2026-09-04T12:00:00"),
+        "the stored timestamp must be the producer's: {stored}"
     );
 }
 
@@ -880,7 +869,13 @@ async fn given_server_timestamp_source_when_consumed_should_let_questdb_stamp_ro
     let after = IggyTimestamp::now().to_utc_string("%Y-%m-%dT%H:%M:%S");
 
     let columns = fixture.column_types().await.expect("no columns");
-    assert!(columns.contains_key("timestamp"), "{columns:?}");
+    // With no designated timestamp in the frame, QuestDB stamps the row on
+    // arrival and creates its default column type for it.
+    assert_eq!(
+        columns.get("timestamp").map(String::as_str),
+        Some("TIMESTAMP"),
+        "{columns:?}"
+    );
     let values = fixture.column_values("timestamp").await.expect("no values");
     let stored = values[0].as_str().expect("timestamp is not a string");
     // ISO-8601 in a fixed layout sorts lexicographically, so comparing the
@@ -1090,6 +1085,8 @@ async fn given_large_payloads_when_consumed_should_write_every_row(
     )
     .await;
 
-    let written = fixture.wait_for_rows(count).await.expect("no rows");
-    assert_eq!(written, count, "large payloads lost rows");
+    fixture
+        .wait_for_rows(count)
+        .await
+        .expect("large payloads lost rows");
 }
