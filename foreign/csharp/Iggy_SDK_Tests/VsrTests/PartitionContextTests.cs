@@ -25,6 +25,7 @@ using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.ContractsTests;
+using Apache.Iggy.Tests.Utils;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -65,7 +66,7 @@ public sealed class PartitionContextTests
                 return Reply(request.Operation, new byte[4]);
             }
 
-            return Answer(request);
+            return Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
@@ -98,7 +99,7 @@ public sealed class PartitionContextTests
                     : Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE);
             }
 
-            return Answer(request);
+            return Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
@@ -133,7 +134,7 @@ public sealed class PartitionContextTests
 
             return request.Operation == (byte)VsrOperation.SendMessages
                 ? Reply(request.Operation, new byte[4])
-                : Answer(request);
+                : Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
@@ -159,7 +160,7 @@ public sealed class PartitionContextTests
                 return Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE);
             }
 
-            return Answer(request);
+            return Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
@@ -189,7 +190,7 @@ public sealed class PartitionContextTests
                     : Reply(request.Operation, new byte[4]);
             }
 
-            return Answer(request);
+            return Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
@@ -216,7 +217,7 @@ public sealed class PartitionContextTests
                 return Reply(request.Operation, new byte[4]);
             }
 
-            return Answer(request);
+            return Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
@@ -232,7 +233,7 @@ public sealed class PartitionContextTests
     public async Task given_plain_polls_at_different_offsets_should_capture_their_context_once()
     {
         using var node = new MockNode();
-        node.Serve(Answer);
+        node.Serve(request => Standalone(node, request));
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await SignInAsync(client);
 
@@ -266,7 +267,7 @@ public sealed class PartitionContextTests
                 return Reply(request.Operation, new byte[4]);
             }
 
-            return Answer(request);
+            return Standalone(node, request);
         });
         using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
         await using var consumer = new IggyConsumer(client, new IggyConsumerConfig
@@ -294,6 +295,223 @@ public sealed class PartitionContextTests
         Assert.Equal(Polled, store.Context);
     }
 
+    [Fact]
+    public async Task given_a_send_refused_for_another_reason_should_keep_the_cached_context()
+    {
+        using var node = new MockNode();
+        var sends = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.SendMessages)
+            {
+                return Interlocked.Increment(ref sends) == 1
+                    ? Reply(request.Operation, [], VsrError.TOPIC_ID_NOT_FOUND)
+                    : Reply(request.Operation, new byte[4]);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => SendAsync(client));
+        await SendAsync(client);
+
+        Assert.Equal(2, Volatile.Read(ref sends));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+    }
+
+    [Fact]
+    public async Task given_a_history_refusal_when_sending_should_drop_every_cached_context_of_the_topic()
+    {
+        using var node = new MockNode();
+        var refused = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.SendMessages)
+            {
+                return Interlocked.Exchange(ref refused, 0) == 1
+                    ? Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE)
+                    : Reply(request.Operation, new byte[4]);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+        await SendAsync(client, PartitionId);
+        await SendAsync(client, PartitionId + 1);
+
+        Volatile.Write(ref refused, 1);
+        await SendAsync(client, PartitionId);
+        await SendAsync(client, PartitionId + 1);
+
+        Assert.Equal(4, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+    }
+
+    [Fact]
+    public async Task given_an_unrelated_metadata_commit_by_this_client_when_sending_again_should_keep_the_context()
+    {
+        const ulong UpdateCommit = 50;
+        using var node = new MockNode();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.UpdateStream)
+            {
+                var reply = Reply(request.Operation, new byte[4]);
+                BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), UpdateCommit);
+                return reply;
+            }
+
+            return request.Operation == (byte)VsrOperation.SendMessages
+                ? Reply(request.Operation, new byte[4])
+                : Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        await SendAsync(client);
+        await client.UpdateStreamAsync(Identifier.Numeric(1), "renamed", TestContext.Current.CancellationToken);
+        await SendAsync(client);
+
+        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+    }
+
+    [Fact]
+    public async Task given_a_stream_and_a_topic_created_by_this_client_when_sending_again_should_keep_the_context()
+    {
+        using var node = new MockNode();
+        node.Serve(request => request.Operation switch
+        {
+            // A replicated reply leads with an empty committed result section.
+            (byte)VsrOperation.CreateStream => Reply(request.Operation,
+                [.. new byte[4], .. BinaryFactory.CreateStreamPayload(1, 0, "created", 0, 0, 0)]),
+            (byte)VsrOperation.CreateTopic or (byte)VsrOperation.SendMessages => Reply(request.Operation, new byte[4]),
+            _ => Standalone(node, request)
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        await SendAsync(client);
+        await client.CreateStreamAsync("created", TestContext.Current.CancellationToken);
+        await client.CreateTopicAsync(Identifier.Numeric(1), "created", 1,
+            token: TestContext.Current.CancellationToken);
+        await SendAsync(client);
+
+        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+    }
+
+    [Theory]
+    [InlineData(Enums.Partitioning.Balanced)]
+    [InlineData(Enums.Partitioning.MessageKey)]
+    public async Task given_a_raw_send_without_a_partition_id_should_refuse_it_before_sending(
+        Enums.Partitioning partitioning)
+    {
+        using var node = new MockNode();
+        node.Serve(request => Standalone(node, request));
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+        byte[] body = [0, 0, 0, 0, 1, 4, 1, 0, 0, 0, 1, 4, 2, 0, 0, 0, (byte)partitioning, 1, 7, 0, 0, 0, 0];
+
+        var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.SendBinaryRequestAsync(CommandCodes.SEND_MESSAGES_CODE, body,
+                TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, refusal.StatusCode);
+        Assert.False(refusal.FromServer);
+        Assert.Equal(0, node.Requests(CommandCodes.SEND_MESSAGES_CODE));
+        Assert.Equal(0, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+    }
+
+    [Fact]
+    public async Task given_a_caller_context_on_a_standalone_poll_should_stamp_it_without_routing()
+    {
+        using var node = new MockNode();
+        var polls = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Code == CommandCodes.POLL_MESSAGES_CODE)
+            {
+                polls.Enqueue(request);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        await PollAsync(client, PollingStrategy.Offset(Offset).WithContext(Replaced));
+
+        Assert.Equal(Replaced, Assert.Single(polls).Context);
+        Assert.Equal(0, node.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+    }
+
+    [Fact]
+    public async Task given_lifecycle_busy_refusals_should_resend_as_new_requests_with_growing_pauses()
+    {
+        using var node = new MockNode();
+        var deletes = new ConcurrentQueue<(ulong RequestId, long At)>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.DeleteStream)
+            {
+                deletes.Enqueue((request.RequestId, Environment.TickCount64));
+                return deletes.Count < 3
+                    ? Reply(request.Operation, [], VsrError.LIFECYCLE_BUSY)
+                    : Reply(request.Operation, new byte[4]);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        await client.DeleteStreamAsync(Identifier.Numeric(1), TestContext.Current.CancellationToken);
+
+        var attempts = deletes.ToArray();
+        Assert.Equal(3, attempts.Select(attempt => attempt.RequestId).Distinct().Count());
+        // TickCount64 can round a pause down by its granularity.
+        Assert.InRange(attempts[1].At - attempts[0].At, 40, long.MaxValue);
+        Assert.InRange(attempts[2].At - attempts[1].At, 90, long.MaxValue);
+    }
+
+    [Fact]
+    public async Task given_a_lifecycle_busy_retry_when_pausing_should_let_other_requests_through()
+    {
+        using var node = new MockNode();
+        var refused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        node.Serve(request =>
+        {
+            if (request.Operation != (byte)VsrOperation.DeleteStream)
+            {
+                return Standalone(node, request);
+            }
+
+            if (node.Pings > 0)
+            {
+                return Reply(request.Operation, new byte[4]);
+            }
+
+            refused.TrySetResult();
+            return Reply(request.Operation, [], VsrError.LIFECYCLE_BUSY);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        var delete = client.DeleteStreamAsync(Identifier.Numeric(1), TestContext.Current.CancellationToken);
+        await refused.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await client.PingAsync(TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        await delete.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>The roster read that routes polls and offset writes finds a standalone server.</summary>
+    private static byte[] Standalone(MockNode node, MockRequest request)
+    {
+        return request.Code == GET_CLUSTER_METADATA_CODE ? StandaloneRoster(node.Port) : Answer(request);
+    }
+
     private static IggyClientConfigurator Configuration(MockNode node)
     {
         return new IggyClientConfigurator
@@ -310,10 +528,10 @@ public sealed class PartitionContextTests
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
     }
 
-    private static Task SendAsync(TcpMessageStream client)
+    private static Task SendAsync(TcpMessageStream client, uint partitionId = PartitionId)
     {
         return client.SendMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2),
-            Partitioning.PartitionId(PartitionId), [new Message(Guid.NewGuid(), "payload"u8.ToArray())],
+            Partitioning.PartitionId(partitionId), [new Message(Guid.NewGuid(), "payload"u8.ToArray())],
             TestContext.Current.CancellationToken);
     }
 

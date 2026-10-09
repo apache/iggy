@@ -217,6 +217,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
         await SendAckAsync(CommandCodes.DELETE_STREAM_CODE, message, token);
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -291,7 +292,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.DeleteTopic(streamId, topicId);
         await SendAckAsync(CommandCodes.DELETE_TOPIC_CODE, message, token);
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -335,18 +336,37 @@ public sealed partial class TcpMessageStream : IIggyClient
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
+        return PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, _ => pollingStrategy, count,
+            autoCommit, token);
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        CancellationToken token = default)
+    {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategyFor,
+            count, autoCommit, token);
+        return BinaryMapper.MaterializeMessages(rental);
+    }
+
+    /// <inheritdoc />
+    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count,
+        bool autoCommit, CancellationToken token = default)
+    {
         ThrowIfAutoCommitWithEncryptor(autoCommit);
 
         // The broker routes explicit partitions only, so a group poll picks one of the member's assigned
         // partitions client-side.
         if (consumer.Type == ConsumerType.ConsumerGroup && partitionId is null)
         {
-            return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategy, count, autoCommit,
+            return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategyFor, count, autoCommit,
                 token);
         }
 
-        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
-            autoCommit, token);
+        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer,
+            pollingStrategyFor(partitionId ?? 0), count, autoCommit, token);
     }
 
     /// <inheritdoc />
@@ -354,7 +374,9 @@ public sealed partial class TcpMessageStream : IIggyClient
         uint? partitionId, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
-        await SendAckAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, token);
+        await WriteOffsetAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, StoreOffsetSuffixSize,
+            new PollRouteKey(CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE, streamId, topicId, consumer.Type,
+                consumer.ConsumerId, partitionId), null, token);
     }
 
     /// <inheritdoc />
@@ -362,7 +384,9 @@ public sealed partial class TcpMessageStream : IIggyClient
         uint partitionId, PartitionContext context, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
-        await SendAckAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, token, context);
+        await WriteOffsetAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, StoreOffsetSuffixSize,
+            new PollRouteKey(CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE, streamId, topicId, consumer.Type,
+                consumer.ConsumerId, partitionId), context, token);
     }
 
     /// <inheritdoc />
@@ -386,7 +410,9 @@ public sealed partial class TcpMessageStream : IIggyClient
         CancellationToken token = default)
     {
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
-        await SendAckAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message, token);
+        await WriteOffsetAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message, DeleteOffsetSuffixSize,
+            new PollRouteKey(CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE, streamId, topicId, consumer.Type,
+                consumer.ConsumerId, partitionId), null, token);
     }
 
     /// <inheritdoc />
@@ -474,7 +500,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.DeletePartitions(streamId, topicId, partitionsCount);
         await SendAckAsync(CommandCodes.DELETE_PARTITIONS_CODE, message, token);
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -483,7 +509,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.CreatePartitions(streamId, topicId, partitionsCount);
         await SendAckAsync(CommandCodes.CREATE_PARTITIONS_CODE, message, token);
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -949,11 +975,10 @@ public sealed partial class TcpMessageStream : IIggyClient
             TcpContracts.GetMessages(payload.AsSpan(0, messageBufferSize), consumer, streamId,
                 topicId, pollingStrategy, count, autoCommit, partitionId);
 
-            responseBuffer = autoCommit
-                ? await PollAutoCommitAsync(new PollRouteKey(streamId, topicId, consumer.Type,
-                        consumer.ConsumerId, partitionId), payload.AsMemory(0, messageBufferSize), token)
-                : await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE,
-                    payload.AsMemory(0, messageBufferSize), token: token);
+            var body = payload.AsMemory(0, messageBufferSize);
+            responseBuffer = await SendRoutedAsync(CommandCodes.POLL_MESSAGES_CODE,
+                new PollRouteKey(CommandCodes.GET_POLL_ROUTING_CODE, streamId, topicId, consumer.Type,
+                    consumer.ConsumerId, partitionId), body, body, pollingStrategy.Context, token);
             if (responseBuffer.Memory.Length == 0)
             {
                 responseBuffer.Dispose();
@@ -1376,42 +1401,100 @@ public sealed partial class TcpMessageStream : IIggyClient
         return e is InvalidCertificatePathException;
     }
 
-    private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token,
-        PartitionContext? context = null)
+    private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)
     {
-        using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, body, token: token, capturedContext: context);
+        using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, body, token: token);
+    }
+
+    /// <summary>Routes a store or delete offset request, whose routing body is the request without its suffix.</summary>
+    private async Task WriteOffsetAsync(int code, byte[] message, int suffixSize, PollRouteKey key,
+        PartitionContext? context, CancellationToken token)
+    {
+        using IMemoryOwner<byte> _ = await SendRoutedAsync(code, key, message.AsMemory(0, message.Length - suffixSize),
+            message, context, token);
     }
 
     private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
         bool autoLoginOnReconnect = true, CancellationToken token = default, PartitionContext? capturedContext = null)
     {
+        if (code == CommandCodes.SEND_MESSAGES_CODE)
+        {
+            return await SendMessagesWithContextAsync(body, autoLoginOnReconnect, capturedContext, token);
+        }
+
         var query = TryBuildContextQuery(code, body.Span);
         if (query is null)
         {
-            return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, capturedContext ?? default, token);
+            return await SendRetryingLifecycleAsync(code, body, autoLoginOnReconnect, capturedContext ?? default,
+                token);
         }
 
-        // The server refuses a replaced incarnation before admission, so a send can go out once more as a new request.
-        var refreshAvailable = capturedContext is null && code == CommandCodes.SEND_MESSAGES_CODE;
+        var context = capturedContext ?? await GetPartitionContextAsync(query, token);
+        try
+        {
+            return await SendRetryingLifecycleAsync(code, body, autoLoginOnReconnect, context, token);
+        }
+        catch
+        {
+            ForgetPartitionContext(query);
+            throw;
+        }
+    }
+
+    /// <summary>
+    ///     Sends messages under the cached context of their partition. The server refuses a replaced incarnation
+    ///     with status 87 before admission, so a send without a caller context goes out once more as a new request
+    ///     under a fresh context. Only that refusal drops the topic's cached contexts.
+    /// </summary>
+    private async Task<IMemoryOwner<byte>> SendMessagesWithContextAsync(ReadOnlyMemory<byte> body,
+        bool autoLoginOnReconnect, PartitionContext? capturedContext, CancellationToken token)
+    {
+        var target = ParseSendTarget(body.Span);
+        var refreshAvailable = capturedContext is null;
         while (true)
         {
-            var context = capturedContext ?? await GetPartitionContextAsync(query, token);
+            var context = capturedContext ?? await GetSendContextAsync(target, token);
             try
             {
-                return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, context, token);
+                return await SendRetryingLifecycleAsync(CommandCodes.SEND_MESSAGES_CODE, body, autoLoginOnReconnect,
+                    context, token);
             }
-            catch (Exception error)
+            catch (IggyInvalidStatusCodeException error) when (error.FromServer
+                && error.StatusCode == VsrError.HISTORY_UNAVAILABLE)
             {
-                ForgetPartitionContext(query);
-                if (!refreshAvailable || error is not IggyInvalidStatusCodeException
-                    {
-                        FromServer: true, StatusCode: VsrError.HISTORY_UNAVAILABLE
-                    })
+                _groupState.InvalidateTopic(target.Topic);
+                if (!refreshAvailable)
                 {
                     throw;
                 }
 
                 refreshAvailable = false;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     A LifecycleBusy refusal is committed, so the request did not apply and goes out again as a new request
+    ///     with a new request id. The pause starts at <see cref="LifecycleRetryIntervalMs" />, doubles up to
+    ///     <see cref="LifecycleRetryMaxIntervalMs" /> and holds no lock, so other requests of this client keep
+    ///     flowing. The retries stop at the request deadline with the last refusal.
+    /// </summary>
+    private async Task<IMemoryOwner<byte>> SendRetryingLifecycleAsync(int code, ReadOnlyMemory<byte> body,
+        bool autoLoginOnReconnect, PartitionContext context, CancellationToken token)
+    {
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        var interval = LifecycleRetryIntervalMs;
+        while (true)
+        {
+            try
+            {
+                return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, context, token);
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.FromServer
+                && error.StatusCode == VsrError.LIFECYCLE_BUSY && Environment.TickCount64 + interval < deadline)
+            {
+                await Task.Delay(interval, token);
+                interval = Math.Min(interval * 2, LifecycleRetryMaxIntervalMs);
             }
         }
     }

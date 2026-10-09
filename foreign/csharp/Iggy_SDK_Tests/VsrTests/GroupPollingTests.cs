@@ -19,9 +19,11 @@ using System.Buffers.Binary;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
@@ -66,6 +68,7 @@ public sealed class GroupPollingTests
             SyncGroupCode => Reply(OPERATION_NON_REPLICATED, AssignmentBody(9, [0])),
             // The server marks a stale assignment with the resync sentinel.
             PollMessagesCode => Reply(request.Operation, EmptyBatchBody(uint.MaxValue)),
+            GET_CLUSTER_METADATA_CODE => StandaloneRoster(node.Port),
             _ => Answer(request)
         });
         using var client = await ConnectAsync(node);
@@ -95,6 +98,8 @@ public sealed class GroupPollingTests
                     return Reply(request.Operation, EmptyBatchBody(uint.MaxValue));
                 case PollMessagesCode:
                     return Reply(request.Operation, EmptyBatchBody(2));
+                case GET_CLUSTER_METADATA_CODE:
+                    return StandaloneRoster(node.Port);
                 default:
                     return Answer(request);
             }
@@ -106,6 +111,29 @@ public sealed class GroupPollingTests
         Assert.Equal(2u, polled.PartitionId);
         Assert.Equal(2, node.Requests(SyncGroupCode));
         Assert.Equal(2, node.Requests(PollMessagesCode));
+    }
+
+    [Fact]
+    public async Task given_a_caller_context_when_a_group_poll_is_fenced_should_resync_and_report_the_fence()
+    {
+        using var node = new MockNode();
+        node.Serve(request => request.Code switch
+        {
+            SyncGroupCode => Reply(OPERATION_NON_REPLICATED, AssignmentBody(9, [0])),
+            PollMessagesCode => Reply(request.Operation, [], VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED),
+            GET_CLUSTER_METADATA_CODE => StandaloneRoster(node.Port),
+            _ => Answer(request)
+        });
+        using var client = await ConnectAsync(node);
+
+        var fence = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.PollMessagesAsync(
+            Identifier.Numeric(1), Identifier.Numeric(2), null, Consumer.Group(3),
+            PollingStrategy.Next().WithContext(new PartitionContext(17, 9, 52)), 10, false,
+            TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED, fence.StatusCode);
+        Assert.Equal(1, node.Requests(PollMessagesCode));
+        Assert.Equal(2, node.Requests(SyncGroupCode));
     }
 
     private static async Task<TcpMessageStream> ConnectAsync(MockNode node)
@@ -125,19 +153,6 @@ public sealed class GroupPollingTests
     {
         return client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), null, Consumer.Group(3),
             PollingStrategy.Next(), 10, false, TestContext.Current.CancellationToken);
-    }
-
-    private static byte[] AssignmentBody(ulong generation, uint[] partitions)
-    {
-        var body = new byte[12 + partitions.Length * 4];
-        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(0, 8), generation);
-        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(8, 4), (uint)partitions.Length);
-        for (var index = 0; index < partitions.Length; index++)
-        {
-            BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(12 + index * 4, 4), partitions[index]);
-        }
-
-        return body;
     }
 
     private static byte[] EmptyBatchBody(uint partitionId)

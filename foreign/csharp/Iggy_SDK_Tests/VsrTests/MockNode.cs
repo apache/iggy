@@ -97,6 +97,62 @@ internal static class MockFrames
         return frame;
     }
 
+    /// <summary>The roster a standalone server reports: itself, as the leader.</summary>
+    internal static byte[] StandaloneRoster(ushort port)
+    {
+        var body = new List<byte>();
+        WriteString(body, "standalone");
+        body.AddRange(BitConverter.GetBytes(1u));
+        WriteNode(body, port, true);
+        return Reply(OPERATION_NON_REPLICATED, body.ToArray());
+    }
+
+    /// <summary>A GetPollRouting or GetConsumerOffsetRouting reply that routes the caller's session to a primary.</summary>
+    internal static byte[] RouteReply(MockRequest request, PartitionContext context, ushort primaryPort, bool leader)
+    {
+        var attachment = new byte[32];
+        BinaryPrimitives.WriteUInt128LittleEndian(attachment, request.ClientId);
+        BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(16), request.Session);
+        BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(24), 1);
+        var body = new List<byte>(attachment);
+        body.AddRange(BitConverter.GetBytes(context.Incarnation));
+        body.AddRange(BitConverter.GetBytes(context.OwnerGeneration));
+        body.AddRange(BitConverter.GetBytes(context.MetadataOp));
+        WriteNode(body, primaryPort, leader);
+        return Reply(OPERATION_NON_REPLICATED, body.ToArray());
+    }
+
+    /// <summary>A SyncConsumerGroup reply body: the assignment generation and the member's partitions.</summary>
+    internal static byte[] AssignmentBody(ulong generation, uint[] partitions)
+    {
+        var body = new byte[12 + partitions.Length * 4];
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(0, 8), generation);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(8, 4), (uint)partitions.Length);
+        for (var index = 0; index < partitions.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(12 + index * 4, 4), partitions[index]);
+        }
+
+        return body;
+    }
+
+    internal static void WriteNode(List<byte> body, ushort port, bool leader)
+    {
+        WriteString(body, $"node-{port}");
+        WriteString(body, "127.0.0.1");
+        body.AddRange(BitConverter.GetBytes(port));
+        body.AddRange(new byte[6]);
+        body.Add(leader ? (byte)0 : (byte)1);
+        body.Add(0);
+    }
+
+    internal static void WriteString(List<byte> body, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        body.AddRange(BitConverter.GetBytes((uint)bytes.Length));
+        body.AddRange(bytes);
+    }
+
     /// <summary>
     ///     A register reply carries a committed result section, so its four leading zero bytes announce zero
     ///     entries and the typed payload starts right after them. A non-replicated read carries none.

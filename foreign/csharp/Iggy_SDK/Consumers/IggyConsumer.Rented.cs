@@ -55,7 +55,7 @@ public partial class IggyConsumer
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, false, ct);
+                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -90,6 +90,7 @@ public partial class IggyConsumer
             Message = message,
             CurrentOffset = message.Header.Offset,
             PartitionId = partitionId,
+            Context = rental.Context,
             Status = status,
             Error = error
         }, ct);
@@ -115,6 +116,7 @@ public partial class IggyConsumer
 
         PolledMessagesRental? rental = null;
         RentedBatchHandle? batchHandle = null;
+        var polledPartition = PolledMessages.NoAssignedPartition;
         try
         {
             if (_config.PollingIntervalMs > 0)
@@ -123,13 +125,18 @@ public partial class IggyConsumer
             }
 
             rental = await _client.PollMessagesRentedAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
-                _config.AutoCommit, ct);
+                _config.PartitionId, _config.Consumer, partitionId =>
+                {
+                    polledPartition = partitionId;
+                    return PollingStrategyFor(partitionId);
+                }, _config.BatchSize, _config.AutoCommit, ct);
 
             if (rental.Messages.Count == 0)
             {
                 if (rental.PartitionId == PolledMessages.NoAssignedPartition)
                 {
+                    // Partitions come back under a new owner generation, which refuses a kept continuation.
+                    _nextPollingStrategies.Clear();
                     LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
                     await Task.Delay(NoAssignedPartitionBackoffMs, ct);
                     return;
@@ -143,7 +150,7 @@ public partial class IggyConsumer
                 return;
             }
 
-            _lastPolledContext[rental.PartitionId] = rental.Context;
+            RememberPolledContext(rental.PartitionId, rental.Context);
             var hasLastOffset = _lastPolledOffset.TryGetValue(rental.PartitionId, out var lastPolledPartitionOffset);
 
             var currentOffset = 0ul;
@@ -183,18 +190,14 @@ public partial class IggyConsumer
                             lastPolledPartitionOffset, rental.PartitionId);
                     }
 
-                    await StoreOffsetAsync(lastPolledPartitionOffset, rental.PartitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, rental.PartitionId, rental.Context, ct);
                 }
 
                 return;
             }
 
             _lastPolledOffset[rental.PartitionId] = currentOffset;
-
-            if (_config.PollingStrategy.Kind == MessagePolling.Offset)
-            {
-                _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
-            }
+            RememberNextPollingStrategy(rental.PartitionId, currentOffset, rental.Context);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -207,6 +210,7 @@ public partial class IggyConsumer
         }
         catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
         {
+            ForgetRefusedPollingStrategy(ex, polledPartition);
             LogFailedToPollMessages(ex);
             _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
         }

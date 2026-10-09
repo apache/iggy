@@ -104,6 +104,7 @@ public sealed class VsrProtocolDriftTests
 
         Assert.DoesNotContain("namespace", offsets.Keys);
         Assert.DoesNotContain("group", offsets.Keys);
+        Assert.DoesNotContain("owner_generation", offsets.Keys);
     }
 
     [Fact]

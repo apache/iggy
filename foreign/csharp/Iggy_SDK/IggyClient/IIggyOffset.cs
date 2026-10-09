@@ -29,6 +29,12 @@ public interface IIggyOffset
     /// <summary>
     ///     Stores the current offset for a consumer at a specific position in a topic partition.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP, the write goes to the partition primary under the context the partition's route reports. After
+    ///     another client deleted and recreated the partition, it can fail once with status 87, or 5009 for a
+    ///     consumer group, from a route this client cached before. The client does not retry it: the failed route
+    ///     is dropped and the next call routes again.
+    /// </remarks>
     /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
@@ -76,6 +82,12 @@ public interface IIggyOffset
     /// <summary>
     ///     Deletes the stored offset for a consumer in a specified topic.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP, the write goes to the partition primary under the context the partition's route reports. After
+    ///     another client deleted and recreated the partition, it can fail once with status 87, or 5009 for a
+    ///     consumer group, from a route this client cached before. The client does not retry it: the failed route
+    ///     is dropped and the next call routes again.
+    /// </remarks>
     /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>

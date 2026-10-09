@@ -56,6 +56,15 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, PartitionContext> _lastPolledContext = new();
     private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
+
+    /// <summary>
+    ///     The poll that continues each partition after the last batch it delivered, under the context of that batch.
+    ///     The configured strategy only says where reading a partition starts, as in the Rust consumer. A
+    ///     continuation pinned to its context is refused by a recreated partition instead of reading a later offset
+    ///     of the new incarnation, and it never moves to another partition of a consumer group.
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, PollingStrategy> _nextPollingStrategies = new();
+
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
     private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private string? _consumerGroupName;
@@ -229,7 +238,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, false, ct);
+                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, message.Context, ct);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -239,6 +248,11 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Use this when auto-commit is disabled or when you need manual offset control.
     ///     The offset is stored under the context of the partition's last poll, so the server refuses it when the
     ///     partition was deleted and recreated since then or moved to another member of the consumer group.
+    ///     An offset taken from a message of an earlier poll belongs under that message's context: store it with
+    ///     <see cref="StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> instead.
+    ///     Before the first poll of the partition the store takes the context the partition's route reports. It can
+    ///     then fail once with status 87, or 5009 for a consumer group, after another client recreated the
+    ///     partition. The failed route is dropped and the next call routes again.
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
@@ -268,8 +282,28 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
+    ///     Stores the offset of a received message under the context of the poll that delivered it, taken from
+    ///     <see cref="ReceivedMessage.Context" />. The server refuses it with status 87 when the partition was
+    ///     deleted and recreated after that poll, and with status 5009 when the partition moved to another member
+    ///     of the consumer group, so a late commit never lands on the newer partition.
+    /// </summary>
+    /// <param name="offset">The offset to store</param>
+    /// <param name="partitionId">The partition that delivered the offset</param>
+    /// <param name="context">The context of the message the offset belongs to</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, PartitionContext context,
+        CancellationToken ct = default)
+    {
+        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId,
+            context, ct);
+    }
+
+    /// <summary>
     ///     Deletes the stored consumer offset for a specific partition.
     ///     The local duplicate filter, polling strategy, and buffered messages remain unchanged.
+    ///     The delete takes the context the partition's route reports, so it can fail once with status 87, or 5009
+    ///     for a consumer group, after another client recreated the partition. The failed route is dropped and the
+    ///     next call routes again.
     /// </summary>
     /// <param name="partitionId">The partition ID</param>
     /// <param name="ct">Cancellation token</param>
@@ -424,6 +458,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         await _pollingSemaphore.WaitAsync(ct);
 
+        var polledPartition = PolledMessages.NoAssignedPartition;
         try
         {
             if (_config.PollingIntervalMs > 0)
@@ -432,13 +467,18 @@ public partial class IggyConsumer : IAsyncDisposable
             }
 
             var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
-                _config.AutoCommit, ct);
+                _config.PartitionId, _config.Consumer, partitionId =>
+                {
+                    polledPartition = partitionId;
+                    return PollingStrategyFor(partitionId);
+                }, _config.BatchSize, _config.AutoCommit, ct);
 
             if (messages.Messages.Count == 0)
             {
                 if (messages.PartitionId == PolledMessages.NoAssignedPartition)
                 {
+                    // Partitions come back under a new owner generation, which refuses a kept continuation.
+                    _nextPollingStrategies.Clear();
                     LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
                     await Task.Delay(NoAssignedPartitionBackoffMs, ct);
                 }
@@ -446,7 +486,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 return;
             }
 
-            _lastPolledContext[messages.PartitionId] = messages.Context;
+            RememberPolledContext(messages.PartitionId, messages.Context);
             var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId,
                 out var lastPolledPartitionOffset);
 
@@ -464,6 +504,7 @@ public partial class IggyConsumer : IAsyncDisposable
                     Message = message,
                     CurrentOffset = message.Header.Offset,
                     PartitionId = messages.PartitionId,
+                    Context = messages.Context,
                     Status = MessageStatus.Success,
                     Error = null
                 };
@@ -479,18 +520,14 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
                         lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, messages.Context, ct);
                 }
 
                 return;
             }
 
             _lastPolledOffset[messages.PartitionId] = currentOffset;
-
-            if (_config.PollingStrategy.Kind == MessagePolling.Offset)
-            {
-                _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
-            }
+            RememberNextPollingStrategy(messages.PartitionId, currentOffset, messages.Context);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -503,6 +540,7 @@ public partial class IggyConsumer : IAsyncDisposable
         }
         catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
         {
+            ForgetRefusedPollingStrategy(ex, polledPartition);
             LogFailedToPollMessages(ex);
             _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
         }
@@ -510,6 +548,60 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             _pollingSemaphore.Release();
         }
+    }
+
+    /// <summary>
+    ///     The strategy for the partition a poll reads: the continuation after its last batch, or the configured
+    ///     strategy before the first batch and after a refused continuation.
+    /// </summary>
+    private PollingStrategy PollingStrategyFor(uint partitionId)
+    {
+        return _nextPollingStrategies.TryGetValue(partitionId, out var next) ? next : _config.PollingStrategy;
+    }
+
+    /// <summary>
+    ///     Under <see cref="MessagePolling.Next" /> the server keeps the position, so nothing is recorded.
+    /// </summary>
+    private void RememberNextPollingStrategy(uint partitionId, ulong lastOffset, PartitionContext context)
+    {
+        if (_config.PollingStrategy.Kind != MessagePolling.Next)
+        {
+            _nextPollingStrategies[partitionId] = PollingStrategy.Offset(lastOffset + 1).WithContext(context);
+        }
+    }
+
+    /// <summary>
+    ///     A refusal names no partition: it answers the poll of the partition the client asked a strategy for last.
+    ///     Status 87 or 5009 means the partition no longer has the incarnation or owner the continuation was pinned
+    ///     to, so its next poll starts over from the configured strategy.
+    /// </summary>
+    private void ForgetRefusedPollingStrategy(Exception error, uint polledPartition)
+    {
+        if (error is IggyInvalidStatusCodeException
+            {
+                FromServer: true,
+                StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
+            })
+        {
+            _nextPollingStrategies.TryRemove(polledPartition, out _);
+        }
+    }
+
+    /// <summary>
+    ///     Records the context a poll of the partition was served under. Offsets compare only within one
+    ///     incarnation and owner, as in the Rust consumer: a recreated partition restarts at offset 0, so a duplicate
+    ///     filter carried over from the old incarnation would drop the replacement's messages and then commit the
+    ///     old offset into it. The metadata operation is left out because unrelated metadata commits advance it.
+    /// </summary>
+    private void RememberPolledContext(uint partitionId, PartitionContext context)
+    {
+        if (_lastPolledContext.TryGetValue(partitionId, out var previous)
+            && (previous.Incarnation != context.Incarnation || previous.OwnerGeneration != context.OwnerGeneration))
+        {
+            _lastPolledOffset.TryRemove(partitionId, out _);
+        }
+
+        _lastPolledContext[partitionId] = context;
     }
 
     /// <summary>

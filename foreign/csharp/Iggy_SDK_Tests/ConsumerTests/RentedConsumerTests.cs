@@ -135,7 +135,7 @@ public class RentedConsumerTests
         var client = new Mock<IIggyClient>(MockBehavior.Loose);
         client.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         client.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(),
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
                 It.IsAny<bool>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new MessageDecryptionException(0, 1, new InvalidOperationException("decrypt fail")));
         var consumer = new IggyConsumer(client.Object, BuildConfig(), NullLoggerFactory.Instance);
@@ -368,7 +368,7 @@ public class RentedConsumerTests
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         mock.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
-                It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(), It.IsAny<bool>(),
+                It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(() =>
             {

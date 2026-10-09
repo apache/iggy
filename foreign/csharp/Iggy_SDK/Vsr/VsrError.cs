@@ -46,6 +46,7 @@ internal static class VsrError
     internal const int TOPIC_ID_NOT_FOUND = 2010;
     internal const int CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
+    internal const int TOO_MANY_CONSUMER_GROUPS = 5010;
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;
     internal const int SESSION_MISMATCH = 14004;
     internal const int REQUEST_ID_EXHAUSTED = 14005;

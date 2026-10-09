@@ -55,6 +55,13 @@ public sealed class ReceivedMessage<T>
     public uint PartitionId { get; init; }
 
     /// <summary>
+    ///     The partition incarnation and owner of the poll that delivered this message. Pass it to
+    ///     <see cref="IggyConsumer.StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> to commit
+    ///     the message after later polls.
+    /// </summary>
+    public PartitionContext Context { get; init; }
+
+    /// <summary>
     ///     The status of the message (Success, DeserializationFailed).
     /// </summary>
     public MessageStatus Status { get; init; } = MessageStatus.Success;
@@ -84,6 +91,13 @@ public class ReceivedMessage
     ///     The partition ID from which this message was consumed
     /// </summary>
     public uint PartitionId { get; init; }
+
+    /// <summary>
+    ///     The partition incarnation and owner of the poll that delivered this message. Pass it to
+    ///     <see cref="IggyConsumer.StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> to commit
+    ///     the message after later polls.
+    /// </summary>
+    public PartitionContext Context { get; init; }
 
     /// <summary>
     ///     The status of the message (Success, DeserializationFailed)

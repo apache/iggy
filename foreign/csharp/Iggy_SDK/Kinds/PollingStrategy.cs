@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Kinds;
@@ -37,6 +38,25 @@ public readonly struct PollingStrategy
     ///     For First, Last, and Next: this value is 0.
     /// </summary>
     public required ulong Value { get; init; }
+
+    /// <summary>
+    ///     The partition incarnation and owner the poll has to be served under, stamped into the request header.
+    ///     The server refuses the poll with status 87 when the partition was deleted and recreated since, and with
+    ///     status 5009 when it moved to another member of the consumer group. Null takes the context the
+    ///     partition's route reports.
+    /// </summary>
+    public PartitionContext? Context { get; init; }
+
+    /// <summary>
+    ///     Pins the poll to a context, such as <see cref="PolledMessages.Context" /> of an earlier poll, so it never
+    ///     reads a newer incarnation of the partition.
+    /// </summary>
+    /// <param name="context">The context the poll has to be served under.</param>
+    /// <returns>This strategy with the context set.</returns>
+    public PollingStrategy WithContext(PartitionContext context)
+    {
+        return this with { Context = context };
+    }
 
     /// <summary>
     ///     Creates a polling strategy that starts from a specific message offset.

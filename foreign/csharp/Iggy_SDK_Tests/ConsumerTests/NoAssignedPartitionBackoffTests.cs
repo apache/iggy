@@ -43,7 +43,7 @@ public sealed class NoAssignedPartitionBackoffTests
         var stopwatch = Stopwatch.StartNew();
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
-                It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(), It.IsAny<bool>(),
+                It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(() =>
             {
@@ -72,7 +72,7 @@ public sealed class NoAssignedPartitionBackoffTests
         var stopwatch = Stopwatch.StartNew();
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
-                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(),
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(),
                 It.IsAny<bool>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(() =>
             {
@@ -101,7 +101,7 @@ public sealed class NoAssignedPartitionBackoffTests
         var errors = 0;
         var mock = new Mock<IIggyClient>(MockBehavior.Loose);
         mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
-                It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(), It.IsAny<bool>(),
+                It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(NoAssignment);
         var consumer = new IggyConsumer(mock.Object, BuildConfig(), NullLoggerFactory.Instance);
