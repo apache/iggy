@@ -132,8 +132,15 @@ const topicPartitions = new WeakMap<RawClient, Map<string, TopicPartitions>>();
 const getTopicPartitions = (client: RawClient, streamId: Id, topicId: Id): TopicPartitions => {
   let topics = topicPartitions.get(client);
   if (!topics) {
-    topics = new Map();
-    topicPartitions.set(client, topics);
+    const created = new Map<string, TopicPartitions>();
+    topicPartitions.set(client, created);
+    // The client's own stream, topic or partition change can alter any
+    // count, as it drops the Rust SDK's topic discovery.
+    client.on('topicDiscoveryReset', () => {
+      for (const topic of created.values())
+        topic.count = undefined;
+    });
+    topics = created;
   }
   const key = `${idKey(streamId)}\0${idKey(topicId)}`;
   let topic = topics.get(key);

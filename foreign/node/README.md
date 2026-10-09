@@ -54,7 +54,22 @@ remains authoritative for classifying or rejecting extension commands.
 Sends always carry an explicit partition id. The client resolves
 `Partitioning.Balanced` round-robin and `Partitioning.MessageKey` as XXH32
 (seed 0) of the key modulo the topic's partition count, as the Rust SDK does.
-The count is cached per topic and read again after a refused send.
+The count is cached per topic. The client reads it again after a refused send,
+and after the client deletes a stream or a topic or creates or deletes
+partitions. A raw `SendMessages` command without an explicit partition id
+fails with error code 5 before the client sends it.
+
+Partition commands carry a partition context: the partition incarnation, the
+owner generation and a metadata operation. To make a poll or an offset write
+fail instead of landing in a recreated partition, pass the `context` of the
+earlier poll reply. Without one, the client takes the context that its cached
+route reports. If another client deletes and recreates the partition, one such
+call can fail with error code 87 (5009 for a consumer group). The client then
+drops the route, and the next call routes again. On a cluster, polls and
+offset writes go to the partition primary with one attempt per route, as in the
+Rust SDK. They return a lifecycle refusal (error code 88) at once. The client
+retries an 88 for any other request as a new request until the request
+deadline. The pause starts at 50 ms and doubles up to 1 s.
 
 VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 

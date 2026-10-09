@@ -22,7 +22,8 @@ import { describe, it } from 'node:test';
 import { EMPTY_PARTITION_CONTEXT } from '../vsr/header.js';
 import type {
   CommandResponse,
-  RawClient
+  RawClient,
+  SendCommandOptions
 } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError } from '../error.utils.js';
@@ -82,15 +83,15 @@ const stubClient = (
 ): {
   client: RawClient,
   emitter: EventEmitter,
-  commands: { command: number, payload: Buffer }[]
+  commands: { command: number, payload: Buffer, options?: SendCommandOptions }[]
 } => {
   const emitter = new EventEmitter();
-  const commands: { command: number, payload: Buffer }[] = [];
+  const commands: { command: number, payload: Buffer, options?: SendCommandOptions }[] = [];
   const client = {
     protocol: 'vsr',
     isAuthenticated: true,
-    sendCommand: async (command: number, payload: Buffer) => {
-      commands.push({ command, payload });
+    sendCommand: async (command: number, payload: Buffer, options?: SendCommandOptions) => {
+      commands.push({ command, payload, options });
       onCommand?.(command, emitter);
       const next = responses.shift();
       if (!next)
@@ -435,5 +436,43 @@ describe('VSR consumer-group polling', () => {
       7
     );
     assert.equal(held, false);
+  });
+});
+
+describe('VSR poll context', () => {
+  const context = { incarnation: 7n, ownerGeneration: 8n, metadataOp: 9n };
+
+  it('passes the caller context with an explicit partition poll', async () => {
+    const { client, commands } = stubClient([pollResponse(4)]);
+    await pollMessages(async () => client)({ ...groupRequest, partitionId: 4, context });
+    assert.deepEqual(commands.map(({ options }) => options?.context), [context]);
+  });
+
+  it('passes the caller context with the partition a group poll selects', async () => {
+    const { client, commands } = stubClient([assignment(1n, [4]), pollResponse(4)]);
+    await pollMessages(async () => client)({ ...groupRequest, context });
+    assert.deepEqual(commands.map(({ options }) => options?.context), [undefined, context]);
+  });
+
+  it('surfaces stale ownership under a caller context and resynchronizes next time', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [4]),
+      new ResponseError(COMMAND_CODE.PollMessages, 5009),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+    const poll = pollMessages(async () => client);
+    await assert.rejects(poll({ ...groupRequest, context }), (error: unknown) =>
+      error instanceof ResponseError && error.errorCode === 5009);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
   });
 });

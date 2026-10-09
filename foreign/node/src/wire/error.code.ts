@@ -241,6 +241,7 @@ export const translateErrorCode = (code: number): string => {
     case '5007': return "Failed to create consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}.";
     case '5008': return "Failed to delete consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}.";
     case '5009': return "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress).";
+    case '5010': return "Too many consumer groups";
     case '6000': return "Base offset is missing";
     case '6001': return "Last offset delta is missing";
     case '6002': return "Max timestamp is missing";

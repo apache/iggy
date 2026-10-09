@@ -27,7 +27,7 @@ import {
 } from '../offset/offset.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError, responseError } from '../error.utils.js';
-import { EMPTY_PARTITION_CONTEXT } from '../vsr/header.js';
+import { EMPTY_PARTITION_CONTEXT, type PartitionContext } from '../vsr/header.js';
 import {
   SYNC_GROUP,
   type ConsumerGroupAssignment,
@@ -101,7 +101,16 @@ export type PollMessages = {
   /** Maximum number of messages to poll */
   count: number,
   /** Whether to auto-commit offset after polling */
-  autocommit: boolean
+  autocommit: boolean,
+  /**
+   * Context of the reply an offset came from (`PollMessagesResponse.context`),
+   * so a continuation poll fails instead of reading that offset in a partition
+   * deleted and recreated since. Without one the client takes the context its
+   * cached route reports: after another client deletes and recreates the
+   * partition, one poll can fail with 87 (5009 for a group consumer). The
+   * failed route is dropped and the next call routes again.
+   */
+  context?: PartitionContext
 };
 
 /**
@@ -213,6 +222,7 @@ const pollConsumerGroup = async (
       response = await client.sendCommand(
         POLL_MESSAGES.code,
         POLL_MESSAGES.serialize({ ...request, partitionId }),
+        { context: request.context },
       );
     } catch (error) {
       if (!(error instanceof ResponseError) ||
@@ -220,6 +230,10 @@ const pollConsumerGroup = async (
            error.errorCode !== GROUP_PARTITION_NOT_OWNED))
         throw error;
       state.cursors.delete(key);
+      // A caller context names one owner, so a retry under it would be
+      // refused again. The caller decides, as in the Rust SDK.
+      if (request.context && error.errorCode === GROUP_PARTITION_NOT_OWNED)
+        throw error;
       continue;
     }
     const polled = POLL_MESSAGES.deserialize(response);
@@ -268,7 +282,8 @@ export const pollMessages = (getClient: ClientProvider) =>
       return POLL_MESSAGES.deserialize(
         await client.sendCommand(
           POLL_MESSAGES.code,
-          POLL_MESSAGES.serialize(request)
+          POLL_MESSAGES.serialize(request),
+          { context: request.context }
         )
       );
     } finally {

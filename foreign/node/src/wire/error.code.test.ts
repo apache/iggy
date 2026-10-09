@@ -82,5 +82,6 @@ it('translates the consumer-group error range', () => {
     translateErrorCode(5009),
     'Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress).'
   );
-  assert.equal(translateErrorCode(5010), 'error');
+  assert.equal(translateErrorCode(5010), 'Too many consumer groups');
+  assert.equal(translateErrorCode(5011), 'error');
 });

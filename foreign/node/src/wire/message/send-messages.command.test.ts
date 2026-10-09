@@ -17,6 +17,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { uuidv7, uuidv4 } from "uuidv7";
 import type { CommandResponse, RawClient } from "../../client/client.type.js";
 import {
@@ -283,7 +284,10 @@ const topicBody = (partitionsCount: number): Buffer => {
 
 const sendClient = (partitionsCount: number, refuseFirstSend = false) => {
   const sent: { code: number, payload: Buffer }[] = [];
+  const events = new EventEmitter();
   const client = {
+    on: events.on.bind(events),
+    emit: events.emit.bind(events),
     sendCommand: async (code: number, payload: Buffer): Promise<CommandResponse> => {
       sent.push({ code, payload });
       if (code === COMMAND_CODE.SendMessages && refuseFirstSend) {
@@ -333,6 +337,16 @@ describe("SendMessages partition resolution", () => {
     await assert.rejects(send(request));
     await send(request);
     assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 2);
+  });
+
+  it("reads the partition count again after the client changes topics", async () => {
+    const { client, sent } = sendClient(2);
+    const send = sendMessages(async () => client);
+    await send(request);
+    (client as unknown as EventEmitter).emit("topicDiscoveryReset");
+    await send(request);
+    assert.equal(countOf(sent, COMMAND_CODE.GetTopic), 2);
+    assert.deepEqual(sentPartitions(sent), [0, 1], "the round-robin position survives");
   });
 
   it("holds the raw client across the topic read and the send", async () => {

@@ -61,9 +61,12 @@ const UNAUTHENTICATED = 40;
 const UNAUTHORIZED = 41;
 const STALE_CLIENT = 30;
 const HISTORY_UNAVAILABLE = 87;
+const LIFECYCLE_BUSY = 88;
+const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
+/** Each lifecycle retry commits another refusal, so its pause doubles up to this. */
+const LIFECYCLE_RETRY_MAX_INTERVAL_MS = 1_000;
 const MAX_POLL_ROUTES = 4096;
-const MAX_SEND_CONTEXTS = 4096;
 const MAX_POLL_CONNECTIONS = 256;
 const CONSUMER_SESSION_SIZE = 32;
 const METADATA_WATERMARK_OFFSET = 24;
@@ -73,11 +76,32 @@ const SEND_METADATA_LENGTH_SIZE = 4;
 const PARTITION_ID_SIZE = 4;
 const STORE_OFFSET_SUFFIX_SIZE = 8 + 1;
 const DELETE_OFFSET_SUFFIX_SIZE = 1;
+const RAW_SEND_NEEDS_PARTITION =
+  'Raw sends need an explicit partition id. Use the typed send API for Balanced or MessageKey partitioning.';
+
+/**
+ * The client's own commands after which every cached send context is dropped,
+ * as the Rust SDK drops its topic discovery. Names and numeric ids can key the
+ * same topic twice, so a single entry cannot be singled out.
+ */
+const TOPIC_DISCOVERY_RESETS = new Set<number>([
+  COMMAND_CODE.DeleteStream,
+  COMMAND_CODE.DeleteTopic,
+  COMMAND_CODE.CreatePartitions,
+  COMMAND_CODE.DeletePartitions
+]);
 
 type PollRoute = {
   context: PartitionContext,
   endpoint: Endpoint,
   attachment: Buffer,
+};
+
+/** The context a route reports for a poll or an offset write on this connection. */
+type RouteContext = {
+  context: PartitionContext,
+  /** Stale once the client observes a newer metadata commit */
+  metadataWatermark: bigint
 };
 
 type PollConnection = {
@@ -224,8 +248,15 @@ export class CommandResponseStream extends EventEmitter {
   private metadataWatermark = 0n;
   private routingGeneration = 0;
   private pollRoutes = new Map<string, PollRoute>();
-  private sendContexts = new Map<string, PartitionContext>();
+  private routeContexts = new Map<string, RouteContext>();
+  /** Send contexts by stream and topic identifier bytes, then partition id */
+  private sendContexts = new Map<string, Map<number, PartitionContext>>();
   private pollConnections = new Map<string, PollConnection>();
+  /**
+   * A connection to a partition primary. Each request on it gets one attempt:
+   * its caller routes again instead, as the Rust SDK does.
+   */
+  private dataConnection = false;
 
   /**
    * Creates a new CommandResponseStream.
@@ -279,9 +310,8 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   /**
-   * Re-submits queued commands through the full send path, so each one
-   * reconnects, re-authenticates and re-checks the leader as if it had just
-   * been called.
+   * Re-submits queued commands once the client has reconnected and signed in
+   * again on the node it moved to.
    *
    * Only for a drop the client caused. Nothing here was written, so there is no
    * outcome in doubt: a command still in the queue when the socket is replaced
@@ -293,17 +323,25 @@ export class CommandResponseStream extends EventEmitter {
     this._execQueue = [];
     for (const job of queued) {
       debug('re-issuing a queued command after a leader move', job.command);
-      // The whole job, not just the payload: a fresh budget would let a command
-      // caught in a move take twice the response timeout, and a roster read
-      // re-issued as leader-following would answer a leader check with another
-      // leader check.
-      this.sendCommand(job.command, job.payload, {
-        handleResponse: job.handleResponse,
-        last: job.last,
-        followsLeaderMoves: job.followsLeaderMoves,
-        deadline: job.deadline
-      }).then(job.resolve, job.reject);
+      this._resubmit(job).then(job.resolve, job.reject);
     }
+  }
+
+  /**
+   * The whole job goes back in the queue, not just its payload, and its caller
+   * still owns every retry decision. A fresh budget would let a command caught
+   * in a move take twice the response timeout, a roster read re-issued as
+   * leader-following would answer a leader check with another leader check,
+   * and a fresh context would commit work from one partition incarnation in
+   * another or refresh a send twice.
+   */
+  private async _resubmit(job: Job): Promise<CommandResponse> {
+    if (!this.connection.connected)
+      await this.connection.connect();
+    if (!this.isAuthenticated && !this.isUnloggedCommand(job.command))
+      await this.authenticate(this._signInCredentials());
+    return this._queueCommand(job.command, job.payload, job.handleResponse,
+      job.last, job.followsLeaderMoves, job.deadline, job.context);
   }
 
   /**
@@ -327,30 +365,30 @@ export class CommandResponseStream extends EventEmitter {
         last = true,
         followsLeaderMoves = true
       } = options;
-      // The server serves every poll on the partition primary only.
-      const routedPoll = command === COMMAND_CODE.PollMessages &&
-        payload.length > POLL_OPTIONS_SIZE;
-      const pollDeadline = routedPoll
+      // The server serves polls and offset writes on the partition primary only.
+      const route = partitionRoute(command, payload);
+      const routeDeadline = route
         ? options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS
         : undefined;
 
       if (!this.connection.connected)
-        await (pollDeadline === undefined ? this.connection.connect()
-          : withinDeadline(this.connection.connect(), pollDeadline));
+        await (routeDeadline === undefined ? this.connection.connect()
+          : withinDeadline(this.connection.connect(), routeDeadline));
 
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
-        await (pollDeadline === undefined ? this.authenticate(this._signInCredentials())
-          : withinDeadline(this.authenticate(this._signInCredentials()), pollDeadline));
+        await (routeDeadline === undefined ? this.authenticate(this._signInCredentials())
+          : withinDeadline(this.authenticate(this._signInCredentials()), routeDeadline));
 
-      if (pollDeadline !== undefined) {
-        const deadline = pollDeadline;
+      if (route && routeDeadline !== undefined) {
+        const deadline = routeDeadline;
         if (this.clustered === undefined)
           await withinDeadline(this.sendCommand(GET_CLUSTER_METADATA.code,
             GET_CLUSTER_METADATA.serialize(), { deadline, followsLeaderMoves: false }), deadline);
         if (this.clustered === undefined)
-          throw new Error('cannot determine the poll routing topology');
+          throw new Error('cannot determine the partition routing topology');
         if (this.clustered)
-          return await this._pollOnPrimary(payload, deadline, handleResponse);
+          return await this._sendOnPrimary(command, route, payload, deadline,
+            handleResponse, options.context);
       }
 
       // The roster read is itself a queued command and the queue is
@@ -371,8 +409,9 @@ export class CommandResponseStream extends EventEmitter {
       // after a move keeps the budget it was first submitted with, rather than
       // opening a second one.
       const deadline = options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS;
-      let context = await this._capturePartitionContext(command, payload, deadline);
+      let context = await this._capturePartitionContext(command, payload, deadline, options.context);
       let contextRefreshed = false;
+      let lifecycleRetryInterval = VSR_RETRY_INTERVAL_MS;
       let response: CommandResponse;
       let walkingRoster = false;
       const visitedRosterEndpoints = new Set<string>();
@@ -382,13 +421,28 @@ export class CommandResponseStream extends EventEmitter {
             last, followsLeaderMoves, deadline, context);
           break;
         } catch (error) {
+          // A failed route is dropped, so the next call routes again.
+          if (route)
+            this.routeContexts.delete(route.key);
           // A history refusal is definitive: no attempt of this request ran,
           // so one re-issue under a fresh context cannot duplicate the write.
-          if (command === COMMAND_CODE.SendMessages && context && !contextRefreshed &&
-              error instanceof ResponseError && error.errorCode === HISTORY_UNAVAILABLE &&
-              worthAnotherAttempt(deadline)) {
-            contextRefreshed = true;
-            context = await this._capturePartitionContext(command, payload, deadline, true);
+          // A context the caller supplied is never replaced.
+          if (command === COMMAND_CODE.SendMessages && error instanceof ResponseError &&
+              error.errorCode === HISTORY_UNAVAILABLE) {
+            this.sendContexts.delete(sendTarget(payload).topic);
+            if (!options.context && !contextRefreshed && worthAnotherAttempt(deadline)) {
+              contextRefreshed = true;
+              context = await this._capturePartitionContext(command, payload, deadline);
+              continue;
+            }
+          }
+          // A lifecycle refusal is committed, so the request did not apply and
+          // its retry is a new request. The pause runs here, outside the queue,
+          // so it holds back no other command of this client.
+          if (error instanceof ResponseError && error.errorCode === LIFECYCLE_BUSY &&
+              Date.now() + lifecycleRetryInterval < deadline) {
+            await delay(lifecycleRetryInterval);
+            lifecycleRetryInterval = Math.min(lifecycleRetryInterval * 2, LIFECYCLE_RETRY_MAX_INTERVAL_MS);
             continue;
           }
           if (!(error instanceof LeaderMovedError))
@@ -448,6 +502,10 @@ export class CommandResponseStream extends EventEmitter {
             await this.authenticate(this._signInCredentials());
         }
       }
+      if (TOPIC_DISCOVERY_RESETS.has(command)) {
+        this.sendContexts.clear();
+        this.emit('topicDiscoveryReset');
+      }
       if (!isLoginCommand(command) || this.settlingLeader)
         return response;
       // A login that re-authenticates a roster walk stays on the dialed node:
@@ -470,57 +528,61 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
+  /**
+   * The context a partition command carries: the caller's, a cached send
+   * context, or one discovered for it. A partition command whose target cannot
+   * be read fails here, before it could go out under no context.
+   */
   private async _capturePartitionContext(
     command: number,
     payload: Buffer,
     deadline: number,
-    refresh = false
+    context?: PartitionContext
   ): Promise<PartitionContext | undefined> {
     if (command === COMMAND_CODE.SendMessages) {
-      let position = SEND_METADATA_LENGTH_SIZE;
-      for (let identifier = 0; identifier < 2; identifier++) {
-        if (position + IDENTIFIER_PREFIX_SIZE > payload.length)
-          return undefined;
-        position += IDENTIFIER_PREFIX_SIZE + payload[position + 1];
-      }
-      if (position + IDENTIFIER_PREFIX_SIZE + PARTITION_ID_SIZE > payload.length ||
-          payload[position] !== PartitionKind.PartitionId ||
-          payload[position + 1] !== PARTITION_ID_SIZE)
-        return undefined;
-      const query = Buffer.concat([
-        payload.subarray(SEND_METADATA_LENGTH_SIZE, position),
-        payload.subarray(position + IDENTIFIER_PREFIX_SIZE,
-          position + IDENTIFIER_PREFIX_SIZE + PARTITION_ID_SIZE)
-      ]);
-      const key = query.toString('hex');
-      const cached = refresh ? undefined : this.sendContexts.get(key);
+      const target = sendTarget(payload);
+      if (context)
+        return context;
+      const cached = this.sendContexts.get(target.topic)?.get(target.partitionId);
       if (cached)
         return cached;
-      const context = await this._queryPartitionContext(
-        command, COMMAND_CODE.GetSendContext, query, 0, deadline);
-      if (this.sendContexts.size >= MAX_SEND_CONTEXTS)
-        this.sendContexts.clear();
-      this.sendContexts.set(key, context);
+      const captured = deserializePartitionContext(await this._queryPartition(
+        command, COMMAND_CODE.GetSendContext, target.query, PARTITION_CONTEXT_SIZE, deadline));
+      let contexts = this.sendContexts.get(target.topic);
+      if (!contexts) {
+        contexts = new Map();
+        this.sendContexts.set(target.topic, contexts);
+      }
+      contexts.set(target.partitionId, captured);
+      return captured;
+    }
+    const route = partitionRoute(command, payload);
+    if (!route || context)
       return context;
+    // The route cache follows the Rust SDK: a route holds until the session
+    // changes or the client observes a newer metadata commit.
+    const cached = this.routeContexts.get(route.key);
+    if (cached && cached.metadataWatermark >= this.metadataWatermark)
+      return cached.context;
+    const generation = this.routingGeneration;
+    const routed = await this._queryPartition(
+      command, route.code, route.query, CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE, deadline);
+    const reported = routed.readBigUInt64LE(METADATA_WATERMARK_OFFSET);
+    const fresh = {
+      context: deserializePartitionContext(routed, CONSUMER_SESSION_SIZE),
+      metadataWatermark: reported > this.metadataWatermark ? reported : this.metadataWatermark
+    };
+    if (generation === this.routingGeneration) {
+      if (this.routeContexts.size >= MAX_POLL_ROUTES)
+        this.routeContexts.clear();
+      this.routeContexts.set(route.key, fresh);
     }
-    let query = payload;
-    let queryCode = COMMAND_CODE.GetPollRouting;
-    if (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset) {
-      const suffix = command === COMMAND_CODE.StoreOffset
-        ? STORE_OFFSET_SUFFIX_SIZE : DELETE_OFFSET_SUFFIX_SIZE;
-      if (payload.length <= suffix)
-        return undefined;
-      query = payload.subarray(0, -suffix);
-      queryCode = COMMAND_CODE.GetConsumerOffsetRouting;
-    } else if (command !== COMMAND_CODE.PollMessages || payload.length <= POLL_OPTIONS_SIZE) {
-      return undefined;
-    }
-    return this._queryPartitionContext(command, queryCode, query, CONSUMER_SESSION_SIZE, deadline);
+    return fresh.context;
   }
 
-  private async _queryPartitionContext(
-    command: number, queryCode: number, query: Buffer, offset: number, deadline: number
-  ): Promise<PartitionContext> {
+  private async _queryPartition(
+    command: number, queryCode: number, query: Buffer, size: number, deadline: number
+  ): Promise<Buffer> {
     let response: CommandResponse;
     try {
       response = await this.sendCommand(queryCode, query, { deadline });
@@ -528,9 +590,9 @@ export class CommandResponseStream extends EventEmitter {
       throw error instanceof ResponseError && !(error instanceof VsrEvictionError)
         ? responseError(command, error.errorCode) : error;
     }
-    if (response.data.length < offset + PARTITION_CONTEXT_SIZE)
+    if (response.data.length < size)
       throw new Error('partition context response is incomplete');
-    return deserializePartitionContext(response.data, offset);
+    return response.data;
   }
 
   private _queueCommand(
@@ -673,13 +735,16 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
-  private async _pollOnPrimary(
+  private async _sendOnPrimary(
+    command: number,
+    partition: PartitionRoute,
     payload: Buffer,
     deadline: number,
-    handleResponse: boolean
+    handleResponse: boolean,
+    context?: PartitionContext
   ): Promise<CommandResponse> {
-    const key = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
-    let captured: PartitionContext | undefined;
+    const key = partition.key;
+    let captured = context;
     while (Date.now() < deadline && !this.connection.ending) {
       try {
         const generation = this.routingGeneration;
@@ -688,16 +753,16 @@ export class CommandResponseStream extends EventEmitter {
             route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
               this.metadataWatermark) {
           const response = await withinDeadline(
-            this._pollRoutingControl(payload, deadline), deadline);
+            this._routingControl(partition, deadline), deadline);
           if (generation !== this.routingGeneration)
-            throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
           if (response.data.length < CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE)
-            throw new Error('poll routing response is incomplete');
+            throw new Error('partition routing response is incomplete');
           const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE);
           if (node.length + CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE !== response.data.length || !node.data.ip)
-            throw new Error('poll routing response has no valid TCP endpoint');
+            throw new Error('partition routing response has no valid TCP endpoint');
           if (node.data.endpoints.tcp === 0)
-            throw responseError(COMMAND_CODE.PollMessages, FEATURE_UNAVAILABLE);
+            throw responseError(command, FEATURE_UNAVAILABLE);
           const attachment = Buffer.from(response.data.subarray(0, CONSUMER_SESSION_SIZE));
           if (attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) < this.metadataWatermark)
             attachment.writeBigUInt64LE(this.metadataWatermark, METADATA_WATERMARK_OFFSET);
@@ -718,7 +783,7 @@ export class CommandResponseStream extends EventEmitter {
           if (this.pollConnections.size >= MAX_POLL_CONNECTIONS) {
             const idle = Array.from(this.pollConnections).find(([, value]) => !value.busy);
             if (!idle)
-              throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+              throw responseError(command, TRANSIENT_NOT_ACCEPTED);
             this.pollConnections.delete(idle[0]);
             idle[1].client.destroy();
           }
@@ -730,7 +795,11 @@ export class CommandResponseStream extends EventEmitter {
               reconnect: { enabled: false, interval: 0, maxRetries: 0 }
             })
           };
-          entry.client.vsrSession = new VsrSession(this.vsrSession.clientId);
+          // One session object, as Rust shares its consensus session: the
+          // partition deduplicates writes by client id and request id, so a
+          // counter of its own would reuse ids the session already sent.
+          entry.client.vsrSession = this.vsrSession;
+          entry.client.dataConnection = true;
           this.pollConnections.set(endpoint, entry);
         }
         while (entry.busy)
@@ -739,11 +808,11 @@ export class CommandResponseStream extends EventEmitter {
             this.pollConnections.get(endpoint) !== entry ||
             route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
               this.metadataWatermark)
-          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+          throw responseError(command, TRANSIENT_NOT_ACCEPTED);
 
         let release!: () => void;
         entry.busy = new Promise<void>((resolve) => { release = resolve; });
-        let polling = false;
+        let sent = false;
         try {
           if (!entry.client.isAuthenticated) {
             entry.attachment = undefined;
@@ -758,9 +827,9 @@ export class CommandResponseStream extends EventEmitter {
           if (generation !== this.routingGeneration ||
               route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
                 this.metadataWatermark)
-            throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
-          polling = true;
-          return await entry.client._queueCommand(COMMAND_CODE.PollMessagesOnPrimary,
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+          sent = true;
+          return await entry.client._queueCommand(partition.primaryCode,
             payload, handleResponse, true, false, deadline, captured);
         } catch (error) {
           if (error instanceof ResponseError &&
@@ -773,8 +842,8 @@ export class CommandResponseStream extends EventEmitter {
           }
           if (!(error instanceof ResponseError) || error instanceof VsrEvictionError ||
               error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT)
-            throw responseError(COMMAND_CODE.PollMessages,
-              polling ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
+            throw responseError(command,
+              sent ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
           throw error;
         } finally {
           entry.busy = undefined;
@@ -783,24 +852,24 @@ export class CommandResponseStream extends EventEmitter {
       } catch (error) {
         this.pollRoutes.delete(key);
         if (error instanceof VsrResponseTimeoutError)
-          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_COMMITTED);
+          throw responseError(command, TRANSIENT_NOT_COMMITTED);
         if (!(error instanceof ResponseError) ||
             error.errorCode !== TRANSIENT_NOT_ACCEPTED)
           throw error instanceof ResponseError
-            ? responseError(COMMAND_CODE.PollMessages, error.errorCode)
+            ? responseError(command, error.errorCode)
             : error;
         if (!worthAnotherAttempt(deadline))
-          throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+          throw responseError(command, TRANSIENT_NOT_ACCEPTED);
         await delay(VSR_RETRY_INTERVAL_MS);
       }
     }
-    throw responseError(COMMAND_CODE.PollMessages, TRANSIENT_NOT_ACCEPTED);
+    throw responseError(command, TRANSIENT_NOT_ACCEPTED);
   }
 
-  private async _pollRoutingControl(payload: Buffer, deadline: number): Promise<CommandResponse> {
+  private async _routingControl(partition: PartitionRoute, deadline: number): Promise<CommandResponse> {
     const options = { deadline, followsLeaderMoves: false };
     try {
-      return await this.sendCommand(COMMAND_CODE.GetPollRouting, payload, options);
+      return await this.sendCommand(partition.code, partition.query, options);
     } catch (error) {
       if (error instanceof ResponseError &&
           error.errorCode !== UNAUTHENTICATED && error.errorCode !== STALE_CLIENT)
@@ -815,7 +884,7 @@ export class CommandResponseStream extends EventEmitter {
         this._resetSession();
       }
       await this.sendCommand(PING.code, PING.serialize(), { deadline });
-      return this.sendCommand(COMMAND_CODE.GetPollRouting, payload, options);
+      return this.sendCommand(partition.code, partition.query, options);
     }
   }
 
@@ -870,6 +939,7 @@ export class CommandResponseStream extends EventEmitter {
   private _clearPollRouting(): void {
     this.routingGeneration += 1;
     this.pollRoutes.clear();
+    this.routeContexts.clear();
     for (const entry of this.pollConnections.values())
       entry.client.destroy();
     this.pollConnections.clear();
@@ -1023,7 +1093,7 @@ export class CommandResponseStream extends EventEmitter {
         this._observeMetadataReply(response);
         if (!handleResp) {
           // Routing still needs refusals when the caller decodes the frame.
-          if (command === COMMAND_CODE.PollMessagesOnPrimary &&
+          if (this.dataConnection &&
               peekCommand(response) === Command.Reply &&
               readStatus(response) === TRANSIENT_NOT_ACCEPTED)
             throw responseError(command, TRANSIENT_NOT_ACCEPTED);
@@ -1044,7 +1114,7 @@ export class CommandResponseStream extends EventEmitter {
           if (!(error instanceof ResponseError) ||
               !isTransientVsrError(error.errorCode))
             throw error;
-          if (command === COMMAND_CODE.PollMessagesOnPrimary ||
+          if (this.dataConnection ||
               command === COMMAND_CODE.GetPollRouting ||
               command === COMMAND_CODE.BindSession)
             throw error;
@@ -1448,3 +1518,78 @@ const withinDeadline = async <T>(
 const isTransientVsrError = (errorCode: number): boolean =>
   errorCode === TRANSIENT_NOT_COMMITTED ||
   errorCode === TRANSIENT_NOT_ACCEPTED;
+
+type PartitionRoute = {
+  code: number,
+  query: Buffer,
+  /** The target without the poll options or the offset, as Rust keys routes */
+  key: string,
+  /** The command a partition primary serves the request as */
+  primaryCode: number
+};
+
+/**
+ * The routing query of a poll or an offset write, or nothing for any other
+ * command.
+ */
+const partitionRoute = (command: number, payload: Buffer): PartitionRoute | undefined => {
+  if (command === COMMAND_CODE.PollMessages) {
+    if (payload.length <= POLL_OPTIONS_SIZE)
+      throw responseError(command, INVALID_COMMAND);
+    const target = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
+    return {
+      code: COMMAND_CODE.GetPollRouting,
+      query: payload,
+      key: `${COMMAND_CODE.GetPollRouting}:${target}`,
+      primaryCode: COMMAND_CODE.PollMessagesOnPrimary
+    };
+  }
+  if (command !== COMMAND_CODE.StoreOffset && command !== COMMAND_CODE.DeleteConsumerOffset)
+    return undefined;
+  const suffix = command === COMMAND_CODE.StoreOffset
+    ? STORE_OFFSET_SUFFIX_SIZE : DELETE_OFFSET_SUFFIX_SIZE;
+  if (payload.length <= suffix)
+    throw responseError(command, INVALID_COMMAND);
+  const query = payload.subarray(0, -suffix);
+  return {
+    code: COMMAND_CODE.GetConsumerOffsetRouting,
+    query,
+    key: `${COMMAND_CODE.GetConsumerOffsetRouting}:${query.toString('hex')}`,
+    primaryCode: command
+  };
+};
+
+type SendTarget = {
+  /** Stream and topic identifier bytes, the scope a history refusal drops */
+  topic: string,
+  partitionId: number,
+  /** `GetSendContext` body: stream, topic and partition id */
+  query: Buffer
+};
+
+/**
+ * Reads the explicit partition a raw send writes to. A Balanced or MessageKey
+ * send names no partition, so there is no context to capture for it, and the
+ * server refuses a send without one.
+ */
+const sendTarget = (payload: Buffer): SendTarget => {
+  let position = SEND_METADATA_LENGTH_SIZE;
+  for (let identifier = 0; identifier < 2; identifier++) {
+    if (position + IDENTIFIER_PREFIX_SIZE > payload.length)
+      throw responseError(COMMAND_CODE.SendMessages, INVALID_COMMAND);
+    position += IDENTIFIER_PREFIX_SIZE + payload[position + 1];
+  }
+  if (position + IDENTIFIER_PREFIX_SIZE > payload.length)
+    throw responseError(COMMAND_CODE.SendMessages, INVALID_COMMAND);
+  if (payload[position] !== PartitionKind.PartitionId)
+    throw responseError(COMMAND_CODE.SendMessages, FEATURE_UNAVAILABLE, RAW_SEND_NEEDS_PARTITION);
+  const partition = position + IDENTIFIER_PREFIX_SIZE;
+  if (payload[position + 1] !== PARTITION_ID_SIZE || partition + PARTITION_ID_SIZE > payload.length)
+    throw responseError(COMMAND_CODE.SendMessages, INVALID_COMMAND);
+  const identifiers = payload.subarray(SEND_METADATA_LENGTH_SIZE, position);
+  return {
+    topic: identifiers.toString('hex'),
+    partitionId: payload.readUInt32LE(partition),
+    query: Buffer.concat([identifiers, payload.subarray(partition, partition + PARTITION_ID_SIZE)])
+  };
+};

@@ -18,6 +18,7 @@
 import type { Readable } from 'stream';
 import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
+import type { PartitionContext } from '../wire/vsr/header.js';
 
 /**
  * TCP socket connection options.
@@ -62,7 +63,15 @@ export type SendCommandOptions = {
    * leader move keeps the budget it was first submitted with, rather than
    * opening a second one on top of it. Defaults to a fresh response timeout.
    */
-  deadline?: number
+  deadline?: number,
+  /**
+   * Partition context of a poll, an offset store or delete, or a send to an
+   * explicit partition, taken from an earlier reply. It replaces the context
+   * the client would capture, stays on every retry, and is never refreshed
+   * after a history refusal (87): work from one partition incarnation must
+   * not land in another.
+   */
+  context?: PartitionContext
 };
 
 /**
