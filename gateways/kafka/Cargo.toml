@@ -40,6 +40,7 @@ bytes = { workspace = true }
 # The four codecs are driven from `records::decompress` rather than through kafka-protocol,
 # whose decompressors materialize the whole stream before a budget can see it.
 flate2 = { workspace = true }
+futures = { workspace = true }
 iggy = { workspace = true }
 # The codec features stay on for the encoder, which the batch tests use to build fixtures.
 kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
@@ -72,6 +73,8 @@ zstd = { workspace = true }
 crc32c = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
+# Reads the JSON events that kafka-verifiable-consumer.sh prints.
+serde_json = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [

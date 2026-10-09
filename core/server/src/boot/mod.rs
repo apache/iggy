@@ -80,12 +80,17 @@ use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{error, info, warn};
+
+const STORAGE_FORMAT_FILE: &str = "storage-format";
+const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
+const STORAGE_FORMAT: &[u8] = b"IGGY-DURABLE-SESSIONS-3\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -113,8 +118,17 @@ pub async fn prepare_runtime_dirs(
     logging: &mut Logging,
     fresh: bool,
 ) -> Result<(), ServerError> {
+    let system_path = PathBuf::from(config.get_system_path());
+    let format_present = if fresh {
+        false
+    } else {
+        validate_storage_format(&system_path)?
+    };
     if fresh {
         wipe_system_path(config).await?;
+    }
+    if !format_present {
+        publish_storage_format(&system_path)?;
     }
     create_directories(config).await.map_err(|source| {
         error!(
@@ -135,6 +149,79 @@ pub async fn prepare_runtime_dirs(
     Ok(())
 }
 
+fn validate_storage_format(system_path: &Path) -> Result<bool, ServerError> {
+    let path = system_path.join(STORAGE_FORMAT_FILE);
+    match std::fs::File::open(&path) {
+        Ok(mut file) => {
+            let result = (|| -> std::io::Result<bool> {
+                if file.metadata()?.len() != STORAGE_FORMAT.len() as u64 {
+                    return Ok(false);
+                }
+                let mut bytes = vec![0; STORAGE_FORMAT.len()];
+                file.read_exact(&mut bytes)?;
+                Ok(bytes == STORAGE_FORMAT)
+            })()
+            .map_err(|source| ServerError::StorageFormatIo {
+                path: path.clone(),
+                source,
+            })?;
+            if !result {
+                return Err(ServerError::UnsupportedStorage { path });
+            }
+            Ok(true)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read_dir(system_path) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(|source| ServerError::StorageFormatIo {
+                            path: system_path.to_owned(),
+                            source,
+                        })?;
+                        if entry.file_name() == STORAGE_FORMAT_TEMP_FILE
+                            && entry
+                                .file_type()
+                                .map_err(|source| ServerError::StorageFormatIo {
+                                    path: entry.path(),
+                                    source,
+                                })?
+                                .is_file()
+                        {
+                            continue;
+                        }
+                        return Err(ServerError::UnsupportedStorage {
+                            path: system_path.to_owned(),
+                        });
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ServerError::StorageFormatIo {
+                        path: system_path.to_owned(),
+                        source,
+                    });
+                }
+            }
+            Ok(false)
+        }
+        Err(source) => Err(ServerError::StorageFormatIo { path, source }),
+    }
+}
+
+fn publish_storage_format(system_path: &Path) -> Result<(), ServerError> {
+    let path = system_path.join(STORAGE_FORMAT_FILE);
+    (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(system_path)?;
+        let temporary = system_path.join(STORAGE_FORMAT_TEMP_FILE);
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(STORAGE_FORMAT)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, &path)?;
+        std::fs::File::open(system_path)?.sync_all()
+    })()
+    .map_err(|source| ServerError::StorageFormatIo { path, source })
+}
+
 /// Delete the configured system path so the server boots on empty state.
 async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
     let path = config.get_system_path();
@@ -145,9 +232,9 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
     if config.cluster.enabled {
         warn!(
             path = %resolved.display(),
-            "--fresh wipes only this replica, which then refills from the cluster by \
-             state transfer; wiping a quorum at once destroys committed data, and a \
-             service unit file carrying --fresh re-transfers everything on every restart"
+            "--fresh wipes only this replica; recovery after erasing its entire metadata \
+             directory is outside the automatic recovery guarantee. Wiping a quorum \
+             destroys committed data. Do not keep --fresh in a restart service command"
         );
     }
 
@@ -186,7 +273,7 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 /// # Errors
 ///
 /// Returns an error if shard allocation fails, the inbox capacity is
-/// invalid, or any OS thread fails to spawn. Per-shard recovery /
+/// invalid, the executable cannot be read, or any OS thread fails to spawn. Per-shard recovery /
 /// listener / consensus failures surface through the per-thread `Result`
 /// the caller observes on `.join()`.
 ///
@@ -216,9 +303,8 @@ pub fn bootstrap(
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
     // Before the shards, so the first count is there when a client connects.
     let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
-    if let Err(error) = crate::sysinfo_probe::start_open_files_scan(sysinfo_print_interval) {
-        warn!(error = %error, "cannot start the open-files scan thread, so open_files_count stays 0");
-    }
+    crate::sysinfo_probe::start_system_stats_sampler(sysinfo_print_interval)
+        .map_err(|source| ServerError::SystemStatsSamplerSpawnFailed { source })?;
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 
@@ -443,6 +529,10 @@ async fn shard_main(
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: message_bus::replica::handshake::binary_identity(
+            crate::VERSION,
+            STORAGE_FORMAT,
+        ),
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,
@@ -912,6 +1002,7 @@ async fn shard_main(
 
         if let Err(error) = start_tcp_runtime(
             &shard,
+            Rc::clone(&consumer_group_liveness),
             config,
             &topology,
             roster,
@@ -947,6 +1038,7 @@ async fn shard_main(
         let cleaner_shard = Rc::clone(&shard);
         let interval = config.consumer_group.heartbeat_interval.get_duration();
         let timeout = config.consumer_group.session_timeout.get_duration();
+        let system_path = config.get_system_path();
         let handle = compio::runtime::spawn(async move {
             crate::consumer_group::liveness::run(
                 cleaner_shard,
@@ -954,6 +1046,7 @@ async fn shard_main(
                 stop_rx,
                 interval,
                 timeout,
+                system_path,
             )
             .await;
         });
@@ -1073,6 +1166,72 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    async fn given_missing_or_empty_storage_when_booting_should_initialize_without_wiping_on_restart()
+     {
+        let mut logging = Logging::new(crate::VERSION);
+        logging.early_init();
+        for (exists, interrupted) in [(false, false), (true, false), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let data_path = directory.path().join("data");
+            if exists {
+                std::fs::create_dir(&data_path).unwrap();
+            }
+            if interrupted {
+                std::fs::write(data_path.join(STORAGE_FORMAT_TEMP_FILE), b"IGGY-").unwrap();
+            }
+            let mut config = ServerConfig {
+                path: data_path.to_string_lossy().into_owned(),
+                ..ServerConfig::default()
+            };
+            config.logging.file_enabled = false;
+            config.telemetry.enabled = false;
+            prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(data_path.join(STORAGE_FORMAT_FILE)).unwrap(),
+                STORAGE_FORMAT
+            );
+            let sentinel = data_path.join("existing-data");
+            let bytes = b"preserve existing data";
+            std::fs::write(&sentinel, bytes).unwrap();
+            prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(sentinel).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn incompatible_storage_is_refused_without_changing_existing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("journal");
+        let marker = directory.path().join(STORAGE_FORMAT_FILE);
+        let bytes = b"existing durable data";
+        std::fs::write(&wal, bytes).unwrap();
+        assert!(matches!(
+            validate_storage_format(directory.path()),
+            Err(ServerError::UnsupportedStorage { .. })
+        ));
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        assert!(!marker.exists());
+        for format in [
+            b"old format\n".as_slice(),
+            &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
+        ] {
+            std::fs::write(&marker, format).unwrap();
+            assert!(matches!(
+                validate_storage_format(directory.path()),
+                Err(ServerError::UnsupportedStorage { .. })
+            ));
+            assert_eq!(std::fs::read(&marker).unwrap(), format);
+            assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        }
+        std::fs::write(&marker, STORAGE_FORMAT).unwrap();
+        assert!(validate_storage_format(directory.path()).unwrap());
+    }
 
     #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {

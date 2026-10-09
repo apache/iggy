@@ -55,6 +55,7 @@ impl GetConsumerOffsetCmd {
                 format!("consumer with ID: {}", self.consumer.id)
             }
             ConsumerKind::ConsumerGroup => format!("consumer group with ID: {}", self.consumer.id),
+            ConsumerKind::ExternalGroup => format!("external group with ID: {}", self.consumer.id),
         }
     }
 }

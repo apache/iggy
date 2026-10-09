@@ -47,13 +47,20 @@ pub use iggy_binary_protocol::consensus::result_code;
 pub struct ApplyReply {
     pub code: u32,
     pub body: Bytes,
+    /// Local apply effect, recomputed from the committed operation on every replay.
+    /// It is not part of the client reply or persisted receipt.
+    pub(crate) revoked_user: Option<u32>,
 }
 
 impl ApplyReply {
     /// Successful apply carrying the typed reply body.
     #[must_use]
     pub const fn ok(body: Bytes) -> Self {
-        Self { code: 0, body }
+        Self {
+            code: 0,
+            body,
+            revoked_user: None,
+        }
     }
 
     /// Committed business rejection: empty body, `code` is the result
@@ -63,6 +70,7 @@ impl ApplyReply {
         Self {
             code: code.into(),
             body: Bytes::new(),
+            revoked_user: None,
         }
     }
 
@@ -202,6 +210,7 @@ result_enum!(TruncatePartitionResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     PartitionNotFound = 3007,
+    HistoryChanged = 3014,
 });
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`
@@ -672,6 +681,10 @@ mod tests {
         assert_ne!(
             partition_id_space_exhausted,
             IggyError::TooManyPartitions.as_code(),
+        );
+        assert_eq!(
+            u32::from(TruncatePartitionResult::HistoryChanged),
+            IggyError::PartitionHistoryChanged.as_code(),
         );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.

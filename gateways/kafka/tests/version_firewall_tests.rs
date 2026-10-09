@@ -39,7 +39,8 @@ use tokio::net::TcpStream;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS, API_KEY_FETCH,
     API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP,
-    API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE,
+    API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, 
+    API_KEY_OFFSET_FETCH,API_KEY_PRODUCE,
     API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION,
     advertised_min_version, handle_request, is_supported_version, supported_api_ranges,
 };
@@ -59,13 +60,13 @@ use wire::{
     build_fetch_empty_topics_request, build_find_coordinator_request, build_heartbeat_request,
     build_init_producer_id_request, build_join_group_request, build_leave_group_request,
     build_list_offsets_request, build_metadata_all_topics_flexible,
-    build_metadata_all_topics_legacy, build_metadata_flexible_request_v10,
+    build_metadata_all_topics_legacy, build_metadata_flexible_request_v10,build_offset_commit_request, build_offset_fetch_request,
     build_sync_group_request,
 };
 
 #[test]
-fn supported_ranges_table_has_thirteen_entries() {
-    assert_eq!(supported_api_ranges().len(), 13);
+fn supported_ranges_table_has_fourteen_entries() {
+    assert_eq!(supported_api_ranges().len(), 14);
 }
 
 #[test]
@@ -521,6 +522,8 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             },
         ),
         API_KEY_INIT_PRODUCER_ID => build_init_producer_id_request(version, None),
+        API_KEY_OFFSET_COMMIT => build_offset_commit_request(version, "scope-group", "orders", 0),
+        API_KEY_OFFSET_FETCH => build_offset_fetch_request(version, "scope-group", Some("orders")),
         _ => Bytes::new(),
     }
 }

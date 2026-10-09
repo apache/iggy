@@ -204,6 +204,7 @@ impl PreparedHttp {
 pub fn start(
     bound: BoundHttp,
     shard: &Rc<ServerShard>,
+    session_liveness: Rc<RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
     http_config: &HttpConfig,
     clients_table_max: usize,
     max_tokens_per_user: u32,
@@ -226,6 +227,7 @@ pub fn start(
             },
     } = bound;
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
+        session_liveness,
         shard: Rc::clone(shard),
         jwt,
         server_config,
