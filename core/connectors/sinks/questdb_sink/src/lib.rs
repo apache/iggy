@@ -1214,6 +1214,14 @@ enum Unclaimed {
 /// erases debt that the late credit was going to repay, and that credit then
 /// fails one later batch. The drop itself is reported, so the operator already
 /// has a reason to distrust the next failure.
+///
+/// A second case is a plain race. If another topic's batch settles a credit
+/// as an unclaimed rejection before the chunk that failed on it debits, the
+/// rejection is reported twice, once per batch, and the debit leaves the
+/// balance at -1, where it absorbs the next rejection only the handler
+/// reports. Nothing ties a credit to a batch, so the sink cannot tell the two
+/// orders apart. The rejection itself is never lost: the handler logs it, and
+/// the batch that saw it fails.
 fn settle_rejections(
     balance: &AtomicI64,
     drops_seen: &AtomicU64,
@@ -1865,37 +1873,50 @@ mod tests {
         // The handler credits on the client's thread and the failed chunk
         // debits on the Tokio thread, in no fixed order. Both orders must
         // leave nothing for the next batch to find.
-        for credit_first in [true, false] {
-            let balance = AtomicI64::new(0);
-            let drops = AtomicU64::new(0);
-            if credit_first {
-                balance.fetch_add(1, Ordering::Relaxed);
-                // Between the two, the credit is a rejection nobody retired
-                // yet, which a batch running now has to report.
-                assert_eq!(
-                    settle_rejections(&balance, &drops, 0),
-                    Some(Unclaimed::Rejection),
-                    "an unretired credit must be reported"
-                );
-                // That batch took the token, so the chunk's debit lands on an
-                // empty balance and dips below zero.
-                balance.fetch_sub(1, Ordering::Relaxed);
-                balance.fetch_add(1, Ordering::Relaxed);
-            } else {
-                balance.fetch_sub(1, Ordering::Relaxed);
-                assert_eq!(
-                    settle_rejections(&balance, &drops, 0),
-                    None,
-                    "a late credit must not be mistaken for a token"
-                );
-                balance.fetch_add(1, Ordering::Relaxed);
-            }
-            assert_eq!(
-                settle_rejections(&balance, &drops, 0),
-                None,
-                "{credit_first}"
-            );
-        }
+        // Credit first: nothing settles between, so the debit cancels it.
+        let balance = AtomicI64::new(0);
+        let drops = AtomicU64::new(0);
+        balance.fetch_add(1, Ordering::Relaxed);
+        balance.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(settle_rejections(&balance, &drops, 0), None);
+        assert_eq!(balance.load(Ordering::Relaxed), 0);
+
+        // Debit first: the late credit must not be mistaken for a token while
+        // it is pending, and nets to zero when it lands.
+        let balance = AtomicI64::new(0);
+        balance.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(
+            settle_rejections(&balance, &drops, 0),
+            None,
+            "a pending credit must not be mistaken for a token"
+        );
+        balance.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(settle_rejections(&balance, &drops, 0), None);
+        assert_eq!(balance.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn given_another_batch_takes_the_credit_before_the_debit_when_settled_should_leave_a_debt() {
+        // The documented residual case: another topic's batch settles the
+        // credit as an unclaimed rejection before the failed chunk debits it,
+        // so the rejection is reported twice and the balance stays at -1,
+        // where it absorbs the next handler-only rejection. Pinned so that a
+        // change to this behaviour is a deliberate one.
+        let balance = AtomicI64::new(0);
+        let drops = AtomicU64::new(0);
+        balance.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            settle_rejections(&balance, &drops, 0),
+            Some(Unclaimed::Rejection)
+        );
+        balance.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(balance.load(Ordering::Relaxed), -1);
+        balance.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            settle_rejections(&balance, &drops, 0),
+            None,
+            "the debt absorbs the next handler-only rejection"
+        );
     }
 
     #[test]

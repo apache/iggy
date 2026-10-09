@@ -126,7 +126,10 @@ pub(crate) enum Rounding {
 }
 
 impl Rounding {
-    const COUNT: usize = 3;
+    /// Follows the last variant rather than a literal, so a variant added
+    /// before it is counted automatically. A new variant must go before
+    /// `ArrayElement`, or this must name the new last one.
+    const COUNT: usize = Self::ArrayElement as usize + 1;
 
     fn remedy(self) -> &'static str {
         match self {
@@ -583,7 +586,7 @@ impl Mapping {
     fn warn_rounding(&self, name: &str, source: Rounding) {
         if !self.rounding_warned[source as usize].swap(true, Ordering::Relaxed) {
             warn!(
-                "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {}. This is reported once per connector.",
+                "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {}. This is reported once per connector for this kind of value.",
                 self.id,
                 source.remedy()
             );
