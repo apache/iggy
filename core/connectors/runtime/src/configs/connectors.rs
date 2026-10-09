@@ -16,7 +16,7 @@
 // under the License.
 
 pub mod http_provider;
-mod local_provider;
+pub(crate) mod local_provider;
 
 use crate::configs::connectors::http_provider::HttpConnectorsConfigProvider;
 use crate::configs::connectors::local_provider::LocalConnectorsConfigProvider;

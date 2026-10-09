@@ -39,7 +39,7 @@ jobs:
     # Concurrency cancels a run when a newer one starts for the same pull
     # request or branch, and the newer run sends its own trigger.
     if: github.event.workflow_run.conclusion != 'cancelled'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Send Codecov notifications

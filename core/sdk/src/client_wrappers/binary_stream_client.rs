@@ -79,14 +79,4 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::WebSocket(client) => client.delete_stream(stream_id).await,
         }
     }
-
-    async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.purge_stream(stream_id).await,
-            ClientWrapper::Http(client) => client.purge_stream(stream_id).await,
-            ClientWrapper::Tcp(client) => client.purge_stream(stream_id).await,
-            ClientWrapper::Quic(client) => client.purge_stream(stream_id).await,
-            ClientWrapper::WebSocket(client) => client.purge_stream(stream_id).await,
-        }
-    }
 }

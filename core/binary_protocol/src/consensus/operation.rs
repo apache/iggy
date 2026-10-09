@@ -68,11 +68,11 @@ pub enum Operation {
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
-    PurgeStream = 131,
+    // 131 was PurgeStream. Never reuse it.
     CreateTopic = 132,
     UpdateTopic = 133,
     DeleteTopic = 134,
-    PurgeTopic = 135,
+    // 135 was PurgeTopic. Never reuse it.
     CreatePartitions = 136,
     DeletePartitions = 137,
     // Client op handled specially: the dispatch layer resolves the requested
@@ -103,10 +103,11 @@ pub enum Operation {
 impl Operation {
     /// Whether `code` is a discriminant this build defines.
     ///
-    /// The typed decode needs this to tell an operation a newer release added
-    /// from a corrupted header byte: bytemuck's checked cast rejects both with
-    /// one undifferentiated error, and only the former is fixable by upgrading
-    /// this node.
+    /// Decoders need this to tell an operation another release defines from a
+    /// corrupted header byte: bytemuck's checked cast rejects both with one
+    /// undifferentiated error, and only the former is fixed by aligning the
+    /// releases. A newer release adds operations, and an older one can still
+    /// send a retired one.
     #[must_use]
     pub fn is_known_code(code: u8) -> bool {
         bytemuck::checked::try_cast::<u8, Self>(code).is_ok()
@@ -149,11 +150,9 @@ impl Operation {
             Self::CreateStream
                 | Self::UpdateStream
                 | Self::DeleteStream
-                | Self::PurgeStream
                 | Self::CreateTopic
                 | Self::UpdateTopic
                 | Self::DeleteTopic
-                | Self::PurgeTopic
                 | Self::CreatePartitions
                 | Self::DeletePartitions
                 | Self::CreateConsumerGroup
@@ -254,11 +253,9 @@ impl Operation {
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
-            | Self::PurgeStream
             | Self::CreateTopic
             | Self::UpdateTopic
             | Self::DeleteTopic
-            | Self::PurgeTopic
             | Self::CreatePartitions
             | Self::DeletePartitions
             | Self::DeleteSegments
@@ -304,11 +301,9 @@ mod tests {
             Operation::CreateStream,
             Operation::UpdateStream,
             Operation::DeleteStream,
-            Operation::PurgeStream,
             Operation::CreateTopic,
             Operation::UpdateTopic,
             Operation::DeleteTopic,
-            Operation::PurgeTopic,
             Operation::CreatePartitions,
             Operation::DeletePartitions,
             Operation::DeleteSegments,
@@ -423,6 +418,18 @@ mod tests {
                 !UNROUTABLE.contains(&operation),
                 "{operation:?}: is_plane_routable={} disagrees with the unroutable list",
                 operation.is_plane_routable(),
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_codes_remain_unknown() {
+        const RESERVED_CODES: [u8; 5] = [131, 135, 163, 164, 165];
+
+        for code in RESERVED_CODES {
+            assert!(
+                !Operation::is_known_code(code),
+                "reserved operation code {code} must not be reused"
             );
         }
     }

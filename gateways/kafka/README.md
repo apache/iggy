@@ -365,7 +365,7 @@ records, in request order. One uncompressed batch per partition.
 | Partition, offset | As sent. Both systems count from 0. |
 | Iggy replica | The one on the node each bridge client is on. Every client signs in at the metadata leader, and a view change or a refused call can move it. So in a cluster, a probe and a poll can read nodes that are not at the same offset. |
 | Offset below the oldest kept one | Reads from the oldest kept one. If none is kept, no records until the next write, because a cluster replica that lost records after a crash reads the same. Kafka answers `1` here, so `auto.offset.reset=none` gets no error. |
-| Purge | Iggy restarts the partition at offset 0, and Fetch cannot see it. Seek consumers to 0 after a purge. Otherwise writes past a consumer's old offset make it skip the records below. |
+| Recreated topic | Iggy starts each partition at offset 0 again, and Fetch cannot see it. Seek consumers to 0 after you recreate a topic. Otherwise writes past a consumer's old offset make it skip the records below. |
 | `high_watermark` | One past the last committed offset. |
 | `last_stable_offset` | Same as `high_watermark`. No transactions. |
 | `log_start_offset` | Always `-1`. |

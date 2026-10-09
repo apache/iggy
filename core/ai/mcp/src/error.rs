@@ -45,4 +45,6 @@ pub enum McpRuntimeError {
     TokenFileReadError(String, String),
     #[error("Token file is empty: {0}")]
     TokenFileEmpty(String),
+    #[error("Failed to list config environment variables")]
+    ListConfigEnvVars(#[source] std::io::Error),
 }
