@@ -8824,15 +8824,14 @@ where
     /// the tombstone is the only gate in `get_mut_by_ns` and the queue does not
     /// drain until the end of the pump iteration.
     ///
-    /// `intended_frontier` is the offset frontier the caller knows the group is
-    /// at, for the paths where the LIVE counter is not it. A failed install can
-    /// leave the counter at its pre-install value, below the frontier the group
-    /// committed. `None` where the counter is authoritative.
+    /// `intended_frontier` is the offset frontier the group committed, not the
+    /// LIVE counter: a failed install can leave the counter at its pre-install
+    /// value, below that frontier.
     fn fence_partition_for_rebuild(
         &self,
         namespace: IggyNamespace,
         partition: &mut IggyPartition<B, SB>,
-        intended_frontier: Option<u64>,
+        intended_frontier: u64,
     ) where
         B: MessageBus + 'static,
         T: ShardsTable,
@@ -9548,7 +9547,8 @@ where
                 namespace_raw = namespace,
                 commit_op,
                 offsets_frontier = frontier,
-                "descriptor commit_op disagrees with its offsets artifact frontier;                  refusing the install"
+                "descriptor commit_op disagrees with its offsets artifact frontier; \
+                 refusing the install"
             );
             damaged = true;
         }
@@ -9642,7 +9642,7 @@ where
                 self.fence_partition_for_rebuild(
                     IggyNamespace::from_raw(namespace),
                     partition,
-                    Some(frontier),
+                    frontier,
                 );
             }
             Err(error) => {
@@ -12186,7 +12186,8 @@ mod view_coverage_tests {
         assert_eq!(
             missing,
             Some(15),
-            "the scan must walk the held run below the merged commit point, not stop at its              first covered probe"
+            "the scan must walk the held run below the merged commit point, not stop at its \
+             first covered probe"
         );
     }
 

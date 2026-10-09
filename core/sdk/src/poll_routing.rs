@@ -990,7 +990,7 @@ mod tests {
             ]);
             let error = routed_request(&router, &coordinator, &request, code)
                 .await
-                .expect_err("obsolete offset mutations must be returned to the caller");
+                .expect_err("terminal offset errors must be returned to the caller");
             assert_eq!(error.as_code(), expected_code);
             assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
             assert!(coordinator.script.exchanges.lock().unwrap().is_empty());

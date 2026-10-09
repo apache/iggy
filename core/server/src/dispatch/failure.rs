@@ -174,7 +174,7 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
 /// Deny a request whose operation byte this build does not declare with
 /// `InvalidCommand`. Silence would stall the client's lockstep connection.
 ///
-/// `request_header` was copied before the typed cast refused the byte.
+/// `request_header` is raw because no typed header can hold the byte.
 /// `Operation::Reserved` stands in for it while the echo is built, and the
 /// reply gets the original byte back, because clients match a reply by
 /// operation and request id. No checksum covers the byte, since `ReplyHeader`
@@ -196,9 +196,6 @@ pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
     let operation_offset = offset_of!(RequestHeader, operation);
     let operation = request_header[operation_offset];
     request_header[operation_offset] = Operation::Reserved as u8;
-    // Routing fields unset, as `Message::into_routed` leaves them, so the
-    // client's reserved tail never reads as a group.
-    request_header[offset_of!(RoutedRequestHeader, metadata_watermark)..].fill(0);
     let request_header =
         match bytemuck::checked::try_pod_read_unaligned::<RoutedRequestHeader>(&request_header) {
             Ok(request_header) => request_header,

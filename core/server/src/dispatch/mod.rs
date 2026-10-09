@@ -68,8 +68,7 @@ use iggy_binary_protocol::codes::{
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
-    ConsensusError, EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader,
-    RoutedRequestHeader,
+    EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader, RoutedRequestHeader,
 };
 use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
@@ -385,9 +384,8 @@ fn non_replicated_code(header: &RoutedRequestHeader) -> u32 {
 }
 
 /// A copy of the header of a client frame whose operation byte this build
-/// does not declare. The typed cast consumes the frame, and the deny for such
-/// a request must echo its header, so the copy is taken first. A declared
-/// byte costs one read and no copy.
+/// does not declare, for the deny to patch and echo. A declared byte costs
+/// one read and no copy.
 fn undeclared_operation_header(message: &Message<GenericHeader>) -> Option<[u8; HEADER_SIZE]> {
     let header = message.as_slice().get(..HEADER_SIZE)?;
     if Operation::is_known_code(header[offset_of!(RequestHeader, operation)]) {
@@ -398,7 +396,9 @@ fn undeclared_operation_header(message: &Message<GenericHeader>) -> Option<[u8; 
 
 /// Type a client frame as a request. A frame whose operation byte this build
 /// does not declare gets the `InvalidCommand` deny, and any other header that
-/// will not cast is dropped with a warning: both return `None`.
+/// will not cast is dropped with a warning: both return `None`. Probing the
+/// byte first skips the cast's command check, which is safe because the
+/// transport admits only `Request` frames.
 #[allow(clippy::future_not_send)]
 async fn decode_or_deny_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -412,17 +412,13 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let undeclared_operation_header = undeclared_operation_header(&message);
-    match (
-        message.try_into_typed::<RequestHeader>(),
-        undeclared_operation_header,
-    ) {
-        (Ok(request), _) => Some(request),
-        (Err(ConsensusError::UnsupportedOperation { .. }), Some(request_header)) => {
-            send_undeclared_operation_deny(shard, transport_client_id, request_header).await;
-            None
-        }
-        (Err(error), _) => {
+    if let Some(request_header) = undeclared_operation_header(&message) {
+        send_undeclared_operation_deny(shard, transport_client_id, request_header).await;
+        return None;
+    }
+    match message.try_into_typed::<RequestHeader>() {
+        Ok(request) => Some(request),
+        Err(error) => {
             warn!(
                 transport_client_id,
                 error = %error,

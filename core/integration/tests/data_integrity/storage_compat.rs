@@ -1386,17 +1386,10 @@ async fn assert_token_recovered(
         });
 }
 
-/// A topic directory relative to the data directory, in the key form of
-/// [`disk::collect_comparable_files`].
-fn topic_prefix(stream_id: u32, topic_id: u32) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/")
-}
-
 fn partition_dir(data_path: &Path, stream_id: u32, topic_id: u32, partition_id: u32) -> PathBuf {
-    data_path
-        .join(topic_prefix(stream_id, topic_id))
-        .join("partitions")
-        .join(partition_id.to_string())
+    data_path.join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}"
+    ))
 }
 
 /// Segment log file names in a partition directory, in offset order (they are

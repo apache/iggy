@@ -650,17 +650,16 @@ async fn given_purge_paths_when_deleting_should_answer_404_and_keep_messages(
         "/streams/http-purge-paths/purge",
         "/streams/http-purge-paths/topics/kept/purge",
     ] {
-        let response = http
-            .client
-            .delete(http.url(path))
-            .bearer_auth(&http.token)
-            .send()
-            .await
-            .expect("delete purge path request");
+        let response = http.delete(path).await;
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
             "{path} must match no route"
+        );
+        let body = response.text().await.expect("read 404 body");
+        assert!(
+            body.is_empty(),
+            "{path} must match no route, not a handler 404: {body}"
         );
     }
 

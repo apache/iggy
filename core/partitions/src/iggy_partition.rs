@@ -492,7 +492,7 @@ pub enum PendingPartitionTransition {
     },
     Install(Box<crate::state_transfer::PendingInstall>),
     Quarantine {
-        frontier: Option<u64>,
+        frontier: u64,
         drain: Option<crate::PersistenceDrain>,
         phase: QuarantinePhase,
     },
@@ -640,7 +640,7 @@ pub enum SuperblockIntent {
     /// Drop a local reservation to the installed group's committed frontier.
     Install(u64),
     /// Bypass retry backoff before moving the frontier's corroborating files.
-    Quarantine(Option<u64>),
+    Quarantine(u64),
     /// After a successful shutdown flush, retain only the consumed reservation.
     Collapse { frontier: u64, reserved: u64 },
 }
@@ -713,18 +713,6 @@ impl PendingConsumerOffsetCommit {
         match offset {
             Some(offset) => Self::upsert(kind, consumer_id, offset),
             None => Self::delete(kind, consumer_id),
-        }
-    }
-
-    /// Terminal refusal for a mutation admitted before a reset of the poll
-    /// history. A retry would store the old offset, or delete a checkpoint, in
-    /// the replacement history.
-    const fn history_reset_refusal(&self) -> IggyError {
-        match self.mutation {
-            PendingConsumerOffsetMutation::Upsert(offset) => IggyError::InvalidOffset(offset),
-            PendingConsumerOffsetMutation::Delete => {
-                IggyError::ConsumerOffsetNotFound(self.consumer_id as usize)
-            }
         }
     }
 
@@ -997,7 +985,7 @@ where
         }
     }
 
-    pub fn begin_quarantine(&mut self, frontier: Option<u64>) {
+    pub fn begin_quarantine(&mut self, frontier: u64) {
         if self
             .superblock_intent
             .get()
@@ -2055,10 +2043,9 @@ where
                 reserved.max(self.durable_offset_reserved.get()),
             ),
             SuperblockIntent::Install(frontier) => (self.advanced_frontier(frontier), frontier),
-            SuperblockIntent::Quarantine(intended) => (
-                intended.unwrap_or_else(|| self.advanced_frontier(self.offset_frontier())),
-                self.durable_offset_reserved.get(),
-            ),
+            SuperblockIntent::Quarantine(frontier) => {
+                (frontier, self.durable_offset_reserved.get())
+            }
             SuperblockIntent::Collapse { frontier, reserved } => (frontier, reserved),
         };
         state.offset_frontier = frontier;
@@ -3646,10 +3633,7 @@ where
             || !self.no_ack.is_empty()
             || self.consumer_offset_is_blocked(kind, consumer_id, Some(offset), true)
         {
-            let context = AutoCommitRequestContext {
-                history: self.poll_history,
-                reservation,
-            };
+            let context = AutoCommitRequestContext { reservation };
             self.queue_local_request(
                 consensus::RequestEntry::with_auto_commit(request, context),
                 order,
@@ -6521,10 +6505,7 @@ where
                     self.admit_reserved_send(&message).await
                 };
                 if reservation == crate::PartitionIoVerdict::Pending {
-                    let entry = consensus::RequestEntry::with_sender(message, reply.take())
-                        .with_consumer_offset_history(
-                            consumer_offset.is_some().then_some(self.poll_history),
-                        );
+                    let entry = consensus::RequestEntry::with_sender(message, reply.take());
                     let push_result = self.queue_local_request(entry, order);
                     if let Err(mut refused) = push_result {
                         emit_partition_diag(
@@ -6647,10 +6628,9 @@ where
             };
             let context = request.take_auto_commit();
             if context.as_ref().is_some_and(|context| {
-                context.history != self.poll_history
-                    || !self
-                        .consumer_offset_capacity_for(context.reservation.kind())
-                        .owns(&context.reservation)
+                !self
+                    .consumer_offset_capacity_for(context.reservation.kind())
+                    .owns(&context.reservation)
             }) {
                 if Self::record_promotion_denial(&mut consecutive_denials) {
                     break;
@@ -6666,24 +6646,6 @@ where
                         &header,
                         IggyError::TransientNotAccepted.as_code(),
                         "queued request metadata frontier is behind retirement",
-                        reply_sender.take(),
-                        &mut consecutive_denials,
-                    )
-                    .await
-                {
-                    break;
-                }
-                continue;
-            }
-            if let Some(error) = self.stale_offset_history_refusal(&request) {
-                // An old offset can fit the replacement history, and an old
-                // delete can erase a replacement checkpoint. Refuse before
-                // projection with a terminal error so clients do not replay it.
-                if self
-                    .deny_queued_request(
-                        &header,
-                        error.as_code(),
-                        "queued offset history deny reply send failed",
                         reply_sender.take(),
                         &mut consecutive_denials,
                     )
@@ -6839,18 +6801,14 @@ where
     }
 
     /// Shutdown promotes nothing, so answer every queued request now. None
-    /// holds an op yet, so its client can safely retry it, unless it is an
-    /// offset mutation that a history reset made stale.
+    /// holds an op yet, so its client can safely retry it.
     async fn deny_queued_requests_at_shutdown(&self) {
         while let Some(mut request) = self.consensus.pop_queued_request() {
-            let error = self
-                .stale_offset_history_refusal(&request)
-                .unwrap_or(IggyError::TransientNotAccepted);
             let waiter = request.take_reply_sender();
             Self::send_partition_deny_or_log(
                 &self.consensus,
                 request.message.header(),
-                error.as_code(),
+                IggyError::TransientNotAccepted.as_code(),
                 "shutdown queued request reply failed",
                 waiter,
             )
@@ -6881,27 +6839,6 @@ where
     const fn record_promotion_denial(consecutive_denials: &mut usize) -> bool {
         *consecutive_denials += 1;
         *consecutive_denials >= PROMOTION_DENIALS_MAX
-    }
-
-    /// The terminal refusal for a queued offset mutation admitted before a
-    /// reset of the poll history, or `None` while its history is current.
-    fn stale_offset_history_refusal(&self, request: &consensus::RequestEntry) -> Option<IggyError> {
-        request
-            .consumer_offset_history()
-            .is_some_and(|history| history != self.poll_history)
-            .then(|| {
-                Self::parse_consumer_offset_request(
-                    request.message.header().operation,
-                    &request.message,
-                )
-                .map_or(
-                    IggyError::InvalidCommand,
-                    |(kind, consumer_id, offset, _)| {
-                        PendingConsumerOffsetCommit::explicit(kind, consumer_id, offset)
-                            .history_reset_refusal()
-                    },
-                )
-            })
     }
 
     /// # Panics
@@ -11741,7 +11678,7 @@ mod tests {
 
     /// Run the owner's I/O continuations the way the shard lane would, until
     /// nothing is left to do.
-    pub(super) async fn settle_partition_io<B: MessageBus, SB: SuperblockStore>(
+    async fn settle_partition_io<B: MessageBus, SB: SuperblockStore>(
         partition: &mut IggyPartition<B, SB>,
         config: &PartitionsConfig,
     ) {
@@ -15973,6 +15910,88 @@ mod tests {
         assert_eq!(last_recorded_frontier(&store), 1_030);
     }
 
+    /// The install's frontier write describes the state the install is about
+    /// to adopt. Once its failure aborts the install, the replica keeps its old
+    /// state, so the same write landing later would record a frontier and a
+    /// reservation for an install that never happened.
+    #[compio::test]
+    async fn given_failed_install_frontier_write_when_install_aborts_should_never_write_it_later() {
+        // Between the recorded frontier and reservation, so a late write would
+        // move both.
+        const OFFER_FRONTIER: u64 = 150;
+        const STEPS_MAX: usize = 32;
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = partition_at_view(1, 1);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut partition, directory.path());
+        let store = Rc::new(RecordingSuperblock::default());
+        let recovered = recorded_state(100, 200);
+        partition.set_superblock(Rc::clone(&store), Some(&recovered));
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        store.fail_writes.set(true);
+        let wire = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::PARTITION_DEDUP_CLIENTS_MAX,
+            next_offset: OFFER_FRONTIER,
+            ..Default::default()
+        };
+        partition
+            .queue_state_transfer_install(1, Vec::new(), &wire.encode(), 1)
+            .unwrap();
+
+        let config = repair_config();
+        let mut aborted = false;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::InstallFinished { outcome, .. } => {
+                    assert!(
+                        matches!(
+                            outcome,
+                            Err(
+                                crate::state_transfer::PartitionInstallError::FrontierNotDurable {
+                                    frontier: OFFER_FRONTIER
+                                }
+                            )
+                        ),
+                        "the failed frontier write must abort the install: got {outcome:?}"
+                    );
+                    aborted = true;
+                    break;
+                }
+                crate::PartitionIoStep::Progress | crate::PartitionIoStep::Pending => {}
+                _ => panic!("unexpected install continuation"),
+            }
+        }
+        assert!(aborted);
+        assert_eq!(
+            store.attempts.get(),
+            1,
+            "the install must try its frontier write"
+        );
+
+        store.fail_writes.set(false);
+        partition.superblock_retry_after_micros.set(0);
+        settle_partition_io(&mut partition, &config).await;
+        assert_eq!(
+            store.attempts.get(),
+            1,
+            "an aborted install must never write its frontier later"
+        );
+        assert_eq!(
+            partition.durable_offset_frontier.get(),
+            recovered.offset_frontier
+        );
+        assert_eq!(
+            partition.durable_offset_reserved.get(),
+            recovered.offset_reserved
+        );
+    }
+
     /// The reservation can never sit below the frontier: "offsets under N exist"
     /// is stronger than "offsets under N may have been handed out".
     #[compio::test]
@@ -16102,7 +16121,7 @@ mod tests {
             } else {
                 None
             };
-            partition.begin_quarantine(None);
+            partition.begin_quarantine(partition.offset_frontier());
             if let Some(captured) = captured {
                 let result = captured.job.execute().await;
                 partition.accept_io(captured.identity, result).unwrap();
@@ -17434,6 +17453,90 @@ mod tests {
                     .unwrap()
                     .offset,
                 4
+            );
+        }
+    }
+
+    /// The durable table does not list a file the partition failed to load or
+    /// unlink, so the install cleanup has to budget for its stranded id and
+    /// then clear it.
+    #[compio::test]
+    async fn given_durable_and_stranded_offsets_when_install_cleans_old_offsets_should_reserve_and_release_both()
+     {
+        const DURABLE: u32 = 7;
+        const STRANDED: u32 = 42;
+        const STEPS_MAX: usize = 128;
+        let (_directory, mut partition) = transfer_receiver();
+        for kind in ConsumerKind::ALL {
+            partition
+                .durable_consumer_offsets
+                .record_explicit(kind, DURABLE, 0, 0);
+            partition
+                .consumer_offset_capacity_for(kind)
+                .record_stranded(STRANDED);
+        }
+        let file_phase_charge = crate::io::file_phase_charge::<PingPongSuperblock>(
+            std::iter::once(partition.partition_dir.as_deref())
+                .chain(ConsumerKind::ALL.map(|kind| partition.consumer_offsets_dir(kind)))
+                .flatten(),
+        )
+        .unwrap();
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        // An offer without offsets retains no ids, so only the cleanup
+        // reservation can cover the known set.
+        let wire = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::PARTITION_DEDUP_CLIENTS_MAX,
+            next_offset: 1,
+            ..Default::default()
+        };
+        partition
+            .queue_state_transfer_install(1, Vec::new(), &wire.encode(), 1)
+            .unwrap();
+        let config = repair_config();
+        let mut cleanups = 0;
+        let mut installed = false;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    let captured = partition.capture_io(plan, &config).unwrap().unwrap();
+                    if let crate::PartitionIoJob::OffsetCleanup { known, .. } = &captured.job {
+                        assert_eq!(
+                            *known,
+                            HashSet::from([DURABLE, STRANDED]),
+                            "the cleanup must know the durable and the stranded file"
+                        );
+                        assert!(
+                            plan.allocation_charge
+                                >= file_phase_charge + known.capacity() * size_of::<u32>(),
+                            "the plan must reserve the known set on top of the file phase"
+                        );
+                        cleanups += 1;
+                    }
+                    let result = captured.job.execute().await;
+                    partition.accept_io(captured.identity, result).unwrap();
+                    if let Some(gate) = captured.gate {
+                        gate.release();
+                    }
+                }
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::InstallFinished { outcome, .. } => {
+                    outcome.unwrap();
+                    installed = true;
+                    break;
+                }
+                _ => panic!("unexpected install continuation"),
+            }
+        }
+        assert!(installed);
+        assert_eq!(cleanups, ConsumerKind::COUNT);
+        for kind in ConsumerKind::ALL {
+            assert_eq!(
+                partition.stranded_consumer_offset_count(kind),
+                0,
+                "the install must release the stranded {kind:?} id"
             );
         }
     }
@@ -19716,9 +19819,9 @@ mod tests {
         let explicit_consumer_id = 8;
         let explicit_client_id = 42;
 
-        // Only the automatic request carries a history identity and holds the
-        // provisional slot. Queue an explicit store beside it to prove that
-        // retiring the history does not discard unrelated client requests.
+        // Only the automatic request holds the provisional slot. Queue an
+        // explicit store beside it to prove that retiring the history does not
+        // discard unrelated client requests.
         let automatic_reservation = partition
             .consumer_offset_capacity_for(ConsumerKind::Consumer)
             .reserve_provisional(automatic_consumer_id, &partition.durable_consumer_offsets)
@@ -19731,7 +19834,6 @@ mod tests {
             .push_queued_request(consensus::RequestEntry::with_auto_commit(
                 automatic_request,
                 AutoCommitRequestContext {
-                    history: partition.poll_history,
                     reservation: automatic_reservation,
                 },
             ))
@@ -19766,40 +19868,152 @@ mod tests {
         assert!(partition.consensus.pop_queued_request().is_none());
     }
 
+    /// Promotion does not check a queued offset mutation against the poll
+    /// history, so an install must leave none queued to run against the
+    /// installed offsets.
     #[compio::test]
-    async fn given_old_auto_commit_context_when_promoted_should_not_assign_an_operation() {
-        let (mut partition, _) = recording_partition();
-        let consumer_id = 7;
-        let old_reservation = partition
-            .consumer_offset_capacity_for(ConsumerKind::Consumer)
-            .reserve_provisional(consumer_id, &partition.durable_consumer_offsets)
-            .unwrap();
-        let old_context = AutoCommitRequestContext {
-            history: partition.poll_history,
-            reservation: old_reservation,
+    async fn given_queued_offset_mutations_when_install_publishes_should_drop_them_and_keep_installed_offsets()
+     {
+        const STORED: u32 = 7;
+        const DELETED: u32 = 8;
+        const INSTALLED_OP: u64 = 1;
+        const INSTALLED_OFFSET: u64 = 4;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) =
+            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 2));
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut partition, directory.path());
+        partition.open_persistence().await.unwrap();
+        queue_offset_mutations_then_arm_transfer(&mut partition, STORED, DELETED).await;
+
+        let checkpoint =
+            checksummed_segment_prepare(INSTALLED_OP, 0, INSTALLED_OFFSET, b"installed");
+        let installed_state = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::PARTITION_DEDUP_CLIENTS_MAX,
+            prepare_checksum: Some(checkpoint.header().checksum),
+            checkpoint_prepare: checkpoint.as_slice().to_vec(),
+            next_offset: INSTALLED_OFFSET + 1,
+            consumers: vec![(STORED, INSTALLED_OFFSET), (DELETED, INSTALLED_OFFSET)],
+            ..Default::default()
         };
-        let old_request = partition
-            .build_poll_auto_commit_request(ConsumerKind::Consumer, consumer_id, 0)
-            .unwrap();
-
-        // Inject the obsolete context after invalidation has swept the queue.
-        // Promotion must independently check its history before assigning an op.
-        partition.invalidate_poll_history();
         partition
-            .consensus
-            .push_queued_request(consensus::RequestEntry::with_auto_commit(
-                old_request,
-                old_context,
-            ))
+            .install_state_transfer(
+                &repair_config(),
+                INSTALLED_OP,
+                Vec::new(),
+                &installed_state.encode(),
+            )
+            .await
             .unwrap();
-        partition.drain_request_queue_into_prepares(1).await;
 
-        assert_eq!(partition.consensus.pipeline_len(), 0);
-        assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
-        assert_eq!(
-            partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
-            0
+        assert_eq!(partition.consensus().request_queue_len(), 0);
+        for consumer in [STORED, DELETED] {
+            assert_eq!(
+                partition.get_consumer_offset(PollingConsumer::Consumer(consumer as usize, 0)),
+                Some(INSTALLED_OFFSET),
+                "consumer {consumer} must keep its installed offset"
+            );
+        }
+    }
+
+    /// Converge wipes the journal that held the pipeline's prepares, and a
+    /// queued mutation must not run against the converged offsets.
+    #[compio::test]
+    async fn given_queued_offset_mutations_when_failed_install_converges_should_clear_the_pipeline()
+    {
+        const STORED: u32 = 7;
+        const DELETED: u32 = 8;
+        const OFFERED_OP: u64 = 12;
+        const OFFERED_NEXT_OFFSET: u64 = 2;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) =
+            recording_partition_with_pipeline(0, 3, LocalPipeline::with_capacities(1, 2));
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut partition, directory.path());
+        queue_offset_mutations_then_arm_transfer(&mut partition, STORED, DELETED).await;
+
+        // Staged files that do not exist fail the swap after preflight, and
+        // without a WAL the partition converges instead of fencing.
+        let missing_staged_segment = crate::state_transfer::StagedSegmentMeta {
+            start_offset: 0,
+            end_offset: 0,
+            index_size: 0,
+            size: 8,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            max_timestamp: 0,
+            log_staging: directory.path().join("00000000000000000000.log.staging"),
+            index_staging: directory.path().join("00000000000000000000.index.staging"),
+        };
+        let offered_state = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
+            next_offset: OFFERED_NEXT_OFFSET,
+            ..Default::default()
+        };
+        let install_error = partition
+            .install_state_transfer(
+                &repair_config(),
+                OFFERED_OP,
+                vec![missing_staged_segment],
+                &offered_state.encode(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                install_error,
+                crate::state_transfer::PartitionInstallError::SwapIo { .. }
+            ),
+            "unexpected failure: {install_error:?}"
         );
+
+        assert_eq!(
+            partition.consensus().request_queue_len(),
+            0,
+            "request queue"
+        );
+        assert_eq!(partition.consensus().pipeline_len(), 0, "prepare queue");
+    }
+
+    /// Admits an explicit store and a delete while a filler store holds the
+    /// only prepare slot, so both wait in the request queue, then arms a
+    /// state transfer behind them.
+    async fn queue_offset_mutations_then_arm_transfer(
+        partition: &mut IggyPartition<RecordingBus>,
+        stored: u32,
+        deleted: u32,
+    ) {
+        // A key of its own, so the mutations queue for the full pipeline alone.
+        let filler = stored.max(deleted) + 1;
+        // One message makes offset 0 storable, and a delete on a replicated
+        // partition needs a durable entry to remove.
+        partition.stats.increment_messages_count(1);
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, deleted, 0, 0);
+        partition
+            .on_request(
+                store_offset_request(42, 1, ConsumerKind::Consumer, filler, 0, AckLevel::Quorum),
+                None,
+            )
+            .await;
+        partition
+            .on_request(
+                store_offset_request(43, 1, ConsumerKind::Consumer, stored, 0, AckLevel::Quorum),
+                None,
+            )
+            .await;
+        partition
+            .on_request(delete_offset_request(44, 1, deleted), None)
+            .await;
+        assert_eq!(partition.consensus().pipeline_len(), 1);
+        assert_eq!(partition.consensus().request_queue_len(), 2);
+
+        for stage in [
+            consensus::StateTransferStage::AwaitingTarget,
+            consensus::StateTransferStage::Fetching,
+            consensus::StateTransferStage::Installing,
+        ] {
+            partition.consensus().set_state_transfer_stage(stage);
+        }
     }
 
     #[compio::test]
@@ -19878,6 +20092,82 @@ mod tests {
         );
         assert_eq!(committed, None, "old reads must not commit an offset");
         assert_eq!(partition.consensus.pipeline_len(), 0);
+    }
+
+    /// An install unlinks the segment files a suspended poll may still hold
+    /// open, so the poll has to reopen by path instead of reading the old inode.
+    #[compio::test]
+    async fn given_in_flight_sealed_poll_when_state_is_installed_should_wipe_its_read_state() {
+        let (directory, mut partition) = transfer_receiver();
+        let namespace = partition.namespace();
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
+        partition.log.segments_mut()[0].sealed = true;
+        partition.log.storages_mut()[0] = SegmentStorage::new(&log_path, &index_path, 0, 0, false)
+            .await
+            .unwrap();
+        let record = build_segment_record(namespace, 0);
+        let record_len = record.len() as u64;
+        std::fs::write(&log_path, record).unwrap();
+        partition.log.touch_sealed_read_state(0);
+        let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
+        let poll = || DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+            bytes_per_message: None,
+            widest_batch_bytes: 0,
+            validate_checksum: true,
+            segments: vec![DiskSegment {
+                start_offset: 0,
+                persisted: record_len,
+                read_state: Rc::clone(&handle),
+                sealed: true,
+            }],
+            start_position: 0,
+            start_index_offset: None,
+            namespace_raw: namespace.inner(),
+        };
+        let lookup = MessageLookup::Offset {
+            offset: 0,
+            count: 1,
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            poll().read_disk(lookup).await,
+            DiskReadOutcome::Matched { .. }
+        ));
+        assert!(handle.fd.borrow().is_some());
+        assert!(handle.index.borrow().is_some());
+
+        let installed_state = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: consensus::PARTITION_DEDUP_CLIENTS_MAX,
+            next_offset: 10,
+            ..Default::default()
+        };
+        partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &installed_state.encode())
+            .await
+            .unwrap();
+
+        assert!(
+            handle.fd.borrow().is_none(),
+            "install must drop the fd the poll cached"
+        );
+        assert!(
+            handle.index.borrow().is_none(),
+            "install must drop the index the poll cached"
+        );
+        assert!(
+            !handle.tracked.get(),
+            "a resumed walk must not cache into the old handle"
+        );
+        assert!(
+            !matches!(
+                poll().read_disk(lookup).await,
+                DiskReadOutcome::Matched { .. }
+            ),
+            "a resumed walk must not serve the unlinked segment"
+        );
     }
 
     #[compio::test]
@@ -20095,8 +20385,8 @@ mod tests {
         assert_eq!(committed, Some(0));
         assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
 
-        // The queued request owns both the history identity and the capacity
-        // reservation. Taking it out of the queue must keep that slot occupied.
+        // The queued request owns the capacity reservation. Taking it out of
+        // the queue must keep that slot occupied.
         let queued_request = partition
             .consensus
             .pop_queued_request()
@@ -20104,7 +20394,6 @@ mod tests {
         let queued_context = queued_request
             .auto_commit()
             .expect("request carries its context");
-        assert_eq!(queued_context.history, partition.poll_history);
         assert_eq!(
             queued_context.reservation.kind(),
             ConsumerKind::ConsumerGroup
@@ -20723,6 +21012,72 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Promotion from the request queue must keep an explicit store's
+    /// overwrite, or a client could never move its cursor back.
+    #[compio::test]
+    async fn given_queued_explicit_store_below_committed_offset_when_promoted_should_rewind_it() {
+        const CLIENT: u128 = 42;
+        const FILLER_CLIENT: u128 = 43;
+        const CONSUMER: u32 = 7;
+        const FILLER_CONSUMER: u32 = 8;
+        for (kind, consumer) in [
+            (
+                ConsumerKind::Consumer,
+                PollingConsumer::Consumer(CONSUMER as usize, 0),
+            ),
+            (
+                ConsumerKind::ConsumerGroup,
+                PollingConsumer::ConsumerGroup(CONSUMER as usize, 0),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut partition, _) =
+                recording_partition_with_pipeline(0, 1, LocalPipeline::with_capacities(1, 1));
+            set_offset_dirs_under(&mut partition, directory.path());
+            partition.stats.increment_messages_count(2);
+            partition.stats.set_current_offset(1);
+            partition
+                .on_request(
+                    store_offset_request(CLIENT, 1, kind, CONSUMER, 1, AckLevel::Quorum),
+                    None,
+                )
+                .await;
+            commit_recorded_loopback(&mut partition).await;
+            assert_eq!(partition.get_consumer_offset(consumer), Some(1));
+
+            // The filler holds the only prepare slot, so the rewind has to queue.
+            partition
+                .on_request(
+                    store_offset_request(
+                        FILLER_CLIENT,
+                        1,
+                        kind,
+                        FILLER_CONSUMER,
+                        0,
+                        AckLevel::Quorum,
+                    ),
+                    None,
+                )
+                .await;
+            partition
+                .on_request(
+                    store_offset_request(CLIENT, 2, kind, CONSUMER, 0, AckLevel::Quorum),
+                    None,
+                )
+                .await;
+            assert_eq!(partition.consensus().request_queue_len(), 1);
+            commit_recorded_loopback(&mut partition).await;
+            commit_recorded_loopback(&mut partition).await;
+
+            assert_eq!(partition.consensus().commit_min(), 3, "{kind:?}");
+            assert_eq!(
+                partition.get_consumer_offset(consumer),
+                Some(0),
+                "a promoted {kind:?} store must overwrite, not fold to the max"
+            );
+        }
     }
 
     #[compio::test]
@@ -23994,344 +24349,5 @@ mod review_4092_tests {
             persistence.failure().is_none(),
             "a single refused prepare latched the partition permanently; `failure` has no clearing path, so every later durability query answers false"
         );
-    }
-}
-
-#[cfg(test)]
-mod consumer_offset_history_tests {
-    use super::tests::settle_partition_io;
-    use super::*;
-    use crate::PartitionPathLayout;
-    use consensus::{LocalPipeline, oneshot_channel};
-    use futures::FutureExt;
-    use server_common::send_messages::{
-        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
-    };
-
-    const CONSUMER_ID: u32 = 7;
-    const CLUSTER_REPLICAS: u8 = 3;
-    type TestPartition = IggyPartition<Rc<IggyMessageBus>>;
-
-    #[compio::test]
-    async fn given_queued_explicit_store_when_history_is_unchanged_should_allow_rewind() {
-        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-            let (mut partition, config, _directory) =
-                Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
-            partition
-                .on_request(append(2, b"second record"), None)
-                .await;
-            commit_pending(&mut partition, &config).await;
-            let (sender, receiver) = oneshot_channel();
-            partition
-                .on_request(store(42, 1, kind, 1), Some(sender))
-                .await;
-            commit_pending(&mut partition, &config).await;
-            assert_success(receiver);
-            assert_eq!(
-                partition.get_consumer_offset(polling_consumer(kind)),
-                Some(1)
-            );
-
-            partition.on_request(append(3, b"third record"), None).await;
-            let (sender, receiver) = oneshot_channel();
-            partition
-                .on_request(store(42, 2, kind, 0), Some(sender))
-                .await;
-            assert_eq!(partition.consensus().request_queue_len(), 1);
-            commit_pending(&mut partition, &config).await;
-            assert_success(receiver);
-            assert_eq!(
-                partition.get_consumer_offset(polling_consumer(kind)),
-                Some(0),
-                "history protection must not turn an explicit store into a monotone automatic commit"
-            );
-        }
-    }
-
-    #[compio::test]
-    async fn given_queued_offset_delete_when_history_changes_should_reject_without_replay() {
-        for history_changes in [false, true] {
-            for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-                let (mut partition, config, _directory) =
-                    Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
-                let (sender, receiver) = oneshot_channel();
-                partition
-                    .on_request(store(42, 1, kind, 0), Some(sender))
-                    .await;
-                commit_pending(&mut partition, &config).await;
-                assert_success(receiver);
-                partition
-                    .on_request(append(2, b"pending prepare"), None)
-                    .await;
-                partition.on_request(append(3, b"third record"), None).await;
-                let (sender, receiver) = oneshot_channel();
-                partition.on_request(delete(kind, 2), Some(sender)).await;
-                assert_eq!(partition.consensus().request_queue_len(), 2);
-                if history_changes {
-                    partition.invalidate_poll_history();
-                }
-                commit_pending(&mut partition, &config).await;
-                assert_eq!(
-                    reply_status(receiver),
-                    if history_changes {
-                        IggyError::ConsumerOffsetNotFound(CONSUMER_ID as usize).as_code()
-                    } else {
-                        0
-                    },
-                    "{kind:?}, history changes: {history_changes}"
-                );
-                assert_eq!(
-                    partition.consensus().sequencer().current_sequence(),
-                    if history_changes { 4 } else { 5 },
-                    "a refused delete must not be assigned an operation ({kind:?})"
-                );
-                assert_eq!(
-                    partition.get_consumer_offset(polling_consumer(kind)),
-                    if history_changes { Some(0) } else { None },
-                    "only a delete admitted into the current history removes the offset ({kind:?})"
-                );
-            }
-        }
-    }
-
-    #[compio::test]
-    async fn given_queued_offset_mutations_when_shutdown_follows_history_change_should_reject_without_replay()
-     {
-        for history_changes in [false, true] {
-            for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-                let (mut partition, config, _directory) =
-                    Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
-                let (sender, receiver) = oneshot_channel();
-                partition
-                    .on_request(store(42, 1, kind, 0), Some(sender))
-                    .await;
-                commit_pending(&mut partition, &config).await;
-                assert_success(receiver);
-                partition
-                    .on_request(append(2, b"pending prepare"), None)
-                    .await;
-                assert!(partition.consensus().pipeline_is_full());
-                // A client has one request in flight, so another client queues the store.
-                let (sender, stored) = oneshot_channel();
-                partition
-                    .on_request(store(43, 1, kind, 0), Some(sender))
-                    .await;
-                let (sender, deleted) = oneshot_channel();
-                partition.on_request(delete(kind, 2), Some(sender)).await;
-                if history_changes {
-                    partition.invalidate_poll_history();
-                }
-                let (sender, published) = oneshot_channel();
-                partition
-                    .on_request(append(3, b"third record"), Some(sender))
-                    .await;
-                assert_eq!(partition.consensus().request_queue_len(), 3);
-
-                partition.begin_shutdown_io();
-                settle_partition_io(&mut partition, &config).await;
-                assert_eq!(partition.consensus().request_queue_len(), 0);
-                let (store_status, delete_status) = if history_changes {
-                    (
-                        IggyError::InvalidOffset(0),
-                        IggyError::ConsumerOffsetNotFound(CONSUMER_ID as usize),
-                    )
-                } else {
-                    (
-                        IggyError::TransientNotAccepted,
-                        IggyError::TransientNotAccepted,
-                    )
-                };
-                assert_eq!(
-                    reply_status(stored),
-                    store_status.as_code(),
-                    "{kind:?}, history changes: {history_changes}"
-                );
-                assert_eq!(
-                    reply_status(deleted),
-                    delete_status.as_code(),
-                    "{kind:?}, history changes: {history_changes}"
-                );
-                assert_eq!(
-                    reply_status(published),
-                    IggyError::TransientNotAccepted.as_code(),
-                    "a request admitted into the current history stays retryable"
-                );
-            }
-        }
-    }
-
-    #[allow(clippy::future_not_send)]
-    async fn partition_with_old_record(
-        replica_count: u8,
-    ) -> (TestPartition, PartitionsConfig, tempfile::TempDir) {
-        let directory = tempfile::tempdir().unwrap();
-        let segment_size = IggyByteSize::from(1_048_576_u64);
-        let config = PartitionsConfig {
-            messages_required_to_save: 100,
-            size_of_messages_required_to_save: segment_size,
-            validate_checksum: true,
-            segment_size,
-            preallocate_segments: false,
-            encryptor: None,
-            path_layout: PartitionPathLayout::default(),
-        };
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            replica_count,
-            namespace().inner(),
-            Rc::new(IggyMessageBus::new(0)),
-            LocalPipeline::with_capacities(1, 8),
-        );
-        consensus.init();
-        let mut partition = IggyPartition::with_in_memory_storage(
-            Arc::new(PartitionStats::default()),
-            consensus,
-            segment_size,
-        );
-        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-        partition.on_request(append(1, b"old record"), None).await;
-        commit_pending(&mut partition, &config).await;
-        assert_eq!(partition.consensus().commit_min(), 1);
-        (partition, config, directory)
-    }
-
-    // Drive the actual commit and queue-promotion paths with deterministic quorum
-    // completion. Remote replicas and timing do not decide when a prepare advances.
-    #[allow(clippy::future_not_send)]
-    async fn commit_pending(partition: &mut TestPartition, config: &PartitionsConfig) {
-        for _ in 0..16 {
-            process_self_acknowledgments(partition, config).await;
-            let current = partition.consensus().sequencer().current_sequence();
-            if partition.consensus().commit_min() == current {
-                return;
-            }
-            partition.consensus().advance_commit_max(current);
-            partition.commit_journal(config).await;
-        }
-        panic!("the bounded request queue did not drain");
-    }
-
-    #[allow(clippy::future_not_send)]
-    async fn process_self_acknowledgments(
-        partition: &mut TestPartition,
-        config: &PartitionsConfig,
-    ) {
-        let mut queued = Vec::new();
-        partition.consensus().drain_loopback_into(&mut queued);
-        for message in queued {
-            let mut typed = Message::<PrepareOkHeader>::new(message.as_slice().len());
-            typed.as_mut_slice().copy_from_slice(message.as_slice());
-            partition.on_ack(typed, config).await;
-        }
-    }
-
-    fn namespace() -> IggyNamespace {
-        IggyNamespace::new(1, 1, 0)
-    }
-
-    const fn polling_consumer(kind: ConsumerKind) -> PollingConsumer {
-        match kind {
-            ConsumerKind::Consumer => PollingConsumer::Consumer(CONSUMER_ID as usize, 0),
-            ConsumerKind::ConsumerGroup => PollingConsumer::ConsumerGroup(CONSUMER_ID as usize, 0),
-            ConsumerKind::ExternalGroup => panic!("an external group is never polled"),
-        }
-    }
-
-    fn append(request: u64, payload: &[u8]) -> Message<RoutedRequestHeader> {
-        let mut messages = IggyMessages::with_capacity(1);
-        messages.push(IggyMessage {
-            header: IggyMessageHeader {
-                id: u128::from(request),
-                payload_length: u32::try_from(payload.len()).unwrap(),
-                ..Default::default()
-            },
-            payload: payload.to_vec().into(),
-            user_headers: None,
-        });
-        SendMessagesOwned::from_messages(namespace(), &messages)
-            .unwrap()
-            .encode_request(RoutedRequestHeader {
-                command: Command::Request,
-                operation: Operation::SendMessages,
-                client: u128::from(request),
-                session: 1,
-                request,
-                group: namespace().inner(),
-                ..Default::default()
-            })
-            .unwrap()
-    }
-
-    fn store(
-        client: u128,
-        request: u64,
-        kind: ConsumerKind,
-        offset: u64,
-    ) -> Message<RoutedRequestHeader> {
-        let body = StoreConsumerOffsetRequest {
-            consumer: WireConsumer {
-                kind: kind.as_code(),
-                id: WireIdentifier::numeric(CONSUMER_ID),
-            },
-            stream_id: WireIdentifier::numeric(1),
-            topic_id: WireIdentifier::numeric(1),
-            partition_id: Some(0),
-            offset,
-            ack: AckLevel::Quorum,
-        }
-        .to_bytes();
-        offset_request(Operation::StoreConsumerOffset, client, request, &body)
-    }
-
-    fn delete(kind: ConsumerKind, request: u64) -> Message<RoutedRequestHeader> {
-        let body = DeleteConsumerOffsetRequest {
-            consumer: WireConsumer {
-                kind: kind.as_code(),
-                id: WireIdentifier::numeric(CONSUMER_ID),
-            },
-            stream_id: WireIdentifier::numeric(1),
-            topic_id: WireIdentifier::numeric(1),
-            partition_id: Some(0),
-            ack: AckLevel::Quorum,
-        }
-        .to_bytes();
-        offset_request(Operation::DeleteConsumerOffset, 42, request, &body)
-    }
-
-    fn offset_request(
-        operation: Operation,
-        client: u128,
-        request: u64,
-        body: &[u8],
-    ) -> Message<RoutedRequestHeader> {
-        let size = size_of::<RoutedRequestHeader>() + body.len();
-        let mut message = Message::<RoutedRequestHeader>::new(size);
-        message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
-        message.transmute_header(|_, header: &mut RoutedRequestHeader| {
-            *header = RoutedRequestHeader {
-                command: Command::Request,
-                operation,
-                size: u32::try_from(size).unwrap(),
-                client,
-                session: 1,
-                request,
-                group: namespace().inner(),
-                ..Default::default()
-            };
-        })
-    }
-
-    fn assert_success(receiver: consensus::Receiver<Message<ReplyHeader>>) {
-        assert_eq!(reply_status(receiver), 0);
-    }
-
-    fn reply_status(receiver: consensus::Receiver<Message<ReplyHeader>>) -> u32 {
-        receiver
-            .now_or_never()
-            .expect("the request must finish")
-            .unwrap()
-            .header()
-            .status
     }
 }

@@ -696,7 +696,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .await?
                 > 0
         {
-            // A purged inode can still be retained by older prepares.
+            // A view change can truncate a suffix that rolled into this offset.
+            // Its public name survives the truncation with the dropped bytes.
             self.remove_segment_name(&public).await?;
         }
         // Segment roll can create the public name during any await. Both

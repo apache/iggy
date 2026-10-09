@@ -3796,6 +3796,9 @@ where
         self.log.invalidate_sealed_read_state();
         while self.log.retire_front().is_some() {}
         self.clear_install_journal();
+        // The journal wipe took the bodies of the pipeline's prepares, and its
+        // queued requests were admitted under the history retired above.
+        self.consensus().clear_pipeline();
         self.clear_install_offsets();
         self.segment_checksum_cache.borrow_mut().clear();
         self.reuse_scan_memo.borrow_mut().take();

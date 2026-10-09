@@ -873,7 +873,7 @@ where
 ///
 /// This classification runs before `verify_frame`, so the byte is still
 /// unverified: a flipped bit landing in an undefined discriminant would
-/// otherwise be reported as "upgrade this node", and for a `PrepareOk` --
+/// otherwise be reported as version skew, and for a `PrepareOk` --
 /// which echoes an operation this primary minted itself -- corruption is the
 /// likelier cause anyway. Sealed headers verify the frame checksum; the
 /// Prepare family verifies the identity checksum, which covers the operation

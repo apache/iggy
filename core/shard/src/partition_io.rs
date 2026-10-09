@@ -2029,7 +2029,7 @@ mod tests {
             let partitions = owner.plane.partitions();
             let partition = partitions.get_mut_by_ns(&namespace).unwrap();
             partition.set_partition_dir(partition_path.to_str().unwrap().to_owned());
-            owner.fence_partition_for_rebuild(namespace, partition, None);
+            owner.fence_partition_for_rebuild(namespace, partition, partition.offset_frontier());
             owner.service_partition_io().await;
             owner.apply_reconcile_ops();
             assert!(partitions.is_tombstoned(&namespace));

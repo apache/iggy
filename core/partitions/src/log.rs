@@ -22,14 +22,12 @@ use crate::poll_plan::SealedSegmentHandle;
 use crate::segment::Segment;
 use iggy_common::IggyByteSize;
 use journal::Journal;
-use ringbuffer::AllocRingBuffer;
 use server_common::SegmentStorage;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
 
 const SEGMENTS_CAPACITY: usize = 1024;
-const ACCESS_MAP_CAPACITY: usize = 8;
 /// Max sealed segments per partition that keep a resident read handle (fd +
 /// sparse index). Without a cap every sealed segment a reader ever touched pins
 /// one fd for the partition's lifetime; the server-wide budget is this cap times
@@ -138,10 +136,6 @@ where
     J: Debug + Journal,
 {
     journal: JournalState<J>,
-    // Ring buffer tracking recently accessed segment indices for cleanup optimization.
-    // A background task uses this to identify and close file descriptors for unused segments.
-    _access_map: AllocRingBuffer<usize>,
-    _cache: (),
     segments: Vec<Segment>,
     indexes: Vec<Option<IggyIndexCache>>,
     storage: Vec<SegmentStorage>,
@@ -166,8 +160,6 @@ where
     fn default() -> Self {
         Self {
             journal: JournalState::default(),
-            _access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
-            _cache: (),
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
             indexes: Vec::with_capacity(SEGMENTS_CAPACITY),

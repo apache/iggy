@@ -133,10 +133,12 @@ pub mod frame_drop_variant {
 /// traffic has nobody to answer, so this is the direct record that local bytes
 /// were destroyed and repair may be required.
 pub mod frame_drop_reason {
-    /// Operation discriminant unknown to this build: the sender is newer.
+    /// Operation discriminant unknown to this build: the sender runs another
+    /// release.
     ///
-    /// Distinct from `UNPARSABLE` because upgrading this node is the fix, and
-    /// until it is, the frame's consensus group gap-stops here.
+    /// Distinct from `UNPARSABLE` because aligning the releases is the fix, and
+    /// until they are aligned, a replication frame's consensus group gap-stops
+    /// here.
     pub const UNSUPPORTED_OPERATION: &str = "unsupported_operation";
     /// A consensus frame failed typed decode for any other reason (corrupt
     /// header, bad size, client-bound command on the inbound path).

@@ -3115,6 +3115,47 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_truncated_roll_when_the_replacement_rolls_at_the_same_offset_should_replace_the_public_file()
+     {
+        const BODY_BYTES: usize = 8192;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let dropped = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        journal.append(dropped.into_frozen()).await.unwrap();
+        journal.truncate_from(2).await.unwrap();
+        let rolled = partition.path().join("00000000000000000001.log");
+        assert_eq!(std::fs::metadata(&rolled).unwrap().len(), BODY_BYTES as u64);
+
+        let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
+        journal
+            .append(replacement.clone().into_frozen())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&rolled).unwrap(),
+            replacement.as_slice()[size_of::<PrepareHeader>()..],
+            "the replacement segment must not keep the truncated suffix's bytes"
+        );
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), replacement.as_slice());
+    }
+
+    #[compio::test]
     async fn owned_segments_recover_unpublished_bytes_and_append_in_their_place() {
         const BODY_BYTES: usize = 8192;
         let partition = tempdir().unwrap();

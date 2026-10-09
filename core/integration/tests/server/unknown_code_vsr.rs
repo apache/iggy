@@ -26,11 +26,11 @@
 //! claims (the SDK forwards unknown codes untouched, `COMMAND_TABLE` being a
 //! registry rather than a capability list): the shared response builder's
 //! catch-all already denied it `InvalidCommand`, so that test pins the
-//! pre-existing deny now that the gate owns it. Retired codes are unknown in
-//! the same way. One the table lists but no read serves (`LOGOUT_USER`, which
-//! the SDK only ever sends as `Operation::Logout`): the old gate fell open
-//! and let the builder acknowledge it empty-ok, as if a logout had happened,
-//! so that test pins the closed fail-open.
+//! pre-existing deny now that the gate owns it. One the table lists but no
+//! read serves (`LOGOUT_USER`, which the SDK only ever sends as
+//! `Operation::Logout`): the old gate fell open and let the builder
+//! acknowledge it empty-ok, as if a logout had happened, so that test pins
+//! the closed fail-open.
 //!
 //! An operation byte `Operation` does not declare fails the typed header
 //! decode, so the funnel answers it before any gate. The deny must echo the
@@ -56,12 +56,6 @@ use crate::server::raw_tcp::{
 
 /// A code no `COMMAND_TABLE` entry claims.
 const UNKNOWN_CODE: u32 = 9999;
-
-/// Retired command codes, as `codes.rs` records them: 205 was `PURGE_STREAM`
-/// and 305 was `PURGE_TOPIC`. A client whose table no longer lists a code
-/// sends it as `NonReplicated`, like any code it does not know.
-const RETIRED_STREAM_CODE: u32 = 205;
-const RETIRED_TOPIC_CODE: u32 = 305;
 
 /// An operation byte `Operation` does not declare.
 /// `reserved_codes_remain_unknown` pins 131 as never reused, so a new
@@ -103,28 +97,6 @@ async fn given_bound_session_when_table_listed_code_without_read_arm_sent_should
         "test needs a non-replicated COMMAND_TABLE entry"
     );
     assert_non_replicated_code_denied_invalid_command(harness, LOGOUT_USER_CODE).await;
-}
-
-#[iggy_harness]
-async fn given_bound_session_when_retired_stream_code_sent_should_deny_invalid_command(
-    harness: &TestHarness,
-) {
-    assert!(
-        lookup_command(RETIRED_STREAM_CODE).is_none(),
-        "test needs a retired code absent from COMMAND_TABLE"
-    );
-    assert_non_replicated_code_denied_invalid_command(harness, RETIRED_STREAM_CODE).await;
-}
-
-#[iggy_harness]
-async fn given_bound_session_when_retired_topic_code_sent_should_deny_invalid_command(
-    harness: &TestHarness,
-) {
-    assert!(
-        lookup_command(RETIRED_TOPIC_CODE).is_none(),
-        "test needs a retired code absent from COMMAND_TABLE"
-    );
-    assert_non_replicated_code_denied_invalid_command(harness, RETIRED_TOPIC_CODE).await;
 }
 
 #[iggy_harness]

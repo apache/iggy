@@ -300,21 +300,21 @@ impl BookmarkStorageHarness {
     }
 }
 
-/// Assert the bookmark of every kind. The external group is never polled, so its
+/// Assert bookmark 2 for every kind. The external group is never polled, so its
 /// bookmark is read directly rather than through a polling consumer.
-fn assert_bookmarks(partition: &TestPartition, expected: Option<u64>, context: &str) {
+fn assert_bookmarks(partition: &TestPartition) {
     for consumer in consumers() {
         assert_eq!(
             partition.get_consumer_offset(consumer),
-            expected,
-            "{context}: {consumer:?}"
+            Some(STORED_OFFSET),
+            "{consumer:?}"
         );
     }
     let group_id = u32::try_from(GROUP_ID).expect("group id fits u32");
     assert_eq!(
         partition.external_group_offset(group_id),
-        expected,
-        "{context}: external group {group_id}"
+        Some(STORED_OFFSET),
+        "external group {group_id}"
     );
 }
 
@@ -350,7 +350,7 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
             harness.storage.crash(Crash::PowerLoss);
             let recovered = harness.recover_partition().await;
 
-            assert_bookmarks(&recovered, Some(STORED_OFFSET), "recovery must keep it");
+            assert_bookmarks(&recovered);
             // Bookmark 2 means the first three messages were already consumed.
             harness
                 .poll_next_and_assert_messages(recovered, &[3, 4])

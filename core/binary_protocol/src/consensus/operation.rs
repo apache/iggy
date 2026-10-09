@@ -103,10 +103,11 @@ pub enum Operation {
 impl Operation {
     /// Whether `code` is a discriminant this build defines.
     ///
-    /// The typed decode needs this to tell an operation a newer release added
-    /// from a corrupted header byte: bytemuck's checked cast rejects both with
-    /// one undifferentiated error, and only the former is fixable by upgrading
-    /// this node.
+    /// Decoders need this to tell an operation another release defines from a
+    /// corrupted header byte: bytemuck's checked cast rejects both with one
+    /// undifferentiated error, and only the former is fixed by aligning the
+    /// releases. A newer release adds operations, and an older one can still
+    /// send a retired one.
     #[must_use]
     pub fn is_known_code(code: u8) -> bool {
         bytemuck::checked::try_cast::<u8, Self>(code).is_ok()
