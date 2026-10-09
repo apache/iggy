@@ -18,6 +18,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
+use ahash::AHashMap;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{read_u32_le, read_u64_le};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
@@ -33,7 +34,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::stm::result::ApplyReply;
 use crate::stm::snapshot::SnapshotError;
-use crate::stm::stream::{Streams, StreamsInner, StreamsSnapshot};
+use crate::stm::stream::{
+    PartitionSnapshot, Streams, StreamsInner, StreamsSnapshot, TopicSnapshot,
+};
 use crate::stm::{ApplyContext, StateHandler};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -445,11 +448,23 @@ impl StateHandler for CompleteLifecycleRequest {
     }
 }
 
+/// Owner rows and lifecycle targets look partitions up by id. A scan per row
+/// made recovery quadratic in partitions per topic. The first duplicate wins,
+/// as it did for the scan.
+fn partition_index(topic: &TopicSnapshot) -> AHashMap<usize, &PartitionSnapshot> {
+    let mut index = AHashMap::with_capacity(topic.partitions.len());
+    for partition in &topic.partitions {
+        index.entry(partition.id).or_insert(partition);
+    }
+    index
+}
+
 impl StreamsSnapshot {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn validate_ownership_history(&self, metadata_op: u64) -> Result<(), SnapshotError> {
         for (_, stream) in &self.items {
             for (_, topic) in &stream.topics {
+                let partitions = partition_index(topic);
                 for (group_id, group) in &topic.consumer_groups {
                     if group.id != *group_id || *group_id >= topic.next_consumer_group_id {
                         return Err(SnapshotError::InvalidState(
@@ -476,13 +491,12 @@ impl StreamsSnapshot {
                         }
                     }
                     for (&partition_id, assignment) in &group.assignments {
-                        let partition = topic
-                            .partitions
-                            .iter()
-                            .find(|partition| partition.id == partition_id)
-                            .ok_or(SnapshotError::InvalidState(
-                                "owner refers to an absent partition",
-                            ))?;
+                        let partition =
+                            partitions
+                                .get(&partition_id)
+                                .ok_or(SnapshotError::InvalidState(
+                                    "owner refers to an absent partition",
+                                ))?;
                         if assignment.incarnation != partition.created_revision {
                             return Err(SnapshotError::InvalidState(
                                 "owner belongs to another history",
@@ -573,17 +587,18 @@ impl StreamsSnapshot {
                     expected.insert((*topic_id, partition.id));
                 }
             }
+            let mut topics = AHashMap::with_capacity(stream.topics.len());
+            for (topic_id, topic) in &stream.topics {
+                topics
+                    .entry(*topic_id)
+                    .or_insert_with(|| (topic, partition_index(topic)));
+            }
             for target in &intent.partitions {
-                let topic = stream
-                    .topics
-                    .iter()
-                    .find(|(id, _)| *id == target.topic_id as usize)
-                    .map(|(_, topic)| topic)
+                let (topic, partitions) = topics
+                    .get(&(target.topic_id as usize))
                     .ok_or(SnapshotError::InvalidState("lifecycle topic is absent"))?;
-                let partition = topic
-                    .partitions
-                    .iter()
-                    .find(|partition| partition.id == target.partition_id as usize)
+                let partition = partitions
+                    .get(&(target.partition_id as usize))
                     .ok_or(SnapshotError::InvalidState("lifecycle partition is absent"))?;
                 if !expected.remove(&(target.topic_id as usize, target.partition_id as usize))
                     || target.partition_op == Some(0)
