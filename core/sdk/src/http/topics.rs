@@ -17,6 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::{Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use async_trait::async_trait;
 use iggy_common::TopicClient;
@@ -134,9 +135,9 @@ impl TopicClient for HttpClient {
 }
 
 fn get_path(stream_id: &str) -> String {
-    format!("streams/{stream_id}/topics")
+    format!("streams/{}/topics", encode_segment(stream_id))
 }
 
 fn get_details_path(stream_id: &str, topic_id: &str) -> String {
-    format!("{}/{topic_id}", get_path(stream_id))
+    format!("{}/{}", get_path(stream_id), encode_segment(topic_id))
 }

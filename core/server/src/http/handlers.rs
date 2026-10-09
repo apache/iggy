@@ -1229,15 +1229,21 @@ pub(in crate::http) async fn poll_messages(
         },
     ))
     .await?;
-    let wire = poll_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
+
+    let wire = match poll_wire_request(&stream_id, &topic_id, &query) {
+        Ok(request) => request,
+        Err(error) => return Err(ReadError::Rejected(error)),
+    };
+
     let (namespace, partition_id, consumer, args) =
         match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
             Ok(decoded) => decoded,
-            // A partition id the topic does not have is a client addressing
-            // error with its own code; collapsing it into the generic 404 body
-            // told an SDK "no such stream/topic" for a request whose stream and
-            // topic both resolved. TCP parity: the dispatch denies typed here.
-            Err(error @ IggyError::PartitionNotFound(..)) => {
+            // A partition id the topic does not have, or a consumer kind HTTP
+            // can't poll with, is a client addressing error with its own code;
+            // collapsing it into the generic 404 body told an SDK "no such
+            // stream/topic" for a request whose stream and topic both
+            // resolved. TCP parity: the dispatch denies typed here.
+            Err(error @ (IggyError::PartitionNotFound(..) | IggyError::FeatureUnavailable)) => {
                 return Err(ReadError::Rejected(error));
             }
             // The remaining resolver failures are STM lookups that came up

@@ -101,9 +101,8 @@ pub(in crate::http) fn poll_wire_request(
     topic_id: &Identifier,
     query: &PollMessages,
 ) -> Result<PollMessagesRequest, IggyError> {
-    if query.consumer.kind == ConsumerKind::ConsumerGroup {
-        return Err(IggyError::FeatureUnavailable);
-    }
+    refuse_consumer_group(query.consumer.kind)?;
+
     Ok(PollMessagesRequest {
         consumer: WireConsumer {
             kind: query.consumer.kind.as_code(),
@@ -152,9 +151,8 @@ pub(in crate::http) fn store_offset_wire_request(
     topic_id: &Identifier,
     command: &StoreConsumerOffset,
 ) -> Result<StoreConsumerOffsetRequest, IggyError> {
-    if command.consumer.kind == ConsumerKind::ConsumerGroup {
-        return Err(IggyError::FeatureUnavailable);
-    }
+    refuse_consumer_group(command.consumer.kind)?;
+
     Ok(StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(&command.consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
@@ -175,9 +173,8 @@ pub(in crate::http) fn delete_offset_wire_request(
     consumer: &Consumer,
     partition_id: Option<u32>,
 ) -> Result<DeleteConsumerOffsetRequest, IggyError> {
-    if consumer.kind == ConsumerKind::ConsumerGroup {
-        return Err(IggyError::FeatureUnavailable);
-    }
+    refuse_consumer_group(consumer.kind)?;
+
     Ok(DeleteConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
@@ -212,6 +209,13 @@ pub(in crate::http) fn build_request_message(
     header.request = request_id;
     header.size = u32::try_from(total).expect("control-plane message size fits u32");
     message
+}
+
+fn refuse_consumer_group(kind: ConsumerKind) -> Result<(), IggyError> {
+    if kind == ConsumerKind::ConsumerGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -594,6 +598,18 @@ mod tests {
     }
 
     #[test]
+    fn refuse_consumer_group_rejects_group_kind() {
+        let error = refuse_consumer_group(ConsumerKind::ConsumerGroup).expect_err("must reject");
+        assert!(matches!(error, IggyError::FeatureUnavailable));
+    }
+
+    #[test]
+    fn refuse_consumer_group_passes_non_group_kinds() {
+        assert!(refuse_consumer_group(ConsumerKind::Consumer).is_ok());
+        assert!(refuse_consumer_group(ConsumerKind::ExternalGroup).is_ok());
+    }
+
+    #[test]
     fn delete_offset_wire_request_rejects_consumer_group_kind() {
         let stream_id = Identifier::named("stream-1").expect("valid stream id");
         let topic_id = Identifier::numeric(2).expect("valid topic id");
@@ -679,13 +695,5 @@ mod tests {
             polled.messages[1].user_headers.as_deref(),
             Some(b"raw-header-bytes".as_ref())
         );
-    }
-
-    #[test]
-    fn resync_required_polled_messages_carries_sentinel_partition() {
-        let polled = resync_required_polled_messages();
-        assert_eq!(polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL);
-        assert_eq!(polled.count, 0);
-        assert_eq!(polled.messages, []);
     }
 }

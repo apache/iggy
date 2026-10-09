@@ -152,8 +152,8 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
                 .await
                 .expect_err("HTTP store must reject a consumer-group kind");
             assert!(
-                matches!(store_error, IggyError::HttpResponseError(400, _)),
-                "expected a 400 rejection for HTTP store with consumer_kind=consumer_group, got {store_error:?}"
+                is_feature_unavailable(&store_error),
+                "expected a feature-unavailable rejection for HTTP store with consumer_kind=consumer_group, got {store_error:?}"
             );
 
             let delete_error = client
@@ -161,8 +161,8 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
                 .await
                 .expect_err("HTTP delete must reject a consumer-group kind");
             assert!(
-                matches!(delete_error, IggyError::HttpResponseError(400, _)),
-                "expected a 400 rejection for HTTP delete with consumer_kind=consumer_group, got {delete_error:?}"
+                is_feature_unavailable(&delete_error),
+                "expected a feature-unavailable rejection for HTTP delete with consumer_kind=consumer_group, got {delete_error:?}"
             );
 
             let poll_error = client
@@ -178,8 +178,8 @@ async fn given_consumer_and_group_offsets_when_managed_over_any_transport_should
                 .await
                 .expect_err("HTTP poll must reject a consumer-group kind");
             assert!(
-                matches!(poll_error, IggyError::HttpResponseError(400, _)),
-                "expected a 400 rejection for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
+                is_feature_unavailable(&poll_error),
+                "expected a feature-unavailable rejection for HTTP poll with consumer_kind=consumer_group, got {poll_error:?}"
             );
         }
     }
@@ -334,6 +334,16 @@ async fn given_standalone_stream_consumer_when_creating_topic_should_select_part
         assert_eq!(consumer.partition_id(), partition_id);
         consumer.shutdown().await.expect("Shut down consumer");
     }
+}
+
+/// True when an HTTP error body wraps the `FeatureUnavailable` error code into a 400.
+fn is_feature_unavailable(error: &IggyError) -> bool {
+    let IggyError::HttpResponseError(_, body) = error else {
+        return false;
+    };
+
+    crate::server::scenarios::permissions_scenario::http_error_id(body)
+        == Some(IggyError::FeatureUnavailable.as_code())
 }
 
 /// Read the offset the server has stored for the consumer.

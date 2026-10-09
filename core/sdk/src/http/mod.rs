@@ -22,6 +22,7 @@ pub mod http_client;
 pub(crate) mod http_transport;
 pub mod messages;
 pub mod partitions;
+pub(crate) mod path;
 pub mod personal_access_tokens;
 pub mod segments;
 pub mod streams;
