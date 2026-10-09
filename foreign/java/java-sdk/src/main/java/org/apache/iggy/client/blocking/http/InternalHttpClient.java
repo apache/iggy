@@ -21,18 +21,26 @@ package org.apache.iggy.client.blocking.http;
 
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.http.ClassicHttpResponse;
+import org.apache.hc.core5.http.HttpRequest;
+import org.apache.hc.core5.http.HttpResponse;
+import org.apache.hc.core5.http.HttpStatus;
+import org.apache.hc.core5.http.Method;
 import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.io.HttpClientResponseHandler;
 import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
+import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.ssl.SSLContextBuilder;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTlsException;
 import org.slf4j.Logger;
@@ -47,13 +55,21 @@ import java.io.File;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.Optional;
+import java.util.Set;
 
 final class InternalHttpClient implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(InternalHttpClient.class);
 
     private static final String AUTHORIZATION = "Authorization";
+    private static final String UNCERTAIN_ATTEMPT = "iggy.uncertain-attempt";
+    private static final Set<IggyErrorCode> SETTLED_REFUSALS = EnumSet.of(
+            IggyErrorCode.HISTORY_UNAVAILABLE,
+            IggyErrorCode.LIFECYCLE_BUSY,
+            IggyErrorCode.UNAUTHORIZED,
+            IggyErrorCode.UNAUTHENTICATED);
     private final String url;
     private final ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
     private final CloseableHttpClient httpClient;
@@ -94,6 +110,7 @@ final class InternalHttpClient implements Closeable {
         return HttpClients.custom()
                 .setConnectionManager(connectionManagerBuilder.build())
                 .setDefaultRequestConfig(requestConfigBuilder.build())
+                .setRetryStrategy(new UncertainAttempts())
                 .build();
     }
 
@@ -146,11 +163,32 @@ final class InternalHttpClient implements Closeable {
     }
 
     private <T> T executeRequest(ClassicHttpRequest request, HttpClientResponseHandler<T> responseHandler) {
+        var context = HttpClientContext.create();
         try {
-            return httpClient.execute(request, responseHandler);
+            return httpClient.execute(request, context, responseHandler);
+        } catch (IggyServerException refusal) {
+            throw settle(request, context, refusal);
         } catch (IOException e) {
             throw new IggyConnectionException("HTTP request failed", e);
         }
+    }
+
+    /**
+     * HTTP has no request dedup: an automatic resend is a new request, so its refusal cannot tell
+     * whether an earlier attempt committed. Such a refusal reports an unknown outcome, which
+     * nothing refreshes or repeats.
+     */
+    private static IggyServerException settle(
+            ClassicHttpRequest request, HttpContext context, IggyServerException refusal) {
+        // Reads commit nothing, so only a write can leave an uncertain outcome behind.
+        boolean uncertain =
+                !Method.GET.isSame(request.getMethod()) && Boolean.TRUE.equals(context.getAttribute(UNCERTAIN_ATTEMPT));
+        if (!uncertain || !SETTLED_REFUSALS.contains(refusal.getErrorCode())) {
+            return refusal;
+        }
+        var unknownOutcome = new IggyServerException(IggyErrorCode.TRANSIENT_NOT_COMMITTED.getCode());
+        unknownOutcome.initCause(refusal);
+        return unknownOutcome;
     }
 
     ClassicHttpRequest prepareGetRequest(String path, NameValuePair... params) {
@@ -208,5 +246,34 @@ final class InternalHttpClient implements Closeable {
 
     private static boolean isSuccessful(int statusCode) {
         return statusCode >= 200 && statusCode < 300;
+    }
+
+    /**
+     * Resends what the default strategy resends: a 429 or a 503 answer to any request, and an I/O
+     * failure of an idempotent one. Each resend marks the request uncertain unless the server
+     * provably never took the attempt before it.
+     */
+    private static final class UncertainAttempts extends DefaultHttpRequestRetryStrategy {
+
+        @Override
+        public boolean retryRequest(HttpResponse response, int execCount, HttpContext context) {
+            boolean retry = super.retryRequest(response, execCount, context);
+            // Only an admission refusal proves the attempt was not taken. A 503 can mean either.
+            if (retry && response.getCode() != HttpStatus.SC_TOO_MANY_REQUESTS) {
+                context.setAttribute(UNCERTAIN_ATTEMPT, Boolean.TRUE);
+            }
+            return retry;
+        }
+
+        @Override
+        public boolean retryRequest(HttpRequest request, IOException exception, int execCount, HttpContext context) {
+            boolean retry = super.retryRequest(request, exception, execCount, context);
+            // The default strategy never resends a failed connection, so the failed attempt may
+            // have reached the server.
+            if (retry) {
+                context.setAttribute(UNCERTAIN_ATTEMPT, Boolean.TRUE);
+            }
+            return retry;
+        }
     }
 }

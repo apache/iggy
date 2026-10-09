@@ -93,8 +93,10 @@ class MessagesHttpClient implements MessagesClient {
             if (error.getErrorCode() != IggyErrorCode.HISTORY_UNAVAILABLE) {
                 throw error;
             }
-            // A refused batch did not commit, so one resend under the contexts read again cannot
-            // duplicate it. The binary transports resend once the same way.
+            // No attempt of this batch committed: InternalHttpClient reports the refusal of an
+            // automatic resend after an attempt that may have committed as 57 instead. So one
+            // resend under the contexts read again cannot duplicate the batch. The binary
+            // transports resend once the same way.
             return post(streamId, topicId, partitioning, messages);
         }
     }

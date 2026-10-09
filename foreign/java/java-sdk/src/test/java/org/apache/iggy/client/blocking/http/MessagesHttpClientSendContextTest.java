@@ -20,7 +20,9 @@
 package org.apache.iggy.client.blocking.http;
 
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import org.apache.hc.core5.http.HttpStatus;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -31,6 +33,7 @@ import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -45,6 +48,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -60,6 +65,8 @@ class MessagesHttpClientSendContextTest {
     private static final String GET_TOPIC = "GET /streams/1/topics/2";
     private static final String POST_MESSAGES = "POST /streams/1/topics/2/messages";
     private static final String POLL_MESSAGES = "GET /streams/1/topics/2/messages";
+    private static final String DELETE_STREAM = "DELETE /streams/1";
+    private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int HISTORY_UNAVAILABLE = 87;
     private static final int UNAUTHORIZED = 41;
 
@@ -94,6 +101,68 @@ class MessagesHttpClientSendContextTest {
                     .containsExactly(GET_TOPIC, POST_MESSAGES, POST_MESSAGES, GET_TOPIC, POST_MESSAGES);
             assertThat(server.sends.get(1).get("context")).isEqualTo(context(103));
             assertThat(server.sends.get(2).get("context")).isEqualTo(context(203));
+        }
+    }
+
+    @Test
+    void shouldReportAnUnknownOutcomeWhenTheAutomaticResendOfASendIsRefused() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            send(client, Partitioning.partitionId(3L));
+            server.interruptNextRequest(HttpStatus.SC_SERVICE_UNAVAILABLE);
+
+            assertThatThrownBy(() -> send(client, Partitioning.partitionId(3L)))
+                    .isInstanceOfSatisfying(
+                            IggyServerException.class,
+                            error -> assertThat(error.getRawErrorCode()).isEqualTo(TRANSIENT_NOT_COMMITTED));
+            assertThat(server.requests).containsExactly(GET_TOPIC, POST_MESSAGES, POST_MESSAGES, POST_MESSAGES);
+        }
+    }
+
+    @Test
+    void shouldResendUnderTheContextReadAgainWhenTheResendAfterATooManyRequestsAnswerIsRefused() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            send(client, Partitioning.partitionId(3L));
+            // A 429 proves the server never took the send, so its refused resend was the only attempt.
+            server.interruptNextRequest(HttpStatus.SC_TOO_MANY_REQUESTS);
+
+            send(client, Partitioning.partitionId(3L));
+
+            assertThat(server.requests)
+                    .containsExactly(GET_TOPIC, POST_MESSAGES, POST_MESSAGES, POST_MESSAGES, GET_TOPIC, POST_MESSAGES);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"400, 88, lifecycle_busy", "403, 41, unauthorized", "401, 40, unauthenticated"})
+    void shouldReportAnUnknownOutcomeWhenTheResendOfAnUnansweredDeleteIsRefused(int status, int id, String code)
+            throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            // Closing an exchange without an answer drops the connection after the server took the delete.
+            server.scriptedAnswers.add(HttpExchange::close);
+            server.scriptedAnswers.add(exchange -> FakeServer.reply(exchange, status, FakeServer.error(id, code)));
+
+            assertThatThrownBy(() -> client.streams().deleteStream(STREAM))
+                    .isInstanceOfSatisfying(
+                            IggyServerException.class,
+                            error -> assertThat(error.getRawErrorCode()).isEqualTo(TRANSIENT_NOT_COMMITTED));
+            assertThat(server.requests).containsExactly(DELETE_STREAM, DELETE_STREAM);
+        }
+    }
+
+    @Test
+    void shouldSendWithoutAContextWhenTheAutomaticResendOfTheTopicReadIsRefused() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            server.topicReadable = false;
+            server.interruptNextRequest(HttpStatus.SC_SERVICE_UNAVAILABLE);
+
+            send(client, Partitioning.partitionId(3L));
+
+            assertThat(server.requests).containsExactly(GET_TOPIC, GET_TOPIC, POST_MESSAGES);
+            assertThat(server.sends).noneMatch(send -> send.has("context"));
         }
     }
 
@@ -239,6 +308,8 @@ class MessagesHttpClientSendContextTest {
         private final List<String> requests = new CopyOnWriteArrayList<>();
         private final List<JsonNode> sends = new CopyOnWriteArrayList<>();
         private final List<String> polls = new CopyOnWriteArrayList<>();
+        // Answers given in place of the server's, one per request.
+        private final Queue<HttpHandler> scriptedAnswers = new ConcurrentLinkedQueue<>();
         private volatile long epoch = 1;
         private volatile List<Long> partitionIds = List.of(1L, 3L);
         private volatile boolean topicReadable = true;
@@ -246,7 +317,7 @@ class MessagesHttpClientSendContextTest {
 
         FakeServer() throws IOException {
             server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
-            server.createContext("/", this::handle);
+            server.createContext("/", this::receive);
             server.start();
         }
 
@@ -259,11 +330,31 @@ class MessagesHttpClientSendContextTest {
             epoch++;
         }
 
-        private void handle(HttpExchange exchange) throws IOException {
+        /**
+         * Answers the next request with {@code status} in place of the server, and another client
+         * recreates the partitions before the request is sent again.
+         */
+        void interruptNextRequest(int status) {
+            scriptedAnswers.add(exchange -> {
+                recreatePartitions();
+                reply(exchange, status, "");
+            });
+        }
+
+        private void receive(HttpExchange exchange) throws IOException {
             String request =
                     exchange.getRequestMethod() + " " + exchange.getRequestURI().getPath();
             byte[] body = exchange.getRequestBody().readAllBytes();
             requests.add(request);
+            HttpHandler scripted = scriptedAnswers.poll();
+            if (scripted != null) {
+                scripted.handle(exchange);
+            } else {
+                handle(exchange, request, body);
+            }
+        }
+
+        private void handle(HttpExchange exchange, String request, byte[] body) throws IOException {
             switch (request) {
                 case GET_TOPIC -> {
                     if (topicReadable) {
