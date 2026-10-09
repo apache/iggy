@@ -11397,8 +11397,15 @@ where
                 // a fully evicted window -- is indistinguishable from a
                 // message range below the floor that this replica does not
                 // durably own, and accepting it would serve a holed log.
+                // A replica with no committed message transfers too: a jump
+                // would leave its counter at 0 while the group may have
+                // committed messages below the floor. Such a replica then
+                // moves its commit point only by walking each op, by a window
+                // whose first batch starts at offset 0, or by an install, so
+                // its empty offer as primary is real state.
                 (None, _) => {
-                    floor < session.commit_to_op
+                    self.offset_frontier() > 0
+                        && floor < session.commit_to_op
                         && committed_shape.complete
                         && !committed_shape.holds_messages
                 }
@@ -18741,17 +18748,27 @@ mod tests {
         request_id: u64,
         consumer_id: u32,
     ) -> Message<RoutedRequestHeader> {
-        delete_offset_request_with_ack(client_id, request_id, consumer_id, AckLevel::Quorum)
+        delete_offset_request_with_ack(
+            client_id,
+            request_id,
+            ConsumerKind::Consumer,
+            consumer_id,
+            AckLevel::Quorum,
+        )
     }
 
     fn delete_offset_request_with_ack(
         client_id: u128,
         request_id: u64,
+        kind: ConsumerKind,
         consumer_id: u32,
         ack: AckLevel,
     ) -> Message<RoutedRequestHeader> {
         let body = DeleteConsumerOffsetRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
+            consumer: WireConsumer {
+                kind: kind.as_code(),
+                id: WireIdentifier::Numeric(consumer_id),
+            },
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
             partition_id: Some(0),
@@ -19927,7 +19944,13 @@ mod tests {
                 );
                 partition
                     .on_request(
-                        delete_offset_request_with_ack(CLIENT, 2, CONSUMER, delete_ack),
+                        delete_offset_request_with_ack(
+                            CLIENT,
+                            2,
+                            ConsumerKind::Consumer,
+                            CONSUMER,
+                            delete_ack,
+                        ),
                         None,
                     )
                     .await;
@@ -20668,11 +20691,10 @@ mod tests {
     }
 
     /// External group offsets can be stored and deleted on a partition that never took a
-    /// message. Its commit floor then moves with no bytes behind it, which is also what a replica
-    /// holding zero bytes while its peers hold messages looks like. Nothing backs that empty
-    /// chain, so the offer is refused.
+    /// message. Its commit floor then moves with no bytes behind it, and the offer carries
+    /// exactly that: no segment, frontier 0 and no offset.
     #[compio::test]
-    async fn given_external_offset_stored_then_deleted_on_empty_partition_when_offer_requested_should_refuse_it()
+    async fn given_external_offset_stored_then_deleted_on_empty_partition_when_offer_requested_should_serve_it()
      {
         let directory = tempfile::tempdir().unwrap();
         let (mut origin, _) = recording_partition_at(0, 3);
@@ -20688,15 +20710,13 @@ mod tests {
         }
         assert_eq!(origin.external_group_offset(5), None);
 
-        let refused = origin.state_transfer_offer(&repair_config()).await;
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
 
-        assert!(
-            matches!(
-                refused,
-                Err(crate::state_transfer::PartitionTransferUnavailable::NothingCommitted)
-            ),
-            "expected a NothingCommitted refusal, got {refused:?}"
-        );
+        assert_eq!(offer.commit_op, 2);
+        assert!(offer.segments.is_empty());
+        let offsets = crate::state_transfer::ConsumerOffsetsWire::decode(&offer.offsets.1).unwrap();
+        assert_eq!(offsets.next_offset, 0);
+        assert_eq!(offsets.external_groups, []);
     }
 
     /// The sender snapshot of a real offer carries an external group offset, and the receiver
@@ -20783,6 +20803,183 @@ mod tests {
         );
         assert_eq!(receiver.external_group_offset(7), Some(1 << 40));
         assert!(offset_file.exists());
+    }
+
+    /// Known residual: the replica stays refused until its group commits a message or offset store.
+    #[compio::test]
+    async fn given_counter_zero_replica_that_missed_an_evicted_offset_delete_when_transferring_should_stay_refused()
+     {
+        let donor_directory = tempfile::tempdir().unwrap();
+        let (mut donor, _) = recording_partition_at(0, 3);
+        donor.set_partition_dir(donor_directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut donor, donor_directory.path());
+        donor
+            .on_request(
+                store_offset_request(
+                    MESSAGE_LESS_CLIENT_ID,
+                    1,
+                    ConsumerKind::ExternalGroup,
+                    MESSAGE_LESS_EXTERNAL_GROUP_ID,
+                    MESSAGE_LESS_EXTERNAL_OFFSET,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        donor.consensus().advance_commit_max(1);
+        donor.commit_journal(&repair_config()).await;
+        let (receiver_directory, mut receiver) = transfer_receiver();
+        receiver.on_replicate(retained_prepare(&donor, 1)).await;
+        receiver.consensus().advance_commit_max(1);
+        receiver.commit_journal(&repair_config()).await;
+        let offset_file = receiver_directory.path().join(format!(
+            "offsets/external_groups/{MESSAGE_LESS_EXTERNAL_GROUP_ID}"
+        ));
+        assert!(offset_file.exists());
+        donor
+            .on_request(
+                delete_offset_request_with_ack(
+                    MESSAGE_LESS_CLIENT_ID,
+                    2,
+                    ConsumerKind::ExternalGroup,
+                    MESSAGE_LESS_EXTERNAL_GROUP_ID,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        donor.consensus().advance_commit_max(2);
+        donor.commit_journal(&repair_config()).await;
+        assert_eq!(
+            donor.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            None
+        );
+
+        // No peer retains the delete any more, so repair cannot reach it.
+        receiver.consensus().advance_commit_max(2);
+        receiver.repair = Some(armed_session(2, 2, None));
+        assert_eq!(
+            receiver.complete_repair(&repair_config()).await,
+            RepairConclusion::FloorRefused { floor: 2, to_op: 2 }
+        );
+        let offer = donor.state_transfer_offer(&repair_config()).await.unwrap();
+        let refused = receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(
+                    crate::state_transfer::PartitionInstallError::OfferErasesDurableOffsets {
+                        local_offsets: 1
+                    }
+                )
+            ),
+            "expected the donor's empty offer to be refused, got {refused:?}"
+        );
+        assert_eq!(receiver.consensus().commit_min(), 1);
+        assert_eq!(
+            receiver.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            Some(MESSAGE_LESS_EXTERNAL_OFFSET)
+        );
+        assert!(offset_file.exists());
+    }
+
+    /// A message-less replica that falls behind catches up only by transfer. A donor that
+    /// restarted after a WAL checkpoint still serves the prepare at that op, which a
+    /// receiver keeping prepare history needs to install the offer.
+    #[compio::test]
+    async fn given_message_less_donor_restarted_after_checkpoint_when_persistent_replica_transfers_should_hold_its_state()
+     {
+        const COMMIT_ROUNDS_MAX: usize = 8;
+        let (_origin_directory, origin, transition) = message_less_origin().await;
+        let commit_op = origin.consensus().commit_min();
+        let donor_directory = tempfile::tempdir().unwrap();
+        let (config, mut donor) = replica_with_prepare_history(donor_directory.path(), 1).await;
+        let persistence = Rc::clone(donor.persistence.as_ref().unwrap());
+        for op in 1..=commit_op {
+            donor.on_replicate(retained_prepare(&origin, op)).await;
+        }
+        donor.consensus().advance_commit_max(commit_op);
+        // Each applied op waits on persistence, so drive it between commits.
+        for _ in 0..COMMIT_ROUNDS_MAX {
+            donor.commit_journal(&config).await;
+            persistence.drain_with_timeout().await.unwrap();
+            donor.drive_persistence().await;
+            if donor.consensus().commit_min() == commit_op {
+                break;
+            }
+        }
+        assert_eq!(donor.consensus().commit_min(), commit_op);
+        persistence.request_checkpoint();
+        donor.checkpoint_persistence(&config).await;
+        persistence.drain_with_timeout().await.unwrap();
+        assert!(donor.fatal().is_none(), "{:?}", donor.fatal());
+        assert_eq!(persistence.checkpoint_op(), commit_op);
+        drop(persistence);
+        drop(donor);
+
+        let (_, mut donor) = replica_with_prepare_history(donor_directory.path(), 1).await;
+        assert_eq!(donor.consensus().commit_min(), commit_op);
+        // A view change makes the restarted replica the primary.
+        donor.consensus.set_view(1);
+        let offer = donor.state_transfer_offer(&config).await.unwrap();
+        let receiver_directory = tempfile::tempdir().unwrap();
+        let (receiver_config, mut receiver) =
+            replica_with_prepare_history(receiver_directory.path(), 2).await;
+        receiver
+            .install_state_transfer(
+                &receiver_config,
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_holds_message_less_state(&receiver, &origin, &transition);
+        assert!(
+            receiver
+                .log
+                .journal()
+                .inner
+                .repair_entry(commit_op)
+                .is_some()
+        );
+    }
+
+    /// A replica of three that keeps prepare history under `root`, opened the way boot
+    /// opens it, so a second call on the same root restarts it.
+    async fn replica_with_prepare_history(
+        root: &std::path::Path,
+        replica: u8,
+    ) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+        let mut config = repair_config();
+        config.path_layout.streams_root = root.to_string_lossy().into_owned();
+        let partition_dir = config.get_partition_path(1, 1, 0);
+        let (mut partition, _) = recording_partition_at(replica, 3);
+        partition.set_partition_dir(partition_dir.clone());
+        // Boot loads the offset directories that partition creation made.
+        set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_dir));
+        crate::partition_storage::configure_consumer_offsets_with_storage(
+            &DiskStorage,
+            &mut partition,
+            &config,
+            IggyNamespace::new(1, 1, 0),
+            0,
+        )
+        .await
+        .unwrap();
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        partition.open_persistence().await.unwrap();
+        (config, partition)
     }
 
     /// The first boot after an upgrade creates the external group offsets
@@ -25202,8 +25399,32 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_no_repaired_batch_when_window_offsets_only_should_accept_commit_floor() {
+    async fn given_no_repaired_batch_when_window_offsets_only_at_counter_zero_should_refuse_commit_floor()
+     {
         let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        for op in 6..=8 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.repair = Some(armed_session(8, 5, None));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 5, to_op: 8 },
+            "a jump would leave the counter at 0 whatever messages ops 1 to 5 hold"
+        );
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_none());
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_offsets_only_above_counter_zero_should_accept_commit_floor()
+     {
+        let mut partition = test_partition();
+        partition.set_offset_space_used(true);
+        partition.offset.store(99, Ordering::Release);
         partition.consensus().advance_commit_max(8);
         // Any non-SendMessages operation exercises the offsets-only arm; the
         // commit walk no-ops operations it does not recognize, so the test
@@ -25628,6 +25849,261 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&partition_dir);
+    }
+
+    const MESSAGE_LESS_CLIENT_ID: u128 = 42;
+    const MESSAGE_LESS_GROUP_ID: u64 = 7;
+    const MESSAGE_LESS_EXTERNAL_GROUP_ID: u32 = 5;
+    const MESSAGE_LESS_EXTERNAL_OFFSET: u64 = 9;
+
+    /// A partition that never took a message still commits owner, history and
+    /// retry state, so a replica behind the repair window can only recover by
+    /// transfer. The caught-up primary serves its empty chain at frontier 0,
+    /// and the receiver lands on that state without claiming an offset.
+    #[compio::test]
+    async fn given_message_less_primary_when_offer_requested_should_serve_its_committed_state() {
+        let (_origin_directory, mut origin, transition) = message_less_origin().await;
+
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        assert!(offer.segments.is_empty());
+        let (_receiver_directory, mut receiver) = transfer_receiver();
+        let incarnation = receiver.created_revision();
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_holds_message_less_state(&receiver, &origin, &transition);
+        assert_eq!(receiver.created_revision(), incarnation);
+    }
+
+    /// A replica that never took a message and lags past every op its peers
+    /// retain cannot repair, so it catches up from the primary's offer.
+    #[compio::test]
+    async fn given_lagging_message_less_replica_when_window_fully_evicted_should_catch_up_by_transfer()
+     {
+        let (_origin_directory, mut origin, transition) = message_less_origin().await;
+        let (_receiver_directory, mut receiver) = transfer_receiver();
+        receiver.consensus().advance_commit_max(3);
+        // An empty serving journal reports eviction from its commit point.
+        receiver.repair = Some(armed_session(3, 3, None));
+
+        let conclusion = receiver.complete_repair(&repair_config()).await;
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 3, to_op: 3 }
+        );
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_holds_message_less_state(&receiver, &origin, &transition);
+    }
+
+    /// A complete window without messages says nothing about the ops below
+    /// its floor when the replica never took a message. Op 1 stored an
+    /// external offset, so jumping the floor would drop it unseen.
+    #[compio::test]
+    async fn given_lagging_message_less_replica_when_window_partly_evicted_should_catch_up_by_transfer()
+     {
+        let (_origin_directory, mut origin, transition) = message_less_origin().await;
+        let (_receiver_directory, mut receiver) = transfer_receiver();
+        receiver.consensus().advance_commit_max(3);
+        // The serving peer evicted op 1 and still retains ops 2 and 3.
+        receiver.repair = Some(armed_session(3, 1, None));
+        for op in [2, 3] {
+            receiver
+                .apply_repaired_prepare(retained_prepare(&origin, op))
+                .await;
+        }
+
+        let conclusion = receiver.complete_repair(&repair_config()).await;
+        assert_eq!(
+            (conclusion, receiver.consensus().commit_min()),
+            (RepairConclusion::FloorRefused { floor: 1, to_op: 3 }, 0)
+        );
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_holds_message_less_state(&receiver, &origin, &transition);
+    }
+
+    /// A primary whose ops 1 to 3 commit an external group offset, an owner
+    /// install and a history fence, but no message. Keep the directory alive
+    /// while the origin runs.
+    async fn message_less_origin() -> (
+        tempfile::TempDir,
+        IggyPartition<RecordingBus>,
+        TransitionPartitionHistoryRequest,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut origin, _) = recording_partition_at(0, 3);
+        origin.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut origin, directory.path());
+        origin
+            .on_request(
+                store_offset_request(
+                    MESSAGE_LESS_CLIENT_ID,
+                    1,
+                    ConsumerKind::ExternalGroup,
+                    MESSAGE_LESS_EXTERNAL_GROUP_ID,
+                    MESSAGE_LESS_EXTERNAL_OFFSET,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        origin.consensus.advance_commit_max(1);
+        origin.commit_journal(&repair_config()).await;
+        install_test_owner(&mut origin, MESSAGE_LESS_GROUP_ID, MESSAGE_LESS_CLIENT_ID).await;
+        let transition = TransitionPartitionHistoryRequest {
+            incarnation: origin.created_revision(),
+            metadata_op: origin.required_metadata_frontier + 1,
+        };
+        let fence = partition_control_request(
+            &origin,
+            Operation::TransitionPartitionHistory,
+            &transition.to_bytes(),
+            transition.metadata_op,
+        );
+        origin.on_request(fence, None).await;
+        origin.consensus.advance_commit_max(3);
+        origin.commit_journal(&repair_config()).await;
+        assert!(origin.fatal().is_none(), "{:?}", origin.fatal());
+        assert_eq!(origin.consensus().commit_min(), 3);
+        assert!(origin.consumer_group_owner(MESSAGE_LESS_GROUP_ID).is_some());
+        assert_eq!(origin.installed_history_transition(&transition), Some(3));
+        assert_eq!(origin.offset_frontier(), 0);
+        assert_ne!(origin.dedup().watermarks_sorted(), []);
+        (directory, origin, transition)
+    }
+
+    fn assert_holds_message_less_state(
+        receiver: &IggyPartition<RecordingBus>,
+        origin: &IggyPartition<RecordingBus>,
+        transition: &TransitionPartitionHistoryRequest,
+    ) {
+        assert_eq!(receiver.consensus().commit_min(), 3);
+        assert_eq!(
+            receiver.consumer_group_owner(MESSAGE_LESS_GROUP_ID),
+            origin.consumer_group_owner(MESSAGE_LESS_GROUP_ID)
+        );
+        assert_eq!(receiver.installed_history_transition(transition), Some(3));
+        assert_eq!(
+            receiver.dedup().watermarks_sorted(),
+            origin.dedup().watermarks_sorted()
+        );
+        assert_eq!(
+            receiver.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            Some(MESSAGE_LESS_EXTERNAL_OFFSET)
+        );
+        assert_eq!(
+            (receiver.offset_frontier(), receiver.mint_frontier()),
+            (0, 0)
+        );
+        assert!(!receiver.offset_space_used());
+    }
+
+    /// A prepare the partition still retains, as a peer serves it in repair.
+    fn retained_prepare<B: MessageBus>(
+        partition: &IggyPartition<B>,
+        op: u64,
+    ) -> Message<PrepareHeader> {
+        let retained = partition.log.journal().inner.repair_entry(op).unwrap();
+        Message::<PrepareHeader>::try_from(Owned::copy_from_slice(retained.as_slice())).unwrap()
+    }
+
+    /// A backup restarts with origin op 1 replayed from its WAL but not
+    /// committed, and its peers retain only op 3. A floor at op 2 would skip
+    /// that op 1 and the op 2 nobody serves, so a replica with no committed
+    /// message walks op 1, refuses the floor and catches up by transfer.
+    #[compio::test]
+    async fn given_restarted_message_less_backup_when_floor_skips_unserved_op_should_refuse_and_transfer()
+     {
+        let (_origin_directory, mut origin, transition) = message_less_origin().await;
+        for durability in [
+            iggy_common::Durability::Replicated,
+            iggy_common::Durability::Persisted,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let open_backup = async || {
+                let (mut backup, _) = recording_partition_at(1, 3);
+                backup.set_partition_dir(directory.path().to_string_lossy().into_owned());
+                set_offset_dirs_under(&mut backup, directory.path());
+                backup.runtime_options.durability = durability;
+                backup.runtime_options.consumer_offset_durability = durability;
+                backup.open_persistence().await.unwrap();
+                backup
+            };
+            let mut backup = open_backup().await;
+            backup.on_replicate(retained_prepare(&origin, 1)).await;
+            // Replicated durability writes op 1 without a barrier, and recovery
+            // drops what was never synced, so sync it before the crash.
+            let persistence = backup.persistence.as_ref().unwrap();
+            persistence.sync();
+            backup.start_persistence();
+            persistence.drain_with_timeout().await.unwrap();
+            assert!(persistence.is_durable_through(1), "{durability:?}");
+            drop(backup);
+
+            let mut receiver = open_backup().await;
+            assert_eq!(
+                receiver.consensus().sequencer().current_sequence(),
+                1,
+                "{durability:?}"
+            );
+            assert!(receiver.log.journal().inner.holds_op(1), "{durability:?}");
+            assert_eq!(receiver.consensus().commit_min(), 0, "{durability:?}");
+            receiver.consensus().advance_commit_max(3);
+            receiver.repair = Some(armed_session(3, 2, None));
+            receiver
+                .apply_repaired_prepare(retained_prepare(&origin, 3))
+                .await;
+
+            let conclusion = receiver.complete_repair(&repair_config()).await;
+            assert_eq!(
+                conclusion,
+                RepairConclusion::FloorRefused { floor: 2, to_op: 3 },
+                "{durability:?}"
+            );
+            assert_eq!(receiver.consensus().commit_min(), 1, "{durability:?}");
+            assert_eq!(
+                receiver.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+                Some(MESSAGE_LESS_EXTERNAL_OFFSET),
+                "{durability:?}"
+            );
+            let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+            receiver
+                .install_state_transfer(
+                    &repair_config(),
+                    offer.commit_op,
+                    Vec::new(),
+                    &offer.offsets.1,
+                )
+                .await
+                .unwrap();
+            assert_holds_message_less_state(&receiver, &origin, &transition);
+        }
     }
 
     fn batch_stats(base_offset: u64, message_count: u32) -> CommittedBatchStats {

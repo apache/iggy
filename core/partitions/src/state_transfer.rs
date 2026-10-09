@@ -2750,15 +2750,11 @@ where
             return Err(PartitionTransferUnavailable::FlushPending);
         }
 
-        // An empty chain at frontier 0 tells the receiver to unlink its own, so
-        // never serve one. Offset-only ops, such as external group commits,
-        // move the commit floor without a message, so a replica holding zero
-        // bytes passes the `NothingCommitted` gate above. Its empty chain would
-        // let a receiver at frontier 0 claim a history that neither replica
-        // holds.
-        if segments.is_empty() && plan.offsets.next_offset == 0 {
-            return Err(PartitionTransferUnavailable::NothingCommitted);
-        }
+        // An empty chain at frontier 0 is real state: `complete_repair` lets a
+        // replica with no committed message jump its commit floor only past
+        // ops proven to hold none, so this primary holds every message the
+        // group committed. A receiver that holds data refuses an offer that
+        // would erase it.
         let offsets_bytes = Rc::new(plan.offsets.encode());
         let offsets_entry = consensus::StateArtifact::for_bytes(
             artifact_kind::CONSUMER_OFFSETS,
