@@ -6528,3 +6528,333 @@ mod probe_answer_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod recovery_election_tests {
+    //! The probe-exhaustion election of a restarted replica.
+    //!
+    //! A replica that restarts probes for the current view and, when nobody
+    //! answers, elects on its recovered log as though the whole cluster had
+    //! restarted. Under `replicated` durability that log can be shorter than what
+    //! the replica acked before the crash, so the fallback is safe only when the
+    //! quorum it elects with still holds every committed op.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use crate::dvc_merge::suffix_all_present;
+    use crate::test_bus::NoopBus;
+    use crate::view_change_quorum::encode_prepare_headers;
+    use iggy_binary_protocol::{HEADER_SIZE, Operation};
+
+    const REPLICA_COUNT: u8 = 3;
+    /// Primary of `OLD_VIEW`, crashed holding only part of what it committed.
+    const RESTARTED_PRIMARY: u8 = 0;
+    /// Crashed earlier, behind the committed tail.
+    const LAGGING_BACKUP: u8 = 1;
+    /// The only replica that never crashed, and the only one holding the tail.
+    const SURVIVOR: u8 = 2;
+    const OLD_VIEW: u32 = 3;
+    /// `RESTARTED_PRIMARY` committed through here with `SURVIVOR`'s acks.
+    const COMMITTED: u64 = 10;
+    /// What `RESTARTED_PRIMARY`'s WAL held at the crash: its own appends of
+    /// `RECOVERED_HEAD + 1..=COMMITTED` were queued but not yet written, which
+    /// `replicated` durability acknowledges.
+    const RECOVERED_HEAD: u64 = 7;
+    /// `LAGGING_BACKUP` crashed before the tail was prepared.
+    const LAGGING_HEAD: u64 = 5;
+    /// Enough for several probe exhaustions and status escalations.
+    const TICKS: u64 =
+        4 * TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS * PROBE_ATTEMPTS_MAX as u64;
+
+    fn group() -> u64 {
+        IggyNamespace::new(0, 0, 0).inner()
+    }
+
+    /// Op `op` of the log every replica shares up to its own head, hash-chained
+    /// from op 1 so the merge accepts it.
+    fn prepare(op: u64) -> PrepareHeader {
+        let mut parent = 0;
+        let mut header = PrepareHeader::default();
+        for at in 1..=op {
+            header = PrepareHeader {
+                command: Command::Prepare,
+                operation: Operation::SendMessages,
+                op: at,
+                view: OLD_VIEW,
+                parent,
+                commit: at - 1,
+                timestamp: at,
+                ..Default::default()
+            };
+            header.checksum = header.identity_checksum();
+            parent = header.checksum;
+        }
+        header
+    }
+
+    /// A replica rebooted from a WAL ending at `head`, joining as the boot path
+    /// does when the WAL recovered a frontier: probing, with the fallback
+    /// election allowed.
+    fn restarted(replica: u8, head: u64) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let commit = prepare(head).commit;
+        let mut consensus = VsrConsensus::new(
+            1,
+            replica,
+            REPLICA_COUNT,
+            group(),
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.restore_view(ViewRestore {
+            durable_view: Some((OLD_VIEW, OLD_VIEW)),
+            view_fallback: None,
+            seed_view: None,
+        });
+        consensus.sequencer().set_sequence(head);
+        consensus.restore_commit_state(commit, commit);
+        consensus.set_last_prepare_checksum(prepare(head).checksum);
+        consensus.set_local_dvc_suffix(suffix_all_present(
+            (commit..=head).rev().map(prepare).collect(),
+        ));
+        consensus.set_recovery_election_allowed(true);
+        consensus.join(JoinMode::ProbeAsBackup {
+            await_state_transfer: false,
+        });
+        consensus
+    }
+
+    /// A backup of `OLD_VIEW` holding the whole committed log, left in the view
+    /// change its primary's crash started and escalated while nobody else was up.
+    fn survivor_in_view_change(plane: PlaneKind) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let mut consensus = VsrConsensus::new(
+            1,
+            SURVIVOR,
+            REPLICA_COUNT,
+            group(),
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.set_view(OLD_VIEW);
+        consensus.set_log_view(OLD_VIEW);
+        consensus.sequencer().set_sequence(COMMITTED);
+        consensus.restore_commit_state(COMMITTED - 1, COMMITTED - 1);
+        consensus.set_local_dvc_suffix(suffix_all_present(
+            (COMMITTED - 1..=COMMITTED).rev().map(prepare).collect(),
+        ));
+        consensus.init();
+        while consensus.view() <= OLD_VIEW + 1 {
+            consensus.tick(plane);
+        }
+        assert_eq!(consensus.status(), Status::ViewChange);
+        consensus
+    }
+
+    fn message<H: ConsensusHeader>(body: usize, fill: impl FnOnce(&mut H)) -> Message<H> {
+        Message::<H>::new(HEADER_SIZE + body).transmute_header(|_, header: &mut H| fill(header))
+    }
+
+    struct Cluster {
+        replicas: Vec<VsrConsensus<NoopBus, LocalPipeline>>,
+        plane: PlaneKind,
+        /// `(sender, receiver, view)` of every `DoViewChange` delivered.
+        do_view_changes: Vec<(u8, u8, u32)>,
+    }
+
+    impl Cluster {
+        fn replica(&self, index: u8) -> &VsrConsensus<NoopBus, LocalPipeline> {
+            &self.replicas[usize::from(index)]
+        }
+
+        /// Deliver `outbox` and every reply it provokes, dropping whatever
+        /// `reachable` rules out, until nothing is left in flight.
+        fn deliver(
+            &mut self,
+            mut outbox: VecDeque<(u8, VsrAction)>,
+            reachable: impl Fn(u8) -> bool,
+        ) {
+            while let Some((from, action)) = outbox.pop_front() {
+                if !reachable(from) {
+                    continue;
+                }
+                for to in 0..REPLICA_COUNT {
+                    if to == from {
+                        continue;
+                    }
+                    for reply in self.receive(from, to, &action) {
+                        outbox.push_back((to, reply));
+                    }
+                }
+                // The shard starts a parked view once repair covers the merged
+                // log. Every op in it is offered by a quorum member here, so the
+                // repair is assumed to succeed.
+                for index in 0..REPLICA_COUNT {
+                    for action in self.replica(index).start_pending_view(self.plane) {
+                        outbox.push_back((index, action));
+                    }
+                }
+            }
+        }
+
+        fn receive(&mut self, from: u8, to: u8, action: &VsrAction) -> Vec<VsrAction> {
+            let plane = self.plane;
+            let receiver = self.replica(to);
+            match action {
+                VsrAction::SendStartViewChange { view, group } => {
+                    let svc = message(0, |header: &mut StartViewChangeHeader| {
+                        header.command = Command::StartViewChange;
+                        header.cluster = 1;
+                        header.size = u32::try_from(HEADER_SIZE).unwrap();
+                        header.replica = from;
+                        header.view = *view;
+                        header.group = *group;
+                    });
+                    receiver.handle_start_view_change(plane, svc.header())
+                }
+                VsrAction::SendDoViewChange {
+                    view,
+                    target,
+                    log_view,
+                    op,
+                    commit,
+                    group,
+                    suffix,
+                } if *target == to => {
+                    let mut dvc =
+                        message(suffix.encoded_len(), |header: &mut DoViewChangeHeader| {
+                            header.command = Command::DoViewChange;
+                            header.cluster = 1;
+                            header.size =
+                                u32::try_from(HEADER_SIZE + suffix.encoded_len()).unwrap();
+                            header.replica = from;
+                            header.view = *view;
+                            header.log_view = *log_view;
+                            header.op = *op;
+                            header.commit = *commit;
+                            header.group = *group;
+                            header.nack_bitset = suffix.nack_bitset();
+                            header.present_bitset = suffix.present_bitset();
+                        });
+                    suffix.encode_into(&mut dvc.as_mut_slice()[HEADER_SIZE..]);
+                    self.do_view_changes.push((from, to, *view));
+                    self.replica(to).handle_do_view_change(
+                        plane,
+                        dvc.header(),
+                        &dvc.as_slice()[HEADER_SIZE..],
+                    )
+                }
+                VsrAction::SendRequestStartView { view, group } => {
+                    let probe = message(0, |header: &mut RequestStartViewHeader| {
+                        header.command = Command::RequestStartView;
+                        header.cluster = 1;
+                        header.size = u32::try_from(HEADER_SIZE).unwrap();
+                        header.replica = from;
+                        header.view = *view;
+                        header.group = *group;
+                    });
+                    receiver.handle_request_start_view(plane, probe.header())
+                }
+                VsrAction::SendStartView {
+                    view,
+                    op,
+                    commit,
+                    incarnation,
+                    target,
+                    group,
+                    suffix,
+                } if target.is_none_or(|target| target == to) => {
+                    let body = suffix.len() * size_of::<PrepareHeader>();
+                    let mut start_view = message(body, |header: &mut StartViewHeader| {
+                        header.command = Command::StartView;
+                        header.cluster = 1;
+                        header.size = u32::try_from(HEADER_SIZE + body).unwrap();
+                        header.replica = from;
+                        header.view = *view;
+                        header.op = *op;
+                        header.commit = *commit;
+                        header.incarnation = *incarnation;
+                        header.group = *group;
+                    });
+                    encode_prepare_headers(suffix, &mut start_view.as_mut_slice()[HEADER_SIZE..]);
+                    receiver.handle_start_view(
+                        plane,
+                        start_view.header(),
+                        &start_view.as_slice()[HEADER_SIZE..],
+                    )
+                }
+                _ => Vec::new(),
+            }
+        }
+
+        /// The invariant: a replica settled in a view newer than `OLD_VIEW` holds
+        /// a log covering every op committed in `OLD_VIEW`.
+        fn assert_committed_ops_survive(&self, tick: u64) {
+            for replica in &self.replicas {
+                if replica.status() != Status::Normal || replica.log_view() <= OLD_VIEW {
+                    continue;
+                }
+                let head = replica.sequencer().current_sequence();
+                let voters: Vec<u8> = self
+                    .do_view_changes
+                    .iter()
+                    .filter(|(_, _, view)| *view == replica.log_view())
+                    .map(|(from, _, _)| *from)
+                    .chain(std::iter::once(replica.primary_index(replica.log_view())))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                assert!(
+                    head >= COMMITTED,
+                    "tick {tick}: replica {} is Normal in view {} with head {head}, dropping \
+                     ops {}..={COMMITTED} committed in view {OLD_VIEW}. The view was formed from \
+                     the DoViewChanges of replicas {voters:?}; only replica {SURVIVOR} (status \
+                     {:?}, view {}) holds those ops",
+                    replica.replica(),
+                    replica.log_view(),
+                    head + 1,
+                    self.replica(SURVIVOR).status(),
+                    self.replica(SURVIVOR).view(),
+                );
+            }
+        }
+    }
+
+    /// Two replicas restart after a double crash, the primary having lost the
+    /// tail of what it committed. The survivor holding that tail is mid view
+    /// change, so it answers no probe. Its view-change traffic reaches the
+    /// restarted pair while they probe (and is ignored) and is then delayed past
+    /// their fallback election, which an asynchronous network permits. Whatever
+    /// the restarted pair decide without it must still contain the committed ops.
+    #[test]
+    #[ignore = "#4476: two restarted replicas elect without the survivor and drop committed ops"]
+    fn given_survivor_in_view_change_when_restarted_pair_elects_should_keep_committed_ops() {
+        let plane = PlaneKind::Partitions;
+        let mut cluster = Cluster {
+            replicas: vec![
+                restarted(RESTARTED_PRIMARY, RECOVERED_HEAD),
+                restarted(LAGGING_BACKUP, LAGGING_HEAD),
+                survivor_in_view_change(plane),
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+        };
+        assert_eq!(
+            cluster.replica(RESTARTED_PRIMARY).status(),
+            Status::Recovering
+        );
+        assert_eq!(cluster.replica(LAGGING_BACKUP).status(), Status::Recovering);
+
+        for tick in 0..TICKS {
+            let mut outbox = VecDeque::new();
+            for index in 0..REPLICA_COUNT {
+                for action in cluster.replica(index).tick(plane) {
+                    outbox.push_back((index, action));
+                }
+            }
+            let probing = [RESTARTED_PRIMARY, LAGGING_BACKUP]
+                .iter()
+                .all(|index| cluster.replica(*index).status() == Status::Recovering);
+            cluster.deliver(outbox, |from| probing || from != SURVIVOR);
+            cluster.assert_committed_ops_survive(tick);
+        }
+    }
+}
