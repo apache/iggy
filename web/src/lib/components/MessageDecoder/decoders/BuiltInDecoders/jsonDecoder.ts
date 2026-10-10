@@ -16,7 +16,7 @@
 // under the License.
 
 import type { Decoder } from '../types';
-import { parseNestedJson } from '$lib/utils/parsers';
+import { parseNestedJson } from '#lib/utils/parsers.js';
 
 export const jsonDecoder: Decoder = {
   name: 'json',

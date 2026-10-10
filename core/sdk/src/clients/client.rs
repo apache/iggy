@@ -94,8 +94,8 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// - [`SystemClient`]: ping, server statistics, snapshots, and connected-client info.
 /// - [`UserClient`]: create, inspect, update, and delete users and their permissions.
 /// - [`PersonalAccessTokenClient`]: create, list, and delete personal access tokens, log in with one.
-/// - [`StreamClient`]: create, get, update, delete, and purge streams.
-/// - [`TopicClient`]: create, get, update, delete, and purge topics within a stream.
+/// - [`StreamClient`]: create, get, update, and delete streams.
+/// - [`TopicClient`]: create, get, update, and delete topics within a stream.
 /// - [`PartitionClient`]: add and remove partitions on a topic.
 /// - [`SegmentClient`]: delete closed segments from a partition.
 /// - [`ConsumerGroupClient`]: create, get, delete, and join or leave consumer groups.

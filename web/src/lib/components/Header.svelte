@@ -22,10 +22,10 @@ under the License.
   import Icon, { type iconType } from './Icon.svelte';
   import PeriodicInvalidator from './PeriodicInvalidator.svelte';
   import { type Theme } from './ThemeController.svelte';
-  import type { User } from '$lib/domain/User';
+  import type { User } from '#lib/domain/User.js';
   import DropdownMenu from './DropdownMenu/DropdownMenu.svelte';
   import { theme } from './ThemeController.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
+  import { typedRoute } from '#lib/types/appRoutes.js';
   import { resolve } from '$app/paths';
   import Button from './Button.svelte';
   import StopPropagation from './StopPropagation.svelte';
@@ -100,7 +100,7 @@ under the License.
             </label>
           </div>
           <a
-            href={resolve(typedRoute('/auth/logout'))}
+            href={resolve(typedRoute('auth/logout'))}
             class="flex w-full items-center justify-between gap-2 px-2 py-2 hover:bg-shade-l300 dark:hover:bg-shade-d1000 rounded-md my-1 dark:hover:text-white"
           >
             <span>Log Out</span>

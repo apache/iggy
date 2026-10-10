@@ -15,5 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// `PurgeStream` response is empty.
-pub type PurgeStreamResponse = super::EmptyResponse;
+import { defineEnvVars } from '@sveltejs/kit/env';
+
+export const variables = defineEnvVars({
+  PUBLIC_IGGY_API_URL: { public: true, schema: (input) => input ?? '' }
+});

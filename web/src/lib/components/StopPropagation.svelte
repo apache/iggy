@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import { Keys } from '$lib/utils/constants/keys';
+  import { Keys } from '#lib/utils/constants/keys.js';
 
   interface Props {
     class?: string | undefined;

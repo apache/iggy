@@ -35,20 +35,24 @@ runs:
           libclang-dev \
           libhwloc-dev \
           libssl-dev \
-          php8.3-cli \
-          php8.3-dev \
-          php8.3-mbstring \
-          php8.3-xml \
+          php8.5-cli \
+          php8.5-dev \
+          php8.5-mbstring \
+          php8.5-xml \
           pkg-config \
           unzip
 
-        php_bin="$(command -v php8.3)"
-        php_config="$(command -v php-config8.3)"
+        php_bin="$(command -v php8.5)"
+        php_config="$(command -v php-config8.5)"
         composer_bin="$(command -v composer)"
+        # bindgen loads the newest libclang on the runner but reads builtin
+        # headers from the default clang, and the two differ on Ubuntu 26.04.
+        llvm_dir="$(dirname "$(dirname "$(readlink -f "$(command -v clang)")")")"
         {
           echo "PHP=${php_bin}"
           echo "PHP_CONFIG=${php_config}"
           echo "COMPOSER_BIN=${composer_bin}"
+          echo "LIBCLANG_PATH=${llvm_dir}/lib"
         } >> "$GITHUB_ENV"
         "${php_bin}" --version
         "${php_config}" --version

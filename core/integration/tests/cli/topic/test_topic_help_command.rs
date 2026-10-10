@@ -37,7 +37,6 @@ Commands:
   update  Update topic name, compression algorithm and message expiry time for given topic ID in given stream ID [alias: u]
   get     Get topic detail for given topic ID and stream ID [alias: g]
   list    List all topics in given stream ID [alias: l]
-  purge   Purge topic with given ID in given stream ID [alias: p]
   help    Print this message or the help of the given subcommand(s)
 
 Options:

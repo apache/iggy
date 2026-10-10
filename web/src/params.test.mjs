@@ -15,27 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::Identifier;
-use crate::Validatable;
-use crate::error::IggyError;
-use serde::{Deserialize, Serialize};
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { params } from './params.ts';
 
-/// `PurgeTopic` command is used to purge topic data (its messages in all the partitions) from a stream.
-/// It has additional payload:
-/// - `stream_id` - unique stream ID (numeric or name).
-/// - `topic_id` - unique topic ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
-pub struct PurgeTopic {
-    /// Unique stream ID (numeric or name).
-    #[serde(skip)]
-    pub stream_id: Identifier,
-    /// Unique topic ID (numeric or name).
-    #[serde(skip)]
-    pub topic_id: Identifier,
-}
+test('preserve numeric route parameters as strings', async () => {
+  for (const value of ['0', '01', '42', '-1', '1.5']) {
+    const result = await params.i32['~standard'].validate(value);
+    assert.deepEqual(result, { value }, `Unexpected route parameter: ${value}`);
+  }
+});
 
-impl Validatable<IggyError> for PurgeTopic {
-    fn validate(&self) -> Result<(), IggyError> {
-        Ok(())
-    }
-}
+test('reject nonnumeric route parameters', async () => {
+  for (const value of ['', 'stream', '1/2', '1e3']) {
+    const result = await params.i32['~standard'].validate(value);
+    assert.ok(result.issues?.length, `Accepted invalid route parameter: ${value}`);
+  }
+});

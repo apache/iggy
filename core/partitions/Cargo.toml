@@ -63,7 +63,6 @@ iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 papaya = { workspace = true }
-ringbuffer = { workspace = true }
 server_common = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }
