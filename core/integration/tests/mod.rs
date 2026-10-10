@@ -37,6 +37,7 @@ mod cli;
 // Raw-wire spec tests for VSR session continuity across a node restart
 // (IGGY-137).
 mod cluster;
+mod config_env_listing;
 mod config_provider;
 mod connectors;
 mod data_integrity;

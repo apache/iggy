@@ -36,12 +36,32 @@ use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::poll::{AutoCommitReservation, PollHistoryId};
+use server_common::poll::AutoCommitReservation;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
+use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::time::Duration;
+
+#[derive(Clone)]
+pub struct LoopbackNotifier(Rc<dyn Fn()>);
+
+impl LoopbackNotifier {
+    pub fn new(notify: impl Fn() + 'static) -> Self {
+        Self(Rc::new(notify))
+    }
+
+    fn notify(&self) {
+        self.0();
+    }
+}
+
+impl std::fmt::Debug for LoopbackNotifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LoopbackNotifier")
+    }
+}
 
 /// Injected time source for primary-stamped prepare timestamps.
 ///
@@ -197,9 +217,14 @@ pub const CLIENTS_TABLE_MAX: usize = 8192;
 /// `[partition] dedup_clients_max` default by a bootstrap assert.
 pub const PARTITION_DEDUP_CLIENTS_MAX: usize = 4096;
 
+/// Admission order on one partition owner. It is never replicated or recovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalRequestOrder(pub NonZeroU64);
+
 #[derive(Debug)]
 pub struct PipelineEntry {
     pub header: PrepareHeader,
+    pub local_order: Option<LocalRequestOrder>,
     /// Bitmap of replicas that have acknowledged this prepare.
     pub ok_from_replicas: BitSet<u32>,
     /// Whether we've received a quorum of `prepare_ok` messages.
@@ -217,6 +242,7 @@ impl PipelineEntry {
     pub fn new(header: PrepareHeader) -> Self {
         Self {
             header,
+            local_order: None,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
             reply_sender: None,
@@ -241,6 +267,7 @@ impl PipelineEntry {
     pub fn with_sender(header: PrepareHeader, sender: Sender<Message<ReplyHeader>>) -> Self {
         Self {
             header,
+            local_order: None,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
             reply_sender: Some(sender),
@@ -281,11 +308,9 @@ impl PipelineEntry {
     }
 }
 
-/// Identity and capacity held by a pending automatic commit.
+/// Capacity held by a pending automatic commit.
 #[derive(Debug)]
 pub struct AutoCommitRequestContext {
-    /// History accepted with the poll, which must still match at promotion.
-    pub history: PollHistoryId,
     /// Keeps this request's consumer key occupied through promotion and staging.
     pub reservation: AutoCommitReservation,
 }
@@ -293,11 +318,9 @@ pub struct AutoCommitRequestContext {
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
+    pub local_order: Option<LocalRequestOrder>,
     /// Automatic commit context owned by this entry until promotion or removal.
     auto_commit: Option<AutoCommitRequestContext>,
-    /// Offset writes must not cross a reset of the owner's message history.
-    /// Explicit stores keep their overwrite and client-dedup behavior.
-    consumer_offset_history: Option<PollHistoryId>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
     /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
@@ -345,22 +368,6 @@ impl RequestEntry {
         self.auto_commit.as_ref()
     }
 
-    /// Bind an explicit offset mutation to the history at owner admission.
-    /// `None` leaves other request kinds without an explicit-offset binding.
-    #[must_use]
-    pub const fn with_consumer_offset_history(mut self, history: Option<PollHistoryId>) -> Self {
-        self.consumer_offset_history = history;
-        self
-    }
-
-    /// History captured when an explicit offset mutation queues on its owner.
-    /// A mismatch at promotion rejects the mutation before it can affect replacement progress.
-    /// `None` means this entry has no explicit-offset history binding.
-    #[must_use]
-    pub const fn consumer_offset_history(&self) -> Option<PollHistoryId> {
-        self.consumer_offset_history
-    }
-
     /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
@@ -390,7 +397,7 @@ impl RequestEntry {
     ) -> Self {
         Self {
             auto_commit: None,
-            consumer_offset_history: None,
+            local_order: None,
             message,
             received_at: 0,
             reply_sender,
@@ -595,6 +602,23 @@ impl LocalPipeline {
     }
 
     #[must_use]
+    pub const fn request_queue_capacity(&self) -> usize {
+        self.request_queue_max
+    }
+
+    /// Rebuilt entries have no local marker and precede new local requests.
+    #[must_use]
+    pub fn has_request_before(&self, order: LocalRequestOrder) -> bool {
+        self.prepare_queue
+            .iter()
+            .any(|entry| entry.local_order.is_none_or(|admitted| admitted < order))
+            || self
+                .request_queue
+                .iter()
+                .any(|entry| entry.local_order.is_none_or(|admitted| admitted < order))
+    }
+
+    #[must_use]
     pub fn request_queue_full(&self) -> bool {
         self.request_queue.len() >= self.request_queue_max
     }
@@ -623,6 +647,11 @@ impl LocalPipeline {
 
     pub fn pending_requests(&self) -> impl Iterator<Item = &RequestEntry> {
         self.request_queue.iter()
+    }
+
+    #[must_use]
+    pub fn request_head(&self) -> Option<&RequestEntry> {
+        self.request_queue.front()
     }
 
     /// True iff `prepare_queue` is full (NOT including `request_queue`).
@@ -960,6 +989,10 @@ impl Pipeline for LocalPipeline {
         Self::pop_request(self)
     }
 
+    fn request_head(&self) -> Option<&Self::Request> {
+        Self::request_head(self)
+    }
+
     fn request_queue_len(&self) -> usize {
         Self::request_queue_len(self)
     }
@@ -1232,6 +1265,7 @@ where
 
     message_bus: B,
     loopback_queue: RefCell<VecDeque<Message<GenericHeader>>>,
+    loopback_notifier: RefCell<Option<LoopbackNotifier>>,
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
     /// Consecutive unanswered `RequestStartView` probes while Recovering;
@@ -1630,6 +1664,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             prepare_queue_max,
             message_bus,
             loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
+            loopback_notifier: RefCell::new(None),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
@@ -2114,7 +2149,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Stops the timer on an empty pipeline; otherwise restarts it so it times
     /// the current oldest entry from now. Exposed for the plane-side drains that
-    /// pop through [`Pipeline`] directly (`drain_committable_prefix`) rather than
+    /// pop through [`Pipeline`] directly rather than
     /// through [`Self::pop_committed_prepare`].
     pub fn sync_prepare_timeout(&self) {
         let empty = self.pipeline.borrow().is_empty();
@@ -2282,6 +2317,25 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         sender: Sender<Message<ReplyHeader>>,
     ) {
         let entry = PipelineEntry::with_sender(*message.header(), sender);
+        self.push_prepare_entry(plane, message, entry);
+    }
+
+    /// Preserve local admission order when a queued request becomes a prepare.
+    ///
+    /// # Panics
+    /// If not primary, as with other pipeline insertion methods.
+    pub fn pipeline_message_with_order(
+        &self,
+        plane: PlaneKind,
+        message: &Message<PrepareHeader>,
+        sender: Option<Sender<Message<ReplyHeader>>>,
+        order: Option<LocalRequestOrder>,
+    ) {
+        let mut entry = sender.map_or_else(
+            || PipelineEntry::new(*message.header()),
+            |sender| PipelineEntry::with_sender(*message.header(), sender),
+        );
+        entry.local_order = order;
         self.push_prepare_entry(plane, message, entry);
     }
 
@@ -2572,6 +2626,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
     pub fn tick(&self, plane: PlaneKind) -> Vec<VsrAction> {
+        self.tick_with_history_fence(plane, false)
+    }
+
+    /// Timers and retransmissions continue while storage leases defer history changes.
+    pub fn tick_with_history_fence(
+        &self,
+        plane: PlaneKind,
+        history_fenced: bool,
+    ) -> Vec<VsrAction> {
         let mut actions = Vec::new();
         let mut timeouts = self.timeouts.borrow_mut();
 
@@ -2579,7 +2642,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         timeouts.tick();
 
         // Phase 2: Handle fired timeouts
-        if timeouts.fired(TimeoutKind::NormalHeartbeat) {
+        if !history_fenced && timeouts.fired(TimeoutKind::NormalHeartbeat) {
             drop(timeouts);
             actions.extend(self.handle_normal_heartbeat_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
@@ -2609,7 +2672,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
-        if timeouts.fired(TimeoutKind::RequestStartViewMessage) {
+        if !history_fenced && timeouts.fired(TimeoutKind::RequestStartViewMessage) {
             drop(timeouts);
             // Two probers share this timeout, both asking "resend me the
             // current StartView":
@@ -2684,7 +2747,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
-        if timeouts.fired(TimeoutKind::ViewChangeStatus) {
+        if !history_fenced && timeouts.fired(TimeoutKind::ViewChangeStatus) {
             drop(timeouts);
             actions.extend(self.handle_view_change_status_timeout(plane));
             // timeouts = self.timeouts.borrow_mut(); // Not needed if last
@@ -4176,22 +4239,25 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
-    /// Enqueue a self-addressed message for processing in the next loopback drain.
-    ///
-    /// Only `PrepareOk` reaches here (via `send_or_loopback`), and deliberately:
-    /// it is a message to a peer that happens to be this replica, so a one-drain
-    /// delay costs nothing. A replica's own SVC/DVC is not that shape -- it is the
-    /// local decision to change view, recorded synchronously with the view and
-    /// status writes in [`Self::enter_view_change`]. Routing it here instead would
-    /// leave a window where the replica has entered a view change without counting
-    /// itself, which on a solo group is the entire quorum.
+    /// Enqueue a self-ack for the next owner service round.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
-        assert!(
-            self.loopback_queue.borrow().len() < self.prepare_queue_max,
-            "loopback queue overflow: {} items",
-            self.loopback_queue.borrow().len()
-        );
-        self.loopback_queue.borrow_mut().push_back(message);
+        let notify = {
+            let mut queue = self.loopback_queue.borrow_mut();
+            assert!(
+                queue.len() < self.prepare_queue_max,
+                "loopback queue overflow: {} items",
+                queue.len()
+            );
+            let was_empty = queue.is_empty();
+            queue.push_back(message);
+            was_empty
+        };
+        if notify {
+            let notifier = self.loopback_notifier.borrow().clone();
+            if let Some(notifier) = notifier {
+                notifier.notify();
+            }
+        }
     }
 
     /// Drain all pending loopback messages into `buf`, leaving the queue empty.
@@ -4199,6 +4265,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// The caller must dispatch each drained message to the appropriate handler.
     pub fn drain_loopback_into(&self, buf: &mut Vec<Message<GenericHeader>>) {
         buf.extend(self.loopback_queue.borrow_mut().drain(..));
+    }
+
+    /// Registers existing work as well as future empty-to-nonempty edges.
+    pub fn set_loopback_notifier(&self, notifier: Option<LoopbackNotifier>) {
+        self.loopback_notifier.borrow_mut().clone_from(&notifier);
+        if self.has_loopback()
+            && let Some(notifier) = notifier
+        {
+            notifier.notify();
+        }
+    }
+
+    #[must_use]
+    pub fn has_loopback(&self) -> bool {
+        !self.loopback_queue.borrow().is_empty()
     }
 
     /// Send a message to `target`, routing self-addressed messages through the loopback queue.
@@ -4577,14 +4658,12 @@ mod request_queue_tests {
             reclaim_epoch,
             Rc::clone(&active_keys),
         ));
-        let history = PollHistoryId::default();
         let mut pipeline = LocalPipeline::new();
 
         // Each queued request holds its own guard for the same consumer key.
         // The queue stores these messages without interpreting their payloads.
         for request_number in 1..=2 {
             let context = AutoCommitRequestContext {
-                history,
                 reservation: token.acquire(),
             };
             pipeline
@@ -4602,7 +4681,6 @@ mod request_queue_tests {
             .take_auto_commit()
             .expect("context follows first request");
         assert_eq!(first_request.message.header().request, 1);
-        assert_eq!(first_context.history, history);
         drop(first_context);
         assert_eq!(token.active_count(), 1);
         assert_eq!(
@@ -5763,7 +5841,6 @@ mod vsr_consensus_tests {
         consensus.pipeline_message(PlaneKind::Metadata, message);
     }
 
-    use crate::drain_committable_prefix;
     use iggy_binary_protocol::Operation;
 
     /// Clock frozen at a fixed instant, so a stamp read off it is assertable.
@@ -5823,8 +5900,7 @@ mod vsr_consensus_tests {
         // Committing the head leaves op 2 in flight, so the timer stays armed --
         // now measuring op 2 rather than carrying op 1's elapsed ticks.
         consensus.advance_commit_max(1);
-        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
-        // As real callers do, per entry: the next drain starts at the op now owed.
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 1);
         consensus.advance_commit_min(1);
         assert!(
             prepare_ticking(&consensus),
@@ -5832,7 +5908,7 @@ mod vsr_consensus_tests {
         );
 
         consensus.advance_commit_max(2);
-        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 2);
         consensus.advance_commit_min(2);
         assert!(
             !prepare_ticking(&consensus),

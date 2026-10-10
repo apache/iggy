@@ -51,7 +51,7 @@ jobs:
     # cache warms only make sense for master. Skipping detect skips every
     # downstream job.
     if: github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     outputs:
       rust: ${{ steps.affected.outputs.rust }}
@@ -83,7 +83,7 @@ jobs:
     name: Rust coverage baseline
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
@@ -154,7 +154,7 @@ jobs:
     name: Java coverage baseline
     needs: detect
     if: needs.detect.outputs.java == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -199,7 +199,7 @@ jobs:
     name: C# coverage baseline (${{ matrix.framework }})
     needs: detect
     if: needs.detect.outputs.csharp == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -284,7 +284,7 @@ jobs:
     name: Python coverage baseline
     needs: detect
     if: needs.detect.outputs.python == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -408,7 +408,7 @@ jobs:
     name: PHP coverage baseline
     needs: detect
     if: needs.detect.outputs.php == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -431,7 +431,7 @@ jobs:
     name: Node coverage baseline
     needs: detect
     if: needs.detect.outputs.node == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -498,7 +498,7 @@ jobs:
     name: Go coverage baseline
     needs: detect
     if: needs.detect.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -586,7 +586,7 @@ jobs:
     name: C++ coverage baseline
     needs: detect
     if: needs.detect.outputs.cpp == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1

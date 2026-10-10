@@ -20,11 +20,12 @@ use crate::applied_frontier::AppliedFrontier;
 use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
-    FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace, Snapshot, SnapshotError,
+    FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
 };
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
+use compio::io::AsyncWriteAtExt;
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
     Consensus, EXPIRED_SESSION_REQUEST_ID, EvictionContext, FatalReason, Pipeline, PipelineEntry,
@@ -37,6 +38,8 @@ use consensus::{
     register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
     send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
+use futures::channel::oneshot;
+use futures::lock::Mutex;
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
@@ -66,11 +69,17 @@ use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use std::cell::{Cell, RefCell};
+use std::io;
+#[cfg(feature = "simulator")]
+use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+// The writer retains this gate after caller cancellation, until the rename is durable.
+static SNAPSHOT_IO: Mutex<()> = Mutex::new(());
 
 fn freeze_client_reply(
     message: Message<GenericHeader>,
@@ -126,8 +135,8 @@ impl IggySnapshot {
     ///
     /// # Errors
     /// Returns `SnapshotError` if serialization or I/O fails.
-    pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
-        Self::write_durably(path, &self.encode()?)
+    pub async fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        Self::write_durably(path, self.encode()?).await
     }
 
     /// Write already-encoded snapshot bytes to `path` durably: temp, fsync,
@@ -140,54 +149,73 @@ impl IggySnapshot {
     ///
     /// # Errors
     /// `SnapshotError::Persist` if any write, fsync, or rename fails.
-    pub(super) fn write_durably(path: &Path, encoded: &[u8]) -> Result<(), SnapshotError> {
-        use crate::stm::snapshot::PersistStage;
-        use std::fs;
-        use std::io::Write;
+    pub(super) async fn write_durably(path: &Path, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+        let permit = SNAPSHOT_IO.lock().await;
+        let path = path.to_path_buf();
+        let (sender, receiver) = oneshot::channel();
+        compio::runtime::spawn(async move {
+            let _permit = permit;
+            let result = Self::write_durably_inner(&path, encoded, SnapshotIo::Compio).await;
+            if let Err(Err(error)) = sender.send(result) {
+                warn!(path = %path.display(), %error, "snapshot write failed after its caller stopped");
+            }
+        })
+        .detach();
+        receiver
+            .await
+            .map_err(|_| SnapshotError::Io(io::Error::other("snapshot writer stopped")))?
+    }
 
+    #[allow(clippy::future_not_send)]
+    async fn write_durably_inner(
+        path: &Path,
+        mut encoded: Vec<u8>,
+        storage: SnapshotIo,
+    ) -> Result<(), SnapshotError> {
+        let trailer = snapshot_trailer(&encoded);
+        // TODO: Write payload and trailer as separate buffers to avoid growing the payload.
+        encoded.extend_from_slice(&trailer);
         let tmp_path = path.with_extension("bin.tmp");
 
-        let mut file = fs::File::create(&tmp_path)
+        let mut file = storage
+            .create(&tmp_path)
+            .await
             .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
             .map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::Write,
                 source: e,
             })?;
         file.write_all(encoded)
-            .map_err(|e| SnapshotError::Persist {
+            .await
+            .map_err(|source| SnapshotError::Persist {
                 stage: PersistStage::Write,
-                source: e,
+                source,
             })?;
-        // Self-verifying trailer. The superblock's checkpoint pairing cannot stand in:
-        // phase 1 of a checkpoint renames the new snapshot over `snapshot.bin`, so a
-        // crash before the pairing write is the NORMAL crash-inside-a-checkpoint
-        // outcome, and it recovers through the `checkpoint_op < snapshot_op` arm, which
-        // accepts the snapshot with nothing to check it against.
-        file.write_all(&snapshot_trailer(encoded))
-            .map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::Write,
-                source: e,
-            })?;
-        file.sync_all().map_err(|e| SnapshotError::Persist {
+        file.sync_all().await.map_err(|e| SnapshotError::Persist {
             stage: PersistStage::Sync,
             source: e,
         })?;
         drop(file);
 
-        fs::rename(&tmp_path, path).map_err(|e| SnapshotError::Persist {
-            stage: PersistStage::Rename,
-            source: e,
-        })?;
+        storage
+            .rename(&tmp_path, path)
+            .await
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Rename,
+                source: e,
+            })?;
 
         // Fsync the parent directory to ensure the rename is durable.
         if let Some(parent) = path.parent() {
-            let dir = fs::File::open(parent)
+            let dir = storage
+                .open(parent)
+                .await
                 .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
                 .map_err(|e| SnapshotError::Persist {
                     stage: PersistStage::DirSync,
                     source: e,
                 })?;
-            dir.sync_all().map_err(|e| SnapshotError::Persist {
+            dir.sync_all().await.map_err(|e| SnapshotError::Persist {
                 stage: PersistStage::DirSync,
                 source: e,
             })?;
@@ -217,6 +245,75 @@ impl IggySnapshot {
         let data = std::fs::read(path)?;
         let (payload, checksum) = split_trailer(&data)?;
         Ok((Self::decode(payload)?, checksum))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotIo {
+    Compio,
+    #[cfg(feature = "simulator")]
+    Synchronous,
+}
+
+enum SnapshotFile {
+    Compio(compio::fs::File),
+    #[cfg(feature = "simulator")]
+    Synchronous(std::fs::File),
+}
+
+#[allow(clippy::future_not_send)]
+impl SnapshotIo {
+    async fn create(self, path: &Path) -> io::Result<SnapshotFile> {
+        match self {
+            Self::Compio => compio::fs::File::create(path)
+                .await
+                .map(SnapshotFile::Compio),
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::File::create(path).map(SnapshotFile::Synchronous),
+        }
+    }
+
+    async fn open(self, path: &Path) -> io::Result<SnapshotFile> {
+        match self {
+            Self::Compio => compio::fs::File::open(path).await.map(SnapshotFile::Compio),
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::File::open(path).map(SnapshotFile::Synchronous),
+        }
+    }
+
+    async fn read(self, path: &Path) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Compio => compio::fs::read(path).await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::read(path),
+        }
+    }
+
+    async fn rename(self, source: &Path, target: &Path) -> io::Result<()> {
+        match self {
+            Self::Compio => compio::fs::rename(source, target).await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => std::fs::rename(source, target),
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+impl SnapshotFile {
+    async fn write_all(&mut self, encoded: Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Compio(file) => file.write_all_at(encoded, 0).await.0,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous(file) => file.write_all(&encoded),
+        }
+    }
+
+    async fn sync_all(&self) -> io::Result<()> {
+        match self {
+            Self::Compio(file) => file.sync_all().await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous(file) => file.sync_all(),
+        }
     }
 }
 
@@ -332,6 +429,7 @@ impl Snapshot for IggySnapshot {
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
     create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+    io: SnapshotIo,
     /// Remaining-journal-slots threshold at which a checkpoint is forced.
     /// Defaults to [`Self::CHECKPOINT_MARGIN`]; bootstrap raises it to at
     /// least the configured prepare-queue depth (see the static assert and
@@ -361,9 +459,17 @@ impl<M> SnapshotCoordinator<M> {
         Self {
             data_dir,
             create_snapshot,
+            io: SnapshotIo::Compio,
             checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
             last_checkpoint: Cell::new((0, 0)),
         }
+    }
+
+    /// Complete snapshot I/O within one poll so host completions cannot change
+    /// the deterministic simulator's schedule. Select during replica construction.
+    #[cfg(feature = "simulator")]
+    pub const fn use_synchronous_io(&mut self) {
+        self.io = SnapshotIo::Synchronous;
     }
 
     /// Raise (never lower) the forced-checkpoint margin. Bootstrap calls
@@ -410,9 +516,10 @@ impl<M> SnapshotCoordinator<M> {
     /// Create and durably persist a snapshot at `commit_op`, record the pairing, and
     /// return its checksum. Does NOT drain the WAL: the caller must durably record
     /// the pairing in the superblock first, so a crash between persist and drain
-    /// recovers a consistent checkpoint with the WAL intact. Synchronous, since
-    /// snapshot creation and `std::fs` persistence never await.
-    fn persist_snapshot(
+    /// recovers a consistent checkpoint with the WAL intact. Snapshot creation and
+    /// encoding finish before the first await, preserving the captured frontier.
+    #[allow(clippy::future_not_send)]
+    async fn persist_snapshot(
         &self,
         stm: &M,
         commit_op: u64,
@@ -429,10 +536,21 @@ impl<M> SnapshotCoordinator<M> {
         // core, and the pairing is provably over the bytes that reach the file.
         let encoded = snapshot.encode()?;
         let checksum = checkpoint_checksum(&encoded);
-        let path = self.snapshot_path();
-        IggySnapshot::write_durably(&path, &encoded)?;
+        self.write_snapshot(encoded).await?;
         self.last_checkpoint.set((commit_op, checksum));
         Ok(checksum)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn write_snapshot(&self, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+        let path = self.snapshot_path();
+        match self.io {
+            SnapshotIo::Compio => IggySnapshot::write_durably(&path, encoded).await,
+            #[cfg(feature = "simulator")]
+            SnapshotIo::Synchronous => {
+                IggySnapshot::write_durably_inner(&path, encoded, self.io).await
+            }
+        }
     }
 
     /// Drain the snapshotted prefix below `last_op` to reclaim WAL space. Runs
@@ -827,7 +945,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// Scoped to the write itself, NOT to a whole checkpoint. A pending view persist
     /// blocks every gated send behind it, including the ack path's
     /// `send_prepare_ok`, so it must not also wait out a checkpoint's snapshot
-    /// encode, two `std::fs` fsyncs and an async WAL drain. Whoever writes builds
+    /// encode, filesystem syncs and the WAL drain. Whoever writes builds
     /// its `VsrState` inside this section with no await in between, so the last
     /// writer carries the freshest view and the durable view cannot regress.
     ///
@@ -1712,6 +1830,8 @@ pub enum StateTransferUnavailable {
     /// No snapshot has ever been persisted. The WAL still holds the full
     /// history, so the requester's journal repair covers its whole gap.
     NoSnapshot,
+    /// A checkpoint or detached snapshot writer still owns the snapshot.
+    CheckpointInProgress,
     /// `snapshot.bin` exists but could not be read, or failed its integrity
     /// trailer. Refusing is strictly better than shipping it: the receiver
     /// would re-seal the corruption under a fresh valid trailer.
@@ -1724,6 +1844,7 @@ impl std::fmt::Display for StateTransferUnavailable {
             Self::NotCaughtUpPrimary => write!(f, "not a caught-up primary"),
             Self::NoCoordinator => write!(f, "no snapshot coordinator on this shard"),
             Self::NoSnapshot => write!(f, "no snapshot has been persisted yet"),
+            Self::CheckpointInProgress => write!(f, "snapshot checkpoint is in progress"),
             Self::SnapshotUnreadable(source) => {
                 write!(f, "persisted snapshot is unreadable: {source}")
             }
@@ -1806,7 +1927,27 @@ where
     ///
     /// # Errors
     /// [`StateTransferUnavailable`] naming why this replica cannot serve.
-    pub fn state_transfer_offer(&self) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+    #[allow(clippy::future_not_send)]
+    pub async fn state_transfer_offer(
+        &self,
+    ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        let _checkpoint = self
+            .checkpoint_lock
+            .try_acquire()
+            .ok_or(StateTransferUnavailable::CheckpointInProgress)?;
+        let _snapshot_io = if self
+            .coordinator
+            .as_ref()
+            .is_none_or(|coordinator| matches!(coordinator.io, SnapshotIo::Compio))
+        {
+            Some(
+                SNAPSHOT_IO
+                    .try_lock()
+                    .ok_or(StateTransferUnavailable::CheckpointInProgress)?,
+            )
+        } else {
+            None
+        };
         let consensus = self
             .consensus
             .as_ref()
@@ -1818,12 +1959,20 @@ where
             .coordinator
             .as_ref()
             .ok_or(StateTransferUnavailable::NoCoordinator)?;
-        let path = coordinator.snapshot_path();
-        if !path.exists() {
-            return Err(StateTransferUnavailable::NoSnapshot);
+        if let Some(cached) = self.transfer_offer_cache.borrow().as_ref() {
+            return Ok(Rc::clone(cached));
         }
-        let sealed = std::fs::read(&path)
-            .map_err(|source| StateTransferUnavailable::SnapshotUnreadable(source.into()))?;
+        let path = coordinator.snapshot_path();
+        let sealed = coordinator.io.read(&path).await.map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                StateTransferUnavailable::NoSnapshot
+            } else {
+                StateTransferUnavailable::SnapshotUnreadable(source.into())
+            }
+        })?;
+        if !is_caught_up_primary(consensus) {
+            return Err(StateTransferUnavailable::NotCaughtUpPrimary);
+        }
         // Verifies the trailer and hands back the payload alone.
         let (payload, _) =
             split_trailer(&sealed).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
@@ -1834,16 +1983,6 @@ where
         let snapshot_seq = IggySnapshot::decode(payload)
             .map_err(StateTransferUnavailable::SnapshotUnreadable)?
             .sequence_number();
-
-        // Reuse the cached offer for this generation. Only the SNAPSHOT half is
-        // expensive to rebuild, and the cached table is merely older, never
-        // incoherent: its frontier is stamped at its own encode, and the receiver
-        // replays everything above that frontier during tail repair.
-        if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
-            && cached.snapshot_seq == snapshot_seq
-        {
-            return Ok(Rc::clone(cached));
-        }
 
         let commit_op = consensus.commit_min();
         let table = self.client_table.borrow().encode();
@@ -1985,8 +2124,7 @@ where
         // withholds acks, but "should not be committing" is not an invariant
         // this path can rest on.
         //
-        // Deadlock-free: nothing between here and the superblock write awaits,
-        // and `write_superblock` takes no lock of its own.
+        // `write_superblock` takes no lock of its own.
         let _install_gates = if snapshot_ahead {
             let checkpoint = self.checkpoint_lock.acquire().await;
             let superblock = if self.superblock.is_some() {
@@ -2007,8 +2145,9 @@ where
         // snapshot.bin, regress its pairing, and rewind the STM below the
         // applied frontier -- then panic on `set_commit_floor`'s anti-rewind
         // assert with the damage already durable.
-        let local_applied = consensus.commit_min();
-        let snapshot_ahead = snapshot_seq > local_applied;
+        let mut local_applied = consensus.commit_min();
+        let mut snapshot_ahead = snapshot_seq > local_applied;
+        let persist_pairing = snapshot_ahead;
 
         let snapshot_table = if snapshot_ahead {
             let table = snapshot
@@ -2020,24 +2159,6 @@ where
         } else {
             None
         };
-        let protection_frontier = table_frontier.max(self.client_table_frontier.get());
-        let replay_table = if snapshot_ahead && protection_frontier > snapshot_seq {
-            snapshot_table
-        } else if !snapshot_ahead
-            && table_frontier > local_applied
-            && self.replay_client_table.borrow().is_none()
-        {
-            let local_table = self.client_table.borrow();
-            Some(if local_table.capacity_committed() {
-                ClientTable::from_snapshot(local_table.to_snapshot())
-                    .map_err(SnapshotError::ClientTable)?
-            } else {
-                ClientTable::new(local_table.capacity())
-            })
-        } else {
-            None
-        };
-
         if snapshot_ahead && let Some(journal) = &self.journal {
             // Discard the WAL suffix above the incoming floor BEFORE anything
             // installs: the commit walk matches entries by op number alone, so
@@ -2096,7 +2217,10 @@ where
                     coordinator.last_checkpoint().0
                 );
                 let checksum = checkpoint_checksum(snapshot_bytes);
-                IggySnapshot::write_durably(&coordinator.snapshot_path(), snapshot_bytes)?;
+                self.clear_state_transfer_offer_cache();
+                let mut encoded = Vec::with_capacity(snapshot_bytes.len() + SNAPSHOT_TRAILER_LEN);
+                encoded.extend_from_slice(snapshot_bytes);
+                coordinator.write_snapshot(encoded).await?;
                 coordinator.seed_last_checkpoint(snapshot_seq, checksum);
                 tracing::info!(
                     checkpoint_op = snapshot_seq,
@@ -2110,8 +2234,14 @@ where
                 );
             }
 
-            self.mux_stm
-                .restore_snapshot_in_place(snapshot.snapshot())?;
+            // Commits may progress while the snapshot reaches disk. Its bytes remain
+            // a valid checkpoint, but must not replace a newer in-memory state.
+            local_applied = consensus.commit_min();
+            snapshot_ahead = snapshot_seq > local_applied;
+            if snapshot_ahead {
+                self.mux_stm
+                    .restore_snapshot_in_place(snapshot.snapshot())?;
+            }
         } else {
             tracing::info!(
                 snapshot_seq,
@@ -2121,6 +2251,23 @@ where
             );
         }
 
+        let protection_frontier = table_frontier.max(self.client_table_frontier.get());
+        let replay_table = if snapshot_ahead && protection_frontier > snapshot_seq {
+            snapshot_table
+        } else if !snapshot_ahead
+            && table_frontier > local_applied
+            && self.replay_client_table.borrow().is_none()
+        {
+            let local_table = self.client_table.borrow();
+            Some(if local_table.capacity_committed() {
+                ClientTable::from_snapshot(local_table.to_snapshot())
+                    .map_err(SnapshotError::ClientTable)?
+            } else {
+                ClientTable::new(local_table.capacity())
+            })
+        } else {
+            None
+        };
         if snapshot_ahead || replay_table.is_some() {
             *self.replay_client_table.borrow_mut() = replay_table.map(RefCell::new);
         }
@@ -2184,7 +2331,7 @@ where
         // `verify_checkpoint_pairing` accepts -- so it is reported as a DEGRADED
         // install rather than a failed one.
         let mut pairing_durable = true;
-        if snapshot_ahead && let Some(superblock) = self.superblock.as_ref() {
+        if persist_pairing && let Some(superblock) = self.superblock.as_ref() {
             // Already under `_install_gates`, acquired above; re-acquiring here
             // would deadlock on the same non-reentrant gate.
             pairing_durable = self.write_superblock(consensus, superblock.as_ref()).await;
@@ -3623,12 +3770,11 @@ where
         // then-current commit_min. The prepare being replicated appends regardless
         // (see the phantom-op comment at the call site).
         let client_table = self.client_table.borrow().to_snapshot();
-        let checksum = match coordinator.persist_snapshot(
-            &*self.mux_stm,
-            snap_op,
-            created_at,
-            Some(client_table),
-        ) {
+        self.clear_state_transfer_offer_cache();
+        let checksum = match coordinator
+            .persist_snapshot(&*self.mux_stm, snap_op, created_at, Some(client_table))
+            .await
+        {
             Ok(checksum) => checksum,
             Err(e) => {
                 error!(
@@ -4214,69 +4360,19 @@ where
     msg
 }
 
-/// Build a `TruncatePartition` request attributed to the originating client.
-///
-/// Replicated through the standard client-request path so the commit records
-/// `(client, session, request)` in the `ClientTable` and advances that
-/// session's watermark. Attributing the truncate to an internal id (or
-/// skipping the commit) would leave this request id unrecorded, so the
-/// client's own retry of it would re-execute instead of deduping.
-///
-/// `template` is the client's own `DeleteSegments` header: it supplies the wire
-/// `cluster` / `view` / `release` and the client's `request` number.
-/// `client_id` / `session` are the bound VSR identity.
+/// Build a truncate attributed to the client's original request and session.
+/// Committed rejections also advance the client table, so retries deduplicate.
 ///
 /// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few fixed-width fields, so this cannot happen in practice.
+/// If the request size exceeds `u32::MAX`; this fixed-size command cannot.
 #[must_use]
 pub fn build_truncate_partition_client_message(
     template: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
-    stream_id: u32,
-    topic_id: u32,
-    partition_id: u32,
-    up_to_offset: u64,
+    request: &TruncatePartitionRequest,
 ) -> Message<RoutedRequestHeader> {
-    build_truncate_partition_client_message_with_identifiers(
-        template,
-        client_id,
-        session,
-        WireIdentifier::numeric(stream_id),
-        WireIdentifier::numeric(topic_id),
-        partition_id,
-        up_to_offset,
-    )
-}
-
-/// [`build_truncate_partition_client_message`] with the client's raw wire
-/// identifiers (name or id) instead of resolved numeric ids.
-///
-/// Used when the target does not resolve on the handling node: the truncate
-/// still commits, and the apply rejects it as a committed result, keeping the
-/// client's request sequence contiguous while surfacing the typed error.
-///
-/// # Panics
-/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
-/// a few small fields, so this cannot happen in practice.
-#[must_use]
-pub fn build_truncate_partition_client_message_with_identifiers(
-    template: &RoutedRequestHeader,
-    client_id: u128,
-    session: u64,
-    stream_id: WireIdentifier,
-    topic_id: WireIdentifier,
-    partition_id: u32,
-    up_to_offset: u64,
-) -> Message<RoutedRequestHeader> {
-    let body = TruncatePartitionRequest {
-        stream_id,
-        topic_id,
-        partition_id,
-        up_to_offset,
-    }
-    .to_bytes();
+    let body = request.to_bytes();
     let header_size = size_of::<RoutedRequestHeader>();
     let total = header_size + body.len();
     let mut msg = Message::<RoutedRequestHeader>::new(total);
@@ -4301,6 +4397,35 @@ pub fn build_truncate_partition_client_message_with_identifiers(
         };
     }
     msg
+}
+
+/// Build a committed rejection for a target that did not resolve locally.
+/// Keeping the raw identifiers lets metadata report the missing resource.
+///
+/// # Panics
+/// If the request size exceeds `u32::MAX`; this fixed-size command cannot.
+#[must_use]
+pub fn build_truncate_partition_client_message_with_identifiers(
+    template: &RoutedRequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RoutedRequestHeader> {
+    build_truncate_partition_client_message(
+        template,
+        client_id,
+        session,
+        &TruncatePartitionRequest {
+            stream_id,
+            topic_id,
+            partition_id,
+            up_to_offset,
+            expected_history: None,
+        },
+    )
 }
 
 fn build_prepare_message<B, P>(
@@ -4530,6 +4655,186 @@ mod tests {
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn given_cancelled_snapshot_writer_when_replaced_should_keep_the_new_snapshot() {
+        let runtime = server_common::executor::create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("snapshot.bin");
+            let first = IggySnapshot::create(&TestMux::default(), 1, 1).unwrap();
+            let mut cancelled = Box::pin(first.persist(&path));
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+
+            let replacement = IggySnapshot::create(&TestMux::default(), 2, 2).unwrap();
+            replacement.persist(&path).await.unwrap();
+            let (loaded, checksum) = IggySnapshot::load(&path).unwrap();
+            assert_eq!(loaded.sequence_number(), 2);
+            assert_eq!(
+                checksum,
+                checkpoint_checksum(&replacement.encode().unwrap())
+            );
+            assert!(!path.with_extension("bin.tmp").exists());
+        });
+    }
+
+    #[compio::test]
+    async fn given_cached_offer_when_installing_snapshot_should_invalidate_without_rereading() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let mut metadata = metadata_plane();
+        metadata.coordinator = Some(SnapshotCoordinator::new(
+            directory.path().to_path_buf(),
+            IggySnapshot::create,
+        ));
+        let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
+        IggySnapshot::create(&TestMux::default(), 0, 1)
+            .unwrap()
+            .persist(&path)
+            .await
+            .unwrap();
+        let checkpoint = metadata.checkpoint_lock.acquire().await;
+        {
+            let mut blocked_offer = std::pin::pin!(metadata.state_transfer_offer());
+            assert!(matches!(
+                futures::poll!(&mut blocked_offer),
+                std::task::Poll::Ready(Err(StateTransferUnavailable::CheckpointInProgress))
+            ));
+        }
+        drop(checkpoint);
+        let first = settled_transfer_offer(&metadata).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let cached = settled_transfer_offer(&metadata).await.unwrap();
+        assert!(
+            Rc::ptr_eq(&first, &cached),
+            "a cache hit must need no disk read"
+        );
+
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), 1, 2).unwrap();
+        snapshot.snapshot_mut().client_table = Some(metadata.client_table.borrow().to_snapshot());
+        let incoming = snapshot.encode().unwrap();
+        metadata
+            .install_state_transfer(&incoming, ClientTable::new(CLIENTS_TABLE_MAX), 1, 1)
+            .await
+            .unwrap();
+        let replaced = settled_transfer_offer(&metadata).await.unwrap();
+        assert_eq!(replaced.snapshot_seq, 1);
+        assert!(!Rc::ptr_eq(&first, &replaced));
+
+        metadata.clear_state_transfer_offer_cache();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[0] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        assert!(matches!(
+            settled_transfer_offer(&metadata).await,
+            Err(StateTransferUnavailable::SnapshotUnreadable(_))
+        ));
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn settled_transfer_offer(
+        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+    ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
+        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        compio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                match metadata.state_transfer_offer().await {
+                    Err(StateTransferUnavailable::CheckpointInProgress) => {
+                        compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .expect("concurrent snapshot writers settle")
+    }
+
+    #[compio::test]
+    async fn given_commits_during_snapshot_io_when_installing_should_preserve_the_newer_frontier() {
+        const SNAPSHOT_OP: u64 = 1;
+        const LOCAL_OP: u64 = 2;
+        const TRANSFER_OP: u64 = 3;
+        const CLIENT: u128 = 9;
+        const USER: u32 = 7;
+        const BIND_VERIFIER: [u8; 32] = [0x5a; 32];
+        for table_frontier in [SNAPSHOT_OP, TRANSFER_OP] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+            let mut metadata = metadata_plane();
+            metadata.coordinator = Some(SnapshotCoordinator::new(
+                directory.path().to_path_buf(),
+                IggySnapshot::create,
+            ));
+            let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+            table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+            let mut snapshot = IggySnapshot::create(&TestMux::default(), SNAPSHOT_OP, 1).unwrap();
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            let incoming = snapshot.encode().unwrap();
+            let held = SNAPSHOT_IO.lock().await;
+            let mut install = Box::pin(metadata.install_state_transfer(
+                &incoming,
+                table,
+                table_frontier,
+                table_frontier,
+            ));
+            assert!(futures::poll!(&mut install).is_pending());
+            let consensus = metadata.consensus.as_ref().unwrap();
+            consensus.advance_commit_max(LOCAL_OP);
+            consensus.set_commit_floor(LOCAL_OP);
+            {
+                let mut local_table = metadata.client_table.borrow_mut();
+                local_table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+                local_table
+                    .commit_register(
+                        CLIENT,
+                        USER,
+                        BIND_VERIFIER,
+                        register_reply(CLIENT, LOCAL_OP),
+                    )
+                    .unwrap();
+            }
+            drop(held);
+            let outcome = install.await.unwrap();
+            assert_eq!(outcome.installed_frontier, LOCAL_OP);
+            assert_eq!(consensus.commit_min(), LOCAL_OP);
+            if table_frontier > LOCAL_OP {
+                assert_eq!(metadata.client_table.borrow().get_epoch(CLIENT), None);
+                let replay = metadata.replay_client_table.borrow();
+                assert_eq!(
+                    replay.as_ref().unwrap().borrow().get_epoch(CLIENT),
+                    Some(LOCAL_OP),
+                    "tail replay must retain the session committed during snapshot I/O"
+                );
+            } else {
+                assert_eq!(
+                    metadata.client_table.borrow().get_epoch(CLIENT),
+                    Some(LOCAL_OP)
+                );
+                assert!(metadata.replay_client_table.borrow().is_none());
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_failed_snapshot_replacement_when_retrying_should_publish_valid_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.bin");
+        std::fs::create_dir(&path).unwrap();
+        let snapshot = IggySnapshot::create(&TestMux::default(), 1, 1).unwrap();
+        assert!(matches!(
+            snapshot.persist(&path).await,
+            Err(SnapshotError::Persist {
+                stage: PersistStage::Rename,
+                ..
+            })
+        ));
+        std::fs::remove_dir(&path).unwrap();
+        snapshot.persist(&path).await.unwrap();
+        let (loaded, _) = IggySnapshot::load(&path).unwrap();
+        assert_eq!(loaded.sequence_number(), 1);
+    }
 
     #[test]
     fn eviction_reason_splits_client_and_internal_ops() {

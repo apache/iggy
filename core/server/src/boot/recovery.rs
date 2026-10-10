@@ -290,6 +290,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         },
         metrics,
     )
+    .with_partition_io_limits(super::threads::partition_io_limits(&config.sharding)?)
     .build()
     .map_err(ServerError::ShardConstruction)?;
 

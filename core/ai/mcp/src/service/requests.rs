@@ -48,12 +48,6 @@ pub struct DeleteStream {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct PurgeStream {
-    #[schemars(description = "stream identifier (name or number)")]
-    pub stream_id: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetTopics {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
@@ -127,15 +121,6 @@ pub struct UpdateTopic {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteTopic {
-    #[schemars(description = "stream identifier (name or number)")]
-    pub stream_id: String,
-
-    #[schemars(description = "topic identifier (name or number)")]
-    pub topic_id: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct PurgeTopic {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
 

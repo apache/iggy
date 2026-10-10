@@ -67,7 +67,7 @@ jobs:
     if: |
       github.event.workflow_run.event == 'issue_comment'
       && github.event.workflow_run.conclusion != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 15
     steps:
       - name: Download the run output

@@ -24,6 +24,7 @@ mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
 pub mod install_backup;
+mod io;
 mod journal;
 mod log;
 mod messages_writer;
@@ -34,6 +35,7 @@ mod persistence;
 mod poll_plan;
 #[cfg(feature = "simulator")]
 pub use persistence::CheckpointBarrier;
+pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
@@ -49,8 +51,15 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
+pub use iggy_partition::{IggyPartition, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
+pub(crate) use io::PartitionIoVerdict;
+pub use io::{
+    CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
+    PartitionIncarnation, PartitionIoContinuation, PartitionIoIdentity, PartitionIoJob,
+    PartitionIoNotifier, PartitionIoPlan, PartitionIoQuiescence, PartitionIoResources,
+    PartitionIoResult, PartitionIoStep, PartitionTeardown, largest_legal_job_charge,
+};
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 
 /// Offsets a partition claims in its superblock ahead of the mint counter

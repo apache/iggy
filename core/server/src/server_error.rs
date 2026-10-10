@@ -28,7 +28,7 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum ServerError {
     #[error(
-        "storage at {path} does not match the durable-session format; offline migration or explicit --fresh initialization is required"
+        "storage at {path} does not match this build's storage format; offline migration or explicit --fresh initialization is required"
     )]
     UnsupportedStorage { path: PathBuf },
     #[error("cannot validate or publish the storage format at {path}: {source}")]
@@ -58,6 +58,11 @@ pub enum ServerError {
     #[error("failed to spawn OS thread for shard {shard_id}")]
     ShardSpawnFailed {
         shard_id: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to spawn the system stats sampler: {source}")]
+    SystemStatsSamplerSpawnFailed {
         #[source]
         source: std::io::Error,
     },
@@ -117,6 +122,8 @@ pub enum ServerError {
     InvalidReplyInboxCapacity { value: usize, max: usize },
     #[error("sharding.poll_completion_capacity must be in 1..={max}; got {value}")]
     InvalidPollCompletionCapacity { value: usize, max: usize },
+    #[error(transparent)]
+    InvalidPartitionIoLimits(#[from] shard::PartitionIoLimitsError),
     #[error("sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
@@ -362,6 +369,8 @@ pub enum ServerError {
     /// as clean.
     #[error("server shut down after a panic: {description}")]
     Panicked { description: String },
+    #[error("Failed to list config environment variables")]
+    ListConfigEnvVars(#[source] std::io::Error),
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

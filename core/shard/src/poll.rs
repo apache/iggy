@@ -23,10 +23,11 @@
 //! 3. The owner checks the reply connection, history, and recovery state, admits
 //!    any automatic commit, and updates progress before releasing the reply.
 //!
-//! A disk read can yield while purge or state transfer replaces the history,
-//! even on the same shard thread. The detached task therefore cannot advance
-//! progress or authorize a successful reply. Completion validation and progress
-//! updates run synchronously on the owner, before any replication wait.
+//! A disk read can yield while a delete and re-create or a state transfer
+//! replaces the history, even on the same shard thread. The detached task
+//! therefore cannot advance progress or authorize a successful reply.
+//! Completion validation and progress updates run synchronously on the owner,
+//! before any replication wait.
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
@@ -48,7 +49,7 @@ mod completion_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-mod timeout_tests;
+pub mod timeout_tests;
 
 /// Parent session and metadata identity checked by the partition owner before
 /// accepting consumer progress, including after detached poll I/O.
@@ -120,10 +121,9 @@ where
                     && consensus.is_primary()
                     && consensus.is_normal()
                     && !consensus.is_transferring()
-                    && attachment.metadata.matches_partition(
-                        self.shards_table.epoch_for(namespace),
-                        partition.applied_purge_generation(),
-                    )
+                    && attachment
+                        .metadata
+                        .matches_partition(self.shards_table.epoch_for(namespace))
             })
             .unwrap_or(false);
         if !admissible {
@@ -159,7 +159,7 @@ where
         }
         let rejected = partitions
             .with_partition(&namespace, |partition| {
-                if partition.requires_state_transfer() {
+                if partition.requires_state_transfer() || partition.read_history_is_changing() {
                     return true;
                 }
                 if let PartitionRead::PollOnPrimary { attachment, .. } = &read {
@@ -167,10 +167,9 @@ where
                     return !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
-                        || !attachment.metadata.matches_partition(
-                            self.shards_table.epoch_for(namespace),
-                            partition.applied_purge_generation(),
-                        );
+                        || !attachment
+                            .metadata
+                            .matches_partition(self.shards_table.epoch_for(namespace));
                 }
                 false
             })
@@ -294,12 +293,16 @@ where
                 .map_or(PartitionReadReply::NotFound, |()| PartitionReadReply::Ack),
             PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
                 .segment_delete_resolution(&namespace, count)
-                .map_or(PartitionReadReply::NotFound, |(up_to_offset, lagging)| {
-                    PartitionReadReply::SegmentDeleteOffset {
-                        up_to_offset,
-                        lagging,
-                    }
-                }),
+                .map_or(
+                    PartitionReadReply::NotFound,
+                    |(up_to_offset, lagging, created_revision)| {
+                        PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
+                            created_revision,
+                        }
+                    },
+                ),
         };
         let _ = reply.try_send(result);
     }

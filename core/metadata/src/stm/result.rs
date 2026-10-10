@@ -162,7 +162,6 @@ result_enum!(UpdateStreamResult {
     InvalidOptionValue = 4042,
 });
 result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
-result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
 
 // Topics.
 result_enum!(CreateTopicResult {
@@ -180,10 +179,6 @@ result_enum!(UpdateTopicResult {
     InvalidOptionValue = 4042,
 });
 result_enum!(DeleteTopicResult {
-    StreamNotFound = 1009,
-    TopicNotFound = 2010,
-});
-result_enum!(PurgeTopicResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
 });
@@ -210,6 +205,7 @@ result_enum!(TruncatePartitionResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     PartitionNotFound = 3007,
+    HistoryChanged = 3014,
 });
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`
@@ -301,13 +297,11 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
         Operation::CreateStream => CreateStreamResult::from_u32(code).is_some(),
         Operation::UpdateStream => UpdateStreamResult::from_u32(code).is_some(),
         Operation::DeleteStream => DeleteStreamResult::from_u32(code).is_some(),
-        Operation::PurgeStream => PurgeStreamResult::from_u32(code).is_some(),
         Operation::CreateTopic | Operation::CreateTopicWithAssignments => {
             CreateTopicResult::from_u32(code).is_some()
         }
         Operation::UpdateTopic => UpdateTopicResult::from_u32(code).is_some(),
         Operation::DeleteTopic => DeleteTopicResult::from_u32(code).is_some(),
-        Operation::PurgeTopic => PurgeTopicResult::from_u32(code).is_some(),
         Operation::CreatePartitions | Operation::CreatePartitionsWithAssignments => {
             CreatePartitionsResult::from_u32(code).is_some()
         }
@@ -400,13 +394,13 @@ mod tests {
             Operation::CreateTopicWithAssignments,
             u32::from(CreateTopicResult::NameAlreadyExists),
         ));
-        // Undeclared codes fail, even a real code from another op. `PurgeStream`
-        // has no `TopicNotFound`: the explicit arm rejects it where the prior
-        // `_ => true` default would have passed any code.
+        // Undeclared codes fail, even a real code from another op. `DeleteStream`
+        // has no `TopicNotFound`: its explicit arm rejects it where the
+        // `_ => true` fallback would pass any code.
         assert!(!result_code_recognized(Operation::CreateStream, 9999));
         assert!(!result_code_recognized(
-            Operation::PurgeStream,
-            u32::from(PurgeTopicResult::TopicNotFound),
+            Operation::DeleteStream,
+            u32::from(DeleteTopicResult::TopicNotFound),
         ));
         // Partition-plane ops carry no result section, so any code is accepted.
         assert!(result_code_recognized(Operation::SendMessages, 12345));
@@ -449,10 +443,6 @@ mod tests {
             stream_not_found
         );
         assert_eq!(
-            u32::from(PurgeStreamResult::StreamNotFound),
-            stream_not_found
-        );
-        assert_eq!(
             u32::from(CreateTopicResult::StreamNotFound),
             stream_not_found
         );
@@ -462,10 +452,6 @@ mod tests {
         );
         assert_eq!(
             u32::from(DeleteTopicResult::StreamNotFound),
-            stream_not_found
-        );
-        assert_eq!(
-            u32::from(PurgeTopicResult::StreamNotFound),
             stream_not_found
         );
         assert_eq!(
@@ -496,7 +482,6 @@ mod tests {
         let topic_not_found = IggyError::TopicIdNotFound(id(), id()).as_code();
         assert_eq!(u32::from(UpdateTopicResult::TopicNotFound), topic_not_found);
         assert_eq!(u32::from(DeleteTopicResult::TopicNotFound), topic_not_found);
-        assert_eq!(u32::from(PurgeTopicResult::TopicNotFound), topic_not_found);
         assert_eq!(
             u32::from(CreatePartitionsResult::TopicNotFound),
             topic_not_found
@@ -680,6 +665,10 @@ mod tests {
         assert_ne!(
             partition_id_space_exhausted,
             IggyError::TooManyPartitions.as_code(),
+        );
+        assert_eq!(
+            u32::from(TruncatePartitionResult::HistoryChanged),
+            IggyError::PartitionHistoryChanged.as_code(),
         );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.
