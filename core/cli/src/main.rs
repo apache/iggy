@@ -38,8 +38,8 @@ use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
-use iggy::prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessTokenExpiry};
-use iggy_cli::commands::binary_context::common::ContextManager;
+use iggy::prelude::{Aes256GcmEncryptor, ClientError, EncryptorKind, PersonalAccessTokenExpiry};
+use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
 use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
@@ -107,7 +107,7 @@ use main_login_session::*;
 fn get_command(
     command: Command,
     cli_options: &CliOptions,
-    iggy_args: &Args,
+    server_address: &str,
 ) -> Box<dyn CliCommand> {
     #[warn(clippy::let_and_return)]
     match command {
@@ -190,13 +190,13 @@ fn get_command(
                     PersonalAccessTokenExpiry::new(pat_create_args.expiry.clone()),
                     cli_options.quiet,
                     pat_create_args.store_token,
-                    iggy_args.get_server_address().unwrap(),
+                    server_address.to_string(),
                 ))
             }
             PersonalAccessTokenAction::Delete(pat_delete_args) => {
                 Box::new(DeletePersonalAccessTokenCmd::new(
                     pat_delete_args.name.clone(),
-                    iggy_args.get_server_address().unwrap(),
+                    server_address.to_string(),
                 ))
             }
             PersonalAccessTokenAction::List(pat_list_args) => Box::new(
@@ -336,16 +336,14 @@ fn get_command(
         },
         #[cfg(feature = "login-session")]
         Command::Login(login_args) => Box::new(LoginCmd::new(
-            iggy_args.get_server_address().unwrap(),
+            server_address.to_string(),
             LoginSessionExpiry::new(login_args.expiry.clone()),
         )),
         #[cfg(feature = "login-session")]
-        Command::Logout => Box::new(LogoutCmd::new(iggy_args.get_server_address().unwrap())),
+        Command::Logout => Box::new(LogoutCmd::new(server_address.to_string())),
         #[cfg(feature = "login-session")]
         Command::Session(command) => match command {
-            SessionAction::Status => Box::new(SessionStatusCmd::new(
-                iggy_args.get_server_address().unwrap(),
-            )),
+            SessionAction::Status => Box::new(SessionStatusCmd::new(server_address.to_string())),
         },
     }
 }
@@ -384,13 +382,18 @@ async fn main() -> Result<(), IggyCmdError> {
     let iggy_args = merged_args.iggy;
     let cli_options = merged_args.cli;
 
+    validate_transport(&iggy_args.transport)?;
+    let server_address = iggy_args
+        .get_server_address()
+        .ok_or_else(|| ClientError::InvalidTransport(iggy_args.transport.clone()))?;
+
     // Get command based on command line arguments
-    let mut command = get_command(command, &cli_options, &iggy_args);
+    let mut command = get_command(command, &cli_options, &server_address);
 
     // Create credentials based on command line arguments and command
     let mut credentials = IggyCredentials::new(
         &cli_options,
-        &iggy_args,
+        &server_address,
         command.login_required(),
         command.prefer_explicit_credentials(),
     )?;
