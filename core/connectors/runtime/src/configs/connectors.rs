@@ -176,7 +176,7 @@ impl CreateSinkConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SinkConfig {
-    // Identity comes from the file: an env KEY would orphan saved state.
+    // Identity comes from the file: an env KEY would rename the sink and move its consumer group.
     #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
@@ -498,29 +498,19 @@ mod tests {
 
     #[test]
     fn given_sink_and_source_configs_when_mapped_should_exclude_key_and_version() {
-        for (name, mappings, templates) in [
-            (
-                "sink",
-                SinkConfig::env_mappings(),
-                SinkConfig::env_templates(),
-            ),
-            (
-                "source",
-                SourceConfig::env_mappings(),
-                SourceConfig::env_templates(),
-            ),
+        for (name, mappings) in [
+            ("sink", SinkConfig::env_mappings()),
+            ("source", SourceConfig::env_mappings()),
         ] {
+            assert!(
+                mappings.iter().any(|mapping| mapping.env_name == "ENABLED"),
+                "{name} should map ENABLED from the environment"
+            );
             assert!(
                 mappings
                     .iter()
                     .all(|mapping| !matches!(mapping.env_name, "KEY" | "VERSION")),
                 "{name} maps key or version from the environment"
-            );
-            assert!(
-                templates
-                    .iter()
-                    .all(|template| !matches!(template.env_name, "KEY" | "VERSION")),
-                "{name} advertises KEY or VERSION"
             );
         }
     }

@@ -294,7 +294,16 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
                 }
                 WarningContext::ConnectorConfig(prefix) => {
                     let plugin_config_prefix = format!("{}{PLUGIN_CONFIG_ENV_SEGMENT}", prefix);
-                    key.starts_with(&plugin_config_prefix)
+                    if key.starts_with(&plugin_config_prefix) {
+                        true
+                    } else if key == format!("{prefix}KEY") || key == format!("{prefix}VERSION") {
+                        info!(
+                            "Environment variable '{key}' is ignored: connector identity comes from the config file."
+                        );
+                        true
+                    } else {
+                        false
+                    }
                 }
             };
             if should_skip {
@@ -649,6 +658,30 @@ mod tests {
         }
 
         for name in runtime_env_vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+    }
+
+    /// Retired KEY/VERSION overrides must not trip the unknown-variable scan:
+    /// a debug build refuses to boot on an unknown name, so reaching the
+    /// `debug_assert!` below would fail this test in debug builds.
+    #[test]
+    #[serial_test::serial]
+    fn retired_connector_identity_vars_are_skipped_by_the_unknown_variable_scan() {
+        let prefix = "IGGY_CONNECTORS_SINK_TEST_";
+        let retired = [format!("{prefix}KEY"), format!("{prefix}VERSION")];
+        for name in &retired {
+            // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+            // against any concurrent environment access. `serial_test::serial` on
+            // this test is what prevents that.
+            unsafe { env::set_var(name, "stale") };
+        }
+
+        TypedEnvProvider::<TestConfig>::new(prefix, &[])
+            .warn_unknown_env_vars_inner(WarningContext::ConnectorConfig(prefix));
+
+        for name in &retired {
             // SAFETY: paired with the set above.
             unsafe { env::remove_var(name) };
         }
