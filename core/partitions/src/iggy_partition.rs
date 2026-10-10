@@ -1686,6 +1686,7 @@ where
 
     pub fn needs_persistence_checkpoint(&self) -> bool {
         self.maintenance.checkpoint.is_none()
+            && !self.checkpoint_waits_for_commit()
             && self.persistence.as_ref().is_some_and(|persistence| {
                 persistence.needs_checkpoint()
                     && self.consensus.commit_min().min(persistence.head())
@@ -1694,7 +1695,7 @@ where
     }
 
     pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
-        if self.fatal.is_some() {
+        if self.fatal.is_some() || self.checkpoint_waits_for_commit() {
             return;
         }
         let Some(persistence) = self
@@ -2033,6 +2034,18 @@ where
     /// materialized files. Replicated commits continue.
     fn commit_waits_for_checkpoint(&self) -> bool {
         self.durability().is_persisted() && self.persistence_checkpoint_pending()
+    }
+
+    /// A lifecycle fence applies its owner and history state before its commit
+    /// publishes `commit_min`. Receipts captured in between would hold an op
+    /// past their own frontier, which recovery refuses.
+    fn checkpoint_waits_for_commit(&self) -> bool {
+        self.pending_commit.as_ref().is_some_and(|pending| {
+            pending
+                .headers
+                .iter()
+                .any(|header| header.operation.is_partition_lifecycle())
+        })
     }
 
     /// A checkpoint may still need to open the deleted path. In-place writes
@@ -17258,6 +17271,128 @@ mod tests {
                 recovered.installed_history_transition(&transition),
                 Some(checkpoint)
             );
+        }
+    }
+
+    #[compio::test]
+    async fn given_fence_awaiting_directory_sync_when_checkpoint_is_due_should_recover_the_fence() {
+        const FIRST_GROUP_ID: u64 = 1;
+        const SECOND_GROUP_ID: u64 = 2;
+        const CLIENT_ID: u128 = 42;
+        // Only the second resident control op makes the flush due, so the owner
+        // install leaves the segment names dirty for the fence to sync.
+        const CONTROL_OPS_PER_FLUSH: u32 = 2;
+        for operation in [
+            Operation::InstallConsumerGroupOwner,
+            Operation::TransitionPartitionHistory,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = repair_config();
+            config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+            let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+            std::fs::create_dir_all(&directory).unwrap();
+            let (mut partition, _) = recording_partition_at(0, 1);
+            partition.set_partition_dir(directory.to_string_lossy().into_owned());
+            set_offset_dirs_under(&mut partition, &directory);
+            partition.runtime_options.messages_required_to_save = Some(CONTROL_OPS_PER_FLUSH);
+            partition.open_persistence().await.unwrap();
+            partition.log.retire_front().unwrap();
+            partition.install_empty_segment(&config, 0).await.unwrap();
+            partition.set_io_notifier(
+                Rc::new(|_, _| {}),
+                crate::largest_legal_job_charge().unwrap(),
+            );
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+            let first = next_test_installation(&partition, FIRST_GROUP_ID, CLIENT_ID);
+            partition
+                .on_request(owner_install_request(&partition, &first), None)
+                .await;
+            persistence.drain().await.unwrap();
+            partition.consensus.advance_commit_max(1);
+            partition.commit_journal(&config).await;
+            assert_eq!(partition.consensus.commit_min(), 1);
+
+            let second = next_test_installation(&partition, SECOND_GROUP_ID, CLIENT_ID);
+            let body = if operation == Operation::InstallConsumerGroupOwner {
+                second.to_bytes()
+            } else {
+                TransitionPartitionHistoryRequest {
+                    incarnation: partition.created_revision(),
+                    metadata_op: second.metadata_op,
+                }
+                .to_bytes()
+            };
+            let fence_applied = |partition: &IggyPartition<RecordingBus>| {
+                if operation == Operation::InstallConsumerGroupOwner {
+                    partition.consumer_group_owner(SECOND_GROUP_ID) == Some(second.owner)
+                } else {
+                    partition.history_deleted()
+                }
+            };
+            partition
+                .on_request(
+                    partition_control_request(&partition, operation, &body, second.metadata_op),
+                    None,
+                )
+                .await;
+            persistence.drain().await.unwrap();
+            partition.consensus.advance_commit_max(2);
+            partition.commit_journal(&config).await;
+            assert!(
+                matches!(
+                    partition
+                        .pending_commit
+                        .as_ref()
+                        .map(|pending| pending.phase),
+                    Some(CommitPhase::SegmentDirectory)
+                ),
+                "{operation:?} must wait for the directory sync"
+            );
+            assert_eq!(partition.consensus.commit_min(), 1);
+            assert!(
+                fence_applied(&partition),
+                "{operation:?} applies before its commit publishes"
+            );
+
+            // Shard ticks: one while the directory sync is pending, one after it.
+            persistence.request_checkpoint();
+            if partition.needs_persistence_checkpoint() {
+                partition.checkpoint_persistence(&config).await;
+            }
+            settle_partition_io(&mut partition, &config).await;
+            assert_eq!(partition.consensus.commit_min(), 2);
+            if partition.needs_persistence_checkpoint() {
+                partition.checkpoint_persistence(&config).await;
+            }
+            settle_partition_io(&mut partition, &config).await;
+            persistence.drain().await.unwrap();
+            settle_partition_io(&mut partition, &config).await;
+            assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+            drop(partition);
+            drop(persistence);
+
+            let (mut recovered, _) = recording_partition_at(0, 1);
+            recovered.set_partition_dir(directory.to_string_lossy().into_owned());
+            set_offset_dirs_under(&mut recovered, &directory);
+            let recovery = recovered.open_persistence().await;
+            assert!(
+                recovery.is_ok(),
+                "{operation:?}: recovery refused the published checkpoint: {recovery:?}"
+            );
+            assert_eq!(
+                recovered
+                    .persistence
+                    .as_ref()
+                    .map(|persistence| persistence.checkpoint_op()),
+                Some(2),
+                "{operation:?}: the deferred checkpoint must run once the fence publishes"
+            );
+            assert_eq!(
+                recovered.consumer_group_owner(FIRST_GROUP_ID),
+                Some(first.owner)
+            );
+            assert!(fence_applied(&recovered), "{operation:?}");
         }
     }
 
