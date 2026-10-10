@@ -263,6 +263,36 @@ func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheMemberOwnsNothing(t *tes
 	assert.Empty(t, polled.Messages)
 }
 
+func TestPollMessages_GroupPollResyncsAnEmptyAssignmentOnTheNextPoll(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	// The join committed, but no partition installed the member as owner yet.
+	assignment := assignmentBody(1)
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.SyncGroupCode) {
+			return replyFrame(vsr.OperationNonReplicated, assignment)
+		}
+		return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+	})
+
+	first, err := pollOnce(t, client)
+	require.NoError(t, err)
+	require.Equal(t, iggcon.NoAssignedPartition, first.PartitionId)
+
+	assignment = assignmentBody(4, 7)
+
+	second, err := pollOnce(t, client)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(7), second.PartitionId,
+		"an empty assignment is not trusted for the refresh window")
+	syncs := 0
+	for _, read := range server.recorded() {
+		if read.code() == uint32(command.SyncGroupCode) {
+			syncs++
+		}
+	}
+	assert.Equal(t, 2, syncs, "the poll after an empty sync syncs again")
+}
+
 func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheRebalanceOutlastsTheAttempts(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {

@@ -253,7 +253,9 @@ func (c *IggyTcpClient) ensureAssignment(
 	key groupKey,
 	streamId, topicId, groupId iggcon.Identifier,
 ) (groupAssignment, error) {
-	if cached, ok := c.groups.get(key); ok &&
+	// As in Rust, an empty assignment is synced again on every poll: a member
+	// gets its partitions only as each one installs it as the owner.
+	if cached, ok := c.groups.get(key); ok && len(cached.partitions) > 0 &&
 		time.Since(cached.fetchedAt) < assignmentRefreshInterval {
 		return cached, nil
 	}
