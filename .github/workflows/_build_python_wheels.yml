@@ -85,7 +85,26 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+
+      - name: Select wheel interpreters
+        id: interpreters
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+
+          with open("foreign/python/pyproject.toml", "rb") as project_file:
+              classifiers = tomllib.load(project_file)["project"]["classifiers"]
+          versions = [
+              classifier.rsplit(" :: ", 1)[-1]
+              for classifier in classifiers
+              if re.fullmatch(r"Programming Language :: Python :: \d+\.\d+", classifier)
+          ]
+          if not versions:
+              raise SystemExit("No Python version classifiers found")
+          print("versions=" + " ".join(f"python{version}" for version in versions))
+          PY
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -114,7 +133,7 @@ jobs:
               yum install -y perl-IPC-Cmd
             fi
           manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist --interpreter ${{ steps.interpreters.outputs.versions }}
           sccache: "true"
 
       - name: Upload wheels
@@ -151,7 +170,34 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+
+      - name: Select wheel interpreters
+        id: interpreters
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+
+          with open("foreign/python/pyproject.toml", "rb") as project_file:
+              classifiers = tomllib.load(project_file)["project"]["classifiers"]
+          versions = [
+              classifier.rsplit(" :: ", 1)[-1]
+              for classifier in classifiers
+              if re.fullmatch(r"Programming Language :: Python :: \d+\.\d+", classifier)
+          ]
+          if not versions:
+              raise SystemExit("No Python version classifiers found")
+          print("versions=" + " ".join(f"python{version}" for version in versions))
+          print("python_versions<<PYTHON_VERSIONS")
+          print("\n".join(versions))
+          print("PYTHON_VERSIONS")
+          PY
+
+      - name: Setup wheel Python versions
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ steps.interpreters.outputs.python_versions }}
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -179,7 +225,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           working-directory: foreign/python
-          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist --interpreter ${{ steps.interpreters.outputs.versions }}
           sccache: "true"
 
       - name: Upload wheels
@@ -198,8 +244,7 @@ jobs:
       # fallback does not see setup-python tool-cache installs, so one
       # job cannot target several interpreters. One job per version
       # instead, each falling through to maturin's default of the
-      # interpreter on PATH. 3.10 is Windows-only excluded, see
-      # WHEEL_MATRIX_SKIP in scripts/ci/sync-python-interpreter-version.sh.
+      # interpreter on PATH.
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
@@ -319,6 +364,37 @@ jobs:
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Read Python support from release commit
+        id: support
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+
+          with open("foreign/python/pyproject.toml", "rb") as project_file:
+              project = tomllib.load(project_file)["project"]
+          versions = [
+              classifier.rsplit(" :: ", 1)[-1]
+              for classifier in project["classifiers"]
+              if re.fullmatch(r"Programming Language :: Python :: \d+\.\d+", classifier)
+          ]
+          if not versions:
+              raise SystemExit("No Python version classifiers found")
+          minimum_version = min(versions, key=lambda version: tuple(map(int, version.split("."))))
+          print(f"count={len(versions)}")
+          print(f"minimum_version={minimum_version}")
+          print(f"requires_python={project['requires-python']}")
+          PY
+
       - name: Download all wheels
         uses: actions/download-artifact@v8
         with:
@@ -363,13 +439,13 @@ jobs:
 
       # Runs last so the artifact and the summary survive for inspection
       # when a leg is missing. A failed build job uploads nothing, so a
-      # short count means one did not contribute. These counts are not
-      # derived from the matrices above - update them together.
+      # short count means one did not contribute. Linux and macOS counts
+      # use the release commit's classifiers; Windows has a fixed matrix.
       - name: Verify wheel coverage
         run: |
-          EXPECTED_LINUX=16   # 4 build variants x 4 interpreters
-          EXPECTED_MACOS=8    # 2 targets x 4 interpreters
-          EXPECTED_WINDOWS=3  # 1 interpreter per job, 3.10 excluded
+          EXPECTED_LINUX=$((4 * ${{ steps.support.outputs.count }}))  # 12 for Python 3.11-3.13
+          EXPECTED_MACOS=$((2 * ${{ steps.support.outputs.count }}))  # 6 for Python 3.11-3.13
+          EXPECTED_WINDOWS=3  # 1 interpreter per job
           EXPECTED_SDIST=1
 
           missing=0
@@ -390,3 +466,42 @@ jobs:
           check sdist '*.tar.gz' "$EXPECTED_SDIST"
 
           exit "$missing"
+
+      - name: Verify Python compatibility metadata
+        env:
+          EXPECTED_REQUIRES_PYTHON: ${{ steps.support.outputs.requires_python }}
+          MINIMUM_VERSION: ${{ steps.support.outputs.minimum_version }}
+        run: |
+          python - <<'PY'
+          from email.parser import Parser
+          from os import environ
+          from pathlib import Path
+          from tarfile import open as open_tar
+          from zipfile import ZipFile
+
+          expected_requires_python = environ["EXPECTED_REQUIRES_PYTHON"]
+          minimum_version = tuple(map(int, environ["MINIMUM_VERSION"].split(".")))
+          for artifact in Path("dist").iterdir():
+              if artifact.suffix == ".whl":
+                  if minimum_version >= (3, 11) and "cp310" in artifact.name:
+                      raise SystemExit(f"Unsupported Python wheel: {artifact.name}")
+                  with ZipFile(artifact) as wheel:
+                      metadata_path = next(
+                          name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
+                      )
+                      metadata = wheel.read(metadata_path).decode("utf-8")
+              elif artifact.name.endswith(".tar.gz"):
+                  with open_tar(artifact, "r:gz") as sdist:
+                      pkg_info = next(member for member in sdist if member.name.endswith("/PKG-INFO"))
+                      metadata = sdist.extractfile(pkg_info).read().decode("utf-8")
+              else:
+                  continue
+
+              requires_python = Parser().parsestr(metadata).get("Requires-Python")
+              if requires_python != expected_requires_python:
+                  raise SystemExit(
+                      f"{artifact.name}: Requires-Python is {requires_python!r}, "
+                      f"expected {expected_requires_python!r}"
+                  )
+              print(f"{artifact.name}: Requires-Python {requires_python}")
+          PY
