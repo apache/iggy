@@ -169,12 +169,17 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                 };
                 let _ = reply.try_send(committed);
             }
-            shard::MetadataSubmit::CompleteLifecycle(request) => {
-                let _ = shard
+            shard::MetadataSubmit::CompleteLifecycle {
+                request,
+                reporter,
+                reply,
+            } => {
+                let applied = shard
                     .plane
                     .metadata()
-                    .submit_complete_lifecycle_in_process(request)
+                    .submit_complete_lifecycle_in_process(request, reporter)
                     .await;
+                let _ = reply.try_send(matches!(applied, Ok(true)));
             }
             shard::MetadataSubmit::CompleteRevocation {
                 stream_id,

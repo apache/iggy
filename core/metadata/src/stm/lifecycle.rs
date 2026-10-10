@@ -100,26 +100,80 @@ impl LifecycleIntent {
 /// incarnation offline completes it instead.
 pub const RETIRED_PARTITION_OP: u64 = u64::MAX;
 
-#[derive(Debug, Clone, Copy)]
-pub struct CompleteLifecycleRequest {
-    pub metadata_op: u64,
-    pub stream_id: u32,
+/// Upper bound on the targets of one [`CompleteLifecycleRequest`], which keeps
+/// one metadata prepare small. A reporter with more ready targets sends the
+/// rest in its next batch.
+pub const LIFECYCLE_COMPLETIONS_MAX: usize = 1024;
+
+const COMPLETION_BATCH_HEADER_SIZE: usize = size_of::<u64>() + 2 * size_of::<u32>();
+const COMPLETION_SIZE: usize = 2 * size_of::<u32>() + size_of::<u64>();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleCompletion {
     pub topic_id: u32,
     pub partition_id: u32,
     pub partition_op: u64,
 }
 
+/// The installed fences of one intent that one reporter relays.
+///
+/// The completions are not empty, at most [`LIFECYCLE_COMPLETIONS_MAX`], and
+/// strictly ascending by `(topic_id, partition_id)`, so a batch names each
+/// target once. Construction and decode enforce the same rules: no committed
+/// batch can fail to decode on a replica.
+#[derive(Debug, Clone)]
+pub struct CompleteLifecycleRequest {
+    pub metadata_op: u64,
+    pub stream_id: u32,
+    completions: Vec<LifecycleCompletion>,
+}
+
+impl CompleteLifecycleRequest {
+    /// `None` when the batch breaks a rule of the type or a completion lacks an op.
+    #[must_use]
+    pub fn new(
+        metadata_op: u64,
+        stream_id: u32,
+        completions: Vec<LifecycleCompletion>,
+    ) -> Option<Self> {
+        let well_formed = metadata_op != 0
+            && (1..=LIFECYCLE_COMPLETIONS_MAX).contains(&completions.len())
+            && completions
+                .iter()
+                .all(|completion| completion.partition_op != 0)
+            && completions.windows(2).all(|pair| {
+                (pair[0].topic_id, pair[0].partition_id) < (pair[1].topic_id, pair[1].partition_id)
+            });
+        well_formed.then_some(Self {
+            metadata_op,
+            stream_id,
+            completions,
+        })
+    }
+
+    #[must_use]
+    pub fn completions(&self) -> &[LifecycleCompletion] {
+        &self.completions
+    }
+}
+
 impl WireEncode for CompleteLifecycleRequest {
     fn encoded_size(&self) -> usize {
-        2 * size_of::<u64>() + 3 * size_of::<u32>()
+        COMPLETION_BATCH_HEADER_SIZE + self.completions.len() * COMPLETION_SIZE
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u64_le(self.metadata_op);
         buf.put_u32_le(self.stream_id);
-        buf.put_u32_le(self.topic_id);
-        buf.put_u32_le(self.partition_id);
-        buf.put_u64_le(self.partition_op);
+        buf.put_u32_le(
+            u32::try_from(self.completions.len())
+                .expect("LIFECYCLE_COMPLETIONS_MAX bounds the batch"),
+        );
+        for completion in &self.completions {
+            buf.put_u32_le(completion.topic_id);
+            buf.put_u32_le(completion.partition_id);
+            buf.put_u64_le(completion.partition_op);
+        }
     }
 }
 
@@ -137,21 +191,18 @@ impl WireDecode for CompleteLifecycleRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let metadata_op = read_u64_le(buf, 0)?;
         let stream_id = read_u32_le(buf, 8)?;
-        let topic_id = read_u32_le(buf, 12)?;
-        let partition_id = read_u32_le(buf, 16)?;
-        let partition_op = read_u64_le(buf, 20)?;
-        if metadata_op == 0 || partition_op == 0 {
-            return Err(WireError::Validation(
-                "missing lifecycle completion identity".into(),
-            ));
+        let count = read_u32_le(buf, 12)? as usize;
+        let mut completions = Vec::with_capacity(count.min(LIFECYCLE_COMPLETIONS_MAX));
+        for index in 0..count {
+            let offset = COMPLETION_BATCH_HEADER_SIZE + index * COMPLETION_SIZE;
+            completions.push(LifecycleCompletion {
+                topic_id: read_u32_le(buf, offset)?,
+                partition_id: read_u32_le(buf, offset + size_of::<u32>())?,
+                partition_op: read_u64_le(buf, offset + 2 * size_of::<u32>())?,
+            });
         }
-        let request = Self {
-            metadata_op,
-            stream_id,
-            topic_id,
-            partition_id,
-            partition_op,
-        };
+        let request = Self::new(metadata_op, stream_id, completions)
+            .ok_or_else(|| WireError::Validation("malformed lifecycle completion batch".into()))?;
         let size = request.encoded_size();
         Ok((request, size))
     }
@@ -381,26 +432,32 @@ impl StateHandler for CompleteLifecycleRequest {
         if intent.stream_id != self.stream_id {
             return ApplyReply::err(IggyError::InvalidCommand.as_code());
         }
-        let Some(&index) = intent
-            .partition_index
-            .get(&(self.topic_id, self.partition_id))
-        else {
-            return ApplyReply::err(IggyError::InvalidCommand.as_code());
-        };
-        let Some(partition) = intent.partitions.get_mut(index) else {
-            return ApplyReply::err(IggyError::InvalidCommand.as_code());
-        };
-        if partition
-            .partition_op
-            .is_some_and(|op| op != self.partition_op)
-        {
-            return ApplyReply::err(IggyError::InvalidCommand.as_code());
+        // A batch applies whole or not at all, so nothing is recorded until
+        // every completion passes.
+        let mut recorded = Vec::with_capacity(self.completions.len());
+        for completion in &self.completions {
+            let Some(&index) = intent
+                .partition_index
+                .get(&(completion.topic_id, completion.partition_id))
+            else {
+                return ApplyReply::err(IggyError::InvalidCommand.as_code());
+            };
+            match intent
+                .partitions
+                .get(index)
+                .map(|partition| partition.partition_op)
+            {
+                Some(None) => recorded.push((index, completion.partition_op)),
+                Some(Some(op)) if op == completion.partition_op => {}
+                _ => return ApplyReply::err(IggyError::InvalidCommand.as_code()),
+            }
         }
-        let previous_completion = partition.partition_op;
-        partition.partition_op = Some(self.partition_op);
-        if previous_completion.is_none() {
-            intent.remaining_partitions -= 1;
+        for &(index, partition_op) in &recorded {
+            if let Some(partition) = intent.partitions.get_mut(index) {
+                partition.partition_op = Some(partition_op);
+            }
         }
+        intent.remaining_partitions -= recorded.len();
         if intent.remaining_partitions != 0 {
             return ApplyReply::ok(Bytes::new());
         }
@@ -436,12 +493,12 @@ impl StateHandler for CompleteLifecycleRequest {
         state.apply_context = context;
         if reply.code != 0 {
             // Keep the final report pending so reconciliation can retry finalization.
-            if let Some(partition) = intent.partitions.get_mut(index) {
-                partition.partition_op = previous_completion;
-                if previous_completion.is_none() {
-                    intent.remaining_partitions += 1;
+            for &(index, _) in &recorded {
+                if let Some(partition) = intent.partitions.get_mut(index) {
+                    partition.partition_op = None;
                 }
             }
+            intent.remaining_partitions += recorded.len();
             state.lifecycle_intents.insert(self.metadata_op, intent);
         } else if matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. })
             && let Some(topic) = intent.topic_id.and_then(|topic_id| {
@@ -688,14 +745,14 @@ pub(crate) fn apply_with_lifecycle_completion<R: StateHandler<State = StreamsInn
     };
     for (index, partition) in intent.partitions.iter().enumerate() {
         state.apply_context.metadata_op += 1;
-        let result = CompleteLifecycleRequest {
-            metadata_op: op,
-            stream_id: intent.stream_id,
+        let completion = LifecycleCompletion {
             topic_id: partition.topic_id,
             partition_id: partition.partition_id,
             partition_op: u64::try_from(index).unwrap() + 1,
-        }
-        .apply(state, timestamp);
+        };
+        let result = CompleteLifecycleRequest::new(op, intent.stream_id, vec![completion])
+            .unwrap()
+            .apply(state, timestamp);
         assert_eq!(
             result.code, 0,
             "fixture must complete each matching partition fence"
@@ -771,21 +828,35 @@ mod tests {
         }
     }
 
-    fn complete(streams: &Streams, partition_id: u32, partition_op: u64) {
-        let reply = apply(
+    fn completion(partition_id: u32, partition_op: u64) -> LifecycleCompletion {
+        LifecycleCompletion {
+            topic_id: 0,
+            partition_id,
+            partition_op,
+        }
+    }
+
+    fn complete_batch(
+        streams: &Streams,
+        completions: Vec<LifecycleCompletion>,
+        metadata_op: u64,
+    ) -> ApplyReply {
+        apply(
             streams,
             Operation::CompleteLifecycle,
-            &CompleteLifecycleRequest {
-                metadata_op: INTENT_OP,
-                stream_id: 0,
-                topic_id: 0,
-                partition_id,
-                partition_op,
-            },
+            &CompleteLifecycleRequest::new(INTENT_OP, 0, completions).unwrap(),
             ApplyContext {
-                metadata_op: INTENT_OP + 1 + u64::from(partition_id),
+                metadata_op,
                 ..ApplyContext::default()
             },
+        )
+    }
+
+    fn complete(streams: &Streams, partition_id: u32, partition_op: u64) {
+        let reply = complete_batch(
+            streams,
+            vec![completion(partition_id, partition_op)],
+            INTENT_OP + 1 + u64::from(partition_id),
         );
         assert_eq!(reply.code, 0);
     }
@@ -1271,5 +1342,144 @@ mod tests {
             crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
         let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
         assert_eq!(catalog(&restored), (REMOVAL_OP, 2, vec![1]));
+    }
+
+    #[test]
+    fn given_completion_batch_when_decoding_should_accept_only_canonical_batches() {
+        let batch =
+            CompleteLifecycleRequest::new(INTENT_OP, 3, vec![completion(0, 12), completion(1, 23)])
+                .unwrap();
+        let decoded = CompleteLifecycleRequest::decode_from(&batch.to_bytes()).unwrap();
+        assert_eq!((decoded.metadata_op, decoded.stream_id), (INTENT_OP, 3));
+        assert_eq!(decoded.completions(), batch.completions());
+
+        let encode = |metadata_op: u64, completions: &[LifecycleCompletion]| {
+            let mut buf = BytesMut::new();
+            buf.put_u64_le(metadata_op);
+            buf.put_u32_le(0);
+            buf.put_u32_le(u32::try_from(completions.len()).unwrap());
+            for completion in completions {
+                buf.put_u32_le(completion.topic_id);
+                buf.put_u32_le(completion.partition_id);
+                buf.put_u64_le(completion.partition_op);
+            }
+            buf.freeze()
+        };
+        let oversized: Vec<_> = (0..=LIFECYCLE_COMPLETIONS_MAX)
+            .map(|id| completion(u32::try_from(id).unwrap(), 1))
+            .collect();
+        let encoded = batch.to_bytes();
+        let mut trailing = BytesMut::from(&encoded[..]);
+        trailing.put_u8(0);
+        for (label, body) in [
+            ("empty", encode(INTENT_OP, &[])),
+            (
+                "unordered",
+                encode(INTENT_OP, &[completion(1, 23), completion(0, 12)]),
+            ),
+            (
+                "duplicate",
+                encode(INTENT_OP, &[completion(0, 12), completion(0, 12)]),
+            ),
+            ("zero partition op", encode(INTENT_OP, &[completion(0, 0)])),
+            ("zero metadata op", encode(0, &[completion(0, 12)])),
+            ("oversized", encode(INTENT_OP, &oversized)),
+            ("truncated", encoded.slice(..encoded.len() - 1)),
+            ("trailing", trailing.freeze()),
+        ] {
+            assert!(
+                CompleteLifecycleRequest::decode_from(&body).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_batch_with_invalid_completion_when_applied_should_record_nothing() {
+        let streams = streams();
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        assert_eq!(
+            apply(&streams, Operation::DeleteTopic, &delete, context()).code,
+            0
+        );
+        complete(&streams, 0, 12);
+        for (offset, label, completions) in [
+            (
+                2,
+                "unknown target",
+                vec![completion(1, 23), completion(7, 1)],
+            ),
+            (
+                3,
+                "conflicting op",
+                vec![completion(0, 13), completion(1, 23)],
+            ),
+        ] {
+            let reply = complete_batch(&streams, completions, INTENT_OP + offset);
+            assert_eq!(reply.code, IggyError::InvalidCommand.as_code(), "{label}");
+            let pending = streams.pending_lifecycles();
+            assert_eq!(pending[0].partitions[1].partition_op, None, "{label}");
+            assert_eq!(pending[0].remaining_partitions, 1, "{label}");
+        }
+
+        let reply = complete_batch(
+            &streams,
+            vec![completion(0, 12), completion(1, 23)],
+            INTENT_OP + 4,
+        );
+        assert_eq!(reply.code, 0);
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+        for partition_id in 0..2 {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            assert_eq!(streams.created_revision_for_namespace(namespace), None);
+        }
+    }
+
+    /// The group cannot vanish while its deletion is pending, so the test
+    /// removes it from the state directly to make the finalization fail.
+    #[test]
+    fn given_failing_finalization_when_batch_completes_should_reopen_every_recorded_target() {
+        let streams = streams();
+        let create = CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: WireName::new("group").unwrap(),
+        };
+        let create_context = ApplyContext {
+            metadata_op: INTENT_OP - 1,
+            ..context()
+        };
+        let reply = apply(
+            &streams,
+            Operation::CreateConsumerGroup,
+            &create,
+            create_context,
+        );
+        assert_eq!(reply.code, 0);
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(0),
+        };
+        let reply = apply(&streams, Operation::DeleteConsumerGroup, &delete, context());
+        assert_eq!(reply.code, 0);
+        let mut inner = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
+        inner.items[0].topics[0].consumer_groups.remove(&0);
+
+        let batch =
+            CompleteLifecycleRequest::new(INTENT_OP, 0, vec![completion(0, 12), completion(1, 23)])
+                .unwrap();
+        assert_ne!(batch.apply(&mut inner, IggyTimestamp::now()).code, 0);
+        let intent = &inner.lifecycle_intents[&INTENT_OP];
+        assert!(
+            intent
+                .partitions
+                .iter()
+                .all(|target| target.partition_op.is_none())
+        );
+        assert_eq!(intent.remaining_partitions, 2);
     }
 }

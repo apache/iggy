@@ -113,6 +113,9 @@ pub struct SimReplica {
     _stop_txs: Vec<shard::Sender<()>>,
     /// Pump task per shard, aborted on crash.
     pump_tasks: Vec<TaskId>,
+    /// Lifecycle report state per shard, indexed by shard id. A restart starts
+    /// it empty, as a rebooted reconciler does.
+    lifecycle_reports: Vec<server::LifecycleReports>,
 }
 
 impl SimReplica {
@@ -508,6 +511,10 @@ impl Simulator {
                 shards.push(shard);
             }
 
+            let lifecycle_reports = shards
+                .iter()
+                .map(|_| server::LifecycleReports::default())
+                .collect();
             replicas.push(SimReplica {
                 seeded_namespaces: RefCell::new(BTreeMap::new()),
                 shards,
@@ -519,6 +526,7 @@ impl Simulator {
                 data_dir: replica_data_dir,
                 _stop_txs: stop_txs,
                 pump_tasks,
+                lifecycle_reports,
             });
             outboxes.push(outbox);
         }
@@ -1134,9 +1142,9 @@ impl Simulator {
                     materialise_partition(replica, namespace, self.consumer_offsets_max);
                 }
             }
-            for shard in &replica.shards {
+            for (shard, reports) in replica.shards.iter().zip(&replica.lifecycle_reports) {
                 server::reconcile_pending_revocations(shard, now, timeout);
-                let _ = server::reconcile_partition_lifecycles(shard);
+                server::reconcile_partition_lifecycles(shard, reports, now);
             }
         }
     }
@@ -1393,6 +1401,10 @@ impl Simulator {
 
         // Replacing the replica drops the old shards, losing all volatile consensus
         // state as a real restart does. The harness-owned superblock carries over.
+        let lifecycle_reports = shards
+            .iter()
+            .map(|_| server::LifecycleReports::default())
+            .collect();
         self.replicas[idx] = SimReplica {
             seeded_namespaces: RefCell::new(seeded_namespaces),
             shards,
@@ -1404,6 +1416,7 @@ impl Simulator {
             data_dir: replica_data_dir,
             _stop_txs: stop_txs,
             pump_tasks,
+            lifecycle_reports,
         };
 
         // Re-materialise every group this replica had before the crash, as a

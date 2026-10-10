@@ -1353,7 +1353,7 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use metadata::IggyMetadata;
     use metadata::stm::StateMachine as _;
-    use metadata::stm::lifecycle::CompleteLifecycleRequest;
+    use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::{PartitionLocation, ShardId};
@@ -2938,13 +2938,16 @@ mod tests {
                 Operation::CompleteLifecycle,
                 1,
                 1,
-                &CompleteLifecycleRequest {
-                    metadata_op: intent.context.metadata_op,
-                    stream_id: intent.stream_id,
-                    topic_id: partition.topic_id,
-                    partition_id: partition.partition_id,
-                    partition_op: 1,
-                }
+                &CompleteLifecycleRequest::new(
+                    intent.context.metadata_op,
+                    intent.stream_id,
+                    vec![LifecycleCompletion {
+                        topic_id: partition.topic_id,
+                        partition_id: partition.partition_id,
+                        partition_op: 1,
+                    }],
+                )
+                .unwrap()
                 .to_bytes(),
             ))
             .unwrap();

@@ -2898,9 +2898,16 @@ where
             &request.to_bytes(),
         )
         .await
+        .map(|reply| reply.header().commit)
     }
 
-    /// Commit durable partition completion on the metadata primary.
+    /// Commit one batch of lifecycle completions on the metadata primary.
+    /// `true` when the batch committed and applied.
+    ///
+    /// Each reporter shard owns one internal client, so batches of different
+    /// shards share the pipeline. Partition namespaces never set
+    /// `METADATA_GROUP`, so a reporter client cannot collide with the
+    /// per-partition clients of revocations.
     ///
     /// # Errors
     /// Returns the same leadership, pipeline and cancellation errors as
@@ -2909,30 +2916,28 @@ where
     pub async fn submit_complete_lifecycle_in_process(
         &self,
         request: crate::stm::lifecycle::CompleteLifecycleRequest,
-    ) -> Result<u64, MetadataSubmitError> {
-        self.submit_partition_completion(
-            Operation::CompleteLifecycle,
-            server_common::sharding::IggyNamespace::new(
-                request.stream_id as usize,
-                request.topic_id as usize,
-                request.partition_id as usize,
+        reporter: u16,
+    ) -> Result<bool, MetadataSubmitError> {
+        let reply = self
+            .submit_partition_completion(
+                Operation::CompleteLifecycle,
+                server_common::sharding::METADATA_GROUP | u64::from(reporter),
+                &request.to_bytes(),
             )
-            .inner(),
-            &request.to_bytes(),
-        )
-        .await
+            .await?;
+        Ok(iggy_binary_protocol::result_code(reply.body()) == Some(0))
     }
 
     #[allow(clippy::future_not_send)]
     async fn submit_partition_completion(
         &self,
         operation: Operation,
-        namespace: u64,
+        internal_client: u64,
         body: &[u8],
-    ) -> Result<u64, MetadataSubmitError> {
-        // One internal client per partition serializes completions across groups.
+    ) -> Result<Message<ReplyHeader>, MetadataSubmitError> {
+        // One internal client per key serializes the completions of that key.
         const INTERNAL_REQUEST_ID: u64 = u64::MAX;
-        let internal_client_id = (u128::from(u64::MAX) << 64) | u128::from(namespace);
+        let internal_client_id = (u128::from(u64::MAX) << 64) | u128::from(internal_client);
         let consensus = self
             .consensus
             .as_ref()
@@ -2971,10 +2976,9 @@ where
             consensus.retry_capacity(&self.client_table.borrow()),
         );
 
-        match self.dispatch_prepare_and_await(consensus, prepare).await {
-            Ok(reply) => Ok(reply.header().commit),
-            Err(Canceled) => Err(MetadataSubmitError::Canceled),
-        }
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
     }
 
     /// `true` when this node is the caught-up primary of the metadata

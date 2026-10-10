@@ -280,11 +280,17 @@ pub enum MetadataSubmit {
         request: Message<GenericHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
     },
-    /// A shard's partition reconciler reports the committed partition fence of
-    /// one lifecycle target to shard 0, which proposes it through metadata
-    /// consensus with no client session. Fire-and-forget and idempotent: the
-    /// reconciler resends while the intent stays pending.
-    CompleteLifecycle(metadata::stm::lifecycle::CompleteLifecycleRequest),
+    /// A shard's partition reconciler reports the committed partition fences
+    /// of one lifecycle intent to shard 0, which proposes them as one batch
+    /// through metadata consensus with no client session. `reply` carries
+    /// `true` when the batch committed and applied. A dropped frame drops
+    /// `reply`, which reads as `false`. The reconciler keeps one batch in
+    /// flight and resends while the intent stays pending.
+    CompleteLifecycle {
+        request: metadata::stm::lifecycle::CompleteLifecycleRequest,
+        reporter: u16,
+        reply: Sender<bool>,
+    },
     /// A shard's partition reconciler asks shard 0 to complete a cooperative
     /// consumer-group revocation (the source drained the partition or it timed
     /// out). Server-originated: shard 0 proposes it through metadata consensus

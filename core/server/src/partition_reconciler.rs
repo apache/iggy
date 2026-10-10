@@ -174,7 +174,10 @@ use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleFence, RETIRED_PARTITION_OP};
+use metadata::stm::lifecycle::{
+    CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion, LifecycleFence,
+    LifecycleIntent, RETIRED_PARTITION_OP,
+};
 use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::{delete_partitions_from_disk, read_created_revision};
 use server_common::Message;
@@ -198,6 +201,11 @@ const GROUP_OFFSET_DELETES_PER_PASS: usize = 32;
 /// retries alone never surface a permanently failing partition).
 const ESCALATE_AFTER_ATTEMPTS: u32 = 10;
 
+/// A lifecycle fence that its partition has not installed goes out again after
+/// this long. An admitted fence commits on its own, so an earlier resend only
+/// meets a refusal.
+const LIFECYCLE_FENCE_RETRY_MICROS: u64 = 100_000;
+
 /// Doubles per attempt, clamped at `BACKOFF_MAX`.
 fn next_backoff(attempts: u32) -> Duration {
     let shift = attempts.saturating_sub(1).min(6);
@@ -216,6 +224,17 @@ struct FailureRecord {
 enum FailureCause {
     Add,
     Delete,
+}
+
+/// The lifecycle reports of one shard.
+///
+/// A completion batch waits for its metadata reply before the next one leaves,
+/// so a lifecycle costs one metadata op per batch and not one per partition.
+#[derive(Default)]
+pub struct LifecycleReports {
+    batch_in_flight: Rc<Cell<bool>>,
+    /// The last send of each fence in microseconds, by intent op and target.
+    fence_sends: RefCell<AHashMap<(u64, IggyNamespace), u64>>,
 }
 
 pub struct ReconcilerCtx {
@@ -242,6 +261,7 @@ pub struct ReconcilerCtx {
     group_offset_cleanup_inflight: Rc<RefCell<AHashSet<IggyNamespace>>>,
     group_offset_cleanup_completed: Rc<Cell<usize>>,
     last_group_offset_reconcile_epoch: Cell<u64>,
+    lifecycle_reports: LifecycleReports,
 }
 
 impl ReconcilerCtx {
@@ -274,6 +294,7 @@ impl ReconcilerCtx {
             group_offset_cleanup_inflight: Rc::new(RefCell::new(AHashSet::new())),
             group_offset_cleanup_completed: Rc::new(Cell::new(0)),
             last_group_offset_reconcile_epoch: Cell::new(0),
+            lifecycle_reports: LifecycleReports::default(),
         }
     }
 
@@ -423,11 +444,6 @@ struct PassCounters {
     /// acted on is not answered: aging answers requests, discarding also
     /// destroys prepares.
     parked_reclaimed: usize,
-    /// Lifecycle fences this replica has not reported complete. Counted so the
-    /// pass does not arm the fast-skip: a fence applies, or its primary changes,
-    /// without a `Streams::revision` bump, so an armed skip would strand the
-    /// fence submission or the completion report.
-    lifecycle_fences_pending: usize,
     /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
     /// so the pass does not arm the fast-skip: the pump's drop clears the
     /// tombstone and re-wakes us without bumping `Streams::revision`, so an
@@ -451,7 +467,6 @@ impl PassCounters {
             + self.cg_offsets_completed
             + self.cg_offsets_pending
             + self.trims_pending
-            + self.lifecycle_fences_pending
             + self.deferred
             + self.parked_reclaimed
             + self.already_staged
@@ -510,6 +525,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             shard = shard_id,
             revision, "reconciler fast-skip (no change)"
         );
+        report_lifecycles(ctx).await;
         return false;
     }
 
@@ -525,8 +541,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_parked_frames(ctx, &mut counters);
     reconcile_consumer_group_offsets(ctx, &mut counters);
     reconcile_segment_truncations(ctx, &mut counters);
-    counters.lifecycle_fences_pending += reconcile_partition_lifecycles(&ctx.shard);
-    counters.lifecycle_fences_pending += reconcile_retired_lifecycles(ctx).await;
+    report_lifecycles(ctx).await;
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -556,7 +571,6 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             already_staged = counters.already_staged,
             parked_reclaimed = counters.parked_reclaimed,
             trims_pending = counters.trims_pending,
-            lifecycle_fences_pending = counters.lifecycle_fences_pending,
             cg_offsets_pending = counters.cg_offsets_pending,
             "partition reconciler pass complete"
         );
@@ -568,6 +582,19 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     }
 
     true
+}
+
+/// Runs on every wake, apart from the full pass. A fence applies, or its
+/// primary changes, without a `Streams::revision` bump. Each report commit
+/// also wakes every shard, so a full pass per report grows a delete
+/// quadratically with its partitions.
+async fn report_lifecycles(ctx: &ReconcilerCtx) {
+    reconcile_partition_lifecycles(
+        &ctx.shard,
+        &ctx.lifecycle_reports,
+        IggyTimestamp::now().as_micros(),
+    );
+    reconcile_retired_lifecycles(ctx).await;
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1552,19 +1579,28 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounter
 }
 
 /// A report relays committed local evidence. Only the partition primary orders a fence.
-#[must_use]
-pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> usize
-where
+pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    reports: &LifecycleReports,
+    now: u64,
+) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
     MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let mut pending = 0;
-    let metadata = shard.plane.metadata();
+    let streams = shard.plane.metadata().mux_stm.streams();
+    if !streams.has_pending_lifecycles() {
+        reports.fence_sends.borrow_mut().clear();
+        return;
+    }
     let partitions = shard.plane.partitions();
-    for intent in metadata.mux_stm.streams().pending_lifecycles() {
+    let previous_sends = reports.fence_sends.take();
+    let mut fence_sends = AHashMap::with_capacity(previous_sends.len());
+    let mut batch = None;
+    for intent in streams.pending_lifecycles() {
+        let mut completions = Vec::new();
         for target in intent
             .partitions
             .iter()
@@ -1578,7 +1614,6 @@ where
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 continue;
             };
-            pending += 1;
             let installed = match target.fence {
                 LifecycleFence::History(transition) => {
                     partition.installed_history_transition(&transition)
@@ -1588,21 +1623,33 @@ where
                 }
             };
             if let Some(partition_op) = installed {
-                shard.forward_metadata_submit(MetadataSubmit::CompleteLifecycle(
-                    CompleteLifecycleRequest {
-                        metadata_op: intent.context.metadata_op,
-                        stream_id: intent.stream_id,
-                        topic_id: target.topic_id,
-                        partition_id: target.partition_id,
-                        partition_op,
-                    },
-                ));
-            } else {
-                submit_partition_fence(shard, namespace, target.fence);
+                completions.push(LifecycleCompletion {
+                    topic_id: target.topic_id,
+                    partition_id: target.partition_id,
+                    partition_op,
+                });
+                continue;
+            }
+            let key = (intent.context.metadata_op, namespace);
+            // A clock that went back counts as due.
+            let recent = previous_sends.get(&key).copied().filter(|&sent_at| {
+                now.checked_sub(sent_at)
+                    .is_some_and(|elapsed| elapsed < LIFECYCLE_FENCE_RETRY_MICROS)
+            });
+            let sent_at = recent
+                .or_else(|| submit_partition_fence(shard, namespace, target.fence).then_some(now));
+            if let Some(sent_at) = sent_at {
+                fence_sends.insert(key, sent_at);
             }
         }
+        if batch.is_none() {
+            batch = lifecycle_batch(&intent, completions);
+        }
     }
-    pending
+    *reports.fence_sends.borrow_mut() = fence_sends;
+    if let Some(request) = batch {
+        send_lifecycle_batch(shard, reports, request);
+    }
 }
 
 /// On a single-replica node, recovery fences a partition it cannot load, and
@@ -1610,13 +1657,12 @@ where
 /// topic, the operator's exit from that fence, would wait forever. The durable
 /// retirement fence keeps the incarnation offline, which is what the lifecycle
 /// fence would have proven.
-async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) -> usize {
-    if ctx.replica_count != 1 {
-        return 0;
+async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
+    if ctx.replica_count != 1 || ctx.lifecycle_reports.batch_in_flight.get() {
+        return;
     }
     let partitions = ctx.shard.plane.partitions();
     let system_path = ctx.config.get_system_path();
-    let mut pending = 0;
     for intent in ctx
         .shard
         .plane
@@ -1625,6 +1671,7 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) -> usize {
         .streams()
         .pending_lifecycles()
     {
+        let mut completions = Vec::new();
         for target in intent
             .partitions
             .iter()
@@ -1642,7 +1689,6 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) -> usize {
             if partitions.failed_revision(&namespace) != Some(incarnation) {
                 continue;
             }
-            pending += 1;
             if let Err(error) =
                 record_partition_retirement_fence(&system_path, namespace, incarnation).await
             {
@@ -1650,25 +1696,37 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) -> usize {
                     "lifecycle waits for a durable partition fence");
                 continue;
             }
-            ctx.shard
-                .forward_metadata_submit(MetadataSubmit::CompleteLifecycle(
-                    CompleteLifecycleRequest {
-                        metadata_op: intent.context.metadata_op,
-                        stream_id: intent.stream_id,
-                        topic_id: target.topic_id,
-                        partition_id: target.partition_id,
-                        partition_op: RETIRED_PARTITION_OP,
-                    },
-                ));
+            completions.push(LifecycleCompletion {
+                topic_id: target.topic_id,
+                partition_id: target.partition_id,
+                partition_op: RETIRED_PARTITION_OP,
+            });
+        }
+        if let Some(request) = lifecycle_batch(&intent, completions) {
+            send_lifecycle_batch(&ctx.shard, &ctx.lifecycle_reports, request);
+            return;
         }
     }
-    pending
 }
 
-fn submit_partition_fence<B, MJ, S, SB>(
+/// The ready completions of `intent` in batch order, at most
+/// [`LIFECYCLE_COMPLETIONS_MAX`] of them. The next batch takes the rest.
+fn lifecycle_batch(
+    intent: &LifecycleIntent,
+    mut completions: Vec<LifecycleCompletion>,
+) -> Option<CompleteLifecycleRequest> {
+    completions.sort_unstable_by_key(|completion| (completion.topic_id, completion.partition_id));
+    completions.truncate(LIFECYCLE_COMPLETIONS_MAX);
+    CompleteLifecycleRequest::new(intent.context.metadata_op, intent.stream_id, completions)
+}
+
+/// Relays `request` unless an earlier batch of this shard still waits for its
+/// reply. An applied batch wakes the reconciler for the next one. A refused or
+/// dropped batch waits for the next wake, so a lasting refusal cannot loop.
+fn send_lifecycle_batch<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    namespace: IggyNamespace,
-    fence: LifecycleFence,
+    reports: &LifecycleReports,
+    request: CompleteLifecycleRequest,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1676,17 +1734,50 @@ fn submit_partition_fence<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let Some(partition) = shard.plane.partitions().get_by_ns(&namespace) else {
+    if reports.batch_in_flight.replace(true) {
         return;
+    }
+    let (reply, receiver) = shard::channel::<bool>(1);
+    shard.forward_metadata_submit(MetadataSubmit::CompleteLifecycle {
+        request,
+        reporter: shard.id,
+        reply,
+    });
+    let batch_in_flight = Rc::clone(&reports.batch_in_flight);
+    let reporter = Rc::clone(shard);
+    shard.bus.clone().spawn(async move {
+        let applied = receiver.recv().await.unwrap_or(false);
+        batch_in_flight.set(false);
+        if applied {
+            reporter.dispatch_metadata_commit_tick();
+        }
+    });
+}
+
+/// `true` when the inbox of the partition took the fence.
+fn submit_partition_fence<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    fence: LifecycleFence,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(partition) = shard.plane.partitions().get_by_ns(&namespace) else {
+        return false;
     };
     let consensus = partition.consensus();
     if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
-        return;
+        return false;
     }
     if let LifecycleFence::Owner(installation) = fence
         && partition.consumer_group_owner_admitted(&installation)
     {
-        return;
+        return false;
     }
     let (operation, metadata_op, body) = match fence {
         LifecycleFence::History(transition) => (
@@ -1706,7 +1797,7 @@ fn submit_partition_fence<B, MJ, S, SB>(
         metadata_op: shard.plane.metadata().applied_frontier().get(),
     };
     let request = partition_maintenance_request(namespace, operation, &body, context, metadata_op);
-    let _ = shard.partition_submit(namespace, request);
+    shard.partition_submit(namespace, request).is_ok()
 }
 
 pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
@@ -1722,8 +1813,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, PassCounters, ReconcilerCtx, TargetPartition,
-        build_partition_fresh, current_revision, delete_partitions_from_disk,
+        FailureCause, FailureRecord, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
+        TargetPartition, build_partition_fresh, current_revision, delete_partitions_from_disk,
         fetch_partition_build_inputs, reconcile_additions, reconcile_consumer_group_offsets,
         reconcile_once, reconcile_partition_lifecycles, reconcile_pending_revocations,
     };
@@ -1751,6 +1842,7 @@ mod tests {
     use metadata::impls::metadata::IggySnapshot;
     use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateMachine;
+    use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession};
@@ -1758,6 +1850,7 @@ mod tests {
     use server_common::{Message, MessageBag};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, ShardIdentity};
+    use std::cell::Cell;
     use std::mem::size_of;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -2041,13 +2134,16 @@ mod tests {
                 mux.update(build_prepare(
                     intent.context.metadata_op,
                     Operation::CompleteLifecycle,
-                    &metadata::stm::lifecycle::CompleteLifecycleRequest {
-                        metadata_op: intent.context.metadata_op,
-                        stream_id: intent.stream_id,
-                        topic_id: target.topic_id,
-                        partition_id: target.partition_id,
-                        partition_op: 1,
-                    },
+                    &CompleteLifecycleRequest::new(
+                        intent.context.metadata_op,
+                        intent.stream_id,
+                        vec![LifecycleCompletion {
+                            topic_id: target.topic_id,
+                            partition_id: target.partition_id,
+                            partition_op: 1,
+                        }],
+                    )
+                    .unwrap(),
                 ))
                 .unwrap();
             }
@@ -2321,6 +2417,30 @@ mod tests {
             }
         }
         requests
+    }
+
+    /// A lifecycle batch and the sender that answers whether it applied.
+    type ReportedBatch = (CompleteLifecycleRequest, shard::Sender<bool>);
+
+    /// Take the fences and the lifecycle batches a test shard sent to itself.
+    fn drain_lifecycle_reports(
+        lanes: &TestLanes,
+    ) -> (Vec<Message<RoutedRequestHeader>>, Vec<ReportedBatch>) {
+        let mut fences = Vec::new();
+        let mut batches = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            match frame {
+                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::PartitionSubmit {
+                    request,
+                    ..
+                }) => fences.push(request),
+                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
+                    shard::MetadataSubmit::CompleteLifecycle { request, reply, .. },
+                )) => batches.push((request, reply)),
+                _ => {}
+            }
+        }
+        (fences, batches)
     }
 
     fn make_ctx(
@@ -3698,7 +3818,7 @@ mod tests {
         let completions: Vec<_> = std::iter::from_fn(|| lanes.main.try_recv().ok())
             .filter_map(|frame| match frame {
                 shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
-                    shard::MetadataSubmit::CompleteLifecycle(request),
+                    shard::MetadataSubmit::CompleteLifecycle { request, .. },
                 )) => Some(request),
                 _ => None,
             })
@@ -3709,8 +3829,12 @@ mod tests {
             "the fenced partition must complete the delete"
         );
         assert_eq!(
-            completions[0].partition_op,
-            metadata::stm::lifecycle::RETIRED_PARTITION_OP
+            completions[0].completions(),
+            [LifecycleCompletion {
+                topic_id: 0,
+                partition_id: 0,
+                partition_op: metadata::stm::lifecycle::RETIRED_PARTITION_OP,
+            }]
         );
         assert_eq!(
             crate::partition_helpers::partition_retirement_fence(&ctx.config.get_system_path(), ns)
@@ -4107,6 +4231,88 @@ mod tests {
         assert_eq!(counters.cg_offsets_submitted, 1);
     }
 
+    /// Each completion commit wakes every shard, so a shard reports its installed
+    /// fences in one batch and sends the next batch only after a reply.
+    #[compio::test]
+    async fn given_installed_history_fences_when_reconciling_should_report_one_batch_at_a_time() {
+        const PARTITIONS: u32 = 3;
+        const INSTALLED: usize = 2;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "batch-stream");
+        let assignments = (0..PARTITIONS)
+            .map(|id| assignment(id, u64::from(id) + 1))
+            .collect();
+        seed_topic(&mux, 2, 0, "batch-topic", assignments);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 64);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let wakes = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&wakes);
+        shard.set_metadata_tick_handler(Some(Rc::new(move || counter.set(counter.get() + 1))));
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::DeleteTopic, &delete))
+            .unwrap();
+        let reports = &ctx.lifecycle_reports;
+        let now = iggy_common::IggyTimestamp::now().as_micros();
+
+        reconcile_partition_lifecycles(&shard, reports, now);
+        let (fences, batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(fences.len(), PARTITIONS as usize);
+        assert!(batches.is_empty());
+        reconcile_partition_lifecycles(&shard, reports, now + LIFECYCLE_FENCE_RETRY_MICROS - 1);
+        let (resent, _) = drain_lifecycle_reports(&lanes);
+        assert!(
+            resent.is_empty(),
+            "a sent fence waits out its retry interval"
+        );
+
+        let mut expected = Vec::new();
+        for fence in fences.into_iter().take(INSTALLED) {
+            let namespace = IggyNamespace::from_raw(fence.header().group);
+            let partition_op = commit_partition_submit(&shard, namespace, fence).await;
+            expected.push(LifecycleCompletion {
+                topic_id: 0,
+                partition_id: u32::try_from(namespace.partition_id()).unwrap(),
+                partition_op,
+            });
+        }
+        let later = now + LIFECYCLE_FENCE_RETRY_MICROS;
+        reconcile_partition_lifecycles(&shard, reports, later);
+        let (resent, mut batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(resent.len(), 1, "the fence without an install is due again");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0.completions(), expected);
+
+        reconcile_partition_lifecycles(&shard, reports, later);
+        let (_, waiting) = drain_lifecycle_reports(&lanes);
+        assert!(waiting.is_empty(), "one batch waits for metadata at a time");
+
+        for (applied, expected_wakes) in [(false, 0), (true, 1)] {
+            let (_, reply) = batches.pop().unwrap();
+            reply.try_send(applied).unwrap();
+            compio::time::timeout(std::time::Duration::from_secs(5), async {
+                while reports.batch_in_flight.get() {
+                    compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(wakes.get(), expected_wakes, "applied={applied}");
+            reconcile_partition_lifecycles(&shard, reports, later);
+            (_, batches) = drain_lifecycle_reports(&lanes);
+            assert_eq!(batches.len(), 1, "a pending report goes out again");
+        }
+    }
+
     /// Shard 0 publishes metadata while a peer shard runs this pass, so the
     /// node-wide applied frontier can already cover a group removal that the
     /// catalog the pass captured does not show. The frontier is advanced before
@@ -4132,7 +4338,11 @@ mod tests {
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace).await;
-        assert_eq!(reconcile_partition_lifecycles(&shard), 1);
+        reconcile_partition_lifecycles(
+            &shard,
+            &ctx.lifecycle_reports,
+            iggy_common::IggyTimestamp::now().as_micros(),
+        );
         let mut fences = drain_partition_submits(&inbox);
         assert_eq!(
             fences.len(),
@@ -4154,13 +4364,16 @@ mod tests {
             .update(build_prepare(
                 DELETING_REMOVAL_OP,
                 Operation::CompleteLifecycle,
-                &metadata::stm::lifecycle::CompleteLifecycleRequest {
-                    metadata_op: DELETING_INTENT_OP,
-                    stream_id: 0,
-                    topic_id: 0,
-                    partition_id: 0,
-                    partition_op: fence_op,
-                },
+                &CompleteLifecycleRequest::new(
+                    DELETING_INTENT_OP,
+                    0,
+                    vec![LifecycleCompletion {
+                        topic_id: 0,
+                        partition_id: 0,
+                        partition_op: fence_op,
+                    }],
+                )
+                .unwrap(),
             ))
             .unwrap();
         let second = commit_owner_retirement(&ctx, &inbox, namespace).await;

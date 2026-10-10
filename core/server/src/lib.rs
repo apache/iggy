@@ -59,7 +59,9 @@ pub(crate) mod http;
 
 // background: per-shard maintenance loops.
 pub(crate) mod partition_reconciler;
-pub use partition_reconciler::{reconcile_partition_lifecycles, reconcile_pending_revocations};
+pub use partition_reconciler::{
+    LifecycleReports, reconcile_partition_lifecycles, reconcile_pending_revocations,
+};
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
