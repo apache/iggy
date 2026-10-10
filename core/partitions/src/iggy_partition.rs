@@ -265,6 +265,10 @@ where
     pub(crate) consumer_offset_capacities: [ConsumerOffsetCapacity; ConsumerKind::COUNT],
     pub(crate) observed_view: u32,
     offset_reservations_need_resync: Cell<bool>,
+    /// Set by a truncation and taken by the next log scan. The truncation can
+    /// drop the install the latch names, and a scan in an unchanged view keeps
+    /// the latch, so this flag makes that scan rebuild it.
+    truncated_since_scan: Cell<bool>,
     offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     /// Shared by the partitions of a shard. Set when a fence publishes, so the
@@ -875,6 +879,7 @@ where
                 .map(|kind| ConsumerOffsetCapacity::new(kind, crate::DEFAULT_CONSUMER_OFFSETS_MAX)),
             observed_view,
             offset_reservations_need_resync: Cell::new(false),
+            truncated_since_scan: Cell::new(false),
             offset_reservations_scan_state: None,
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             fence_published: Rc::default(),
@@ -4842,7 +4847,10 @@ where
             self.log.journal().inner.last_op(),
         );
         let uncertain = self.any_consumer_offset_capacity_uncertain();
-        if current_view == self.observed_view {
+        // After a truncation the latch rebuild below runs before the next
+        // admission reads the latch, even while uncertainty holds rescans.
+        let truncated = self.truncated_since_scan.take();
+        if current_view == self.observed_view && !truncated {
             if uncertain && !from_tick {
                 return;
             }
@@ -4860,6 +4868,11 @@ where
             self.pending_history_transition.set(None);
             self.discard_queued_auto_commits();
             self.mark_consumer_group_offsets_need_reconcile();
+        } else if truncated {
+            // A dropped install never publishes, so a latch on it refuses every
+            // later install. A truncation follows a view change, which empties
+            // the request queue, so the retained log alone re-arms the latch.
+            self.pending_owner_install.set(None);
         }
 
         let from_op = self.consensus.commit_min().saturating_add(1);
@@ -8584,6 +8597,7 @@ where
         self.pending_consumer_offset_commits
             .retain(|op, _| *op < from_op || *op <= commit_max);
         self.offset_reservations_need_resync.set(true);
+        self.truncated_since_scan.set(true);
         Ok(removed)
     }
 
@@ -21867,6 +21881,87 @@ mod tests {
                 .consumer_offset_capacity_for(ConsumerKind::Consumer)
                 .is_uncertain()
         );
+    }
+
+    /// A primary-elect defers dropping the suffix its new view discards. An
+    /// acknowledgement that arrives first scans the new view and latches an
+    /// install from that suffix. A latch left on the dropped install refuses
+    /// every later install until another view change. Uncertain accounting
+    /// holds rescans for the shard tick, and the rebuild does not wait for it.
+    #[compio::test]
+    async fn given_ack_scan_before_deferred_truncation_when_resynchronizing_should_release_discarded_install()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        let config = repair_config();
+        for uncertain in [false, true] {
+            let mut partition = test_partition();
+            let installed_op = install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+            let discarded = next_test_installation(&partition, GROUP_ID, CLIENT_ID + 1);
+            partition
+                .on_request(owner_install_request(&partition, &discarded), None)
+                .await;
+            let discarded_op = partition.consensus.sequencer().current_sequence();
+            assert_eq!(discarded_op, installed_op + 1);
+
+            partition.consensus.set_view(1);
+            let stale_ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                .transmute_header(|_, header: &mut PrepareOkHeader| {
+                    header.command = Command::PrepareOk;
+                    header.cluster = TEST_CLUSTER;
+                    header.group = partition.consensus.group();
+                    header.op = installed_op;
+                    header.operation = Operation::InstallConsumerGroupOwner;
+                    header.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                });
+            partition.on_ack(stale_ack, &config).await;
+            assert_eq!(partition.pending_owner_install.get(), Some(discarded));
+
+            partition.defer_view_truncation(discarded_op, Vec::new(), None);
+            assert!(matches!(
+                partition.resume_io(&config).await,
+                crate::PartitionIoStep::ViewApplied { .. }
+            ));
+            // The view starts on the retained head with an empty pipeline.
+            partition.consensus.sequencer().set_sequence(installed_op);
+            partition.consensus.with_pipeline_mut(LocalPipeline::clear);
+            if uncertain {
+                for capacity in &partition.consumer_offset_capacities {
+                    capacity.mark_uncertain();
+                }
+            }
+            partition.commit_journal(&config).await;
+            assert!(
+                !partition.consumer_group_owner_admitted(&discarded),
+                "uncertain {uncertain}: the latch still names the dropped install: {:?}",
+                partition.pending_owner_install.get()
+            );
+
+            let successor = InstallConsumerGroupOwnerRequest {
+                owner: ConsumerGroupOwner {
+                    client_id: CLIENT_ID + 2,
+                    session: 1,
+                    generation: discarded.owner.generation + 1,
+                },
+                metadata_op: discarded.metadata_op + 1,
+                ..discarded
+            };
+            partition
+                .on_request(owner_install_request(&partition, &successor), None)
+                .await;
+            assert_eq!(
+                partition.pending_owner_install.get(),
+                Some(successor),
+                "uncertain {uncertain}"
+            );
+            commit_log(&mut partition).await;
+            assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+            assert_eq!(
+                partition.consumer_group_owner(GROUP_ID),
+                Some(successor.owner),
+                "uncertain {uncertain}"
+            );
+        }
     }
 
     #[compio::test]
