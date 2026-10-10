@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-DURABLE-SESSIONS-3\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-NO-PURGE-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -1139,14 +1139,13 @@ fn make_metadata_commit_notifier(
 /// assignment-bearing variant. Kept as defense-in-depth against a future
 /// commit path that emits a bare op.
 ///
-/// "Partition-shape" is not only the partition SET: the purge and truncate
-/// ops leave the set intact but advance per-partition state (purge
-/// generation, delete watermark) that only the reconciler enforces on disk.
-/// Omitting them defers the on-disk effect to the periodic safety tick,
-/// stretching a purge's client-visible tail to a full
-/// `reconcile_periodic_interval`. `DeleteSegments` is absent by design: the
-/// leader rewrites it into `TruncatePartition` before journaling, so no
-/// commit ever carries it.
+/// "Partition-shape" is not only the partition SET: `TruncatePartition`
+/// leaves the set intact but advances the per-partition delete watermark,
+/// which only the reconciler enforces on disk. Omitting it defers the on-disk
+/// effect to the periodic safety tick, stretching a segment delete's
+/// client-visible tail to a full `reconcile_periodic_interval`.
+/// `DeleteSegments` is absent by design: the leader rewrites it into
+/// `TruncatePartition` before journaling, so no commit ever carries it.
 const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
     matches!(
         op,
@@ -1157,8 +1156,6 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
             | Operation::DeleteTopic
             | Operation::DeleteStream
             | Operation::DeletePartitions
-            | Operation::PurgeStream
-            | Operation::PurgeTopic
             | Operation::TruncatePartition
     )
 }
@@ -1219,6 +1216,7 @@ mod tests {
         assert!(!marker.exists());
         for format in [
             b"old format\n".as_slice(),
+            b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1235,21 +1233,15 @@ mod tests {
 
     #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {
-        // These commit without touching the partition set, so nothing else
-        // signals the reconciler: `reconcile_partition_purges` and
-        // `reconcile_segment_truncations` are the only code that turns them
-        // into on-disk effect, and they run only when a pass runs. Dropping
-        // one from the filter silently downgrades it to the periodic tick.
-        for op in [
-            Operation::PurgeStream,
-            Operation::PurgeTopic,
-            Operation::TruncatePartition,
-        ] {
-            assert!(
-                operation_triggers_partition_reconcile(op),
-                "{op:?} is enforced by the reconciler and must wake it on commit"
-            );
-        }
+        // `TruncatePartition` commits without touching the partition set, so
+        // nothing else signals the reconciler: `reconcile_segment_truncations`
+        // is the only code that turns it into on-disk effect, and it runs only
+        // when a pass runs. Dropping it from the filter silently downgrades it
+        // to the periodic tick.
+        assert!(
+            operation_triggers_partition_reconcile(Operation::TruncatePartition),
+            "TruncatePartition is enforced by the reconciler and must wake it on commit"
+        );
         assert!(
             !operation_triggers_partition_reconcile(Operation::CreateUser),
             "ops with no partition-shape effect must stay off the broadcast"
