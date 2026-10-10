@@ -61,6 +61,19 @@ public static class IggyClientFactory
         };
     }
 
+    /// <summary>
+    ///     Creates a TCP client from a connection string such as <c>iggy://iggy:iggy@127.0.0.1:8090</c>. See
+    ///     <see cref="IggyClientConfigurator.FromConnectionString" /> for the format and the supported options.
+    /// </summary>
+    /// <param name="connectionString">The connection string.</param>
+    /// <returns>An unconnected <see cref="IIggyClient" /> that signs in with the connection string credentials.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="connectionString" /> is null.</exception>
+    /// <exception cref="FormatException">Thrown when the connection string is invalid.</exception>
+    public static IIggyClient CreateClient(string connectionString)
+    {
+        return CreateClient(IggyClientConfigurator.FromConnectionString(connectionString));
+    }
+
     private static void Validate(IggyClientConfigurator options)
     {
         if (options.Protocol == Protocol.Tcp && options.MaxResponseFrameSize < VsrHeader.HEADER_SIZE)
@@ -81,10 +94,10 @@ public static class IggyClientFactory
                 options.SendBufferSize, "SendBufferSize must be greater than 0 when set.");
         }
 
-        // The bounds PeriodicTimer accepts; anything outside them would fault the heartbeat task at start
-        // instead of failing the caller here.
-        if (options.HeartbeatInterval < TimeSpan.FromMilliseconds(1) ||
-            options.HeartbeatInterval > TimeSpan.FromMilliseconds(uint.MaxValue - 1))
+        // Outside these bounds PeriodicTimer would fault the heartbeat task at start instead of failing the
+        // caller here.
+        if (options.HeartbeatInterval < IggyClientConfigurator.MinInterval ||
+            options.HeartbeatInterval > IggyClientConfigurator.MaxInterval)
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.HeartbeatInterval,
                 "HeartbeatInterval must be between 1 millisecond and about 49 days.");
