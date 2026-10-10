@@ -15,14 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
+import urllib.request
+from collections.abc import Callable
+
 import pytest
 
 from apache_iggy import (
     GlobalPermissions,
+    HttpConfig,
+    IdentityInfo,
     IggyClient,
     Permissions,
+    QuicConfig,
+    QuicReconnectionConfig,
     UserInfoDetails,
     UserStatus,
+    WebSocketConfig,
+    WebSocketReconnectionConfig,
 )
 
 from .utils import (
@@ -30,11 +40,56 @@ from .utils import (
     MAX_USERNAME_BYTES,
     MIN_PASSWORD_BYTES,
     MIN_USERNAME_BYTES,
+    get_http_server_config,
+    get_quic_server_config,
     get_server_config,
+    get_websocket_server_config,
     unique_credentials,
     wait_for_ping,
     wait_for_server,
 )
+
+# IggyExpiry::NeverExpire serializes as u64::MAX.
+NEVER_EXPIRE = 18446744073709551615
+
+
+def _create_personal_access_token(
+    api: str,
+    username: str,
+    password: str,
+    name: str,
+    expiry: int,
+) -> tuple[str, str]:
+    login_req = urllib.request.Request(  # noqa: S310
+        f"{api}/users/login",
+        data=json.dumps({"username": username, "password": password}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
+        jwt = json.loads(response.read())["access_token"]["token"]
+    create_req = urllib.request.Request(  # noqa: S310
+        f"{api}/personal-access-tokens",
+        data=json.dumps({"name": name, "expiry": expiry}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {jwt}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(create_req, timeout=10) as response:  # noqa: S310
+        personal_access_token = json.loads(response.read())["token"]
+    return jwt, personal_access_token
+
+
+def _delete_personal_access_token(api: str, jwt: str, name: str) -> None:
+    delete_req = urllib.request.Request(  # noqa: S310
+        f"{api}/personal-access-tokens/{name}",
+        headers={"Authorization": f"Bearer {jwt}"},
+        method="DELETE",
+    )
+    with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
+        pass
 
 
 class TestCreateUser:
@@ -114,7 +169,10 @@ class TestCreateUser:
         client = IggyClient(f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
-        await client.login_user(username, password)
+        identity = await client.login_user(username, password)
+        assert isinstance(identity, IdentityInfo)
+        assert identity.user_id == created.id
+        assert identity.access_token is None
 
         await iggy_client.delete_user(created.id)
 
@@ -206,6 +264,221 @@ class TestCreateUser:
         await client.login_user(username, password)
 
         await iggy_client.delete_user(created.id)
+
+
+class TestLoginIdentity:
+    """Test login returns IdentityInfo with transport-specific access_token."""
+
+    @pytest.mark.parametrize(
+        "create_client",
+        [
+            lambda: IggyClient(f"{get_server_config()[0]}:{get_server_config()[1]}"),
+            lambda: IggyClient(
+                QuicConfig(
+                    server_address=(
+                        f"{get_quic_server_config()[0]}:{get_quic_server_config()[1]}"
+                    ),
+                    reconnection=QuicReconnectionConfig(enabled=False),
+                )
+            ),
+            lambda: IggyClient(
+                WebSocketConfig(
+                    server_address=(
+                        f"{get_websocket_server_config()[0]}:"
+                        f"{get_websocket_server_config()[1]}"
+                    ),
+                    reconnection=WebSocketReconnectionConfig(enabled=False),
+                )
+            ),
+        ],
+        ids=["tcp", "quic", "websocket"],
+    )
+    @pytest.mark.asyncio
+    async def test_binary_login_returns_identity_without_access_token(
+        self, iggy_client: IggyClient, create_client: Callable[[], IggyClient]
+    ):
+        """Test binary transports return user_id and no HTTP access token."""
+        root = await iggy_client.get_user("iggy")
+        assert root is not None
+
+        client = create_client()
+        await client.connect()
+        await wait_for_ping(client)
+        identity = await client.login_user("iggy", "iggy")
+
+        assert isinstance(identity, IdentityInfo)
+        assert identity.user_id == root.id
+        assert identity.access_token is None
+
+    @pytest.mark.asyncio
+    async def test_http_login_returns_access_token(self, iggy_client: IggyClient):
+        """Test HTTP login returns user_id and a session TokenInfo."""
+        host, port = get_http_server_config()
+        client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
+        await client.connect()
+        await wait_for_ping(client)
+
+        identity = await client.login_user("iggy", "iggy")
+        root = await iggy_client.get_user("iggy")
+        assert root is not None
+
+        assert isinstance(identity, IdentityInfo)
+        assert identity.user_id == root.id
+        assert identity.access_token is not None
+        assert identity.access_token.token
+        assert identity.access_token.expiry > 0
+        assert identity.access_token.token not in repr(identity)
+        assert identity.access_token.token not in repr(identity.access_token)
+
+    @pytest.mark.asyncio
+    async def test_login_with_personal_access_token(self, unique_name):
+        """Test PAT login using a token created directly through HTTP."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        login_req = urllib.request.Request(  # noqa: S310
+            f"{api}/users/login",
+            data=json.dumps({"username": "iggy", "password": "iggy"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
+            jwt = json.loads(response.read())["access_token"]["token"]
+        create_req = urllib.request.Request(  # noqa: S310
+            f"{api}/personal-access-tokens",
+            data=json.dumps({"name": name, "expiry": NEVER_EXPIRE}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {jwt}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(create_req, timeout=10) as response:  # noqa: S310
+            personal_access_token = json.loads(response.read())["token"]
+
+        try:
+            host, port = get_server_config()
+            client = IggyClient(f"{host}:{port}")
+            await client.connect()
+            identity = await client.login_with_personal_access_token(
+                personal_access_token
+            )
+
+            assert isinstance(identity, IdentityInfo)
+            assert identity.access_token is None
+            user = await client.get_user("iggy")
+            assert user is not None
+            assert identity.user_id == user.id
+            assert personal_access_token not in repr(identity)
+        finally:
+            delete_req = urllib.request.Request(  # noqa: S310
+                f"{api}/personal-access-tokens/{name}",
+                headers={"Authorization": f"Bearer {jwt}"},
+                method="DELETE",
+            )
+            with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
+                pass
+
+    @pytest.mark.parametrize(
+        "token",
+        ["unknown-personal-access-token", "%%%garbled-token%%%"],
+        ids=["unknown", "garbled"],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_personal_access_token_fails(self, token):
+        """Test unknown and garbled PAT values are rejected."""
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        with pytest.raises(RuntimeError):
+            await client.login_with_personal_access_token(token)
+
+    @pytest.mark.asyncio
+    async def test_expired_personal_access_token_fails(self, unique_name):
+        """Test an expired PAT cannot authenticate."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt, personal_access_token = _create_personal_access_token(
+            api, "iggy", "iggy", name, 1
+        )
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        try:
+            with pytest.raises(RuntimeError):
+                await client.login_with_personal_access_token(personal_access_token)
+        finally:
+            _delete_personal_access_token(api, jwt, name)
+
+    @pytest.mark.asyncio
+    async def test_deleted_personal_access_token_fails(self, unique_name):
+        """Test a deleted PAT cannot authenticate."""
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        jwt, personal_access_token = _create_personal_access_token(
+            api, "iggy", "iggy", name, NEVER_EXPIRE
+        )
+        _delete_personal_access_token(api, jwt, name)
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        with pytest.raises(RuntimeError):
+            await client.login_with_personal_access_token(personal_access_token)
+
+    @pytest.mark.asyncio
+    async def test_inactive_pat_owner_cannot_login(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a PAT cannot authenticate after its owner becomes inactive."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        _, personal_access_token = _create_personal_access_token(
+            api, username, password, name, NEVER_EXPIRE
+        )
+
+        await iggy_client.update_user(created.id, status=UserStatus.Inactive)
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        try:
+            with pytest.raises(RuntimeError):
+                await client.login_with_personal_access_token(personal_access_token)
+        finally:
+            await iggy_client.update_user(created.id, status=UserStatus.Active)
+            await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_deleted_pat_owner_cannot_login(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a PAT cannot authenticate after its owner is deleted."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+        name = unique_name(min_bytes=16, max_bytes=30)
+        http_host, http_port = get_http_server_config()
+        api = f"http://{http_host}:{http_port}"
+        _, personal_access_token = _create_personal_access_token(
+            api, username, password, name, NEVER_EXPIRE
+        )
+
+        await iggy_client.delete_user(created.id)
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        with pytest.raises(RuntimeError):
+            await client.login_with_personal_access_token(personal_access_token)
 
 
 class TestGetUser:
