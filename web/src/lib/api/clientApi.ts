@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { env } from '$env/dynamic/public';
-import { authStore } from '$lib/auth/authStore.svelte';
-import { typedRoute } from '$lib/types/appRoutes';
+import { PUBLIC_IGGY_API_URL } from '$app/env/public';
+import { authStore } from '#lib/auth/authStore.svelte.js';
+import { typedRoute } from '#lib/types/appRoutes.js';
 import { error } from '@sveltejs/kit';
 import { getJson } from './getJson';
 
@@ -43,7 +43,7 @@ export async function clientApi<T = unknown>(args: ApiRequest): Promise<T> {
   }
 
   // Use PUBLIC_IGGY_API_URL if set, otherwise use relative path (for embedded mode)
-  const baseUrl = env.PUBLIC_IGGY_API_URL || '';
+  const baseUrl = PUBLIC_IGGY_API_URL || '';
   let fullUrl = `${baseUrl}${path}`;
 
   if (queryParams) {
@@ -68,11 +68,11 @@ export async function clientApi<T = unknown>(args: ApiRequest): Promise<T> {
     if (browser) {
       authStore.logout();
     }
-    error(401, { message: 'Unauthorized' });
+    error(401, 'Unauthorized');
   }
 
   if (response.status === 404) {
-    error(404, { message: 'Not Found' });
+    error(404, 'Not Found');
   }
 
   if (response.status === 400) {
@@ -80,7 +80,7 @@ export async function clientApi<T = unknown>(args: ApiRequest): Promise<T> {
     throw { status: 400, data };
   }
 
-  error(500, { message: 'Internal server error' });
+  error(500, 'Internal server error');
 }
 
 /**
@@ -95,7 +95,7 @@ export async function clientApiSafe<T = unknown>(
   } catch (e: any) {
     if (e?.status === 401 || e?.status === 403) {
       if (browser) {
-        goto(resolve(typedRoute('/auth/sign-in')));
+        goto(resolve(typedRoute('auth/sign-in')));
       }
       return { data: null, error: 'Unauthorized' };
     }

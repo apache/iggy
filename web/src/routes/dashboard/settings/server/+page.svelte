@@ -18,11 +18,11 @@ under the License.
 -->
 
 <script lang="ts">
-  import Button from '$lib/components/Button.svelte';
-  import SettingsLayout from '$lib/components/Layouts/SettingsLayout.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import SettingsLayout from '#lib/components/Layouts/SettingsLayout.svelte';
 
-  import RangeInput from '$lib/components/RangeInput.svelte';
-  import Toggler from '$lib/components/Toggler.svelte';
+  import RangeInput from '#lib/components/RangeInput.svelte';
+  import Toggler from '#lib/components/Toggler.svelte';
 
   interface Props {
     data: any;
