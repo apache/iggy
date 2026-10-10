@@ -33,6 +33,7 @@ systemd = ["dep:sd-notify", "dep:tokio-util"]
 [dependencies]
 axum = { workspace = true }
 axum-server = { workspace = true }
+clap = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
 dirs = { workspace = true }

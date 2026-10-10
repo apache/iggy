@@ -46,7 +46,7 @@ pub mod test_support;
 use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::dispatch::failure::{
     FrameChannel, send_deny_reply, send_eviction, send_host_frame, send_pre_consensus_deny,
-    send_unbound_deny_reply,
+    send_unbound_deny_reply, send_undeclared_operation_deny,
 };
 use crate::dispatch::partition::{dispatch_partition_request, handle_delete_segments_request};
 use crate::dispatch::reads::handle_non_replicated_request;
@@ -68,7 +68,7 @@ use iggy_binary_protocol::codes::{
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
-    EvictionReason, GenericHeader, Operation, RequestHeader, RoutedRequestHeader,
+    EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader, RoutedRequestHeader,
 };
 use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
@@ -78,6 +78,7 @@ use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::mem::offset_of;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -168,10 +169,12 @@ fn enqueue_client_request<B, MJ, S, SB>(
 /// [`MAX_QUEUED_CLIENT_REQUESTS`] with the retryable transient denial.
 ///
 /// Spawned rather than awaited: the enqueue path is sync (it runs straight off
-/// frame arrival) and the reply goes out on the bus. Two shapes are dropped
-/// rather than answered: a frame whose header will not even cast, exactly as
-/// the drain loop drops it, and a frame that arrives before the shard is
-/// built, which leaves nothing to render a reply from.
+/// frame arrival) and the reply goes out on the bus. The header decodes as in
+/// the drain loop: an undeclared operation byte gets the `InvalidCommand` deny
+/// instead of the transient one, because no retry of that frame can succeed,
+/// and any other header that will not cast is dropped. A frame that arrives
+/// before the shard is built is dropped too: nothing exists yet to render a
+/// reply from.
 fn deny_overflowing_client_request<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     transport_client_id: u128,
@@ -195,22 +198,20 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
         return;
     };
     shard.metrics().record_client_request_denied_queue_full();
-    let Ok(request) = message.try_into_typed::<RequestHeader>() else {
-        warn!(
-            transport_client_id,
-            "dropping over-queue client request with invalid header"
-        );
-        return;
-    };
-    let request = request.into_routed();
-    debug!(
-        transport_client_id,
-        operation = ?request.header().operation,
-        queued = MAX_QUEUED_CLIENT_REQUESTS,
-        "denying client request retryable: this connection's request queue is full"
-    );
     let bus = shard.bus.clone();
     bus.spawn(async move {
+        let Some(request) =
+            decode_or_deny_client_request(&shard, transport_client_id, message).await
+        else {
+            return;
+        };
+        let request = request.into_routed();
+        debug!(
+            transport_client_id,
+            operation = ?request.header().operation,
+            queued = MAX_QUEUED_CLIENT_REQUESTS,
+            "denying client request retryable: this connection's request queue is full"
+        );
         send_deny_reply(
             &shard,
             transport_client_id,
@@ -382,6 +383,52 @@ fn non_replicated_code(header: &RoutedRequestHeader) -> u32 {
     u32::from_le_bytes(header.reserved[..4].try_into().unwrap())
 }
 
+/// A copy of the header of a client frame whose operation byte this build
+/// does not declare, for the deny to patch and echo. A declared byte costs
+/// one read and no copy.
+fn undeclared_operation_header(message: &Message<GenericHeader>) -> Option<[u8; HEADER_SIZE]> {
+    let header = message.as_slice().get(..HEADER_SIZE)?;
+    if Operation::is_known_code(header[offset_of!(RequestHeader, operation)]) {
+        return None;
+    }
+    header.try_into().ok()
+}
+
+/// Type a client frame as a request. A frame whose operation byte this build
+/// does not declare gets the `InvalidCommand` deny, and any other header that
+/// will not cast is dropped with a warning: both return `None`. Probing the
+/// byte first skips the cast's command check, which is safe because the
+/// transport admits only `Request` frames.
+#[allow(clippy::future_not_send)]
+async fn decode_or_deny_client_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    message: Message<GenericHeader>,
+) -> Option<Message<RequestHeader>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Some(request_header) = undeclared_operation_header(&message) {
+        send_undeclared_operation_deny(shard, transport_client_id, request_header).await;
+        return None;
+    }
+    match message.try_into_typed::<RequestHeader>() {
+        Ok(request) => Some(request),
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "dropping client request with invalid header"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -397,16 +444,9 @@ async fn handle_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let request = match message.try_into_typed::<RequestHeader>() {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                transport_client_id,
-                error = %error,
-                "dropping client request with invalid header"
-            );
-            return;
-        }
+    let Some(request) = decode_or_deny_client_request(shard, transport_client_id, message).await
+    else {
+        return;
     };
     // Promote to the server-internal routed shape at the boundary: the
     // client wire carries no group (it is derived -- plane from `operation`,
@@ -830,8 +870,8 @@ mod tests {
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply, request_message,
-        test_shard,
+        FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, prepare_message,
+        register_reply, request_message, test_shard,
     };
     use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
@@ -1849,6 +1889,60 @@ mod tests {
             assert_eq!(*client, TRANSPORT);
             assert_eq!(frame_command(frame), Command::Reply as u8);
             assert_eq!(reply_status(frame), 0, "a served ping succeeds");
+        }
+    }
+
+    /// The two frames differ only in the operation byte. A declared one gets
+    /// the retryable deny, and an undeclared one gets `InvalidCommand`,
+    /// because no retry of that frame can succeed.
+    #[compio::test]
+    async fn overflowing_request_gets_transient_deny_unless_its_operation_is_undeclared() {
+        const TRANSPORT: u128 = 99;
+        assert!(
+            !Operation::is_known_code(UNDECLARED_OPERATION),
+            "test needs an operation byte this build does not declare"
+        );
+        for (operation, status) in [
+            (
+                Operation::NonReplicated as u8,
+                IggyError::TransientNotAccepted.as_code(),
+            ),
+            (UNDECLARED_OPERATION, IggyError::InvalidCommand.as_code()),
+        ] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let shard_handle = unset_shard_handle();
+            *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+            let mut frame = non_replicated_request(TRANSPORT, PING_CODE);
+            frame.as_mut_slice()[offset_of!(RequestHeader, operation)] = operation;
+
+            deny_overflowing_client_request(&shard_handle, TRANSPORT, frame);
+            for _ in 0..500 {
+                if !bus.client_replies.borrow().is_empty() {
+                    break;
+                }
+                run_spawned_tasks().await;
+            }
+
+            let replies = bus.client_replies.borrow();
+            assert_eq!(
+                replies.len(),
+                1,
+                "operation {operation:#04x}: an over-queue request must be answered"
+            );
+            let (client, reply) = &replies[0];
+            assert_eq!(*client, TRANSPORT);
+            assert_eq!(frame_command(reply), Command::Reply as u8);
+            assert_eq!(
+                reply_status(reply),
+                status,
+                "operation {operation:#04x}: wrong deny status"
+            );
+            assert_eq!(
+                reply[offset_of!(ReplyHeader, operation)],
+                operation,
+                "the deny must echo the request's own operation byte"
+            );
         }
     }
 
