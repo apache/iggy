@@ -27,6 +27,102 @@ use serial_test::parallel;
 const BENCHMARK_DATA_BYTES: u64 = 5_000_000;
 const REPORT_TEST_DATA: &str = "1MiB";
 const TEST_SECRET: &str = "sensitive-benchmark-test-value";
+const WARMUP_MESSAGES_PER_BATCH: &str = "32";
+const WARMUP_MESSAGE_SIZE: &str = "128";
+const BENCH_STREAM: &str = "bench-stream-1";
+const BENCH_TOPIC: &str = "topic-1";
+
+#[tokio::test]
+#[parallel]
+async fn given_populated_topic_when_warming_consumer_group_should_replay_without_refused_deletes() {
+    for high_level in [false, true] {
+        let mut harness = TestHarness::builder()
+            .cluster_nodes(1)
+            .server(TestServerConfig::default())
+            .build()
+            .unwrap();
+        harness.start().await.unwrap();
+        let server_address = harness.server().raw_tcp_addr().unwrap();
+        #[allow(deprecated)]
+        let command = Command::cargo_bin("iggy-bench").unwrap();
+        assert_cmd::Command::from_std(command)
+            .args([
+                "--total-data",
+                REPORT_TEST_DATA,
+                "--messages-per-batch",
+                WARMUP_MESSAGES_PER_BATCH,
+                "--message-size",
+                WARMUP_MESSAGE_SIZE,
+                "--reuse-streams",
+                "balanced-producer",
+                "--producers",
+                "1",
+                "--streams",
+                "1",
+                "--partitions",
+                "4",
+                "tcp",
+                "--server-address",
+                &server_address,
+            ])
+            .timeout(BENCH_WAIT_TIMEOUT)
+            .assert()
+            .success();
+
+        // The reset stores offset 0 on every partition. The server refuses that store on an
+        // empty partition.
+        harness
+            .root_client()
+            .await
+            .unwrap()
+            .create_partitions(
+                &Identifier::named(BENCH_STREAM).unwrap(),
+                &Identifier::named(BENCH_TOPIC).unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        #[allow(deprecated)]
+        let command = Command::cargo_bin("iggy-bench").unwrap();
+        let mut command = assert_cmd::Command::from_std(command);
+        command.args([
+            "--total-data",
+            REPORT_TEST_DATA,
+            "--messages-per-batch",
+            WARMUP_MESSAGES_PER_BATCH,
+            "--warmup-time",
+            "1s",
+            "--reuse-streams",
+        ]);
+        if high_level {
+            command.arg("--high-level-api");
+        }
+        command.args([
+            "balanced-consumer-group",
+            "--consumers",
+            "2",
+            "--consumer-groups",
+            "1",
+            "--streams",
+            "1",
+            "tcp",
+            "--server-address",
+            &server_address,
+        ]);
+        command.timeout(BENCH_WAIT_TIMEOUT).assert().success();
+        let (stdout, stderr) = harness.server().collect_logs();
+        for log in [stdout, stderr] {
+            assert!(
+                !log.lines()
+                    .any(|line| (line.contains("DeleteConsumerOffset")
+                        || line.contains("delete_consumer_offset"))
+                        && line.contains("WARN")),
+                "high_level={high_level}: {log}"
+            );
+        }
+    }
+}
 
 #[tokio::test]
 #[parallel]

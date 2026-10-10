@@ -112,12 +112,20 @@ where
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.producer_config.warmup_time.get_duration();
 
+            // Warmup sends under the same limiter as the measured phase, so the phase boundary
+            // is a step rather than a burst far above the rate being measured.
             while Instant::now() < warmup_end {
-                let _ = self.producer.produce_batch(&mut batch_generator).await;
-                let _ = self.consumer.consume_batch().await;
+                if let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
+                    && let Some(limiter) = &rate_limiter
+                {
+                    limiter.wait_until_necessary(batch.user_data_bytes).await;
+                }
+                self.consumer.consume_batch().await?;
             }
         }
 
+        // No offset reset here, unlike the standalone consumer: this kind reports the age of
+        // the message, so re-reading warmup messages would report the whole warmup as latency.
         self.log_setup_info();
         let max_capacity = self
             .send_finish_condition
@@ -125,7 +133,7 @@ where
             .max(self.poll_finish_condition.max_capacity());
         let mut records = Vec::with_capacity(max_capacity);
 
-        let mut rl_value = 0;
+        let mut uncharged_send_bytes = 0;
         let mut sent_user_bytes = 0;
         let mut sent_total_bytes = 0;
         let mut sent_messages = 0;
@@ -151,7 +159,7 @@ where
                 && (!require_reply || !awaiting_reply)
                 && let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
             {
-                rl_value += batch.user_data_bytes;
+                uncharged_send_bytes += batch.user_data_bytes;
                 sent_user_bytes += batch.user_data_bytes;
                 sent_total_bytes += batch.total_bytes;
                 sent_messages += u64::from(batch.messages);
@@ -179,7 +187,6 @@ where
                 && !self.poll_finish_condition.is_done()
                 && let Some(batch) = self.consumer.consume_batch().await?
             {
-                rl_value += batch.user_data_bytes;
                 recv_user_bytes += batch.user_data_bytes;
                 recv_total_bytes += batch.total_bytes;
                 recv_messages += u64::from(batch.messages);
@@ -197,16 +204,22 @@ where
                     total_bytes: sent_total_bytes + recv_total_bytes,
                 });
 
-                if let Some(limiter) = &rate_limiter {
-                    limiter.wait_until_necessary(rl_value).await;
-                    rl_value = 0;
-                }
-
                 self.poll_finish_condition
                     .account_and_check(batch.user_data_bytes);
                 if require_reply {
                     awaiting_reply = false;
                 }
+            }
+
+            // Only sends are charged: a poll can only return what a send already paid for.
+            // The wait comes once the actor may send again, so it never sits between a send
+            // and the poll that reads it back, where it would be recorded as latency.
+            if uncharged_send_bytes > 0
+                && (!require_reply || !awaiting_reply)
+                && let Some(limiter) = &rate_limiter
+            {
+                limiter.wait_until_necessary(uncharged_send_bytes).await;
+                uncharged_send_bytes = 0;
             }
         }
 
