@@ -331,6 +331,26 @@ impl SnapshotFile {
 /// `commit_min < commit_max` every tick.
 const COMMIT_WALK_OPS_MAX: usize = 64;
 
+/// Why one [`IggyMetadata::commit_journal`] call stopped walking.
+///
+/// Only [`Self::BodyMissing`] names an op whose header the journal holds but
+/// cannot serve. A [`Self::PipelineHead`] op is committed from the journal by
+/// the pipeline driver (`commit_committable_prefix`, via `on_ack` or
+/// `resume_stranded_commits`), so its prepare must stay resident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitWalkStop {
+    /// `commit_min` reached `commit_max`.
+    CaughtUp,
+    /// The per-call walk cap was reached; the next call resumes.
+    WalkCap,
+    /// The next op is the pipeline head; the pipeline driver commits it.
+    PipelineHead,
+    /// No header is resident at `op`.
+    HeaderMissing { op: u64 },
+    /// The header at `op` is resident but the WAL cannot produce its body.
+    BodyMissing { op: u64 },
+}
+
 /// Integrity framing is mandatory because the superblock can lag snapshot publication.
 const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
 
@@ -4109,9 +4129,12 @@ where
     ///    `is_caught_up_primary` on a higher "applied frontier".
     ///
     /// `is_caught_up_primary_gate_states` pins clauses, NOT intra-loop window.
+    ///
+    /// Returns why the walk stopped; callers that only drive the walk ignore
+    /// it.
     #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
     #[allow(clippy::future_not_send)]
-    pub async fn commit_journal(&self) {
+    pub async fn commit_journal(&self) -> CommitWalkStop {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -4122,7 +4145,7 @@ where
                     "commit_journal: stopping at op={} after {applied} ops; resuming next tick",
                     consensus.commit_min()
                 );
-                break;
+                return CommitWalkStop::WalkCap;
             }
             applied += 1;
             let op = consensus.commit_min() + 1;
@@ -4142,7 +4165,7 @@ where
                 .pipeline_head_header()
                 .is_some_and(|head| head.op == op)
             {
-                break;
+                return CommitWalkStop::PipelineHead;
             }
 
             let Some(header) = journal.handle().header(op as usize) else {
@@ -4153,13 +4176,13 @@ where
                 // StartView adoption, or by `tick_metadata`'s gap detector,
                 // which is the only one of those a live drop under sustained
                 // traffic reaches.
-                break;
+                return CommitWalkStop::HeaderMissing { op };
             };
             let header = *header;
 
             let Some(prepare) = journal.handle().entry(&header).await else {
                 warn!("commit_journal: prepare body missing for op={op}, stopping");
-                break;
+                return CommitWalkStop::BodyMissing { op };
             };
 
             // SM apply + client_table mutation BEFORE `advance_commit_min`
@@ -4176,6 +4199,7 @@ where
             self.advance_applied_frontier(op);
             debug!("commit_journal: committed op={op}");
         }
+        CommitWalkStop::CaughtUp
     }
 
     fn observe_prepare_runtime_state(&self, prepare: &Message<PrepareHeader>) {
@@ -6207,7 +6231,7 @@ mod tests {
         // committed by the group and resident here, none of it walked.
         consensus.advance_commit_max(OPS);
 
-        md.commit_journal().await;
+        assert_eq!(md.commit_journal().await, CommitWalkStop::WalkCap);
         assert_eq!(
             consensus.commit_min(),
             CAP,
@@ -6215,12 +6239,155 @@ mod tests {
              as the resident run is, however long that is"
         );
 
-        md.commit_journal().await;
+        assert_eq!(md.commit_journal().await, CommitWalkStop::CaughtUp);
         assert_eq!(
             consensus.commit_min(),
             OPS,
             "the walk did not resume where it stopped, so `commit_min` is pinned \
              below `commit_max` with no other re-driver"
+        );
+    }
+
+    /// The walk leaves the pipeline head to `on_ack` and says so.
+    ///
+    /// A primary-elect inherits a committed head at `commit_min + 1` and the
+    /// walk moves nothing over it. `tick_metadata`'s stall detector truncates
+    /// on `BodyMissing` only, so this has to come back as `PipelineHead` with
+    /// the prepare still journaled for the pipeline driver to read.
+    #[compio::test]
+    async fn given_committed_pipeline_head_at_next_op_when_walking_should_stop_as_pipeline_head() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        // Committed with no driver to apply it: the inherited-head shape.
+        consensus.advance_commit_max(1);
+
+        assert_eq!(md.commit_journal().await, CommitWalkStop::PipelineHead);
+        assert_eq!(
+            consensus.commit_min(),
+            0,
+            "the walk applied the pipeline head"
+        );
+        assert!(
+            md.journal.as_ref().unwrap().handle().header(1).is_some(),
+            "the head's prepare must stay journaled for the pipeline driver"
+        );
+
+        md.resume_stranded_commits().await;
+        assert_eq!(
+            consensus.commit_min(),
+            1,
+            "the pipeline driver commits the head the walk left to it"
+        );
+    }
+
+    /// A committed op with no resident header is a plain gap: the walk names it
+    /// as `HeaderMissing`, never as a missing body that needs truncating.
+    #[compio::test]
+    async fn given_committed_op_without_header_when_walking_should_stop_as_header_missing() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const RESIDENT_OPS: u64 = 2;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // A backup, so no pipeline head caps the walk.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+
+        for request in 1..=RESIDENT_OPS {
+            let prepare = md
+                .prepare_request(create_stream_request(
+                    CLIENT,
+                    request,
+                    &format!("s{request}"),
+                ))
+                .expect("CreateStream is client-allowed");
+            md.on_replicate(prepare).await;
+        }
+        consensus.advance_commit_max(RESIDENT_OPS + 1);
+
+        assert_eq!(
+            md.commit_journal().await,
+            CommitWalkStop::HeaderMissing {
+                op: RESIDENT_OPS + 1
+            }
+        );
+        assert_eq!(
+            consensus.commit_min(),
+            RESIDENT_OPS,
+            "the walk applies the resident run before stopping at the gap"
         );
     }
 

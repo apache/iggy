@@ -28,8 +28,8 @@ pub use applied_frontier::{AppliedFrontier, Reached};
 
 // Re-export IggyMetadata for use in other modules
 pub use impls::metadata::{
-    BoundSession, CommitNotifier, IggyMetadata, MetadataSubmitError, StateTransferOffer,
-    apply_committed_prepare,
+    BoundSession, CommitNotifier, CommitWalkStop, IggyMetadata, MetadataSubmitError,
+    StateTransferOffer, apply_committed_prepare,
 };
 
 // Recovery vocabulary other crates name in their own signatures and error
