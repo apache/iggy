@@ -91,7 +91,7 @@ pub struct ConsumerOffsetKindLabel {
 /// target inbox refused. A shed client request is answered with a retriable
 /// status, so the client recovers. A shed *prepare* has nobody to answer and is
 /// not covered by retransmit once its op has reached quorum
-/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// (`consensus::prepare_timeout_targets` skips `ok_quorum_received`), so the backup
 /// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
 /// partition state transfer when the primary has evicted the range, and
 /// `partition_prepare_gap_drops_total` is what counts the prepares that reached

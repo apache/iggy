@@ -1745,6 +1745,20 @@ where
         }
     }
 
+    /// `VsrAction::RetryLocalWrite`: re-submit the journaled WAL tail, then
+    /// re-arm the self-ack for `op` unless it is already armed.
+    pub async fn retry_local_write(&self, op: u64) {
+        // Only a primary in normal status owns a self-ack to re-drive.
+        if !self.consensus.is_primary() || !self.consensus.is_normal() {
+            return;
+        }
+        self.persist_repaired_prefix();
+        if self.pending_persisted_acks.borrow().contains_key(&op) {
+            return;
+        }
+        self.acknowledge_prepare(op).await;
+    }
+
     pub async fn acknowledge_prepare(&self, op: u64) {
         let Some(prepare) = self.log.journal().inner.repair_entry(op) else {
             return;
@@ -7117,12 +7131,12 @@ where
                 // (`push_prepare_entry`), and this sits ahead of
                 // `send_prepare_ok`, so it never gets its ack and `commit_max`
                 // can never pass it: every later op journals fine and queues
-                // behind it forever. Nothing lifts that -- the prepare timeout
-                // only backs off, a solo group's retransmit target is itself,
-                // this plane has no `repair_primary_self_acks`, and a solo group
-                // never starts a view change. Clients get no reply at all, since
-                // replies are generated on commit, so they wait out their read
-                // timeout, and once the queues fill so does every send after.
+                // behind it forever. Nothing lifts that: the op never reached
+                // the journal, so `retry_local_write` has nothing to re-submit,
+                // and a solo group never starts a view change. Clients get no
+                // reply at all, since replies are generated on commit, so they
+                // wait out their read timeout, and once the queues fill so does
+                // every send after.
                 //
                 // So fence there, the way a failed local commit of a
                 // cluster-committed op does: the shard picks `fatal` up on its
@@ -10742,8 +10756,9 @@ where
         // (view, log_view), so it must not leave until they are durable, or a
         // crash could recover an older view than the one this ack helped
         // commit in, losing a committed op. Mirrors the view-change dispatch
-        // gate; withhold on persist failure and let the primary's prepare
-        // retransmit re-drive the ack once a later persist succeeds.
+        // gate; withhold on persist failure and let the prepare retransmit
+        // (backup) or `retry_local_write` (primary) re-drive the ack once a
+        // later persist succeeds.
         if (self.consensus.replica_count() > 1 || self.persistence.is_some())
             && !self.register_rebuilt_ack(header)
         {
@@ -11248,7 +11263,8 @@ mod tests {
     use consensus::LocalPipeline;
     use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
     use iggy_binary_protocol::{
-        Command, CommitHeader, ReplyHeader, StartViewHeader, WireConsumer, WireEncode, WireName,
+        Command, CommitHeader, ConsensusHeader, ReplyHeader, StartViewHeader, WireConsumer,
+        WireEncode, WireName,
     };
     use journal::DurableAppend;
     use journal::durable_storage::DiskStorage;
@@ -11260,6 +11276,7 @@ mod tests {
         decode_batch_slice,
     };
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
 
     #[cfg(target_os = "linux")]
@@ -20729,6 +20746,245 @@ mod tests {
         assert_eq!(persistence.durable_op(), 1);
         assert_eq!(partition.consensus().commit_min(), 1);
         assert_eq!(replies.borrow().len(), 1);
+        assert_eq!(
+            partition.get_consumer_offset(PollingConsumer::Consumer(7, 0)),
+            Some(0)
+        );
+    }
+
+    /// A backup's `PrepareOk` for `header`, in the primary's current view.
+    fn backup_prepare_ok(
+        partition: &IggyPartition<RecordingBus>,
+        replica: u8,
+        header: &PrepareHeader,
+    ) -> Message<PrepareOkHeader> {
+        let consensus = partition.consensus();
+        Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(
+            |_, ack: &mut PrepareOkHeader| {
+                ack.command = Command::PrepareOk;
+                ack.cluster = consensus.cluster();
+                ack.replica = replica;
+                ack.view = consensus.view();
+                ack.op = header.op;
+                ack.prepare_checksum = header.checksum;
+                ack.operation = header.operation;
+                ack.group = header.group;
+                ack.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                ack.seal();
+            },
+        )
+    }
+
+    /// A two-replica primary whose WAL refused its own prepare for op 1, which
+    /// is journaled and pipelined with no WAL entry and no armed self-ack.
+    #[allow(clippy::future_not_send)]
+    async fn primary_with_refused_offset_prepare(
+        directory: &Path,
+    ) -> (IggyPartition<RecordingBus>, SentFrames, PrepareHeader) {
+        let (mut partition, replies) = recording_partition_at(0, 2);
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] =
+            Some(directory.join("consumers").to_string_lossy().into_owned());
+        partition.stats.increment_messages_count(1);
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+        // Exhaust WAL capacity between admission and the submit under
+        // `write_lock`, so the WAL refuses the prepare.
+        let write_lock = Arc::clone(&partition.write_lock);
+        let parked = write_lock.lock().await;
+        let request = store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum);
+        let mut admission = Box::pin(partition.on_request(request, None));
+        assert!(futures::poll!(&mut admission).is_pending());
+        persistence.exhaust_capacity_for_test();
+        drop(parked);
+        admission.await;
+        persistence.release_capacity_for_test();
+        let header = partition
+            .consensus()
+            .pipeline_head_header()
+            .expect("op 1 was admitted");
+        assert_eq!(
+            persistence.head(),
+            0,
+            "the WAL refused the primary's own prepare"
+        );
+        assert!(partition.pending_persisted_acks.borrow().is_empty());
+        (partition, replies, header)
+    }
+
+    #[compio::test]
+    async fn given_an_armed_self_ack_when_the_local_write_is_retried_should_not_send_a_second_prepare_ok()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, header) =
+            Box::pin(primary_with_refused_offset_prepare(directory.path())).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        partition
+            .pending_persisted_acks
+            .borrow_mut()
+            .insert(header.op, header);
+        partition.persist_repaired_prefix();
+        persistence.drain_with_timeout().await.unwrap();
+
+        partition.retry_local_write(header.op).await;
+        partition.drive_persistence().await;
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert_eq!(
+            acknowledgments.len(),
+            1,
+            "the armed self-ack fires once, so the retry must not ack on its own"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_wal_still_full_at_the_first_retry_when_capacity_frees_should_resubmit_and_commit()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, header) =
+            Box::pin(primary_with_refused_offset_prepare(directory.path())).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        partition
+            .on_ack(backup_prepare_ok(&partition, 1, &header), &repair_config())
+            .await;
+        commit_recorded_loopback(&mut partition).await;
+        persistence.exhaust_capacity_for_test();
+
+        let mut retries = 0;
+        for _ in 0..consensus::TimeoutManager::PREPARE_TICKS * 200 {
+            if retries == 1 {
+                persistence.release_capacity_for_test();
+            }
+            for action in partition.consensus().tick(PlaneKind::Partitions) {
+                if let consensus::VsrAction::RetryLocalWrite { op } = action {
+                    partition.retry_local_write(op).await;
+                    retries += 1;
+                }
+            }
+            commit_recorded_loopback(&mut partition).await;
+        }
+        persistence.drain_with_timeout().await.unwrap();
+        commit_recorded_loopback(&mut partition).await;
+
+        assert!(
+            retries > 1,
+            "the timer must keep retrying, retries={retries}"
+        );
+        assert_eq!(
+            persistence.head(),
+            header.op,
+            "a retry after capacity frees must re-submit the op the full WAL refused"
+        );
+        assert_eq!(partition.consensus().commit_min(), header.op);
+    }
+
+    #[compio::test]
+    async fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_keeps_firing_should_not_queue_another()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, header) =
+            Box::pin(primary_with_refused_offset_prepare(directory.path())).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        partition
+            .on_ack(backup_prepare_ok(&partition, 1, &header), &repair_config())
+            .await;
+        commit_recorded_loopback(&mut partition).await;
+        partition.retry_local_write(header.op).await;
+        persistence.drain_with_timeout().await.unwrap();
+        partition.drive_persistence().await;
+
+        for _ in 0..consensus::TimeoutManager::PREPARE_TICKS * 40 {
+            for action in partition.consensus().tick(PlaneKind::Partitions) {
+                if let consensus::VsrAction::RetryLocalWrite { op } = action {
+                    partition.retry_local_write(op).await;
+                }
+            }
+        }
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert_eq!(
+            acknowledgments.len(),
+            1,
+            "an undrained self-ack already carries the primary's vote"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_replica_that_lost_primacy_when_the_local_write_is_retried_should_neither_submit_nor_ack()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, header) =
+            Box::pin(primary_with_refused_offset_prepare(directory.path())).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        partition.consensus.set_view(1);
+        assert!(!partition.consensus().is_primary());
+
+        partition.retry_local_write(header.op).await;
+        assert_eq!(persistence.head(), 0, "a non-primary must not re-submit");
+        assert!(partition.pending_persisted_acks.borrow().is_empty());
+        let mut acknowledgments = Vec::new();
+        partition
+            .consensus()
+            .drain_loopback_into(&mut acknowledgments);
+        assert!(acknowledgments.is_empty());
+    }
+
+    #[compio::test]
+    async fn given_a_wal_that_refused_the_primary_prepare_when_the_prepare_timeout_fires_should_retry_locally_and_commit()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies, header) =
+            Box::pin(primary_with_refused_offset_prepare(directory.path())).await;
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+        // Two replicas need both votes, so the backup's ack alone commits nothing.
+        partition
+            .on_ack(backup_prepare_ok(&partition, 1, &header), &repair_config())
+            .await;
+        commit_recorded_loopback(&mut partition).await;
+        assert_eq!(partition.consensus().commit_min(), 0);
+
+        let mut retried = false;
+        for _ in 0..=consensus::TimeoutManager::PREPARE_TICKS {
+            for action in partition.consensus().tick(PlaneKind::Partitions) {
+                match action {
+                    consensus::VsrAction::RetryLocalWrite { op } => {
+                        partition.retry_local_write(op).await;
+                        retried = true;
+                    }
+                    consensus::VsrAction::RetransmitPrepares { targets } => {
+                        assert!(
+                            targets.iter().all(|(_, replicas)| !replicas.contains(&0)),
+                            "a send to self is a no-op, so it cannot be the remedy: {targets:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            retried,
+            "the prepare timeout must retry the primary's own write"
+        );
+        assert_eq!(
+            persistence.head(),
+            header.op,
+            "the retry re-submitted op 1 to the WAL"
+        );
+
+        persistence.drain_with_timeout().await.unwrap();
+        commit_recorded_loopback(&mut partition).await;
+        assert_eq!(partition.consensus().commit_min(), header.op);
+        assert_eq!(
+            replies.borrow().len(),
+            1,
+            "the client learns the outcome from a reply"
+        );
         assert_eq!(
             partition.get_consumer_offset(PollingConsumer::Consumer(7, 0)),
             Some(0)

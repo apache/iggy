@@ -1130,6 +1130,9 @@ pub enum VsrAction {
     RetransmitPrepares {
         targets: Vec<(PrepareHeader, Vec<u8>)>,
     },
+    /// Re-submit the primary's own WAL write for `op` and re-arm its self-ack.
+    /// Partition plane only; metadata re-acks via `repair_primary_self_acks`.
+    RetryLocalWrite { op: u64 },
     /// Rebuild the pipeline from the journal after a view change.
     ///
     /// The new primary must re-populate its pipeline with uncommitted ops
@@ -2948,33 +2951,41 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         )
     }
 
-    /// Collect uncommitted pipeline entries that should be retransmitted.
+    /// What the prepare timeout has to re-drive, as `(retransmits, local retries)`.
     ///
-    /// Returns `(PrepareHeader, Vec<u8>)` pairs: each op that hasn't reached
-    /// quorum paired with the replica IDs that haven't acked it.
-    fn retransmit_targets(&self) -> Vec<(PrepareHeader, Vec<u8>)> {
+    /// Retransmits pair an op short of quorum with the backups missing its ack.
+    /// Local retries are the ops short of quorum this primary has not acked.
+    fn prepare_timeout_targets(&self) -> (Vec<(PrepareHeader, Vec<u8>)>, Vec<u64>) {
         let pipeline = self.pipeline.borrow();
         let current_op = self.sequencer.current_sequence();
         let replica_count = self.replica_count;
-        let mut targets = Vec::new();
+        let self_replica = self.replica;
+        let mut retransmits = Vec::new();
+        let mut local_retries = Vec::new();
 
         let mut op = self.commit_max() + 1;
         while op <= current_op {
             if let Some(entry) = pipeline.entry_by_op(op)
                 && !entry.ok_quorum_received
             {
-                let missing: Vec<u8> = (0..replica_count).filter(|&r| !entry.has_ack(r)).collect();
+                if !entry.has_ack(self_replica) && !self.loopback_holds_prepare_ok(op) {
+                    local_retries.push(op);
+                }
+                let missing: Vec<u8> = (0..replica_count)
+                    .filter(|&replica| replica != self_replica && !entry.has_ack(replica))
+                    .collect();
                 if !missing.is_empty() {
-                    targets.push((entry.header, missing));
+                    retransmits.push((entry.header, missing));
                 }
             }
             op += 1;
         }
 
-        targets
+        (retransmits, local_retries)
     }
 
-    /// Retransmit uncommitted prepares when the prepare timeout fires.
+    /// Retransmit uncommitted prepares when the prepare timeout fires, and
+    /// retry the local write for any that still lack this primary's own ack.
     ///
     /// Only acts on the primary in normal status with a non-empty pipeline.
     /// Resets the timeout with backoff on each firing.
@@ -2986,10 +2997,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // entry's elapsed ticks. The stop below is now a backstop for a pipeline
         // emptied by a path that skipped that maintenance, not the primary
         // disarm.
-        //
-        // TODO(prepare-timeout): special-case "all remote acks present, own
-        // journal write is the laggard" by retrying the local write instead of
-        // retransmitting to peers that already acked.
         //
         // Every early return below must stop or back off the timeout.
         // `fired()` stays true until the timer is rearmed, so returning
@@ -3011,8 +3018,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        let targets = self.retransmit_targets();
-        if targets.is_empty() {
+        let (targets, local_retries) = self.prepare_timeout_targets();
+        if targets.is_empty() && local_retries.is_empty() {
             // In-flight ops all have their acks; re-check after backoff.
             self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
             return Vec::new();
@@ -3022,12 +3029,24 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             replica = self.replica,
             view = self.view.get(),
             targets = targets.len(),
-            first_op = targets.first().map(|(h, _)| h.op),
-            "prepare timeout: retransmitting un-acked prepares"
+            first_retransmit_op = targets.first().map(|(h, _)| h.op),
+            local_retries = local_retries.len(),
+            first_local_retry_op = local_retries.first(),
+            "prepare timeout: re-driving un-acked prepares"
         );
         self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
 
-        vec![VsrAction::RetransmitPrepares { targets }]
+        let mut actions =
+            Vec::with_capacity(local_retries.len() + usize::from(!targets.is_empty()));
+        actions.extend(
+            local_retries
+                .into_iter()
+                .map(|op| VsrAction::RetryLocalWrite { op }),
+        );
+        if !targets.is_empty() {
+            actions.push(VsrAction::RetransmitPrepares { targets });
+        }
+        actions
     }
 
     /// Primary heartbeat: send commit point to all backups so they know
@@ -4258,6 +4277,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 notifier.notify();
             }
         }
+    }
+
+    /// Whether the undrained loopback already carries this replica's `PrepareOk` for `op`.
+    fn loopback_holds_prepare_ok(&self, op: u64) -> bool {
+        self.loopback_queue.borrow().iter().any(|message| {
+            message.header().command == Command::PrepareOk
+                && bytemuck::checked::try_from_bytes::<PrepareOkHeader>(
+                    &message.as_slice()[..size_of::<PrepareOkHeader>()],
+                )
+                .is_ok_and(|header| header.op == op)
+        })
     }
 
     /// Drain all pending loopback messages into `buf`, leaving the queue empty.
@@ -5948,6 +5978,151 @@ mod vsr_consensus_tests {
             before + 1,
             "parking must not consume the prepare-stamping monotonic sequence"
         );
+    }
+
+    /// A backup's `PrepareOk` for `header`, in the primary's current view.
+    fn backup_ack(
+        consensus: &VsrConsensus<StageNoopBus>,
+        replica: u8,
+        header: &PrepareHeader,
+    ) -> PrepareOkHeader {
+        PrepareOkHeader {
+            command: Command::PrepareOk,
+            replica,
+            view: consensus.view(),
+            op: header.op,
+            prepare_checksum: header.checksum,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn given_every_backup_ack_when_the_prepare_timeout_fires_should_retry_the_local_write() {
+        // Two replicas need both votes, so with the backup's ack in the only
+        // one that can still commit op 1 is this primary's own, and a
+        // retransmit cannot produce it: the send to self is a no-op.
+        let consensus = VsrConsensus::new(1, 0, 2, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        assert!(matches!(
+            consensus.handle_prepare_ok(
+                PlaneKind::Metadata,
+                &backup_ack(&consensus, 1, prepare.header())
+            ),
+            PrepareOkOutcome::Accepted {
+                quorum_reached: false,
+                ..
+            }
+        ));
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            matches!(actions.as_slice(), [VsrAction::RetryLocalWrite { op: 1 }]),
+            "expected only a local retry, got {actions:?}"
+        );
+        assert!(
+            prepare_ticking(&consensus),
+            "the retry backs the timer off rather than stopping it"
+        );
+    }
+
+    #[test]
+    fn given_a_solo_primary_when_the_prepare_timeout_fires_should_retry_the_local_write_not_itself()
+    {
+        let consensus = VsrConsensus::new(1, 0, 1, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        pipeline(&consensus, &projected_prepare(1, 0));
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            matches!(actions.as_slice(), [VsrAction::RetryLocalWrite { op: 1 }]),
+            "a solo group has nobody to retransmit to, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_silent_backup_and_no_self_ack_when_the_prepare_timeout_fires_should_retry_locally_and_retransmit_to_the_silent_backup()
+     {
+        // Backup 1 acked, backup 2 is silent, and this primary's own write is
+        // still outstanding. Each missing vote gets its own remedy, and the
+        // retransmit names neither the acked backup nor the primary.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &backup_ack(&consensus, 1, prepare.header()),
+        );
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::RetryLocalWrite { op: 1 })),
+            "the primary's own vote is still missing, got {actions:?}"
+        );
+        let targets = actions
+            .iter()
+            .find_map(|action| match action {
+                VsrAction::RetransmitPrepares { targets } => Some(targets),
+                _ => None,
+            })
+            .expect("the silent backup still needs the prepare");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0.op, 1);
+        assert_eq!(targets[0].1, vec![2], "neither self nor the acked backup");
+        assert_eq!(actions.len(), 2, "{actions:?}");
+    }
+
+    #[test]
+    fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_fires_should_not_retry_the_local_write()
+     {
+        let consensus = VsrConsensus::new(1, 0, 1, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        let self_ack = backup_ack(&consensus, 0, prepare.header());
+        consensus.push_loopback(
+            Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                .transmute_header(|_, header: &mut PrepareOkHeader| {
+                    *header = PrepareOkHeader {
+                        size: u32::try_from(size_of::<PrepareOkHeader>()).unwrap(),
+                        ..self_ack
+                    };
+                    header.seal();
+                })
+                .into_generic(),
+        );
+
+        let actions = consensus.handle_prepare_timeout();
+        assert!(
+            actions.is_empty(),
+            "the queued self-ack already carries this vote, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_self_acked_op_short_of_quorum_when_the_prepare_timeout_fires_should_only_retransmit()
+    {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        let prepare = projected_prepare(1, 0);
+        pipeline(&consensus, &prepare);
+        consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &backup_ack(&consensus, 0, prepare.header()),
+        );
+
+        let actions = consensus.handle_prepare_timeout();
+        match actions.as_slice() {
+            [VsrAction::RetransmitPrepares { targets }] => {
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].1, vec![1, 2]);
+            }
+            other => panic!("expected one retransmit to both backups, got {other:?}"),
+        }
     }
 
     #[test]
