@@ -54,7 +54,8 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 10: `PartitionSnapshot` dropped `purge_generation`.
 ///
-/// Version 11: streams also persist pending lifecycle intents.
+/// Version 11: streams also persist pending lifecycle intents, and each
+/// `TopicSnapshot` the op of its last consumer group catalog change.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 11;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
@@ -625,7 +626,7 @@ mod tests {
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 11;
+        const TOPIC_FIELD_COUNT: u32 = 12;
         const STREAM_FIELD_COUNT: u32 = 6;
         const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
@@ -665,6 +666,7 @@ mod tests {
             consumer_groups: Vec::new(),
             next_consumer_group_id: 0,
             options: ResourceOptions::new(),
+            consumer_group_catalog_op: 0,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -895,6 +897,7 @@ mod tests {
                             // instead of matching a default.
                             next_consumer_group_id: 5,
                             options: ResourceOptions::default(),
+                            consumer_group_catalog_op: 7,
                         },
                     )],
                     options: ResourceOptions::default(),
@@ -925,6 +928,7 @@ mod tests {
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);
+        assert_eq!(topic.consumer_group_catalog_op, 7);
     }
 
     fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {

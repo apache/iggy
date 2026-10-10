@@ -1099,6 +1099,7 @@ mod tests {
             consumer_groups: ahash::AHashMap::default(),
             consumer_group_index: ahash::AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         });
         streams.items.insert(stream);
 
@@ -1159,6 +1160,7 @@ mod tests {
             consumer_groups: ahash::AHashMap::default(),
             consumer_group_index: ahash::AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         };
 
         // Stored `ServerDefault` sentinels echo the wire sentinel (0)

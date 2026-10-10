@@ -443,6 +443,18 @@ impl StateHandler for CompleteLifecycleRequest {
                 }
             }
             state.lifecycle_intents.insert(self.metadata_op, intent);
+        } else if matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. })
+            && let Some(topic) = intent.topic_id.and_then(|topic_id| {
+                state
+                    .items
+                    .get_mut(intent.stream_id as usize)?
+                    .topics
+                    .get_mut(topic_id as usize)
+            })
+        {
+            // A sibling group created after the intent may already hold a later
+            // op, and the label must keep growing with the catalog.
+            topic.consumer_group_catalog_op = context.metadata_op;
         }
         reply
     }
@@ -703,7 +715,9 @@ mod tests {
     };
     use crate::stm::snapshot::Snapshotable;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
-    use iggy_binary_protocol::requests::consumer_groups::JoinConsumerGroupRequest;
+    use iggy_binary_protocol::requests::consumer_groups::{
+        CreateConsumerGroupRequest, JoinConsumerGroupRequest,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
@@ -1194,5 +1208,68 @@ mod tests {
             };
             assert_eq!(created.code, expected, "apply, stream_wide={stream_wide}");
         }
+    }
+
+    #[test]
+    fn given_group_deletion_when_lifecycle_completes_should_label_catalog_with_completion_op() {
+        const DELETED_CREATE_OP: u64 = 10;
+        const SIBLING_CREATE_OP: u64 = 20;
+        const REMOVAL_OP: u64 = INTENT_OP + 2;
+        let streams = streams();
+        let catalog = |streams: &Streams| {
+            streams.read(|inner| {
+                let topic = &inner.items[0].topics[0];
+                let mut live: Vec<u64> = topic.consumer_groups.keys().copied().collect();
+                live.sort_unstable();
+                (
+                    topic.consumer_group_catalog_op,
+                    topic.next_consumer_group_id,
+                    live,
+                )
+            })
+        };
+        for (name, metadata_op) in [
+            ("deleted", DELETED_CREATE_OP),
+            ("sibling", SIBLING_CREATE_OP),
+        ] {
+            let request = CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new(name).unwrap(),
+            };
+            let context = ApplyContext {
+                metadata_op,
+                ..context()
+            };
+            let reply = apply(&streams, Operation::CreateConsumerGroup, &request, context);
+            assert_eq!(reply.code, 0);
+        }
+        assert_eq!(catalog(&streams), (SIBLING_CREATE_OP, 2, vec![0, 1]));
+        let reply = apply(
+            &streams,
+            Operation::DeleteConsumerGroup,
+            &DeleteConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+            },
+            context(),
+        );
+        assert_eq!(reply.code, 0);
+        complete(&streams, 0, 12);
+        assert_eq!(
+            catalog(&streams),
+            (SIBLING_CREATE_OP, 2, vec![0, 1]),
+            "a pending deletion keeps the group and its label"
+        );
+        complete(&streams, 1, 23);
+        assert_eq!(catalog(&streams), (REMOVAL_OP, 2, vec![1]));
+
+        let mut snapshot = crate::stm::snapshot::MetadataSnapshot::new(REMOVAL_OP);
+        snapshot.streams = Some(streams.to_snapshot());
+        let decoded =
+            crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let restored = Streams::from_snapshot(decoded.streams.unwrap()).unwrap();
+        assert_eq!(catalog(&restored), (REMOVAL_OP, 2, vec![1]));
     }
 }

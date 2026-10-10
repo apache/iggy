@@ -540,6 +540,7 @@ impl StateHandler for CreateConsumerGroupRequest {
         }
         let id = topic.next_consumer_group_id;
         topic.next_consumer_group_id += 1;
+        topic.consumer_group_catalog_op = state.apply_context.metadata_op;
         topic
             .consumer_groups
             .insert(id, ConsumerGroup::new(id, name.clone()));
@@ -610,6 +611,9 @@ impl StateHandler for DeleteConsumerGroupRequest {
             return ApplyReply::err(DeleteConsumerGroupResult::ConsumerGroupNotFound);
         };
         topic.consumer_group_index.remove(&group.name);
+        // Finalization runs under the intent's op, and the lifecycle completion
+        // then records the op that actually removed the group.
+        topic.consumer_group_catalog_op = state.apply_context.metadata_op;
         // Bump the partition-shaping revision so the reconciler's fast-skip
         // doesn't pass over the delete: it reclaims the group's leftover
         // offsets on the topic's surviving partitions.

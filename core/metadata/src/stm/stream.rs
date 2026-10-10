@@ -177,6 +177,8 @@ pub struct TopicSnapshot {
     pub next_consumer_group_id: u64,
     #[serde(default)]
     pub options: ResourceOptions,
+    #[serde(default)]
+    pub consumer_group_catalog_op: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +213,10 @@ pub struct Topic {
     /// clamped wire ids all collide on `u32::MAX`, including with a live
     /// group's offset key.
     pub next_consumer_group_id: u64,
+    /// Op of the last apply that changed `next_consumer_group_id` or the group
+    /// set. A partition expects one owner retirement catalog per op, so a reader
+    /// takes the catalog and this op from the same published state.
+    pub consumer_group_catalog_op: u64,
 }
 
 impl Default for Topic {
@@ -229,6 +235,7 @@ impl Default for Topic {
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         }
     }
 }
@@ -256,6 +263,7 @@ impl Topic {
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         }
     }
 
@@ -2202,6 +2210,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -2654,6 +2663,7 @@ impl Snapshotable for Streams {
                                         })
                                         .collect(),
                                     next_consumer_group_id: topic.next_consumer_group_id,
+                                    consumer_group_catalog_op: topic.consumer_group_catalog_op,
                                 },
                             )
                         })
@@ -2792,6 +2802,7 @@ impl StreamsInner {
                             .max()
                             .unwrap_or(0),
                     ),
+                    consumer_group_catalog_op: topic_snap.consumer_group_catalog_op,
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()
