@@ -27,6 +27,7 @@ mod iceberg;
 mod influxdb;
 mod meilisearch;
 mod mongodb;
+mod mysql;
 mod postgres;
 mod quickwit;
 mod rabbitmq;
@@ -82,6 +83,16 @@ pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
+};
+pub use mysql::{
+    MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
+    MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
+    MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
+    MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
+    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
+    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,
