@@ -59,6 +59,24 @@ impl MaxTopicSize {
             MaxTopicSize::Custom(iggy_byte_size) => iggy_byte_size.as_bytes_u64(),
         }
     }
+
+    /// The cap in bytes with `ServerDefault` resolved against `default`, or
+    /// `None` for "no cap".
+    ///
+    /// For `ServerDefault`, a `default` of 0 or `u64::MAX` yields `None`: 0
+    /// means "no cap", never a budget that trims everything. `ServerDefault`
+    /// therefore never comes back as `Some(0)`, so a caller can size against
+    /// any returned value directly.
+    pub fn resolve(self, default: u64) -> Option<u64> {
+        let resolved = match self {
+            MaxTopicSize::ServerDefault => MaxTopicSize::from(default),
+            sized => sized,
+        };
+        match resolved {
+            MaxTopicSize::Custom(size) => Some(size.as_bytes_u64()),
+            MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
+        }
+    }
 }
 
 impl From<IggyByteSize> for MaxTopicSize {
@@ -185,5 +203,19 @@ impl fmt::Display for MaxTopicSize {
             MaxTopicSize::Unlimited => write!(f, "unlimited"),
             MaxTopicSize::ServerDefault => write!(f, "server_default"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MaxTopicSize;
+
+    #[test]
+    fn given_max_topic_size_variants_when_resolving_should_yield_only_a_finite_cap() {
+        assert_eq!(MaxTopicSize::from(1024).resolve(u64::MAX), Some(1024));
+        assert_eq!(MaxTopicSize::Unlimited.resolve(4096), None);
+        assert_eq!(MaxTopicSize::ServerDefault.resolve(4096), Some(4096));
+        assert_eq!(MaxTopicSize::ServerDefault.resolve(u64::MAX), None);
+        assert_eq!(MaxTopicSize::ServerDefault.resolve(0), None);
     }
 }

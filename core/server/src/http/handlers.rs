@@ -103,13 +103,13 @@ use iggy_common::wire_conversions::{
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, CompressionAlgorithm, Consumer, ConsumerGroup,
-    ConsumerGroupDetails, ConsumerOffsetInfo, Identifier, IdentityInfo, IggyError, IggyExpiry,
-    MaxTopicSize, OptionSpec, OptionsScope, PersonalAccessTokenInfo, PollMessages, PolledMessages,
-    RawPersonalAccessToken, SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails,
-    StreamUpdateOptions, TokenInfo, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
-    UPDATABLE_STREAM_OPTION_KEYS, UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS,
-    UserInfo, UserInfoDetails, UserUpdateOptions, Validatable, validate_preallocated_topic_bytes,
-    validate_topic_segment_size,
+    ConsumerGroupDetails, ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo,
+    IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionsScope, PersonalAccessTokenInfo,
+    PollMessages, PolledMessages, RawPersonalAccessToken, SendMessages, SendMessagesConfirmations,
+    Stats, Stream, StreamDetails, StreamUpdateOptions, TokenInfo, Topic, TopicCreateOptions,
+    TopicDetails, TopicUpdateOptions, UPDATABLE_STREAM_OPTION_KEYS, UPDATABLE_TOPIC_OPTION_KEYS,
+    UPDATABLE_USER_OPTION_KEYS, UserInfo, UserInfoDetails, UserUpdateOptions, Validatable,
+    validate_preallocated_topic_bytes, validate_topic_segment_size,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -125,7 +125,7 @@ use crate::http::error::{
     ReadError, WriteError,
 };
 use crate::http::extractor::{Authenticated, Identity};
-use crate::http::metrics::gauge_value;
+use crate::http::metrics::{TopicUsageSample, gauge_value};
 use crate::http::reads::{
     authorize_data_plane, gate_local_read, read_local, resolve_gate_stream, resolve_gate_topic,
     resolve_gate_topic_ids, resolve_gate_user, topic_durability,
@@ -605,22 +605,44 @@ pub(in crate::http) async fn get_stats(
 }
 
 /// `GET <http.metrics.endpoint>`: the metric set in prometheus text
-/// exposition. Auth-only, like `/stats`: the `Identity` extractor rejects a
-/// missing or invalid bearer with 401, and any authenticated user may scrape
-/// (no RBAC rule guards it). Scrapers present a JWT or a raw PAT the same way
-/// every read route accepts them.
+/// exposition. The `Identity` extractor rejects a missing or invalid bearer
+/// with 401, and any authenticated user may scrape the aggregate gauges.
+/// The per-topic series name every stream and topic, so they are exported only
+/// to a user the `/stats` rule ([`Permissioner::get_stats`]) admits; anyone
+/// else gets the aggregates with no per-topic series. Scrapers present a JWT
+/// or a raw PAT the same way every read route accepts them.
 ///
 /// The entity gauges sample the same reads `/stats` serves: the metadata STM
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
 /// increments are relaxed, so scraped values are approximate while writes are
-/// in flight. The clients count scatter-gathers the per-shard session managers
-/// exactly like `GET /clients` and turns partial when a shard misses the reply
-/// deadline.
+/// in flight. The per-topic series come from the same walk and the same
+/// rollups `GetTopic` reads, and encode synchronously on shard 0 in time linear
+/// in the topic count. The clients count scatter-gathers the per-shard session
+/// managers exactly like `GET /clients` and turns partial when a shard misses
+/// the reply deadline.
+///
+/// Per-topic series are this replica's local view, so a lagging backup may
+/// report smaller values than the primary.
 pub(in crate::http) async fn get_metrics(
     State(state): State<HttpState>,
-    _identity: Identity,
+    identity: Identity,
 ) -> String {
-    let (streams_count, topics_count, partitions_count, segments_count, messages_count) = state
+    // Awaited before the permission check and the walk so check, walk, replace
+    // and encode run without a yield, and a scrape that finishes later never
+    // publishes an older per-topic snapshot.
+    let clients_count = SendWrapper::new(state.shard.count_all_clients()).await as u64;
+    let exports_topics = state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .authorize(|permissioner| permissioner.get_stats(identity.user_id))
+        .is_ok();
+    let (
+        (streams_count, topics_count, partitions_count, segments_count, messages_count),
+        topic_usage,
+    ) = state
         .shard
         .plane
         .metadata()
@@ -631,6 +653,17 @@ pub(in crate::http) async fn get_metrics(
             let mut partitions_count = 0u64;
             let mut segments_count = 0u64;
             let mut messages_count = 0u64;
+            let mut topic_usage = if exports_topics {
+                Vec::with_capacity(
+                    streams
+                        .items
+                        .iter()
+                        .map(|(_, stream)| stream.topics.len())
+                        .sum(),
+                )
+            } else {
+                Vec::new()
+            };
             for (_, stream) in &streams.items {
                 topics_count = topics_count.saturating_add(stream.topics.len() as u64);
                 segments_count = segments_count
@@ -640,14 +673,27 @@ pub(in crate::http) async fn get_metrics(
                 for (_, topic) in &stream.topics {
                     partitions_count =
                         partitions_count.saturating_add(topic.partitions.len() as u64);
+                    if !exports_topics {
+                        continue;
+                    }
+                    topic_usage.push(TopicUsageSample {
+                        stream: Arc::clone(&stream.name),
+                        topic: Arc::clone(&topic.name),
+                        size_bytes: topic.stats.size_bytes_inconsistent(),
+                        messages: topic.stats.messages_count_inconsistent(),
+                        max_size_bytes: topic.max_topic_size.resolve(DEFAULT_MAX_TOPIC_SIZE),
+                    });
                 }
             }
             (
-                streams.items.len() as u64,
-                topics_count,
-                partitions_count,
-                segments_count,
-                messages_count,
+                (
+                    streams.items.len() as u64,
+                    topics_count,
+                    partitions_count,
+                    segments_count,
+                    messages_count,
+                ),
+                topic_usage,
             )
         });
     let users_count = state
@@ -657,7 +703,6 @@ pub(in crate::http) async fn get_metrics(
         .mux_stm
         .users()
         .read(|users| users.items.len() as u64);
-    let clients_count = SendWrapper::new(state.shard.count_all_clients()).await as u64;
 
     let metrics = &state.metrics;
     metrics.streams.set(gauge_value(streams_count));
@@ -667,6 +712,7 @@ pub(in crate::http) async fn get_metrics(
     metrics.messages.set(gauge_value(messages_count));
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
+    metrics.topic_usage.replace(topic_usage);
     metrics.formatted_output()
 }
 
