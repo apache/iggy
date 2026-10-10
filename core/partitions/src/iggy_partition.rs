@@ -3819,6 +3819,11 @@ where
         {
             return Err(IggyError::TransientNotAccepted);
         }
+        // The delete fence leaves the history identity unchanged, and this
+        // node's metadata can still list the partition after the fence.
+        if self.history_deleted() {
+            return Err(IggyError::HistoryUnavailable);
+        }
         // A view change rebuilds the install latch and barrier from the log,
         // so the owner checks below must run after it.
         self.resynchronize_consumer_offset_reservations();
@@ -3966,7 +3971,6 @@ where
         if self.pending_owner_install.get().is_some_and(|pending| {
             kind == ConsumerKind::ConsumerGroup && pending.group_id == u64::from(consumer_id)
         }) || self.pending_history_transition.get().is_some()
-            || self.history_deleted()
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -22795,6 +22799,74 @@ mod tests {
             "the old read must not record group progress"
         );
         assert_eq!(committed, None, "automatic commits are disabled");
+    }
+
+    /// A replica applies the delete fence from its partition log, and its
+    /// metadata can apply the delete later. Until then reads planned before or
+    /// after the fence pass every metadata check. Completion refuses them with
+    /// or without automatic commits, also when the offset is already durable.
+    #[compio::test]
+    async fn given_deleted_history_when_poll_completes_should_refuse_without_progress() {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const CONSUMER_ID: u32 = 8;
+        const DURABLE_CONSUMER_ID: u32 = 9;
+        const METADATA_OP: u64 = 10;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, DURABLE_CONSUMER_ID, 0, 0);
+        let group = PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0);
+        let consumer = |id: u32| PollingConsumer::Consumer(usize::try_from(id).unwrap(), 0);
+        let reads = |partition: &IggyPartition<RecordingBus>| {
+            [
+                (group, false),
+                (group, true),
+                (consumer(CONSUMER_ID), false),
+                (consumer(CONSUMER_ID), true),
+                (consumer(DURABLE_CONSUMER_ID), true),
+            ]
+            .map(|(polling, auto_commit)| {
+                poll_read_result(partition, polling, auto_commit, Some(0))
+            })
+        };
+        let planned_before_fence = reads(&partition);
+        let transition = TransitionPartitionHistoryRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: METADATA_OP,
+        };
+        let fence = partition_control_request(
+            &partition,
+            Operation::TransitionPartitionHistory,
+            &transition.to_bytes(),
+            METADATA_OP,
+        );
+        partition.on_request(fence, None).await;
+        let fence_op = partition.consensus.sequencer().current_sequence();
+        partition.consensus.advance_commit_max(fence_op);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.installed_history_transition(&transition),
+            Some(fence_op)
+        );
+
+        for read in planned_before_fence.into_iter().chain(reads(&partition)) {
+            let (polling, auto_commit) = (read.context.consumer, read.context.auto_commit);
+            let completion = partition.complete_poll(read);
+            assert!(
+                matches!(completion, Err(IggyError::HistoryUnavailable)),
+                "{polling:?} with auto_commit {auto_commit} read the deleted history: {:?}",
+                completion.map(|accepted| accepted.fragments.len())
+            );
+        }
+        assert_eq!(partition.group_offset_state(GROUP_ID), (None, None));
+        for id in [CONSUMER_ID, DURABLE_CONSUMER_ID] {
+            assert_eq!(partition.get_consumer_offset(consumer(id)), None);
+        }
+        assert_eq!(partition.consensus.sequencer().current_sequence(), fence_op);
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+        assert_eq!(partition.consensus.request_queue_len(), 0);
     }
 
     #[compio::test]

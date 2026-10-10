@@ -19,7 +19,10 @@ use std::sync::Arc;
 
 use consensus::{LocalPipeline, Sequencer, VsrConsensus, oneshot_channel};
 use futures::FutureExt;
-use iggy_binary_protocol::{Command, Operation, RoutedRequestHeader};
+use iggy_binary_protocol::requests::partitions::{
+    InstallConsumerGroupOwnerRequest, TransitionPartitionHistoryRequest,
+};
+use iggy_binary_protocol::{Command, Operation, RoutedRequestHeader, WireEncode};
 use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use message_bus::MessageBus;
 use metadata::MuxStateMachine;
@@ -135,22 +138,73 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
 pub(super) async fn install_group_owner<B: MessageBus + Clone>(
     partition: &mut IggyPartition<B>,
     config: &PartitionsConfig,
-    installation: iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest,
+    installation: InstallConsumerGroupOwnerRequest,
 ) -> u64 {
-    let body = iggy_binary_protocol::WireEncode::to_bytes(&installation);
+    let op = commit_lifecycle_fence(
+        partition,
+        config,
+        Operation::InstallConsumerGroupOwner,
+        &installation.to_bytes(),
+        installation.incarnation,
+        installation.metadata_op,
+    )
+    .await;
+    assert_eq!(
+        partition.installed_consumer_group_owner(&installation),
+        Some(op)
+    );
+    op
+}
+
+/// Commit the delete fence that closes the partition's current incarnation.
+#[allow(clippy::future_not_send)]
+pub(super) async fn delete_history<B: MessageBus + Clone>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    metadata_op: u64,
+) -> u64 {
+    let transition = TransitionPartitionHistoryRequest {
+        incarnation: partition.created_revision(),
+        metadata_op,
+    };
+    let op = commit_lifecycle_fence(
+        partition,
+        config,
+        Operation::TransitionPartitionHistory,
+        &transition.to_bytes(),
+        transition.incarnation,
+        metadata_op,
+    )
+    .await;
+    assert_eq!(
+        partition.installed_history_transition(&transition),
+        Some(op)
+    );
+    op
+}
+
+#[allow(clippy::future_not_send)]
+async fn commit_lifecycle_fence<B: MessageBus + Clone>(
+    partition: &mut IggyPartition<B>,
+    config: &PartitionsConfig,
+    operation: Operation,
+    body: &[u8],
+    incarnation: u64,
+    metadata_op: u64,
+) -> u64 {
     let size = size_of::<RoutedRequestHeader>() + body.len();
     let mut message = server_common::Message::<RoutedRequestHeader>::new(size);
-    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    message.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
     let message = message.transmute_header::<RoutedRequestHeader>(|_, header| {
         *header = RoutedRequestHeader {
             command: Command::Request,
-            operation: Operation::InstallConsumerGroupOwner,
+            operation,
             client: u128::MAX,
             session: 1,
-            request: installation.metadata_op,
+            request: metadata_op,
             size: u32::try_from(size).unwrap(),
-            partition_incarnation: installation.incarnation,
-            metadata_watermark: installation.metadata_op,
+            partition_incarnation: incarnation,
+            metadata_watermark: metadata_op,
             ..Default::default()
         };
     });
@@ -158,9 +212,5 @@ pub(super) async fn install_group_owner<B: MessageBus + Clone>(
     let op = partition.consensus().sequencer().current_sequence();
     partition.consensus().advance_commit_max(op);
     partition.commit_journal(config).await;
-    assert_eq!(
-        partition.installed_consumer_group_owner(&installation),
-        Some(op)
-    );
     op
 }

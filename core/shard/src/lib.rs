@@ -418,7 +418,8 @@ pub enum PartitionReadReply {
     /// inbox is unavailable, or whose automatic commit cannot be admitted returns
     /// `TransientNotAccepted`, allowing the client to retry. Reads also return
     /// `TransientNotAccepted` when submission fails before reaching the owner
-    /// or while the partition requires state transfer.
+    /// or while the partition requires state transfer. A poll of an incarnation
+    /// whose delete fence committed returns `HistoryUnavailable`.
     Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).

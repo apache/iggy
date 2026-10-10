@@ -179,6 +179,11 @@ where
                     {
                         return Some(IggyError::TransientNotAccepted);
                     }
+                    // This node's metadata can lag a delete fence the partition
+                    // already applied, so it still authorizes the old incarnation.
+                    if partition.history_deleted() {
+                        return Some(IggyError::HistoryUnavailable);
+                    }
                     // The plan captures this owner in the same turn, and
                     // completion refuses an owner that changed since.
                     return match *consumer {
@@ -195,13 +200,13 @@ where
                     metadata: Some(metadata),
                     ..
                 } = &read
-                {
-                    return (!metadata
-                        .is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+                    && (!metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
                         || !metadata.matches_partition(self.shards_table.epoch_for(namespace)))
-                    .then_some(IggyError::TransientNotAccepted);
+                {
+                    return Some(IggyError::TransientNotAccepted);
                 }
-                None
+                (matches!(read, PartitionRead::Poll { .. }) && partition.history_deleted())
+                    .then_some(IggyError::HistoryUnavailable)
             })
             .unwrap_or_else(|| {
                 matches!(read, PartitionRead::PollOnPrimary { .. })

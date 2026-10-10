@@ -53,7 +53,7 @@ use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
 use super::test_support::{
-    PollTestMetadata, install_group_owner, partition_with_messages,
+    PollTestMetadata, delete_history, install_group_owner, partition_with_messages,
     partition_with_messages_at_revision, partitions_config,
 };
 use crate::metrics::ShardMetrics;
@@ -599,6 +599,161 @@ impl BoundPoll {
             .group_offset_state(&self.namespace, BOUND_GROUP)
             .unwrap()
     }
+}
+
+/// A replica applies the delete fence from its partition log, and its metadata
+/// can apply the delete later. Until then that metadata authorizes reads of the
+/// old incarnation, on a backup or on a primary elected after the fence. The
+/// partition refuses them before reading, and refuses a read captured before
+/// the fence when it completes.
+#[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_deleted_history_when_metadata_still_lists_the_partition_should_refuse_every_poll() {
+    const CLIENT: u128 = 41;
+    const USER: u32 = 7;
+    const DELETE_METADATA_OP: u64 = 10;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let (partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
+    let created_revision = partition.created_revision();
+    let mut topic = Topic::default();
+    topic.partitions.push(Partition::new(
+        0,
+        namespace.inner(),
+        IggyTimestamp::default(),
+        created_revision,
+        0,
+    ));
+    let mut stream = Stream::default();
+    stream.topics.insert(topic);
+    let mut inner = StreamsInner::default();
+    inner.items.insert(stream);
+    let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+    let (owner, _owner_sender) = owner_with_metadata(&bus, config.clone(), namespace, metadata);
+    owner.shards_table.insert(
+        namespace,
+        PartitionLocation::new(ShardId::new(0), created_revision),
+    );
+    let partitions = owner.plane.partitions();
+    partitions.insert(namespace, partition);
+    let mut table = ClientTable::new(1);
+    let registration = PrepareHeader {
+        client: CLIENT,
+        user_id: USER,
+        operation: Operation::Register,
+        op: 1,
+        ..Default::default()
+    };
+    table
+        .commit_register(
+            CLIENT,
+            USER,
+            [0x5a; 32],
+            build_reply_message_with(&registration, 0, |_| {}),
+        )
+        .unwrap();
+    let streams = owner.plane.metadata().mux_stm.streams();
+    let consumer = PollingConsumer::Consumer(USER as usize, 0);
+    let first = |auto_commit| PollingArgs::new(PollingStrategy::first(), 1, auto_commit);
+
+    let (late_reply, late_replies) = channel(1);
+    let late = owner
+        .poll_completions
+        .try_reserve(namespace, late_reply, None)
+        .expect("reserve the read before the fence");
+    let late_result = partitions
+        .build_poll_snapshot(&namespace, consumer, &first(false))
+        .expect("the partition holds a message")
+        .execute_resident();
+    let fence_op = delete_history(
+        partitions
+            .get_mut_by_ns(&namespace)
+            .expect("partition exists"),
+        &config,
+        DELETE_METADATA_OP,
+    )
+    .await;
+    late.complete(late_result);
+    let completion = owner
+        .poll_completions
+        .try_recv()
+        .expect("the late read reached its owner");
+    owner.on_poll_completed(*completion).await;
+    let reply = late_replies.try_recv();
+    assert!(
+        matches!(
+            reply,
+            Ok(PartitionReadReply::Rejected(IggyError::HistoryUnavailable))
+        ),
+        "a read captured before the fence must not return the deleted history, got {reply:?}"
+    );
+
+    for disk in [false, true] {
+        if disk {
+            partitions
+                .with_partition(&namespace, |partition| {
+                    partition.log.journal().inner.evict_prefix(1);
+                })
+                .expect("partition exists");
+            assert!(
+                partitions
+                    .build_poll_snapshot(&namespace, consumer, &first(false))
+                    .expect("partition exists")
+                    .needs_off_pump_io()
+            );
+        }
+        for auto_commit in [false, true] {
+            let metadata = streams
+                .poll_metadata(namespace, None, CLIENT)
+                .expect("metadata still lists the partition");
+            let reads = [
+                (
+                    "Poll",
+                    PartitionRead::Poll {
+                        consumer,
+                        args: first(auto_commit),
+                        metadata: Some(metadata),
+                    },
+                ),
+                (
+                    "PollOnPrimary",
+                    PartitionRead::PollOnPrimary {
+                        consumer,
+                        args: first(auto_commit),
+                        attachment: ConsumerAttachment {
+                            session: table.attach_session(CLIENT, 1, USER).unwrap(),
+                            metadata,
+                        },
+                    },
+                ),
+            ];
+            for (shape, read) in reads {
+                let (reply, replies) = channel(1);
+                owner.on_partition_read(namespace, read, reply).await;
+                let reply = replies.try_recv();
+                assert!(
+                    matches!(
+                        reply,
+                        Ok(PartitionReadReply::Rejected(IggyError::HistoryUnavailable))
+                    ),
+                    "{shape}, disk {disk}, auto_commit {auto_commit}: the read must be refused \
+                     before reading, got {reply:?}"
+                );
+            }
+        }
+    }
+    let (stored, _) = partitions
+        .consumer_offset_read(&namespace, consumer)
+        .expect("partition exists");
+    assert_eq!(stored, None);
+    partitions
+        .with_partition(&namespace, |partition| {
+            let consensus = partition.consensus();
+            assert_eq!(consensus.sequencer().current_sequence(), fence_op);
+            assert!(consensus.pipeline_is_empty());
+            assert_eq!(consensus.request_queue_len(), 0);
+        })
+        .expect("partition exists");
 }
 
 #[compio::test]
