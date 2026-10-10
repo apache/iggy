@@ -19,7 +19,7 @@ use crate::OutputFormat;
 use crate::buffer::FileBuffer;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_to_serde_json,
+    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_into_serde_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -42,7 +42,7 @@ struct JsonMessage<'a> {
 }
 
 pub(crate) fn format_message(
-    message: &ConsumedMessage,
+    message: ConsumedMessage,
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
     include_metadata: bool,
@@ -62,7 +62,7 @@ pub(crate) fn format_message(
 }
 
 fn format_json_message(
-    message: &ConsumedMessage,
+    message: ConsumedMessage,
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
     include_metadata: bool,
@@ -100,7 +100,7 @@ fn format_json_message(
         } else {
             None
         },
-        payload: payload_to_json_value(&message.payload),
+        payload: payload_to_json_value(message.payload),
     };
 
     serde_json::to_vec(&msg).map_err(|e| {
@@ -111,8 +111,8 @@ fn format_json_message(
     })
 }
 
-fn format_raw_message(message: &ConsumedMessage) -> Result<Vec<u8>, Error> {
-    message.payload.try_to_bytes().map_err(|e| {
+fn format_raw_message(message: ConsumedMessage) -> Result<Vec<u8>, Error> {
+    message.payload.try_into_vec().map_err(|e| {
         Error::CannotStoreData(format!(
             "Failed to extract raw bytes at offset {}: {e}",
             message.offset
@@ -165,23 +165,17 @@ fn serialize_headers(
     Value::Object(obj)
 }
 
-fn payload_to_json_value(payload: &Payload) -> Value {
-    match payload {
-        Payload::Json(value) => owned_value_to_serde_json(value),
-        Payload::Text(text) => Value::String(text.clone()),
-        Payload::Raw(bytes) => match serde_json::from_slice(bytes) {
+// Proto text holding JSON is written as the document it holds, like a native `json` batch.
+fn payload_to_json_value(payload: Payload) -> Value {
+    match payload.into_json_document() {
+        Payload::Json(value) => owned_value_into_serde_json(value),
+        Payload::Text(text) | Payload::Proto(text) => Value::String(text),
+        Payload::Raw(bytes) => match serde_json::from_slice(&bytes) {
             Ok(v) => v,
-            Err(_) => Value::String(base64_encode(bytes)),
+            Err(_) => Value::String(base64_encode(&bytes)),
         },
-        // Proto text holding JSON is the descriptor-less `proto_convert`
-        // fallback and is written as the document it holds, the way the same
-        // bytes were written when the batch was tagged `json`.
-        Payload::Proto(text) => match payload.json_document() {
-            Some(document) => owned_value_to_serde_json(document.as_ref()),
-            None => Value::String(text.clone()),
-        },
-        Payload::FlatBuffer(bytes) => Value::String(base64_encode(bytes)),
-        Payload::Avro(bytes) => Value::String(base64_encode(bytes)),
+        Payload::FlatBuffer(bytes) => Value::String(base64_encode(&bytes)),
+        Payload::Avro(bytes) => Value::String(base64_encode(&bytes)),
     }
 }
 
@@ -276,7 +270,7 @@ mod tests {
         let meta = make_messages_metadata();
 
         let bytes =
-            format_message(&msg, &topic, &meta, true, false, OutputFormat::JsonLines).unwrap();
+            format_message(msg, &topic, &meta, true, false, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(value["offset"], 42);
@@ -295,7 +289,7 @@ mod tests {
         let meta = make_messages_metadata();
 
         let bytes =
-            format_message(&msg, &topic, &meta, false, false, OutputFormat::JsonLines).unwrap();
+            format_message(msg, &topic, &meta, false, false, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(value.get("offset").is_none());
@@ -318,7 +312,7 @@ mod tests {
         let meta = make_messages_metadata();
 
         let bytes =
-            format_message(&msg, &topic, &meta, false, true, OutputFormat::JsonLines).unwrap();
+            format_message(msg, &topic, &meta, false, true, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(value["headers"].is_object());
@@ -330,8 +324,18 @@ mod tests {
         let payload = Payload::Proto(r#"{"id":1,"name":"row-1"}"#.to_string());
 
         assert_eq!(
-            payload_to_json_value(&payload),
+            payload_to_json_value(payload),
             serde_json::json!({"id": 1, "name": "row-1"})
+        );
+    }
+
+    #[test]
+    fn text_payload_holding_json_looking_content_stays_a_string() {
+        let payload = Payload::Text(r#"{"id":1}"#.to_string());
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String(r#"{"id":1}"#.to_string())
         );
     }
 
@@ -340,8 +344,45 @@ mod tests {
         let payload = Payload::Proto("name: \"row-1\"".to_string());
 
         assert_eq!(
-            payload_to_json_value(&payload),
+            payload_to_json_value(payload),
             Value::String("name: \"row-1\"".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_payload_holding_json_bytes_is_parsed() {
+        let payload = Payload::Raw(br#"{"id":1}"#.to_vec());
+
+        assert_eq!(payload_to_json_value(payload), serde_json::json!({"id": 1}));
+    }
+
+    #[test]
+    fn raw_payload_that_is_not_json_is_base64_encoded() {
+        let payload = Payload::Raw(vec![0xff, 0x00, 0x10]);
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("/wAQ".to_string())
+        );
+    }
+
+    #[test]
+    fn flatbuffer_payload_is_base64_encoded() {
+        let payload = Payload::FlatBuffer(vec![1, 2, 3]);
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("AQID".to_string())
+        );
+    }
+
+    #[test]
+    fn avro_payload_is_base64_encoded() {
+        let payload = Payload::Avro(vec![4, 5, 6]);
+
+        assert_eq!(
+            payload_to_json_value(payload),
+            Value::String("BAUG".to_string())
         );
     }
 
@@ -352,7 +393,7 @@ mod tests {
         let topic = make_topic_metadata();
         let meta = make_messages_metadata();
 
-        let bytes = format_message(&msg, &topic, &meta, true, false, OutputFormat::Raw).unwrap();
+        let bytes = format_message(msg, &topic, &meta, true, false, OutputFormat::Raw).unwrap();
         assert_eq!(bytes, b"hello world");
     }
 

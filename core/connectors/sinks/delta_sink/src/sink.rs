@@ -22,7 +22,8 @@ use crate::storage::build_storage_options;
 use async_trait::async_trait;
 use deltalake::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, owned_value_to_serde_json,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    owned_value_into_serde_json,
 };
 use tracing::{debug, error, info};
 
@@ -131,7 +132,7 @@ impl Sink for DeltaSink {
             messages_metadata.current_offset,
         );
 
-        let mut json_values = json_values(&messages)?;
+        let mut json_values = json_values(messages)?;
 
         if json_values.is_empty() {
             debug!("No JSON values to write");
@@ -199,17 +200,18 @@ impl Sink for DeltaSink {
 /// payload that has none. Proto text holding JSON is the descriptor-less
 /// `proto_convert` fallback and is written as the document it holds; proto
 /// text that is not JSON fails the batch like any other non-JSON payload.
-fn json_values(messages: &[ConsumedMessage]) -> Result<Vec<serde_json::Value>, Error> {
+fn json_values(messages: Vec<ConsumedMessage>) -> Result<Vec<serde_json::Value>, Error> {
     let mut json_values = Vec::with_capacity(messages.len());
     for message in messages {
-        let Some(document) = message.payload.json_document() else {
-            error!(
-                "Unsupported payload type: {}. Delta sink only supports JSON payloads.",
-                message.payload
-            );
-            return Err(Error::InvalidPayloadType);
-        };
-        json_values.push(owned_value_to_serde_json(document.as_ref()));
+        match message.payload.into_json_document() {
+            Payload::Json(document) => json_values.push(owned_value_into_serde_json(document)),
+            payload => {
+                error!(
+                    "Unsupported payload type: {payload}. Delta sink only supports JSON payloads."
+                );
+                return Err(Error::InvalidPayloadType);
+            }
+        }
     }
     Ok(json_values)
 }
@@ -238,7 +240,7 @@ mod tests {
             message(Payload::Proto(r#"{"id": 2}"#.to_owned())),
         ];
 
-        let values = json_values(&messages).expect("proto text holding JSON is a document");
+        let values = json_values(messages).expect("proto text holding JSON is a document");
 
         assert_eq!(
             values,
@@ -251,7 +253,21 @@ mod tests {
         let messages = vec![message(Payload::Proto("id: 2".to_owned()))];
 
         assert_eq!(
-            json_values(&messages).expect_err("proto text that is not JSON has no document"),
+            json_values(messages).expect_err("proto text that is not JSON has no document"),
+            Error::InvalidPayloadType
+        );
+    }
+
+    #[test]
+    fn json_values_rejects_a_batch_with_one_unsupported_payload_among_valid_ones() {
+        let messages = vec![
+            message(Payload::Json(simd_json::json!({"id": 1}))),
+            message(Payload::Raw(b"not json".to_vec())),
+            message(Payload::Json(simd_json::json!({"id": 3}))),
+        ];
+
+        assert_eq!(
+            json_values(messages).expect_err("one unsupported payload must fail the whole batch"),
             Error::InvalidPayloadType
         );
     }
