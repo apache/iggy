@@ -25,6 +25,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::{AckLevel, WireConsumer, WireIdentifier};
 use integration::harness::{TestHarness, disk};
 use integration::iggy_harness;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
@@ -189,10 +190,11 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
         .expect("pause one replica during group churn");
     for generation in 0..6 {
         let name = format!("quota-group-{generation}");
-        client
+        let group_id = client
             .create_consumer_group(&stream, &topic, &name)
             .await
-            .expect("create group");
+            .expect("create group")
+            .id;
         let group = Identifier::named(&name).expect("group identifier");
         client
             .join_consumer_group(&stream, &topic, &group)
@@ -208,29 +210,30 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
             )
             .await
             .expect("store valid group offset");
+        // The cleanup wait below would also pass if the store never reached
+        // disk.
+        wait_for_group_offset_ids(
+            harness,
+            leader,
+            stream_details.id,
+            topic_details.id,
+            "group offset file did not reach disk",
+            |ids| ids.contains(&group_id),
+        )
+        .await;
         client
             .delete_consumer_group(&stream, &topic, &group)
             .await
             .expect("delete group metadata");
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let ids = disk::consumer_offset_file_ids(
-                &harness.node(leader).data_path(),
-                stream_details.id,
-                topic_details.id,
-                PARTITION_ID,
-                ConsumerKind::ConsumerGroup,
-            )
-            .expect("group offset directory");
-            if ids.is_empty() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "replicated cleanup did not delete {ids:?}"
-            );
-            sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_group_offset_ids(
+            harness,
+            leader,
+            stream_details.id,
+            topic_details.id,
+            "replicated cleanup did not delete the group offset files",
+            BTreeSet::is_empty,
+        )
+        .await;
     }
     harness
         .restart_node(backup)
@@ -341,6 +344,35 @@ async fn wait_for_max_file_count(harness: &TestHarness, stream_id: u32, topic_id
             "consumer offset files did not converge at {max}: {counts:?}"
         );
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_group_offset_ids(
+    harness: &TestHarness,
+    node: usize,
+    stream_id: u32,
+    topic_id: u32,
+    failure: &str,
+    converged: impl Fn(&BTreeSet<u32>) -> bool,
+) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let ids = disk::consumer_offset_file_ids(
+            &harness.node(node).data_path(),
+            stream_id,
+            topic_id,
+            PARTITION_ID,
+            ConsumerKind::ConsumerGroup,
+        )
+        .expect("group offset directory");
+        if converged(&ids) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{failure}: node {node} holds {ids:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
     }
 }
 

@@ -19,14 +19,16 @@ use crate::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer offset module.
+///
+/// The HTTP transport cannot name a consumer kind, so every method refuses a
+/// [`ConsumerKind::ExternalGroup`](crate::ConsumerKind::ExternalGroup) consumer with
+/// [`IggyError::FeatureUnavailable`] there.
 #[async_trait]
 pub trait ConsumerOffsetClient {
     /// Store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
     /// A new key at the per-partition limit returns [`IggyError::TooManyConsumerOffsets`] (3024).
-    /// A queued store that outlives a partition history reset, such as purge, returns [`IggyError::InvalidOffset`] (4100), even if its numeric offset fits the replacement history.
-    /// This refusal is terminal. Re-evaluate the intended checkpoint against the current data before issuing a new store, rather than replaying the old request.
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -39,7 +41,10 @@ pub trait ConsumerOffsetClient {
     ///
     /// Authentication is required, and the permission to poll the messages.
     /// An absent offset key returns `Ok(None)` when its stream, topic, and consumer group resolve.
+    /// A replica unable to admit the request returns [`IggyError::TransientNotAccepted`].
     /// A local auto-commit cursor can be visible before its durable store commits.
+    /// In a cluster the node the client is connected to answers from its own replica of the partition.
+    /// That replica can be a backup that lags the partition's primary, so a read right after a store can return the previous offset.
     async fn get_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -54,8 +59,6 @@ pub trait ConsumerOffsetClient {
     /// Missing numeric and named groups return codes 5000 and 5003 respectively.
     /// A replica unable to admit the request returns [`IggyError::TransientNotAccepted`].
     /// Deletion does not allocate a new key and is allowed at the offset limit.
-    /// A queued delete that outlives a partition history reset, such as purge, returns [`IggyError::ConsumerOffsetNotFound`] (3021), even if a replacement checkpoint exists.
-    /// This refusal is terminal and preserves replacement progress. Re-evaluate which checkpoint to delete before issuing a new request.
     async fn delete_consumer_offset(
         &self,
         consumer: &Consumer,

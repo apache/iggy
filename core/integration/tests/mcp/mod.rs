@@ -88,7 +88,7 @@ async fn should_list_tools(harness: &TestHarness) {
         .expect("Failed to list tools");
 
     assert!(!tools.tools.is_empty());
-    assert_eq!(tools.tools.len(), 41);
+    assert_eq!(tools.tools.len(), 39);
 }
 
 #[iggy_harness(server(mcp))]
@@ -169,17 +169,6 @@ async fn should_delete_stream(harness: &TestHarness) {
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_purge_stream(harness: &TestHarness) {
-    let mcp_client = harness.mcp_client().await.expect("MCP client required");
-    invoke_empty(
-        &mcp_client,
-        "purge_stream",
-        Some(json!({"stream_id": seeds::names::STREAM})),
-    )
-    .await;
-}
-
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
 async fn should_return_list_of_topics(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let topics: Vec<Topic> = invoke(
@@ -248,17 +237,6 @@ async fn should_delete_topic(harness: &TestHarness) {
     invoke_empty(
         &mcp_client,
         "delete_topic",
-        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": seeds::names::TOPIC})),
-    )
-    .await;
-}
-
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_purge_topic(harness: &TestHarness) {
-    let mcp_client = harness.mcp_client().await.expect("MCP client required");
-    invoke_empty(
-        &mcp_client,
-        "purge_topic",
         Some(json!({"stream_id": seeds::names::STREAM, "topic_id": seeds::names::TOPIC})),
     )
     .await;

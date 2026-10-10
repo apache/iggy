@@ -24,7 +24,7 @@ internal static class CommandCodes
     internal const int GET_SNAPSHOT_CODE = 11;
     internal const int GET_CLUSTER_METADATA_CODE = 12;
     internal const int DESCRIBE_OPTIONS_CODE = 13;
-    internal const int ATTACH_CONSUMER_SESSION_CODE = 14;
+    internal const int BIND_SESSION_CODE = 15;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -56,13 +56,11 @@ internal static class CommandCodes
     internal const int CREATE_STREAM_CODE = 202;
     internal const int DELETE_STREAM_CODE = 203;
     internal const int UPDATE_STREAM_CODE = 204;
-    internal const int PURGE_STREAM_CODE = 205;
     internal const int GET_TOPIC_CODE = 300;
     internal const int GET_TOPICS_CODE = 301;
     internal const int CREATE_TOPIC_CODE = 302;
     internal const int DELETE_TOPIC_CODE = 303;
     internal const int UPDATE_TOPIC_CODE = 304;
-    internal const int PURGE_TOPIC_CODE = 305;
     internal const int CREATE_PARTITIONS_CODE = 402;
     internal const int DELETE_PARTITIONS_CODE = 403;
     internal const int DELETE_SEGMENTS_CODE = 503;

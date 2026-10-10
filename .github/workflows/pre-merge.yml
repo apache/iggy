@@ -40,7 +40,10 @@ jobs:
   # Common checks - always run
   common:
     name: Common checks
+    needs: detect
     uses: ./.github/workflows/_common.yml
+    with:
+      validate-third-party-licenses: ${{ needs.detect.outputs.third_party_licenses == 'true' }}
     permissions:
       contents: read
       pull-requests: read
@@ -224,7 +227,7 @@ jobs:
 
   # Final status check
   finalize_pr:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     needs: [common, detect, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:

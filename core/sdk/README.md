@@ -46,7 +46,7 @@ Run from your application crate. Use a release compatible with your server; for
 unreleased changes, build the SDK and server from the same source checkout.
 
 Cluster auto-commit polling requires servers that support consumer session
-attachment and primary poll routing (binary commands 14, 103 and 104).
+attachment and primary poll routing (binary commands 15, 103 and 104).
 Rust manual and interval offset writes also require command 123. It discovers
 the primary while allowing final commits for partitions awaiting handoff;
 stores and deletes retain their existing wire formats and deduplication keys. Pause
@@ -61,6 +61,17 @@ cargo add iggy
 ```
 
 All four transports are included; this crate declares no optional Cargo features.
+
+The durable session API adds required `session_identity` and `session_bind_secret`
+methods to `VsrSessionControl`. External transport implementations must provide
+them, retain their logical identity and bind proof across transport reconnects,
+and clear them on explicit logout. `VsrSessionSealed` is an implementation marker,
+not a restriction on external implementations. The bind proof is a bearer
+credential for internal session control and must never be logged or exposed.
+
+An established session has its own lifetime. Password or PAT changes and PAT
+expiry do not end it. Logout, session lease expiry, or user deactivation end the
+session and prevent its bind proof from restoring it.
 
 ## Quick start
 

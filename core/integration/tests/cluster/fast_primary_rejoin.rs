@@ -81,6 +81,7 @@ async fn create_stream_and_topic(harness: &TestHarness) {
         message_expiry: Some(IggyExpiry::NeverExpire),
         messages_required_to_save: Some(1),
         durability: iggy_common::Durability::Persisted,
+        consumer_offset_durability: iggy_common::Durability::Persisted,
         ..TopicCreateOptions::default()
     };
     setup_client

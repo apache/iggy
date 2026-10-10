@@ -49,6 +49,7 @@ const PARTITION_ID: u32 = 0;
 const CONSUMER_ID: u32 = 1;
 
 // `IggyError` discriminants (== the numeric `id` in the JSON error body).
+const UNAUTHENTICATED_ID: u64 = 40;
 const UNAUTHORIZED_ID: u64 = 41;
 const INVALID_CREDENTIALS_ID: u64 = 42;
 const CANNOT_DELETE_USER_ID: u64 = 48;
@@ -56,6 +57,7 @@ const CANNOT_CHANGE_PERMISSIONS_ID: u64 = 49;
 // The apply's `ChangePasswordResult::UserNotFound` maps to `ResourceNotFound`.
 const RESOURCE_NOT_FOUND_ID: u64 = 20;
 // Snake-case `IggyError` names (== the `code` string in the JSON error body).
+const UNAUTHENTICATED_CODE: &str = "unauthenticated";
 const UNAUTHORIZED_CODE: &str = "unauthorized";
 const INVALID_CREDENTIALS_CODE: &str = "invalid_credentials";
 const CANNOT_DELETE_USER_CODE: &str = "cannot_delete_user";
@@ -326,6 +328,95 @@ async fn given_http_requests_when_denied_should_carry_typed_status_and_body(harn
         "re-permission root",
     )
     .await;
+}
+
+#[iggy_harness]
+async fn given_unexpired_jwts_when_user_revoked_should_reject_reads_and_writes(
+    harness: &TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    let permissions = Permissions {
+        global: GlobalPermissions {
+            manage_streams: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let created = root
+        .create_user(
+            "revoked-http-user",
+            "revoked-http-password",
+            serde_json::to_value(permissions).unwrap(),
+        )
+        .await;
+    assert_eq!(created.status(), StatusCode::OK, "create active user");
+    let details: Value = created.json().await.expect("created user JSON");
+    let user_id = details["id"].as_u64().expect("created user id");
+    let user_path = format!("/users/{user_id}");
+    let established = root
+        .login("revoked-http-user", "revoked-http-password")
+        .await;
+    let unused_for_writes = root
+        .login("revoked-http-user", "revoked-http-password")
+        .await;
+    assert_ne!(established.token, unused_for_writes.token);
+
+    assert_eq!(
+        established
+            .post_json("/streams", &json!({ "name": "before-revocation" }))
+            .await
+            .status(),
+        StatusCode::OK,
+        "active user must establish a write session"
+    );
+    for credential in [&established, &unused_for_writes] {
+        assert_eq!(
+            credential.get("/streams").await.status(),
+            StatusCode::OK,
+            "both JWTs must authorize reads before revocation"
+        );
+    }
+
+    for revoked_state in ["inactive", "deleted"] {
+        let revoked = if revoked_state == "inactive" {
+            root.put_json(&user_path, &json!({ "status": "inactive" }))
+                .await
+        } else {
+            root.delete(&user_path).await
+        };
+        assert_eq!(
+            revoked.status(),
+            StatusCode::NO_CONTENT,
+            "mark user {revoked_state}"
+        );
+        for (kind, credential) in [
+            ("established", &established),
+            ("unused-for-writes", &unused_for_writes),
+        ] {
+            let context = format!("{kind} JWT for {revoked_state} user");
+            let read = credential.get("/streams").await;
+            let write = credential
+                .post_json(
+                    "/streams",
+                    &json!({ "name": format!("rejected-{revoked_state}-{kind}") }),
+                )
+                .await;
+            for (operation, response) in [("read", read), ("write", write)] {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{context}: {operation} must be rejected"
+                );
+                assert_error_body(
+                    response,
+                    UNAUTHENTICATED_ID,
+                    UNAUTHENTICATED_CODE,
+                    &format!("{context}: {operation}"),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 // === Authorized requests carry the SDK-hidden success status codes ==========

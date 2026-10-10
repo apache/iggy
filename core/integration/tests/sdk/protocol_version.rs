@@ -22,10 +22,12 @@
 //! frame carrying `IncompatibleProtocol` plus the accepted window; a body
 //! without a decodable prefix with `MalformedLogin` and a zero window.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireName,
 };
@@ -53,6 +55,7 @@ async fn given_incompatible_protocol_version_when_logging_in_should_receive_evic
         username: WireName::new(DEFAULT_ROOT_USERNAME).unwrap(),
         password: SecretString::from(DEFAULT_ROOT_PASSWORD),
         client_context: None,
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
     }
     .to_bytes();
 
@@ -63,6 +66,28 @@ async fn given_incompatible_protocol_version_when_logging_in_should_receive_evic
         (IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN),
     )
     .await;
+}
+
+#[iggy_harness]
+async fn given_out_of_range_version_with_no_credentials_when_logging_in_should_receive_incompatible_protocol(
+    harness: &TestHarness,
+) {
+    for protocol_version in [IGGY_PROTOCOL_VERSION_MIN - 1, IGGY_PROTOCOL_VERSION + 1] {
+        let body = ClientVersionInfo {
+            protocol_version,
+            sdk_name: WireName::new("rust-sdk").unwrap(),
+            sdk_version: WireName::new("0.0.1").unwrap(),
+        }
+        .to_bytes();
+
+        assert_login_evicted(
+            harness,
+            &body,
+            EVICTION_REASON_INCOMPATIBLE_PROTOCOL,
+            (IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN),
+        )
+        .await;
+    }
 }
 
 #[iggy_harness]
