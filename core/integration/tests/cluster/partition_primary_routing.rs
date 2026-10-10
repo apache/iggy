@@ -253,6 +253,92 @@ async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replica
     assert_replicated_offset(harness, &consumer, Some((GROUP_PAYLOADS.len() - 1) as u64)).await;
 }
 
+/// Every partition elects its own primary, so one producer writing several
+/// partitions can face a different primary per partition. A replica that is
+/// not the partition's primary refuses the send as not admitted; the SDK
+/// replays the refusal for its transient window (2s) and then moves its one
+/// session to another node. Alternating between two such partitions pays that
+/// window and a reconnect on every send, which caps a producer at a few sends
+/// per second. Polls already reach the primary without moving the session
+/// (`PollRouter`); sends must not move it either.
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[ignore = "#4436: a send to another partition's primary moves the session on every send"]
+async fn given_partitions_on_different_primaries_when_sending_round_robin_should_keep_the_session(
+    harness: &mut TestHarness,
+) {
+    const SECOND_PARTITION_ID: u32 = PARTITION_ID + 1;
+    const ROUND_ROBIN_SENDS: usize = 4;
+    let partitions = [PARTITION_ID, SECOND_PARTITION_ID];
+
+    // Partition 0 keeps its primary through the metadata-only election. A
+    // partition created afterwards is seeded from the metadata view, so its
+    // primary is the metadata leader.
+    let (partition_primary, metadata_primary, _) = seed_split_primaries(harness).await;
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let producer = harness
+        .root_client_for_node(metadata_primary)
+        .await
+        .unwrap();
+    producer
+        .create_partitions(&stream, &topic, 1)
+        .await
+        .expect("add a partition after the metadata-only election");
+    let mut primaries = Vec::new();
+    for partition_id in partitions {
+        primaries
+            .push(partition_primary_node(harness, &producer, &stream, &topic, partition_id).await);
+    }
+    assert_eq!(
+        primaries,
+        [partition_primary, metadata_primary],
+        "precondition: the two partitions must have their primaries on different nodes"
+    );
+
+    // The first send to each partition may have to find its primary.
+    for partition_id in partitions {
+        send_once(
+            &producer,
+            &stream,
+            &topic,
+            &Partitioning::partition_id(partition_id),
+        )
+        .await
+        .expect("warm-up send");
+    }
+
+    let node_of = |address: &str| {
+        (0..harness.cluster_size())
+            .find(|&node| harness.node(node).tcp_addr().unwrap().to_string() == address)
+            .unwrap_or_else(|| panic!("{address} is not a cluster node"))
+    };
+    let mut session_node = node_of(&producer.get_connection_info().await.server_address);
+    let mut sends = Vec::new();
+    for partition_id in partitions.into_iter().cycle().take(ROUND_ROBIN_SENDS) {
+        let started = Instant::now();
+        send_once(
+            &producer,
+            &stream,
+            &topic,
+            &Partitioning::partition_id(partition_id),
+        )
+        .await
+        .expect("round-robin send");
+        let elapsed = started.elapsed();
+        let landed = node_of(&producer.get_connection_info().await.server_address);
+        sends.push((partition_id, session_node, landed, elapsed));
+        session_node = landed;
+    }
+    let moved = sends.iter().filter(|(_, from, to, _)| from != to).count();
+    assert_eq!(
+        moved, 0,
+        "a producer alternating between partition {PARTITION_ID} (primary node \
+         {partition_primary}) and partition {SECOND_PARTITION_ID} (primary node \
+         {metadata_primary}) must keep its session; {moved} of {ROUND_ROBIN_SENDS} sends moved \
+         it to another node (partition, from node, to node, send time):\n{sends:?}"
+    );
+}
+
 #[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
 #[ignore = "requires Go; run this test explicitly with --ignored"]
 async fn given_split_primaries_when_go_group_auto_commits_should_preserve_membership(
@@ -999,6 +1085,49 @@ fn advance_backup_metadata_view(harness: &mut TestHarness, backup: usize) {
     .join()
     .expect("superblock writer thread");
     harness.restart_node(backup).expect("restart the backup");
+}
+
+/// The node that holds `partition_id`'s primary, as the server's poll routing
+/// reports it. The route is read once per attempt and never moves `client`.
+async fn partition_primary_node(
+    harness: &TestHarness,
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition_id: u32,
+) -> usize {
+    let poll = PollMessagesRequest {
+        consumer: consumer_to_wire(&Consumer::new(Identifier::numeric(1).unwrap())).unwrap(),
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id: Some(partition_id),
+        strategy: polling_strategy_to_wire(&PollingStrategy::next()),
+        count: 1,
+        auto_commit: true,
+    }
+    .to_bytes();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            match client
+                .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+                .await
+            {
+                Ok(response) => {
+                    let route = PollRoutingResponse::decode_from(&response).unwrap();
+                    return (0..harness.cluster_size())
+                        .find(|&node| {
+                            harness.node(node).tcp_addr().unwrap().port() == route.primary.tcp_port
+                        })
+                        .unwrap();
+                }
+                Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("partition {partition_id} route discovery failed: {error:?}"),
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("partition {partition_id} never reported a primary"))
 }
 
 /// One send, bounded. The SDK replays `TransientNotAccepted` and then hands the
