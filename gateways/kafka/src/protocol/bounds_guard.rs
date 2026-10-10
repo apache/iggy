@@ -26,8 +26,8 @@
 //! topics count requests ~481 GB; a 4-byte Metadata v0 frame requests ~143 GiB. No SASL/TLS gates
 //! any of `SUPPORTED_RANGES`, so this is reachable by anyone who can `connect()`.
 //!
-//! This module walks the same field shape `kafka_protocol`'s real decode walks for each of the
-//! eleven accepted message types, but only to validate every length-prefixed field (array count,
+//! This module walks the same field shape `kafka_protocol`'s real decode walks for each accepted
+//! message type, but only to validate every length-prefixed field (array count,
 //! string length, bytes length, tagged-field size) against what could still fit in the bytes
 //! remaining in the frame - it never materializes a value or allocates a collection. Call the
 //! matching `validate_*_shape` function before handing the body to `kafka_protocol`.
@@ -1178,6 +1178,110 @@ pub fn validate_offset_fetch_shape(
 /// reaches `parse_plain`, and what a future mechanism would carry into a credential exchange.
 const MAX_SASL_AUTH_BYTES: usize = 4096;
 
+/// Mirrors the field order `DescribeConfigsRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array or string length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_describe_configs_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 4;
+
+    let resources_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..resources_count {
+        let _resource_type = c.read_i8()?;
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let keys_count = if flexible {
+            c.compact_array_count_nullable()?
+        } else {
+            c.legacy_array_count_nullable()?
+        };
+        for _ in 0..keys_count {
+            if flexible {
+                c.compact_string(false)?;
+            } else {
+                c.legacy_string(false)?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    let _include_synonyms = c.read_bool()?;
+    if version >= 3 {
+        let _include_documentation = c.read_bool()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `AlterConfigsRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array or string length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_alter_configs_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 2;
+
+    let resources_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..resources_count {
+        let _resource_type = c.read_i8()?;
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let configs_count = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..configs_count {
+            if flexible {
+                c.compact_string(false)?;
+                c.compact_string(true)?;
+                c.tagged_fields()?;
+            } else {
+                c.legacy_string(false)?;
+                c.legacy_string(true)?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    let _validate_only = c.read_bool()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// `DescribeAcls` carries a fixed-shape filter: four enums and three nullable strings.
 ///
 /// No arrays and nothing echoed into the response, so there is no amplification to project. The
@@ -1772,6 +1876,39 @@ mod tests {
         assert_decodes(4, &body);
         assert!(validate_leave_group_shape(4, &body, 8 * 1024 * 1024).is_ok());
         assert!(validate_leave_group_shape(4, &body, 1_024).is_err());
+    }
+
+    /// `validate_describe_configs_shape` and `validate_alter_configs_shape` had no POC of their
+    /// own before this - every sibling guard above pins a rejection for both the legacy
+    /// (`i32`) and flexible (compact varint) count forms, and these two never did.
+    #[test]
+    fn describe_configs_v1_huge_legacy_count_rejected() {
+        let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_describe_configs_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The flexible (v4+) sibling of the legacy test above: a huge compact-array-count varint
+    /// for `resources` on its own, exceeding `MAX_COLLECTION_LEN` regardless of what bytes
+    /// remain in the frame.
+    #[test]
+    fn describe_configs_v4_huge_compact_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
+        assert!(validate_describe_configs_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn alter_configs_v0_huge_legacy_count_rejected() {
+        let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        assert!(validate_alter_configs_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The flexible (v2+) sibling of the legacy test above: a huge compact-array-count varint
+    /// for `resources` on its own, exceeding `MAX_COLLECTION_LEN` regardless of what bytes
+    /// remain in the frame.
+    #[test]
+    fn alter_configs_v2_huge_compact_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
+        assert!(validate_alter_configs_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

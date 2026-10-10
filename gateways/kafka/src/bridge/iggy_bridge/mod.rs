@@ -40,7 +40,7 @@ use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
-pub use topics::{KafkaTopicMetadata, TopicCreationOutcome};
+pub use topics::{KafkaTopicMetadata, StreamTopicCache, TopicCreationOutcome, TopicLoad};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///
@@ -187,6 +187,16 @@ impl IggyBridge {
             stream_id: Identifier::named(stream_name).map_err(BridgeError::Iggy)?,
             topic_id: Identifier::named(topic_name).map_err(BridgeError::Iggy)?,
         })
+    }
+
+    /// Iggy stream and topic names `kafka_topic` resolves to.
+    ///
+    /// Callers have already checked the Kafka name. Retention synonym memory is
+    /// keyed by this pair.
+    #[must_use]
+    pub(crate) fn topic_identity(&self, kafka_topic: &str) -> (String, String) {
+        let (stream, topic) = self.config.topic_mapping.resolve(kafka_topic);
+        (stream.to_string(), topic.to_string())
     }
 
     /// Tears down the underlying Iggy client, including its background heartbeat task.
