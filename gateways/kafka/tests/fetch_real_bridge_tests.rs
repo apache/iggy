@@ -258,8 +258,14 @@ async fn fetch_on(
     request
         .encode(&mut body, VERSION)
         .expect("the request encodes at this version");
-    let handled =
-        handle_connection_request(state, connection, API_KEY_FETCH, VERSION, body.freeze());
+    let handled = handle_connection_request(
+        state,
+        connection,
+        None,
+        API_KEY_FETCH,
+        VERSION,
+        body.freeze(),
+    );
     let mut response = tokio::time::timeout(PROMPT, handled)
         .await
         .expect("records or an error answer at once")

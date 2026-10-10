@@ -1,18 +1,18 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, OffsetCommit and OffsetFetch use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DescribeConfigs and AlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
 
 > **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
-> CreateTopics, OffsetCommit and OffsetFetch use Iggy. With the bridge off (the default), those
+> CreateTopics, DescribeConfigs and AlterConfigs use Iggy. With the bridge off (the default), those
 > seven are stubs: Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6),
-> CreateTopics answers `NOT_CONTROLLER` (41), OffsetCommit and OffsetFetch answer retriable
-> `COORDINATOR_LOAD_IN_PROGRESS` (14), and Metadata reports every requested topic unknown.
-> **CreateTopics runs as the bridge's own
+> CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), and Metadata reports
+> every requested topic unknown. **CreateTopics and AlterConfigs run as the bridge's own
 > Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that
-> can reach this port can create topics (up to 1000 partitions each). OffsetCommit creates Iggy
-> resources too: a consumer group `kafka.cg.<group>` per group id and topic, which nothing deletes
-> ([cleanup](docs/OFFSET_STORAGE.md#limits)). Every client reads and writes as the bridge's Iggy
-> user. See [docs/SCOPE.md](docs/SCOPE.md).
+> can reach this port can create topics (up to 1000 partitions each) or shorten a topic's
+> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With SASL on,
+> `AlterConfigs` additionally requires the authenticated principal to hold `manage_topics`; without
+> it every resource in the request fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written.
+> Every client reads and writes as the bridge's Iggy user. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
@@ -193,6 +193,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
+- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs and AlterConfigs for topic `retention.ms`
 
 ### Delivery guarantees
 
@@ -307,7 +308,8 @@ a topic per call) for `ListOffsets`, probes and polls partitions for Fetch, and 
 group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
 ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
-([#3538](https://github.com/apache/iggy/issues/3538)), OffsetCommit and OffsetFetch
+([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs and AlterConfigs , OffsetCommit and OffsetFetchcall it.
+Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
 ([#3542](https://github.com/apache/iggy/issues/3542)) call it.
 Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
 `tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
@@ -487,9 +489,9 @@ call created it." A *different* `partition_count` against an already-existing to
 two concurrent callers requesting different counts for the same topic must not both see success.
 
 Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
-default. Nothing is bounding retention until it's configured explicitly (Iggy's own topic options,
-outside this bridge today); repointing a Kafka app that assumes bounded retention onto this bridge
-will accumulate data indefinitely unless you set that up yourself.
+default. `AlterConfigs` can set that expiry afterwards through `retention.ms`
+([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does, messages never expire, so a Kafka app
+that assumes the 7-day default will accumulate data on this bridge.
 
 They also use Iggy's default **durability**, `Durability::Replicated` - quorum commit without an
 additional stable-storage barrier, with the disk write itself threshold-gated (flushed at 1024
@@ -499,9 +501,9 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-- One `IggyClient` serves Produce, Metadata and CreateTopics for every Kafka connection, one Iggy
-  request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more. Offset
-  calls use 8 more: a commit client and a read client per offset slot.
+- One `IggyClient` serves Produce, Metadata, CreateTopics, DescribeConfigs and AlterConfigs for
+  every Kafka connection, one Iggy request at a time. Fetch polls use 4 more, one per read slot.
+  Topic probes use 1 more. Offset  calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
 - `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in

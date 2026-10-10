@@ -20,6 +20,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
 use kafka_protocol::messages::add_partitions_to_txn_request::*;
+use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::create_topics_request::*;
 use kafka_protocol::messages::delete_records_request::*;
 use kafka_protocol::messages::delete_topics_request::*;
@@ -556,6 +557,15 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .with_resources(vec![r])
                 .encode(&mut buf, version)
                 .context("DescribeConfigs")?;
+        }
+        33 => {
+            let resource = AlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("test-topic"));
+            AlterConfigsRequest::default()
+                .with_resources(vec![resource])
+                .encode(&mut buf, version)
+                .context("AlterConfigs")?;
         }
         36 => {
             SaslAuthenticateRequest::default()

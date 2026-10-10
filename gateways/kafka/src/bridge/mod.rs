@@ -17,10 +17,9 @@
 
 //! Iggy SDK integration layer.
 //!
-//! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning,
-//! high-watermark lookups and group offsets, and translates Iggy errors to Kafka wire error codes.
-//! `ListOffsets`, Produce, Fetch, Metadata, `CreateTopics`, `OffsetCommit` and `OffsetFetch` call
-//! it.
+//! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
+//! high-watermark lookups, group and translates Iggy errors to Kafka wire error codes. `ListOffsets`,
+//! Produce, Fetch, Metadata, `CreateTopics`, `OffsetCommit`, `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
 
 pub mod config;
 pub mod error;
@@ -30,7 +29,7 @@ pub mod topic_map;
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig};
 pub use error::BridgeError;
 pub use iggy_bridge::{
-    IggyBridge, KafkaTopicMetadata, OFFSET_GROUP_PREFIX, OffsetCalls, TopicCreationOutcome,
-    TopicTarget,
+    IggyBridge, KafkaTopicMetadata, OFFSET_GROUP_PREFIX, OffsetCalls, StreamTopicCache,
+    TopicCreationOutcome, TopicLoad, TopicTarget,
 };
 pub use topic_map::{TopicMapping, TopicOverride};
