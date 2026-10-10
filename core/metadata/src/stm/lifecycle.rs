@@ -79,7 +79,20 @@ pub struct LifecycleIntent {
     remaining_partitions: usize,
 }
 
+/// The stream, the topic (`None` for a stream-wide intent) and the metadata op
+/// of one pending intent. A stream-wide intent sorts before the topic-scoped
+/// intents of its stream.
+pub(crate) type LifecycleScope = (usize, Option<usize>, u64);
+
 impl LifecycleIntent {
+    pub(crate) fn scope(&self, metadata_op: u64) -> LifecycleScope {
+        (
+            self.stream_id as usize,
+            self.topic_id.map(|id| id as usize),
+            metadata_op,
+        )
+    }
+
     pub(crate) fn rebuild_partition_index(&mut self) {
         self.partition_index = self
             .partitions
@@ -315,18 +328,32 @@ impl StreamsInner {
             })
     }
 
+    /// A poll asks this twice, so it walks only the stream-wide intents of
+    /// `stream_id` and the intents of the requested topic, or of every topic
+    /// when `topic_id` is `None`.
     fn lifecycle_blockers(
         &self,
         stream_id: usize,
         topic_id: Option<usize>,
     ) -> impl Iterator<Item = &LifecycleIntent> {
-        self.lifecycle_intents.values().filter(move |intent| {
-            !self.finalizing_lifecycle
-                && intent.stream_id as usize == stream_id
-                && (intent.topic_id.is_none()
-                    || topic_id.is_none()
-                    || intent.topic_id.map(|id| id as usize) == topic_id)
-        })
+        let (first_topic, last_topic) = topic_id.map_or((0, usize::MAX), |id| (id, id));
+        let stream_wide = (stream_id, None, 0)..=(stream_id, None, u64::MAX);
+        let topic_scoped =
+            (stream_id, Some(first_topic), 0)..=(stream_id, Some(last_topic), u64::MAX);
+        self.lifecycle_scopes
+            .range(stream_wide)
+            .chain(self.lifecycle_scopes.range(topic_scoped))
+            .filter(move |_| !self.finalizing_lifecycle)
+            .filter_map(move |(_, _, op)| self.lifecycle_intents.get(op))
+    }
+
+    /// Keeps `lifecycle_scopes` exact, also when `op` already holds an intent.
+    fn insert_lifecycle(&mut self, op: u64, intent: LifecycleIntent) {
+        let scope = intent.scope(op);
+        if let Some(replaced) = self.lifecycle_intents.insert(op, intent) {
+            self.lifecycle_scopes.remove(&replaced.scope(op));
+        }
+        self.lifecycle_scopes.insert(scope);
     }
 
     /// Called after command validation, before its destructive metadata effect.
@@ -414,8 +441,7 @@ impl StreamsInner {
             remaining_partitions: 0,
         };
         intent.rebuild_partition_index();
-        self.lifecycle_intents
-            .insert(self.apply_context.metadata_op, intent);
+        self.insert_lifecycle(self.apply_context.metadata_op, intent);
         self.revision = self.revision.wrapping_add(1);
         Some(ApplyReply::ok(Bytes::new()))
     }
@@ -462,6 +488,9 @@ impl StateHandler for CompleteLifecycleRequest {
             return ApplyReply::ok(Bytes::new());
         }
         let mut intent = entry.remove();
+        state
+            .lifecycle_scopes
+            .remove(&intent.scope(self.metadata_op));
         let stream_id = WireIdentifier::numeric(intent.stream_id);
         let topic_id = WireIdentifier::numeric(intent.topic_id.unwrap_or_default());
         let context = state.apply_context;
@@ -499,7 +528,7 @@ impl StateHandler for CompleteLifecycleRequest {
                 }
             }
             intent.remaining_partitions += recorded.len();
-            state.lifecycle_intents.insert(self.metadata_op, intent);
+            state.insert_lifecycle(self.metadata_op, intent);
         } else if matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. })
             && let Some(topic) = intent.topic_id.and_then(|topic_id| {
                 state
@@ -1481,5 +1510,162 @@ mod tests {
                 .all(|target| target.partition_op.is_none())
         );
         assert_eq!(intent.remaining_partitions, 2);
+    }
+
+    #[test]
+    fn given_lifecycle_changes_when_applied_should_keep_scope_index_exact() {
+        const STREAM_DELETE_OP: u64 = INTENT_OP + 10;
+        let streams = streams();
+        streams.seed_namespace(IggyNamespace::new(1, 0, 0), 3, 0);
+        let create = CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: WireName::new("group").unwrap(),
+        };
+        let create_context = ApplyContext {
+            metadata_op: INTENT_OP - 1,
+            ..context()
+        };
+        let reply = apply(
+            &streams,
+            Operation::CreateConsumerGroup,
+            &create,
+            create_context,
+        );
+        assert_eq!(reply.code, 0);
+        let delete_group = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(0),
+        };
+        let reply = apply(
+            &streams,
+            Operation::DeleteConsumerGroup,
+            &delete_group,
+            context(),
+        );
+        assert_eq!(reply.code, 0);
+        let delete_stream = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(1),
+        };
+        let stream_context = ApplyContext {
+            metadata_op: STREAM_DELETE_OP,
+            ..context()
+        };
+        let reply = apply(
+            &streams,
+            Operation::DeleteStream,
+            &delete_stream,
+            stream_context,
+        );
+        assert_eq!(reply.code, 0);
+        let scopes = |streams: &Streams| streams.read(|inner| inner.lifecycle_scopes.clone());
+        let both = BTreeSet::from([(0, Some(0), INTENT_OP), (1, None, STREAM_DELETE_OP)]);
+        assert_eq!(scopes(&streams), both, "begin");
+
+        complete(&streams, 0, 12);
+        assert_eq!(scopes(&streams), both, "partial completion");
+
+        let mut restored = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
+        assert_eq!(restored.lifecycle_scopes, both, "restore");
+
+        // The group cannot vanish while its deletion is pending, so the test
+        // removes it directly to make the finalization fail and reopen.
+        restored.items[0].topics[0].consumer_groups.remove(&0);
+        let last = CompleteLifecycleRequest::new(INTENT_OP, 0, vec![completion(1, 23)]).unwrap();
+        assert_ne!(last.apply(&mut restored, IggyTimestamp::now()).code, 0);
+        assert_eq!(restored.lifecycle_scopes, both, "reopen");
+        assert!(restored.lifecycle_blocks_consumer(0, 0, Some(0)));
+
+        complete(&streams, 1, 23);
+        let remaining = BTreeSet::from([(1, None, STREAM_DELETE_OP)]);
+        assert_eq!(scopes(&streams), remaining, "final completion");
+
+        let mut reused = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
+        let mut replacement = reused.lifecycle_intents[&STREAM_DELETE_OP].clone();
+        replacement.stream_id = 0;
+        replacement.topic_id = Some(0);
+        reused.insert_lifecycle(STREAM_DELETE_OP, replacement);
+        assert_eq!(
+            reused.lifecycle_scopes,
+            BTreeSet::from([(0, Some(0), STREAM_DELETE_OP)]),
+            "reused op"
+        );
+    }
+
+    #[test]
+    fn given_intents_in_other_scopes_when_querying_one_stream_should_find_only_its_blockers() {
+        const TOPIC_ONE_OP: u64 = INTENT_OP;
+        const TOPIC_TWO_OP: u64 = INTENT_OP + 1;
+        const OTHER_TOPIC_OP: u64 = INTENT_OP + 2;
+        const STREAM_OP: u64 = INTENT_OP + 3;
+        let streams = streams();
+        streams.seed_namespace(IggyNamespace::new(0, 1, 0), 3, 0);
+        streams.seed_namespace(IggyNamespace::new(0, 2, 0), 4, 0);
+        streams.seed_namespace(IggyNamespace::new(1, 0, 0), 5, 0);
+        streams.seed_namespace(IggyNamespace::new(2, 0, 0), 6, 0);
+        for (op, stream_id, topic_id) in [
+            (TOPIC_ONE_OP, 0, 1),
+            (TOPIC_TWO_OP, 0, 2),
+            (OTHER_TOPIC_OP, 2, 0),
+        ] {
+            let request = DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(stream_id),
+                topic_id: WireIdentifier::numeric(topic_id),
+            };
+            let context = ApplyContext {
+                metadata_op: op,
+                ..context()
+            };
+            let reply = apply(&streams, Operation::DeleteTopic, &request, context);
+            assert_eq!(reply.code, 0, "op {op}");
+        }
+        let request = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(1),
+        };
+        let context = ApplyContext {
+            metadata_op: STREAM_OP,
+            ..context()
+        };
+        let reply = apply(&streams, Operation::DeleteStream, &request, context);
+        assert_eq!(reply.code, 0);
+
+        let blockers = |inner: &StreamsInner, stream_id, topic_id| {
+            inner
+                .lifecycle_blockers(stream_id, topic_id)
+                .map(|intent| intent.context.metadata_op)
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            (0, Some(0), vec![]),
+            (0, Some(1), vec![TOPIC_ONE_OP]),
+            (0, Some(2), vec![TOPIC_TWO_OP]),
+            (0, None, vec![TOPIC_ONE_OP, TOPIC_TWO_OP]),
+            (1, Some(0), vec![STREAM_OP]),
+            (1, None, vec![STREAM_OP]),
+            (2, Some(0), vec![OTHER_TOPIC_OP]),
+            (2, Some(1), vec![]),
+            (3, None, vec![]),
+        ];
+        let found = streams.read(|inner| {
+            cases
+                .iter()
+                .map(|&(stream_id, topic_id, _)| blockers(inner, stream_id, topic_id))
+                .collect::<Vec<_>>()
+        });
+        for ((stream_id, topic_id, expected), found) in cases.into_iter().zip(found) {
+            assert_eq!(found, expected, "stream {stream_id} topic {topic_id:?}");
+        }
+        assert!(!streams.lifecycle_blocks_consumer(0, 0, None));
+        let topic_creation = streams.read(|inner| {
+            [0, 1, 2].map(|stream_id| inner.lifecycle_blocks_topic_creation(stream_id))
+        });
+        assert_eq!(topic_creation, [false, true, false]);
+
+        let mut inner = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
+        assert_eq!(blockers(&inner, 1, Some(0)), [STREAM_OP]);
+        inner.finalizing_lifecycle = true;
+        assert_eq!(blockers(&inner, 0, None), [] as [u64; 0]);
+        assert_eq!(blockers(&inner, 1, Some(0)), [] as [u64; 0]);
     }
 }

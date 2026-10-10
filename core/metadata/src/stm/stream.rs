@@ -21,7 +21,9 @@ use crate::stm::consumer_group::{
     RefreshConsumerGroupSessionRequest, RemoveConsumerGroupMemberRequest,
 };
 use crate::stm::id_slab::IdSlab;
-use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleAction, LifecycleIntent};
+use crate::stm::lifecycle::{
+    CompleteLifecycleRequest, LifecycleAction, LifecycleIntent, LifecycleScope,
+};
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, TruncatePartitionResult,
@@ -33,7 +35,7 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 // Only `seed_namespace` (sim/test-gated) uses this at module scope, so keep the
 // import under the same gate. The test module re-imports it independently.
 #[cfg(any(test, feature = "simulator"))]
@@ -777,6 +779,9 @@ define_state! {
         // partition incarnations.
         pub namespace_revision: u64,
         pub lifecycle_intents: BTreeMap<u64, LifecycleIntent>,
+        // The keys of `lifecycle_intents` ordered by stream and topic, so a
+        // blocker query visits only its own scope. Rebuilt on restore.
+        pub(crate) lifecycle_scopes: BTreeSet<LifecycleScope>,
         pub(crate) finalizing_lifecycle: bool,
         // Rebuilt after membership changes and restore; ticks visit only open transitions.
         pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
@@ -2835,12 +2840,17 @@ impl StreamsInner {
         for intent in lifecycle_intents.values_mut() {
             intent.rebuild_partition_index();
         }
+        let lifecycle_scopes = lifecycle_intents
+            .iter()
+            .map(|(&op, intent)| intent.scope(op))
+            .collect();
         let mut inner = Self {
             index,
             items,
             revision: snapshot.revision,
             namespace_revision: snapshot.namespace_revision,
             lifecycle_intents,
+            lifecycle_scopes,
             finalizing_lifecycle: false,
             // Recomputed from the restored groups just below.
             pending_revocations: BTreeMap::new(),
