@@ -90,7 +90,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1572,7 +1572,7 @@ where
             PendingCheckpoint::Enqueue(through, ref synced_index) => {
                 let barriers = synced_index
                     .iter()
-                    .map(CheckpointBarrier::already_synced)
+                    .map(FileSyncBarrier::already_synced)
                     .collect();
                 let (files, directories) = self.persistence_checkpoint_files(config);
                 if let Some(persistence) = &self.persistence {
@@ -12073,7 +12073,13 @@ mod tests {
         let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
             .await
             .unwrap();
-        assert_eq!(writer.save_indexes_buffered_at(vec![1; 32], 0).await.unwrap(), 32);
+        assert_eq!(
+            writer
+                .save_indexes_buffered_at(vec![1; 32], 0)
+                .await
+                .unwrap(),
+            32
+        );
         let active = partition.log.index_writers().len() - 1;
         partition.log.index_writers_mut()[active] = Some(Rc::new(writer));
         let offsets = crate::state_transfer::ConsumerOffsetsWire {

@@ -4036,18 +4036,22 @@ where
                                     source,
                                 });
                             }
-                            if let Some(crate::iggy_partition::PendingPartitionTransition::Install(
-                                mut install,
-                            )) = self.transition.take()
+                            if let Some(
+                                crate::iggy_partition::PendingPartitionTransition::Install(
+                                    mut install,
+                                ),
+                            ) = self.transition.take()
                             {
-                            let error = PartitionInstallError::SwapIo {
-                                path: install.partition_dir.clone(),
-                                source,
-                            };
-                            self.fail_install(&mut install, error);
-                            self.transition = Some(
-                                crate::iggy_partition::PendingPartitionTransition::Install(install),
-                            );
+                                let error = PartitionInstallError::SwapIo {
+                                    path: install.partition_dir.clone(),
+                                    source,
+                                };
+                                self.fail_install(&mut install, error);
+                                self.transition = Some(
+                                    crate::iggy_partition::PendingPartitionTransition::Install(
+                                        install,
+                                    ),
+                                );
                             }
                         }
                     } else {

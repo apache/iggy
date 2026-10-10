@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
 use crate::FILE_SYNC_CONCURRENCY;
+use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
 use futures::TryStreamExt;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::ConsumerKind;
