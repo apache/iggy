@@ -7376,6 +7376,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_mongodb_source"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "futures",
+ "humantime",
+ "iggy_connector_sdk",
+ "mongodb",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_postgres_sink"
 version = "0.5.1-edge.1"
 dependencies = [
