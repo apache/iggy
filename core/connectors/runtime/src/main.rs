@@ -182,7 +182,6 @@ fn print_config_env_vars() -> std::io::Result<()> {
         let plugin_config = format!("{prefix}{PLUGIN_CONFIG_ENV_SEGMENT}<FIELD>");
         templates
             .iter()
-            .filter(|template| !matches!(template.env_name, "KEY" | "VERSION"))
             .map(move |template| format!("{prefix}{}", template.env_name))
             .chain(std::iter::once(plugin_config))
     });
