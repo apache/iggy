@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import Listbox from '../Listbox.svelte';
   import Input from '../Input.svelte';
   import { z } from 'zod';
@@ -28,8 +28,8 @@ under the License.
   import PasswordInput from '../PasswordInput.svelte';
   import Button from '../Button.svelte';
   import PermissionsManager from '../PermissionsManager.svelte';
-  import type { Stream } from '$lib/domain/Stream';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import type { Stream } from '#lib/domain/Stream.js';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 

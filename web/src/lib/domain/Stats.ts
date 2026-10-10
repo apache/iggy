@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { formatDate, formatRuntime } from '$lib/utils/formatters/dateFormatter';
+import { formatDate, formatRuntime } from '#lib/utils/formatters/dateFormatter.js';
 
 type StatsStringItem = { name: string; value: string; rawValue: string | number };
 type StatsNumberItem = { name: string; value: number };

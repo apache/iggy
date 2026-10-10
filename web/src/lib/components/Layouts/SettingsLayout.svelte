@@ -19,10 +19,10 @@ under the License.
 
 <script lang="ts">
   import { twMerge } from 'tailwind-merge';
-  import type { iconType } from '$lib/components/Icon.svelte';
-  import Icon from '$lib/components/Icon.svelte';
+  import type { iconType } from '#lib/components/Icon.svelte';
+  import Icon from '#lib/components/Icon.svelte';
 
-  import { typedRoute } from '$lib/types/appRoutes';
+  import { typedRoute } from '#lib/types/appRoutes.js';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   interface Props {
@@ -41,19 +41,19 @@ under the License.
       tab: 'server',
       icon: 'adjustments',
       name: 'Server',
-      path: typedRoute('/dashboard/settings/server')
+      path: typedRoute('dashboard/settings/server')
     },
     {
       tab: 'webUI',
       icon: 'settings',
       name: 'Web UI',
-      path: typedRoute('/dashboard/settings/webUI')
+      path: typedRoute('dashboard/settings/webUI')
     },
     {
       tab: 'users',
       icon: 'usersGroup',
       name: 'Users',
-      path: typedRoute('/dashboard/settings/users')
+      path: typedRoute('dashboard/settings/users')
     }
   ] satisfies { tab: Tabs; name: string; icon: iconType; path: string }[];
 </script>

@@ -15,32 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import adapterNode from '@sveltejs/adapter-node';
-import adapterStatic from '@sveltejs/adapter-static';
-import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+import { defineEnvVars } from '@sveltejs/kit/env';
 
-// Use static adapter when STATIC_BUILD env is set (for embedding in Rust server)
-const useStaticAdapter = process.env.STATIC_BUILD === 'true';
-
-/** @type {import('@sveltejs/kit').Config} */
-const config = {
-  kit: {
-    adapter: useStaticAdapter
-      ? adapterStatic({
-          pages: 'build/static',
-          assets: 'build/static',
-          fallback: 'index.html'
-        })
-      : adapterNode({
-          out: 'build'
-        }),
-    paths: {
-      base: useStaticAdapter ? '/ui' : ''
-    },
-    csrf: {
-      trustedOrigins: ['*']
-    }
-  },
-  preprocess: vitePreprocess()
-};
-export default config;
+export const variables = defineEnvVars({
+  PUBLIC_IGGY_API_URL: { public: true, schema: (input) => input ?? '' }
+});

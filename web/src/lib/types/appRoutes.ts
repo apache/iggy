@@ -17,7 +17,7 @@
 
 type SettingsSegment = `settings/${'server' | 'users' | 'terminal' | 'webUI'}`;
 
-type DashboardRoutes = `/dashboard/${
+type DashboardRoutes = `dashboard/${
   | 'overview'
   | 'streams'
   | `streams/${number}`
@@ -27,7 +27,7 @@ type DashboardRoutes = `/dashboard/${
   | 'logs'
   | SettingsSegment}`;
 
-type AuthRoutes = `/auth/${'sign-in' | 'logout'}`;
+type AuthRoutes = `auth/${'sign-in' | 'logout'}`;
 
 export const typedRoute = <const T extends DashboardRoutes | AuthRoutes>(route: T) => route;
 export const publicRoutes = ['/auth/sign-in', '/auth/logout', '/auth/test'] as const;
