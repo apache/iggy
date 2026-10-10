@@ -34,14 +34,13 @@ export const Operation = {
   RemoveConsumerGroupMember: 66,
   CompleteConsumerGroupRevocation: 67,
   TruncatePartition: 68,
+  FinalizeSession: 70,
   CreateStream: 128,
   UpdateStream: 129,
   DeleteStream: 130,
-  PurgeStream: 131,
   CreateTopic: 132,
   UpdateTopic: 133,
   DeleteTopic: 134,
-  PurgeTopic: 135,
   CreatePartitions: 136,
   DeletePartitions: 137,
   DeleteSegments: 138,
@@ -58,7 +57,8 @@ export const Operation = {
   LeaveConsumerGroup: 149,
   SendMessages: 160,
   StoreConsumerOffset: 161,
-  DeleteConsumerOffset: 162
+  DeleteConsumerOffset: 162,
+  RetireSession: 166
 } as const;
 
 const INTERNAL_START = 64;
@@ -83,11 +83,9 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.CreateStream, Operation.CreateStream],
   [COMMAND_CODE.DeleteStream, Operation.DeleteStream],
   [COMMAND_CODE.UpdateStream, Operation.UpdateStream],
-  [COMMAND_CODE.PurgeStream, Operation.PurgeStream],
   [COMMAND_CODE.CreateTopic, Operation.CreateTopic],
   [COMMAND_CODE.DeleteTopic, Operation.DeleteTopic],
   [COMMAND_CODE.UpdateTopic, Operation.UpdateTopic],
-  [COMMAND_CODE.PurgeTopic, Operation.PurgeTopic],
   [COMMAND_CODE.CreatePartitions, Operation.CreatePartitions],
   [COMMAND_CODE.DeletePartitions, Operation.DeletePartitions],
   [COMMAND_CODE.DeleteSegments, Operation.DeleteSegments],
@@ -108,9 +106,10 @@ const KNOWN_OPERATIONS: ReadonlySet<number> =
 export const isKnownOperation = (operation: number): boolean =>
   KNOWN_OPERATIONS.has(operation);
 
-/** Internal band, never client-sent. */
+/** Replica-only operations, never client-sent. */
 export const isInternal = (operation: number): boolean =>
-  operation >= INTERNAL_START && operation < METADATA_START;
+  (operation >= INTERNAL_START && operation < METADATA_START) ||
+    operation === Operation.RetireSession;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:
@@ -119,7 +118,7 @@ export const isInternal = (operation: number): boolean =>
  * `Operation::is_metadata`.
  */
 export const isMetadata = (operation: number): boolean => {
-  if (isInternal(operation)) return true;
+  if (isInternal(operation) && operation < Operation.SendMessages) return true;
   if (operation === Operation.DeleteSegments) return false;
   return operation >= METADATA_START &&
     operation <= Operation.LeaveConsumerGroup;

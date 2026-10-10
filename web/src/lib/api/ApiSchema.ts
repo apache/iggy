@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { GlobalPermissions, StreamPermissions } from '$lib/domain/Permissions';
-import type { KeysToSnakeCase } from '$lib/utils/utilTypes';
+import type { GlobalPermissions, StreamPermissions } from '#lib/domain/Permissions.js';
+import type { KeysToSnakeCase } from '#lib/utils/utilTypes.js';
 
 type Permissions = {
   global: KeysToSnakeCase<GlobalPermissions>;

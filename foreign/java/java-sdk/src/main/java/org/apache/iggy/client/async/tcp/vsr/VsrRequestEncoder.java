@@ -43,6 +43,23 @@ public final class VsrRequestEncoder {
         this.session = session;
     }
 
+    public static ByteBuf bindSession(
+            ByteBufAllocator alloc, long clientLow, long clientHigh, long session, long watermark, byte[] bindSecret) {
+        return VsrLoginCodec.bindSession(alloc, clientLow, clientHigh, session, watermark, bindSecret);
+    }
+
+    public ByteBuf bindSession(ByteBufAllocator alloc) {
+        synchronized (session) {
+            return bindSession(
+                    alloc,
+                    session.clientIdLow(),
+                    session.clientIdHigh(),
+                    session.boundSession(),
+                    session.metadataWatermark(),
+                    session.bindSecret());
+        }
+    }
+
     /**
      * Builds the full request frame. The caller keeps ownership of
      * {@code payload}; its reader index is not advanced.
@@ -55,17 +72,17 @@ public final class VsrRequestEncoder {
         boolean releaseBody = false;
 
         if (commandCode == LOGIN_USER_CODE || commandCode == LOGIN_REGISTER_CODE) {
-            body = VsrLoginCodec.rewriteUserLogin(alloc, payload);
+            requestId = session.beginRegister();
+            body = VsrLoginCodec.rewriteUserLogin(alloc, payload, session.bindSecret());
             releaseBody = true;
             operation = VsrOperation.REGISTER;
-            requestId = session.beginRegister();
             sessionId = 0;
         } else if (commandCode == LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
                 || commandCode == LOGIN_REGISTER_WITH_PAT_CODE) {
-            body = VsrLoginCodec.rewritePatLogin(alloc, payload);
+            requestId = session.beginRegister();
+            body = VsrLoginCodec.rewritePatLogin(alloc, payload, session.bindSecret());
             releaseBody = true;
             operation = VsrOperation.REGISTER;
-            requestId = session.beginRegister();
             sessionId = 0;
         } else {
             body = payload;
@@ -77,9 +94,8 @@ public final class VsrRequestEncoder {
                 requestId = session.nextCorrelationId();
                 sessionId = session.sessionOrZero();
             } else {
-                // Partition ops consume the dedup counter too, even though no
-                // partition-plane dedup exists yet: dedup needs each send to
-                // carry a distinct number, and the metadata watermark
+                // Partition ops consume the dedup counter too: dedup needs each
+                // send to carry a distinct number, and the metadata watermark
                 // tolerates the gaps.
                 sessionId = session.boundSession();
                 requestId = session.nextRequestId();

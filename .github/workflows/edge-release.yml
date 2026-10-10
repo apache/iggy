@@ -44,7 +44,7 @@ jobs:
 
   create-prerelease:
     name: Create edge pre-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: build-artifacts
     if: needs.build-artifacts.result == 'success' && !github.event.repository.fork
     permissions:

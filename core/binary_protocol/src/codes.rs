@@ -26,7 +26,8 @@ pub const GET_STATS_CODE: u32 = 10;
 pub const GET_SNAPSHOT_FILE_CODE: u32 = 11;
 pub const GET_CLUSTER_METADATA_CODE: u32 = 12;
 pub const DESCRIBE_OPTIONS_CODE: u32 = 13;
-pub const ATTACH_CONSUMER_SESSION_CODE: u32 = 14;
+// Code 14 is retired.
+pub const BIND_SESSION_CODE: u32 = 15;
 pub const GET_ME_CODE: u32 = 20;
 pub const GET_CLIENT_CODE: u32 = 21;
 pub const GET_CLIENTS_CODE: u32 = 22;
@@ -53,7 +54,7 @@ pub const LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE: u32 = 44;
 // -- Messages --
 pub const POLL_MESSAGES_CODE: u32 = 100;
 pub const SEND_MESSAGES_CODE: u32 = 101;
-pub const FLUSH_UNSAVED_BUFFER_CODE: u32 = 102;
+// 102 was FLUSH_UNSAVED_BUFFER. Never reuse it: older clients still send it.
 pub const GET_POLL_ROUTING_CODE: u32 = 103;
 pub const POLL_MESSAGES_ON_PRIMARY_CODE: u32 = 104;
 
@@ -71,7 +72,7 @@ pub const GET_STREAMS_CODE: u32 = 201;
 pub const CREATE_STREAM_CODE: u32 = 202;
 pub const DELETE_STREAM_CODE: u32 = 203;
 pub const UPDATE_STREAM_CODE: u32 = 204;
-pub const PURGE_STREAM_CODE: u32 = 205;
+// 205 was PURGE_STREAM. Never reuse it.
 
 // -- Topics --
 pub const GET_TOPIC_CODE: u32 = 300;
@@ -79,7 +80,7 @@ pub const GET_TOPICS_CODE: u32 = 301;
 pub const CREATE_TOPIC_CODE: u32 = 302;
 pub const DELETE_TOPIC_CODE: u32 = 303;
 pub const UPDATE_TOPIC_CODE: u32 = 304;
-pub const PURGE_TOPIC_CODE: u32 = 305;
+// 305 was PURGE_TOPIC. Never reuse it.
 
 // -- Partitions --
 pub const CREATE_PARTITIONS_CODE: u32 = 402;
@@ -112,13 +113,15 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
+    const RETIRED_CODES: &[u32] = &[14, 102, 205, 305];
+
     const ALL_CODES: &[u32] = &[
         PING_CODE,
         GET_STATS_CODE,
         GET_SNAPSHOT_FILE_CODE,
         GET_CLUSTER_METADATA_CODE,
         DESCRIBE_OPTIONS_CODE,
-        ATTACH_CONSUMER_SESSION_CODE,
+        BIND_SESSION_CODE,
         GET_ME_CODE,
         GET_CLIENT_CODE,
         GET_CLIENTS_CODE,
@@ -141,7 +144,6 @@ mod tests {
         GET_POLL_ROUTING_CODE,
         POLL_MESSAGES_ON_PRIMARY_CODE,
         SEND_MESSAGES_CODE,
-        FLUSH_UNSAVED_BUFFER_CODE,
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
         DELETE_CONSUMER_OFFSET_CODE,
@@ -151,13 +153,11 @@ mod tests {
         CREATE_STREAM_CODE,
         DELETE_STREAM_CODE,
         UPDATE_STREAM_CODE,
-        PURGE_STREAM_CODE,
         GET_TOPIC_CODE,
         GET_TOPICS_CODE,
         CREATE_TOPIC_CODE,
         DELETE_TOPIC_CODE,
         UPDATE_TOPIC_CODE,
-        PURGE_TOPIC_CODE,
         CREATE_PARTITIONS_CODE,
         DELETE_PARTITIONS_CODE,
         DELETE_SEGMENTS_CODE,
@@ -196,5 +196,15 @@ mod tests {
     #[test]
     fn unknown_code_returns_error() {
         assert!(command_name(9999).is_err());
+    }
+
+    #[test]
+    fn retired_codes_remain_unknown() {
+        for &code in RETIRED_CODES {
+            assert!(
+                command_name(code).is_err(),
+                "retired command code {code} must not be reused"
+            );
+        }
     }
 }

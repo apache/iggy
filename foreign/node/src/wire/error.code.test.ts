@@ -19,8 +19,23 @@ import assert from 'node:assert/strict';
 import { it } from 'node:test';
 import { translateErrorCode } from './error.code.js';
 
+it('translates the partitions capacity error', () => {
+  assert.equal(translateErrorCode(2022), 'Partitions limit reached, raise [metadata] partitions_max');
+});
+
+it('reports an unknown outcome for an aged-out request', () => {
+  assert.equal(
+    translateErrorCode(85),
+    'Request is below the deduplication window; outcome unknown, resending may duplicate the write'
+  );
+});
+
 it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
+});
+
+it('translates a partition history change', () => {
+  assert.equal(translateErrorCode(3014), 'Partition history changed after the request was resolved');
 });
 
 it('translates the consumer-group error range', () => {

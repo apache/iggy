@@ -26,8 +26,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serial_test::serial;
+use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::{IggyBridge, TopicMapping, TopicOverride};
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     BrokerAdvertise, ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
@@ -160,6 +162,8 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
         false,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     );
     (state, seed)
 }
@@ -245,7 +249,7 @@ async fn a_null_topics_array_against_an_empty_bridge_lists_nothing() {
     let (state, _seed) = connected_state(&server).await;
 
     let topics = send(&state, None).await;
-    assert!(topics.is_empty());
+    assert_eq!(topics, []);
 }
 
 #[tokio::test]
@@ -280,6 +284,8 @@ async fn a_named_lookup_reports_the_kafka_side_name_through_a_topic_mapping_over
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
         false,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     );
 
     let topics = send(&state, Some(&["orders"])).await;
@@ -311,7 +317,14 @@ async fn a_response_projected_over_max_frame_size_closes_instead_of_answering() 
 
     // 50 partitions * 64 bytes/partition (this crate's own conservative per-partition estimate)
     // = 3200 bytes, comfortably over a 512-byte max_frame_size.
-    let tiny_state = GatewayState::new(state.broker, state.bridge, 512, false);
+    let tiny_state = GatewayState::new(
+        state.broker,
+        state.bridge,
+        512,
+        false,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+    );
     let body = build_request(Some(&["orders"]));
     let outcome = metadata::handle(&tiny_state, REQUEST_VERSION, body).await;
     assert!(outcome.is_close(), "expected Close, got {outcome:?}");
@@ -337,7 +350,14 @@ async fn an_all_topics_response_over_max_frame_size_truncates_instead_of_closing
     // 50 partitions * 64 bytes/partition (this crate's own conservative per-partition estimate)
     // = 3200 bytes, comfortably over a 512-byte max_frame_size - so the catalog as a whole cannot
     // fit, but neither topic's own partition count is malformed or attacker-shaped.
-    let tiny_state = GatewayState::new(state.broker, state.bridge, 512, false);
+    let tiny_state = GatewayState::new(
+        state.broker,
+        state.bridge,
+        512,
+        false,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+    );
     let topics = send(&tiny_state, None).await;
     assert!(
         topics.len() < 2,

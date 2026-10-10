@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { formatDate } from '$lib/utils/formatters/dateFormatter';
+import { formatDate } from '#lib/utils/formatters/dateFormatter.js';
 
 export type User = {
   id: number;

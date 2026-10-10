@@ -33,8 +33,10 @@ use kafka_protocol::records::{
     RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
 use serial_test::serial;
+use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_PRODUCE, BrokerAdvertise, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
@@ -76,6 +78,8 @@ async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayStat
         Some(Arc::new(bridge)),
         MAX_FRAME_SIZE,
         false,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
 }
 
@@ -379,7 +383,7 @@ async fn given_two_batches_in_one_blob_when_handled_should_answer_invalid_record
         produce(&state, 3, 1, TOPIC, &entries).await,
         vec![(0, ERROR_INVALID_RECORD, -1)]
     );
-    assert!(stored(&server, 0, 10).await.is_empty());
+    assert_eq!(stored(&server, 0, 10).await, []);
 }
 
 #[tokio::test]

@@ -43,6 +43,7 @@ mod wire;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -55,12 +56,12 @@ use axum::http::{HeaderName, HeaderValue, Method, StatusCode, Version, header::C
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
-use compio::net::TcpListener;
+use compio::net::{TcpListener, TcpStream};
 use configs::cluster::{ClusterConfig, http_forwarding_key_material};
 use configs::http::{HttpConfig, HttpCorsConfig};
 use configs::server::ServerConfig;
 use iggy_common::IggyError;
-use message_bus::client_listener;
+use message_bus::{ConnectionCap, ConnectionPermit, client_listener};
 use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
@@ -72,9 +73,9 @@ use crate::http::handlers::{
     delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
     get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
     get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
-    login_with_personal_access_token, logout_user, ping, poll_messages, purge_stream, purge_topic,
-    refresh_token, send_messages, store_consumer_offset, update_permissions, update_stream,
-    update_topic, update_user,
+    login_with_personal_access_token, logout_user, ping, poll_messages, refresh_token,
+    send_messages, store_consumer_offset, update_permissions, update_stream, update_topic,
+    update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -189,6 +190,9 @@ impl PreparedHttp {
 /// serve loop, see [`mod@tls`]), plain HTTP otherwise; the listener stops
 /// when the bus shutdown token fires.
 ///
+/// Both paths count every accepted socket in `connections`, the node's cap on
+/// client sockets, and close a socket past it at accept.
+///
 /// `roster` is shard 0's own [`ClusterRoster`], so the HTTP and binary
 /// cluster-metadata reads serve one truth.
 ///
@@ -200,11 +204,13 @@ impl PreparedHttp {
 pub fn start(
     bound: BoundHttp,
     shard: &Rc<ServerShard>,
+    session_liveness: Rc<RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
     http_config: &HttpConfig,
     clients_table_max: usize,
     max_tokens_per_user: u32,
     server_config: Arc<ServerConfig>,
     roster: Rc<ClusterRoster>,
+    connections: &Rc<ConnectionCap>,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
     let BoundHttp {
@@ -221,6 +227,7 @@ pub fn start(
             },
     } = bound;
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
+        session_liveness,
         shard: Rc::clone(shard),
         jwt,
         server_config,
@@ -244,19 +251,24 @@ pub fn start(
 
     if http_config.tls.enabled {
         let server_config = tls::load_http_tls_server_config(&http_config.tls)?;
-        let (connections, pump) = tls::spawn_accept_pump(
+        let (handshaken, pump) = tls::spawn_accept_pump(
             listener,
             server_config,
+            Rc::clone(connections),
             shard.bus.config().handshake_grace,
             shard.bus.token(),
         );
         shard.bus.track_background(pump);
         info!(address = %bound_addr, "server HTTPS listener started");
-        let handle = compio::runtime::spawn(tls::serve(connections, app, shard.bus.token()));
+        let handle = compio::runtime::spawn(tls::serve(handshaken, app, shard.bus.token()));
         shard.bus.track_background(handle);
     } else {
         info!(address = %bound_addr, "server HTTP listener started");
         let shutdown = shard.bus.token();
+        let listener = CappedListener {
+            listener,
+            connections: Rc::clone(connections),
+        };
         let handle = compio::runtime::spawn(async move {
             if let Err(error) = cyper_axum::serve(
                 listener,
@@ -282,12 +294,58 @@ pub fn start(
 /// `ConnectInfo<ClientAddr>` extension per connection instead. Handlers read
 /// it through the `Identity` extractor's `client_ip`, which picks the
 /// advertised address a client is told about - never authorization.
-#[derive(Debug, Clone, Copy)]
-pub struct ClientAddr(pub SocketAddr);
+///
+/// It also holds the connection's slot in the node's connection cap. The
+/// per-connection service owns this value, so the slot frees when hyper drops
+/// the connection.
+#[derive(Debug, Clone)]
+pub struct ClientAddr {
+    pub addr: SocketAddr,
+    _permit: Option<Arc<ConnectionPermit>>,
+}
 
-impl Connected<cyper_axum::IncomingStream<'_, TcpListener>> for ClientAddr {
-    fn connect_info(stream: cyper_axum::IncomingStream<'_, TcpListener>) -> Self {
-        Self(*stream.remote_addr())
+impl Connected<cyper_axum::IncomingStream<'_, CappedListener>> for ClientAddr {
+    fn connect_info(stream: cyper_axum::IncomingStream<'_, CappedListener>) -> Self {
+        stream.remote_addr().clone()
+    }
+}
+
+/// The plain HTTP listener behind the node's connection cap. A socket past
+/// the cap is closed at accept.
+pub struct CappedListener {
+    listener: TcpListener,
+    connections: Rc<ConnectionCap>,
+}
+
+impl cyper_axum::Listener for CappedListener {
+    type Io = TcpStream;
+    /// The permit is `None` only for the listener's own local address.
+    type Addr = ClientAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            // The `TcpListener` impl retries accept errors, and waits a second
+            // after one that is not about the connection, such as `EMFILE`.
+            let (stream, addr) = cyper_axum::Listener::accept(&mut self.listener).await;
+            if let Some(permit) = self.connections.try_acquire() {
+                let permit = Some(Arc::new(permit));
+                return (
+                    stream,
+                    ClientAddr {
+                        addr,
+                        _permit: permit,
+                    },
+                );
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        let addr = self.listener.local_addr()?;
+        Ok(ClientAddr {
+            addr,
+            _permit: None,
+        })
     }
 }
 
@@ -458,7 +516,6 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
             "/streams/{stream_id}",
             get(get_stream).put(update_stream).delete(delete_stream),
         )
-        .route("/streams/{stream_id}/purge", delete(purge_stream))
         .route(
             "/streams/{stream_id}/topics",
             get(get_topics).post(create_topic),
@@ -466,10 +523,6 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         .route(
             "/streams/{stream_id}/topics/{topic_id}",
             get(get_topic).put(update_topic).delete(delete_topic),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/purge",
-            delete(purge_topic),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/partitions",

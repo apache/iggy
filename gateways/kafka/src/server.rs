@@ -33,15 +33,18 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::auth::{AuthError, FailedLoginThrottle, SaslAuthenticator};
+use crate::auth::{AuthError, AuthenticatedPrincipal, FailedLoginThrottle, SaslAuthenticator};
 use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::protocol::api::{
-    API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise, DEFAULT_KAFKA_PORT,
-    ERROR_ILLEGAL_SASL_STATE, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
+    API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
+    ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
+    ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
     ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    decode_sasl_auth_bytes, decode_sasl_mechanism, encode_error_for_key, handle_request_bounded,
-    sasl_authenticate_outcome, sasl_handshake_outcome,
+    SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter, decode_sasl_auth_bytes,
+    decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
+    respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
 };
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
@@ -116,6 +119,14 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
+    /// Consumer-group timeouts and capacity caps. No environment variable maps onto these yet;
+    /// Kafka's own defaults apply.
+    pub group: GroupCoordinatorConfig,
+    /// This gateway's number among the gateways fronting one Iggy cluster
+    /// (`IGGY_KAFKA_INSTANCE_ID`). It is the high half of every producer id handed out by
+    /// `InitProducerId`, which Kafka requires to be cluster-unique; two gateways left on the
+    /// same number hand out the same ids.
+    pub instance_id: u16,
     /// Require SASL authentication before serving any other API.
     ///
     /// Off by default, and switching it on is a breaking change for every client already talking
@@ -164,6 +175,8 @@ impl Default for GatewayConfig {
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
+            group: GroupCoordinatorConfig::default(),
+            instance_id: 0,
             sasl_enabled: false,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
@@ -317,36 +330,28 @@ impl KafkaGateway {
         listener: TcpListener,
         mut shutdown: broadcast::Receiver<()>,
     ) -> Result<()> {
-        if !self.config.sasl_enabled && self.authenticator.is_some() {
-            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
-            // flag is off means every connection is served unauthenticated, with nothing in the log
-            // to say so. Refusing to start is the only way that failure is visible.
-            return Err(KafkaProtocolError::InvalidConfig(
-                "an authenticator is configured but SASL is disabled; every connection would be \
-                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
-                 authenticator"
-                    .into(),
-            ));
-        }
-        if self.config.sasl_enabled && self.authenticator.is_none() {
-            return Err(KafkaProtocolError::InvalidConfig(
-                "SASL is enabled but no authenticator is configured; every client would be \
-                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
-                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
-                    .into(),
-            ));
-        }
+        self.check_sasl_wiring()?;
         let local_addr = listener.local_addr()?;
         let broker = BrokerAdvertise::from_server_config(&self.config, local_addr)?;
+        // instance_id is logged because it is the only way to tell from a running process which
+        // half of the producer-id space this gateway owns. Two gateways left on the default
+        // collide silently, and a config file cannot be diffed against a live deployment.
         info!(
-            "kafka listener bound on {} (advertised as {}:{})",
-            local_addr, broker.host, broker.port
+            "kafka listener bound on {} (advertised as {}:{}, instance id {})",
+            local_addr, broker.host, broker.port, self.config.instance_id
         );
+        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits until
+        // `idle_timeout` (or forever if that is raised). Created before the state so the group
+        // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
+        // otherwise hold the drain open for a full rebalance timeout.
+        let cancel = CancellationToken::new();
         let state = Arc::new(GatewayState::new(
             broker,
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.sasl_enabled,
+            self.config.instance_id,
+            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         ));
 
         let shared_auth = Arc::new(SharedAuth::new(
@@ -355,9 +360,6 @@ impl KafkaGateway {
         ));
         let tracker = TaskTracker::new();
         let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
-        // Cancelled on shutdown so connection tasks exit instead of sitting in idle waits
-        // until `idle_timeout` (or forever if that is raised).
-        let cancel = CancellationToken::new();
 
         let drain_timeout = self.config.shutdown_drain_timeout;
 
@@ -434,6 +436,30 @@ impl KafkaGateway {
         }
         Ok(())
     }
+
+    /// Refuses to start when the SASL flag and the configured authenticator disagree.
+    fn check_sasl_wiring(&self) -> Result<()> {
+        if !self.config.sasl_enabled && self.authenticator.is_some() {
+            // The mirror of the guard below, and the quieter mistake: a verifier attached while the
+            // flag is off means every connection is served unauthenticated, with nothing in the log
+            // to say so. Refusing to start is the only way that failure is visible.
+            return Err(KafkaProtocolError::InvalidConfig(
+                "an authenticator is configured but SASL is disabled; every connection would be \
+                 served unauthenticated. Set IGGY_KAFKA_SASL_ENABLED=true, or remove the \
+                 authenticator"
+                    .into(),
+            ));
+        }
+        if self.config.sasl_enabled && self.authenticator.is_none() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "SASL is enabled but no authenticator is configured; every client would be \
+                 rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials are \
+                 verified against, or unset IGGY_KAFKA_SASL_ENABLED"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Cancel in-flight connections, close the tracker to new spawns, and wait for tasks to finish
@@ -475,6 +501,7 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 struct ConnectionContext<'a> {
     config: &'a GatewayConfig,
     state: &'a GatewayState,
+    connection: &'a ConnectionState,
     authenticator: Option<&'a dyn SaslAuthenticator>,
     auth_slots: &'a Semaphore,
     failed_logins: &'a FailedLoginThrottle,
@@ -489,6 +516,7 @@ struct ConnectionContext<'a> {
 async fn route_frame(
     ctx: &ConnectionContext<'_>,
     sasl_state: &mut SaslState,
+    principal: &mut Option<AuthenticatedPrincipal>,
     req: &RequestHeader,
     body: Bytes,
 ) -> HandleOutcome {
@@ -509,9 +537,20 @@ async fn route_frame(
         mechanism.as_deref(),
     );
     match action {
+        // Answered here rather than in the stateless dispatch, because it describes the principal
+        // this connection authenticated as, which only the connection knows. Gated on the feature
+        // as well as the key: with SASL off there is no principal, and the key is not advertised,
+        // so it falls through to ordinary dispatch and is refused as the unlisted key it is.
+        SaslAction::Dispatch
+            if ctx.config.sasl_enabled && req.request_api_key == API_KEY_DESCRIBE_ACLS =>
+        {
+            describe_acls(principal.as_ref(), req.request_api_version, body, peer)
+        }
         SaslAction::Dispatch => {
-            handle_request_bounded(
+            handle_connection_request(
                 ctx.state,
+                ctx.connection,
+                principal.as_ref(),
                 req.request_api_key,
                 req.request_api_version,
                 body,
@@ -525,8 +564,11 @@ async fn route_frame(
             // peer repeat a rejected version forever, resetting the pre-authentication read budget
             // on every frame and holding a `max_connections` permit with it.
             sasl_state.count_api_versions_answer();
-            handle_request_bounded(
+            // Pre-authentication by construction: no principal exists yet at this point.
+            handle_connection_request(
                 ctx.state,
+                ctx.connection,
+                None,
                 req.request_api_key,
                 req.request_api_version,
                 body,
@@ -562,11 +604,12 @@ async fn route_frame(
             HandleOutcome::Close
         }
         SaslAction::Authenticate => {
-            let outcome = authenticate_token(ctx, req.request_api_version, body).await;
+            let (outcome, verified) = authenticate_token(ctx, req.request_api_version, body).await;
             // Only a plain `Respond` is success: every refusal path answers with
             // `RespondThenClose`, so the state advances on exactly the accepting branch.
             if matches!(outcome, HandleOutcome::Respond(_)) {
                 *sasl_state = SaslState::Authenticated;
+                *principal = verified;
             }
             outcome
         }
@@ -603,9 +646,12 @@ async fn handle_connection(
     } else {
         SaslState::Authenticated
     };
+    let mut principal: Option<AuthenticatedPrincipal> = None;
+    let connection = ConnectionState::default();
     let ctx = ConnectionContext {
         config: &config,
         state: &state,
+        connection: &connection,
         authenticator: shared_auth.authenticator.as_deref(),
         auth_slots: &shared_auth.slots,
         failed_logins: &shared_auth.failed_logins,
@@ -640,7 +686,7 @@ async fn handle_connection(
         // supports, so `decode` cannot fail on the version argument itself; any error here is a
         // malformed header and closes the connection.
         let mut body = frame;
-        let req = RequestHeader::decode(&mut body, req_hdr_ver)
+        let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
             .map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
 
         debug!(
@@ -651,10 +697,15 @@ async fn handle_connection(
             client_id = req.client_id.as_deref().unwrap_or(""),
             "received request"
         );
+        // A group request can park for a whole rebalance timeout. `client_id` and the tagged
+        // fields are views into the frame, so keeping them would pin the frame for that long
+        // after the handler has let go of its own copy.
+        req.client_id = None;
+        req.unknown_tagged_fields.clear();
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
-        let outcome = route_frame(&ctx, &mut sasl_state, &req, body).await;
+        let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
         if dispatch_outcome(
             &mut stream,
             &peer,
@@ -680,9 +731,14 @@ async fn authenticate_token(
     ctx: &ConnectionContext<'_>,
     api_version: i16,
     body: Bytes,
-) -> HandleOutcome {
+) -> (HandleOutcome, Option<AuthenticatedPrincipal>) {
     let peer = ctx.peer;
-    let failed = || sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true);
+    let failed = || {
+        (
+            sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true),
+            None,
+        )
+    };
 
     let Some(authenticator) = ctx.authenticator else {
         // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
@@ -704,7 +760,7 @@ async fn authenticate_token(
     // fatal, and a correct password retried after the delay must still get through.
     if ctx.failed_logins.is_blocked(peer.ip()) {
         debug!(%peer, "SASL authentication refused: peer is throttled after a rejected login");
-        return HandleOutcome::Close;
+        return (HandleOutcome::Close, None);
     }
 
     // The connection loop only watches the shutdown token between frames, so a verification in
@@ -712,7 +768,7 @@ async fn authenticate_token(
     let verified = tokio::select! {
         () = ctx.cancel.cancelled() => {
             debug!(%peer, "SASL authentication abandoned by shutdown");
-            return HandleOutcome::Close;
+            return (HandleOutcome::Close, None);
         }
         verified = verify_within_budget(ctx, authenticator, &credentials) => verified,
     };
@@ -721,14 +777,17 @@ async fn authenticate_token(
         // Overloaded or timed out. Close rather than answer 58: a Kafka client treats that code as
         // fatal and surfaces it to the application, and nothing here says the credentials were
         // wrong. A close reads as a transport failure, which is retriable.
-        return HandleOutcome::Close;
+        return (HandleOutcome::Close, None);
     };
 
     match result {
-        Ok(()) => {
+        Ok(authenticated) => {
             debug!(%peer, "SASL authentication succeeded");
             ctx.failed_logins.record_success(peer.ip());
-            sasl_authenticate_outcome(api_version, ERROR_NONE, false)
+            (
+                sasl_authenticate_outcome(api_version, ERROR_NONE, false),
+                Some(authenticated),
+            )
         }
         // A rejection is the client's problem and is terminal, so it earns a parseable 58.
         Err(AuthError::Rejected) => {
@@ -743,7 +802,57 @@ async fn authenticate_token(
         // the account exists.
         Err(AuthError::Unavailable) => {
             warn!(%peer, "SASL authentication could not be completed; Iggy is unreachable");
-            HandleOutcome::Close
+            (HandleOutcome::Close, None)
+        }
+    }
+}
+
+/// Answers `DescribeAcls` from the permissions captured when this connection authenticated.
+///
+/// Only reachable on an authenticated connection: the SASL gate refuses every key but one before a
+/// principal exists, and the caller additionally gates this on the feature being on, so a gateway
+/// with SASL off never routes here. The `None` arm is a fail-closed guard, not a reachable path.
+fn describe_acls(
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+    peer: &SocketAddr,
+) -> HandleOutcome {
+    let Some(principal) = principal else {
+        // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching this
+        // means the routing guards above disagree with each other, which is a gateway fault and not
+        // something a client can provoke.
+        error!(%peer, "DescribeAcls reached a connection with no authenticated principal");
+        // Not `encode_error_for_key`: key 29 is absent from `SUPPORTED_RANGES`, so that helper
+        // always returns `Close` here and the code would read as if it answers when it cannot.
+        return respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, true);
+    };
+    // The firewall table cannot cover this key: it is kept out of `SUPPORTED_RANGES` on purpose,
+    // so the advertised range would otherwise be enforced only by whatever `kafka_protocol`'s
+    // schema happens to accept. A crate bump adding v4 would start answering v4 while ApiVersions
+    // still says 3, which is exactly what the sibling SASL keys pin explicitly against.
+    if !SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.contains(&api_version) {
+        debug!(%peer, api_version, "DescribeAcls version outside the advertised range");
+        return HandleOutcome::Close;
+    }
+    if !principal.permissions_known {
+        // The permission read failed after a successful login, so this connection holds no real
+        // answer. Reporting the empty fallback would tell an operator the principal has no access,
+        // which is a different statement from "we could not find out".
+        warn!(%peer, "DescribeAcls asked on a connection whose permissions were never read");
+        return respond_describe_acls_error(api_version, ERROR_UNKNOWN_SERVER_ERROR, false);
+    }
+    match decode_acl_filter(api_version, body) {
+        Ok(filter) => describe_acls_outcome(
+            api_version,
+            &principal.username,
+            &principal.permissions,
+            &filter,
+        ),
+        Err(error) => {
+            debug!(%peer, %error, "failed to decode DescribeAcls filter");
+            // Kept open: a client that sent one bad filter may send a good one.
+            respond_describe_acls_error(api_version, ERROR_INVALID_REQUEST, false)
         }
     }
 }
@@ -760,7 +869,7 @@ async fn verify_within_budget(
     ctx: &ConnectionContext<'_>,
     authenticator: &dyn SaslAuthenticator,
     credentials: &PlainCredentials,
-) -> Option<std::result::Result<(), AuthError>> {
+) -> Option<std::result::Result<AuthenticatedPrincipal, AuthError>> {
     let peer = ctx.peer;
     let budget = ctx.config.pre_auth_timeout;
     let Ok(acquired) = timeout(budget, ctx.auth_slots.acquire()).await else {
@@ -768,11 +877,11 @@ async fn verify_within_budget(
         return None;
     };
     // Acquire fails only once the semaphore is closed, which this gateway never does.
-    let Ok(_slot) = acquired else {
+    let Ok(slot) = acquired else {
         error!(%peer, "authentication slots unavailable");
         return None;
     };
-    let Ok(result) = timeout(budget, authenticator.authenticate(credentials)).await else {
+    let Ok(result) = timeout(budget, authenticator.authenticate(credentials, slot)).await else {
         warn!(%peer, "authentication did not complete within the pre-authentication budget");
         return None;
     };
@@ -801,7 +910,16 @@ fn illegal_state_outcome(
         API_KEY_SASL_AUTHENTICATE if (0..=SASL_AUTHENTICATE_MAX_VERSION).contains(&api_version) => {
             sasl_authenticate_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
         }
+        // `encode_error_for_key` consults the firewall table, and this key is deliberately absent
+        // from it, so routing through there would answer an unauthenticated client with a bodyless
+        // close while the unreachable guard above is the one that speaks. Answer it directly.
+        API_KEY_DESCRIBE_ACLS
+            if sasl_enabled && SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.contains(&api_version) =>
+        {
+            respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
+        }
         API_KEY_SASL_HANDSHAKE | API_KEY_SASL_AUTHENTICATE => HandleOutcome::Close,
+        API_KEY_DESCRIBE_ACLS if sasl_enabled => HandleOutcome::Close,
         _ => encode_error_for_key(api_key, api_version, ERROR_ILLEGAL_SASL_STATE, sasl_enabled),
     }
 }

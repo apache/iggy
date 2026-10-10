@@ -30,6 +30,7 @@ pub trait MessageClient {
     ///
     /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
     /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
+    /// A [`ConsumerKind::ExternalGroup`] consumer only holds offsets, so polling with it returns [`IggyError::FeatureUnavailable`].
     ///
     /// With automatic commits enabled, a new consumer offset key can be
     /// rejected with `TooManyConsumerOffsets` at the partition's configured
@@ -134,14 +135,4 @@ pub trait MessageClient {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError>;
-
-    /// Force flush of the `unsaved_messages` buffer to disk, optionally fsyncing the data.
-    #[allow(clippy::too_many_arguments)]
-    async fn flush_unsaved_buffer(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        fsync: bool,
-    ) -> Result<(), IggyError>;
 }

@@ -27,9 +27,7 @@ use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
-use crate::common::system::{
-    EncryptionConfig, INDEX_EXTENSION, LOG_EXTENSION, LoggingConfig, RuntimeConfig,
-};
+use crate::common::system::{EncryptionConfig, LoggingConfig, RuntimeConfig};
 use configs::{
     ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, RelocatedKey,
     RelocatedTarget, TypedEnvProvider,
@@ -49,25 +47,44 @@ pub use crate::common::server::{
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
-pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
-    "IGGY_CONFIG_PATH",
-    "IGGY_ENV_PATH",
-    "IGGY_DISPLAY_CONFIG",
-    "IGGY_ROOT_USERNAME",
-    "IGGY_ROOT_PASSWORD",
+/// Vars used by sibling binaries (iggy CLI) or test/CI-only. These suppress
+/// unknown-name warnings but are not advertised by the server.
+const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_TEST_VERBOSE",
     "IGGY_TEST_CLUSTER_NODES",
     "IGGY_TEST_CLEANUP_DISABLED",
-    "IGGY_SHARD_RUNTIME_CAPACITY",
-    "IGGY_SHARD_EVENT_INTERVAL",
     "IGGY_CI_BUILD",
     "IGGY_HOME",
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
 ];
 
+/// Non-config env vars supported by the server and advertised to operators.
+const SERVER_RUNTIME_ENV_VARS: &[&str] = &[
+    "IGGY_CONFIG_PATH",
+    "IGGY_ENV_PATH",
+    crate::configs_impl::DISPLAY_CONFIG_ENV,
+    "IGGY_ROOT_USERNAME",
+    "IGGY_ROOT_PASSWORD",
+    "IGGY_SHARD_RUNTIME_CAPACITY",
+    "IGGY_SHARD_EVENT_INTERVAL",
+];
+
+/// Non-config vars advertised by `iggy-server --list-config-env-vars`.
+pub fn server_runtime_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_RUNTIME_ENV_VARS.iter().copied()
+}
+
+/// All non-config vars accepted by the server's unknown-name scan.
+pub fn server_process_env_vars() -> impl Iterator<Item = &'static str> {
+    SERVER_RUNTIME_ENV_VARS
+        .iter()
+        .chain(SERVER_SCAN_ONLY_ENV_VARS)
+        .copied()
+}
+
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
-    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_", "IGGY_TEST_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -264,7 +281,7 @@ impl ServerConfig {
         .with_known_env_names(
             Self::all_env_var_names()
                 .into_iter()
-                .chain(SERVER_PROCESS_ENV_VARS.iter().copied())
+                .chain(server_process_env_vars())
                 .collect(),
         )
         .with_allowed_env_prefixes(SERVER_ALLOWED_ENV_PREFIXES)
@@ -366,78 +383,6 @@ impl ServerConfig {
             partition_id
         )
     }
-
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    pub fn get_segment_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        format!(
-            "{}/{:0>20}",
-            self.get_partition_path(stream_id, topic_id, partition_id),
-            start_offset
-        )
-    }
-
-    pub fn get_messages_file_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{LOG_EXTENSION}")
-    }
-
-    pub fn get_index_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-    ) -> String {
-        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
-        format!("{path}.{INDEX_EXTENSION}")
-    }
 }
 
 impl SystemPaths for ServerConfig {
@@ -483,6 +428,27 @@ mod tests {
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
         assert_eq!(cfg.message_bus.peer_queue_capacity, 4096);
+        assert_eq!(cfg.message_bus.connections_max, None);
+        assert_eq!(ServerConfig::default().message_bus.connections_max, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_zero_connections_max_env_var_when_loading_should_disable_the_cap() {
+        const NAME: &str = "IGGY_MESSAGE_BUS_CONNECTIONS_MAX";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "0") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.message_bus.connections_max, Some(0));
     }
 
     #[test]
@@ -521,7 +487,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn env_provider_accepts_server_process_env_vars() {
-        for name in SERVER_PROCESS_ENV_VARS {
+        for name in server_process_env_vars() {
             // SAFETY: the race is process-wide, not per key: `set_var` is unsound
             // against any concurrent environment access. `serial_test::serial` on
             // this test is what prevents that.
@@ -530,7 +496,7 @@ mod tests {
 
         let data = ServerConfigEnvProvider::default().data();
 
-        for name in SERVER_PROCESS_ENV_VARS {
+        for name in server_process_env_vars() {
             // SAFETY: paired with the set above.
             unsafe { env::remove_var(name) };
         }
@@ -543,6 +509,31 @@ mod tests {
         assert!(
             profile.is_empty(),
             "none of these variables is a config value, so none of them may reach the map: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn server_process_env_vars_include_every_scan_only_name() {
+        let process_names = server_process_env_vars().collect::<std::collections::HashSet<_>>();
+        for name in [
+            "IGGY_TEST_VERBOSE",
+            "IGGY_TEST_CLUSTER_NODES",
+            "IGGY_TEST_CLEANUP_DISABLED",
+            "IGGY_CI_BUILD",
+            "IGGY_HOME",
+            "IGGY_USERNAME",
+            "IGGY_PASSWORD",
+        ] {
+            assert!(
+                process_names.contains(name),
+                "missing scan-only name {name}"
+            );
+        }
+        assert!(
+            SERVER_RUNTIME_ENV_VARS
+                .iter()
+                .all(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name)),
+            "advertised and scan-only env vars must stay disjoint"
         );
     }
 }

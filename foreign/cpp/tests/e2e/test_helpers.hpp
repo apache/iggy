@@ -203,6 +203,16 @@ class E2ETestFixture : public ::testing::Test {
         return user;
     }
 
+    iggy::UserInfoDetails CreateUser(iggy::IggyBlockingClient &client,
+                                     const std::string &username,
+                                     const std::string &password,
+                                     const iggy::UserStatus status,
+                                     std::optional<iggy::Permissions> permissions = std::nullopt) {
+        auto user = client.CreateUser(username, password, status, permissions);
+        tracked_user_names_.push_back(username);
+        return user;
+    }
+
     void ForgetUser(const std::string &username) {
         tracked_user_names_.erase(std::remove(tracked_user_names_.begin(), tracked_user_names_.end(), username),
                                   tracked_user_names_.end());

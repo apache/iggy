@@ -26,6 +26,7 @@ use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, ConsensusHeader, Operation, PrepareHeader};
 use server_common::{
     Message,
+    fatal::NoteDescriptorExhaustion,
     iobuf::{Frozen, Owned},
     send_messages::decode_prepare_slice,
 };
@@ -61,15 +62,17 @@ const FRONTIER_BYTES: usize = FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE;
 const FRONTIER_SEQUENCE_OFFSET: usize = SEALED_STATE_MAGIC_OFFSET + size_of::<u64>();
 const _: () = assert!(FRONTIER_SEQUENCE_OFFSET + size_of::<u64>() <= PARTITION_WAL_BLOCK_SIZE);
 pub const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
-/// Two-slot frontier. `IGGYWAL1` and `IGGYWAL2` were the single-block layout,
-/// which this build neither writes nor reads.
+/// Two-slot frontier. `IGGYWAL1` and `IGGYWAL2` were the single-block layout.
+/// `IGGYWAL3` kept a purge marker in bytes 104..120, which are reserved now,
+/// and reading it as this layout would replay the prepares the marker fenced.
+/// This build neither writes nor reads any of the three.
 ///
-/// The value has to differ from those two. A build that predates the slots
-/// reads block 0 and truncates the data file to the length it finds there, and
-/// after an acknowledgment lands in slot 1 that block is one publication stale.
-/// Rejecting the magic makes such a build refuse the open instead of dropping
-/// acknowledged records.
-const STATE_MAGIC: &[u8; 8] = b"IGGYWAL3";
+/// The value has to differ from the single-block magics. A build that predates
+/// the slots reads block 0 and truncates the data file to the length it finds
+/// there, and after an acknowledgment lands in slot 1 that block is one
+/// publication stale. Rejecting the magic makes such a build refuse the open
+/// instead of dropping acknowledged records.
+const STATE_MAGIC: &[u8; 8] = b"IGGYWAL4";
 /// Segment references live in a flag inside the block, not in the magic, so a
 /// later format bump costs one constant rather than doubling the set.
 const SEGMENT_REFERENCES_FLAG: usize = 100;
@@ -108,6 +111,7 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     file: S::File,
     frontier: S::File,
     frontier_sequence: u64,
+    recovered_frontier: bool,
     storage: S,
     capacity: u64,
     state: JournalState,
@@ -137,8 +141,6 @@ struct JournalState {
     anchor_known: bool,
     checkpoint_prepare: bool,
     certified_log_view: Option<u32>,
-    purge_generation: u64,
-    purge_floor: u64,
     segment_references: bool,
     segment_storage: Option<SegmentState>,
 }
@@ -154,6 +156,18 @@ struct StoredPrepare {
 }
 
 impl PartitionPrepareJournal {
+    /// Check prior publication without creating a frontier. Opening the WAL
+    /// still validates its complete identity and referenced history.
+    ///
+    /// # Errors
+    /// Returns an error if the frontier cannot be read.
+    pub async fn has_published_frontier(directory: &Path) -> io::Result<bool> {
+        let (frontier, slots) =
+            Self::open_frontier(&DiskStorage, &directory.join(FRONTIER_FILE_NAME)).await?;
+        let (state, _, _) = Self::read_frontier(frontier.as_ref(), slots).await?;
+        Ok(state.is_some())
+    }
+
     /// # Errors
     /// Returns an error on I/O failure or invalid durable history.
     pub async fn open(directory: &Path, group: u64, incarnation: u64) -> io::Result<Self> {
@@ -265,6 +279,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             file,
             frontier,
             frontier_sequence,
+            recovered_frontier: existing.is_some(),
             storage,
             capacity,
             state,
@@ -304,6 +319,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         journal.recover_segment_files().await?;
         journal.migrate_segment_prepares().await?;
         Ok(journal)
+    }
+
+    /// An existing verified frontier proves this WAL survived a prior process.
+    #[must_use]
+    pub const fn recovered_frontier(&self) -> bool {
+        self.recovered_frontier
     }
 
     /// Open the frontier slot file without creating it, with the number of whole
@@ -569,7 +590,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     ) -> io::Result<()> {
         futures::stream::iter(files.iter().map(Ok::<_, io::Error>))
             .try_for_each_concurrent(16, |path| async {
-                let file = self.storage.open(path, OpenMode::Read).await?;
+                // Read-only, but part of the sync barrier, so it counts like a write open.
+                let file = self
+                    .storage
+                    .open(path, OpenMode::Read)
+                    .await
+                    .note_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
                 if synced_files.contains(path) {
                     Ok(())
                 } else {
@@ -660,48 +686,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(header)
     }
 
-    #[must_use]
-    pub const fn purge_marker(&self) -> (u64, u64) {
-        (self.state.purge_generation, self.state.purge_floor)
-    }
-
-    /// # Errors
-    /// Returns an error if the purge marker cannot be published durably.
-    pub async fn mark_purge(&mut self, generation: u64, floor: u64) -> io::Result<()> {
-        self.ensure_healthy()?;
-        if generation < self.state.purge_generation
-            || (generation == self.state.purge_generation && floor <= self.state.purge_floor)
-        {
-            return Ok(());
-        }
-        if floor > self.state.head
-            || (self.state.segment_storage.is_some() && floor < self.state.head)
-        {
-            return Err(invalid("purge must cover the owned segment history"));
-        }
-        self.poisoned = true;
-        self.sync_segment_files().await?;
-        self.file.sync().await?;
-        let mut state = JournalState {
-            purge_generation: generation,
-            purge_floor: floor,
-            ..self.state
-        };
-        if let Some(segments) = &mut state.segment_storage {
-            segments.reset_position(SegmentPosition::default())?;
-        }
-        self.publish(state).await?;
-        self.state = state;
-        self.durable_head = state.head;
-        // The barrier above covers every original writer before purge releases it.
-        self.segment_files.clear();
-        self.poisoned = false;
-        if self.state.segment_storage.is_some() {
-            self.migrate_segment_prepares().await?;
-        }
-        Ok(())
-    }
-
     /// Make every buffered predecessor recoverable with one frontier publication.
     ///
     /// The body barrier and the WAL barrier cover different inodes, so they run
@@ -752,7 +736,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// synchronize every referenced body through the handle that wrote it.
     ///
     /// Segment names in the parent directory remain offset-based. Hard links
-    /// owned by this WAL keep referenced inodes alive across retention and purge.
+    /// owned by this WAL keep referenced inodes alive across retention.
     ///
     /// # Errors
     /// Returns an error for invalid references, history, capacity, or storage.
@@ -918,7 +902,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
         if linked {
             // A visible frontier must never name an inode whose last durable
-            // directory entry a concurrent retention or purge can remove.
+            // directory entry a concurrent retention can remove.
             self.storage.sync_directory(&self.directory).await?;
         }
         Ok(())
@@ -1432,27 +1416,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .read_encoded_record(entry.position, self.state.length)
                 .await?;
             let mut next_offset = entry.next_offset;
-            // Purge removes polled data, but these operations still participate
-            // in repair. Inline their bodies before releasing whole segment inodes.
-            let purged_prepare = if state.segment_storage.is_some()
-                && reference.is_some()
-                && op <= state.purge_floor
-            {
-                let (_, _, prepare, _) =
-                    self.read_record(entry.position, self.state.length).await?;
-                reference = None;
-                next_offset = None;
-                Some(prepare)
-            } else {
-                None
-            };
-            let payload = purged_prepare.as_ref().map_or_else(
-                || &record.as_slice()[RECORD_PREFIX..RECORD_PREFIX + payload_length],
-                Message::as_slice,
-            );
+            let payload = &record.as_slice()[RECORD_PREFIX..RECORD_PREFIX + payload_length];
             let mut converted = false;
             if reference.is_none()
-                && op > state.purge_floor
                 && let Some(segments) = &mut state.segment_storage
             {
                 let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
@@ -1580,8 +1546,7 @@ impl JournalState {
         bytes[97] = u8::from(self.checkpoint_prepare);
         bytes[98] = u8::from(self.certified_log_view.is_some());
         bytes[120..124].copy_from_slice(&self.certified_log_view.unwrap_or(0).to_le_bytes());
-        bytes[104..112].copy_from_slice(&self.purge_generation.to_le_bytes());
-        bytes[112..120].copy_from_slice(&self.purge_floor.to_le_bytes());
+        // Bytes 104..120 are reserved and stay zero.
         bytes[segments::SEGMENT_STATE_FLAG] = u8::from(self.segment_storage.is_some());
         if let Some(segments) = self.segment_storage {
             segments.encode(
@@ -1589,8 +1554,7 @@ impl JournalState {
                     ..segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES],
             );
         }
-        // Repeat the format tag inside the existing checksum range. Older
-        // readers accept these reserved bytes, so rollback stays compatible.
+        // Repeat the format tag inside the existing checksum range.
         bytes.copy_within(..8, SEALED_STATE_MAGIC_OFFSET);
         let checksum = XxHash3_64::oneshot(&bytes[16..]);
         bytes[8..16].copy_from_slice(&checksum.to_le_bytes());
@@ -1656,8 +1620,6 @@ impl JournalState {
                 )),
                 _ => return Err(invalid("invalid certified view flag")),
             },
-            purge_generation: read_u64(104)?,
-            purge_floor: read_u64(112)?,
             checkpoint_checksum: u128::from_le_bytes(
                 bytes[56..72]
                     .try_into()
@@ -2126,7 +2088,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn references_coexist_with_legacy_records_and_survive_purge_name_reuse() {
+    async fn references_coexist_with_legacy_records_and_survive_segment_replacement() {
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
         let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
@@ -2161,7 +2123,6 @@ mod tests {
                 .iter()
                 .any(|slot| slot[SEGMENT_REFERENCES_FLAG] == 1)
         );
-        journal.mark_purge(1, 2).await.unwrap();
         DiskStorage
             .remove_file(&partition.path().join("00000000000000000000.log"))
             .await
@@ -2189,7 +2150,6 @@ mod tests {
         assert_eq!(recovered[0].as_slice(), legacy.as_slice());
         assert_eq!(recovered[1].as_slice(), first.as_slice());
         assert_eq!(recovered[2].as_slice(), second.as_slice());
-        assert_eq!(journal.purge_marker(), (1, 2));
         journal.truncate_from(3).await.unwrap();
         assert!(first_reference.path(&directory).exists());
         journal.cleanup_obsolete().await;
@@ -2571,26 +2531,6 @@ mod tests {
     }
 
     #[compio::test]
-    async fn same_generation_purge_retry_persists_the_larger_floor() {
-        let directory = tempdir().unwrap();
-        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        let first = prepare(1, 0);
-        let second = prepare(2, first.header().checksum);
-        journal.append(first.into_frozen()).await.unwrap();
-        journal.mark_purge(9, 1).await.unwrap();
-        journal.append(second.into_frozen()).await.unwrap();
-        journal.mark_purge(9, 2).await.unwrap();
-        journal.mark_purge(9, 1).await.unwrap();
-        drop(journal);
-        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        assert_eq!(journal.purge_marker(), (9, 2));
-    }
-
-    #[compio::test]
     async fn view_certificate_requires_complete_matching_history() {
         let directory = tempdir().unwrap();
         let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
@@ -2641,23 +2581,6 @@ mod tests {
             .append(prepare(8, checksum).into_frozen())
             .await
             .unwrap();
-    }
-
-    #[compio::test]
-    async fn purge_marker_does_not_promote_the_uncommitted_tail_to_checkpoint() {
-        let directory = tempdir().unwrap();
-        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        journal.append(prepare(1, 0).into_frozen()).await.unwrap();
-        journal.mark_purge(9, 1).await.unwrap();
-        drop(journal);
-        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        assert_eq!(journal.purge_marker(), (9, 1));
-        assert_eq!(journal.checkpoint_op(), 0);
-        assert_eq!(journal.prepares().await.unwrap().len(), 1);
     }
 
     #[compio::test]
@@ -2735,62 +2658,6 @@ mod tests {
         assert_eq!(JournalState::decode(bytes.as_slice()).unwrap().0, state);
         bytes.as_mut_slice()[24] ^= 1;
         assert!(JournalState::decode(bytes.as_slice()).is_err());
-    }
-
-    #[compio::test]
-    async fn purge_releases_segment_inodes_after_preserving_repair_bodies_inline() {
-        const BODY_BYTES: usize = 8192;
-        let partition = tempdir().unwrap();
-        let directory = partition.path().join("prepares-7");
-        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
-            .await
-            .unwrap();
-        journal
-            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
-            .await
-            .unwrap();
-        let mut parent = 0;
-        let mut prepares = Vec::new();
-        let mut references = Vec::new();
-        for op in 1..=3 {
-            let prepare = segment_prepare(op, parent, op - 1, BODY_BYTES);
-            parent = prepare.header().checksum;
-            journal.append(prepare.clone().into_frozen()).await.unwrap();
-            references.push(journal.segment_reference(prepare.header()).unwrap());
-            prepares.push(prepare);
-        }
-        let retained_bytes = journal.retained_bytes();
-        journal.mark_purge(1, 3).await.unwrap();
-        assert_eq!(
-            journal.checkpoint_op(),
-            0,
-            "purge must not fabricate a committed frontier"
-        );
-        assert_eq!(journal.retained_bytes(), retained_bytes);
-        journal.cleanup_obsolete().await;
-        for reference in references {
-            assert!(!reference.path(&directory).exists());
-            std::fs::remove_file(
-                partition
-                    .path()
-                    .join(format!("{:020}.log", reference.start_offset)),
-            )
-            .unwrap();
-        }
-        DiskStorage.sync_directory(partition.path()).await.unwrap();
-        drop(journal);
-        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
-            .await
-            .unwrap();
-        for (actual, expected) in journal.prepares().await.unwrap().iter().zip(&prepares) {
-            assert_eq!(actual.as_slice(), expected.as_slice());
-            assert!(journal.segment_reference(actual.header()).is_none());
-        }
-        journal.checkpoint(3).await.unwrap();
-        assert_eq!(
-            journal.size_bytes(),
-            record_length(prepares[2].as_slice().len()).unwrap() as u64
-        );
     }
 
     #[compio::test]
@@ -2913,7 +2780,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn owned_purge_refuses_a_partial_floor_and_preserves_recoverable_history() {
+    async fn owned_segments_refuse_invalid_boundaries_and_preserve_recoverable_history() {
         const BODY_BYTES: usize = 4096;
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -2932,9 +2799,6 @@ mod tests {
             .unwrap();
         journal.sync().await.unwrap();
         let frontier = std::fs::read(directory.join("frontier")).unwrap();
-        assert!(journal.mark_purge(1, 1).await.is_err());
-        assert!(!journal.poisoned);
-        assert_eq!(std::fs::read(directory.join("frontier")).unwrap(), frontier);
         let mut invalid_state = journal.state;
         invalid_state
             .segment_storage
@@ -2945,16 +2809,18 @@ mod tests {
             .next_offset = 3;
         assert!(journal.publish(invalid_state).await.is_err());
         assert_eq!(std::fs::read(directory.join("frontier")).unwrap(), frontier);
-        journal.mark_purge(1, 2).await.unwrap();
         journal.checkpoint(2).await.unwrap();
         drop(journal);
         let journal = PartitionPrepareJournal::open(&directory, 42, 7)
             .await
             .unwrap();
-        assert_eq!(journal.purge_marker(), (1, 2));
         assert_eq!(
             journal.segment_checkpoint(),
-            Some(SegmentPosition::default())
+            Some(SegmentPosition {
+                start_offset: 1,
+                length: BODY_BYTES as u64,
+                next_offset: 2,
+            })
         );
         assert_eq!(journal.prepares().await.unwrap().len(), 1);
     }
@@ -3101,7 +2967,8 @@ mod tests {
             );
             // Both single-block magics are refused, which is what keeps a build
             // that predates the slots from reading block 0 as the whole record.
-            for magic in [b"IGGYWAL1", b"IGGYWAL2"] {
+            // `IGGYWAL3` gave the reserved bytes a meaning this build ignores.
+            for magic in [b"IGGYWAL1", b"IGGYWAL2", b"IGGYWAL3"] {
                 let mut legacy = state.encode(1);
                 legacy.as_mut_slice()[..8].copy_from_slice(magic);
                 assert!(JournalState::decode(legacy.as_slice()).is_err());
@@ -3115,6 +2982,76 @@ mod tests {
             damaged.as_mut_slice()[8..16].copy_from_slice(&checksum.to_le_bytes());
             assert!(JournalState::decode(damaged.as_slice()).is_err());
         }
+    }
+
+    #[compio::test]
+    async fn given_checkpointed_history_when_reanchoring_a_reserved_gap_should_preserve_repair_bodies()
+     {
+        const BODY_BYTES: usize = 4096;
+        const RESERVED_OFFSET: u64 = 8;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let frontier = std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap();
+        assert!(
+            journal
+                .reanchor_segment_storage(RESERVED_OFFSET)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap(),
+            frontier,
+            "uncheckpointed history must not be replaced by an empty append point"
+        );
+        journal.checkpoint(1).await.unwrap();
+        assert!(journal.reanchor_segment_storage(0).await.is_err());
+        journal
+            .reanchor_segment_storage(RESERVED_OFFSET)
+            .await
+            .unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 1);
+        assert_eq!(journal.checkpoint_op(), 1);
+        assert_eq!(
+            journal.segment_checkpoint(),
+            Some(SegmentPosition {
+                start_offset: RESERVED_OFFSET,
+                length: 0,
+                next_offset: RESERVED_OFFSET,
+            })
+        );
+        assert_eq!(
+            journal.prepares().await.unwrap()[0].as_slice(),
+            first.as_slice()
+        );
+        let second = segment_prepare(2, first.header().checksum, RESERVED_OFFSET, BODY_BYTES);
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), second.as_slice());
+        assert_eq!(
+            std::fs::read(partition.path().join(format!("{RESERVED_OFFSET:020}.log"))).unwrap(),
+            second.as_slice()[size_of::<PrepareHeader>()..]
+        );
     }
 
     #[compio::test]
@@ -3178,7 +3115,48 @@ mod tests {
     }
 
     #[compio::test]
-    async fn owned_segments_recover_unpublished_bytes_and_keep_purged_prepare_bodies() {
+    async fn given_a_truncated_roll_when_the_replacement_rolls_at_the_same_offset_should_replace_the_public_file()
+     {
+        const BODY_BYTES: usize = 8192;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let dropped = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        journal.append(dropped.into_frozen()).await.unwrap();
+        journal.truncate_from(2).await.unwrap();
+        let rolled = partition.path().join("00000000000000000001.log");
+        assert_eq!(std::fs::metadata(&rolled).unwrap().len(), BODY_BYTES as u64);
+
+        let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
+        journal
+            .append(replacement.clone().into_frozen())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&rolled).unwrap(),
+            replacement.as_slice()[size_of::<PrepareHeader>()..],
+            "the replacement segment must not keep the truncated suffix's bytes"
+        );
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), replacement.as_slice());
+    }
+
+    #[compio::test]
+    async fn owned_segments_recover_unpublished_bytes_and_append_in_their_place() {
         const BODY_BYTES: usize = 8192;
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -3203,8 +3181,7 @@ mod tests {
                 .len(),
             BODY_BYTES as u64
         );
-        journal.mark_purge(1, 1).await.unwrap();
-        let replacement = segment_prepare(2, first.header().checksum, 0, BODY_BYTES / 2);
+        let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
         journal
             .append(replacement.clone().into_frozen())
             .await
@@ -3218,7 +3195,11 @@ mod tests {
         assert_eq!(recovered[1].as_slice(), replacement.as_slice());
         assert_eq!(
             std::fs::read(partition.path().join("00000000000000000000.log")).unwrap(),
-            replacement.as_slice()[size_of::<PrepareHeader>()..]
+            [
+                &first.as_slice()[size_of::<PrepareHeader>()..],
+                &replacement.as_slice()[size_of::<PrepareHeader>()..],
+            ]
+            .concat()
         );
     }
 
@@ -3547,6 +3528,7 @@ mod tests {
             assert_eq!(&slot[..8], STATE_MAGIC);
             assert_ne!(&slot[..8], b"IGGYWAL1");
             assert_ne!(&slot[..8], b"IGGYWAL2");
+            assert_ne!(&slot[..8], b"IGGYWAL3");
         }
 
         // The other direction. A frontier a single-block build wrote is not a

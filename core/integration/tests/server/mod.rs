@@ -19,8 +19,6 @@
 // the server's ported trusted-issuer path verify them.
 mod a2a_jwt;
 mod cg;
-// Flush (FLUSH_UNSAVED_BUFFER) has no the server primitive; it must deny typed.
-mod flush_vsr;
 // Raw TCP framing (connect, hand-crafted frames, root register) for the
 // server suites that send what the SDK cannot.
 pub(crate) mod raw_tcp;
@@ -28,8 +26,8 @@ pub(crate) mod raw_tcp;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 mod legacy_login_vsr;
 // A non-replicated code no read serves (unknown, or table-listed without an
-// arm) must deny typed (InvalidCommand) at the read gate, not stall or reply
-// empty-ok.
+// arm) must deny typed (InvalidCommand) at the read gate, and an undeclared
+// operation byte at the funnel, not stall or reply empty-ok.
 mod unknown_code_vsr;
 // A failed credential login must report the credential failure, not the
 // payload shape it fell through to.
@@ -41,9 +39,8 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
-// Purge durability: applied generation survives restart; journal-resident
-// purged batches stay fenced behind the purge floor.
-mod purge_vsr;
+// /metrics carries per-topic size and message count (#4473).
+mod topic_metrics_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
 pub(crate) mod http_client;
@@ -78,15 +75,23 @@ mod partition_view_durability_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;
+// The node-wide cap on client sockets closes a socket past it at accept.
+mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
+// A write that runs out of file descriptors flushes, then exits with status 4.
+mod descriptor_exhaustion_vsr;
 mod general;
+mod partitions_limit_vsr;
+// The expired-token cleaner deletes under the reserved client id, and later
+// writes must still commit behind that delete.
+mod personal_access_token_cleaner_vsr;
 // The per-shard segment cleaner deletes expired / oversize segments from disk.
 mod message_cleanup;
 mod message_retrieval;
 // Server restarts, consumer-group barriers, and DeleteSegments maintenance.
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
-mod purge_delete;
+mod delete_segments;
 mod scenarios;
 mod specific;
 mod telemetry;

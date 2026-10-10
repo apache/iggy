@@ -61,10 +61,7 @@ use iggy_cli::commands::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
     binary_context::get_contexts::GetContextsCmd,
-    binary_message::{
-        flush_messages::FlushMessagesCmd, poll_messages::PollMessagesCmd,
-        send_messages::SendMessagesCmd,
-    },
+    binary_message::{poll_messages::PollMessagesCmd, send_messages::SendMessagesCmd},
     binary_partitions::{
         create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
     },
@@ -75,12 +72,12 @@ use iggy_cli::commands::{
     },
     binary_streams::{
         create_stream::CreateStreamCmd, delete_stream::DeleteStreamCmd, get_stream::GetStreamCmd,
-        get_streams::GetStreamsCmd, purge_stream::PurgeStreamCmd, update_stream::UpdateStreamCmd,
+        get_streams::GetStreamsCmd, update_stream::UpdateStreamCmd,
     },
     binary_system::{me::GetMeCmd, options::DescribeOptionsCmd, ping::PingCmd, stats::GetStatsCmd},
     binary_topics::{
         create_topic::CreateTopicCmd, delete_topic::DeleteTopicCmd, get_topic::GetTopicCmd,
-        get_topics::GetTopicsCmd, purge_topic::PurgeTopicCmd, update_topic::UpdateTopicCmd,
+        get_topics::GetTopicsCmd, update_topic::UpdateTopicCmd,
     },
     binary_users::{
         change_password::ChangePasswordCmd,
@@ -123,7 +120,6 @@ fn get_command(
             )),
             StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
             StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
-            StreamAction::Purge(args) => Box::new(PurgeStreamCmd::new(args.stream_id.clone())),
         },
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
@@ -156,10 +152,6 @@ fn get_command(
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
                 args.list_mode.into(),
-            )),
-            TopicAction::Purge(args) => Box::new(PurgeTopicCmd::new(
-                args.stream_id.clone(),
-                args.topic_id.clone(),
             )),
         },
         Command::Partition(command) => match command {
@@ -305,12 +297,6 @@ fn get_command(
                 poll_args.consumer.clone(),
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
-            )),
-            MessageAction::Flush(flush_args) => Box::new(FlushMessagesCmd::new(
-                flush_args.stream_id.clone(),
-                flush_args.topic_id.clone(),
-                flush_args.partition_id,
-                flush_args.fsync,
             )),
         },
         Command::ConsumerOffset(command) => match command {

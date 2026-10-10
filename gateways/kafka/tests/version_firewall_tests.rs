@@ -37,10 +37,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
-    ERROR_UNSUPPORTED_VERSION, advertised_min_version, handle_request, is_supported_version,
-    supported_api_ranges,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_CONFIGS,
+    API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID,
+    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
+    API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION, advertised_min_version,
+    handle_request, is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -53,15 +55,19 @@ use tcp::{
     parse_response_payload, read_byte_with_timeout, round_trip,
 };
 use wire::{
-    OUT_OF_SCOPE_API_KEYS, build_api_versions_flexible_request, build_create_topics_empty_request,
-    build_fetch_empty_topics_request, build_list_offsets_request,
+    JoinGroupParams, OUT_OF_SCOPE_API_KEYS, SyncGroupParams, build_alter_configs_empty_request,
+    build_api_versions_flexible_request, build_create_topics_empty_request,
+    build_describe_configs_empty_request, build_fetch_empty_topics_request,
+    build_find_coordinator_request, build_heartbeat_request, build_init_producer_id_request,
+    build_join_group_request, build_leave_group_request, build_list_offsets_request,
     build_metadata_all_topics_flexible, build_metadata_all_topics_legacy,
-    build_metadata_flexible_request_v10,
+    build_metadata_flexible_request_v10, build_offset_commit_request, build_offset_fetch_request,
+    build_sync_group_request,
 };
 
 #[test]
-fn supported_ranges_table_has_six_entries() {
-    assert_eq!(supported_api_ranges().len(), 6);
+fn supported_ranges_table_has_sixteen_entries() {
+    assert_eq!(supported_api_ranges().len(), 16);
 }
 
 #[test]
@@ -96,10 +102,10 @@ fn is_supported_version_matches_scope_table() {
 /// KIP-511 compatibility) is hardcoded here rather than obtained by calling
 /// `advertised_min_version` - the same reasoning applies to it as the function under test.
 ///
-/// Relies on `SUPPORTED_RANGES` (src) and `SCOPED_API_KEYS` (test) sharing declaration order
-/// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`) -
-/// `supported_ranges_table_has_six_entries` plus `is_supported_version_matches_scope_table`
-/// already pin that both tables cover the same six keys.
+/// The wire rows are `supported_api_ranges()` sorted by `api_key` (`api_versions.rs`).
+/// `SCOPED_API_KEYS` is already in that ascending order, and this test reads the response
+/// in that order. `supported_ranges_table_has_sixteen_entries` and
+/// `is_supported_version_matches_scope_table` pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
@@ -346,7 +352,7 @@ async fn create_topics_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn unsupported_api_keys_close_connection() {
-    for key in [8, 9, 10, 11, 20, 42, 999] {
+    for key in [8, 9, 15, 16, 20, 42, 999] {
         let outcome = handle_request(key, 0, Bytes::new(), &default_broker()).await;
         assert!(
             outcome.is_close(),
@@ -490,6 +496,35 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             .flatten()
             .unwrap_or_else(|| build_list_offsets_request(version, "scope-topic", 0)),
         API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
+        API_KEY_FIND_COORDINATOR => build_find_coordinator_request(version, &["scope-group"], 0),
+        // A member id the coordinator never handed out, so every in-range version answers
+        // UNKNOWN_MEMBER_ID immediately instead of creating a group and parking on its join
+        // barrier for the initial rebalance delay.
+        API_KEY_JOIN_GROUP => build_join_group_request(
+            version,
+            &JoinGroupParams {
+                group_id: "scope-group",
+                member_id: "scope-member",
+                ..JoinGroupParams::default()
+            },
+        ),
+        API_KEY_HEARTBEAT => build_heartbeat_request(version, "scope-group", 1, "scope-member"),
+        API_KEY_LEAVE_GROUP => {
+            build_leave_group_request(version, "scope-group", &[("scope-member", None, None)])
+        }
+        API_KEY_SYNC_GROUP => build_sync_group_request(
+            version,
+            &SyncGroupParams {
+                group_id: "scope-group",
+                member_id: "scope-member",
+                ..SyncGroupParams::default()
+            },
+        ),
+        API_KEY_INIT_PRODUCER_ID => build_init_producer_id_request(version, None),
+        API_KEY_DESCRIBE_CONFIGS => build_describe_configs_empty_request(version),
+        API_KEY_ALTER_CONFIGS => build_alter_configs_empty_request(version),
+        API_KEY_OFFSET_COMMIT => build_offset_commit_request(version, "scope-group", "orders", 0),
+        API_KEY_OFFSET_FETCH => build_offset_fetch_request(version, "scope-group", Some("orders")),
         _ => Bytes::new(),
     }
 }
@@ -820,5 +855,65 @@ async fn corrupt_create_topics_body_returns_invalid_request_error() {
     assert_eq!(d.read_i32().unwrap(), 0, "throttle");
     assert_eq!(d.read_i32().unwrap(), 1, "topics len");
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// v1 is legacy. A count that stops mid-integer never reaches `kafka_protocol`.
+#[tokio::test]
+async fn corrupt_describe_configs_truncated_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_DESCRIBE_CONFIGS, 1, body, &default_broker())
+        .await
+        .expect_response("DescribeConfigs v1 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "results len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// A resource count past what the remaining frame can hold is rejected by the shape walk. Uses
+/// `i32::MAX` (the same boundary `metadata_v0_huge_topics_count_rejected` exercises in
+/// `bounds_guard.rs`'s own test module), not a value `kafka_protocol`'s own decode would already
+/// choke on first: a small frame declaring `100000` fails before this guard gets credit for
+/// catching anything, since the crate's own `Vec::with_capacity` path runs out of bytes to read
+/// well before it would allocate that much. `i32::MAX` is the actual amplification class this
+/// module exists to stop (see its module doc's `handle_alloc_error` reproduction).
+#[tokio::test]
+async fn corrupt_describe_configs_overlong_count_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_DESCRIBE_CONFIGS, 1, body, &default_broker())
+        .await
+        .expect_response("DescribeConfigs v1 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "results len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// v0 is legacy. A count that stops mid-integer never reaches `kafka_protocol`.
+#[tokio::test]
+async fn corrupt_alter_configs_truncated_body_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_ALTER_CONFIGS, 0, body, &default_broker())
+        .await
+        .expect_response("AlterConfigs v0 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "responses len");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+/// A resource count past what the remaining frame can hold is rejected by the shape walk. See
+/// `corrupt_describe_configs_overlong_count_returns_invalid_request_error`'s doc for why
+/// `i32::MAX`, not a smaller value `kafka_protocol`'s own decode would already fail on.
+#[tokio::test]
+async fn corrupt_alter_configs_overlong_count_returns_invalid_request_error() {
+    let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
+    let resp = handle_request(API_KEY_ALTER_CONFIGS, 0, body, &default_broker())
+        .await
+        .expect_response("AlterConfigs v0 has an encodable error response");
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "responses len");
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }

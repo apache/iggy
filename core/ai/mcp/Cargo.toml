@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-mcp"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 description = "MCP Server for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -33,6 +33,7 @@ systemd = ["dep:sd-notify", "dep:tokio-util"]
 [dependencies]
 axum = { workspace = true }
 axum-server = { workspace = true }
+clap = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
 dirs = { workspace = true }

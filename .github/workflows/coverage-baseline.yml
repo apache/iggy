@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Coverage baseline for all 7 languages (Rust, Java, C#, Python, PHP,
-# Node, Go). Runs on push to master so Codecov has data on master SHAs for
+# Coverage baseline for all 8 languages (Rust, Java, C#, Python, PHP,
+# Node, Go, C++). Runs on push to master so Codecov has data on master SHAs for
 # carryforward on PR builds where only a subset of SDKs is tested.
 #
 # Jobs are path-gated: a language job runs only when the paths feeding its
@@ -51,7 +51,7 @@ jobs:
     # cache warms only make sense for master. Skipping detect skips every
     # downstream job.
     if: github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     outputs:
       rust: ${{ steps.affected.outputs.rust }}
@@ -61,6 +61,7 @@ jobs:
       php: ${{ steps.affected.outputs.php }}
       node: ${{ steps.affected.outputs.node }}
       go: ${{ steps.affected.outputs.go }}
+      cpp: ${{ steps.affected.outputs.cpp }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -82,7 +83,7 @@ jobs:
     name: Rust coverage baseline
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
@@ -104,7 +105,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.13
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: cargo-llvm-cov
 
@@ -153,7 +154,7 @@ jobs:
     name: Java coverage baseline
     needs: detect
     if: needs.detect.outputs.java == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -198,7 +199,7 @@ jobs:
     name: C# coverage baseline (${{ matrix.framework }})
     needs: detect
     if: needs.detect.outputs.csharp == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -283,7 +284,7 @@ jobs:
     name: Python coverage baseline
     needs: detect
     if: needs.detect.outputs.python == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -299,12 +300,12 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.13
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Install dependencies
         run: |
@@ -407,7 +408,7 @@ jobs:
     name: PHP coverage baseline
     needs: detect
     if: needs.detect.outputs.php == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -430,7 +431,7 @@ jobs:
     name: Node coverage baseline
     needs: detect
     if: needs.detect.outputs.node == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -497,7 +498,7 @@ jobs:
     name: Go coverage baseline
     needs: detect
     if: needs.detect.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -579,6 +580,29 @@ jobs:
           files: reports/go-coverage.out
           disable_search: true
           flags: go
+          fail_ci_if_error: false
+
+  cpp-coverage:
+    name: C++ coverage baseline
+    needs: detect
+    if: needs.detect.outputs.cpp == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Run C++ SDK tests with coverage
+        uses: ./.github/actions/cpp-bazel/pre-merge
+        with:
+          task: test
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/cpp-coverage.lcov
+          disable_search: true
+          flags: cpp
           fail_ci_if_error: false
 
   warm-cache-macos:

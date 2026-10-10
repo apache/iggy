@@ -2,9 +2,14 @@
 
 ## Issue #3421 — in scope (this iteration)
 
-Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. With a bridge, Produce writes to Iggy and ListOffsets reads offsets from it.
+A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DescribeConfigs and AlterConfigs use Iggy.
 
-**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). CreateTopics validates the request but answers `NOT_CONTROLLER` (41), so clients do not believe topics were created. Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores real data once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
+**Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards
+the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6
+too. CreateTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so clients do not believe
+topics were created or configs were read or changed. OffsetCommit and OffsetFetch answer retriable `COORDINATOR_LOAD_IN_PROGRESS`
+(14). Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records once you configure
+a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
@@ -12,7 +17,7 @@ Foundation layer only: a TCP listener on the Kafka wire port that decodes reques
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
 | Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
-| Request decode + stub encode for 6 API keys | Done | `src/protocol/api.rs`, `responses.rs` (via the `kafka_protocol` crate) |
+| Request decode + stub encode for 7 API keys | Done | `src/protocol/api.rs`, `src/protocol/handlers/` (via the `kafka_protocol` crate) |
 | Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/responses.rs` |
 | Pre-decode bounds guard against unbounded allocation | Done | `src/protocol/bounds_guard.rs` |
 | Graceful errors (corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
@@ -27,11 +32,12 @@ Source of truth for supported ranges: `SUPPORTED_RANGES` in [`src/protocol/api.r
 Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows.
 
 **Every unsupported-version case closes the connection, for every listed key** - not just above
-the encoder max. `kafka_protocol`'s schema floor for each of the six supported messages happens
-to equal `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0,
-ApiVersions 0, CreateTopics 2), so there is no version below an API's min that the crate can
-actually encode a response for either - `unsupported_version_response` still tries, but the
-encode attempt fails and the connection closes rather than sending a malformed body.
+the encoder max. `kafka_protocol`'s schema floor for each supported message happens to equal
+`SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0, ApiVersions 0,
+CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1,DescribeConfigs 1, AlterConfigs 0, and 0 for the five coordination  keys), so there is no version below an API's
+min that the crate can actually encode a response for either - `unsupported_version_response`
+still tries, but the encode attempt fails and the connection closes rather than sending a
+malformed body.
 **ApiVersions is the sole exception** (KIP-511): out of range still answers with a v0 error body,
 because a client probing an unknown server must be able to parse the discovery response before
 it knows the server supports flexible encoding.
@@ -45,11 +51,23 @@ it knows the server supports flexible encoding.
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
-| 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | Decode request; stub response |
+| 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
+| 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
+| 9 | OffsetFetch | 1 | 9 | 1 … 9 | With a bridge: reads each offset, -1 when none is stored, and a null topic list reads every topic that holds the group. Without one: 14. Flexible encoding at v6+ |
+| 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
+| 11 | JoinGroup | 0 | 9 | 0 … 9 | Real membership; parks on the group's join barrier; flexible encoding at v6+ |
+| 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
+| 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
+| 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
+| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
+| 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
+| 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
 
-A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above). Any unlisted API key also closes the connection: no api-specific response schema exists for it, so any body this gateway could send would be misparsed by the client against the schema it expected.
+A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
+
+Any unlisted API key also closes the connection. The gateway declines to define a response for a key it does not advertise, and a conforming client never sends one: it reads ApiVersions first and the key's absence is what stops the request. (`kafka-protocol`'s `broker` feature does ship response schemas for keys this gateway leaves unlisted, so the reason is a deliberate refusal, not an encoding limit.)
 
 ### Valid versions reference (by API key)
 
@@ -61,8 +79,18 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 1 | Fetch | 4–12 | v12 |
 | 2 | ListOffsets | 1–6 | v6 |
 | 3 | Metadata | 0–9 | v9 |
+| 8 | OffsetCommit | 2–9 | v8 |
+| 9 | OffsetFetch | 1–9 | v6 |
+| 10 | FindCoordinator | 0–4 | v3 |
+| 11 | JoinGroup | 0–9 | v6 |
+| 12 | Heartbeat | 0–4 | v4 |
+| 13 | LeaveGroup | 0–5 | v4 |
+| 14 | SyncGroup | 0–5 | v4 |
 | 18 | ApiVersions | 0–3 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
+| 22 | InitProducerId | 0–5 | v2 |
+| 32 | DescribeConfigs | 1–4 | v4 |
+| 33 | AlterConfigs | 0–2 | v2 |
 
 ---
 
@@ -72,14 +100,66 @@ All API keys not listed above close the connection (see Governance model above) 
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
-| 8 | OffsetCommit | Consumer group — later issue |
-| 9 | OffsetFetch | Consumer group — later issue |
-| 10 | FindCoordinator | Consumer group — later issue |
-| 11–16 | JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups | Consumer group — later issue |
+| 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
 | 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
-| 20+ | DeleteTopics, InitProducerId, transactions, ACLs, etc. | Later issues |
+| 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
+| 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
+| 20, 23, 27, 30, 31, 34, 35, 37+ | DeleteTopics, `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, IncrementalAlterConfigs (44), etc. | Later issues. DescribeConfigs (32) and AlterConfigs (33) are supported |
+| 21 | DeleteRecords | Not advertised on purpose, see below |
+| 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
+
+### Transactions
+
+Transactions are not supported and are not planned. There is no last stable offset, no abort
+marker, and nothing that could make `read_committed` mean anything, so accepting a transactional
+write would deliver an aborted transaction's records to every consumer.
+
+Three things enforce that, in the order a client meets them:
+
+1. **AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26) and TxnOffsetCommit (28) stay out
+   of `SUPPORTED_RANGES`**, so ApiVersions never advertises them and a conforming client never
+   sends one. This is the primary gate: the Java client's `NodeApiVersions.latestUsableVersion`
+   throws and `NetworkClient.doSend` keeps the request off the wire; librdkafka's four request
+   builders return `__UNSUPPORTED_FEATURE`, which is fatal there.
+2. **InitProducerId (22) with a `transactional_id`** answers `UNSUPPORTED_VERSION` (35), so a
+   producer that got past step 1 fails before it can open a transaction. Terminal on the Java
+   client, whose `InitProducerIdHandler` treats any unrecognised code as fatal. Not terminal on
+   librdkafka, which retries 35 here indefinitely; librdkafka is stopped by step 1 instead, and
+   [`IDEMPOTENCE.md`](IDEMPOTENCE.md) records why that matters when FindCoordinator is advertised.
+3. **Produce with a non-empty `transactional_id`** answers `UNSUPPORTED_VERSION` (35) per
+   partition, so a raw client that skipped both earlier gates still cannot write transactional
+   records. Under `acks=0` there is no response to carry 35, so the connection is closed
+   instead, the same way a Kafka broker answers an `acks=0` produce error.
+
+An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
+untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
+
+### DeleteRecords is not advertised ([#3547](https://github.com/apache/iggy/issues/3547))
+
+DeleteRecords (21) asks a broker to drop everything below an offset and to answer with the
+partition's new low watermark. Iggy cannot do either honestly:
+
+- It deletes whole segments only (`SegmentClient::delete_segments`), so a trim to an offset inside
+  a segment would delete less than asked or more than asked.
+- It exposes no log-start offset, the same gap that makes ListOffsets answer `EARLIEST` with `0`
+  (see the ListOffsets entry under Phase 2 below). A reported low watermark would be contradicted
+  by the next ListOffsets call.
+
+Leaving the key out of ApiVersions is how the Kafka protocol says a broker does not support an
+API, and it is the better answer than a stub. A client checks the advertised keys before sending,
+so `Admin.deleteRecords()` fails at once with `UnsupportedVersionException` and librdkafka with
+`RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE`, without a request ever reaching the gateway. A stub
+could answer `UNSUPPORTED_VERSION` or `POLICY_VIOLATION` per partition, the latter being what a
+real broker returns for a compacted topic. But it would advertise an API that fails on every
+partition, add a decode and encode path for it, and make ApiVersions claim a capability that does
+not exist.
+
+Real support needs Iggy to expose a log-start offset that segment deletion and retention both
+advance. Its internal delete watermark (`deleted_up_to_offset`) is neither readable by clients
+nor moved by retention. That is the same core change the ListOffsets `EARLIEST` gap needs, and DeleteRecords can follow it.
 
 ---
 
@@ -88,8 +168,8 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except Produce and ListOffsets with a bridge |
-| **3 — Iggy bridge** | Produce and ListOffsets wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)) and ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)) call it. Fetch does not call it yet ([#3536](https://github.com/apache/iggy/issues/3536)) |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 14 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the five consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DescribeConfigs and AlterConfigs with a bridge |
+| **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata, CreateTopics, DescribeConfigs and AlterConfigs wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs and AlterConfigs call it |
 
 ---
 
@@ -230,8 +310,9 @@ below it are still open for the issues that build on top of it.
     tracks no rolling low-watermark distinct from partition creation, so once a partition is
     old enough for retention to purge its first segment, `0` names a log-start offset that no
     longer exists - a real consumer with `auto.offset.reset=earliest` seeks into a hole. Not
-    fixable client-side; needs the bridge to expose a real start offset. Harmless *today* only
-    because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this returns.
+    fixable client-side; needs the bridge to expose a real start offset. Fetch at an offset in
+    that hole reads from the oldest kept message, so the consumer skips the gap. If none is kept,
+    Fetch serves no records until the next write.
   - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
     still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
     one `high_watermarks` call before any bridge work starts (a name repeated across request
@@ -244,6 +325,13 @@ below it are still open for the issues that build on top of it.
     fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
     batch: a topic already resolved when the deadline arrives keeps its real answer, and only the
     not-yet-started topics answer `REQUEST_TIMED_OUT`.
+- [x] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, shared topic probes, paged polls per partition with
+      records, and a wait of up to `max_wait_ms` (max 18 s) when there are none. Only codes the
+      Java consumer handles go out. See [README.md](../README.md#fetch-3536),
+      `src/protocol/handlers/fetch.rs`, `tests/fetch_real_bridge_tests.rs`.
+- [ ] Fetch: pick skip or quarantine for a stored message the gateway cannot map. Today the
+      consumer stops at it, and Fetch reads it at most once per `max_wait_ms`. See [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md#provenance).
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
 ### `kafka-protocol` crate adoption — superseded, done differently
@@ -251,27 +339,38 @@ below it are still open for the issues that build on top of it.
 This TODO originally proposed a selective, feature-gated adoption (`kafka-protocol-cold`)
 alongside the hand-rolled `requests.rs`/`responses.rs` codecs, keeping custom code for the
 Produce/Fetch hot paths. That hybrid approach was not taken: `kafka_protocol` (broker feature
-only) now decodes/encodes all six supported message types wholesale, and the hand-rolled
+only) now decodes/encodes every supported message type wholesale, and the hand-rolled
 `codec.rs`/`requests.rs` were deleted. RecordBatch bytes stay opaque (`Option<Bytes>`, never
 decoded) on the Produce/Fetch hot paths, preserving the one property this TODO was protecting.
 `bounds_guard.rs` covers the DoS-bound gap the crate itself leaves open (see Governance model
 above).
 
-- [ ] Consumer-group API keys (8–14, 10) and complex Metadata/FindCoordinator responses remain unimplemented (see Phase 3 below) - the crate can decode them when that phase starts
+- [x] Offset-related consumer-group API keys (8, 9) - see Phase 3 below
+- [ ] Real Metadata topology
 
 ### Phase 3 — Consumer groups (~7 API keys)
+
+Coordination ([#3541](https://github.com/apache/iggy/issues/3541)) has landed:
+[`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
 
-- [ ] OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
-- [ ] JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
+- [x] FindCoordinator (10), JoinGroup (11), Heartbeat (12), SyncGroup (14) -
+      [#3541](https://github.com/apache/iggy/issues/3541); LeaveGroup (13) -
+      [#3543](https://github.com/apache/iggy/issues/3543); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
+- [x] OffsetCommit (8), OffsetFetch (9) - [#3542](https://github.com/apache/iggy/issues/3542);
+      offsets live in Iggy, see [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)
 - [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning
 
 InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
+
+- [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
+      transactional request is refused. The producer-id-keyed connection pool that would make
+      retries deduplicated is deferred - delivery stays at-least-once
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).
@@ -283,6 +382,9 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
       connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
       silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
       credential storage, not deferred
+- [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
+      bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
+      (31) are not implemented and not advertised
 - [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys

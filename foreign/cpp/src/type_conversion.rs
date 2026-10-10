@@ -158,6 +158,7 @@ impl From<RustUserInfo> for ffi::UserInfo {
             created_at: user.created_at.as_micros(),
             status: ffi::UserStatus::from(user.status),
             username: user.username,
+            options: resource_options_to_ffi(&user.options, true),
         }
     }
 }
@@ -172,6 +173,7 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
             username: user.username,
             has_permissions,
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
+            options: resource_options_to_ffi(&user.options, true),
         }
     }
 }
@@ -273,6 +275,8 @@ impl From<RustStats> for ffi::Stats {
             threads_count: stats.threads_count,
             free_disk_space: stats.free_disk_space.as_bytes_u64(),
             total_disk_space: stats.total_disk_space.as_bytes_u64(),
+            open_files_count: stats.open_files_count,
+            open_files_limit: stats.open_files_limit,
         }
     }
 }

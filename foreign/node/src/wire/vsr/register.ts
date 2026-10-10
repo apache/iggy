@@ -25,12 +25,16 @@
 
 import { DeserializeError } from '../error.utils.js';
 
+export const BIND_SECRET_BYTES = 32;
+export const SESSION_IDENTITY_BYTES = 32;
+
 /**
  * Packed protocol semver of the wire contract this port implements,
- * `pack(0, 11, 0)` per `core/binary_protocol/src/version.rs`. Bump together
- * with the Rust `IGGY_PROTOCOL_VERSION` on any wire-incompatible change.
+ * `pack(0, 11, 1)` per `core/binary_protocol/src/version.rs`. Update with the
+ * Rust constant during stable release preparation. Edge builds sharing this
+ * number are not guaranteed to have compatible layouts.
  */
-export const IGGY_PROTOCOL_VERSION = (0 << 20) | (11 << 10) | 0;
+export const IGGY_PROTOCOL_VERSION = (0 << 20) | (11 << 10) | 1;
 
 const SDK_NAME = 'node-sdk';
 
@@ -49,19 +53,22 @@ const versionInfo = (sdkVersion: string): Buffer => {
 
 /**
  * `LoginRegisterRequest` body:
- * `[ClientVersionInfo][username len u8 + bytes][password len u8 + bytes]
- * [context len u32][context]`.
+ * `[ClientVersionInfo][bind secret 32 bytes][username len u8 + bytes]
+ * [password len u8 + bytes][context len u32][context]`.
  */
 export const serializeLoginRegister = (
   username: string,
   password: string,
-  sdkVersion: string
+  sdkVersion: string,
+  bindSecret: Buffer
 ): Buffer => {
+  validateBindSecret(bindSecret);
   const passwordBytes = Buffer.from(password, 'utf8');
   if (passwordBytes.length > 255)
     throw new Error('password exceeds the u8 length prefix');
   return Buffer.concat([
     versionInfo(sdkVersion),
+    bindSecret,
     wireName(username),
     Buffer.from([passwordBytes.length]),
     passwordBytes,
@@ -72,17 +79,36 @@ export const serializeLoginRegister = (
 /** `LoginRegisterWithPatRequest` body: the PAT takes the credential slot. */
 export const serializeLoginRegisterWithPat = (
   token: string,
-  sdkVersion: string
+  sdkVersion: string,
+  bindSecret: Buffer
 ): Buffer => {
+  validateBindSecret(bindSecret);
   const tokenBytes = Buffer.from(token, 'utf8');
   if (tokenBytes.length > 255)
     throw new Error('token exceeds the u8 length prefix');
   return Buffer.concat([
     versionInfo(sdkVersion),
+    bindSecret,
     Buffer.from([tokenBytes.length]),
     tokenBytes,
     Buffer.alloc(4)
   ]);
+};
+
+export const serializeBindSession = (
+  identity: Buffer,
+  sdkVersion: string,
+  bindSecret: Buffer
+): Buffer => {
+  if (identity.length !== SESSION_IDENTITY_BYTES)
+    throw new RangeError('session identity must be 32 bytes');
+  validateBindSecret(bindSecret);
+  return Buffer.concat([versionInfo(sdkVersion), identity, bindSecret]);
+};
+
+const validateBindSecret = (secret: Buffer): void => {
+  if (secret.length !== BIND_SECRET_BYTES)
+    throw new RangeError('bind secret must be 32 bytes');
 };
 
 /** Decoded `LoginRegisterResponse`. */

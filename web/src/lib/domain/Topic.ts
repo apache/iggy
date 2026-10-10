@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { bytesFormatter } from '$lib/utils/formatters/bytesFormatter';
-import { formatDate } from '$lib/utils/formatters/dateFormatter';
-import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
+import { bytesFormatter } from '#lib/utils/formatters/bytesFormatter.js';
+import { formatDate } from '#lib/utils/formatters/dateFormatter.js';
+import { durationFormatter } from '#lib/utils/formatters/durationFormatter.js';
 
 export type Topic = {
   id: number;

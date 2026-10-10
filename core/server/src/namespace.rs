@@ -33,7 +33,8 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{
-    KIND_CONSUMER_GROUP, Operation, WireDecode, WireIdentifier, WirePartitioning,
+    KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, WireDecode, WireIdentifier,
+    WirePartitioning,
 };
 use iggy_common::{Identifier, IggyError};
 use journal::superblock::SuperblockStore;
@@ -43,52 +44,6 @@ use metadata::stm::stream::Streams;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
-
-/// Fence a consumer-group offset commit/delete: a group consumer may only
-/// touch the offset of a partition it currently owns. `Ok` for individual
-/// consumers (no fence) and for owned group partitions; `Err` otherwise so a
-/// stale client re-syncs instead of corrupting the shared group offset.
-#[allow(clippy::cast_possible_truncation)]
-fn fence_group_offset<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    consumer: &WireConsumer,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-    partition_id: Option<u32>,
-    client_id: u128,
-) -> Result<(), IggyError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    if consumer.kind != KIND_CONSUMER_GROUP {
-        return Ok(());
-    }
-    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
-    let streams = shard.plane.metadata().mux_stm.streams();
-    let Some(_) = streams
-        // Commit fence: allow a pending-revoked partition (the source commits it
-        // to drain the cooperative handoff), so `require_pollable = false`.
-        .consumer_group_fence(
-            stream_id,
-            topic_id,
-            &consumer.id,
-            client_id,
-            partition_id,
-            false,
-        )
-    else {
-        resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
-        return Err(IggyError::ConsumerGroupPartitionNotOwned(
-            client_id as u32,
-            partition_id,
-        ));
-    };
-    Ok(())
-}
 
 pub fn resolve_offset_group_id(
     streams: &Streams,
@@ -108,18 +63,6 @@ pub fn resolve_offset_group_id(
                 IggyError::ResourceNotFound(String::new())
             }
         })
-}
-
-fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifier) -> IggyError {
-    let topic = wire_identifier_for_display(topic);
-    match group {
-        WireIdentifier::Numeric(_) => {
-            IggyError::ConsumerGroupIdNotFound(wire_identifier_for_display(group), topic)
-        }
-        WireIdentifier::String(name) => {
-            IggyError::ConsumerGroupNameNotFound(name.as_str().to_owned(), topic)
-        }
-    }
 }
 
 /// Fence a consumer-group offset op then resolve its target partition
@@ -220,42 +163,6 @@ where
     Ok(namespace.inner())
 }
 
-fn resolve_send_messages_namespace<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    header: &SendMessagesHeader,
-) -> Result<IggyNamespace, IggyError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let partition_id = match &header.partitioning {
-        WirePartitioning::PartitionId(partition_id) => *partition_id,
-        WirePartitioning::Balanced => shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .next_balanced_partition(&header.stream_id, &header.topic_id)
-            .ok_or(IggyError::InvalidIdentifier)?,
-        WirePartitioning::MessagesKey(key) => shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_by_messages_key(&header.stream_id, &header.topic_id, key)
-            .ok_or(IggyError::InvalidIdentifier)?,
-    };
-    resolve_partition_namespace(
-        shard,
-        &header.stream_id,
-        &header.topic_id,
-        Some(partition_id),
-    )
-}
-
 pub fn resolve_partition_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
@@ -299,17 +206,6 @@ where
     }))
 }
 
-/// Best-effort conversion for error payloads only: the wire reply carries just
-/// the error code, so a failed conversion may fall back to a default without
-/// changing what the client sees.
-fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
-    match id {
-        WireIdentifier::Numeric(numeric_id) => Identifier::numeric(*numeric_id),
-        WireIdentifier::String(name) => Identifier::named(name.as_str()),
-    }
-    .unwrap_or_default()
-}
-
 /// Reject a consumer-group read whose parent stream/topic is absent with the
 /// legacy typed error naming the level that missed; the group itself missing
 /// stays the shared not-found reply (empty over TCP, 404 over HTTP).
@@ -336,12 +232,116 @@ where
     })
 }
 
-/// Convert a `WireIdentifier` to the domain `Identifier`.
-fn wire_id_to_identifier(wire: &WireIdentifier) -> Result<Identifier, IggyError> {
-    match wire {
-        WireIdentifier::Numeric(id) => Identifier::numeric(*id),
+/// Fence a consumer-group offset commit/delete: a group consumer may only
+/// touch the offset of a partition it currently owns. `Ok` for individual
+/// consumers (no fence) and for owned group partitions; `Err` otherwise so a
+/// stale client re-syncs instead of corrupting the shared group offset. An
+/// external group has no members here, so it needs only an existing group.
+#[allow(clippy::cast_possible_truncation)]
+fn fence_group_offset<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let streams = shard.plane.metadata().mux_stm.streams();
+    match consumer.kind {
+        KIND_CONSUMER_GROUP => {}
+        KIND_EXTERNAL_GROUP => {
+            partition_id.ok_or(IggyError::InvalidIdentifier)?;
+            resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
+    }
+    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    let Some(_) = streams
+        // Commit fence: allow a pending-revoked partition (the source commits it
+        // to drain the cooperative handoff), so `require_pollable = false`.
+        .consumer_group_fence(
+            stream_id,
+            topic_id,
+            &consumer.id,
+            client_id,
+            partition_id,
+            false,
+        )
+    else {
+        resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
+        return Err(IggyError::ConsumerGroupPartitionNotOwned(
+            client_id as u32,
+            partition_id,
+        ));
+    };
+    Ok(())
+}
+
+fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifier) -> IggyError {
+    let topic = wire_identifier_for_display(topic);
+    match group {
+        WireIdentifier::Numeric(_) => {
+            IggyError::ConsumerGroupIdNotFound(wire_identifier_for_display(group), topic)
+        }
+        WireIdentifier::String(name) => {
+            IggyError::ConsumerGroupNameNotFound(name.as_str().to_owned(), topic)
+        }
+    }
+}
+
+fn resolve_send_messages_namespace<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    header: &SendMessagesHeader,
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let partition_id = match &header.partitioning {
+        WirePartitioning::PartitionId(partition_id) => *partition_id,
+        WirePartitioning::Balanced => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .next_balanced_partition(&header.stream_id, &header.topic_id)
+            .ok_or(IggyError::InvalidIdentifier)?,
+        WirePartitioning::MessagesKey(key) => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_by_messages_key(&header.stream_id, &header.topic_id, key)
+            .ok_or(IggyError::InvalidIdentifier)?,
+    };
+    resolve_partition_namespace(
+        shard,
+        &header.stream_id,
+        &header.topic_id,
+        Some(partition_id),
+    )
+}
+
+/// Best-effort conversion for error payloads only: the wire reply carries just
+/// the error code, so a failed conversion may fall back to a default without
+/// changing what the client sees.
+fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
+    match id {
+        WireIdentifier::Numeric(numeric_id) => Identifier::numeric(*numeric_id),
         WireIdentifier::String(name) => Identifier::named(name.as_str()),
     }
+    .unwrap_or_default()
 }
 
 /// Typed miss for a read's parent stream, matching the legacy servers' error
@@ -359,4 +359,12 @@ fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> Igg
         wire_id_to_identifier(topic_id).unwrap_or_default(),
         wire_id_to_identifier(stream_id).unwrap_or_default(),
     )
+}
+
+/// Convert a `WireIdentifier` to the domain `Identifier`.
+fn wire_id_to_identifier(wire: &WireIdentifier) -> Result<Identifier, IggyError> {
+    match wire {
+        WireIdentifier::Numeric(id) => Identifier::numeric(*id),
+        WireIdentifier::String(name) => Identifier::named(name.as_str()),
+    }
 }

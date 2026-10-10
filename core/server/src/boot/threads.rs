@@ -555,6 +555,19 @@ pub(in crate::boot) fn resolve_shard_assignments(
     }
 }
 
+pub(in crate::boot) fn partition_io_limits(
+    sharding: &configs::sharding::ShardingConfig,
+) -> Result<shard::PartitionIoLimits, shard::PartitionIoLimitsError> {
+    shard::PartitionIoLimits::new(
+        sharding.partition_io_capacity,
+        sharding
+            .partition_io_bytes_max
+            .map(|bytes| usize::try_from(bytes.as_bytes_u64()))
+            .transpose()
+            .map_err(|_| shard::PartitionIoLimitsError::Overflow)?,
+    )
+}
+
 /// Re-validate the runtime sharding knobs that the per-shard runtime
 /// consumes directly: the two inbox capacities, the three shutdown
 /// durations and their ordering, and the reconcile tick. Mirrors
@@ -567,6 +580,7 @@ pub(in crate::boot) fn validate_sharding_runtime_knobs(
     sharding: &configs::sharding::ShardingConfig,
 ) -> Result<(), ServerError> {
     let inbox_capacity = sharding.inbox_capacity;
+    partition_io_limits(sharding)?;
     if inbox_capacity == 0 || inbox_capacity > INBOX_CAPACITY_MAX {
         return Err(ServerError::InvalidInboxCapacity {
             value: inbox_capacity,
@@ -845,6 +859,8 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) heartbeat: Option<Sender<()>>,
     pub(in crate::boot) pat_cleaner: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
+    pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
+    pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
 
 impl StopSignals {
@@ -852,9 +868,15 @@ impl StopSignals {
     pub(in crate::boot) fn fire(&self) {
         let _ = self.pump.try_send(());
         let _ = self.reconciler.try_send(());
-        for stop in [&self.heartbeat, &self.pat_cleaner, &self.segment_cleaner]
-            .into_iter()
-            .flatten()
+        for stop in [
+            &self.heartbeat,
+            &self.pat_cleaner,
+            &self.segment_cleaner,
+            &self.sysinfo_printer,
+            &self.consumer_group_liveness,
+        ]
+        .into_iter()
+        .flatten()
         {
             let _ = stop.try_send(());
         }
@@ -1190,7 +1212,7 @@ mod tests {
         let fault = FatalCommit {
             namespace_raw: 42,
             op: 7,
-            operation: iggy_binary_protocol::Operation::SendMessages,
+            operation: Some(iggy_binary_protocol::Operation::SendMessages),
         };
         let pump = compio::runtime::spawn(async move { Some(fault) });
 

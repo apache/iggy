@@ -157,7 +157,6 @@ An invalid network configuration exits 2 before the simulator starts. Every othe
 | Checkpointing | `--journal-slots`, `--data-dir`, `--reuse-data-dir` |
 | Quiesce | `--no-quiesce`, `--heal-before-quiesce` |
 | Gates | `--min-commits` (1), `--min-ops-compared` (1), `--require-entity-oracle`, `--require-faults` |
-| Durability study | `--restore-partition-frontier` |
 
 `--plane` picks the op mix: `partition` (writes and consumer offsets), `metadata` (replicated metadata mutations), `mixed` (stream creates over a write-heavy base), `uniform` (every action equally likely, the widest per-tick coverage).
 
@@ -202,9 +201,10 @@ Constructors: `Simulator::new` (one shard per replica), `with_shards` (metadata 
 
 ## Not modelled
 
+- Client heartbeat verification and periodic consumer-group session expiry. Disconnect detaches a local binding and leaves the durable session live. The consumer-group tests invoke ordered cleanup explicitly; they do not cover the production timer or automatic liveness reporting.
 - Storage faults, beyond two knobs on the superblock. `SimSuperblock::set_fail_writes` and `set_yield_writes` inject a persistent write fault and an fsync-wide suspension point; `MemStorage` under the journal never fails and never tears a write. Partition superblocks are storeless, which leaves partition view recovery untested.
 - Segment files. Partition messages live in memory; they survive a restart only because the harness carries `RetainedPartitionState` across the rebuild.
-- Partition-plane durability. Production's `load_partition` restores the view alone, so a restarted replica rejoins at op 0, invisible to quorum. `--restore-partition-frontier` looks past that at a system more durable than Iggy is.
+- Physical partition durability. The consensus model uses persisted topic policies and retains the partition journal, committed frontier and retry receipts together across restarts. Storage is ideal: it cannot lose a write or reorder persistence barriers. WAL/checkpoint fault tests and real-server crash tests must prove those physical properties separately.
 - Packet corruption. Packets are delayed, dropped, duplicated, partitioned and clogged, never mangled.
 - Multi-shard metadata. Shard 0 owns the only metadata consensus group.
 - I/O of any kind except the checkpoint files: no `io_uring`, no sockets, no wall clock.

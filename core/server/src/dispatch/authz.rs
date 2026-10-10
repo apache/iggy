@@ -29,10 +29,9 @@ use std::rc::Rc;
 
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -101,14 +100,14 @@ where
                 | Operation::RemoveConsumerGroupMember
                 | Operation::CompleteConsumerGroupRevocation
                 | Operation::TruncatePartition
+                | Operation::FinalizeSession
+                | Operation::RetireSession
                 | Operation::CreateStream
                 | Operation::UpdateStream
                 | Operation::DeleteStream
-                | Operation::PurgeStream
                 | Operation::CreateTopic
                 | Operation::UpdateTopic
                 | Operation::DeleteTopic
-                | Operation::PurgeTopic
                 | Operation::CreatePartitions
                 | Operation::DeletePartitions
                 | Operation::DeleteSegments
@@ -171,7 +170,12 @@ where
     let Some(user_id) = user_id else {
         return Some(IggyError::Unauthenticated.as_code());
     };
-    let (stream_id, topic_id) = resolve_topic_scope(shard, stream_id, topic_id)?;
+    let (stream_id, topic_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_topic_ids(stream_id, topic_id)?;
     shard
         .plane
         .metadata()
@@ -260,9 +264,6 @@ where
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_groups,
         ),
-        // No on-demand flush primitive exists, and flush has no HTTP route, so
-        // this arm is the only thing answering `FeatureUnavailable` for it.
-        FLUSH_UNSAVED_BUFFER_CODE => Err(IggyError::FeatureUnavailable),
         // A replicated code smuggled inside a `NonReplicated` header keeps the
         // builder's `FeatureUnavailable`; a table-listed code with no arm above
         // and an unknown code are both refused as `InvalidCommand`. The builder
@@ -332,7 +333,13 @@ where
     let Ok(request) = T::decode_from(body) else {
         return Ok(());
     };
-    let Some(stream_id) = resolve_stream_scope(shard, stream_id(&request)) else {
+    let Some(stream_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_stream_id(stream_id(&request))
+    else {
         return Ok(());
     };
     authorize_uid(shard, user_id, |permissioner, uid| {
@@ -362,53 +369,17 @@ where
         return Ok(());
     };
     let (stream_id, topic_id) = ids(&request);
-    let Some((stream_id, topic_id)) = resolve_topic_scope(shard, stream_id, topic_id) else {
-        return Ok(());
-    };
-    authorize_uid(shard, user_id, |permissioner, uid| {
-        rule(permissioner, uid, stream_id, topic_id)
-    })
-}
-
-/// Resolve a wire stream identifier to its committed slab id, or `None` on a
-/// miss (the gate then falls through to the builder's not-found reply).
-fn resolve_stream_scope<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-) -> Option<usize>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard
+    let Some((stream_id, topic_id)) = shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| inner.resolve_stream_id(stream_id))
-}
-
-/// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
-/// either misses.
-fn resolve_topic_scope<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-) -> Option<(usize, usize)>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let stream_id = inner.resolve_stream_id(stream_id)?;
-        let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
-        Some((stream_id, topic_id))
+        .resolve_topic_ids(stream_id, topic_id)
+    else {
+        return Ok(());
+    };
+    authorize_uid(shard, user_id, |permissioner, uid| {
+        rule(permissioner, uid, stream_id, topic_id)
     })
 }
 
@@ -418,7 +389,7 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        ATTACH_CONSUMER_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
+        BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
         GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
         GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
         LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
@@ -471,7 +442,6 @@ mod tests {
         let allow = Verdict::Allow;
         let unauthenticated = Verdict::Deny(IggyError::Unauthenticated.as_code());
         let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
-        let feature_unavailable = Verdict::Deny(IggyError::FeatureUnavailable.as_code());
         vec![
             (PING_CODE, invalid_command, invalid_command),
             (GET_STATS_CODE, unauthenticated, allow),
@@ -492,11 +462,7 @@ mod tests {
                 invalid_command,
             ),
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
-            (
-                ATTACH_CONSUMER_SESSION_CODE,
-                invalid_command,
-                invalid_command,
-            ),
+            (BIND_SESSION_CODE, invalid_command, invalid_command),
             (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
             (
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -507,11 +473,6 @@ mod tests {
                 GET_CONSUMER_OFFSET_ROUTING_CODE,
                 invalid_command,
                 invalid_command,
-            ),
-            (
-                FLUSH_UNSAVED_BUFFER_CODE,
-                feature_unavailable,
-                feature_unavailable,
             ),
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),

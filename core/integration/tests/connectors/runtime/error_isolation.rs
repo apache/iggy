@@ -28,7 +28,8 @@
 //! `source::init` and `sink::init`:
 //!   * plugin path resolution failure (missing `.so`),
 //!   * source state-load failure (unreachable state file),
-//!   * post-container setup failure (invalid duration in stream config).
+//!   * post-container setup failure (invalid duration in stream config),
+//!   * post-container setup failure surfaced as an Iggy error (missing stream).
 
 use iggy_common::{Identifier, IggyMessage, MessageClient, Partitioning};
 use iggy_connector_sdk::api::{
@@ -397,4 +398,49 @@ async fn given_sink_transform_error_when_batch_processed_should_not_count_filter
         "transform errors are not intentional filters"
     );
     assert_eq!(sink.status, ConnectorStatus::Running);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(
+        config_path = "tests/connectors/runtime/sink_missing_stream.toml"
+    )),
+    seed = seeds::connector_stream
+)]
+async fn given_sink_with_missing_stream_when_runtime_starts_should_expose_iggy_error_reason(
+    harness: &TestHarness,
+) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let http_client = Client::new();
+
+    assert_runtime_healthy(&http_client, &api_address).await;
+    let sinks = fetch_sinks(&http_client, &api_address).await;
+
+    let missing_stream_sink = sinks
+        .iter()
+        .find(|sink| sink.key == "stdout_missing_stream")
+        .expect("Sink with a missing stream should be reported");
+    assert_eq!(missing_stream_sink.status, ConnectorStatus::Error);
+    let last_error = missing_stream_sink
+        .last_error
+        .as_ref()
+        .expect("Sink with a missing stream should expose a last_error");
+    assert!(
+        last_error.message.contains("no_such_stream")
+            && last_error.message.contains("was not found"),
+        "last_error should carry the SDK's StreamNameNotFound message, got: {}",
+        last_error.message
+    );
+
+    let valid_sink = sinks
+        .iter()
+        .find(|sink| sink.key == "stdout_valid")
+        .expect("Healthy sibling sink should be reported");
+    assert_eq!(valid_sink.status, ConnectorStatus::Running);
+    assert!(
+        valid_sink.last_error.is_none(),
+        "Healthy sibling sink should have no last_error"
+    );
 }

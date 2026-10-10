@@ -72,10 +72,35 @@ max-threads = 4
 [[profile.default.overrides]]
 filter = '''
     binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)
+    + binary_id(iggy-gateway-kafka::fetch_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::create_topics_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
 '''
 test-group = "kafka_bridge"
+
+# The real-client suite spawns its own server too, so it needs serializing for the same reason, but
+# in its own group rather than queued behind the bridge tests: sharing one group would put eight
+# container-driven tests behind twenty-one unrelated ones, serially, for no isolation gained. Both
+# groups cap their servers' shard pools themselves, so running the two alongside each other is
+# bounded.
+[test-groups.kafka_client_e2e]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests)'
+test-group = "kafka_client_e2e"
+
+# The chaos monkey runs a five-node cluster for minutes (IGGY_TEST_CHAOS_DURATION_SECS, 120 by
+# default), then drains and verifies. It needs the whole box, so its kill and restart timing is
+# not distorted by other tests, and a timeout above the default 300 s. The cap is one hour.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/chaos_monkey/)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 60 }
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
