@@ -146,7 +146,7 @@ impl<'a> IggyCredentials<'a> {
                 iggy_client: None,
                 login_required,
             })
-        } else if let Some(credentials) = session_credentials() {
+        } else if prefer_explicit_credentials && let Some(credentials) = session_credentials() {
             // `iggy login` with no explicit credentials: reuse the cached
             // session token so a still-valid session reports "already logged in"
             // instead of demanding credentials for a no-op.

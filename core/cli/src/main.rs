@@ -39,7 +39,7 @@ use clap::Parser;
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Aes256GcmEncryptor, ClientError, EncryptorKind, PersonalAccessTokenExpiry};
-use iggy_cli::commands::binary_context::common::ContextManager;
+use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
 use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
@@ -382,6 +382,7 @@ async fn main() -> Result<(), IggyCmdError> {
     let iggy_args = merged_args.iggy;
     let cli_options = merged_args.cli;
 
+    validate_transport(&iggy_args.transport)?;
     let server_address = iggy_args
         .get_server_address()
         .ok_or_else(|| ClientError::InvalidTransport(iggy_args.transport.clone()))?;

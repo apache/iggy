@@ -37,9 +37,9 @@ impl IggyCmdTestCase for TestUnknownTransportCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        command_state
-            .failure()
-            .stderr(contains("Error: IggyClient(InvalidTransport(\"foo\"))"));
+        command_state.failure().stderr(contains(
+            "invalid transport 'foo' - valid values are: tcp, quic, http, ws",
+        ));
     }
 
     async fn verify_server_state(&self, _client: &dyn Client) {}

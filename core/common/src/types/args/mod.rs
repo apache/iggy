@@ -356,6 +356,10 @@ pub struct Args {
 }
 
 impl Args {
+    /// Returns the server address for `tcp`, `quic`, `http`, or `ws`.
+    ///
+    /// Transport names are case-sensitive. Returns `None` for an unsupported name.
+    /// For HTTP, removes `http://` from the API URL.
     pub fn get_server_address(&self) -> Option<String> {
         match TransportProtocol::from_str(&self.transport).ok()? {
             TransportProtocol::Quic => Some(self.quic_server_address.clone()),

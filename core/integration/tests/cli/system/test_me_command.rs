@@ -33,25 +33,6 @@ pub(super) enum Scenario {
     FailureDueToSessionTimeout,
 }
 
-// Helper trait to add command-specific methods to TransportProtocol
-trait TransportProtocolExt {
-    fn as_arg(&self) -> Vec<&str>;
-}
-
-impl TransportProtocolExt for TransportProtocol {
-    fn as_arg(&self) -> Vec<&str> {
-        match self {
-            TransportProtocol::Tcp => vec!["--transport", "tcp"],
-            TransportProtocol::Quic => vec!["--transport", "quic"],
-            TransportProtocol::WebSocket => vec!["--transport", "ws"],
-            // Note: HTTP is not supported for the 'me' command
-            TransportProtocol::Http => {
-                panic!("HTTP transport is not supported for the 'me' command")
-            }
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct TestMeCmd {
     protocol: TransportProtocol,
@@ -73,7 +54,9 @@ impl IggyCmdTestCase for TestMeCmd {
     async fn prepare_server_state(&mut self, _client: &dyn Client) {}
 
     fn get_command(&self) -> IggyCmdCommand {
-        let command = IggyCmdCommand::new().opts(self.protocol.as_arg()).arg("me");
+        let command = IggyCmdCommand::new()
+            .opts(vec!["--transport", self.protocol.as_str()])
+            .arg("me");
 
         match &self.scenario {
             Scenario::SuccessWithCredentials => command.with_env_credentials(),
