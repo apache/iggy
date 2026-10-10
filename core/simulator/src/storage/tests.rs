@@ -66,7 +66,6 @@ enum Mutation {
     CheckpointBufferedTail,
     Truncate,
     Reset,
-    Purge,
 }
 
 #[test]
@@ -132,7 +131,6 @@ fn wal_fault_sweep_preserves_acknowledged_history_at_every_io_boundary() {
             Mutation::CheckpointBufferedTail,
             Mutation::Truncate,
             Mutation::Reset,
-            Mutation::Purge,
         ] {
             let (storage, mut journal) = baseline().await;
             storage.clear_trace();
@@ -174,7 +172,6 @@ fn referenced_wal_fault_sweep_preserves_bodies_through_publication_and_reclamati
             Mutation::Checkpoint,
             Mutation::Truncate,
             Mutation::Reset,
-            Mutation::Purge,
         ] {
             let (storage, mut journal) = referenced_baseline().await;
             storage.clear_trace();
@@ -1396,6 +1393,19 @@ async fn storage_for_partition() -> SimStorage {
     storage
 }
 
+async fn owned_journal_for_partition() -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
+    let storage = storage_for_partition().await;
+    let mut journal =
+        PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    journal
+        .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64)
+        .await
+        .unwrap();
+    (storage, journal)
+}
+
 async fn queued_batch(count: u64) -> (SimStorage, Rc<PartitionPersistence<SimStorage>>) {
     let storage = storage_for_partition().await;
     let (persistence, _) =
@@ -1512,105 +1522,104 @@ async fn segment_roll_during_wal_open(operation: StorageOperation) {
 }
 
 #[test]
-fn buffered_owned_segments_rotate_without_barriers_and_persist_offset_predecessors() {
+fn buffered_owned_rotations_publish_names_and_persist_offset_predecessors() {
     block_on(async {
-        let storage = storage_for_partition().await;
-        let mut journal =
-            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
-                .await
-                .unwrap();
-        journal
-            .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64)
-            .await
-            .unwrap();
-        storage.clear_trace();
-        let written_before: usize = storage.state.borrow().written_bytes.values().sum();
-        let mut parent = 0;
-        let mut prepares = Vec::new();
-        for offset in 0..3 {
-            let prepare = owned_prepare(offset + 1, parent, offset);
-            parent = prepare.header().checksum;
-            journal
-                .append_buffered(prepare.clone().into_frozen())
-                .await
-                .unwrap();
-            prepares.push(prepare);
-        }
-        assert!(
-            !storage.trace().iter().any(|operation| matches!(
-                operation,
-                StorageOperation::FileSync | StorageOperation::DirectorySync
-            )),
-            "replicated bodies must not require a barrier, including across append groups and rotations"
-        );
-        assert_eq!(journal.durable_op(), 0);
-        assert_eq!(journal.size_bytes(), (3 * PARTITION_WAL_BLOCK_SIZE) as u64);
-        assert_eq!(
-            journal.retained_bytes(),
-            3 * journal::partition_journal::record_length(prepares[0].as_slice().len()).unwrap()
-                as u64
-        );
-        let written_after: usize = storage.state.borrow().written_bytes.values().sum();
-        assert_eq!(
-            written_after - written_before,
-            3 * (OWNED_BATCH_BYTES + PARTITION_WAL_BLOCK_SIZE),
-            "each append writes one body and one metadata WAL record"
-        );
-        let offset = offset_prepare(4, parent);
-        journal.append(offset.clone().into_frozen()).await.unwrap();
-        prepares.push(offset);
-        for prepare in &prepares[..3] {
-            let reference = journal.segment_reference(prepare.header()).unwrap();
-            let public = Path::new(DIRECTORY).join(format!("{:020}.log", reference.start_offset));
-            let retained = Path::new(WAL).join(format!(
-                "segment-{}-{}.log",
-                reference.generation, reference.start_offset
-            ));
-            let state = storage.state.borrow();
-            let inode = state.lookup(&public).unwrap();
-            assert_eq!(inode, state.lookup(&retained).unwrap());
-            assert_eq!(state.written_bytes[&inode], OWNED_BATCH_BYTES);
-        }
-        drop(journal);
-        storage.crash(Crash::PowerLoss);
-        let mut recovered =
-            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
-                .await
-                .unwrap();
-        assert_eq!(recovered.durable_op(), 4);
-        assert_eq!(
-            recovered.segment_checkpoint(),
-            Some(SegmentPosition::default())
-        );
-        let actual = recovered.prepares().await.unwrap();
-        assert_eq!(actual.len(), prepares.len());
-        for (actual, expected) in actual.iter().zip(&prepares) {
-            assert_eq!(actual.as_slice(), expected.as_slice());
-        }
-        recovered.checkpoint(2).await.unwrap();
-        let retained_path = Path::new(DIRECTORY).join(format!("{:020}.log", 1));
-        let reader = storage.open(&retained_path, OpenMode::Read).await.unwrap();
-        for offset in 0..2 {
-            storage
-                .remove_file(&Path::new(DIRECTORY).join(format!("{offset:020}.log")))
-                .await
-                .unwrap();
-        }
-        storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
-        assert_eq!(
-            reader.read(0, OWNED_BATCH_BYTES).await.unwrap(),
-            prepares[1].as_slice()[size_of::<PrepareHeader>()..]
-        );
-        drop(recovered);
-        storage.crash(Crash::PowerLoss);
-        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
-            .await
-            .unwrap();
-        assert_eq!(recovered.checkpoint_op(), 2);
-        let actual = recovered.prepares().await.unwrap();
-        assert_eq!(actual.len(), prepares.len() - 1);
-        for (actual, expected) in actual.iter().zip(&prepares[1..]) {
-            assert_eq!(actual.as_slice(), expected.as_slice());
+        let checkpoint = Some(SegmentPosition::default());
+        for persist_offset in [false, true] {
+            let (storage, mut journal) = owned_journal_for_partition().await;
+            let written_before: usize = storage.state.borrow().written_bytes.values().sum();
+            let mut parent = 0;
+            let mut prepares = Vec::new();
+            for offset in 0..3 {
+                let prepare = owned_prepare(offset + 1, parent, offset);
+                parent = prepare.header().checksum;
+                journal
+                    .append_buffered(prepare.clone().into_frozen())
+                    .await
+                    .unwrap();
+                prepares.push(prepare);
+            }
+            assert_eq!(journal.durable_op(), 0);
+            assert_eq!(journal.size_bytes(), (3 * PARTITION_WAL_BLOCK_SIZE) as u64);
+            assert_eq!(
+                journal.retained_bytes(),
+                3 * journal::partition_journal::record_length(prepares[0].as_slice().len()).unwrap()
+                    as u64
+            );
+            let written_after: usize = storage.state.borrow().written_bytes.values().sum();
+            assert_eq!(
+                written_after - written_before,
+                3 * (OWNED_BATCH_BYTES + PARTITION_WAL_BLOCK_SIZE),
+                "each append writes one body and one metadata WAL record"
+            );
+            let mut segment_names = (0..prepares.len())
+                .map(|offset| Path::new(DIRECTORY).join(format!("{offset:020}.log")))
+                .collect::<Vec<_>>();
+            if persist_offset {
+                let offset = offset_prepare(4, parent);
+                journal.append(offset.clone().into_frozen()).await.unwrap();
+                prepares.push(offset);
+                for prepare in &prepares[..3] {
+                    let reference = journal.segment_reference(prepare.header()).unwrap();
+                    let public =
+                        Path::new(DIRECTORY).join(format!("{:020}.log", reference.start_offset));
+                    let retained = Path::new(WAL).join(format!(
+                        "segment-{}-{}.log",
+                        reference.generation, reference.start_offset
+                    ));
+                    let state = storage.state.borrow();
+                    let inode = state.lookup(&public).unwrap();
+                    assert_eq!(inode, state.lookup(&retained).unwrap());
+                    assert_eq!(state.written_bytes[&inode], OWNED_BATCH_BYTES);
+                    segment_names.push(retained);
+                }
+            }
+            drop(journal);
+            storage.crash(Crash::PowerLoss);
+            for name in segment_names {
+                assert!(storage.exists(&name).await.unwrap());
+            }
+            let mut recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.durable_op(), if persist_offset { 4 } else { 0 });
+            assert_eq!(recovered.segment_checkpoint(), checkpoint);
+            let actual = recovered.prepares().await.unwrap();
+            if !persist_offset {
+                assert!(actual.is_empty(), "buffered WAL persisted");
+                continue;
+            }
+            assert_eq!(actual.len(), prepares.len());
+            for (actual, expected) in actual.iter().zip(&prepares) {
+                assert_eq!(actual.as_slice(), expected.as_slice());
+            }
+            recovered.checkpoint(2).await.unwrap();
+            let retained_path = Path::new(DIRECTORY).join(format!("{:020}.log", 1));
+            let reader = storage.open(&retained_path, OpenMode::Read).await.unwrap();
+            for offset in 0..2 {
+                storage
+                    .remove_file(&Path::new(DIRECTORY).join(format!("{offset:020}.log")))
+                    .await
+                    .unwrap();
+            }
+            storage.sync_directory(Path::new(DIRECTORY)).await.unwrap();
+            assert_eq!(
+                reader.read(0, OWNED_BATCH_BYTES).await.unwrap(),
+                prepares[1].as_slice()[size_of::<PrepareHeader>()..]
+            );
+            drop(recovered);
+            storage.crash(Crash::PowerLoss);
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.checkpoint_op(), 2);
+            let actual = recovered.prepares().await.unwrap();
+            assert_eq!(actual.len(), prepares.len() - 1);
+            for (actual, expected) in actual.iter().zip(&prepares[1..]) {
+                assert_eq!(actual.as_slice(), expected.as_slice());
+            }
         }
     });
 }
@@ -1698,7 +1707,6 @@ fn owned_segment_fault_sweep_preserves_acknowledged_bodies_and_checkpoint_bounds
             Mutation::Checkpoint,
             Mutation::Truncate,
             Mutation::Reset,
-            Mutation::Purge,
         ] {
             for buffered in [false, true] {
                 let (storage, mut journal) = owned_segment_baseline(buffered).await;
@@ -1769,6 +1777,55 @@ async fn owned_segment_baseline(
         journal.sync().await.unwrap();
     }
     (storage, journal)
+}
+
+#[test]
+fn reopening_retained_segments_syncs_only_recovery_mutations() {
+    block_on(async {
+        for buffered_tail in [false, true] {
+            let (storage, mut journal) = owned_segment_baseline(buffered_tail).await;
+            journal.cleanup_obsolete().await;
+            drop(journal);
+            storage.clear_trace();
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                    .await
+                    .unwrap();
+            let trace = storage.trace();
+            let file_syncs = trace
+                .iter()
+                .filter(|operation| **operation == StorageOperation::FileSync)
+                .count();
+            assert_eq!(file_syncs, 1 + usize::from(buffered_tail), "{trace:?}");
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|operation| **operation == StorageOperation::DirectorySync)
+                    .count(),
+                3,
+                "retained names need no new publication barrier: {trace:?}"
+            );
+            let expected_head = if buffered_tail { 1 } else { 2 };
+            assert_eq!(recovered.head(), expected_head);
+            drop(recovered);
+            storage.crash(Crash::PowerLoss);
+            let public = Path::new("/partition/00000000000000000000.log");
+            let file = storage.open(public, OpenMode::Read).await.unwrap();
+            assert_eq!(
+                file.length().await.unwrap(),
+                expected_head * OWNED_BATCH_BYTES as u64
+            );
+            let recovered =
+                PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+                    .await
+                    .unwrap();
+            assert_eq!(recovered.head(), expected_head);
+            assert_eq!(
+                recovered.prepares().await.unwrap().len() as u64,
+                expected_head
+            );
+        }
+    });
 }
 
 #[test]
@@ -2169,12 +2226,6 @@ async fn mutate_owned_segments(
                 )
                 .await
         }
-        Mutation::Purge => {
-            journal.mark_purge(1, 2).await?;
-            journal
-                .append(owned_prepare(3, second.header().checksum, 0).into_frozen())
-                .await
-        }
     }
 }
 
@@ -2187,20 +2238,11 @@ async fn assert_owned_segments(
 ) {
     let first = owned_prepare(1, 0, 0);
     let second = owned_prepare(2, first.header().checksum, 1);
-    let third = owned_prepare(
-        3,
-        second.header().checksum,
-        if matches!(mutation, Mutation::Purge) {
-            0
-        } else {
-            2
-        },
-    );
+    let third = owned_prepare(3, second.header().checksum, 2);
     let expected = [first, second, third];
     let checkpoint = journal.segment_checkpoint().unwrap();
     let checkpointed = match mutation {
         Mutation::Checkpoint if journal.checkpoint_op() == 2 => 2,
-        Mutation::Purge if journal.purge_marker() == (1, 2) => 0,
         Mutation::Reset if journal.checkpoint_op() == 2 => 0,
         _ => 1,
     };
@@ -2214,7 +2256,7 @@ async fn assert_owned_segments(
         "{context}"
     );
     let expected_head = match mutation {
-        Mutation::Append | Mutation::Purge => 3,
+        Mutation::Append => 3,
         Mutation::Truncate => 1,
         _ => 2,
     };
@@ -2223,23 +2265,11 @@ async fn assert_owned_segments(
     }
     let baseline_head = if buffered { 1 } else { 2 };
     assert!(
-        [
-            baseline_head,
-            if matches!(mutation, Mutation::Purge) {
-                2
-            } else {
-                expected_head
-            },
-            expected_head
-        ]
-        .contains(&journal.head()),
+        [baseline_head, expected_head].contains(&journal.head()),
         "{context}"
     );
     if completed && matches!(mutation, Mutation::Checkpoint) {
         assert_eq!(checkpointed, 2, "{context}");
-    }
-    if completed && matches!(mutation, Mutation::Purge) {
-        assert_eq!(checkpointed, 0, "{context}");
     }
     let prepares = journal.prepares().await.unwrap();
     let expected_ops: Vec<_> = (journal.checkpoint_op()..=journal.head()).collect();
@@ -2254,25 +2284,14 @@ async fn assert_owned_segments(
     for prepare in &prepares {
         let index = usize::try_from(prepare.header().op - 1).unwrap();
         assert_eq!(prepare.as_slice(), expected[index].as_slice(), "{context}");
-        assert_eq!(
+        assert!(
             journal.segment_reference(prepare.header()).is_some(),
-            prepare.header().op > journal.purge_marker().1,
             "{context}"
         );
     }
     assert_eq!(
         journal.size_bytes(),
-        prepares
-            .iter()
-            .map(|prepare| {
-                if prepare.header().op <= journal.purge_marker().1 {
-                    journal::partition_journal::record_length(prepare.as_slice().len()).unwrap()
-                        as u64
-                } else {
-                    PARTITION_WAL_BLOCK_SIZE as u64
-                }
-            })
-            .sum::<u64>(),
+        (prepares.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
         "{context}"
     );
 }
@@ -2377,23 +2396,6 @@ async fn mutate_referenced(
         Mutation::Checkpoint | Mutation::CheckpointBufferedTail => journal.checkpoint(2).await,
         Mutation::Truncate => journal.truncate_from(2).await,
         Mutation::Reset => journal.reset(7, None).await,
-        Mutation::Purge => {
-            journal.mark_purge(1, 2).await?;
-            for offset in [0, 1] {
-                storage
-                    .remove_file(&Path::new(DIRECTORY).join(format!("{offset:020}.log")))
-                    .await?;
-            }
-            storage.sync_directory(Path::new(DIRECTORY)).await?;
-            append_referenced(
-                storage,
-                journal,
-                &prepare(3, second.header().checksum),
-                1,
-                0,
-            )
-            .await
-        }
     }
 }
 
@@ -2404,7 +2406,7 @@ async fn assert_referenced_recovery(
     context: &str,
 ) {
     match mutation {
-        Mutation::Append | Mutation::Purge => {
+        Mutation::Append => {
             assert!((2..=3).contains(&journal.head()), "{context}");
             if completed {
                 assert_eq!(journal.head(), 3, "{context}");
@@ -2458,15 +2460,6 @@ async fn assert_referenced_recovery(
         expected_ops,
         "{context}",
     );
-    if matches!(mutation, Mutation::Purge) {
-        assert!(
-            [(0, 0), (1, 2)].contains(&journal.purge_marker()),
-            "{context}"
-        );
-        if completed || journal.head() == 3 {
-            assert_eq!(journal.purge_marker(), (1, 2), "{context}");
-        }
-    }
     assert_eq!(
         journal.size_bytes(),
         (recovered.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
@@ -2522,12 +2515,6 @@ async fn mutate(
         Mutation::Reset => {
             replace(storage, Path::new("/partition/materialized"), b"1-7").await?;
             journal.reset(7, None).await
-        }
-        Mutation::Purge => {
-            journal.mark_purge(9, 3).await?;
-            storage.remove_file(Path::new("/partition/state")).await?;
-            storage.sync_directory(Path::new(DIRECTORY)).await?;
-            replace(storage, Path::new("/partition/purge.gen"), b"9").await
         }
     }
 }
@@ -2631,27 +2618,6 @@ async fn assert_recovery(
                 assert_eq!(journal.head(), 7);
             }
         }
-        Mutation::Purge => {
-            assert_eq!(journal.head(), 3);
-            assert!([(0, 0), (9, 3)].contains(&journal.purge_marker()));
-            if storage
-                .exists(Path::new("/partition/purge.gen"))
-                .await
-                .unwrap()
-            {
-                assert_eq!(journal.purge_marker(), (9, 3));
-                assert!(!storage.exists(Path::new("/partition/state")).await.unwrap());
-            }
-            if completed {
-                assert_eq!(journal.purge_marker(), (9, 3));
-                assert!(
-                    storage
-                        .exists(Path::new("/partition/purge.gen"))
-                        .await
-                        .unwrap()
-                );
-            }
-        }
     }
     let entries = journal.prepares().await.unwrap();
     assert_eq!(
@@ -2681,6 +2647,10 @@ fn prepare_with_payload(op: u64, parent: u128, payload: &[u8]) -> Message<Prepar
     header.operation = Operation::SendMessages;
     header.group = 42;
     header.op = op;
+    header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+    header.session = 1;
+    header.request = op;
+    header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
     header.parent = parent;
     header.size = u32::try_from(length).unwrap();
     header.checksum_body = u128::from(XxHash3_64::oneshot(payload));

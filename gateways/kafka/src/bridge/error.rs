@@ -19,10 +19,10 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// Errors from the `IggyBridge`: connection lifecycle, config, and Iggy SDK calls.
@@ -124,6 +124,24 @@ impl BridgeError {
         }
     }
 
+    /// [`Self::to_kafka_error_code`] for `OffsetCommit` and `OffsetFetch`. A failure that a retry
+    /// can fix becomes `COORDINATOR_LOAD_IN_PROGRESS` (14): the Java client retries 14 in both
+    /// APIs, but fails the call on 6, and on 7 in `OffsetFetch`. Offset calls are idempotent, so
+    /// the unknown outcome behind 7 does no harm on a retry. Nor does `RequestTooOld`'s: the retry
+    /// is a new request, which Iggy runs.
+    #[must_use]
+    pub const fn to_offset_error_code(&self) -> i16 {
+        if matches!(self, Self::Iggy(IggyError::RequestTooOld)) {
+            return ERROR_COORDINATOR_LOAD_IN_PROGRESS;
+        }
+        match self.to_kafka_error_code() {
+            ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT => {
+                ERROR_COORDINATOR_LOAD_IN_PROGRESS
+            }
+            code => code,
+        }
+    }
+
     /// True when Iggy rejected the bridge's own login. The Kafka client only sees -1.
     #[must_use]
     pub const fn is_bridge_login_rejected(&self) -> bool {
@@ -216,7 +234,7 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // A read that somehow reaches this variant has no write to have "already applied"; a
         // write-side caller (CreateTopics) special-cases it locally, close to the write it
         // concerns, instead of baking a write-only assumption into a mapping every read also
-        // goes through.
+        // goes through. OffsetCommit does the same in `group_offsets.rs`.
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -289,8 +307,8 @@ mod tests {
     #[test]
     fn request_already_applied_falls_to_the_generic_mapping_here() {
         // This shared mapping has no write to know "already applied" refers to - CreateTopics
-        // (the only caller for whom that's a success, not a fault) special-cases it locally
-        // instead (`create_topics.rs`), close to the write it concerns.
+        // and OffsetCommit (the callers for whom that's a success, not a fault) special-case it
+        // locally instead (`create_topics.rs`, `group_offsets.rs`), close to the write.
         let err = BridgeError::Iggy(IggyError::RequestAlreadyApplied);
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
     }

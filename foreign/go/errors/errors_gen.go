@@ -1628,6 +1628,17 @@ func (e PartitionIdSpaceExhausted) Is(target error) bool {
 	return ok
 }
 
+type PartitionHistoryChanged struct{}
+
+func (e PartitionHistoryChanged) Error() string {
+	return "partition history changed after the request was resolved"
+}
+func (e PartitionHistoryChanged) Code() Code { return 3014 }
+func (e PartitionHistoryChanged) Is(target error) bool {
+	_, ok := target.(PartitionHistoryChanged)
+	return ok
+}
+
 type SegmentNotFound struct{}
 
 func (e SegmentNotFound) Error() string { return "segment not found" }
@@ -2676,6 +2687,29 @@ func (e IncompatibleProtocolVersion) Is(target error) bool {
 	return ok
 }
 
+type SessionMismatch struct {
+	Requested uint64
+	Bound     uint64
+}
+
+func (e SessionMismatch) Error() string {
+	return fmt.Sprintf("vsr session mismatch: requested %d, server bound %d", e.Requested, e.Bound)
+}
+func (e SessionMismatch) Code() Code { return 14004 }
+func (e SessionMismatch) Is(target error) bool {
+	_, ok := target.(SessionMismatch)
+	return ok
+}
+
+type RequestIdExhausted struct{}
+
+func (e RequestIdExhausted) Error() string { return "vsr request id exhausted" }
+func (e RequestIdExhausted) Code() Code    { return 14005 }
+func (e RequestIdExhausted) Is(target error) bool {
+	_, ok := target.(RequestIdExhausted)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2821,6 +2855,7 @@ var (
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
 	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
+	ErrPartitionHistoryChanged                    = PartitionHistoryChanged{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
 	ErrInvalidSegmentSize                         = InvalidSegmentSize{}
@@ -2918,6 +2953,8 @@ var (
 	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
+	ErrSessionMismatch                            = SessionMismatch{}
+	ErrRequestIdExhausted                         = RequestIdExhausted{}
 )
 
 type Code uint32
@@ -3067,6 +3104,7 @@ const (
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
 	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
+	PartitionHistoryChangedCode                    Code = 3014
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
 	InvalidSegmentSizeCode                         Code = 4002
@@ -3164,6 +3202,8 @@ const (
 	AlreadyAuthenticatedCode                       Code = 14000
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
+	SessionMismatchCode                            Code = 14004
+	RequestIdExhaustedCode                         Code = 14005
 )
 
 func (c Code) String() string {
@@ -3456,6 +3496,8 @@ func (c Code) String() string {
 		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
+	case PartitionHistoryChangedCode:
+		return "PartitionHistoryChanged"
 	case SegmentNotFoundCode:
 		return "SegmentNotFound"
 	case SegmentClosedCode:
@@ -3650,6 +3692,10 @@ func (c Code) String() string {
 		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
+	case SessionMismatchCode:
+		return "SessionMismatch"
+	case RequestIdExhaustedCode:
+		return "RequestIdExhausted"
 	default:
 		return "Unknown error code"
 	}
@@ -3945,6 +3991,8 @@ func FromCode(code Code) IggyError {
 		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
+	case PartitionHistoryChangedCode:
+		return ErrPartitionHistoryChanged
 	case SegmentNotFoundCode:
 		return ErrSegmentNotFound
 	case SegmentClosedCode:
@@ -4139,6 +4187,10 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
+	case SessionMismatchCode:
+		return ErrSessionMismatch
+	case RequestIdExhaustedCode:
+		return ErrRequestIdExhausted
 	default:
 		return ErrError
 	}

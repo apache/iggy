@@ -63,6 +63,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     ///     be evicted once idle past 1.2 intervals.
     /// </summary>
     public static readonly TimeSpan ServerHeartbeatInterval = TimeSpan.FromSeconds(2);
+    public static readonly TimeSpan SessionTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
     ///     Extra environment variables for every node, layered over the cluster's base configuration.
@@ -72,7 +73,8 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected virtual Dictionary<string, string> EnvironmentVariables => new()
     {
         { "IGGY_HEARTBEAT_ENABLED", "true" },
-        { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" }
+        { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" },
+        { "IGGY_CONSUMER_GROUP_SESSION_TIMEOUT", $"{SessionTimeout.TotalSeconds}s" }
     };
 
     /// <summary>

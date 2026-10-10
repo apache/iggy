@@ -100,6 +100,7 @@ public enum IggyErrorCode {
     // Partition errors
     PARTITION_NOT_FOUND(3007),
     PARTITION_ID_SPACE_EXHAUSTED(3013),
+    PARTITION_HISTORY_CHANGED(3014),
 
     // Consumer offset errors
     TOO_MANY_CONSUMER_OFFSETS(3024),
@@ -126,6 +127,8 @@ public enum IggyErrorCode {
 
     // VSR protocol errors
     INCOMPATIBLE_PROTOCOL_VERSION(14003),
+    SESSION_MISMATCH(14004),
+    REQUEST_ID_EXHAUSTED(14005),
 
     // Unknown error code
     UNKNOWN(-1);

@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use iggy::prelude::{IggyError, IggyMessage, MessageClient, Partitioning};
 use tokio::sync::Semaphore;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout};
 
-use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot};
+use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by};
 use crate::bridge::error::BridgeError;
 
 /// Frame bytes besides the messages: request header, batch header and ids.
@@ -88,9 +88,8 @@ async fn send_in_slot<T: Send + 'static>(
     deadline: Instant,
     send: impl Future<Output = Result<T, IggyError>> + Send + 'static,
 ) -> Result<T, BridgeError> {
-    let permit = match timeout_at(deadline, Arc::clone(slot).acquire_owned()).await {
-        Ok(Ok(permit)) if Instant::now() < deadline => permit,
-        _ => return Err(BridgeError::Timeout),
+    let Some(permit) = permit_by(slot, deadline).await else {
+        return Err(BridgeError::Timeout);
     };
     let send = async move {
         match timeout(SLOT_LIMIT, send).await {

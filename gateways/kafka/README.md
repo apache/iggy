@@ -1,14 +1,18 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata and CreateTopics use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, OffsetCommit and OffsetFetch use Iggy. InitProducerId and consumer group coordination work with or without one.
 
-> **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata and
-> CreateTopics use Iggy. With the bridge off (the default), those five are stubs: Produce, Fetch and
-> ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics answers `NOT_CONTROLLER`
-> (41), and Metadata reports every requested topic unknown. **CreateTopics runs as the bridge's own
+> **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
+> CreateTopics, OffsetCommit and OffsetFetch use Iggy. With the bridge off (the default), those
+> seven are stubs: Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6),
+> CreateTopics answers `NOT_CONTROLLER` (41), OffsetCommit and OffsetFetch answer retriable
+> `COORDINATOR_LOAD_IN_PROGRESS` (14), and Metadata reports every requested topic unknown.
+> **CreateTopics runs as the bridge's own
 > Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that
-> can reach this port can create topics (up to 1000 partitions each). Every client reads and writes
-> as the bridge's Iggy user. See [docs/SCOPE.md](docs/SCOPE.md).
+> can reach this port can create topics (up to 1000 partitions each). OffsetCommit creates Iggy
+> resources too: a consumer group `kafka.cg.<group>` per group id and topic, which nothing deletes
+> ([cleanup](docs/OFFSET_STORAGE.md#limits)). Every client reads and writes as the bridge's Iggy
+> user. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
@@ -16,9 +20,14 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `LeaveGroup` and `SyncGroup` are real, with real membership, rebalances, graceful leave and
 > session expiry ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). With the bridge off,
 > Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
-> Offset commit and fetch are not implemented yet, so a consumer must use `assign()` with explicit
-> start offsets and `enable.auto.commit=false`. The Java client needs no `group.id`. librdkafka
-> refuses `assign()` without one, so set any value there.
+> With the bridge on, OffsetCommit and OffsetFetch keep each group's offsets in Iggy, so a group
+> resumes from its last commit, also after a gateway restart
+> ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md)). Every Iggy server must run a build with the
+> external group consumer kind ([#4392](https://github.com/apache/iggy/pull/4392)) before the first
+> commit. In a partly upgraded cluster, one commit can make a partition stop committing. In a
+> cluster, a node that has not applied a group's first commit answers "no offset", so a consumer on
+> `auto.offset.reset=latest` can skip records until
+> [#4409](https://github.com/apache/iggy/issues/4409).
 
 ## Run
 
@@ -118,11 +127,10 @@ gateway's `IGGY_KAFKA_IGGY_PASSWORD` is known ahead of time - never reuse them o
 stack. See `gateways/kafka/docker-compose.yml` and the environment variable tables below for
 every other knob.
 
-**Limitations** (see the stub warning above for the full list): OffsetCommit and OffsetFetch are
-not implemented yet, so a consumer group can form and get assigned partitions but can't commit or
-resume from a saved offset - use `assign()` with an explicit start offset, as the Fetch example
-above does with `-o beginning`. Single gateway, single Iggy node, SASL off by default. This is a
-development quick start, not a production deployment shape.
+**Limitations** (see the stub warning above for the full list): single gateway, single Iggy node,
+SASL off by default. This is a development quick start, not a production deployment shape. If your
+local `apache/iggy:edge` predates [#4392](https://github.com/apache/iggy/pull/4392), run
+`docker compose pull`, because that server refuses every offset commit.
 
 This quick start's topics use Iggy's default `Durability::Replicated` - a Produce ack is a
 quorum commit, not an fsync. A `docker kill` or host power loss can lose acked records despite
@@ -205,6 +213,26 @@ Produce request carrying a `transactional_id` gets `UNSUPPORTED_VERSION` (35) on
 rather than having its records stored as if they were ordinary ones. None of those closes the
 connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
+## Consumer groups ([#3544](https://github.com/apache/iggy/issues/3544))
+
+A stock consumer with a `group.id` joins, takes the partitions its own assignor hands it, commits,
+and resumes from its commit. With the bridge on, commits live in Iggy, so a group also resumes after
+a gateway restart. `tests/kafka_client_e2e_tests.rs` checks both with the Java consumer, and a
+member that leaves hands its partition to the other at its commit.
+
+Limits:
+
+- One gateway per bootstrap endpoint. Group membership is gateway memory
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
+- Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
+- `group.instance.id` is accepted but not honoured. A static member that restarts causes two
+  rebalances.
+- No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
+  `kafka-consumer-groups.sh` cannot list or describe a group.
+- No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
+  in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
+- Delivery is at-least-once. A consumer that stops before it commits reads those records again.
+
 ## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
 
 Off by default. With `IGGY_KAFKA_SASL_ENABLED=true` the gateway requires SASL/PLAIN before it serves
@@ -275,10 +303,12 @@ Full reasoning, including what was rejected and why, is in
 
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
 streams/topics, provisions them on demand, looks up high watermarks (one or many partitions of
-a topic per call) for `ListOffsets`, and probes and polls partitions for Fetch.
+a topic per call) for `ListOffsets`, probes and polls partitions for Fetch, and stores and reads
+group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
-([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)) and CreateTopics
-([#3538](https://github.com/apache/iggy/issues/3538)) call it.
+([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
+([#3538](https://github.com/apache/iggy/issues/3538)), OffsetCommit and OffsetFetch
+([#3542](https://github.com/apache/iggy/issues/3542)) call it.
 Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
 `tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
 
@@ -332,7 +362,7 @@ records, in request order. One uncompressed batch per partition.
 | Partition, offset | As sent. Both systems count from 0. |
 | Iggy replica | The one on the node each bridge client is on. Every client signs in at the metadata leader, and a view change or a refused call can move it. So in a cluster, a probe and a poll can read nodes that are not at the same offset. |
 | Offset below the oldest kept one | Reads from the oldest kept one. If none is kept, no records until the next write, because a cluster replica that lost records after a crash reads the same. Kafka answers `1` here, so `auto.offset.reset=none` gets no error. |
-| Purge | Iggy restarts the partition at offset 0, and Fetch cannot see it. Seek consumers to 0 after a purge. Otherwise writes past a consumer's old offset make it skip the records below. |
+| Recreated topic | Iggy starts each partition at offset 0 again, and Fetch cannot see it. Seek consumers to 0 after you recreate a topic. Otherwise writes past a consumer's old offset make it skip the records below. |
 | `high_watermark` | One past the last committed offset. |
 | `last_stable_offset` | Same as `high_watermark`. No transactions. |
 | `log_start_offset` | Always `-1`. |
@@ -470,7 +500,10 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 ### Concurrency ceiling
 
 - One `IggyClient` serves Produce, Metadata and CreateTopics for every Kafka connection, one Iggy
-  request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
+  request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more. Offset
+  calls use 8 more: a commit client and a read client per offset slot.
+- OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
+  cluster, an offset commit client can also open one connection per node for stores.
 - `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in
   [docs/SCOPE.md](docs/SCOPE.md).
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
@@ -512,6 +545,8 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 
 Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
+OffsetCommit and OffsetFetch fold 6, 7 and `RequestTooOld` into `COORDINATOR_LOAD_IN_PROGRESS`
+(14), which the Java client retries in both (`to_offset_error_code`).
 
 ### Server limits the gateway inherits
 

@@ -62,16 +62,17 @@ pub enum Operation {
     /// and submits this through metadata consensus, so every replica applies
     /// the same offset deterministically. No client wire code.
     TruncatePartition = 68,
+    FinalizeSession = 70,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
-    PurgeStream = 131,
+    // 131 was PurgeStream. Never reuse it.
     CreateTopic = 132,
     UpdateTopic = 133,
     DeleteTopic = 134,
-    PurgeTopic = 135,
+    // 135 was PurgeTopic. Never reuse it.
     CreatePartitions = 136,
     DeletePartitions = 137,
     // Client op handled specially: the dispatch layer resolves the requested
@@ -95,15 +96,18 @@ pub enum Operation {
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
+    // 163 is reserved; 164 and 165 are retired offset operations.
+    RetireSession = 166,
 }
 
 impl Operation {
     /// Whether `code` is a discriminant this build defines.
     ///
-    /// The typed decode needs this to tell an operation a newer release added
-    /// from a corrupted header byte: bytemuck's checked cast rejects both with
-    /// one undifferentiated error, and only the former is fixable by upgrading
-    /// this node.
+    /// Decoders need this to tell an operation another release defines from a
+    /// corrupted header byte: bytemuck's checked cast rejects both with one
+    /// undifferentiated error, and only the former is fixed by aligning the
+    /// releases. A newer release adds operations, and an older one can still
+    /// send a retired one.
     #[must_use]
     pub fn is_known_code(code: u8) -> bool {
         bytemuck::checked::try_cast::<u8, Self>(code).is_ok()
@@ -113,18 +117,31 @@ impl Operation {
     pub const METADATA_START: u8 = Self::CreateStream as u8;
     pub const PARTITION_START: u8 = Self::SendMessages as u8;
 
+    /// Preparation rewrites some client opcodes. Retry identity must survive
+    /// that projection, including when only the committed reply remains.
+    #[must_use]
+    pub const fn request_operation(&self) -> Self {
+        match self {
+            Self::CreateTopicWithAssignments => Self::CreateTopic,
+            Self::CreatePartitionsWithAssignments => Self::CreatePartitions,
+            Self::TruncatePartition => Self::DeleteSegments,
+            operation => *operation,
+        }
+    }
+
     /// Internal-only operations reserved for replica / journal use.
     #[must_use]
     #[inline]
     pub const fn is_internal(&self) -> bool {
-        (*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START
+        ((*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START)
+            || matches!(self, Self::RetireSession)
     }
 
     /// Metadata / control-plane operations handled by shard 0.
     #[must_use]
     #[inline]
     pub const fn is_metadata(&self) -> bool {
-        if self.is_internal() {
+        if self.is_internal() && !self.is_partition() {
             return true;
         }
 
@@ -133,11 +150,9 @@ impl Operation {
             Self::CreateStream
                 | Self::UpdateStream
                 | Self::DeleteStream
-                | Self::PurgeStream
                 | Self::CreateTopic
                 | Self::UpdateTopic
                 | Self::DeleteTopic
-                | Self::PurgeTopic
                 | Self::CreatePartitions
                 | Self::DeletePartitions
                 | Self::CreateConsumerGroup
@@ -232,15 +247,15 @@ impl Operation {
             | Self::CreatePartitionsWithAssignments
             | Self::RemoveConsumerGroupMember
             | Self::CompleteConsumerGroupRevocation
-            | Self::TruncatePartition => None,
+            | Self::TruncatePartition
+            | Self::FinalizeSession
+            | Self::RetireSession => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
-            | Self::PurgeStream
             | Self::CreateTopic
             | Self::UpdateTopic
             | Self::DeleteTopic
-            | Self::PurgeTopic
             | Self::CreatePartitions
             | Self::DeletePartitions
             | Self::DeleteSegments
@@ -286,11 +301,9 @@ mod tests {
             Operation::CreateStream,
             Operation::UpdateStream,
             Operation::DeleteStream,
-            Operation::PurgeStream,
             Operation::CreateTopic,
             Operation::UpdateTopic,
             Operation::DeleteTopic,
-            Operation::PurgeTopic,
             Operation::CreatePartitions,
             Operation::DeletePartitions,
             Operation::DeleteSegments,
@@ -405,6 +418,18 @@ mod tests {
                 !UNROUTABLE.contains(&operation),
                 "{operation:?}: is_plane_routable={} disagrees with the unroutable list",
                 operation.is_plane_routable(),
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_codes_remain_unknown() {
+        const RESERVED_CODES: [u8; 5] = [131, 135, 163, 164, 165];
+
+        for code in RESERVED_CODES {
+            assert!(
+                !Operation::is_known_code(code),
+                "reserved operation code {code} must not be reused"
             );
         }
     }

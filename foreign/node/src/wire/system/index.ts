@@ -18,3 +18,4 @@
 export * from './describe-options.command.js';
 export * from './get-stats.command.js';
 export * from './ping.command.js';
+export * from './snapshot.command.js';

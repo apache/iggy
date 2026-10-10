@@ -775,6 +775,62 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
     verify_transferred_quorum(harness, &stream, &topic).await;
 }
 
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_uninitialized_partitions_when_all_replicas_restart_should_elect_and_accept_writes(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_stream_and_topic(&client, true).await;
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
+    let stream_id = client.get_stream(&stream).await.unwrap().unwrap().id;
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    for node in 0..3 {
+        let follower = harness
+            .node(node)
+            .tcp_client()
+            .unwrap()
+            .with_root_login()
+            .connect()
+            .await
+            .unwrap();
+        loop {
+            if matches!(follower.get_topic(&stream, &topic).await, Ok(Some(_))) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "all replicas must commit the topic metadata"
+            );
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+    harness.kill_cluster().unwrap();
+    // No partition writes were submitted. Recreate the crash cut after the
+    // metadata commit and before any local initialization was published.
+    for node in 0..3 {
+        let data = harness.node(node).data_path();
+        for path in [
+            data.join(format!(
+                "streams/{stream_id}/topics/{}/partitions/0",
+                details.id
+            )),
+            data.join("partition-initialization"),
+        ] {
+            if path.exists() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+    harness.restart_cluster().await.unwrap();
+    let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
+    let acked = produce_acked(&client, "initialized-after-restart", 1).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap();
+}
+
 async fn verify_checkpoint_quarantine(
     harness: &mut TestHarness,
     stream_id: u32,
