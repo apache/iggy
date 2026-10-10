@@ -4117,10 +4117,11 @@ where
             consensus.set_last_prepare_checksum(checksum);
         }
         consensus.clear_pipeline();
-        // The cleared pipeline held any pending install, and the checkpoint
-        // already carries every owner installed up to commit_op.
-        self.pending_owner_install.set(None);
         consensus.advance_commit_max(install.commit_op);
+        // The cleared journal and pipeline held any unapplied install, and the
+        // checkpoint already carries every owner installed up to commit_op.
+        self.pending_owner_install.set(None);
+        self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
         self.repair = None;
         self.transfer_offer_cache.borrow_mut().take();

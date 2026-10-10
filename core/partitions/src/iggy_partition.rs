@@ -154,7 +154,7 @@ where
     /// Op of the last unapplied install the latest log scan found. A view
     /// change can leave several, and the latch holds only the last one, so
     /// group reads and offset writes wait until every one of them has applied.
-    owner_install_barrier: u64,
+    pub(crate) owner_install_barrier: u64,
     pending_history_transition: Cell<Option<TransitionPartitionHistoryRequest>>,
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
     pub stats: Arc<PartitionStats>,
@@ -16519,6 +16519,60 @@ mod tests {
         commit_log(&mut partition).await;
         assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
         assert_eq!(partition.group_offset_state(first.group_id).1, Some(0));
+    }
+
+    /// An install wipes the log above its commit op. A barrier left at an
+    /// install it dropped would hold the installed owner until commits pass that
+    /// op, and the auto-commits it refuses are all an idle group would commit.
+    #[compio::test]
+    async fn given_barrier_above_the_offer_when_state_transfer_publishes_should_serve_the_installed_owner()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut partition, directory.path());
+        let installed_op = install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let installed = partition.consumer_group_owners[&GROUP_ID];
+        let successor = next_test_installation(&partition, GROUP_ID, CLIENT_ID + 1);
+        let prepare = partition.pipeline_local_request(
+            owner_install_request(&partition, &successor),
+            None,
+            None,
+        );
+        partition.on_replicate(prepare).await;
+        partition.consensus.set_view(1);
+        partition.resynchronize_consumer_offset_reservations();
+        assert_eq!(partition.owner_install_barrier, installed_op + 1);
+
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: partition.dedup().capacity(),
+            required_metadata_frontier: installed.installation.metadata_op,
+            owners: vec![installed],
+            ..Default::default()
+        };
+        partition
+            .install_state_transfer(
+                &repair_config(),
+                installed_op,
+                Vec::new(),
+                &offsets.encode(),
+            )
+            .await
+            .unwrap();
+        partition.stats.increment_messages_count(1);
+        let read = poll_read_result(
+            &partition,
+            PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0),
+            true,
+            Some(0),
+        );
+
+        let refusal = complete_poll_and_commit(&mut partition, read).await;
+        assert!(refusal.is_none(), "{refusal:?}");
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.group_offset_state(GROUP_ID), (Some(0), Some(0)));
     }
 
     #[compio::test]
