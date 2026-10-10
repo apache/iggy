@@ -17,31 +17,27 @@
  * under the License.
  */
 
-#include <array>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <variant>
 
 #include <gtest/gtest.h>
 
-#include "lib.rs.h"
+#include "iggy.hpp"
 
-TEST(LowLevelE2E_Identifier, FromStringCreatesStringIdentifier) {
-    RecordProperty("description", "Creates a string identifier and preserves its UTF-8 byte payload.");
+TEST(IdentifierTest, FromStringCreatesStringIdentifier) {
+    RecordProperty("description", "Creates a string identifier and preserves its payload.");
     const std::string value = "stream-identifier";
-    iggy::ffi::Identifier identifier;
 
-    ASSERT_NO_THROW(identifier.set_string(value));
+    iggy::Identifier identifier = iggy::Identifier::String(value);
 
-    ASSERT_EQ(identifier.kind, "string");
-    ASSERT_EQ(identifier.length, value.size());
-    ASSERT_EQ(identifier.value.size(), value.size());
-    for (size_t i = 0; i < value.size(); ++i) {
-        EXPECT_EQ(identifier.value[i], static_cast<std::uint8_t>(value[i]));
-    }
+    EXPECT_EQ(identifier.Type(), iggy::Identifier::Kind::String);
+    ASSERT_TRUE(std::holds_alternative<std::string>(identifier.Value()));
+    EXPECT_EQ(std::get<std::string>(identifier.Value()), value);
 }
 
-TEST(LowLevelE2E_Identifier, FromStringAcceptsExact255ByteUtf8Value) {
+TEST(IdentifierTest, FromStringAcceptsExact255ByteUtf8Value) {
     RecordProperty("description", "Accepts a UTF-8 string identifier whose encoded byte length is exactly 255.");
     std::string value;
     for (size_t i = 0; i < 127; ++i) {
@@ -51,27 +47,20 @@ TEST(LowLevelE2E_Identifier, FromStringAcceptsExact255ByteUtf8Value) {
 
     ASSERT_EQ(value.size(), 255u);
 
-    iggy::ffi::Identifier identifier;
-    ASSERT_NO_THROW(identifier.set_string(value));
+    iggy::Identifier identifier = iggy::Identifier::String(value);
 
-    ASSERT_EQ(identifier.kind, "string");
-    ASSERT_EQ(identifier.length, value.size());
-    ASSERT_EQ(identifier.value.size(), value.size());
-    for (size_t i = 0; i < value.size(); ++i) {
-        EXPECT_EQ(identifier.value[i], static_cast<std::uint8_t>(value[i]));
-    }
+    EXPECT_EQ(identifier.Type(), iggy::Identifier::Kind::String);
+    ASSERT_TRUE(std::holds_alternative<std::string>(identifier.Value()));
+    EXPECT_EQ(std::get<std::string>(identifier.Value()), value);
 }
 
-TEST(LowLevelE2E_Identifier, FromStringRejectsEmptyValue) {
+TEST(IdentifierTest, FromStringRejectsEmptyValue) {
     RecordProperty("description", "Rejects creating a string identifier from an empty string.");
-    iggy::ffi::Identifier identifier;
-
-    ASSERT_THROW(identifier.set_string(""), std::exception);
+    EXPECT_THROW(iggy::Identifier::String(""), iggy::IggyException);
 }
 
-TEST(LowLevelE2E_Identifier, FromStringRejectsUtf8ValueLongerThan255Bytes) {
+TEST(IdentifierTest, FromStringRejectsUtf8ValueLongerThan255Bytes) {
     RecordProperty("description", "Rejects creating a UTF-8 string identifier longer than 255 encoded bytes.");
-    iggy::ffi::Identifier identifier;
     std::string too_long_value;
     for (size_t i = 0; i < 128; ++i) {
         too_long_value += "\xC2\xA2";
@@ -79,76 +68,34 @@ TEST(LowLevelE2E_Identifier, FromStringRejectsUtf8ValueLongerThan255Bytes) {
 
     ASSERT_EQ(too_long_value.size(), 256u);
 
-    ASSERT_THROW(identifier.set_string(too_long_value), std::exception);
+    EXPECT_THROW(iggy::Identifier::String(too_long_value), iggy::IggyException);
 }
 
-TEST(LowLevelE2E_Identifier, FromStringRejectsAsciiValueLongerThan255Bytes) {
+TEST(IdentifierTest, FromStringRejectsAsciiValueLongerThan255Bytes) {
     RecordProperty("description", "Rejects creating an ASCII string identifier longer than 255 bytes.");
-    iggy::ffi::Identifier identifier;
     const std::string too_long_value(256, 'a');
 
-    ASSERT_THROW(identifier.set_string(too_long_value), std::exception);
+    EXPECT_THROW(iggy::Identifier::String(too_long_value), iggy::IggyException);
 }
 
-TEST(LowLevelE2E_Identifier, FromNumericCreatesNumericIdentifier) {
-    RecordProperty("description", "Creates a numeric identifier encoded as four little-endian bytes.");
-    iggy::ffi::Identifier identifier;
-    constexpr std::uint32_t value                        = 0x12345678;
-    constexpr std::array<std::uint8_t, 4> expected_bytes = {0x78, 0x56, 0x34, 0x12};
+TEST(IdentifierTest, FromNumericCreatesNumericIdentifier) {
+    RecordProperty("description", "Creates a numeric identifier preserving its value.");
+    constexpr std::uint32_t value = 0x12345678;
 
-    ASSERT_NO_THROW(identifier.set_numeric(value));
+    iggy::Identifier identifier = iggy::Identifier::Numeric(value);
 
-    ASSERT_EQ(identifier.kind, "numeric");
-    ASSERT_EQ(identifier.length, 4u);
-    ASSERT_EQ(identifier.value.size(), expected_bytes.size());
-    for (size_t i = 0; i < expected_bytes.size(); ++i) {
-        EXPECT_EQ(identifier.value[i], expected_bytes[i]);
-    }
+    EXPECT_EQ(identifier.Type(), iggy::Identifier::Kind::Numeric);
+    ASSERT_TRUE(std::holds_alternative<std::uint32_t>(identifier.Value()));
+    EXPECT_EQ(std::get<std::uint32_t>(identifier.Value()), value);
 }
 
-TEST(LowLevelE2E_Identifier, FromNumericCreatesUint32MaxIdentifier) {
-    RecordProperty("description", "Creates a numeric identifier for UINT32_MAX using four 0xFF bytes.");
-    iggy::ffi::Identifier identifier;
-    constexpr std::array<std::uint8_t, 4> expected_bytes = {0xFF, 0xFF, 0xFF, 0xFF};
+TEST(IdentifierTest, FromNumericCreatesUint32MaxIdentifier) {
+    RecordProperty("description", "Creates a numeric identifier for UINT32_MAX.");
+    constexpr std::uint32_t value = std::numeric_limits<std::uint32_t>::max();
 
-    ASSERT_NO_THROW(identifier.set_numeric(std::numeric_limits<std::uint32_t>::max()));
+    iggy::Identifier identifier = iggy::Identifier::Numeric(value);
 
-    ASSERT_EQ(identifier.kind, "numeric");
-    ASSERT_EQ(identifier.length, 4u);
-    ASSERT_EQ(identifier.value.size(), expected_bytes.size());
-    for (size_t i = 0; i < expected_bytes.size(); ++i) {
-        EXPECT_EQ(identifier.value[i], expected_bytes[i]);
-    }
-}
-
-TEST(LowLevelE2E_Identifier, FromNumericOverwritesExistingStringIdentifier) {
-    RecordProperty("description", "Replaces a previously created string identifier with numeric identifier data.");
-    iggy::ffi::Identifier identifier;
-
-    ASSERT_NO_THROW(identifier.set_string("temporary-name"));
-    ASSERT_NO_THROW(identifier.set_numeric(7));
-
-    ASSERT_EQ(identifier.kind, "numeric");
-    ASSERT_EQ(identifier.length, 4u);
-    ASSERT_EQ(identifier.value.size(), 4u);
-    EXPECT_EQ(identifier.value[0], 7u);
-    EXPECT_EQ(identifier.value[1], 0u);
-    EXPECT_EQ(identifier.value[2], 0u);
-    EXPECT_EQ(identifier.value[3], 0u);
-}
-
-TEST(LowLevelE2E_Identifier, FromStringOverwritesExistingNumericIdentifier) {
-    RecordProperty("description", "Replaces a previously created numeric identifier with string identifier data.");
-    const std::string value = "replacement-name";
-    iggy::ffi::Identifier identifier;
-
-    ASSERT_NO_THROW(identifier.set_numeric(42));
-    ASSERT_NO_THROW(identifier.set_string(value));
-
-    ASSERT_EQ(identifier.kind, "string");
-    ASSERT_EQ(identifier.length, value.size());
-    ASSERT_EQ(identifier.value.size(), value.size());
-    for (size_t i = 0; i < value.size(); ++i) {
-        EXPECT_EQ(identifier.value[i], static_cast<std::uint8_t>(value[i]));
-    }
+    EXPECT_EQ(identifier.Type(), iggy::Identifier::Kind::Numeric);
+    ASSERT_TRUE(std::holds_alternative<std::uint32_t>(identifier.Value()));
+    EXPECT_EQ(std::get<std::uint32_t>(identifier.Value()), value);
 }

@@ -249,7 +249,6 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
     const std::string updated_stream_name = GetRandomName();
     const std::string topic_name          = GetRandomName();
     auto client                           = GetLoggedInHighLevelClient();
-    iggy::ffi::Client *ffi_client         = GetLoggedInClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
@@ -267,14 +266,13 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
                                            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
                                            .SetMessageExpiry(iggy::Expiry::NeverExpire())));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        auto message = iggy::ffi::make_message(to_payload("stream-update-preserve-" + std::to_string(i)),
-                                               rust::Vec<iggy::ffi::HeaderEntry>());
+        auto message = iggy::IggyMessageToSend::Create("stream-update-preserve-" + std::to_string(i), {});
         messages.push_back(std::move(message));
     }
-    ASSERT_NO_THROW(ffi_client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0),
-                                              "partition_id", partition_id_bytes(0), std::move(messages)));
+    ASSERT_NO_THROW(client.SendMessages(iggy::Identifier::Numeric(stream_id), iggy::Identifier::Numeric(0),
+                                        iggy::Partitioning::PartitionId(0), messages));
 
     auto stream_before_update      = client.GetStream(iggy::Identifier::Numeric(stream_id));
     const auto stats_before_update = client.GetStats();
@@ -475,7 +473,6 @@ TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
                    "Verifies get_streams returns correct field values after creating stream with topic and messages.");
     const std::string stream_name = GetRandomName();
     auto client                   = GetLoggedInHighLevelClient();
-    iggy::ffi::Client *ffi_client = GetLoggedInClient();
     client.CreateStream(stream_name);
     TrackStream(stream_name);
     auto stream                  = client.GetStream(iggy::Identifier::String(stream_name));
@@ -486,14 +483,13 @@ TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
                            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
                            .SetMessageExpiry(iggy::Expiry::NeverExpire()));
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("field-verify-message-" + std::to_string(i)),
-                                           rust::Vec<iggy::ffi::HeaderEntry>());
+        auto msg = iggy::IggyMessageToSend::Create("field-verify-message-" + std::to_string(i), {});
         messages.push_back(std::move(msg));
     }
-    ffi_client->send_messages(make_numeric_identifier(stream.Id()), make_numeric_identifier(0), "partition_id",
-                              partition_id_bytes(0), std::move(messages));
+    client.SendMessages(iggy::Identifier::Numeric(stream.Id()), iggy::Identifier::Numeric(0),
+                        iggy::Partitioning::PartitionId(0), messages);
 
     auto streams = client.GetStreams();
     ASSERT_GE(streams.size(), 1u);
